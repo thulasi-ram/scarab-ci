@@ -335,6 +335,112 @@ pub trait ApiTokenStore: Send + Sync {
     async fn touch(&self, id: &str, now_ms: i64) -> Result<(), IdentityError>;
 }
 
+// ---------------------------------------------------------------------------
+// Identity links (ADR-0069): a Principal is a Scarab record; each provider
+// identity it holds is pinned by the provider's IMMUTABLE id, never its login.
+// ---------------------------------------------------------------------------
+
+/// One provider's account of who just signed in (ADR-0069 §1).
+///
+/// `(provider, external_id)` is the key. `handle` is what the person is called
+/// there *today* — a forge `login`, a verified email — and is refreshed on
+/// every sign-in, so it is only ever used to mint a readable id and to display.
+/// Keying on it is exactly the recycled-login takeover this type exists to end.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderIdentity {
+    /// The configured provider's stable id (`github`, `okta`, `default`).
+    pub provider: String,
+    /// The provider's immutable user id: OIDC `sub`, else the numeric `id`.
+    pub external_id: String,
+    pub handle: String,
+    pub email: Option<String>,
+    pub email_verified: bool,
+    pub display_name: Option<String>,
+}
+
+/// A Principal's own record (ADR-0069 §1). Rows are never deleted: an id,
+/// once minted, is never minted again — that is what stops a freed id from
+/// being claimed by whoever produces the same string next.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrincipalRecord {
+    /// The `Principal.subject` every binding, token and approver list stores.
+    pub id: String,
+    pub display_name: Option<String>,
+    pub created_at: i64,
+    /// `None` until someone has actually signed in as this Principal.
+    pub claimed_at: Option<i64>,
+    /// Set once this Principal has been folded into another.
+    pub merged_into: Option<String>,
+}
+
+/// Can `s` stand in a minted id as-is? Deliberately narrow: no `:` (it would
+/// leave the provider's namespace) and no `~` (the suffix separator — a handle
+/// carrying one could pre-mint someone else's `~2`).
+fn is_clean_handle(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | '+' | '-'))
+}
+
+/// The id a NEW Principal for `identity` is minted under, before any suffix
+/// (ADR-0069 §2). `unqualified` is the legacy subject an `unqualified_ids`
+/// provider would always have produced (`sub` → `login` → `id`); it is kept
+/// bare so pre-upgrade bindings, tokens and approver entries keep resolving —
+/// unless it carries a `:` or `~`, which would let it sit in another
+/// provider's namespace or squat a suffix, in which case it is qualified like
+/// any other.
+pub fn base_principal_id(identity: &ProviderIdentity, unqualified: Option<&str>) -> String {
+    if let Some(legacy) = unqualified.filter(|l| !l.is_empty() && !l.contains([':', '~'])) {
+        return legacy.to_string();
+    }
+    if is_clean_handle(&identity.handle) {
+        format!("{}:{}", identity.provider, identity.handle)
+    } else {
+        // An opaque id is ugly but unambiguous; `~` is the one character it
+        // may not carry.
+        format!(
+            "{}:{}",
+            identity.provider,
+            identity.external_id.replace('~', "%7E")
+        )
+    }
+}
+
+/// The `n`th candidate for `base`: the base itself, then `base~2`, `base~3`, …
+/// A suffix is taken whenever the base exists **at all** (claimed, unclaimed
+/// or merged) — never only when its holder looks like someone else.
+pub fn principal_id_candidate(base: &str, n: u32) -> String {
+    if n <= 1 {
+        base.to_string()
+    } else {
+        format!("{base}~{n}")
+    }
+}
+
+/// Durable store of Principals and their pinned provider identities
+/// (ADR-0069).
+#[async_trait]
+pub trait IdentityStore: Send + Sync {
+    /// Sign-in. Returns the id of the Principal pinned to `(provider,
+    /// external_id)` — refreshing its handle/email and marking it claimed — or,
+    /// for an identity never seen, a **freshly minted** Principal under the
+    /// first free [`principal_id_candidate`] of `base_id`.
+    ///
+    /// Never attaches a new identity to an existing Principal: that happens
+    /// only through an explicit, proven link. A login whose handle matches
+    /// someone else's id therefore gets its own `~N` id and inherits nothing.
+    async fn sign_in(
+        &self,
+        identity: &ProviderIdentity,
+        base_id: &str,
+        now_ms: i64,
+    ) -> Result<String, IdentityError>;
+    /// The Principal record for `id`, if one was ever minted.
+    async fn principal(&self, id: &str) -> Result<Option<PrincipalRecord>, IdentityError>;
+    /// Every identity pinned to Principal `id`, ordered by provider.
+    async fn identities_of(&self, id: &str) -> Result<Vec<ProviderIdentity>, IdentityError>;
+}
+
 /// Claims to embed in a minted per-run OIDC JWT for keyless cloud federation
 /// (ADR-0015, 0032). Minted per **attempt**, short-lived.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -503,6 +609,58 @@ mod tests {
         assert!(s.is_valid(999));
         assert!(!s.is_valid(1_000));
         assert!(!s.is_valid(1_001));
+    }
+
+    fn ident(provider: &str, external_id: &str, handle: &str) -> ProviderIdentity {
+        ProviderIdentity {
+            provider: provider.into(),
+            external_id: external_id.into(),
+            handle: handle.into(),
+            email: None,
+            email_verified: false,
+            display_name: None,
+        }
+    }
+
+    #[test]
+    fn a_minted_id_is_namespaced_and_cannot_be_squatted() {
+        // Qualified: the provider prefix is what keeps Forgejo-alice and
+        // GitHub-alice apart.
+        assert_eq!(
+            base_principal_id(&ident("github", "1", "alice"), None),
+            "github:alice"
+        );
+        assert_eq!(
+            base_principal_id(&ident("forgejo", "1", "alice"), None),
+            "forgejo:alice"
+        );
+        // A handle that could leave its namespace or forge a suffix falls back
+        // to the provider's opaque id.
+        assert_eq!(
+            base_principal_id(&ident("okta", "00u8", "ada~2"), None),
+            "okta:00u8"
+        );
+        assert_eq!(
+            base_principal_id(&ident("okta", "00u8", "x:y"), None),
+            "okta:00u8"
+        );
+        assert_eq!(
+            base_principal_id(&ident("okta", "a~b", ""), None),
+            "okta:a%7Eb"
+        );
+        // Unqualified (the legacy provider): the bare pre-upgrade subject, so
+        // existing bindings keep resolving...
+        assert_eq!(
+            base_principal_id(&ident("default", "1", "alice"), Some("alice")),
+            "alice"
+        );
+        // ...unless it would sit in a qualified namespace.
+        assert_eq!(
+            base_principal_id(&ident("default", "1", "alice"), Some("github:alice")),
+            "default:alice"
+        );
+        assert_eq!(principal_id_candidate("github:alice", 1), "github:alice");
+        assert_eq!(principal_id_candidate("github:alice", 2), "github:alice~2");
     }
 
     #[test]

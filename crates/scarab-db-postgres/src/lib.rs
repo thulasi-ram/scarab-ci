@@ -2866,6 +2866,170 @@ fn api_token_from_row(r: &sqlx::postgres::PgRow) -> Option<scarab_identity::ApiT
     })
 }
 
+/// How many `~N` suffixes a mint will try before giving up. A real deployment
+/// needs a handful; this bound only stops a pathological loop.
+const MAX_PRINCIPAL_SUFFIX: u32 = 10_000;
+
+#[async_trait]
+impl scarab_identity::IdentityStore for PostgresDb {
+    async fn sign_in(
+        &self,
+        identity: &scarab_identity::ProviderIdentity,
+        base_id: &str,
+        now_ms: i64,
+    ) -> Result<String, scarab_identity::IdentityError> {
+        // Two passes at most: if a racing sign-in pins the same identity
+        // between our lookup and our insert, our mint rolls back and the
+        // second lookup finds theirs. Converging on ONE Principal is the point.
+        for _ in 0..2 {
+            let pinned: Option<String> = sqlx::query_scalar(
+                "SELECT principal_id FROM principal_identities
+                 WHERE provider = $1 AND external_id = $2",
+            )
+            .bind(&identity.provider)
+            .bind(&identity.external_id)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(identity_err)?;
+            if let Some(id) = pinned {
+                sqlx::query(
+                    "UPDATE principal_identities
+                     SET handle = $3, email = $4, email_verified = $5, last_login_at = $6
+                     WHERE provider = $1 AND external_id = $2",
+                )
+                .bind(&identity.provider)
+                .bind(&identity.external_id)
+                .bind(&identity.handle)
+                .bind(&identity.email)
+                .bind(identity.email_verified)
+                .bind(now_ms)
+                .execute(self.pool())
+                .await
+                .map_err(identity_err)?;
+                sqlx::query(
+                    "UPDATE principals
+                     SET display_name = COALESCE($2, display_name),
+                         claimed_at = COALESCE(claimed_at, $3)
+                     WHERE id = $1",
+                )
+                .bind(&id)
+                .bind(&identity.display_name)
+                .bind(now_ms)
+                .execute(self.pool())
+                .await
+                .map_err(identity_err)?;
+                return Ok(id);
+            }
+
+            // Never seen: mint. The PK is the existence check — insert and,
+            // on conflict, take the next suffix. No check-then-act.
+            let mut tx = self.pool().begin().await.map_err(identity_err)?;
+            let mut minted = None;
+            for n in 1..=MAX_PRINCIPAL_SUFFIX {
+                let id = scarab_identity::principal_id_candidate(base_id, n);
+                let inserted = sqlx::query(
+                    "INSERT INTO principals (id, display_name, created_at, claimed_at)
+                     VALUES ($1, $2, $3, $3)
+                     ON CONFLICT (id) DO NOTHING",
+                )
+                .bind(&id)
+                .bind(&identity.display_name)
+                .bind(now_ms)
+                .execute(&mut *tx)
+                .await
+                .map_err(identity_err)?
+                .rows_affected();
+                if inserted == 1 {
+                    minted = Some(id);
+                    break;
+                }
+            }
+            let id = minted.ok_or_else(|| {
+                scarab_identity::IdentityError::Issuance(format!(
+                    "no free principal id for `{base_id}`"
+                ))
+            })?;
+            let pinned_now = sqlx::query(
+                "INSERT INTO principal_identities
+                     (provider, external_id, principal_id, handle, email, email_verified,
+                      linked_at, last_login_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+                 ON CONFLICT (provider, external_id) DO NOTHING",
+            )
+            .bind(&identity.provider)
+            .bind(&identity.external_id)
+            .bind(&id)
+            .bind(&identity.handle)
+            .bind(&identity.email)
+            .bind(identity.email_verified)
+            .bind(now_ms)
+            .execute(&mut *tx)
+            .await
+            .map_err(identity_err)?
+            .rows_affected();
+            if pinned_now == 1 {
+                tx.commit().await.map_err(identity_err)?;
+                return Ok(id);
+            }
+            // Lost the race: drop our unseen mint and resolve theirs.
+            tx.rollback().await.map_err(identity_err)?;
+        }
+        Err(scarab_identity::IdentityError::Issuance(format!(
+            "identity {}:{} could not be pinned",
+            identity.provider, identity.external_id
+        )))
+    }
+
+    async fn principal(
+        &self,
+        id: &str,
+    ) -> Result<Option<scarab_identity::PrincipalRecord>, scarab_identity::IdentityError> {
+        let row = sqlx::query(
+            "SELECT id, display_name, created_at, claimed_at, merged_into
+             FROM principals WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(identity_err)?;
+        Ok(row.map(|r| scarab_identity::PrincipalRecord {
+            id: r.get("id"),
+            display_name: r.get("display_name"),
+            created_at: r.get("created_at"),
+            claimed_at: r.get("claimed_at"),
+            merged_into: r.get("merged_into"),
+        }))
+    }
+
+    async fn identities_of(
+        &self,
+        id: &str,
+    ) -> Result<Vec<scarab_identity::ProviderIdentity>, scarab_identity::IdentityError> {
+        let rows = sqlx::query(
+            "SELECT i.provider, i.external_id, i.handle, i.email, i.email_verified,
+                    p.display_name
+             FROM principal_identities i JOIN principals p ON p.id = i.principal_id
+             WHERE i.principal_id = $1
+             ORDER BY i.provider",
+        )
+        .bind(id)
+        .fetch_all(self.pool())
+        .await
+        .map_err(identity_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| scarab_identity::ProviderIdentity {
+                provider: r.get("provider"),
+                external_id: r.get("external_id"),
+                handle: r.get("handle"),
+                email: r.get("email"),
+                email_verified: r.get("email_verified"),
+                display_name: r.get("display_name"),
+            })
+            .collect())
+    }
+}
+
 const API_TOKEN_COLS: &str = "id, name, owner_subject, scope_org, scope_project, role, \
                               expires_at, created_by, created_at, last_used_at, revoked_at";
 

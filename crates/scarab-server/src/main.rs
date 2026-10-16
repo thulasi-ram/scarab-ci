@@ -820,7 +820,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // OAuth config the process only booted under SCARAB_DEV_INSECURE (ADR-0048
     // default-deny) — sessions stay unwired and authz is off, loudly.
     if let Some(oauth_cfg) = config.oauth.clone() {
-        let login = Arc::new(scarab_server::oauth::OAuthAuthenticator::new(oauth_cfg));
+        // Every sign-in is pinned to a Principal by the provider's immutable id
+        // (ADR-0069), so a recycled login can never inherit someone's grants.
+        let login = Arc::new(
+            scarab_server::oauth::OAuthAuthenticator::new(oauth_cfg).with_identities(pg.clone()),
+        );
         state = state
             .with_auth(login.clone(), pg.clone())
             .with_oauth_login(login)

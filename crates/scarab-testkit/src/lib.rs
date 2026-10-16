@@ -2961,6 +2961,88 @@ impl scarab_identity::ApiTokenStore for InMemoryApiTokens {
     }
 }
 
+/// An in-memory [`scarab_identity::IdentityStore`] with the Postgres adapter's
+/// rules (ADR-0069): an identity is keyed by `(provider, external_id)`, a new
+/// one always mints a NEW Principal, and a minted id is never re-minted.
+#[derive(Default)]
+pub struct InMemoryIdentities {
+    inner: Mutex<IdentitiesState>,
+}
+
+#[derive(Default)]
+struct IdentitiesState {
+    principals: HashMap<String, scarab_identity::PrincipalRecord>,
+    /// (provider, external_id) → (principal id, identity)
+    identities: HashMap<(String, String), (String, scarab_identity::ProviderIdentity)>,
+}
+
+impl InMemoryIdentities {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl scarab_identity::IdentityStore for InMemoryIdentities {
+    async fn sign_in(
+        &self,
+        identity: &scarab_identity::ProviderIdentity,
+        base_id: &str,
+        now_ms: i64,
+    ) -> Result<String, IdentityError> {
+        let mut st = self.inner.lock().unwrap();
+        let key = (identity.provider.clone(), identity.external_id.clone());
+        if let Some((id, _)) = st.identities.get(&key).cloned() {
+            st.identities.insert(key, (id.clone(), identity.clone()));
+            if let Some(p) = st.principals.get_mut(&id) {
+                if identity.display_name.is_some() {
+                    p.display_name = identity.display_name.clone();
+                }
+                p.claimed_at.get_or_insert(now_ms);
+            }
+            return Ok(id);
+        }
+        let id = (1..)
+            .map(|n| scarab_identity::principal_id_candidate(base_id, n))
+            .find(|c| !st.principals.contains_key(c))
+            .expect("an unbounded candidate sequence always has a free id");
+        st.principals.insert(
+            id.clone(),
+            scarab_identity::PrincipalRecord {
+                id: id.clone(),
+                display_name: identity.display_name.clone(),
+                created_at: now_ms,
+                claimed_at: Some(now_ms),
+                merged_into: None,
+            },
+        );
+        st.identities.insert(key, (id.clone(), identity.clone()));
+        Ok(id)
+    }
+
+    async fn principal(
+        &self,
+        id: &str,
+    ) -> Result<Option<scarab_identity::PrincipalRecord>, IdentityError> {
+        Ok(self.inner.lock().unwrap().principals.get(id).cloned())
+    }
+
+    async fn identities_of(
+        &self,
+        id: &str,
+    ) -> Result<Vec<scarab_identity::ProviderIdentity>, IdentityError> {
+        let st = self.inner.lock().unwrap();
+        let mut out: Vec<_> = st
+            .identities
+            .values()
+            .filter(|(p, _)| p == id)
+            .map(|(_, i)| i.clone())
+            .collect();
+        out.sort_by(|a, b| a.provider.cmp(&b.provider));
+        Ok(out)
+    }
+}
+
 /// An in-memory [`scarab_identity::RbacStore`] with the same origin semantics
 /// as the Postgres adapter: native rows are authoritative (imports never
 /// clobber them), a native revoke is a tombstone imports cannot resurrect,

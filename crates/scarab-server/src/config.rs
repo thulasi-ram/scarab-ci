@@ -581,6 +581,16 @@ pub struct OAuthConfig {
     /// issuer `sub` is an opaque per-client id, so subject-only bootstrap would
     /// mean pasting UUIDs before anyone can administer anything.
     pub owners: Vec<String>,
+    /// This provider's stable id (ADR-0069): the prefix of the Principal ids it
+    /// mints and the key its identities are stored under. Changing it orphans
+    /// every identity already pinned, so it is a deliberate, named knob
+    /// (`SCARAB_OAUTH_PROVIDER_ID`, default `default`).
+    pub provider_id: String,
+    /// Mint ids exactly as before ADR-0069 — the bare `sub` → `login` → `id`
+    /// string — so an upgraded deployment's bindings, tokens and approver
+    /// entries keep resolving. The single-provider `SCARAB_OAUTH_*` variables
+    /// set it; at most one provider may.
+    pub unqualified_ids: bool,
 }
 
 /// A configuration the process must refuse to start under, with a message
@@ -677,6 +687,13 @@ pub enum ConfigError {
          provider would fail at first login, not at boot)."
     )]
     PartialOAuth(String),
+
+    #[error(
+        "SCARAB_OAUTH_PROVIDER_ID `{0}` is invalid (ADR-0069) — want lowercase \
+         letters, digits and `-`. It prefixes every Principal id the provider \
+         mints, so it may not carry the `:`/`~` an id is parsed by."
+    )]
+    InvalidProviderId(String),
 
     #[error(
         "SCARAB_RETENTION_LOG_DAYS is set but invalid — want a positive integer number \
@@ -918,6 +935,16 @@ impl Config {
                     .filter(|s| !s.is_empty())
                     .map(String::from)
                     .collect(),
+                provider_id: {
+                    let id = env("SCARAB_OAUTH_PROVIDER_ID")
+                        .filter(|v| !v.is_empty())
+                        .unwrap_or_else(|| "default".into());
+                    if !is_provider_id(&id) {
+                        return Err(ConfigError::InvalidProviderId(id));
+                    }
+                    id
+                },
+                unqualified_ids: true,
             })
         } else if oauth_vals.iter().any(Option::is_some)
             || env("SCARAB_OAUTH_ISSUER")
@@ -1479,6 +1506,14 @@ fn resolve_connection(
 
 /// Redact the password in a connection URL for logging
 /// (`postgres://user:***@host/db`).
+/// A login provider id (ADR-0069): `[a-z0-9-]+`.
+fn is_provider_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
 fn redact_url(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
         return url.to_string();

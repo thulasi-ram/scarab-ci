@@ -28,7 +28,9 @@ use tower::ServiceExt;
 use scarab_server::config::OAuthConfig;
 use scarab_server::oauth::OAuthAuthenticator;
 use scarab_server::{router, AppState, LogService};
-use scarab_testkit::{FakeClock, InMemoryDb, InMemoryObjectStore, InMemorySessions};
+use scarab_testkit::{
+    FakeClock, InMemoryDb, InMemoryIdentities, InMemoryObjectStore, InMemorySessions,
+};
 
 fn b64url(bytes: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
@@ -142,6 +144,10 @@ struct Provider {
     /// How often userinfo was consulted — `0` is how "no silent fallback" is
     /// proven rather than asserted.
     userinfo_hits: Arc<Mutex<usize>>,
+    /// What userinfo answers: GitHub's `/user` shape — an immutable numeric
+    /// `id` beside the renameable `login`. Swapped mid-test to stage a rename
+    /// or a recycled login (ADR-0069).
+    user: Arc<Mutex<serde_json::Value>>,
 }
 
 /// Read one field out of an `application/x-www-form-urlencoded` body.
@@ -160,6 +166,9 @@ async fn provider(id_token: Option<IdToken>) -> Provider {
         id_token: Arc::new(Mutex::new(id_token)),
         verifiers: Arc::new(Mutex::new(Vec::new())),
         userinfo_hits: Arc::new(Mutex::new(0)),
+        user: Arc::new(Mutex::new(
+            serde_json::json!({ "id": 1001, "login": "alice", "name": "Alice A" }),
+        )),
     };
 
     let token_p = p.clone();
@@ -200,7 +209,8 @@ async fn provider(id_token: Option<IdToken>) -> Provider {
                         Some("Bearer at-1")
                     );
                     *p.userinfo_hits.lock().unwrap() += 1;
-                    axum::Json(serde_json::json!({ "login": "alice", "name": "Alice A" }))
+                    let user = p.user.lock().unwrap().clone();
+                    axum::Json(user)
                 }
             }),
         )
@@ -238,16 +248,21 @@ fn app_for(p: &Provider, owners: Vec<String>, oidc: bool) -> axum::Router {
     let clock = Arc::new(FakeClock::new(1_000));
     let store = Arc::new(InMemoryObjectStore::new());
     let logs = Arc::new(LogService::new(store, db.clone()));
-    let login = Arc::new(OAuthAuthenticator::new(OAuthConfig {
-        client_id: "cid".into(),
-        client_secret: "sekret".into(),
-        authorize_url: format!("{}/authorize", p.base),
-        token_url: format!("{}/token", p.base),
-        userinfo_url: format!("{}/user", p.base),
-        oidc_issuer: if oidc { Some(p.base.clone()) } else { None },
-        scopes: "read:user".into(),
-        owners,
-    }));
+    let login = Arc::new(
+        OAuthAuthenticator::new(OAuthConfig {
+            client_id: "cid".into(),
+            client_secret: "sekret".into(),
+            authorize_url: format!("{}/authorize", p.base),
+            token_url: format!("{}/token", p.base),
+            userinfo_url: format!("{}/user", p.base),
+            oidc_issuer: if oidc { Some(p.base.clone()) } else { None },
+            scopes: "read:user".into(),
+            owners,
+            provider_id: "default".into(),
+            unqualified_ids: true,
+        })
+        .with_identities(Arc::new(InMemoryIdentities::new())),
+    );
     router(
         AppState::new(db, clock, logs)
             .with_public_url("https://scarab.example.com")
@@ -780,4 +795,61 @@ async fn unverified_email_owner_entry_does_not_grant_owner() {
             "email_verified={verified:?} must log in as Viewer"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Identity links (ADR-0069): a sign-in is pinned by the provider's immutable
+// id, never by the login it happens to carry today.
+// ---------------------------------------------------------------------------
+
+/// The recycled-login takeover, end to end. GitHub releases a login on rename
+/// and anyone may claim it; before ADR-0069 the Principal WAS the login, so
+/// the new holder inherited every binding, token ceiling and owner entry keyed
+/// on it. Now: the original holder keeps their Principal across the rename,
+/// and the stranger presenting the recycled login gets a fresh `~2` id that
+/// inherits nothing — here, not the bare `alice` owner entry.
+#[tokio::test]
+async fn a_recycled_login_is_a_new_principal_and_inherits_nothing() {
+    let p = provider(None).await;
+    let app = app_for(&p, vec!["alice".into()], false);
+
+    // The legacy (unqualified) provider keeps the pre-upgrade subject, so the
+    // bare owner entry still means the person it always meant.
+    let resp = api_login(&app, "good-code").await;
+    let first = body_json(resp).await;
+    assert_eq!(first["subject"], "alice");
+    assert!(may_write(&app, first["session"].as_str().unwrap()).await);
+
+    // alice renames herself: same immutable id, new login → same Principal.
+    *p.user.lock().unwrap() =
+        serde_json::json!({ "id": 1001, "login": "alice-renamed", "name": "Alice A" });
+    let renamed = body_json(api_login(&app, "good-code").await).await;
+    assert_eq!(renamed["subject"], "alice", "a rename keeps the Principal");
+    assert!(may_write(&app, renamed["session"].as_str().unwrap()).await);
+
+    // A stranger claims the released login: different immutable id.
+    *p.user.lock().unwrap() =
+        serde_json::json!({ "id": 2002, "login": "alice", "name": "Not Alice" });
+    let stranger = body_json(api_login(&app, "good-code").await).await;
+    assert_eq!(
+        stranger["subject"], "alice~2",
+        "never the existing Principal"
+    );
+    assert!(
+        !may_write(&app, stranger["session"].as_str().unwrap()).await,
+        "the recycled login must not inherit alice's Owner entry"
+    );
+}
+
+/// A provider that names no immutable id cannot be pinned, so its sign-in is
+/// refused rather than keyed on a login that could be recycled.
+#[tokio::test]
+async fn a_userinfo_with_no_immutable_id_is_refused() {
+    let p = provider(None).await;
+    let app = app_for(&p, vec![], false);
+    *p.user.lock().unwrap() = serde_json::json!({ "login": "alice" });
+    assert_eq!(
+        api_login(&app, "good-code").await.status(),
+        StatusCode::UNAUTHORIZED
+    );
 }
