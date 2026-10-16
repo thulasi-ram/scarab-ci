@@ -2364,11 +2364,44 @@ pub struct FakeForge {
     /// `Some(default)` ("looked, and it is granted nothing"), which is the whole
     /// misconfiguration this surface reports.
     capabilities: Mutex<Option<scarab_forge::preflight::ForgeCapabilities>>,
+    /// Who the forge says can reach a repo (ADR-0069 import). `None` (default)
+    /// = an adapter that cannot enumerate (`Unsupported`); `Err` = a listing
+    /// that failed part-way, which an import must not prune on.
+    collaborators: Mutex<Option<Result<Vec<scarab_forge::Collaborator>, String>>>,
 }
 
 impl FakeForge {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Seed the repo's collaborators as `(numeric id, login, level)` with
+    /// level `admin` | `write` | `read` | `none` (ADR-0069).
+    pub fn with_collaborators(self, people: &[(&str, &str, &str)]) -> Self {
+        self.set_collaborators(people);
+        self
+    }
+
+    /// Replace the collaborators mid-test — someone left the forge.
+    pub fn set_collaborators(&self, people: &[(&str, &str, &str)]) {
+        let level = |l: &str| Permissions {
+            read: l != "none",
+            write: matches!(l, "admin" | "write"),
+            admin: l == "admin",
+        };
+        *self.collaborators.lock().unwrap() = Some(Ok(people
+            .iter()
+            .map(|(id, login, l)| scarab_forge::Collaborator {
+                external_id: (*id).into(),
+                login: (*login).into(),
+                permissions: level(l),
+            })
+            .collect()));
+    }
+
+    /// Make the next listings fail part-way, as a rate-limited page would.
+    pub fn fail_collaborators(&self, why: &str) {
+        *self.collaborators.lock().unwrap() = Some(Err(why.into()));
     }
 
     /// Seed the content the forge returns for `path` at any ref.
@@ -2810,6 +2843,17 @@ impl ForgePort for FakeForge {
         })
     }
 
+    async fn list_collaborators(
+        &self,
+        _repo: &RepoRef,
+    ) -> Result<Vec<scarab_forge::Collaborator>, ForgeError> {
+        match self.collaborators.lock().unwrap().clone() {
+            None => Err(ForgeError::Unsupported("listing repo collaborators".into())),
+            Some(Ok(people)) => Ok(people),
+            Some(Err(why)) => Err(ForgeError::Api(why)),
+        }
+    }
+
     async fn get_permissions(
         &self,
         _repo: &RepoRef,
@@ -2980,27 +3024,35 @@ impl InMemoryIdentities {
     pub fn new() -> Self {
         Self::default()
     }
-}
 
-#[async_trait]
-impl scarab_identity::IdentityStore for InMemoryIdentities {
-    async fn sign_in(
+    fn pin_or_mint(
         &self,
         identity: &scarab_identity::ProviderIdentity,
         base_id: &str,
         now_ms: i64,
-    ) -> Result<String, IdentityError> {
+        claim: bool,
+    ) -> String {
         let mut st = self.inner.lock().unwrap();
         let key = (identity.provider.clone(), identity.external_id.clone());
-        if let Some((id, _)) = st.identities.get(&key).cloned() {
-            st.identities.insert(key, (id.clone(), identity.clone()));
-            if let Some(p) = st.principals.get_mut(&id) {
-                if identity.display_name.is_some() {
-                    p.display_name = identity.display_name.clone();
+        if let Some((id, held)) = st.identities.get(&key).cloned() {
+            let refreshed = if claim {
+                identity.clone()
+            } else {
+                scarab_identity::ProviderIdentity {
+                    handle: identity.handle.clone(),
+                    ..held
                 }
-                p.claimed_at.get_or_insert(now_ms);
+            };
+            st.identities.insert(key, (id.clone(), refreshed));
+            if claim {
+                if let Some(p) = st.principals.get_mut(&id) {
+                    if identity.display_name.is_some() {
+                        p.display_name = identity.display_name.clone();
+                    }
+                    p.claimed_at.get_or_insert(now_ms);
+                }
             }
-            return Ok(id);
+            return id;
         }
         let id = (1..)
             .map(|n| scarab_identity::principal_id_candidate(base_id, n))
@@ -3012,12 +3064,33 @@ impl scarab_identity::IdentityStore for InMemoryIdentities {
                 id: id.clone(),
                 display_name: identity.display_name.clone(),
                 created_at: now_ms,
-                claimed_at: Some(now_ms),
+                claimed_at: claim.then_some(now_ms),
                 merged_into: None,
             },
         );
         st.identities.insert(key, (id.clone(), identity.clone()));
-        Ok(id)
+        id
+    }
+}
+
+#[async_trait]
+impl scarab_identity::IdentityStore for InMemoryIdentities {
+    async fn sign_in(
+        &self,
+        identity: &scarab_identity::ProviderIdentity,
+        base_id: &str,
+        now_ms: i64,
+    ) -> Result<String, IdentityError> {
+        Ok(self.pin_or_mint(identity, base_id, now_ms, true))
+    }
+
+    async fn pin(
+        &self,
+        identity: &scarab_identity::ProviderIdentity,
+        base_id: &str,
+        now_ms: i64,
+    ) -> Result<String, IdentityError> {
+        Ok(self.pin_or_mint(identity, base_id, now_ms, false))
     }
 
     async fn principal(
@@ -3101,6 +3174,9 @@ pub struct InMemoryRbac {
             ),
         >,
     >,
+    /// (subject, org, project) → the provider an import row was seeded via
+    /// (ADR-0069 `imported_via`); absent = native, or pre-provenance.
+    via: Mutex<HashMap<(String, String, String), String>>,
 }
 
 impl InMemoryRbac {
@@ -3192,6 +3268,53 @@ impl scarab_identity::RbacStore for InMemoryRbac {
             .collect();
         out.sort_by(|a, b| a.subject.cmp(&b.subject));
         Ok(out)
+    }
+
+    async fn import_seeds(
+        &self,
+        scope: &scarab_identity::Scope,
+        via: &str,
+        seeds: &[(String, scarab_identity::Role)],
+        prune: bool,
+    ) -> Result<u64, IdentityError> {
+        let mut rows = self.rows.lock().unwrap();
+        let mut vias = self.via.lock().unwrap();
+        for (subject, role) in seeds {
+            let key = rbac_key(subject, scope);
+            if !matches!(
+                rows.get(&key),
+                Some((_, scarab_identity::BindingOrigin::Native))
+            ) {
+                rows.insert(
+                    key.clone(),
+                    (Some(*role), scarab_identity::BindingOrigin::Import),
+                );
+                vias.insert(key, via.to_string());
+            }
+        }
+        let mut pruned = 0;
+        if prune {
+            let (_, org, project) = rbac_key("", scope);
+            let doomed: Vec<_> = rows
+                .iter()
+                .filter(|((s, o, p), (_, origin))| {
+                    o == &org
+                        && p == &project
+                        && *origin == scarab_identity::BindingOrigin::Import
+                        && vias
+                            .get(&(s.clone(), o.clone(), p.clone()))
+                            .is_none_or(|v| v == via)
+                        && !seeds.iter().any(|(keep, _)| keep == s)
+                })
+                .map(|(k, _)| k.clone())
+                .collect();
+            for k in doomed {
+                rows.remove(&k);
+                vias.remove(&k);
+                pruned += 1;
+            }
+        }
+        Ok(pruned)
     }
 }
 

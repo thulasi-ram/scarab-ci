@@ -9,8 +9,8 @@
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
 use scarab_forge::{
-    filter_refs, preflight::ForgeCapabilities, CheckoutCredential, Commit, Event, ForgeError,
-    ForgePort, ForgeRef, Permissions, RefKind, RepoRef, Status, WebhookDelivery,
+    filter_refs, preflight::ForgeCapabilities, CheckoutCredential, Collaborator, Commit, Event,
+    ForgeError, ForgePort, ForgeRef, Permissions, RefKind, RepoRef, Status, WebhookDelivery,
 };
 use serde_json::Value;
 use sha2::Sha256;
@@ -660,6 +660,44 @@ pub fn capabilities_from_app(body: &Value) -> ForgeCapabilities {
     }
 }
 
+/// One `GET /repos/{o}/{r}/collaborators` item → [`Collaborator`]. GitHub
+/// reports access as a `permissions` object (`admin`/`maintain`/`push`/
+/// `triage`/`pull`) — the effective level, team and org-base access included
+/// under `affiliation=all`. An item with no numeric `id` cannot be pinned, so
+/// it is an error rather than a skipped row: skipping would let a re-sync
+/// revoke someone the forge says still has access.
+fn collaborator_from(item: &Value) -> Result<Collaborator, ForgeError> {
+    let external_id = item
+        .get("id")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ForgeError::Api("collaborator.id missing".into()))?
+        .to_string();
+    let login = item
+        .get("login")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ForgeError::Api("collaborator.login missing".into()))?
+        .to_string();
+    let p = |k: &str| {
+        item.pointer(&format!("/permissions/{k}"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    };
+    let level = if p("admin") {
+        "admin"
+    } else if p("maintain") || p("push") {
+        "write"
+    } else if p("triage") || p("pull") {
+        "read"
+    } else {
+        "none"
+    };
+    Ok(Collaborator {
+        external_id,
+        login,
+        permissions: permissions_from_str(level),
+    })
+}
+
 /// Map GitHub's collaborator permission token to the agnostic flags.
 fn permissions_from_str(p: &str) -> Permissions {
     match p {
@@ -947,6 +985,25 @@ impl ForgePort for GithubForge {
         ok_json(resp).await.map(|_| ())
     }
 
+    /// `affiliation=all`: outside collaborators, org members with access, and
+    /// team-derived access — the whole set, paged through `Link`. Any failed
+    /// page fails the call (`get_paginated` propagates), so a re-sync never
+    /// prunes on a partial list.
+    async fn list_collaborators(&self, repo: &RepoRef) -> Result<Vec<Collaborator>, ForgeError> {
+        let token = self.auth_token_for(repo).await?;
+        self.get_paginated(
+            &format!(
+                "/repos/{}/{}/collaborators?affiliation=all",
+                repo.owner, repo.name
+            ),
+            &token,
+        )
+        .await?
+        .iter()
+        .map(collaborator_from)
+        .collect()
+    }
+
     async fn get_permissions(&self, repo: &RepoRef, user: &str) -> Result<Permissions, ForgeError> {
         let token = self.auth_token_for(repo).await?;
         let url = self.url(&format!(
@@ -1101,6 +1158,36 @@ impl ForgePort for GithubForge {
 
 #[cfg(test)]
 mod tests {
+
+    /// ADR-0069: a collaborator is pinned by GitHub's numeric id, its
+    /// effective level read from the `permissions` object, and an item that
+    /// cannot be pinned fails the whole listing instead of vanishing from it.
+    #[test]
+    fn collaborators_map_to_pinned_ids_and_effective_levels() {
+        let item = |id: Value, perms: Value| serde_json::json!({ "id": id, "login": "alice", "permissions": perms });
+        let level = |perms: Value| {
+            collaborator_from(&item(serde_json::json!(1001), perms))
+                .unwrap()
+                .permissions
+        };
+        let c = collaborator_from(&item(
+            serde_json::json!(1001),
+            serde_json::json!({ "admin": true }),
+        ))
+        .unwrap();
+        assert_eq!(
+            (c.external_id.as_str(), c.login.as_str()),
+            ("1001", "alice")
+        );
+        assert!(c.permissions.admin);
+        let maintain = level(serde_json::json!({ "maintain": true, "push": true, "pull": true }));
+        assert!(maintain.write && !maintain.admin);
+        let triage = level(serde_json::json!({ "triage": true, "pull": true }));
+        assert!(triage.read && !triage.write);
+        assert!(!level(serde_json::json!({})).read);
+        assert!(collaborator_from(&serde_json::json!({ "login": "ghost" })).is_err());
+    }
+
     use super::*;
     use serde_json::json;
 

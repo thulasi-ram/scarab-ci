@@ -193,6 +193,20 @@ impl OAuthAuthenticator {
         self.cfg.unqualified_ids
     }
 
+    /// The forge instance this provider's identities are accounts on
+    /// (ADR-0069 §5), trailing `/` trimmed — compare to a connection's
+    /// `base_url` the same way.
+    pub fn forge_url(&self) -> Option<&str> {
+        self.cfg.forge_url.as_deref()
+    }
+
+    /// The id a new Principal for a forge account would be minted under —
+    /// for a forge import, which knows only `(id, login)`. On a forge the
+    /// legacy subject IS the login (no OIDC `sub`).
+    pub fn base_id_for_forge_account(&self, identity: &ProviderIdentity) -> String {
+        self.base_id(identity, &identity.handle)
+    }
+
     /// Pin every sign-in through `store` (ADR-0069): the Principal is the one
     /// holding `(provider, external_id)`, never whoever's id the handle spells.
     pub fn with_identities(mut self, store: Arc<dyn IdentityStore>) -> Self {

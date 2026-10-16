@@ -2833,6 +2833,56 @@ impl scarab_identity::RbacStore for PostgresDb {
             })
             .collect())
     }
+
+    async fn import_seeds(
+        &self,
+        scope: &scarab_identity::Scope,
+        via: &str,
+        seeds: &[(String, scarab_identity::Role)],
+        prune: bool,
+    ) -> Result<u64, scarab_identity::IdentityError> {
+        let (org, project) = scope_cols(scope);
+        let mut tx = self.pool().begin().await.map_err(identity_err)?;
+        for (subject, role) in seeds {
+            // `origin = 'import'` guard: a native grant or tombstone is never
+            // touched, exactly as `grant(.., Import)`.
+            sqlx::query(
+                "INSERT INTO rbac_bindings (subject, org, project, role, origin, imported_via)
+                 VALUES ($1, $2, $3, $4, 'import', $5)
+                 ON CONFLICT (subject, org, project)
+                 DO UPDATE SET role = EXCLUDED.role, imported_via = EXCLUDED.imported_via
+                 WHERE rbac_bindings.origin = 'import'",
+            )
+            .bind(subject)
+            .bind(org)
+            .bind(project)
+            .bind(role_str(*role))
+            .bind(via)
+            .execute(&mut *tx)
+            .await
+            .map_err(identity_err)?;
+        }
+        let mut pruned = 0;
+        if prune {
+            let keep: Vec<&str> = seeds.iter().map(|(s, _)| s.as_str()).collect();
+            pruned = sqlx::query(
+                "DELETE FROM rbac_bindings
+                 WHERE org = $1 AND project = $2 AND origin = 'import'
+                   AND (imported_via = $3 OR imported_via IS NULL)
+                   AND NOT (subject = ANY($4))",
+            )
+            .bind(org)
+            .bind(project)
+            .bind(via)
+            .bind(&keep)
+            .execute(&mut *tx)
+            .await
+            .map_err(identity_err)?
+            .rows_affected();
+        }
+        tx.commit().await.map_err(identity_err)?;
+        Ok(pruned)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2870,13 +2920,17 @@ fn api_token_from_row(r: &sqlx::postgres::PgRow) -> Option<scarab_identity::ApiT
 /// needs a handful; this bound only stops a pathological loop.
 const MAX_PRINCIPAL_SUFFIX: u32 = 10_000;
 
-#[async_trait]
-impl scarab_identity::IdentityStore for PostgresDb {
-    async fn sign_in(
+impl PostgresDb {
+    /// The identity's Principal, or a freshly minted one under the first free
+    /// `~N` of `base_id` (ADR-0069). `claim` = a sign-in: refresh the contact
+    /// details and stamp `claimed_at`. Otherwise an import: refresh the handle
+    /// only, and mint unclaimed.
+    async fn pin_or_mint(
         &self,
         identity: &scarab_identity::ProviderIdentity,
         base_id: &str,
         now_ms: i64,
+        claim: bool,
     ) -> Result<String, scarab_identity::IdentityError> {
         // Two passes at most: if a racing sign-in pins the same identity
         // between our lookup and our insert, our mint rolls back and the
@@ -2892,6 +2946,19 @@ impl scarab_identity::IdentityStore for PostgresDb {
             .await
             .map_err(identity_err)?;
             if let Some(id) = pinned {
+                if !claim {
+                    sqlx::query(
+                        "UPDATE principal_identities SET handle = $3
+                         WHERE provider = $1 AND external_id = $2",
+                    )
+                    .bind(&identity.provider)
+                    .bind(&identity.external_id)
+                    .bind(&identity.handle)
+                    .execute(self.pool())
+                    .await
+                    .map_err(identity_err)?;
+                    return Ok(id);
+                }
                 sqlx::query(
                     "UPDATE principal_identities
                      SET handle = $3, email = $4, email_verified = $5, last_login_at = $6
@@ -2929,12 +2996,13 @@ impl scarab_identity::IdentityStore for PostgresDb {
                 let id = scarab_identity::principal_id_candidate(base_id, n);
                 let inserted = sqlx::query(
                     "INSERT INTO principals (id, display_name, created_at, claimed_at)
-                     VALUES ($1, $2, $3, $3)
+                     VALUES ($1, $2, $3, $4)
                      ON CONFLICT (id) DO NOTHING",
                 )
                 .bind(&id)
                 .bind(&identity.display_name)
                 .bind(now_ms)
+                .bind(claim.then_some(now_ms))
                 .execute(&mut *tx)
                 .await
                 .map_err(identity_err)?
@@ -2953,7 +3021,7 @@ impl scarab_identity::IdentityStore for PostgresDb {
                 "INSERT INTO principal_identities
                      (provider, external_id, principal_id, handle, email, email_verified,
                       linked_at, last_login_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                  ON CONFLICT (provider, external_id) DO NOTHING",
             )
             .bind(&identity.provider)
@@ -2963,6 +3031,7 @@ impl scarab_identity::IdentityStore for PostgresDb {
             .bind(&identity.email)
             .bind(identity.email_verified)
             .bind(now_ms)
+            .bind(claim.then_some(now_ms))
             .execute(&mut *tx)
             .await
             .map_err(identity_err)?
@@ -2978,6 +3047,27 @@ impl scarab_identity::IdentityStore for PostgresDb {
             "identity {}:{} could not be pinned",
             identity.provider, identity.external_id
         )))
+    }
+}
+
+#[async_trait]
+impl scarab_identity::IdentityStore for PostgresDb {
+    async fn sign_in(
+        &self,
+        identity: &scarab_identity::ProviderIdentity,
+        base_id: &str,
+        now_ms: i64,
+    ) -> Result<String, scarab_identity::IdentityError> {
+        self.pin_or_mint(identity, base_id, now_ms, true).await
+    }
+
+    async fn pin(
+        &self,
+        identity: &scarab_identity::ProviderIdentity,
+        base_id: &str,
+        now_ms: i64,
+    ) -> Result<String, scarab_identity::IdentityError> {
+        self.pin_or_mint(identity, base_id, now_ms, false).await
     }
 
     async fn principal(

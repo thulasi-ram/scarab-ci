@@ -263,6 +263,13 @@ impl ForgePort for RegistryForge {
             .await
     }
 
+    async fn list_collaborators(
+        &self,
+        repo: &RepoRef,
+    ) -> Result<Vec<scarab_forge::Collaborator>, ForgeError> {
+        self.adapter_for(repo).await?.list_collaborators(repo).await
+    }
+
     async fn get_permissions(&self, repo: &RepoRef, user: &str) -> Result<Permissions, ForgeError> {
         self.adapter_for(repo)
             .await?

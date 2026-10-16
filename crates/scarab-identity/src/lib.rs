@@ -147,6 +147,21 @@ pub trait RbacStore: Send + Sync {
     async fn role_of(&self, subject: &str, scope: &Scope) -> Result<Option<Role>, IdentityError>;
     /// All live bindings within `org` (org- and project-scoped).
     async fn bindings(&self, org: &str) -> Result<Vec<Binding>, IdentityError>;
+    /// A forge import at `scope` through login provider `via` (ADR-0069 §5),
+    /// atomically: each `(subject, role)` is seeded as an `import` row — never
+    /// clobbering a native grant or a native revoke — recording `via`. With
+    /// `prune`, this scope's `import` rows seeded through `via` (or before
+    /// provenance was recorded) whose subject is absent from `seeds` are
+    /// deleted: leaving the forge leaves Scarab. Returns how many were pruned.
+    ///
+    /// The caller must only prune on a COMPLETE listing.
+    async fn import_seeds(
+        &self,
+        scope: &Scope,
+        via: &str,
+        seeds: &[(String, Role)],
+        prune: bool,
+    ) -> Result<u64, IdentityError>;
 }
 
 /// A server-side login session for a [`Principal`] (ADR-0032: PG-backed in
@@ -449,6 +464,17 @@ pub trait IdentityStore: Send + Sync {
     /// only through an explicit, proven link. A login whose handle matches
     /// someone else's id therefore gets its own `~N` id and inherits nothing.
     async fn sign_in(
+        &self,
+        identity: &ProviderIdentity,
+        base_id: &str,
+        now_ms: i64,
+    ) -> Result<String, IdentityError>;
+    /// Forge import (ADR-0069 §5): the Principal pinned to `identity`, its
+    /// handle refreshed — or, for an account nobody has signed in as yet, a
+    /// freshly minted **unclaimed** one (`claimed_at` NULL) holding it. Never
+    /// claims: whoever later signs in with this exact identity does, and
+    /// nobody else can.
+    async fn pin(
         &self,
         identity: &ProviderIdentity,
         base_id: &str,

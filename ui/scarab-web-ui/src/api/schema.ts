@@ -520,7 +520,21 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Seed bindings from forge permissions (ADR-0049) */
+        /**
+         * Seed (and re-sync) bindings from forge collaborators (ADR-0049, ADR-0069)
+         * @description Each collaborator is resolved by the forge's **immutable** user id through
+         *     the login provider that IS this forge (`forge_url` = the connection's
+         *     `base_url`). Someone nobody has signed in as yet becomes an unclaimed
+         *     Principal holding exactly that identity — so whoever later signs in with
+         *     that forge account claims these roles, and a stranger who takes over the
+         *     login does not.
+         *
+         *     With no `subjects` filter this is a **re-sync**: an import row at this
+         *     Project for someone the forge no longer lists is deleted. Only on a complete
+         *     listing — any failed page fails the call and writes nothing. Native grants
+         *     and native revokes are never touched, and authorization keeps reading only
+         *     native storage: the forge is consulted here, not on the authz hot path.
+         */
         post: operations["import_bindings"];
         delete?: never;
         options?: never;
@@ -3340,6 +3354,20 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["BindingDto"][];
                 };
+            };
+            /** @description no login provider is associated with this repo's forge */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the forge adapter cannot list collaborators */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };

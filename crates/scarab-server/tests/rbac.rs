@@ -11,11 +11,16 @@ use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
 use scarab_engine::{Db, RunId};
-use scarab_identity::{Binding, BindingOrigin, Principal, RbacStore, Role, Scope};
+use scarab_forge::{ForgeConnection, ForgeConnectionStore, ForgeKind, RepoRef};
+use scarab_identity::{
+    Binding, BindingOrigin, IdentityStore, Principal, ProviderIdentity, RbacStore, Role, Scope,
+};
+use scarab_server::config::OAuthConfig;
+use scarab_server::oauth::OAuthAuthenticator;
 use scarab_server::{router, AppState, LogService};
 use scarab_testkit::{
-    FakeAuthenticator, FakeClock, FakeForge, InMemoryDb, InMemoryObjectStore, InMemoryRbac,
-    InMemorySessions,
+    FakeAuthenticator, FakeClock, FakeForge, InMemoryDb, InMemoryIdentities, InMemoryObjectStore,
+    InMemoryRbac, InMemorySessions,
 };
 
 /// A principal with NO global roles — only scoped bindings decide.
@@ -31,9 +36,48 @@ struct Harness {
     app: axum::Router,
     db: Arc<InMemoryDb>,
     rbac: Arc<InMemoryRbac>,
+    identities: Arc<InMemoryIdentities>,
+    forge: Arc<FakeForge>,
+}
+
+/// The login provider whose accounts ARE the GitHub forge (ADR-0069 §5) —
+/// the legacy bare-id one. Never asked to exchange anything here: sign-in is
+/// the `FakeAuthenticator`'s job; this only answers "which provider's
+/// identities does an import from `https://api.github.com` resolve through".
+fn github_provider(forge_url: Option<&str>) -> Arc<OAuthAuthenticator> {
+    Arc::new(OAuthAuthenticator::new(OAuthConfig {
+        client_id: "cid".into(),
+        client_secret: "s".into(),
+        authorize_url: "https://github.invalid/authorize".into(),
+        token_url: "https://github.invalid/token".into(),
+        userinfo_url: "https://github.invalid/user".into(),
+        oidc_issuer: None,
+        scopes: String::new(),
+        owners: vec![],
+        provider_id: "default".into(),
+        unqualified_ids: true,
+        name: "GitHub".into(),
+        forge_url: forge_url.map(String::from),
+    }))
+}
+
+/// A forge account as an import (or a sign-in) presents it.
+fn account(external_id: &str, login: &str) -> ProviderIdentity {
+    ProviderIdentity {
+        provider: "default".into(),
+        external_id: external_id.into(),
+        handle: login.into(),
+        email: None,
+        email_verified: false,
+        display_name: None,
+    }
 }
 
 fn harness() -> Harness {
+    harness_with(Some("https://api.github.com"))
+}
+
+fn harness_with(forge_url: Option<&str>) -> Harness {
     let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
     let store = Arc::new(InMemoryObjectStore::new());
@@ -52,13 +96,44 @@ fn harness() -> Harness {
             .with_credential("eve-code", scoped_principal("eve")),
     );
     let rbac = Arc::new(InMemoryRbac::new());
+    let identities = Arc::new(InMemoryIdentities::new());
+    let forge = Arc::new(FakeForge::new());
+    // acme/app is served by a GitHub connection — the forge an import asks.
+    futures::executor::block_on(async {
+        db.put_connection(&ForgeConnection {
+            id: "gh".into(),
+            kind: ForgeKind::GitHub,
+            base_url: "https://api.github.com".into(),
+            credential_ref: "github-app".into(),
+        })
+        .await
+        .unwrap();
+        let repo = RepoRef {
+            owner: "acme".into(),
+            name: "app".into(),
+        };
+        db.bind_repo("gh", &repo, "acme", "app").await.unwrap();
+        // The scoped principals have signed in, so a native grant may name them.
+        for (id, who) in [("1", "amy"), ("2", "eve")] {
+            identities.sign_in(&account(id, who), who, 1).await.unwrap();
+        }
+    });
     let app = router(
         AppState::new(db.clone(), clock, logs)
             .with_auth(auth, Arc::new(InMemorySessions::new()))
             .with_rbac(rbac.clone())
-            .with_forge(Arc::new(FakeForge::new())),
+            .with_identities(identities.clone())
+            .with_forge(forge.clone())
+            .with_forge_connections(db.clone())
+            .with_oauth_login(github_provider(forge_url)),
     );
-    Harness { app, db, rbac }
+    Harness {
+        app,
+        db,
+        rbac,
+        identities,
+        forge,
+    }
 }
 
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {
@@ -304,24 +379,37 @@ async fn bindings_api_grants_lists_revokes_and_imports() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
-    // Import seeds carol from the forge (FakeForge grants admin) — but a
-    // native revoke tombstone must survive a later import.
-    let import = || {
+    // ADR-0069: the import lists the forge's collaborators and resolves each
+    // by its IMMUTABLE id. Nobody has signed in as carol or dan yet, so each
+    // becomes an unclaimed Principal under the legacy provider's bare id.
+    h.forge.set_collaborators(&[
+        ("3003", "carol", "admin"),
+        ("4004", "dan", "read"),
+        ("5005", "nobody", "none"),
+    ]);
+    let import = |subjects: serde_json::Value| {
         Request::builder()
             .method("POST")
             .uri("/v1/repos/acme/app/bindings/import")
             .header("content-type", "application/json")
             .header("authorization", format!("Bearer {root}"))
             .body(Body::from(
-                serde_json::json!({ "subjects": ["carol"] }).to_string(),
+                serde_json::json!({ "subjects": subjects }).to_string(),
             ))
             .unwrap()
     };
-    let resp = h.app.clone().oneshot(import()).await.unwrap();
+    let resync = || import(serde_json::json!([]));
+    let resp = h.app.clone().oneshot(resync()).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let imported = body_json(resp).await;
-    assert_eq!(imported[0]["subject"], "carol");
-    assert_eq!(imported[0]["role"], "admin");
+    assert_eq!(
+        imported,
+        serde_json::json!([
+            { "subject": "carol", "role": "admin", "project": "app" },
+            { "subject": "dan", "role": "viewer", "project": "app" },
+        ]),
+        "no-access collaborators are not seeded"
+    );
     let app_scope = Scope::Project {
         org: "acme".into(),
         name: "app".into(),
@@ -329,6 +417,16 @@ async fn bindings_api_grants_lists_revokes_and_imports() {
     assert_eq!(
         h.rbac.role_of("carol", &app_scope).await.unwrap(),
         Some(Role::Admin)
+    );
+    let dan = h.identities.principal("dan").await.unwrap().unwrap();
+    assert_eq!(dan.claimed_at, None, "imported, not yet signed into");
+    // Signing in with THAT forge account claims it — same Principal.
+    assert_eq!(
+        h.identities
+            .sign_in(&account("4004", "dan"), "dan", 9)
+            .await
+            .unwrap(),
+        "dan"
     );
 
     // Native revoke via the API…
@@ -347,9 +445,50 @@ async fn bindings_api_grants_lists_revokes_and_imports() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     assert_eq!(h.rbac.role_of("carol", &app_scope).await.unwrap(), None);
-    // …and a re-import does NOT resurrect the grant (native override wins).
-    let resp = h.app.clone().oneshot(import()).await.unwrap();
+    // …and a re-sync does NOT resurrect the grant (native override wins).
+    let resp = h.app.clone().oneshot(resync()).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(h.rbac.role_of("carol", &app_scope).await.unwrap(), None);
+
+    // A listing that fails part-way changes NOTHING — never a partial prune.
+    h.forge.fail_collaborators("page 2: 403 rate limited");
+    let resp = h.app.clone().oneshot(resync()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        h.rbac.role_of("dan", &app_scope).await.unwrap(),
+        Some(Role::Viewer)
+    );
+
+    // dan leaves the forge: a re-sync removes the role it seeded. A FILTERED
+    // import is no claim about anyone else, so it would not have.
+    h.forge.set_collaborators(&[("3003", "carol", "admin")]);
+    let resp = h
+        .app
+        .clone()
+        .oneshot(import(serde_json::json!(["carol"])))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        h.rbac.role_of("dan", &app_scope).await.unwrap(),
+        Some(Role::Viewer),
+        "a filtered import never prunes"
+    );
+    let resp = h.app.clone().oneshot(resync()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(h.rbac.role_of("dan", &app_scope).await.unwrap(), None);
+    // amy's NATIVE grant is not the forge's to remove.
+    assert_eq!(
+        h.rbac.role_of("amy", &app_scope).await.unwrap(),
+        Some(Role::Member)
+    );
+
+    // A stranger takes over the released login `carol`: a different forge id,
+    // so a different Principal — the role lands on `carol~2`, never on the
+    // person whose grant was explicitly revoked as `carol`.
+    h.forge.set_collaborators(&[("6006", "carol", "admin")]);
+    let resp = h.app.clone().oneshot(resync()).await.unwrap();
+    assert_eq!(body_json(resp).await[0]["subject"], "carol~2");
     assert_eq!(h.rbac.role_of("carol", &app_scope).await.unwrap(), None);
 
     // Listing shows the live bindings.
@@ -382,4 +521,38 @@ async fn bindings_api_grants_lists_revokes_and_imports() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+/// An import through a forge that no login provider IS refuses loudly (409)
+/// instead of seeding roles nobody could ever sign into — the generic-OIDC
+/// gap of ADR-0069 problem (1), made visible.
+#[tokio::test]
+async fn an_import_with_no_provider_for_the_forge_is_a_409() {
+    let h = harness_with(None);
+    h.forge.set_collaborators(&[("3003", "carol", "admin")]);
+    let root = login(&h.app, "root-code").await;
+    let resp = h
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/repos/acme/app/bindings/import")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {root}"))
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let msg = String::from_utf8(
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(msg.contains("SCARAB_OAUTH_FORGE_URL"), "{msg}");
+    assert!(h.identities.principal("carol").await.unwrap().is_none());
 }

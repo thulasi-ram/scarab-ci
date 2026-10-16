@@ -1034,7 +1034,8 @@
         "tags": [
           "Auth & Identity"
         ],
-        "summary": "Seed bindings from forge permissions (ADR-0049)",
+        "summary": "Seed (and re-sync) bindings from forge collaborators (ADR-0049, ADR-0069)",
+        "description": "Each collaborator is resolved by the forge's **immutable** user id through\nthe login provider that IS this forge (`forge_url` = the connection's\n`base_url`). Someone nobody has signed in as yet becomes an unclaimed\nPrincipal holding exactly that identity — so whoever later signs in with\nthat forge account claims these roles, and a stranger who takes over the\nlogin does not.\n\nWith no `subjects` filter this is a **re-sync**: an import row at this\nProject for someone the forge no longer lists is deleted. Only on a complete\nlisting — any failed page fails the call and writes nothing. Native grants\nand native revokes are never touched, and authorization keeps reading only\nnative storage: the forge is consulted here, not on the authz hot path.",
         "operationId": "import_bindings",
         "responses": {
           "200": {
@@ -1049,6 +1050,12 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "no login provider is associated with this repo's forge"
+          },
+          "501": {
+            "description": "the forge adapter cannot list collaborators"
           }
         },
         "security": [

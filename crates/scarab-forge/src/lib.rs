@@ -493,6 +493,19 @@ pub struct Permissions {
     pub admin: bool,
 }
 
+/// One account with access to a repo, as the forge reports it (ADR-0069 §5).
+///
+/// `external_id` is the forge's **immutable** user id — the numeric id its
+/// `/user` endpoint also returns at sign-in — so an import can pin the role to
+/// the person, not to a login that may be released and re-claimed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Collaborator {
+    pub external_id: String,
+    pub login: String,
+    /// Effective access, team- and org-derived access included.
+    pub permissions: Permissions,
+}
+
 /// A short-lived, repo-scoped **checkout credential** (ADR-0045 S4, ADR-0046):
 /// whatever the vendor can mint — GitHub: an installation token scoped
 /// `contents:read` to one repo; Forgejo: a repo-scoped access token. Presented
@@ -601,6 +614,17 @@ pub trait ForgePort: Send + Sync {
     /// re-sync look like it succeeded at unbinding everything.
     async fn list_accessible_repos(&self) -> Result<Vec<RepoRef>, ForgeError> {
         Err(ForgeError::Unsupported("listing accessible repos".into()))
+    }
+
+    /// **Every** account with access to `repo` and its effective permission
+    /// (ADR-0069 §5) — the source of a forge-permission import and re-sync.
+    ///
+    /// All or nothing: a failed or truncated page must be an `Err`, never a
+    /// shorter list, because a re-sync deletes the roles of everyone absent
+    /// from it. Defaults to [`Unsupported`](ForgeError::Unsupported) for the
+    /// same reason `list_accessible_repos` does.
+    async fn list_collaborators(&self, _repo: &RepoRef) -> Result<Vec<Collaborator>, ForgeError> {
+        Err(ForgeError::Unsupported("listing repo collaborators".into()))
     }
 
     /// What this connection's credential is **actually** granted and subscribed

@@ -832,10 +832,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
             })
             .collect();
-        // The port-level authenticator is the first provider; every login path
-        // that knows its provider routes by id instead.
+        // The port-level authenticator is the DEFAULT provider (the
+        // unqualified one, else the first); every login path that names its
+        // provider routes by id instead, and an unnamed login with several
+        // providers and no default is refused by `oauth_provider`.
+        let default = providers
+            .iter()
+            .find(|p| p.unqualified_ids())
+            .unwrap_or(&providers[0])
+            .clone();
         state = state
-            .with_auth(providers[0].clone(), pg.clone())
+            .with_auth(default, pg.clone())
             // Admin-typed subjects must name a Principal (ADR-0069 §3).
             .with_identities(pg.clone());
         for login in providers {

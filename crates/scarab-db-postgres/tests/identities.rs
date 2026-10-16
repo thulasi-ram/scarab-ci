@@ -105,3 +105,57 @@ async fn racing_first_sign_ins_of_one_identity_converge_on_one_principal() {
     // And the losers' rolled-back mints left no `~N` principals behind.
     assert_eq!(db.principal("github:bob~2").await.unwrap(), None);
 }
+
+/// An import pins an identity WITHOUT claiming it; the sign-in that presents
+/// that same identity claims it, and a handle refresh from a later import
+/// never touches the contact details a sign-in recorded.
+#[tokio::test]
+async fn pin_mints_unclaimed_and_sign_in_claims_it() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+
+    let carol = db
+        .pin(&ident("3003", "carol"), "github:carol", 5)
+        .await
+        .unwrap();
+    assert_eq!(carol, "github:carol");
+    assert_eq!(
+        db.principal(&carol).await.unwrap().unwrap().claimed_at,
+        None
+    );
+    // Re-importing the same account is the same Principal, still unclaimed.
+    assert_eq!(
+        db.pin(&ident("3003", "carol"), "github:carol", 6)
+            .await
+            .unwrap(),
+        carol
+    );
+    assert_eq!(
+        db.principal(&carol).await.unwrap().unwrap().claimed_at,
+        None
+    );
+
+    let signed = ProviderIdentity {
+        email: Some("carol@example.com".into()),
+        email_verified: true,
+        ..ident("3003", "carol")
+    };
+    assert_eq!(db.sign_in(&signed, "github:carol", 7).await.unwrap(), carol);
+    assert_eq!(
+        db.principal(&carol).await.unwrap().unwrap().claimed_at,
+        Some(7)
+    );
+
+    // A later import (no email) refreshes the handle only.
+    db.pin(&ident("3003", "carol-renamed"), "github:carol-renamed", 8)
+        .await
+        .unwrap();
+    let held = db.identities_of(&carol).await.unwrap();
+    assert_eq!(held[0].handle, "carol-renamed");
+    assert_eq!(held[0].email.as_deref(), Some("carol@example.com"));
+    tdb.cleanup().await;
+}

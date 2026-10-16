@@ -5042,9 +5042,18 @@ async fn login(
     // A client that carries a verifier gets it replayed at the token endpoint;
     // otherwise this is exactly the pre-PKCE port call.
     let verifier = req.code_verifier.as_deref().filter(|v| !v.is_empty());
-    let principal = match st.oauth_provider(req.provider.as_deref())? {
-        Some(oauth) => oauth.exchange(&req.credential, verifier, None).await,
-        None => auth.authenticate(&req.credential).await,
+    // A named provider exchanges through itself. Unnamed: the default provider
+    // — which is what the composition root wires as `auth` — refusing the
+    // ambiguity when several are configured and none is the default.
+    let principal = match req.provider.as_deref().filter(|p| !p.is_empty()) {
+        Some(id) => {
+            let oauth = st.oauth_provider(Some(id))?.ok_or(ApiError::NotFound)?;
+            oauth.exchange(&req.credential, verifier, None).await
+        }
+        None => match (st.oauth_provider(None)?, verifier) {
+            (Some(oauth), Some(v)) => oauth.exchange(&req.credential, Some(v), None).await,
+            _ => auth.authenticate(&req.credential).await,
+        },
     }
     .map_err(|_| ApiError::Unauthorized)?;
     let now = st.clock.now().await.0;
@@ -5273,6 +5282,9 @@ pub struct BindingDto {
 /// repo permissions to import as seed bindings.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ImportBindingsRequest {
+    /// Forge logins to import, as a filter over the collaborator list. Empty
+    /// or absent = everyone, which is a re-sync (ADR-0069 §5).
+    #[serde(default)]
     pub subjects: Vec<String>,
 }
 
@@ -5470,12 +5482,23 @@ async fn delete_binding(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Import the given users' forge permissions on the repo as **seed** bindings
-/// (ADR-0049): admin→Admin, write→Member, read→Viewer, none→skipped. The
-/// import never clobbers a native grant or revoke, and authorization keeps
-/// reading only native storage — the forge is consulted here, once, not on
-/// the authz hot path.
-#[utoipa::path(post, path = "/v1/repos/{org}/{repo}/bindings/import", summary = "Seed bindings from forge permissions (ADR-0049)", responses((status = 200, body = [BindingDto])))]
+/// Import the repo's forge collaborators as **seed** bindings (ADR-0049,
+/// re-founded on pinned identities by ADR-0069 §5): admin→Admin, write→Member,
+/// read→Viewer, none→skipped.
+///
+/// Each collaborator is resolved by the forge's **immutable** user id through
+/// the login provider that IS this forge (`forge_url` = the connection's
+/// `base_url`). Someone nobody has signed in as yet becomes an unclaimed
+/// Principal holding exactly that identity — so whoever later signs in with
+/// that forge account claims these roles, and a stranger who takes over the
+/// login does not.
+///
+/// With no `subjects` filter this is a **re-sync**: an import row at this
+/// Project for someone the forge no longer lists is deleted. Only on a complete
+/// listing — any failed page fails the call and writes nothing. Native grants
+/// and native revokes are never touched, and authorization keeps reading only
+/// native storage: the forge is consulted here, not on the authz hot path.
+#[utoipa::path(post, path = "/v1/repos/{org}/{repo}/bindings/import", summary = "Seed (and re-sync) bindings from forge collaborators (ADR-0049, ADR-0069)", responses((status = 200, body = [BindingDto]), (status = 409, description = "no login provider is associated with this repo's forge"), (status = 501, description = "the forge adapter cannot list collaborators")))]
 async fn import_bindings(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -5488,47 +5511,111 @@ async fn import_bindings(
     };
     authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
     let rbac = st.rbac.as_ref().ok_or(ApiError::NotFound)?;
+    let identities = st.identities.as_ref().ok_or(ApiError::NotFound)?;
     let forge = st
         .forge
         .as_ref()
         .ok_or_else(|| ApiError::BadRequest("no forge configured".into()))?;
+    let connections = st
+        .connections
+        .as_ref()
+        .ok_or_else(|| ApiError::BadRequest("no forge connections configured".into()))?;
     let repo_ref = scarab_forge::RepoRef {
         owner: org.clone(),
         name: repo.clone(),
     };
 
-    let mut imported = Vec::new();
-    for subject in &req.subjects {
-        let perms = forge
-            .get_permissions(&repo_ref, subject)
-            .await
-            .map_err(|e| ApiError::BadRequest(format!("forge permissions for {subject}: {e}")))?;
-        let role = if perms.admin {
+    // Which forge serves this repo, and which login provider's identities are
+    // accounts on it.
+    let resolved = connections
+        .resolve(&repo_ref)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!("{org}/{repo} is not bound to a forge connection"))
+        })?;
+    let base_url = resolved.connection.base_url.trim_end_matches('/');
+    let provider = st
+        .oauth_providers
+        .iter()
+        .find(|p| p.forge_url() == Some(base_url))
+        .ok_or_else(|| {
+            ApiError::Conflict(format!(
+                "no login provider is associated with the forge at {base_url}, so imported \
+                 roles could never be signed into. Set SCARAB_OAUTH_FORGE_URL (or `forge_url` \
+                 on a SCARAB_OAUTH_PROVIDERS entry) to {base_url} on the provider whose \
+                 accounts are this forge's (ADR-0069)"
+            ))
+        })?;
+
+    let listed = match forge.list_collaborators(&repo_ref).await {
+        Ok(people) => people,
+        Err(scarab_forge::ForgeError::Unsupported(what)) => {
+            return Err(ApiError::NotImplemented(format!(
+                "this forge adapter does not support {what}"
+            )))
+        }
+        Err(e) => return Err(ApiError::BadRequest(format!("forge collaborators: {e}"))),
+    };
+    let filtered = !req.subjects.is_empty();
+    let now = st.clock.now().await.0;
+    let mut seeds: Vec<(String, scarab_identity::Role)> = Vec::new();
+    for c in &listed {
+        if filtered
+            && !req
+                .subjects
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(&c.login))
+        {
+            continue;
+        }
+        let role = if c.permissions.admin {
             scarab_identity::Role::Admin
-        } else if perms.write {
+        } else if c.permissions.write {
             scarab_identity::Role::Member
-        } else if perms.read {
+        } else if c.permissions.read {
             scarab_identity::Role::Viewer
         } else {
-            continue; // no forge access — nothing to seed
+            continue; // listed, but no access — nothing to seed
         };
-        rbac.grant(
-            &scarab_identity::Binding {
-                subject: subject.clone(),
-                scope: scope.clone(),
-                role,
-            },
-            scarab_identity::BindingOrigin::Import,
-        )
+        let identity = scarab_identity::ProviderIdentity {
+            provider: provider.provider_id().to_string(),
+            external_id: c.external_id.clone(),
+            handle: c.login.clone(),
+            email: None,
+            email_verified: false,
+            display_name: None,
+        };
+        let principal = identities
+            .pin(
+                &identity,
+                &provider.base_id_for_forge_account(&identity),
+                now,
+            )
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        match seeds.iter_mut().find(|(s, _)| *s == principal) {
+            Some((_, r)) => *r = (*r).max(role),
+            None => seeds.push((principal, role)),
+        }
+    }
+    // Prune only on an unfiltered, non-empty listing: a filter is not a claim
+    // about everyone else, and an empty list from a forge that always lists at
+    // least the repo's owner is a broken answer, not a mass offboarding.
+    let prune = !filtered && !listed.is_empty();
+    rbac.import_seeds(&scope, provider.provider_id(), &seeds, prune)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-        imported.push(BindingDto {
-            subject: subject.clone(),
-            role: role_name(role).to_string(),
-            project: repo.clone(),
-        });
-    }
-    Ok(Json(imported))
+    Ok(Json(
+        seeds
+            .into_iter()
+            .map(|(subject, role)| BindingDto {
+                subject,
+                role: role_name(role).to_string(),
+                project: repo.clone(),
+            })
+            .collect(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
