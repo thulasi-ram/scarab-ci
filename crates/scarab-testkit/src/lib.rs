@@ -3093,6 +3093,94 @@ impl scarab_identity::IdentityStore for InMemoryIdentities {
         Ok(self.pin_or_mint(identity, base_id, now_ms, false))
     }
 
+    /// Attach / already-linked / conflict, exactly as Postgres. A **merge**
+    /// is refused here: it rewrites bindings, approver lists, tokens and
+    /// sessions in one transaction across tables this fake cannot see, and a
+    /// fake that half-merged would let a test pass that production fails.
+    async fn link(
+        &self,
+        principal: &str,
+        identity: &scarab_identity::ProviderIdentity,
+        now_ms: i64,
+    ) -> Result<scarab_identity::LinkOutcome, IdentityError> {
+        let mut st = self.inner.lock().unwrap();
+        let key = (identity.provider.clone(), identity.external_id.clone());
+        let holder = st.identities.get(&key).map(|(p, _)| p.clone());
+        if holder.as_deref() == Some(principal) {
+            return Ok(scarab_identity::LinkOutcome::AlreadyLinked);
+        }
+        if let Some((_, (_, held))) = st
+            .identities
+            .iter()
+            .find(|((prov, _), (p, _))| prov == &identity.provider && p == principal)
+        {
+            return Err(IdentityError::Conflict(format!(
+                "you already have a {} account linked (`{}`) — unlink it first",
+                identity.provider, held.handle
+            )));
+        }
+        match holder {
+            None => {
+                st.identities
+                    .insert(key, (principal.to_string(), identity.clone()));
+                let _ = now_ms;
+                Ok(scarab_identity::LinkOutcome::Attached)
+            }
+            Some(from) => {
+                let held = st.identities.values().filter(|(p, _)| *p == from).count();
+                if held > 1 {
+                    return Err(IdentityError::Conflict(format!(
+                        "that {} account belongs to `{from}`, which also signs in another way",
+                        identity.provider
+                    )));
+                }
+                Err(IdentityError::Issuance(
+                    "merging Principals needs the Postgres adapter (one transaction across \
+                     bindings, approvers, tokens and sessions)"
+                        .into(),
+                ))
+            }
+        }
+    }
+
+    async fn unlink(&self, principal: &str, provider: &str) -> Result<(), IdentityError> {
+        let mut st = self.inner.lock().unwrap();
+        let mine: Vec<_> = st
+            .identities
+            .iter()
+            .filter(|(_, (p, _))| p == principal)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let Some(key) = mine.iter().find(|(prov, _)| prov == provider).cloned() else {
+            return Err(IdentityError::Conflict(format!(
+                "no {provider} account is linked"
+            )));
+        };
+        if mine.len() == 1 {
+            return Err(IdentityError::Conflict(format!(
+                "{provider} is your only way to sign in — link another account first"
+            )));
+        }
+        st.identities.remove(&key);
+        Ok(())
+    }
+
+    async fn aliases_of(&self, id: &str) -> Result<Vec<String>, IdentityError> {
+        let st = self.inner.lock().unwrap();
+        let mut out: Vec<String> = Vec::new();
+        let mut frontier = vec![id.to_string()];
+        while let Some(target) = frontier.pop() {
+            for p in st.principals.values() {
+                if p.merged_into.as_deref() == Some(target.as_str()) && !out.contains(&p.id) {
+                    out.push(p.id.clone());
+                    frontier.push(p.id.clone());
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
     async fn principal(
         &self,
         id: &str,
@@ -3315,6 +3403,28 @@ impl scarab_identity::RbacStore for InMemoryRbac {
             }
         }
         Ok(pruned)
+    }
+
+    async fn drop_imports(&self, subject: &str, via: &str) -> Result<u64, IdentityError> {
+        let mut rows = self.rows.lock().unwrap();
+        let mut vias = self.via.lock().unwrap();
+        let doomed: Vec<_> = rows
+            .iter()
+            .filter(|((s, o, p), (_, origin))| {
+                s == subject
+                    && *origin == scarab_identity::BindingOrigin::Import
+                    && vias
+                        .get(&(s.clone(), o.clone(), p.clone()))
+                        .map(String::as_str)
+                        == Some(via)
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in &doomed {
+            rows.remove(k);
+            vias.remove(k);
+        }
+        Ok(doomed.len() as u64)
     }
 }
 

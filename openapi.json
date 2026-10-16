@@ -722,6 +722,73 @@
         ]
       }
     },
+    "/v1/me/identities/link": {
+      "post": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Begin linking another sign-in account (ADR-0069)",
+        "operationId": "begin_link_identity",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LinkIdentityRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LinkIdentityResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not a browser session"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/me/identities/{provider}": {
+      "delete": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Unlink a sign-in account (ADR-0069)",
+        "operationId": "unlink_identity",
+        "responses": {
+          "204": {
+            "description": "unlinked"
+          },
+          "409": {
+            "description": "not linked, or the only way to sign in"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/orgs/{org}/bindings": {
       "get": {
         "tags": [
@@ -3686,6 +3753,31 @@
           }
         }
       },
+      "LinkIdentityRequest": {
+        "type": "object",
+        "description": "`POST /v1/me/identities/link` body.",
+        "required": [
+          "provider"
+        ],
+        "properties": {
+          "provider": {
+            "type": "string",
+            "description": "The login provider to link an account from (`GET /v1/auth/providers`)."
+          }
+        }
+      },
+      "LinkIdentityResponse": {
+        "type": "object",
+        "description": "Where the browser goes to prove the account.",
+        "required": [
+          "authorize_url"
+        ],
+        "properties": {
+          "authorize_url": {
+            "type": "string"
+          }
+        }
+      },
       "LoginResponse": {
         "type": "object",
         "required": [
@@ -3713,7 +3805,8 @@
           "subject",
           "roles",
           "can_administer",
-          "admin_orgs"
+          "admin_orgs",
+          "identities"
         ],
         "properties": {
           "admin_orgs": {
@@ -3733,6 +3826,13 @@
               "null"
             ],
             "description": "Human display name, when the identity provides one."
+          },
+          "identities": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PrincipalIdentityDto"
+            },
+            "description": "The provider accounts this Principal can sign in with (ADR-0069).\nEmpty when no identity store is wired (dev)."
           },
           "roles": {
             "type": "array",

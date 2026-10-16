@@ -162,6 +162,10 @@ pub trait RbacStore: Send + Sync {
         seeds: &[(String, Role)],
         prune: bool,
     ) -> Result<u64, IdentityError>;
+    /// Delete every `import` row for `subject` seeded through `via`, in every
+    /// scope (ADR-0069 §6 unlink): a forge account the person no longer holds
+    /// stops granting roles. Native rows are untouched. Returns how many.
+    async fn drop_imports(&self, subject: &str, via: &str) -> Result<u64, IdentityError>;
 }
 
 /// A server-side login session for a [`Principal`] (ADR-0032: PG-backed in
@@ -407,6 +411,21 @@ pub fn like_literal(q: &str) -> String {
         .replace('_', "\\_")
 }
 
+/// What linking an identity to a signed-in Principal did (ADR-0069 §6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "outcome")]
+pub enum LinkOutcome {
+    /// The identity was new to Scarab; it now belongs to the caller.
+    Attached,
+    /// It already was the caller's.
+    AlreadyLinked,
+    /// It was the ONLY identity of Principal `from` — so proving it proved
+    /// `from` outright — and `from` was folded into the caller: its bindings,
+    /// approver entries and tokens now name the caller, its sessions are gone,
+    /// and its id is kept (`merged_into`) so it can never be minted again.
+    Merged { from: String },
+}
+
 /// Can `s` stand in a minted id as-is? Deliberately narrow: no `:` (it would
 /// leave the provider's namespace) and no `~` (the suffix separator — a handle
 /// carrying one could pre-mint someone else's `~2`).
@@ -484,6 +503,26 @@ pub trait IdentityStore: Send + Sync {
     async fn principal(&self, id: &str) -> Result<Option<PrincipalRecord>, IdentityError>;
     /// Every identity pinned to Principal `id`, ordered by provider.
     async fn identities_of(&self, id: &str) -> Result<Vec<ProviderIdentity>, IdentityError>;
+    /// Attach `identity` — just proven by an OAuth round-trip the signed-in
+    /// `principal` completed — to `principal` (ADR-0069 §6). Held by another
+    /// Principal whose only identity it is → merge that one into `principal`,
+    /// atomically; held by a Principal with other identities, or `principal`
+    /// already holding a different account on this provider → `Conflict`.
+    /// Never matches anything by email.
+    async fn link(
+        &self,
+        principal: &str,
+        identity: &ProviderIdentity,
+        now_ms: i64,
+    ) -> Result<LinkOutcome, IdentityError>;
+    /// Detach `principal`'s identity on `provider`. Refuses (`Conflict`) to
+    /// remove the last one — that would leave a Principal nobody can sign in
+    /// as. The caller drops the roles imported through it first
+    /// ([`RbacStore::drop_imports`]).
+    async fn unlink(&self, principal: &str, provider: &str) -> Result<(), IdentityError>;
+    /// Every id folded into `id`, transitively (ADR-0069 §6) — an owners entry
+    /// naming one of them still means this Principal.
+    async fn aliases_of(&self, id: &str) -> Result<Vec<String>, IdentityError>;
     /// Unmerged Principals whose id or a handle starts with `query`, or whose
     /// display name contains it (case-insensitive), ordered by id, at most
     /// `limit`.
@@ -557,6 +596,11 @@ pub enum IdentityError {
     Issuance(String),
     #[error("access denied")]
     Denied,
+    /// The request contradicts who holds what (ADR-0069): an identity already
+    /// held by someone the caller cannot prove they are, a second account on
+    /// one provider, unlinking the last way in. The message says which.
+    #[error("{0}")]
+    Conflict(String),
 }
 
 /// Inbound login via OAuth / OIDC.

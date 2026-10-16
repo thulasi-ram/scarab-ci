@@ -2685,6 +2685,9 @@ pub struct MeResponse {
     /// bound to it, so `can_administer` can be true with nothing to administer
     /// yet.
     pub admin_orgs: Vec<String>,
+    /// The provider accounts this Principal can sign in with (ADR-0069).
+    /// Empty when no identity store is wired (dev).
+    pub identities: Vec<PrincipalIdentityDto>,
 }
 
 /// Return the current authenticated principal. In dev (auth disabled) this is
@@ -2701,6 +2704,19 @@ async fn me(State(st): State<AppState>, headers: HeaderMap) -> Result<Json<MeRes
     let caller = authenticate(&st, &headers, Action::Read).await?;
     let admin_orgs = administrable_orgs(&st, &caller).await?;
     let can_administer = caller.may_globally(Action::Administer) || !admin_orgs.is_empty();
+    let identities = match st.identities.as_ref() {
+        Some(store) => store
+            .identities_of(&caller.principal.subject)
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?
+            .into_iter()
+            .map(|i| PrincipalIdentityDto {
+                provider: i.provider,
+                handle: i.handle,
+            })
+            .collect(),
+        None => Vec::new(),
+    };
     // `roles` stays the caller's GLOBAL roles, which for a token caller is the
     // owner's C1 bootstrap and nothing else — so an API token never reports an
     // administrable org it could not actually act on.
@@ -2715,6 +2731,7 @@ async fn me(State(st): State<AppState>, headers: HeaderMap) -> Result<Json<MeRes
             .collect(),
         can_administer,
         admin_orgs,
+        identities,
     }))
 }
 
@@ -5160,6 +5177,9 @@ async fn oauth_callback(
     let Some(flow) = flow.filter(|f| f.state == *state) else {
         return Err(ApiError::Unauthorized);
     };
+    if !flow.link.is_empty() {
+        return link_callback(&st, &headers, &flow, code).await;
+    }
     // The OAuth provider is the one that can honour PKCE/nonce; a non-OAuth
     // authenticator (dev fakes) still goes through the port unchanged.
     let principal = match st.oauth_provider(Some(flow.provider.as_str()))? {
@@ -5187,6 +5207,178 @@ async fn oauth_callback(
         resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
     }
     Ok(resp)
+}
+
+/// The hex SHA-256 of a session id — what a link flow's state cookie carries
+/// (ADR-0069 §6) instead of the session id itself.
+fn session_hash(sid: &str) -> String {
+    scarab_identity::api_token_hash(sid)
+}
+
+/// The signed-in, cookie-borne session a link acts for, or a refusal. Linking
+/// is a browser act on a person's own account: an API token cannot do it (it
+/// is a narrowing of someone's authority, not them), and neither can a Bearer
+/// session, which has no browser to come back through the callback.
+async fn link_session(
+    st: &AppState,
+    headers: &HeaderMap,
+    action: Action,
+) -> Result<(String, Principal), ApiError> {
+    let caller = authenticate(st, headers, action).await?;
+    if caller.grant.is_some() {
+        return Err(ApiError::Forbidden);
+    }
+    match session_id(headers) {
+        Some((sid, AuthVia::Cookie)) => Ok((sid, caller.principal)),
+        _ => Err(ApiError::Forbidden),
+    }
+}
+
+/// `POST /v1/me/identities/link` body.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct LinkIdentityRequest {
+    /// The login provider to link an account from (`GET /v1/auth/providers`).
+    pub provider: String,
+}
+
+/// Where the browser goes to prove the account.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LinkIdentityResponse {
+    pub authorize_url: String,
+}
+
+/// Begin linking another provider's account to the signed-in Principal
+/// (ADR-0069 §6). A POST (so the CSRF double-submit applies) that returns the
+/// authorize URL and plants a one-shot state cookie bound to THIS session; the
+/// shared callback then attaches the proven account, or merges in a Principal
+/// whose only way in it was. Never by email.
+#[utoipa::path(post, path = "/v1/me/identities/link", summary = "Begin linking another sign-in account (ADR-0069)", request_body = LinkIdentityRequest, responses((status = 200, body = LinkIdentityResponse), (status = 403, description = "not a browser session")))]
+async fn begin_link_identity(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<LinkIdentityRequest>,
+) -> Result<Response, ApiError> {
+    let (sid, _) = link_session(&st, &headers, Action::Write).await?;
+    st.identities.as_ref().ok_or(ApiError::NotFound)?;
+    let provider = st
+        .oauth_provider(Some(&req.provider))?
+        .ok_or(ApiError::NotFound)?;
+    let flow = oauth::LoginFlow::generate()
+        .for_provider(provider.provider_id())
+        .for_link(&session_hash(&sid));
+    let redirect_uri = format!("{}/v1/auth/callback", st.public_url.trim_end_matches('/'));
+    let mut resp = Json(LinkIdentityResponse {
+        authorize_url: provider.authorize_redirect(&redirect_uri, &flow),
+    })
+    .into_response();
+    let cookie = format!(
+        "scarab_oauth_state={}; HttpOnly; Secure; Path=/; SameSite=Lax; Max-Age=600",
+        flow.to_cookie()
+    );
+    if let Ok(v) = axum::http::HeaderValue::from_str(&cookie) {
+        resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
+    }
+    Ok(resp)
+}
+
+/// The callback half of a link (ADR-0069 §6). The session presenting the
+/// callback must be the one that started it — the state cookie carries its
+/// hash — so a code minted for one person cannot be landed in another's
+/// account. Outcomes come back to the UI as a query parameter, not an error
+/// page: this is a browser redirect, not an API call.
+async fn link_callback(
+    st: &AppState,
+    headers: &HeaderMap,
+    flow: &oauth::LoginFlow,
+    code: &str,
+) -> Result<Response, ApiError> {
+    let (sid, principal) = link_session(st, headers, Action::Read).await?;
+    if session_hash(&sid) != flow.link {
+        return Err(ApiError::Unauthorized);
+    }
+    let store = st.identities.as_ref().ok_or(ApiError::NotFound)?;
+    let provider = st
+        .oauth_provider(Some(flow.provider.as_str()))?
+        .ok_or(ApiError::NotFound)?;
+    let identity = provider
+        .exchange_identity(code, flow.verifier(), flow.nonce())
+        .await
+        .map_err(|_| ApiError::Unauthorized)?;
+    let now = st.clock.now().await.0;
+    let location = match store.link(&principal.subject, &identity, now).await {
+        Ok(scarab_identity::LinkOutcome::Merged { from }) => {
+            format!(
+                "/?identity_linked={}&merged={}",
+                flow.provider,
+                query_escape(&from)
+            )
+        }
+        Ok(_) => format!("/?identity_linked={}", flow.provider),
+        Err(scarab_identity::IdentityError::Conflict(why)) => {
+            format!("/?identity_link_error={}", query_escape(&why))
+        }
+        Err(e) => return Err(ApiError::BadRequest(e.to_string())),
+    };
+    let mut resp = (StatusCode::FOUND, ()).into_response();
+    if let Ok(v) = axum::http::HeaderValue::from_str(&location) {
+        resp.headers_mut().insert(axum::http::header::LOCATION, v);
+    }
+    if let Ok(v) = axum::http::HeaderValue::from_str(
+        "scarab_oauth_state=; HttpOnly; Secure; Path=/; SameSite=Lax; Max-Age=0",
+    ) {
+        resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
+    }
+    Ok(resp)
+}
+
+/// Percent-encode a query value (everything but RFC 3986 unreserved).
+fn query_escape(v: &str) -> String {
+    v.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// Unlink the signed-in Principal's account on `provider` (ADR-0069 §6). The
+/// roles imported through that account go FIRST, so a failure between the two
+/// steps leaves less authority, never more. Refuses (409) to remove the last
+/// way to sign in.
+#[utoipa::path(delete, path = "/v1/me/identities/{provider}", summary = "Unlink a sign-in account (ADR-0069)", responses((status = 204, description = "unlinked"), (status = 409, description = "not linked, or the only way to sign in")))]
+async fn unlink_identity(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(provider): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let (_, principal) = link_session(&st, &headers, Action::Write).await?;
+    let store = st.identities.as_ref().ok_or(ApiError::NotFound)?;
+    let held = store
+        .identities_of(&principal.subject)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    if !held.iter().any(|i| i.provider == provider) {
+        return Err(ApiError::Conflict(format!(
+            "no {provider} account is linked"
+        )));
+    }
+    if held.len() == 1 {
+        return Err(ApiError::Conflict(format!(
+            "{provider} is your only way to sign in — link another account first"
+        )));
+    }
+    if let Some(rbac) = st.rbac.as_ref() {
+        rbac.drop_imports(&principal.subject, &provider)
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    }
+    match store.unlink(&principal.subject, &provider).await {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(scarab_identity::IdentityError::Conflict(why)) => Err(ApiError::Conflict(why)),
+        Err(e) => Err(ApiError::BadRequest(e.to_string())),
+    }
 }
 
 /// One login provider, as the login page offers it (ADR-0069).
@@ -5779,7 +5971,7 @@ async fn mint_api_token(
     let owner_view = Principal {
         subject: caller.principal.subject.clone(),
         display_name: None,
-        roles: token_owner_roles(&st, &caller.principal.subject),
+        roles: token_owner_roles(&st, &caller.principal.subject).await,
     };
     match live_role_in(&st, &owner_view, &scope).await? {
         Some(held) if held >= role => {}
@@ -6023,12 +6215,18 @@ async fn live_role_in(
 /// later, which is the frozen-authority trap this design exists to avoid. The
 /// mint endpoint bounds a grant with exactly this view too, so what a minter is
 /// allowed to issue and what the token will actually do cannot drift.
-fn token_owner_roles(st: &AppState, subject: &str) -> Vec<scarab_identity::Role> {
+async fn token_owner_roles(st: &AppState, subject: &str) -> Vec<scarab_identity::Role> {
+    // An owners entry naming an id since merged into this Principal still
+    // means them (ADR-0069 §6). A store failure only ever costs authority.
+    let mut ids = vec![subject.to_string()];
+    if let Some(store) = st.identities.as_ref() {
+        ids.extend(store.aliases_of(subject).await.unwrap_or_default());
+    }
     // The owners list is install-wide (ADR-0069), so any provider's view of it
     // answers; `max` keeps this correct should they ever differ.
     st.oauth_providers
         .iter()
-        .filter_map(|o| o.bootstrap_owner_role(subject))
+        .flat_map(|o| ids.iter().filter_map(|id| o.bootstrap_owner_role(id)))
         .max()
         .into_iter()
         .collect()
@@ -6118,7 +6316,7 @@ async fn authenticate_api_token(
     {
         let _ = store.touch(&token.id, now).await;
     }
-    let roles = token_owner_roles(st, &token.owner_subject);
+    let roles = token_owner_roles(st, &token.owner_subject).await;
     Ok(Caller {
         principal: Principal {
             subject: token.owner_subject.clone(),
@@ -8417,6 +8615,7 @@ fn tag_for_path(path: &str) -> Option<&'static str> {
     } else if path.starts_with("/.well-known/")
         || path.starts_with("/v1/auth/")
         || path == "/v1/me"
+        || path.starts_with("/v1/me/")
         || path.contains("bindings")
         || path.contains("/principals")
         || path.contains("/tokens")
@@ -8581,6 +8780,8 @@ impl utoipa::Modify for SecuritySchemes {
         oauth_login_redirect,
         oauth_callback,
         auth_providers,
+        begin_link_identity,
+        unlink_identity,
         logout,
         me,
         mint_api_token,
@@ -8691,6 +8892,8 @@ impl utoipa::Modify for SecuritySchemes {
         GrantedPermissionDto,
         MeResponse,
         AuthProviderDto,
+        LinkIdentityRequest,
+        LinkIdentityResponse,
         PrincipalDto,
         PrincipalIdentityDto,
         MintTokenRequest,
@@ -8730,6 +8933,8 @@ fn router_inner(state: AppState) -> Router {
         .route("/v1/auth/providers", get(auth_providers))
         .route("/v1/auth/logout", post(logout))
         .route("/v1/me", get(me))
+        .route("/v1/me/identities/link", post(begin_link_identity))
+        .route("/v1/me/identities/{provider}", delete(unlink_identity))
         .route(
             "/v1/orgs/{org}/bindings",
             get(list_bindings).put(put_binding).delete(delete_binding),

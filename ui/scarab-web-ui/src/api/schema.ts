@@ -419,6 +419,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/me/identities/link": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Begin linking another sign-in account (ADR-0069) */
+        post: operations["begin_link_identity"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/me/identities/{provider}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Unlink a sign-in account (ADR-0069) */
+        delete: operations["unlink_identity"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/orgs/{org}/bindings": {
         parameters: {
             query?: never;
@@ -1749,6 +1783,15 @@ export interface components {
             level: string;
             name: string;
         };
+        /** @description `POST /v1/me/identities/link` body. */
+        LinkIdentityRequest: {
+            /** @description The login provider to link an account from (`GET /v1/auth/providers`). */
+            provider: string;
+        };
+        /** @description Where the browser goes to prove the account. */
+        LinkIdentityResponse: {
+            authorize_url: string;
+        };
         LoginResponse: {
             /**
              * @description The session's CSRF token — browsers echo it in `x-csrf-token` on every
@@ -1783,6 +1826,11 @@ export interface components {
             can_administer: boolean;
             /** @description Human display name, when the identity provides one. */
             display_name?: string | null;
+            /**
+             * @description The provider accounts this Principal can sign in with (ADR-0069).
+             *     Empty when no identity store is wired (dev).
+             */
+            identities: components["schemas"]["PrincipalIdentityDto"][];
             /** @description The principal's Scarab-native roles (e.g. `["Owner"]`). */
             roles: string[];
             /** @description Stable, forge-agnostic identity subject. */
@@ -3101,6 +3149,61 @@ export interface operations {
             };
             /** @description not authenticated */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    begin_link_identity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LinkIdentityRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LinkIdentityResponse"];
+                };
+            };
+            /** @description not a browser session */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    unlink_identity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description unlinked */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not linked, or the only way to sign in */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

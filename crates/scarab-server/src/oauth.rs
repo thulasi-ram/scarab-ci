@@ -85,6 +85,10 @@ pub struct LoginFlow {
     pub verifier: String,
     pub nonce: String,
     pub provider: String,
+    /// Non-empty = a LINK flow (ADR-0069 §6), not a sign-in: the hex SHA-256
+    /// of the session that started it. The callback links only into that same
+    /// session, so a code cannot be replayed into someone else's account.
+    pub link: String,
 }
 
 impl LoginFlow {
@@ -95,7 +99,15 @@ impl LoginFlow {
             verifier: random_urlsafe(),
             nonce: random_urlsafe(),
             provider: String::new(),
+            link: String::new(),
         }
+    }
+
+    /// The same flow, made a link into the session whose id hashes to
+    /// `session_hash` (ADR-0069 §6).
+    pub fn for_link(mut self, session_hash: &str) -> Self {
+        self.link = session_hash.to_string();
+        self
     }
 
     /// The same flow, bound to `provider` (an `[a-z0-9-]+` id, so it can never
@@ -113,14 +125,18 @@ impl LoginFlow {
     /// The opaque state-cookie value carrying the whole flow. Every component
     /// is base64url or a provider id, so `.` is an unambiguous separator.
     pub fn to_cookie(&self) -> String {
-        if self.provider.is_empty() {
-            format!("{}.{}.{}", self.state, self.verifier, self.nonce)
-        } else {
-            format!(
-                "{}.{}.{}.{}",
-                self.state, self.verifier, self.nonce, self.provider
-            )
+        let mut parts = vec![
+            self.state.as_str(),
+            self.verifier.as_str(),
+            self.nonce.as_str(),
+        ];
+        if !self.provider.is_empty() || !self.link.is_empty() {
+            parts.push(&self.provider);
         }
+        if !self.link.is_empty() {
+            parts.push(&self.link);
+        }
+        parts.join(".")
     }
 
     /// Parse the state cookie back. A single component is accepted as a
@@ -132,6 +148,7 @@ impl LoginFlow {
         let verifier = parts.next().unwrap_or_default();
         let nonce = parts.next().unwrap_or_default();
         let provider = parts.next().unwrap_or_default();
+        let link = parts.next().unwrap_or_default();
         if parts.next().is_some() {
             return None;
         }
@@ -140,6 +157,7 @@ impl LoginFlow {
             verifier: verifier.to_string(),
             nonce: nonce.to_string(),
             provider: provider.to_string(),
+            link: link.to_string(),
         })
     }
 
@@ -251,6 +269,31 @@ impl OAuthAuthenticator {
         verifier: Option<&str>,
         expected_nonce: Option<&str>,
     ) -> Result<Principal, IdentityError> {
+        let (claims, from_id_token) = self.exchange_claims(code, verifier, expected_nonce).await?;
+        self.principal_for(&claims, from_id_token).await
+    }
+
+    /// The account an authorization `code` proves — WITHOUT signing anyone in
+    /// (ADR-0069 §6 linking): the caller is already signed in, and this proves
+    /// they also control this provider's account.
+    pub async fn exchange_identity(
+        &self,
+        code: &str,
+        verifier: Option<&str>,
+        expected_nonce: Option<&str>,
+    ) -> Result<ProviderIdentity, IdentityError> {
+        let (claims, from_id_token) = self.exchange_claims(code, verifier, expected_nonce).await?;
+        Ok(self.identity_from(&claims, from_id_token)?.0)
+    }
+
+    /// Code → verified claims, and whether they came from a verified
+    /// `id_token` (else userinfo).
+    async fn exchange_claims(
+        &self,
+        code: &str,
+        verifier: Option<&str>,
+        expected_nonce: Option<&str>,
+    ) -> Result<(serde_json::Value, bool), IdentityError> {
         let mut pairs: Vec<(&str, &str)> = vec![
             ("grant_type", "authorization_code"),
             ("code", code),
@@ -302,7 +345,7 @@ impl OAuthAuthenticator {
                     return Err(IdentityError::AuthFailed);
                 }
             }
-            return self.principal_for(&claims, true).await;
+            return Ok((claims, true));
         }
 
         let access = token
@@ -325,7 +368,7 @@ impl OAuthAuthenticator {
             .json()
             .await
             .map_err(|e| IdentityError::Issuance(format!("userinfo body: {e}")))?;
-        self.principal_for(&user, false).await
+        Ok((user, false))
     }
 
     /// Read who signed in out of provider claims (ADR-0069 §1): the
@@ -390,7 +433,7 @@ impl OAuthAuthenticator {
     fn principal_from(&self, claims: &serde_json::Value) -> Result<Principal, IdentityError> {
         let (identity, legacy) = self.identity_from(claims, false)?;
         let subject = self.base_id(&identity, &legacy);
-        Ok(self.principal_with(subject, &identity))
+        Ok(self.principal_with(subject, &identity, &[]))
     }
 
     /// Map provider claims to a [`Principal`], pinned through the identity
@@ -402,19 +445,33 @@ impl OAuthAuthenticator {
     ) -> Result<Principal, IdentityError> {
         let (identity, legacy) = self.identity_from(claims, from_id_token)?;
         let base = self.base_id(&identity, &legacy);
-        let subject = match &self.identities {
-            Some(store) => store.sign_in(&identity, &base, now_ms()).await?,
-            None => base,
+        let (subject, aliases) = match &self.identities {
+            Some(store) => {
+                let id = store.sign_in(&identity, &base, now_ms()).await?;
+                let aliases = store.aliases_of(&id).await?;
+                (id, aliases)
+            }
+            None => (base, Vec::new()),
         };
-        Ok(self.principal_with(subject, &identity))
+        Ok(self.principal_with(subject, &identity, &aliases))
     }
 
-    fn principal_with(&self, subject: String, identity: &ProviderIdentity) -> Principal {
+    /// `aliases`: ids folded into `subject` by a merge (ADR-0069 §6) — an
+    /// owners entry naming one of them still means this person.
+    fn principal_with(
+        &self,
+        subject: String,
+        identity: &ProviderIdentity,
+        aliases: &[String],
+    ) -> Principal {
         let verified = identity
             .email
             .as_deref()
             .filter(|_| identity.email_verified);
-        let role = if self.is_owner(&subject, verified) {
+        let role = if std::iter::once(&subject)
+            .chain(aliases)
+            .any(|id| self.is_owner(id, verified))
+        {
             Role::Owner
         } else {
             Role::Viewer
@@ -650,6 +707,7 @@ mod tests {
             verifier: "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk".into(),
             nonce: "n".into(),
             provider: String::new(),
+            link: String::new(),
         };
         assert_eq!(
             flow.challenge(),
@@ -675,7 +733,14 @@ mod tests {
         assert_eq!(flow.verifier(), None, "nothing to replay");
         assert_eq!(flow.nonce(), None, "nothing to check");
         assert_eq!(LoginFlow::from_cookie(""), None);
-        assert_eq!(LoginFlow::from_cookie("a.b.c.d.e"), None);
+        assert_eq!(LoginFlow::from_cookie("a.b.c.d.e.f"), None);
+        let link = LoginFlow::generate()
+            .for_provider("github")
+            .for_link("abc123");
+        assert_eq!(
+            LoginFlow::from_cookie(&link.to_cookie()),
+            Some(link.clone())
+        );
         // ADR-0069: a fourth component names the provider the flow went to.
         let bound = LoginFlow::generate().for_provider("okta");
         assert_eq!(

@@ -159,3 +159,91 @@ async fn pin_mints_unclaimed_and_sign_in_claims_it() {
     assert_eq!(held[0].email.as_deref(), Some("carol@example.com"));
     tdb.cleanup().await;
 }
+
+/// The common trap ADR-0069 §6 exists for: someone who once clicked "Sign in
+/// with GitHub" instead of linking now has TWO claimed Principals. Linking the
+/// GitHub account (its Principal's only way in) folds that one in — and its
+/// API tokens follow the person (capped by the merged-into roles from now on)
+/// while its sessions die. A second account on one provider is refused.
+#[tokio::test]
+async fn link_merges_a_claimed_single_identity_principal_with_its_tokens() {
+    use scarab_identity::{
+        ApiToken, ApiTokenStore, IdentityError, LinkOutcome, Principal, Scope, Session,
+        SessionStore,
+    };
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+
+    let okta = ProviderIdentity {
+        provider: "okta".into(),
+        ..ident("00u-ada", "ada@example.com")
+    };
+    let ada = db.sign_in(&okta, "okta:ada@example.com", 1).await.unwrap();
+    let stray = db
+        .sign_in(&ident("1001", "ada-gh"), "github:ada-gh", 2)
+        .await
+        .unwrap();
+    ApiTokenStore::put(
+        &db,
+        &ApiToken {
+            id: "t1".into(),
+            name: "laptop".into(),
+            owner_subject: stray.clone(),
+            scope: Scope::Org("acme".into()),
+            role: scarab_identity::Role::Member,
+            expires_at: 10_000,
+            created_by: stray.clone(),
+            created_at: 2,
+            last_used_at: None,
+            revoked_at: None,
+        },
+        "hash-1",
+    )
+    .await
+    .unwrap();
+    SessionStore::put(
+        &db,
+        &Session {
+            id: "stray-session".into(),
+            principal: Principal {
+                subject: stray.clone(),
+                display_name: None,
+                roles: vec![],
+            },
+            expires_at: 10_000,
+            csrf: String::new(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let outcome = db.link(&ada, &ident("1001", "ada-gh"), 3).await.unwrap();
+    assert_eq!(
+        outcome,
+        LinkOutcome::Merged {
+            from: stray.clone()
+        }
+    );
+    assert_eq!(
+        db.by_hash("hash-1").await.unwrap().unwrap().owner_subject,
+        ada,
+        "the token follows the person"
+    );
+    assert_eq!(SessionStore::get(&db, "stray-session").await.unwrap(), None);
+    assert_eq!(db.aliases_of(&ada).await.unwrap(), vec![stray.clone()]);
+    // Linking it again is a no-op, not a second merge.
+    assert_eq!(
+        db.link(&ada, &ident("1001", "ada-gh"), 4).await.unwrap(),
+        LinkOutcome::AlreadyLinked
+    );
+    // A second GitHub account on the same Principal is refused.
+    assert!(matches!(
+        db.link(&ada, &ident("3003", "ada-alt"), 5).await,
+        Err(IdentityError::Conflict(_))
+    ));
+    tdb.cleanup().await;
+}
