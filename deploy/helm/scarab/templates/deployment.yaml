@@ -21,6 +21,10 @@ spec:
         # values edit must reach a running server.
         checksum/connections: {{ include (print $.Template.BasePath "/configmap-connections.yaml") . | sha256sum }}
         {{- end }}
+        {{- if .Values.scarab.placement }}
+        # Roll pods when the placement config changes — it is read once at boot.
+        checksum/placement: {{ include (print $.Template.BasePath "/configmap-placement.yaml") . | sha256sum }}
+        {{- end }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -101,6 +105,13 @@ spec:
               mountPath: {{ include "scarab.connectionsDir" . | quote }}
               readOnly: true
             {{- end }}
+            {{- if .Values.scarab.placement }}
+            # Operator placement config (ADR-0055) —
+            # SCARAB_PLACEMENT_CONFIG_FILE points at the file inside.
+            - name: placement
+              mountPath: {{ include "scarab.placementDir" . | quote }}
+              readOnly: true
+            {{- end }}
       volumes:
         - name: scratch
           emptyDir: {}
@@ -121,6 +132,11 @@ spec:
         - name: connections
           configMap:
             name: {{ include "scarab.connectionsConfigMapName" . }}
+        {{- end }}
+        {{- if .Values.scarab.placement }}
+        - name: placement
+          configMap:
+            name: {{ include "scarab.placementConfigMapName" . }}
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

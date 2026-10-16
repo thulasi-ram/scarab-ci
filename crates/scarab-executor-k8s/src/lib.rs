@@ -120,9 +120,11 @@ pub struct ResultsEgress {
 /// (`SCARAB_PLACEMENT_CONFIG_FILE`), never in a pipeline.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct PlacementConfig {
-    /// A raw pod-spec fragment merged onto **every** step Pod first — the
-    /// pain-killer for tainted clusters (default tolerations/nodeSelector). `None`
-    /// = no baseline.
+    /// A raw **Pod** fragment (`{"spec": {"tolerations": …}}`, not a bare
+    /// pod-spec) merge-patched onto **every** step Pod first — the pain-killer
+    /// for tainted clusters (default tolerations/nodeSelector). A key other than
+    /// `metadata`/`spec` is dropped silently when the merged Pod is decoded.
+    /// `None` = no baseline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline: Option<serde_json::Value>,
     /// Default container resources applied when a step requests none. A step's own

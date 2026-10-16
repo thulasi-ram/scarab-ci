@@ -888,8 +888,9 @@ pub struct PlacementProfile {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub default: bool,
     /// The concrete k8s placement this profile contributes — merged onto the Pod.
-    /// An opaque JSON pod-spec fragment, so an admin can bake any static placement
-    /// fact in without a Scarab schema change.
+    /// An opaque JSON **Pod** fragment (`{"spec": {...}}`, not a bare pod-spec),
+    /// so an admin can bake any static placement fact in without a Scarab schema
+    /// change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub k8s: Option<serde_json::Value>,
 }

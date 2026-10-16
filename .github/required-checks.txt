@@ -48,6 +48,11 @@ required-if-run  ci/ui-tests            # UI no-DOM vitest suites
 # flake was ever observed, so it graduates.
 required-if-run  kind/cluster-tests     # live-cluster executor tier
 
+# Path-filtered (`chart` in .github/path-filters.yml) on PRs; on a `v*` tag it
+# is the job that PUBLISHES the chart, so a red render here is a release that
+# cannot be installed.
+required-if-run  image/chart            # helm lint + template (PR); package + push to ghcr (v* tag)
+
 # Probation until ~2026-08-08 (wired 2026-07-25 — needs a track record first).
 # Promote by moving this line up and deleting `continue-on-error` in ci.yml.
 advisory         ci/ui-e2e              # 2 Playwright specs over mock mode

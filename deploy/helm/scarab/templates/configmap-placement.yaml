@@ -1,0 +1,50 @@
+{{- if .Values.scarab.placement -}}
+{{- /* The operator placement config (ADR-0055): the cluster baseline stamped onto
+       every step Pod plus the named PlacementProfile registry a step selects
+       from. On a cluster whose every node is tainted this is the ONLY place step
+       Pods get their tolerations — without it they sit Pending forever.
+
+       Rendered verbatim from `scarab.placement`, so the keys are the SERVER's
+       schema (`baseline`, `default_resources`, `profiles`) — what you write here
+       is exactly what the server parses.
+
+       Two mistakes are silent server-side, so the chart refuses them here:
+
+       1. An unknown top-level key. The server's parser does not reject one, so
+          `tolerations:` written beside `baseline:` parses as an empty config.
+       2. A pod-SPEC fragment where a POD fragment belongs. `baseline` and each
+          profile's `k8s` are RFC-7386 merge-patched onto the whole Pod object
+          and decoded back into a Pod, which drops unknown fields — so
+          `baseline: {tolerations: …}` vanishes; it must be
+          `baseline: {spec: {tolerations: …}}`.
+
+       Either way every step Pod stays Pending with no error anywhere. */ -}}
+{{- $known := list "baseline" "default_resources" "profiles" -}}
+{{- range $key, $_ := .Values.scarab.placement }}
+{{- if not (has $key $known) }}
+{{- fail (printf "scarab.placement: unknown key %q — the server schema is %s (snake_case). Pod fields go in `baseline: {spec: {...}}` or a profile's `k8s: {spec: {...}}`." $key (join ", " $known)) }}
+{{- end }}
+{{- end }}
+{{- $podKeys := list "metadata" "spec" -}}
+{{- $fragments := dict -}}
+{{- with .Values.scarab.placement.baseline }}{{- $_ := set $fragments "baseline" . }}{{- end }}
+{{- range $p := .Values.scarab.placement.profiles }}
+{{- with $p.k8s }}{{- $_ := set $fragments (printf "profile %q k8s" $p.name) . }}{{- end }}
+{{- end }}
+{{- range $where, $fragment := $fragments }}
+{{- range $key, $_ := $fragment }}
+{{- if not (has $key $podKeys) }}
+{{- fail (printf "scarab.placement %s: key %q is not a Pod field — this block is merged onto the whole Pod, so pod-spec fields go under `spec:` (e.g. `spec: {tolerations: [...]}`)." $where $key) }}
+{{- end }}
+{{- end }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "scarab.placementConfigMapName" . }}
+  labels:
+    {{- include "scarab.labels" . | nindent 4 }}
+data:
+  placement.yaml: |
+    {{- toYaml .Values.scarab.placement | nindent 4 }}
+{{- end }}
