@@ -7,7 +7,7 @@ are **not** deployed here; they ship to GitHub Pages.
 
 **Object store (why MinIO):** the server's CAS holds logs, artifacts, and the
 per-step **workspace snapshots** that reruns restore. `deploy.sh` points it at the
-in-cluster MinIO (`minio.yaml`, official `minio/minio` image — no Bitnami, like
+in-cluster MinIO (`minio.yaml`, `pgsty/minio`, the maintained fork of the archived upstream — no Bitnami, like
 Postgres) on a PVC. This is load-bearing: the local-dir fallback lives on the
 server Pod's `scratch` emptyDir, so — since every deploy now rolls the Pod — it
 would wipe all workspaces and any rerun of a prior run would hang restoring its
