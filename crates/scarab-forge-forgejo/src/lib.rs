@@ -20,8 +20,8 @@
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
 use scarab_forge::{
-    filter_refs, CheckoutCredential, Commit, Event, ForgeError, ForgePort, ForgeRef, Permissions,
-    RefKind, RepoRef, Status, WebhookDelivery,
+    filter_refs, CheckoutCredential, Collaborator, Commit, Event, ForgeError, ForgePort, ForgeRef,
+    Permissions, RefKind, RepoRef, Status, WebhookDelivery,
 };
 use serde_json::Value;
 use sha2::Sha256;
@@ -351,6 +351,37 @@ impl ForgejoForge {
         format!("{}/api/v1{path}", self.base_url)
     }
 
+    /// Every page of a paged list (ADR-0069): walked to an EMPTY page, and an
+    /// error — never a shorter list — if the runaway ceiling is hit first. A
+    /// re-sync deletes the roles of everyone absent from what this returns.
+    async fn get_all_pages(&self, path: &str) -> Result<Vec<Value>, ForgeError> {
+        let sep = if path.contains('?') { '&' } else { '?' };
+        let mut out = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let url = self.url(&format!("{path}{sep}page={page}&limit={PAGE}"));
+            let body = ok_json(self.send(|| self.client.get(&url)).await?).await?;
+            let items = body
+                .as_array()
+                .ok_or_else(|| ForgeError::Api(format!("{path}: expected a list")))?;
+            if items.is_empty() {
+                return Ok(out);
+            }
+            out.extend(items.iter().cloned());
+        }
+        Err(ForgeError::Api(format!(
+            "{path}: more than {MAX_PAGES} pages — refusing to treat a truncated list as whole"
+        )))
+    }
+
+    /// One un-paged list endpoint (Forgejo returns these whole).
+    async fn get_list(&self, path: &str) -> Result<Vec<Value>, ForgeError> {
+        let url = self.url(path);
+        let body = ok_json(self.send(|| self.client.get(&url)).await?).await?;
+        body.as_array()
+            .cloned()
+            .ok_or_else(|| ForgeError::Api(format!("{path}: expected a list")))
+    }
+
     async fn send(
         &self,
         build: impl Fn() -> reqwest::RequestBuilder,
@@ -376,6 +407,23 @@ async fn ok_json(resp: reqwest::Response) -> Result<Value, ForgeError> {
         return Err(ForgeError::Api(format!("{status}: {text}")));
     }
     serde_json::from_str(&text).map_err(|e| ForgeError::Api(format!("bad JSON: {e}")))
+}
+
+/// A Forgejo user object → `(numeric id, login)`. Older instances spell the
+/// login `username`. An object with no numeric id cannot be pinned, which is an
+/// error: dropping it would let a re-sync revoke someone who still has access.
+fn user_key(u: &Value) -> Result<(String, String), ForgeError> {
+    let id = u
+        .get("id")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ForgeError::Api("user.id missing".into()))?;
+    let login = u
+        .get("login")
+        .or_else(|| u.get("username"))
+        .and_then(Value::as_str)
+        .filter(|l| !l.is_empty())
+        .ok_or_else(|| ForgeError::Api("user.login missing".into()))?;
+    Ok((id.to_string(), login.to_string()))
 }
 
 /// Map Forgejo's permission token to the agnostic flags (same vocabulary as
@@ -629,6 +677,57 @@ impl ForgePort for ForgejoForge {
         let payload = serde_json::json!({ "body": body });
         let resp = self.send(|| self.client.post(&url).json(&payload)).await?;
         ok_json(resp).await.map(|_| ())
+    }
+
+    /// Forgejo has no single "everyone with access" list, so this assembles
+    /// one: explicit collaborators, plus — for an org-owned repo — the members
+    /// of every team on it, or — for a user-owned repo — its owner. Each
+    /// person's EFFECTIVE level then comes from the per-user permission
+    /// endpoint, which sees team- and owner-derived access the collaborators
+    /// list does not. Without the teams, everyone with team access would be
+    /// absent and a re-sync would revoke them.
+    async fn list_collaborators(&self, repo: &RepoRef) -> Result<Vec<Collaborator>, ForgeError> {
+        let base = format!("/repos/{}/{}", repo.owner, repo.name);
+        let mut users: std::collections::BTreeMap<String, String> = Default::default();
+        for u in self.get_all_pages(&format!("{base}/collaborators")).await? {
+            let (id, login) = user_key(&u)?;
+            users.insert(id, login);
+        }
+        // Org or user? `/orgs/{name}` answers 404 for a user — the one status
+        // here that is an answer rather than a failure.
+        let org_url = self.url(&format!("/orgs/{}", repo.owner));
+        let org = self.send(|| self.client.get(&org_url)).await?;
+        if org.status() == reqwest::StatusCode::NOT_FOUND {
+            let owner_url = self.url(&format!("/users/{}", repo.owner));
+            let owner = ok_json(self.send(|| self.client.get(&owner_url)).await?).await?;
+            let (id, login) = user_key(&owner)?;
+            users.insert(id, login);
+        } else {
+            ok_json(org).await?;
+            for team in self.get_list(&format!("{base}/teams")).await? {
+                let team_id = team
+                    .get("id")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| ForgeError::Api("team.id missing".into()))?;
+                for u in self
+                    .get_all_pages(&format!("/teams/{team_id}/members"))
+                    .await?
+                {
+                    let (id, login) = user_key(&u)?;
+                    users.insert(id, login);
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(users.len());
+        for (external_id, login) in users {
+            let permissions = self.get_permissions(repo, &login).await?;
+            out.push(Collaborator {
+                external_id,
+                login,
+                permissions,
+            });
+        }
+        Ok(out)
     }
 
     async fn get_permissions(&self, repo: &RepoRef, user: &str) -> Result<Permissions, ForgeError> {

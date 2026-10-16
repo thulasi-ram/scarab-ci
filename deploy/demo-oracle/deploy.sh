@@ -259,6 +259,9 @@ scarab:
   sidecarImage: "${SCARAB_SIDECAR_IMAGE:-ghcr.io/thulasi-ram/scarab-results-sidecar:edge}"
   oauth:
     clientId: "${SCARAB_OAUTH_CLIENT_ID}"
+    # The demo signs in with GitHub, so its identities ARE GitHub accounts: a
+    # forge-permission import resolves through this provider (ADR-0069).
+    forgeUrl: "https://api.github.com"
     owners: [${SCARAB_OAUTH_OWNERS:+\"$(printf '%s' "$SCARAB_OAUTH_OWNERS" | sed 's/ *, */", "/g')\"}]
 workspace:
   fetcherImage: "${SCARAB_WSFETCH_IMAGE:-ghcr.io/thulasi-ram/scarab-wsfetch:edge}"

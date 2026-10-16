@@ -3231,3 +3231,41 @@ h1, .crumb-head, .run-title {
   word-break: break-all;
   user-select: all;
 }
+
+/* ════════════════════════════════════════════════════════════════════════
+   Identity links (ADR-0069) — sign-in choices, Account, Members, user search
+   ════════════════════════════════════════════════════════════════════════ */
+
+.login-choices { display: grid; gap: 10px; }
+
+/* A completed action's confirmation — the calm counterpart of .error. */
+.notice-ok {
+  color: var(--sage);
+  border: 1px dotted var(--border);
+  border-radius: 5px;
+  padding: 8px 12px;
+  font-size: 13px;
+  margin: 0 0 12px;
+}
+
+/* User search: a plain input whose matches list right under it. Each match
+   shows who someone IS — name, id, linked accounts, signed-in or not — because
+   granting a role to the wrong `alice` is the mistake this exists to stop. */
+.ps { display: grid; gap: 6px; }
+.ps-list {
+  list-style: none; margin: 0; padding: 0;
+  border: 1px solid var(--border-soft); border-radius: 5px;
+  max-height: 220px; overflow-y: auto;
+}
+.ps-hit {
+  all: unset; box-sizing: border-box; width: 100%; cursor: pointer;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  padding: 7px 10px; font-size: 13px;
+}
+.ps-hit:hover, .ps-hit:focus-visible { background: var(--emerald-surface); }
+.ps-name { color: var(--soft-white); }
+.ps-id { font-size: 11.5px; color: var(--muted-sage); }
+.ps-acct {
+  font-size: 10.5px; color: var(--sage);
+  border: 1px dotted var(--border); border-radius: 3px; padding: 0 5px;
+}

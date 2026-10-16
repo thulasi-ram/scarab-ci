@@ -187,9 +187,14 @@ pub struct AppState {
     /// consults per request against the path's Org/Project. `None` = only the
     /// principal's flat global roles decide (the C1 bootstrap).
     pub rbac: Option<Arc<dyn scarab_identity::RbacStore>>,
-    /// The browser OAuth login flow (ADR-0049): redirect + callback. `None`
-    /// leaves only the credential-exchange `POST /v1/auth/login` (API/CLI).
-    pub oauth_login: Option<Arc<oauth::OAuthAuthenticator>>,
+    /// Principals and their pinned provider identities (ADR-0069). `Some` makes
+    /// every admin-typed subject (a grant, an approver) resolve to a Principal
+    /// that exists; `None` (dev/tests) leaves typed strings unchecked.
+    pub identities: Option<Arc<dyn scarab_identity::IdentityStore>>,
+    /// The configured login providers (ADR-0049, several since ADR-0069): the
+    /// browser redirect + callback and the API/CLI exchange. Empty leaves only
+    /// the credential-exchange `POST /v1/auth/login` through [`Self::auth`].
+    pub oauth_providers: Vec<Arc<oauth::OAuthAuthenticator>>,
     /// Scarab's public base URL — where the outside world reaches this server.
     /// Two things are built from it, and **neither depends on login being on**:
     /// the OAuth callback `redirect_uri` (`{public_url}/v1/auth/callback`) and
@@ -241,7 +246,8 @@ impl AppState {
             debug_launcher: None,
             ui_dir: None,
             rbac: None,
-            oauth_login: None,
+            identities: None,
+            oauth_providers: Vec::new(),
             public_url: "http://localhost:8080".into(),
             credential_overrides: Arc::new(connections_config::CredentialOverrides::new()),
             snapshot_retention_days: DEFAULT_SNAPSHOT_RETENTION_DAYS,
@@ -416,6 +422,13 @@ impl AppState {
         self
     }
 
+    /// Resolve admin-typed subjects against the Principal store (ADR-0069 §3)
+    /// and serve the principals typeahead.
+    pub fn with_identities(mut self, store: Arc<dyn scarab_identity::IdentityStore>) -> Self {
+        self.identities = Some(store);
+        self
+    }
+
     /// Set Scarab's public base URL (`SCARAB_PUBLIC_URL`) — the one place the
     /// server learns how the outside world reaches it.
     ///
@@ -437,9 +450,44 @@ impl AppState {
     /// Auth only — the public URL comes from
     /// [`with_public_url`](AppState::with_public_url), because webhook
     /// registration needs it whether or not login is configured.
+    ///
+    /// Call once per provider (ADR-0069); they share the one callback URL, the
+    /// state cookie naming which provider the flow went to.
     pub fn with_oauth_login(mut self, login: Arc<oauth::OAuthAuthenticator>) -> Self {
-        self.oauth_login = Some(login);
+        self.oauth_providers.push(login);
         self
+    }
+
+    /// The provider a login names, or the default when it names none
+    /// (ADR-0069 §4): the only provider, else the `unqualified_ids` one. With
+    /// several and no default, the caller must choose — guessing would sign
+    /// someone into the wrong identity. `Ok(None)` = no OAuth provider at all.
+    fn oauth_provider(
+        &self,
+        id: Option<&str>,
+    ) -> Result<Option<&Arc<oauth::OAuthAuthenticator>>, ApiError> {
+        if self.oauth_providers.is_empty() {
+            return Ok(None);
+        }
+        match id.filter(|i| !i.is_empty()) {
+            Some(id) => self
+                .oauth_providers
+                .iter()
+                .find(|p| p.provider_id() == id)
+                .map(Some)
+                .ok_or_else(|| ApiError::BadRequest(format!("unknown login provider `{id}`"))),
+            None if self.oauth_providers.len() == 1 => Ok(self.oauth_providers.first()),
+            None => self
+                .oauth_providers
+                .iter()
+                .find(|p| p.unqualified_ids())
+                .map(Some)
+                .ok_or_else(|| {
+                    ApiError::BadRequest(
+                        "several login providers are configured — name one with `provider`".into(),
+                    )
+                }),
+        }
     }
 }
 
@@ -2637,6 +2685,9 @@ pub struct MeResponse {
     /// bound to it, so `can_administer` can be true with nothing to administer
     /// yet.
     pub admin_orgs: Vec<String>,
+    /// The provider accounts this Principal can sign in with (ADR-0069).
+    /// Empty when no identity store is wired (dev).
+    pub identities: Vec<PrincipalIdentityDto>,
 }
 
 /// Return the current authenticated principal. In dev (auth disabled) this is
@@ -2653,6 +2704,19 @@ async fn me(State(st): State<AppState>, headers: HeaderMap) -> Result<Json<MeRes
     let caller = authenticate(&st, &headers, Action::Read).await?;
     let admin_orgs = administrable_orgs(&st, &caller).await?;
     let can_administer = caller.may_globally(Action::Administer) || !admin_orgs.is_empty();
+    let identities = match st.identities.as_ref() {
+        Some(store) => store
+            .identities_of(&caller.principal.subject)
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?
+            .into_iter()
+            .map(|i| PrincipalIdentityDto {
+                provider: i.provider,
+                handle: i.handle,
+            })
+            .collect(),
+        None => Vec::new(),
+    };
     // `roles` stays the caller's GLOBAL roles, which for a token caller is the
     // owner's C1 bootstrap and nothing else — so an API token never reports an
     // administrable org it could not actually act on.
@@ -2667,6 +2731,7 @@ async fn me(State(st): State<AppState>, headers: HeaderMap) -> Result<Json<MeRes
             .collect(),
         can_administer,
         admin_orgs,
+        identities,
     }))
 }
 
@@ -4965,6 +5030,10 @@ pub struct LoginRequest {
     /// server-side browser flow to carry a verifier through.
     #[serde(default)]
     pub code_verifier: Option<String>,
+    /// Which login provider issued `credential` (ADR-0069) — a provider id
+    /// from `GET /v1/auth/providers`. Absent = the default provider.
+    #[serde(default)]
+    pub provider: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -4990,9 +5059,18 @@ async fn login(
     // A client that carries a verifier gets it replayed at the token endpoint;
     // otherwise this is exactly the pre-PKCE port call.
     let verifier = req.code_verifier.as_deref().filter(|v| !v.is_empty());
-    let principal = match (st.oauth_login.as_ref(), verifier) {
-        (Some(oauth), Some(v)) => oauth.exchange(&req.credential, Some(v), None).await,
-        _ => auth.authenticate(&req.credential).await,
+    // A named provider exchanges through itself. Unnamed: the default provider
+    // — which is what the composition root wires as `auth` — refusing the
+    // ambiguity when several are configured and none is the default.
+    let principal = match req.provider.as_deref().filter(|p| !p.is_empty()) {
+        Some(id) => {
+            let oauth = st.oauth_provider(Some(id))?.ok_or(ApiError::NotFound)?;
+            oauth.exchange(&req.credential, verifier, None).await
+        }
+        None => match (st.oauth_provider(None)?, verifier) {
+            (Some(oauth), Some(v)) => oauth.exchange(&req.credential, Some(v), None).await,
+            _ => auth.authenticate(&req.credential).await,
+        },
     }
     .map_err(|_| ApiError::Unauthorized)?;
     let now = st.clock.now().await.0;
@@ -5047,12 +5125,17 @@ fn set_session_cookies(headers: &mut HeaderMap, session: &Session) {
 /// login secrets (`state` + PKCE verifier + OIDC nonce), keep them in one
 /// HttpOnly cookie (10 min), and redirect to the provider's authorize endpoint
 /// with the `state` echo and the S256 `code_challenge`.
-#[utoipa::path(get, path = "/v1/auth/login", summary = "Begin the browser OAuth flow (ADR-0049)", responses((status = 302, description = "redirect to the provider with a state cookie"), (status = 404, description = "OAuth not configured")))]
-async fn oauth_login_redirect(State(st): State<AppState>) -> Result<Response, ApiError> {
-    let Some(provider) = st.oauth_login.as_ref() else {
+#[utoipa::path(get, path = "/v1/auth/login", summary = "Begin the browser OAuth flow (ADR-0049)", params(("provider" = Option<String>, Query, description = "login provider id (ADR-0069); default = the only, or the unqualified_ids, provider")), responses((status = 302, description = "redirect to the provider with a state cookie"), (status = 400, description = "unknown provider, or several and none named"), (status = 404, description = "OAuth not configured")))]
+async fn oauth_login_redirect(
+    State(st): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    let Some(provider) = st.oauth_provider(q.get("provider").map(String::as_str))? else {
         return Err(ApiError::NotFound);
     };
-    let flow = oauth::LoginFlow::generate();
+    // The provider rides in the state cookie, so every provider shares the one
+    // registered callback URL (ADR-0069).
+    let flow = oauth::LoginFlow::generate().for_provider(provider.provider_id());
     let redirect_uri = format!("{}/v1/auth/callback", st.public_url.trim_end_matches('/'));
     let location = provider.authorize_redirect(&redirect_uri, &flow);
     let mut resp = (StatusCode::FOUND, ()).into_response();
@@ -5094,9 +5177,12 @@ async fn oauth_callback(
     let Some(flow) = flow.filter(|f| f.state == *state) else {
         return Err(ApiError::Unauthorized);
     };
+    if !flow.link.is_empty() {
+        return link_callback(&st, &headers, &flow, code).await;
+    }
     // The OAuth provider is the one that can honour PKCE/nonce; a non-OAuth
     // authenticator (dev fakes) still goes through the port unchanged.
-    let principal = match st.oauth_login.as_ref() {
+    let principal = match st.oauth_provider(Some(flow.provider.as_str()))? {
         Some(oauth) => oauth.exchange(code, flow.verifier(), flow.nonce()).await,
         None => auth.authenticate(code).await,
     }
@@ -5121,6 +5207,211 @@ async fn oauth_callback(
         resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
     }
     Ok(resp)
+}
+
+/// The hex SHA-256 of a session id — what a link flow's state cookie carries
+/// (ADR-0069 §6) instead of the session id itself.
+fn session_hash(sid: &str) -> String {
+    scarab_identity::api_token_hash(sid)
+}
+
+/// The signed-in, cookie-borne session a link acts for, or a refusal. Linking
+/// is a browser act on a person's own account: an API token cannot do it (it
+/// is a narrowing of someone's authority, not them), and neither can a Bearer
+/// session, which has no browser to come back through the callback.
+async fn link_session(
+    st: &AppState,
+    headers: &HeaderMap,
+    action: Action,
+) -> Result<(String, Principal), ApiError> {
+    let caller = authenticate(st, headers, action).await?;
+    if caller.grant.is_some() {
+        return Err(ApiError::Forbidden);
+    }
+    match session_id(headers) {
+        Some((sid, AuthVia::Cookie)) => Ok((sid, caller.principal)),
+        _ => Err(ApiError::Forbidden),
+    }
+}
+
+/// `POST /v1/me/identities/link` body.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct LinkIdentityRequest {
+    /// The login provider to link an account from (`GET /v1/auth/providers`).
+    pub provider: String,
+}
+
+/// Where the browser goes to prove the account.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LinkIdentityResponse {
+    pub authorize_url: String,
+}
+
+/// Begin linking another provider's account to the signed-in Principal
+/// (ADR-0069 §6). A POST (so the CSRF double-submit applies) that returns the
+/// authorize URL and plants a one-shot state cookie bound to THIS session; the
+/// shared callback then attaches the proven account, or merges in a Principal
+/// whose only way in it was. Never by email.
+#[utoipa::path(post, path = "/v1/me/identities/link", summary = "Begin linking another sign-in account (ADR-0069)", request_body = LinkIdentityRequest, responses((status = 200, body = LinkIdentityResponse), (status = 403, description = "not a browser session")))]
+async fn begin_link_identity(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<LinkIdentityRequest>,
+) -> Result<Response, ApiError> {
+    let (sid, _) = link_session(&st, &headers, Action::Write).await?;
+    st.identities.as_ref().ok_or(ApiError::NotFound)?;
+    let provider = st
+        .oauth_provider(Some(&req.provider))?
+        .ok_or(ApiError::NotFound)?;
+    let flow = oauth::LoginFlow::generate()
+        .for_provider(provider.provider_id())
+        .for_link(&session_hash(&sid));
+    let redirect_uri = format!("{}/v1/auth/callback", st.public_url.trim_end_matches('/'));
+    let mut resp = Json(LinkIdentityResponse {
+        authorize_url: provider.authorize_redirect(&redirect_uri, &flow),
+    })
+    .into_response();
+    let cookie = format!(
+        "scarab_oauth_state={}; HttpOnly; Secure; Path=/; SameSite=Lax; Max-Age=600",
+        flow.to_cookie()
+    );
+    if let Ok(v) = axum::http::HeaderValue::from_str(&cookie) {
+        resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
+    }
+    Ok(resp)
+}
+
+/// The callback half of a link (ADR-0069 §6). The session presenting the
+/// callback must be the one that started it — the state cookie carries its
+/// hash — so a code minted for one person cannot be landed in another's
+/// account. Outcomes come back to the UI as a query parameter, not an error
+/// page: this is a browser redirect, not an API call.
+async fn link_callback(
+    st: &AppState,
+    headers: &HeaderMap,
+    flow: &oauth::LoginFlow,
+    code: &str,
+) -> Result<Response, ApiError> {
+    let (sid, principal) = link_session(st, headers, Action::Read).await?;
+    if session_hash(&sid) != flow.link {
+        return Err(ApiError::Unauthorized);
+    }
+    let store = st.identities.as_ref().ok_or(ApiError::NotFound)?;
+    let provider = st
+        .oauth_provider(Some(flow.provider.as_str()))?
+        .ok_or(ApiError::NotFound)?;
+    let identity = provider
+        .exchange_identity(code, flow.verifier(), flow.nonce())
+        .await
+        .map_err(|_| ApiError::Unauthorized)?;
+    let now = st.clock.now().await.0;
+    let location = match store.link(&principal.subject, &identity, now).await {
+        Ok(scarab_identity::LinkOutcome::Merged { from }) => {
+            format!(
+                "/account?identity_linked={}&merged={}",
+                flow.provider,
+                query_escape(&from)
+            )
+        }
+        Ok(_) => format!("/account?identity_linked={}", flow.provider),
+        Err(scarab_identity::IdentityError::Conflict(why)) => {
+            format!("/account?identity_link_error={}", query_escape(&why))
+        }
+        Err(e) => return Err(ApiError::BadRequest(e.to_string())),
+    };
+    let mut resp = (StatusCode::FOUND, ()).into_response();
+    if let Ok(v) = axum::http::HeaderValue::from_str(&location) {
+        resp.headers_mut().insert(axum::http::header::LOCATION, v);
+    }
+    if let Ok(v) = axum::http::HeaderValue::from_str(
+        "scarab_oauth_state=; HttpOnly; Secure; Path=/; SameSite=Lax; Max-Age=0",
+    ) {
+        resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
+    }
+    Ok(resp)
+}
+
+/// Percent-encode a query value (everything but RFC 3986 unreserved).
+fn query_escape(v: &str) -> String {
+    v.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// Unlink the signed-in Principal's account on `provider` (ADR-0069 §6). The
+/// roles imported through that account go FIRST, so a failure between the two
+/// steps leaves less authority, never more. Refuses (409) to remove the last
+/// way to sign in.
+#[utoipa::path(delete, path = "/v1/me/identities/{provider}", summary = "Unlink a sign-in account (ADR-0069)", responses((status = 204, description = "unlinked"), (status = 409, description = "not linked, or the only way to sign in")))]
+async fn unlink_identity(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(provider): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let (_, principal) = link_session(&st, &headers, Action::Write).await?;
+    let store = st.identities.as_ref().ok_or(ApiError::NotFound)?;
+    let held = store
+        .identities_of(&principal.subject)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    if !held.iter().any(|i| i.provider == provider) {
+        return Err(ApiError::Conflict(format!(
+            "no {provider} account is linked"
+        )));
+    }
+    if held.len() == 1 {
+        return Err(ApiError::Conflict(format!(
+            "{provider} is your only way to sign in — link another account first"
+        )));
+    }
+    if let Some(rbac) = st.rbac.as_ref() {
+        rbac.drop_imports(&principal.subject, &provider)
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    }
+    match store.unlink(&principal.subject, &provider).await {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(scarab_identity::IdentityError::Conflict(why)) => Err(ApiError::Conflict(why)),
+        Err(e) => Err(ApiError::BadRequest(e.to_string())),
+    }
+}
+
+/// One login provider, as the login page offers it (ADR-0069).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AuthProviderDto {
+    /// Pass as `provider` to `GET`/`POST /v1/auth/login`.
+    pub id: String,
+    /// The button label.
+    pub name: String,
+    /// The one used when a login names none.
+    pub default: bool,
+}
+
+/// `GET /v1/auth/providers` (ADR-0069): the configured login providers, for
+/// the login page. Unauthenticated by necessity — it is what you see before
+/// you have signed in — and it carries nothing secret.
+#[utoipa::path(get, path = "/v1/auth/providers", summary = "List login providers (ADR-0069)", responses((status = 200, body = [AuthProviderDto])))]
+async fn auth_providers(State(st): State<AppState>) -> Json<Vec<AuthProviderDto>> {
+    let default = st
+        .oauth_provider(None)
+        .ok()
+        .flatten()
+        .map(|p| p.provider_id().to_string());
+    Json(
+        st.oauth_providers
+            .iter()
+            .map(|p| AuthProviderDto {
+                id: p.provider_id().to_string(),
+                name: p.name().to_string(),
+                default: default.as_deref() == Some(p.provider_id()),
+            })
+            .collect(),
+    )
 }
 
 /// `POST /v1/auth/logout` (ADR-0049): revoke the presented session server-side
@@ -5177,12 +5468,25 @@ pub struct BindingDto {
     pub role: String,
     /// Empty = org-scoped.
     pub project: String,
+    /// The Principal's display name, when the identity store knows it
+    /// (ADR-0069). Absent for a pre-upgrade bare subject nobody has signed in
+    /// as since.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// `false` = created by a forge import and not signed into yet — the
+    /// Members panel's "not signed in yet". Absent when the store does not
+    /// know the subject.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claimed: Option<bool>,
 }
 
 /// `POST /v1/repos/{org}/{repo}/bindings/import` body: the forge users whose
 /// repo permissions to import as seed bindings.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ImportBindingsRequest {
+    /// Forge logins to import, as a filter over the collaborator list. Empty
+    /// or absent = everyone, which is a re-sync (ADR-0069 §5).
+    #[serde(default)]
     pub subjects: Vec<String>,
 }
 
@@ -5223,19 +5527,24 @@ async fn list_bindings(
         .bindings(&org)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    Ok(Json(
-        bindings
-            .into_iter()
-            .map(|b| BindingDto {
-                subject: b.subject,
-                role: role_name(b.role).to_string(),
-                project: match b.scope {
-                    scarab_identity::Scope::Org(_) => String::new(),
-                    scarab_identity::Scope::Project { name, .. } => name,
-                },
-            })
-            .collect(),
-    ))
+    let mut out = Vec::with_capacity(bindings.len());
+    for b in bindings {
+        let record = match st.identities.as_ref() {
+            Some(store) => store.principal(&b.subject).await.ok().flatten(),
+            None => None,
+        };
+        out.push(BindingDto {
+            display_name: record.as_ref().and_then(|r| r.display_name.clone()),
+            claimed: record.as_ref().map(|r| r.claimed_at.is_some()),
+            subject: b.subject,
+            role: role_name(b.role).to_string(),
+            project: match b.scope {
+                scarab_identity::Scope::Org(_) => String::new(),
+                scarab_identity::Scope::Project { name, .. } => name,
+            },
+        });
+    }
+    Ok(Json(out))
 }
 
 /// Natively grant `subject` a role in the org (or one of its projects).
@@ -5254,7 +5563,7 @@ async fn put_binding(
         return Err(ApiError::BadRequest("subject is required".into()));
     }
     let binding = scarab_identity::Binding {
-        subject: req.subject,
+        subject: resolve_typed_subject(&st, &req.subject).await?,
         scope: match req.project.filter(|p| !p.is_empty()) {
             Some(name) => scarab_identity::Scope::Project { org, name },
             None => org_scope,
@@ -5266,6 +5575,97 @@ async fn put_binding(
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
 }
+
+/// An admin-typed subject → the Principal id it names (ADR-0069 §3): a merged
+/// id follows to its target; a string no Principal holds is refused. Granting
+/// to one would hand the role to whoever next produced that string at sign-in —
+/// the recycled-login takeover, re-opened for every pre-assigned surface.
+async fn resolve_typed_subject(st: &AppState, subject: &str) -> Result<String, ApiError> {
+    let Some(store) = st.identities.as_ref() else {
+        return Ok(subject.to_string());
+    };
+    scarab_identity::resolve_principal(store.as_ref(), subject)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "`{subject}` is not a Scarab user. They must sign in once, or be imported \
+                 from the forge (POST /v1/repos/{{org}}/{{repo}}/bindings/import), before \
+                 a role or an approval can name them (ADR-0069)"
+            ))
+        })
+}
+
+/// `GET /v1/orgs/{org}/principals?q=` query.
+#[derive(Debug, Deserialize)]
+struct PrincipalQuery {
+    #[serde(default)]
+    q: String,
+}
+
+/// One linked identity of a [`PrincipalDto`].
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PrincipalIdentityDto {
+    pub provider: String,
+    /// The person's handle there today (login / email) — display only.
+    pub handle: String,
+}
+
+/// A Principal, as the grant/approver typeahead offers it (ADR-0069 §3).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PrincipalDto {
+    /// What a grant or an approver entry stores.
+    pub id: String,
+    pub display_name: Option<String>,
+    /// `false` = created by a forge import, not signed into yet.
+    pub claimed: bool,
+    pub identities: Vec<PrincipalIdentityDto>,
+}
+
+/// Search Principals for the grant/approver typeahead (ADR-0069 §3). Principals
+/// are install-wide, so this is Administer-gated and capped: an org admin needs
+/// to find someone who holds no role here yet, which no org-scoped list could
+/// contain.
+#[utoipa::path(get, path = "/v1/orgs/{org}/principals", summary = "Search users for a grant or approver entry (ADR-0069)", params(("q" = String, Query, description = "id or handle prefix, or a display-name fragment")), responses((status = 200, body = [PrincipalDto]), (status = 403, description = "not an org admin")))]
+async fn search_principals(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(org): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<PrincipalQuery>,
+) -> Result<Json<Vec<PrincipalDto>>, ApiError> {
+    let org_scope = scarab_identity::Scope::Org(org);
+    authorize_scoped(&st, &headers, Action::Administer, Some(&org_scope)).await?;
+    let store = st.identities.as_ref().ok_or(ApiError::NotFound)?;
+    let q = q.q.trim();
+    if q.is_empty() {
+        return Ok(Json(Vec::new()));
+    }
+    let found = store
+        .search(q, PRINCIPAL_SEARCH_LIMIT)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    Ok(Json(
+        found
+            .into_iter()
+            .map(|m| PrincipalDto {
+                id: m.id,
+                display_name: m.display_name,
+                claimed: m.claimed,
+                identities: m
+                    .identities
+                    .into_iter()
+                    .map(|i| PrincipalIdentityDto {
+                        provider: i.provider,
+                        handle: i.handle,
+                    })
+                    .collect(),
+            })
+            .collect(),
+    ))
+}
+
+/// A typeahead shows a handful; more is enumeration, not search.
+const PRINCIPAL_SEARCH_LIMIT: usize = 20;
 
 /// Natively revoke `subject`'s binding at the scope — a durable tombstone a
 /// later forge import cannot resurrect.
@@ -5289,12 +5689,23 @@ async fn delete_binding(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Import the given users' forge permissions on the repo as **seed** bindings
-/// (ADR-0049): admin→Admin, write→Member, read→Viewer, none→skipped. The
-/// import never clobbers a native grant or revoke, and authorization keeps
-/// reading only native storage — the forge is consulted here, once, not on
-/// the authz hot path.
-#[utoipa::path(post, path = "/v1/repos/{org}/{repo}/bindings/import", summary = "Seed bindings from forge permissions (ADR-0049)", responses((status = 200, body = [BindingDto])))]
+/// Import the repo's forge collaborators as **seed** bindings (ADR-0049,
+/// re-founded on pinned identities by ADR-0069 §5): admin→Admin, write→Member,
+/// read→Viewer, none→skipped.
+///
+/// Each collaborator is resolved by the forge's **immutable** user id through
+/// the login provider that IS this forge (`forge_url` = the connection's
+/// `base_url`). Someone nobody has signed in as yet becomes an unclaimed
+/// Principal holding exactly that identity — so whoever later signs in with
+/// that forge account claims these roles, and a stranger who takes over the
+/// login does not.
+///
+/// With no `subjects` filter this is a **re-sync**: an import row at this
+/// Project for someone the forge no longer lists is deleted. Only on a complete
+/// listing — any failed page fails the call and writes nothing. Native grants
+/// and native revokes are never touched, and authorization keeps reading only
+/// native storage: the forge is consulted here, not on the authz hot path.
+#[utoipa::path(post, path = "/v1/repos/{org}/{repo}/bindings/import", summary = "Seed (and re-sync) bindings from forge collaborators (ADR-0049, ADR-0069)", responses((status = 200, body = [BindingDto]), (status = 409, description = "no login provider is associated with this repo's forge"), (status = 501, description = "the forge adapter cannot list collaborators")))]
 async fn import_bindings(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -5307,47 +5718,113 @@ async fn import_bindings(
     };
     authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
     let rbac = st.rbac.as_ref().ok_or(ApiError::NotFound)?;
+    let identities = st.identities.as_ref().ok_or(ApiError::NotFound)?;
     let forge = st
         .forge
         .as_ref()
         .ok_or_else(|| ApiError::BadRequest("no forge configured".into()))?;
+    let connections = st
+        .connections
+        .as_ref()
+        .ok_or_else(|| ApiError::BadRequest("no forge connections configured".into()))?;
     let repo_ref = scarab_forge::RepoRef {
         owner: org.clone(),
         name: repo.clone(),
     };
 
-    let mut imported = Vec::new();
-    for subject in &req.subjects {
-        let perms = forge
-            .get_permissions(&repo_ref, subject)
-            .await
-            .map_err(|e| ApiError::BadRequest(format!("forge permissions for {subject}: {e}")))?;
-        let role = if perms.admin {
+    // Which forge serves this repo, and which login provider's identities are
+    // accounts on it.
+    let resolved = connections
+        .resolve(&repo_ref)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!("{org}/{repo} is not bound to a forge connection"))
+        })?;
+    let base_url = resolved.connection.base_url.trim_end_matches('/');
+    let provider = st
+        .oauth_providers
+        .iter()
+        .find(|p| p.forge_url() == Some(base_url))
+        .ok_or_else(|| {
+            ApiError::Conflict(format!(
+                "no login provider is associated with the forge at {base_url}, so imported \
+                 roles could never be signed into. Set SCARAB_OAUTH_FORGE_URL (or `forge_url` \
+                 on a SCARAB_OAUTH_PROVIDERS entry) to {base_url} on the provider whose \
+                 accounts are this forge's (ADR-0069)"
+            ))
+        })?;
+
+    let listed = match forge.list_collaborators(&repo_ref).await {
+        Ok(people) => people,
+        Err(scarab_forge::ForgeError::Unsupported(what)) => {
+            return Err(ApiError::NotImplemented(format!(
+                "this forge adapter does not support {what}"
+            )))
+        }
+        Err(e) => return Err(ApiError::BadRequest(format!("forge collaborators: {e}"))),
+    };
+    let filtered = !req.subjects.is_empty();
+    let now = st.clock.now().await.0;
+    let mut seeds: Vec<(String, scarab_identity::Role)> = Vec::new();
+    for c in &listed {
+        if filtered
+            && !req
+                .subjects
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(&c.login))
+        {
+            continue;
+        }
+        let role = if c.permissions.admin {
             scarab_identity::Role::Admin
-        } else if perms.write {
+        } else if c.permissions.write {
             scarab_identity::Role::Member
-        } else if perms.read {
+        } else if c.permissions.read {
             scarab_identity::Role::Viewer
         } else {
-            continue; // no forge access — nothing to seed
+            continue; // listed, but no access — nothing to seed
         };
-        rbac.grant(
-            &scarab_identity::Binding {
-                subject: subject.clone(),
-                scope: scope.clone(),
-                role,
-            },
-            scarab_identity::BindingOrigin::Import,
-        )
+        let identity = scarab_identity::ProviderIdentity {
+            provider: provider.provider_id().to_string(),
+            external_id: c.external_id.clone(),
+            handle: c.login.clone(),
+            email: None,
+            email_verified: false,
+            display_name: None,
+        };
+        let principal = identities
+            .pin(
+                &identity,
+                &provider.base_id_for_forge_account(&identity),
+                now,
+            )
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        match seeds.iter_mut().find(|(s, _)| *s == principal) {
+            Some((_, r)) => *r = (*r).max(role),
+            None => seeds.push((principal, role)),
+        }
+    }
+    // Prune only on an unfiltered, non-empty listing: a filter is not a claim
+    // about everyone else, and an empty list from a forge that always lists at
+    // least the repo's owner is a broken answer, not a mass offboarding.
+    let prune = !filtered && !listed.is_empty();
+    rbac.import_seeds(&scope, provider.provider_id(), &seeds, prune)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-        imported.push(BindingDto {
-            subject: subject.clone(),
-            role: role_name(role).to_string(),
-            project: repo.clone(),
-        });
-    }
-    Ok(Json(imported))
+    Ok(Json(
+        seeds
+            .into_iter()
+            .map(|(subject, role)| BindingDto {
+                subject,
+                role: role_name(role).to_string(),
+                project: repo.clone(),
+                display_name: None,
+                claimed: None,
+            })
+            .collect(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -5511,7 +5988,7 @@ async fn mint_api_token(
     let owner_view = Principal {
         subject: caller.principal.subject.clone(),
         display_name: None,
-        roles: token_owner_roles(&st, &caller.principal.subject),
+        roles: token_owner_roles(&st, &caller.principal.subject).await,
     };
     match live_role_in(&st, &owner_view, &scope).await? {
         Some(held) if held >= role => {}
@@ -5755,10 +6232,19 @@ async fn live_role_in(
 /// later, which is the frozen-authority trap this design exists to avoid. The
 /// mint endpoint bounds a grant with exactly this view too, so what a minter is
 /// allowed to issue and what the token will actually do cannot drift.
-fn token_owner_roles(st: &AppState, subject: &str) -> Vec<scarab_identity::Role> {
-    st.oauth_login
-        .as_ref()
-        .and_then(|o| o.bootstrap_owner_role(subject))
+async fn token_owner_roles(st: &AppState, subject: &str) -> Vec<scarab_identity::Role> {
+    // An owners entry naming an id since merged into this Principal still
+    // means them (ADR-0069 §6). A store failure only ever costs authority.
+    let mut ids = vec![subject.to_string()];
+    if let Some(store) = st.identities.as_ref() {
+        ids.extend(store.aliases_of(subject).await.unwrap_or_default());
+    }
+    // The owners list is install-wide (ADR-0069), so any provider's view of it
+    // answers; `max` keeps this correct should they ever differ.
+    st.oauth_providers
+        .iter()
+        .flat_map(|o| ids.iter().filter_map(|id| o.bootstrap_owner_role(id)))
+        .max()
         .into_iter()
         .collect()
 }
@@ -5847,7 +6333,7 @@ async fn authenticate_api_token(
     {
         let _ = store.touch(&token.id, now).await;
     }
-    let roles = token_owner_roles(st, &token.owner_subject);
+    let roles = token_owner_roles(st, &token.owner_subject).await;
     Ok(Caller {
         principal: Principal {
             subject: token.owner_subject.clone(),
@@ -6415,6 +6901,13 @@ async fn put_environment(
         environment: name.clone(),
     };
     protection.oidc_subject = format!("scarab:org/{org}/repo/{repo}/env/{name}");
+    // Approvers are matched by exact string against the approving Principal's
+    // id (`ProtectionRules::admits`), so each must name one (ADR-0069 §3).
+    let mut approvers = Vec::with_capacity(protection.approvers.len());
+    for a in &protection.approvers {
+        approvers.push(resolve_typed_subject(&st, a).await?);
+    }
+    protection.approvers = approvers;
     let env = scarab_project::Environment {
         name: name.clone(),
         protection,
@@ -8139,7 +8632,9 @@ fn tag_for_path(path: &str) -> Option<&'static str> {
     } else if path.starts_with("/.well-known/")
         || path.starts_with("/v1/auth/")
         || path == "/v1/me"
+        || path.starts_with("/v1/me/")
         || path.contains("bindings")
+        || path.contains("/principals")
         || path.contains("/tokens")
     {
         "Auth & Identity"
@@ -8298,8 +8793,12 @@ impl utoipa::Modify for SecuritySchemes {
         jwks,
         openid_configuration,
         login,
+        search_principals,
         oauth_login_redirect,
         oauth_callback,
+        auth_providers,
+        begin_link_identity,
+        unlink_identity,
         logout,
         me,
         mint_api_token,
@@ -8409,6 +8908,11 @@ impl utoipa::Modify for SecuritySchemes {
         CapabilityRequirementDto,
         GrantedPermissionDto,
         MeResponse,
+        AuthProviderDto,
+        LinkIdentityRequest,
+        LinkIdentityResponse,
+        PrincipalDto,
+        PrincipalIdentityDto,
         MintTokenRequest,
         MintedTokenDto,
         ApiTokenDto
@@ -8443,12 +8947,16 @@ fn router_inner(state: AppState) -> Router {
         )
         .route("/v1/auth/login", post(login).get(oauth_login_redirect))
         .route("/v1/auth/callback", get(oauth_callback))
+        .route("/v1/auth/providers", get(auth_providers))
         .route("/v1/auth/logout", post(logout))
         .route("/v1/me", get(me))
+        .route("/v1/me/identities/link", post(begin_link_identity))
+        .route("/v1/me/identities/{provider}", delete(unlink_identity))
         .route(
             "/v1/orgs/{org}/bindings",
             get(list_bindings).put(put_binding).delete(delete_binding),
         )
+        .route("/v1/orgs/{org}/principals", get(search_principals))
         .route(
             "/v1/orgs/{org}/tokens",
             get(list_api_tokens).post(mint_api_token),

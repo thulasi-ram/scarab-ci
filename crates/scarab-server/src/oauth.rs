@@ -25,11 +25,15 @@
 
 use std::collections::HashMap;
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use base64::Engine;
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use rand::RngCore;
-use scarab_identity::{Authenticator, IdentityError, Principal, Role};
+use scarab_identity::{
+    Authenticator, IdentityError, IdentityStore, Principal, ProviderIdentity, Role,
+};
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
@@ -72,11 +76,19 @@ fn random_urlsafe() -> String {
 ///   [`challenge`](Self::challenge) leaves the server on the redirect.
 /// - `nonce` — the value the issuer must stamp into the `id_token`, which
 ///   binds the token to this authorize request (OIDC replay guard).
+/// - `provider` — which configured provider this login went to (ADR-0069),
+///   so every provider shares ONE callback URL. Empty = the default provider
+///   (a flow minted before ADR-0069, still completing across a deploy).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoginFlow {
     pub state: String,
     pub verifier: String,
     pub nonce: String,
+    pub provider: String,
+    /// Non-empty = a LINK flow (ADR-0069 §6), not a sign-in: the hex SHA-256
+    /// of the session that started it. The callback links only into that same
+    /// session, so a code cannot be replayed into someone else's account.
+    pub link: String,
 }
 
 impl LoginFlow {
@@ -86,7 +98,23 @@ impl LoginFlow {
             state: random_urlsafe(),
             verifier: random_urlsafe(),
             nonce: random_urlsafe(),
+            provider: String::new(),
+            link: String::new(),
         }
+    }
+
+    /// The same flow, made a link into the session whose id hashes to
+    /// `session_hash` (ADR-0069 §6).
+    pub fn for_link(mut self, session_hash: &str) -> Self {
+        self.link = session_hash.to_string();
+        self
+    }
+
+    /// The same flow, bound to `provider` (an `[a-z0-9-]+` id, so it can never
+    /// carry the `.` separator).
+    pub fn for_provider(mut self, provider: &str) -> Self {
+        self.provider = provider.to_string();
+        self
     }
 
     /// The PKCE `code_challenge`: base64url(SHA-256(verifier)), method `S256`.
@@ -95,9 +123,20 @@ impl LoginFlow {
     }
 
     /// The opaque state-cookie value carrying the whole flow. Every component
-    /// is base64url, so `.` is an unambiguous separator.
+    /// is base64url or a provider id, so `.` is an unambiguous separator.
     pub fn to_cookie(&self) -> String {
-        format!("{}.{}.{}", self.state, self.verifier, self.nonce)
+        let mut parts = vec![
+            self.state.as_str(),
+            self.verifier.as_str(),
+            self.nonce.as_str(),
+        ];
+        if !self.provider.is_empty() || !self.link.is_empty() {
+            parts.push(&self.provider);
+        }
+        if !self.link.is_empty() {
+            parts.push(&self.link);
+        }
+        parts.join(".")
     }
 
     /// Parse the state cookie back. A single component is accepted as a
@@ -108,6 +147,8 @@ impl LoginFlow {
         let state = parts.next().filter(|s| !s.is_empty())?;
         let verifier = parts.next().unwrap_or_default();
         let nonce = parts.next().unwrap_or_default();
+        let provider = parts.next().unwrap_or_default();
+        let link = parts.next().unwrap_or_default();
         if parts.next().is_some() {
             return None;
         }
@@ -115,6 +156,8 @@ impl LoginFlow {
             state: state.to_string(),
             verifier: verifier.to_string(),
             nonce: nonce.to_string(),
+            provider: provider.to_string(),
+            link: link.to_string(),
         })
     }
 
@@ -137,6 +180,10 @@ pub struct OAuthAuthenticator {
     /// discovery on the first `id_token` and refetched when a `kid` is unknown
     /// (that is what key rotation looks like from here).
     jwks: RwLock<HashMap<String, (String, String)>>,
+    /// Where a sign-in is pinned to a Principal (ADR-0069). `None` (unit
+    /// tests, dev) maps claims straight to a subject with no record kept —
+    /// and therefore with none of the recycled-login protection.
+    identities: Option<Arc<dyn IdentityStore>>,
 }
 
 impl OAuthAuthenticator {
@@ -145,7 +192,44 @@ impl OAuthAuthenticator {
             cfg,
             http: reqwest::Client::new(),
             jwks: RwLock::new(HashMap::new()),
+            identities: None,
         }
+    }
+
+    /// This provider's stable id (ADR-0069).
+    pub fn provider_id(&self) -> &str {
+        &self.cfg.provider_id
+    }
+
+    /// The login button's label.
+    pub fn name(&self) -> &str {
+        &self.cfg.name
+    }
+
+    /// Does this provider mint the pre-ADR-0069 bare ids (the default one)?
+    pub fn unqualified_ids(&self) -> bool {
+        self.cfg.unqualified_ids
+    }
+
+    /// The forge instance this provider's identities are accounts on
+    /// (ADR-0069 §5), trailing `/` trimmed — compare to a connection's
+    /// `base_url` the same way.
+    pub fn forge_url(&self) -> Option<&str> {
+        self.cfg.forge_url.as_deref()
+    }
+
+    /// The id a new Principal for a forge account would be minted under —
+    /// for a forge import, which knows only `(id, login)`. On a forge the
+    /// legacy subject IS the login (no OIDC `sub`).
+    pub fn base_id_for_forge_account(&self, identity: &ProviderIdentity) -> String {
+        self.base_id(identity, &identity.handle)
+    }
+
+    /// Pin every sign-in through `store` (ADR-0069): the Principal is the one
+    /// holding `(provider, external_id)`, never whoever's id the handle spells.
+    pub fn with_identities(mut self, store: Arc<dyn IdentityStore>) -> Self {
+        self.identities = Some(store);
+        self
     }
 
     /// The provider authorize URL the browser is sent to (`GET /v1/auth/login`),
@@ -185,6 +269,31 @@ impl OAuthAuthenticator {
         verifier: Option<&str>,
         expected_nonce: Option<&str>,
     ) -> Result<Principal, IdentityError> {
+        let (claims, from_id_token) = self.exchange_claims(code, verifier, expected_nonce).await?;
+        self.principal_for(&claims, from_id_token).await
+    }
+
+    /// The account an authorization `code` proves — WITHOUT signing anyone in
+    /// (ADR-0069 §6 linking): the caller is already signed in, and this proves
+    /// they also control this provider's account.
+    pub async fn exchange_identity(
+        &self,
+        code: &str,
+        verifier: Option<&str>,
+        expected_nonce: Option<&str>,
+    ) -> Result<ProviderIdentity, IdentityError> {
+        let (claims, from_id_token) = self.exchange_claims(code, verifier, expected_nonce).await?;
+        Ok(self.identity_from(&claims, from_id_token)?.0)
+    }
+
+    /// Code → verified claims, and whether they came from a verified
+    /// `id_token` (else userinfo).
+    async fn exchange_claims(
+        &self,
+        code: &str,
+        verifier: Option<&str>,
+        expected_nonce: Option<&str>,
+    ) -> Result<(serde_json::Value, bool), IdentityError> {
         let mut pairs: Vec<(&str, &str)> = vec![
             ("grant_type", "authorization_code"),
             ("code", code),
@@ -236,7 +345,7 @@ impl OAuthAuthenticator {
                     return Err(IdentityError::AuthFailed);
                 }
             }
-            return self.principal_from(&claims);
+            return Ok((claims, true));
         }
 
         let access = token
@@ -259,47 +368,125 @@ impl OAuthAuthenticator {
             .json()
             .await
             .map_err(|e| IdentityError::Issuance(format!("userinfo body: {e}")))?;
-        self.principal_from(&user)
+        Ok((user, false))
     }
 
-    /// Map provider claims (verified `id_token` or userinfo) to a [`Principal`].
-    /// Subject precedence: OIDC `sub`, then forge `login` (GitHub/Forgejo), then
-    /// numeric `id`. Roles are the C1 bootstrap: configured owners get `Owner`,
-    /// everyone else `Viewer` (scoped RBAC replaces this in C2).
-    fn principal_from(&self, claims: &serde_json::Value) -> Result<Principal, IdentityError> {
-        let subject = claims
-            .get("sub")
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .or_else(|| {
-                claims
-                    .get("login")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-            })
-            .or_else(|| claims.get("id").map(|v| v.to_string()))
+    /// Read who signed in out of provider claims (ADR-0069 §1): the
+    /// [`ProviderIdentity`] keyed by the provider's **immutable** id, plus the
+    /// legacy subject an `unqualified_ids` provider keeps minting.
+    ///
+    /// - `external_id`: OIDC `sub`, else the numeric `id` (GitHub/Forgejo
+    ///   `/user`). Never `login` — a login is released on rename.
+    /// - `handle`: from a verified `id_token`, the verified email (else `sub`);
+    ///   from userinfo, the forge `login` (else verified email). Never
+    ///   `preferred_username`, which some IdPs let users edit.
+    /// - legacy: `sub` → `login` → `id`, exactly the pre-ADR-0069 subject.
+    fn identity_from(
+        &self,
+        claims: &serde_json::Value,
+        from_id_token: bool,
+    ) -> Result<(ProviderIdentity, String), IdentityError> {
+        let sub = claim_str(claims, "sub");
+        let login = claim_str(claims, "login");
+        let id = claim_str(claims, "id");
+        let external_id = sub
+            .clone()
+            .or_else(|| id.clone())
             .ok_or(IdentityError::AuthFailed)?;
+        let legacy = sub
+            .clone()
+            .or_else(|| login.clone())
+            .or_else(|| id.clone())
+            .ok_or(IdentityError::AuthFailed)?;
+        let email = verified_email(claims);
+        let handle = if from_id_token {
+            email.clone().or(sub)
+        } else {
+            login.or_else(|| email.clone())
+        }
+        .unwrap_or_default();
         let display_name = claims
             .get("name")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .map(String::from);
-        let role = if self.is_owner(&subject, verified_email(claims).as_deref()) {
+        let identity = ProviderIdentity {
+            provider: self.cfg.provider_id.clone(),
+            external_id,
+            handle,
+            email: email.clone().or_else(|| claim_str(claims, "email")),
+            email_verified: email.is_some(),
+            display_name,
+        };
+        Ok((identity, legacy))
+    }
+
+    /// The id a new Principal for `identity` is minted under (ADR-0069 §2).
+    fn base_id(&self, identity: &ProviderIdentity, legacy: &str) -> String {
+        scarab_identity::base_principal_id(identity, self.cfg.unqualified_ids.then_some(legacy))
+    }
+
+    /// Map provider claims to a [`Principal`] **without** an identity store:
+    /// the subject is the would-be minted id, unpinned. Roles are the C1
+    /// bootstrap: configured owners get `Owner`, everyone else `Viewer`.
+    #[cfg(test)]
+    fn principal_from(&self, claims: &serde_json::Value) -> Result<Principal, IdentityError> {
+        let (identity, legacy) = self.identity_from(claims, false)?;
+        let subject = self.base_id(&identity, &legacy);
+        Ok(self.principal_with(subject, &identity, &[]))
+    }
+
+    /// Map provider claims to a [`Principal`], pinned through the identity
+    /// store when one is wired (ADR-0069).
+    async fn principal_for(
+        &self,
+        claims: &serde_json::Value,
+        from_id_token: bool,
+    ) -> Result<Principal, IdentityError> {
+        let (identity, legacy) = self.identity_from(claims, from_id_token)?;
+        let base = self.base_id(&identity, &legacy);
+        let (subject, aliases) = match &self.identities {
+            Some(store) => {
+                let id = store.sign_in(&identity, &base, now_ms()).await?;
+                let aliases = store.aliases_of(&id).await?;
+                (id, aliases)
+            }
+            None => (base, Vec::new()),
+        };
+        Ok(self.principal_with(subject, &identity, &aliases))
+    }
+
+    /// `aliases`: ids folded into `subject` by a merge (ADR-0069 §6) — an
+    /// owners entry naming one of them still means this person.
+    fn principal_with(
+        &self,
+        subject: String,
+        identity: &ProviderIdentity,
+        aliases: &[String],
+    ) -> Principal {
+        let verified = identity
+            .email
+            .as_deref()
+            .filter(|_| identity.email_verified);
+        let role = if std::iter::once(&subject)
+            .chain(aliases)
+            .any(|id| self.is_owner(id, verified))
+        {
             Role::Owner
         } else {
             Role::Viewer
         };
-        Ok(Principal {
+        Principal {
             subject,
-            display_name,
+            display_name: identity.display_name.clone(),
             roles: vec![role],
-        })
+        }
     }
 
     /// The C1 global bootstrap role `subject` holds **right now**, decided by
     /// subject match against the configured owners (ADR-0049 amendment).
     ///
-    /// Deliberately narrower than [`principal_from`](Self::principal_from)'s
+    /// Deliberately narrower than [`principal_for`](Self::principal_for)'s
     /// login-time decision, in two ways that can only ever return *less*
     /// authority. It cannot honour an owner entry that matched a VERIFIED
     /// EMAIL, because that email is a claim the provider asserts during login
@@ -321,21 +508,27 @@ impl OAuthAuthenticator {
             .then_some(Role::Owner)
     }
 
-    /// An owner entry matches the stored subject **or** a VERIFIED email
-    /// (ADR-0049 amendment): with a real OIDC issuer `sub` is an opaque
-    /// per-client id, so subject-only bootstrap means pasting UUIDs before
-    /// anyone can administer anything. `sub` stays the Principal's identity;
-    /// email is only ever a *matcher*, and only when the issuer asserts
-    /// `email_verified` — an unverified email would let anyone who can set a
-    /// profile field claim `Owner`.
+    /// An owner entry matches the Principal id **or** a VERIFIED email
+    /// (ADR-0049 amendment, scoped per provider by ADR-0069): with a real OIDC
+    /// issuer `sub` is an opaque per-client id, so id-only bootstrap means
+    /// pasting UUIDs before anyone can administer anything. Email is only ever
+    /// a *matcher*, and only when THIS provider asserts `email_verified`:
+    ///
+    /// - `<provider>:<email>` matches only when `<provider>` is this one —
+    ///   otherwise the weakest IdP willing to call an address verified would
+    ///   mint a global Owner;
+    /// - a bare email matches any provider, which boot permits only when there
+    ///   is exactly one.
     fn is_owner(&self, subject: &str, verified_email: Option<&str>) -> bool {
-        self.cfg.owners.iter().any(|o| o == subject)
-            || verified_email.is_some_and(|email| {
-                self.cfg
-                    .owners
-                    .iter()
-                    .any(|o| o.eq_ignore_ascii_case(email))
-            })
+        self.cfg.owners.iter().any(|o| {
+            o == subject
+                || verified_email.is_some_and(|email| match o.split_once(':') {
+                    Some((provider, addr)) => {
+                        provider == self.cfg.provider_id && addr.eq_ignore_ascii_case(email)
+                    }
+                    None => o.eq_ignore_ascii_case(email),
+                })
+        })
     }
 
     /// Verify an `id_token`: RS256 signature against the issuer's JWKS, plus
@@ -452,6 +645,24 @@ impl OAuthAuthenticator {
     }
 }
 
+/// A claim as a plain string: a JSON string as-is, a number in decimal. The
+/// pre-ADR-0069 mapping used `Value::to_string`, which kept the quotes of a
+/// string-typed `id` (`"\"123\""`).
+fn claim_str(claims: &serde_json::Value, key: &str) -> Option<String> {
+    match claims.get(key)? {
+        serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or_default()
+}
+
 /// The `email` claim, but only when the provider asserts it is verified.
 /// `email_verified` is a bool in OIDC; some issuers stringify it, and nothing
 /// else counts as verified (a missing claim never does).
@@ -495,6 +706,8 @@ mod tests {
             state: "s".into(),
             verifier: "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk".into(),
             nonce: "n".into(),
+            provider: String::new(),
+            link: String::new(),
         };
         assert_eq!(
             flow.challenge(),
@@ -520,7 +733,20 @@ mod tests {
         assert_eq!(flow.verifier(), None, "nothing to replay");
         assert_eq!(flow.nonce(), None, "nothing to check");
         assert_eq!(LoginFlow::from_cookie(""), None);
-        assert_eq!(LoginFlow::from_cookie("a.b.c.d"), None);
+        assert_eq!(LoginFlow::from_cookie("a.b.c.d.e.f"), None);
+        let link = LoginFlow::generate()
+            .for_provider("github")
+            .for_link("abc123");
+        assert_eq!(
+            LoginFlow::from_cookie(&link.to_cookie()),
+            Some(link.clone())
+        );
+        // ADR-0069: a fourth component names the provider the flow went to.
+        let bound = LoginFlow::generate().for_provider("okta");
+        assert_eq!(
+            LoginFlow::from_cookie(&bound.to_cookie()),
+            Some(bound.clone())
+        );
     }
 
     fn cfg(owners: Vec<String>) -> OAuthConfig {
@@ -533,6 +759,10 @@ mod tests {
             oidc_issuer: None,
             scopes: String::new(),
             owners,
+            provider_id: "default".into(),
+            unqualified_ids: true,
+            name: "Sign in".into(),
+            forge_url: None,
         }
     }
 
@@ -561,5 +791,35 @@ mod tests {
                 "unverified/absent email must not grant Owner: {unverified}"
             );
         }
+    }
+
+    /// ADR-0069: a qualified email owner entry is honoured only by the
+    /// provider it names — another IdP asserting the same address verified
+    /// must not mint an Owner.
+    #[test]
+    fn a_qualified_email_owner_entry_binds_to_its_provider() {
+        let claims = serde_json::json!({
+            "sub": "s1", "email": "ada@example.com", "email_verified": true,
+        });
+        let owners = vec!["okta:ada@example.com".to_string()];
+        let okta = OAuthAuthenticator::new(OAuthConfig {
+            provider_id: "okta".into(),
+            unqualified_ids: false,
+            ..cfg(owners.clone())
+        });
+        let other = OAuthAuthenticator::new(OAuthConfig {
+            provider_id: "weak-idp".into(),
+            unqualified_ids: false,
+            ..cfg(owners)
+        });
+        assert_eq!(
+            okta.principal_from(&claims).unwrap().roles,
+            vec![Role::Owner]
+        );
+        assert_eq!(
+            other.principal_from(&claims).unwrap().roles,
+            vec![Role::Viewer],
+            "the same verified address from another provider grants nothing"
+        );
     }
 }

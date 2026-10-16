@@ -36,12 +36,34 @@ data:
   {{- with .Values.scarab.oauth.scopes }}
   SCARAB_OAUTH_SCOPES: {{ . | quote }}
   {{- end }}
-  {{- with .Values.scarab.oauth.owners }}
-  SCARAB_OAUTH_OWNERS: {{ join "," . | quote }}
-  {{- end }}
   {{- with .Values.scarab.oauth.issuer }}
   SCARAB_OAUTH_ISSUER: {{ . | quote }}
   {{- end }}
+  {{- with .Values.scarab.oauth.providerId }}
+  SCARAB_OAUTH_PROVIDER_ID: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.scarab.oauth.providerName }}
+  SCARAB_OAUTH_PROVIDER_NAME: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.scarab.oauth.forgeUrl }}
+  SCARAB_OAUTH_FORGE_URL: {{ . | quote }}
+  {{- end }}
+  {{- end }}
+  {{- with .Values.scarab.oauth.owners }}
+  SCARAB_OAUTH_OWNERS: {{ join "," . | quote }}
+  {{- end }}
+  {{- with .Values.scarab.oauth.providers }}
+  {{- /* Further login providers (ADR-0069). Each secret is named by
+         client_secret_env and injected by the Deployment's secretKeyRef. */}}
+  {{- $list := list }}
+  {{- range . }}
+  {{- $p := dict "id" .id "name" (default .id .name) "client_id" .clientId "client_secret_env" (include "scarab.providerSecretEnv" .id) "authorize_url" .authorizeUrl "token_url" .tokenUrl "userinfo_url" .userinfoUrl }}
+  {{- with .issuer }}{{- $_ := set $p "issuer" . }}{{- end }}
+  {{- with .scopes }}{{- $_ := set $p "scopes" . }}{{- end }}
+  {{- with .forgeUrl }}{{- $_ := set $p "forge_url" . }}{{- end }}
+  {{- $list = append $list $p }}
+  {{- end }}
+  SCARAB_OAUTH_PROVIDERS: {{ toJson $list | quote }}
   {{- end }}
   {{- if .Values.scarab.devInsecure }}
   SCARAB_DEV_INSECURE: "1"

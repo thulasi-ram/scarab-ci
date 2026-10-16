@@ -130,3 +130,92 @@ async fn scoped_roles_inherit_and_origins_respect_authority() {
 
     tdb.cleanup().await;
 }
+
+/// ADR-0069 §5 re-sync, in SQL: seeds never clobber a native row; a prune
+/// removes only this scope's import rows seeded through THIS provider — or
+/// before provenance existed — that the listing no longer names; another
+/// provider's import rows, other scopes, and native rows are untouched.
+#[tokio::test]
+async fn import_seeds_prune_only_what_this_provider_seeded_here() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+    let app = project("acme", "app");
+    let other = project("acme", "api");
+
+    // State before the re-sync:
+    // - `legacy`: an import row from before provenance (imported_via NULL);
+    // - `native`: a native grant; `tomb`: a native revoke;
+    // - `okta-only`: seeded through ANOTHER provider;
+    // - `elsewhere`: this provider, but another project.
+    db.grant(
+        &binding("legacy", app.clone(), Role::Member),
+        BindingOrigin::Import,
+    )
+    .await
+    .unwrap();
+    db.grant(
+        &binding("native", app.clone(), Role::Viewer),
+        BindingOrigin::Native,
+    )
+    .await
+    .unwrap();
+    db.revoke("tomb", &app).await.unwrap();
+    db.import_seeds(&app, "okta", &[("okta-only".into(), Role::Viewer)], false)
+        .await
+        .unwrap();
+    db.import_seeds(
+        &other,
+        "github",
+        &[("elsewhere".into(), Role::Admin)],
+        false,
+    )
+    .await
+    .unwrap();
+
+    // The re-sync lists `stays`, plus `native` and `tomb` as admins.
+    let pruned = db
+        .import_seeds(
+            &app,
+            "github",
+            &[
+                ("stays".into(), Role::Member),
+                ("native".into(), Role::Admin),
+                ("tomb".into(), Role::Admin),
+            ],
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(pruned, 1, "only `legacy` goes");
+    assert_eq!(db.role_of("legacy", &app).await.unwrap(), None);
+    assert_eq!(db.role_of("stays", &app).await.unwrap(), Some(Role::Member));
+    assert_eq!(
+        db.role_of("native", &app).await.unwrap(),
+        Some(Role::Viewer),
+        "a native grant is never raised by an import"
+    );
+    assert_eq!(
+        db.role_of("tomb", &app).await.unwrap(),
+        None,
+        "a native revoke is never resurrected"
+    );
+    assert_eq!(
+        db.role_of("okta-only", &app).await.unwrap(),
+        Some(Role::Viewer)
+    );
+    assert_eq!(
+        db.role_of("elsewhere", &other).await.unwrap(),
+        Some(Role::Admin)
+    );
+
+    // The next re-sync prunes `stays` once the forge drops it — its row now
+    // carries this provider's provenance.
+    let pruned = db.import_seeds(&app, "github", &[], true).await.unwrap();
+    assert_eq!(pruned, 1);
+    assert_eq!(db.role_of("stays", &app).await.unwrap(), None);
+    tdb.cleanup().await;
+}

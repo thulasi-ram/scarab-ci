@@ -38,7 +38,50 @@ const me = {
   roles: ["Owner"],
   can_administer: true,
   admin_orgs: ["acme"],
+  // Signed in two ways (ADR-0069): the legacy GitHub provider and Okta.
+  identities: [
+    { provider: "default", handle: "a-kim" },
+    { provider: "okta", handle: "a.kim@acme.example" },
+  ],
 };
+
+// ── identity links (ADR-0069) ─────────────────────────────────────────────
+// Three providers so the login page shows the multi-provider choice and the
+// Account page has one left to link.
+const authProviders = [
+  { id: "default", name: "GitHub", default: true },
+  { id: "okta", name: "Okta", default: false },
+  { id: "forgejo", name: "Forgejo", default: false },
+];
+// Members: a native org Owner, forge-imported collaborators (one never signed
+// in), and a project-scoped approver.
+const bindings = [
+  { subject: "a.kim", role: "owner", project: "", display_name: "Avery Kim", claimed: true },
+  { subject: "j.lee", role: "admin", project: "orders-api", display_name: "Jordan Lee", claimed: true },
+  { subject: "j.lee", role: "member", project: "scarab", display_name: "Jordan Lee", claimed: true },
+  { subject: "r.okafor", role: "member", project: "scarab", claimed: false },
+  { subject: "okta:s.patel@acme.example", role: "viewer", project: "", display_name: "Sam Patel", claimed: true },
+];
+const principals = [
+  {
+    id: "j.lee",
+    display_name: "Jordan Lee",
+    claimed: true,
+    identities: [{ provider: "default", handle: "j.lee" }],
+  },
+  {
+    id: "r.okafor",
+    display_name: null,
+    claimed: false,
+    identities: [{ provider: "default", handle: "r.okafor" }],
+  },
+  {
+    id: "okta:s.patel@acme.example",
+    display_name: "Sam Patel",
+    claimed: true,
+    identities: [{ provider: "okta", handle: "s.patel@acme.example" }],
+  },
+];
 
 // ── /v1/repos (dashboard: first 4 → "most active" cards; count → "repos · 7")
 const proj = (project: string, mins: number | null) => ({
@@ -567,6 +610,30 @@ function json(body: unknown, init?: ResponseInit) {
 function route(pathname: string, search: string, method: string): Response | null {
   const p = pathname;
   if (p === "/v1/me") return json(me);
+  if (p === "/v1/auth/providers") return json(authProviders);
+  // Linking: no provider to bounce through, so "authorize" straight back to
+  // the Account page with the outcome a real callback would carry.
+  if (p === "/v1/me/identities/link") {
+    return json({ authorize_url: "/account?identity_linked=forgejo" });
+  }
+  if (/^\/v1\/me\/identities\/[^/]+$/.test(p)) return new Response(null, { status: 204 });
+  if (/^\/v1\/orgs\/[^/]+\/bindings$/.test(p)) {
+    return method === "GET" ? json(bindings) : new Response(null, { status: 204 });
+  }
+  if (/^\/v1\/orgs\/[^/]+\/principals$/.test(p)) {
+    const q = (new URLSearchParams(search).get("q") ?? "").toLowerCase();
+    return json(
+      principals.filter(
+        (x) =>
+          x.id.toLowerCase().startsWith(q) ||
+          (x.display_name ?? "").toLowerCase().includes(q) ||
+          x.identities.some((i) => i.handle.toLowerCase().startsWith(q)),
+      ),
+    );
+  }
+  if (/^\/v1\/repos\/[^/]+\/[^/]+\/bindings\/import$/.test(p)) {
+    return json(bindings.filter((b) => b.project === "scarab"));
+  }
   if (p === "/v1/repos") return json(projects);
   if (p === "/v1/runs") return json({ runs });
 

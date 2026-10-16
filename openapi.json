@@ -119,9 +119,23 @@
         ],
         "summary": "Begin the browser OAuth flow (ADR-0049)",
         "operationId": "oauth_login_redirect",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "query",
+            "description": "login provider id (ADR-0069); default = the only, or the unqualified_ids, provider",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "302": {
             "description": "redirect to the provider with a state cookie"
+          },
+          "400": {
+            "description": "unknown provider, or several and none named"
           },
           "404": {
             "description": "OAuth not configured"
@@ -166,6 +180,31 @@
         "responses": {
           "204": {
             "description": "session revoked; cookies expired"
+          }
+        },
+        "security": []
+      }
+    },
+    "/v1/auth/providers": {
+      "get": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "List login providers (ADR-0069)",
+        "operationId": "auth_providers",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AuthProviderDto"
+                  }
+                }
+              }
+            }
           }
         },
         "security": []
@@ -683,6 +722,73 @@
         ]
       }
     },
+    "/v1/me/identities/link": {
+      "post": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Begin linking another sign-in account (ADR-0069)",
+        "operationId": "begin_link_identity",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LinkIdentityRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LinkIdentityResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not a browser session"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/me/identities/{provider}": {
+      "delete": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Unlink a sign-in account (ADR-0069)",
+        "operationId": "unlink_identity",
+        "responses": {
+          "204": {
+            "description": "unlinked"
+          },
+          "409": {
+            "description": "not linked, or the only way to sign in"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/orgs/{org}/bindings": {
       "get": {
         "tags": [
@@ -746,6 +852,52 @@
         "responses": {
           "204": {
             "description": "revoked"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/principals": {
+      "get": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Search users for a grant or approver entry (ADR-0069)",
+        "operationId": "search_principals",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "description": "id or handle prefix, or a display-name fragment",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PrincipalDto"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not an org admin"
           }
         },
         "security": [
@@ -949,7 +1101,8 @@
         "tags": [
           "Auth & Identity"
         ],
-        "summary": "Seed bindings from forge permissions (ADR-0049)",
+        "summary": "Seed (and re-sync) bindings from forge collaborators (ADR-0049, ADR-0069)",
+        "description": "Each collaborator is resolved by the forge's **immutable** user id through\nthe login provider that IS this forge (`forge_url` = the connection's\n`base_url`). Someone nobody has signed in as yet becomes an unclaimed\nPrincipal holding exactly that identity — so whoever later signs in with\nthat forge account claims these roles, and a stranger who takes over the\nlogin does not.\n\nWith no `subjects` filter this is a **re-sync**: an import row at this\nProject for someone the forge no longer lists is deleted. Only on a complete\nlisting — any failed page fails the call and writes nothing. Native grants\nand native revokes are never touched, and authorization keeps reading only\nnative storage: the forge is consulted here, not on the authz hot path.",
         "operationId": "import_bindings",
         "responses": {
           "200": {
@@ -964,6 +1117,12 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "no login provider is associated with this repo's forge"
+          },
+          "501": {
+            "description": "the forge adapter cannot list collaborators"
           }
         },
         "security": [
@@ -3079,6 +3238,29 @@
           }
         }
       },
+      "AuthProviderDto": {
+        "type": "object",
+        "description": "One login provider, as the login page offers it (ADR-0069).",
+        "required": [
+          "id",
+          "name",
+          "default"
+        ],
+        "properties": {
+          "default": {
+            "type": "boolean",
+            "description": "The one used when a login names none."
+          },
+          "id": {
+            "type": "string",
+            "description": "Pass as `provider` to `GET`/`POST /v1/auth/login`."
+          },
+          "name": {
+            "type": "string",
+            "description": "The button label."
+          }
+        }
+      },
       "AvailableRepoDto": {
         "type": "object",
         "description": "`GET /v1/connections/{id}/available-repos`: what the connection's credential\nreaches, and which of those Scarab already governs.",
@@ -3157,6 +3339,20 @@
           "project"
         ],
         "properties": {
+          "claimed": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "`false` = created by a forge import and not signed into yet — the\nMembers panel's \"not signed in yet\". Absent when the store does not\nknow the subject."
+          },
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Principal's display name, when the identity store knows it\n(ADR-0069). Absent for a pre-upgrade bare subject nobody has signed in\nas since."
+          },
           "project": {
             "type": "string",
             "description": "Empty = org-scoped."
@@ -3571,6 +3767,31 @@
           }
         }
       },
+      "LinkIdentityRequest": {
+        "type": "object",
+        "description": "`POST /v1/me/identities/link` body.",
+        "required": [
+          "provider"
+        ],
+        "properties": {
+          "provider": {
+            "type": "string",
+            "description": "The login provider to link an account from (`GET /v1/auth/providers`)."
+          }
+        }
+      },
+      "LinkIdentityResponse": {
+        "type": "object",
+        "description": "Where the browser goes to prove the account.",
+        "required": [
+          "authorize_url"
+        ],
+        "properties": {
+          "authorize_url": {
+            "type": "string"
+          }
+        }
+      },
       "LoginResponse": {
         "type": "object",
         "required": [
@@ -3598,7 +3819,8 @@
           "subject",
           "roles",
           "can_administer",
-          "admin_orgs"
+          "admin_orgs",
+          "identities"
         ],
         "properties": {
           "admin_orgs": {
@@ -3618,6 +3840,13 @@
               "null"
             ],
             "description": "Human display name, when the identity provides one."
+          },
+          "identities": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PrincipalIdentityDto"
+            },
+            "description": "The provider accounts this Principal can sign in with (ADR-0069).\nEmpty when no identity store is wired (dev)."
           },
           "roles": {
             "type": "array",
@@ -3806,6 +4035,54 @@
           "step": {
             "type": "string",
             "description": "The step that re-runs (a gate re-arms and pauses instead of running)."
+          }
+        }
+      },
+      "PrincipalDto": {
+        "type": "object",
+        "description": "A Principal, as the grant/approver typeahead offers it (ADR-0069 §3).",
+        "required": [
+          "id",
+          "claimed",
+          "identities"
+        ],
+        "properties": {
+          "claimed": {
+            "type": "boolean",
+            "description": "`false` = created by a forge import, not signed into yet."
+          },
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string",
+            "description": "What a grant or an approver entry stores."
+          },
+          "identities": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PrincipalIdentityDto"
+            }
+          }
+        }
+      },
+      "PrincipalIdentityDto": {
+        "type": "object",
+        "description": "One linked identity of a [`PrincipalDto`].",
+        "required": [
+          "provider",
+          "handle"
+        ],
+        "properties": {
+          "handle": {
+            "type": "string",
+            "description": "The person's handle there today (login / email) — display only."
+          },
+          "provider": {
+            "type": "string"
           }
         }
       },

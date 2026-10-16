@@ -225,6 +225,125 @@ export async function revokeApiToken(org: string, id: string): Promise<void> {
   }
 }
 
+// --- Identity links (ADR-0069) — sign-in accounts, members, imports. ---
+
+/** A configured login provider, for the sign-in page. */
+export type AuthProvider = components["schemas"]["AuthProviderDto"];
+/** A user, as the grant/approver typeahead offers them. */
+export type PrincipalMatch = components["schemas"]["PrincipalDto"];
+/** One role binding — enriched with the person's name and whether they have
+ * signed in yet. */
+export type Binding = components["schemas"]["BindingDto"];
+
+/** The `scarab_csrf` double-submit token (ADR-0049), for the few calls made
+ * with plain `fetch` rather than through `api` (whose middleware adds it). */
+function csrfToken(): string | undefined {
+  return document.cookie
+    .split(";")
+    .map((c) => c.trim())
+    .find((c) => c.startsWith("scarab_csrf="))
+    ?.slice("scarab_csrf=".length);
+}
+
+/**
+ * `fetch` with the CSRF header and a JSON body, throwing the SERVER's own
+ * message on failure. Several of these endpoints refuse with an explanation
+ * worth showing verbatim — "`github:bob` is not a Scarab user…", "no login
+ * provider is associated with the forge at …" — and a generic "failed" would
+ * hide the one thing the admin needs to know.
+ */
+async function send(path: string, method: string, body?: unknown): Promise<Response> {
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  const csrf = csrfToken();
+  if (csrf) headers["x-csrf-token"] = csrf;
+  const res = await fetch(path, {
+    method,
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (res.status === 401) setUnauthenticated(true);
+  if (!res.ok) {
+    const text = (await res.text().catch(() => "")).trim();
+    throw new Error(text || `${method} ${path} failed (${res.status})`);
+  }
+  return res;
+}
+
+/** The configured login providers (`GET /v1/auth/providers`) — readable before
+ * sign-in. Best-effort: an older server without the route yields `[]`, which
+ * the sign-in page treats as "one provider, the default". */
+export async function listAuthProviders(): Promise<AuthProvider[]> {
+  const res = await fetch("/v1/auth/providers").catch(() => null);
+  if (!res || !res.ok) return [];
+  return (await res.json()) as AuthProvider[];
+}
+
+/** Start linking another provider's account (`POST /v1/me/identities/link`):
+ * the browser is then sent to the returned authorize URL, and the callback
+ * lands back on `/account` with the outcome in the query string. */
+export async function beginLinkIdentity(provider: string): Promise<string> {
+  const res = await send("/v1/me/identities/link", "POST", { provider });
+  const body = (await res.json()) as components["schemas"]["LinkIdentityResponse"];
+  return body.authorize_url;
+}
+
+/** Unlink this person's account on `provider` (`DELETE /v1/me/identities/…`);
+ * the roles imported through it go with it. */
+export async function unlinkIdentity(provider: string): Promise<void> {
+  await send(`/v1/me/identities/${encodeURIComponent(provider)}`, "DELETE");
+}
+
+/** An org's role bindings (`GET /v1/orgs/{org}/bindings`); `null` when the
+ * deployment has no RBAC store (dev). */
+export async function listBindings(org: string): Promise<Binding[] | null> {
+  const res = await fetch(`/v1/orgs/${encodeURIComponent(org)}/bindings`, {
+    headers: csrfToken() ? { "x-csrf-token": csrfToken()! } : {},
+  });
+  if (res.status === 404) return null;
+  if (res.status === 401) setUnauthenticated(true);
+  if (!res.ok) throw new Error((await res.text()).trim() || "failed to load members");
+  return (await res.json()) as Binding[];
+}
+
+/** Natively grant `subject` a role, org-wide or on one project. The subject
+ * must be an existing user (ADR-0069 §3) — pick it from `searchPrincipals`. */
+export async function grantRole(
+  org: string,
+  body: { subject: string; role: string; project?: string },
+): Promise<void> {
+  await send(`/v1/orgs/${encodeURIComponent(org)}/bindings`, "PUT", body);
+}
+
+/** Natively revoke — a durable tombstone a later forge re-sync cannot undo. */
+export async function revokeRole(org: string, subject: string, project?: string): Promise<void> {
+  const q = new URLSearchParams({ subject });
+  if (project) q.set("project", project);
+  await send(`/v1/orgs/${encodeURIComponent(org)}/bindings?${q}`, "DELETE");
+}
+
+/** Re-sync a repo's forge collaborators into roles (ADR-0069 §5): everyone the
+ * forge lists is seeded (pinned by their forge id, so whoever signs in with
+ * that account gets exactly these roles), and anyone it no longer lists loses
+ * the role the forge gave them. */
+export async function importFromForge(org: string, repo: string): Promise<Binding[]> {
+  const res = await send(
+    `/v1/repos/${encodeURIComponent(org)}/${encodeURIComponent(repo)}/bindings/import`,
+    "POST",
+    {},
+  );
+  return (await res.json()) as Binding[];
+}
+
+/** Find users for a grant or an approver entry (`GET /v1/orgs/{org}/principals`). */
+export async function searchPrincipals(org: string, q: string): Promise<PrincipalMatch[]> {
+  if (!q.trim()) return [];
+  const res = await send(
+    `/v1/orgs/${encodeURIComponent(org)}/principals?q=${encodeURIComponent(q.trim())}`,
+    "GET",
+  );
+  return (await res.json()) as PrincipalMatch[];
+}
+
 /** List a run's artifacts of record (`GET /v1/runs/{id}/artifacts`, ADR-0052). */
 export async function listArtifacts(id: string): Promise<Artifact[]> {
   const { data, error } = await api.GET("/v1/runs/{id}/artifacts", {
@@ -358,15 +477,14 @@ export async function putEnvironment(
   name: string,
   protection: ProtectionRules,
 ): Promise<void> {
-  const res = await fetch(
+  // Through `send`: Administer-gated, so a cookie session needs the CSRF
+  // token (this raw `fetch` used to omit it and 403 under real login), and an
+  // unknown approver comes back with the server's explanation (ADR-0069 §3).
+  await send(
     `/v1/repos/${encodeURIComponent(org)}/${encodeURIComponent(repo)}/environments/${encodeURIComponent(name)}`,
-    {
-      method: "PUT",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(protection),
-    },
+    "PUT",
+    protection,
   );
-  if (!res.ok) throw new Error("failed to save environment");
 }
 
 /** A recorded deployment into an environment (`at` is epoch millis). */

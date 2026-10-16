@@ -28,7 +28,9 @@ use tower::ServiceExt;
 use scarab_server::config::OAuthConfig;
 use scarab_server::oauth::OAuthAuthenticator;
 use scarab_server::{router, AppState, LogService};
-use scarab_testkit::{FakeClock, InMemoryDb, InMemoryObjectStore, InMemorySessions};
+use scarab_testkit::{
+    FakeClock, InMemoryDb, InMemoryIdentities, InMemoryObjectStore, InMemorySessions,
+};
 
 fn b64url(bytes: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
@@ -142,6 +144,10 @@ struct Provider {
     /// How often userinfo was consulted — `0` is how "no silent fallback" is
     /// proven rather than asserted.
     userinfo_hits: Arc<Mutex<usize>>,
+    /// What userinfo answers: GitHub's `/user` shape — an immutable numeric
+    /// `id` beside the renameable `login`. Swapped mid-test to stage a rename
+    /// or a recycled login (ADR-0069).
+    user: Arc<Mutex<serde_json::Value>>,
 }
 
 /// Read one field out of an `application/x-www-form-urlencoded` body.
@@ -160,6 +166,9 @@ async fn provider(id_token: Option<IdToken>) -> Provider {
         id_token: Arc::new(Mutex::new(id_token)),
         verifiers: Arc::new(Mutex::new(Vec::new())),
         userinfo_hits: Arc::new(Mutex::new(0)),
+        user: Arc::new(Mutex::new(
+            serde_json::json!({ "id": 1001, "login": "alice", "name": "Alice A" }),
+        )),
     };
 
     let token_p = p.clone();
@@ -200,7 +209,8 @@ async fn provider(id_token: Option<IdToken>) -> Provider {
                         Some("Bearer at-1")
                     );
                     *p.userinfo_hits.lock().unwrap() += 1;
-                    axum::Json(serde_json::json!({ "login": "alice", "name": "Alice A" }))
+                    let user = p.user.lock().unwrap().clone();
+                    axum::Json(user)
                 }
             }),
         )
@@ -238,16 +248,23 @@ fn app_for(p: &Provider, owners: Vec<String>, oidc: bool) -> axum::Router {
     let clock = Arc::new(FakeClock::new(1_000));
     let store = Arc::new(InMemoryObjectStore::new());
     let logs = Arc::new(LogService::new(store, db.clone()));
-    let login = Arc::new(OAuthAuthenticator::new(OAuthConfig {
-        client_id: "cid".into(),
-        client_secret: "sekret".into(),
-        authorize_url: format!("{}/authorize", p.base),
-        token_url: format!("{}/token", p.base),
-        userinfo_url: format!("{}/user", p.base),
-        oidc_issuer: if oidc { Some(p.base.clone()) } else { None },
-        scopes: "read:user".into(),
-        owners,
-    }));
+    let login = Arc::new(
+        OAuthAuthenticator::new(OAuthConfig {
+            client_id: "cid".into(),
+            client_secret: "sekret".into(),
+            authorize_url: format!("{}/authorize", p.base),
+            token_url: format!("{}/token", p.base),
+            userinfo_url: format!("{}/user", p.base),
+            oidc_issuer: if oidc { Some(p.base.clone()) } else { None },
+            scopes: "read:user".into(),
+            owners,
+            provider_id: "default".into(),
+            unqualified_ids: true,
+            name: "GitHub".into(),
+            forge_url: None,
+        })
+        .with_identities(Arc::new(InMemoryIdentities::new())),
+    );
     router(
         AppState::new(db, clock, logs)
             .with_public_url("https://scarab.example.com")
@@ -269,23 +286,30 @@ fn cookie_from(resp: &axum::response::Response, name: &str) -> Option<String> {
 
 /// The login secrets the server planted, read the way the browser would — and
 /// split here (not via the production parser) so the test is an independent
-/// check on the cookie's shape: `state.verifier.nonce`.
+/// check on the cookie's shape: `state.verifier.nonce.provider` (the provider
+/// id since ADR-0069 — one callback URL serves every provider).
 struct Flow {
     state: String,
     verifier: String,
     nonce: String,
+    provider: String,
 }
 
 fn parse_flow(cookie: &str) -> Flow {
     let parts: Vec<&str> = cookie.split('.').collect();
-    assert_eq!(parts.len(), 3, "state cookie must carry state.verifier.nonce");
-    for p in &parts {
+    assert_eq!(
+        parts.len(),
+        4,
+        "state cookie must carry state.verifier.nonce.provider"
+    );
+    for p in &parts[..3] {
         assert!(p.len() >= 20, "each component must be high-entropy: {p}");
     }
     Flow {
         state: parts[0].into(),
         verifier: parts[1].into(),
         nonce: parts[2].into(),
+        provider: parts[3].into(),
     }
 }
 
@@ -310,8 +334,8 @@ async fn begin_login(app: &axum::Router) -> (String, Flow) {
 /// `GET /v1/auth/callback` with the flow cookie replayed.
 async fn callback(app: &axum::Router, flow: &Flow, code: &str) -> axum::response::Response {
     let cookie = format!(
-        "scarab_oauth_state={}.{}.{}",
-        flow.state, flow.verifier, flow.nonce
+        "scarab_oauth_state={}.{}.{}.{}",
+        flow.state, flow.verifier, flow.nonce, flow.provider
     );
     app.clone()
         .oneshot(
@@ -780,4 +804,197 @@ async fn unverified_email_owner_entry_does_not_grant_owner() {
             "email_verified={verified:?} must log in as Viewer"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Identity links (ADR-0069): a sign-in is pinned by the provider's immutable
+// id, never by the login it happens to carry today.
+// ---------------------------------------------------------------------------
+
+/// The recycled-login takeover, end to end. GitHub releases a login on rename
+/// and anyone may claim it; before ADR-0069 the Principal WAS the login, so
+/// the new holder inherited every binding, token ceiling and owner entry keyed
+/// on it. Now: the original holder keeps their Principal across the rename,
+/// and the stranger presenting the recycled login gets a fresh `~2` id that
+/// inherits nothing — here, not the bare `alice` owner entry.
+#[tokio::test]
+async fn a_recycled_login_is_a_new_principal_and_inherits_nothing() {
+    let p = provider(None).await;
+    let app = app_for(&p, vec!["alice".into()], false);
+
+    // The legacy (unqualified) provider keeps the pre-upgrade subject, so the
+    // bare owner entry still means the person it always meant.
+    let resp = api_login(&app, "good-code").await;
+    let first = body_json(resp).await;
+    assert_eq!(first["subject"], "alice");
+    assert!(may_write(&app, first["session"].as_str().unwrap()).await);
+
+    // alice renames herself: same immutable id, new login → same Principal.
+    *p.user.lock().unwrap() =
+        serde_json::json!({ "id": 1001, "login": "alice-renamed", "name": "Alice A" });
+    let renamed = body_json(api_login(&app, "good-code").await).await;
+    assert_eq!(renamed["subject"], "alice", "a rename keeps the Principal");
+    assert!(may_write(&app, renamed["session"].as_str().unwrap()).await);
+
+    // A stranger claims the released login: different immutable id.
+    *p.user.lock().unwrap() =
+        serde_json::json!({ "id": 2002, "login": "alice", "name": "Not Alice" });
+    let stranger = body_json(api_login(&app, "good-code").await).await;
+    assert_eq!(
+        stranger["subject"], "alice~2",
+        "never the existing Principal"
+    );
+    assert!(
+        !may_write(&app, stranger["session"].as_str().unwrap()).await,
+        "the recycled login must not inherit alice's Owner entry"
+    );
+}
+
+/// A provider that names no immutable id cannot be pinned, so its sign-in is
+/// refused rather than keyed on a login that could be recycled.
+#[tokio::test]
+async fn a_userinfo_with_no_immutable_id_is_refused() {
+    let p = provider(None).await;
+    let app = app_for(&p, vec![], false);
+    *p.user.lock().unwrap() = serde_json::json!({ "login": "alice" });
+    assert_eq!(
+        api_login(&app, "good-code").await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// Two providers in one app, sharing one identity store: `default` (the
+/// legacy, bare-id GitHub provider) and a named `forgejo` one. Both stubs
+/// answer the same `{id: 1001, login: alice}` — two different people who
+/// happen to share a login on two forges.
+fn two_provider_app(github: &Provider, forgejo: &Provider, owners: Vec<String>) -> axum::Router {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        db.clone(),
+    ));
+    let identities = Arc::new(InMemoryIdentities::new());
+    let provider = |p: &Provider, id: &str, unqualified: bool| {
+        Arc::new(
+            OAuthAuthenticator::new(OAuthConfig {
+                client_id: "cid".into(),
+                client_secret: "sekret".into(),
+                authorize_url: format!("{}/authorize", p.base),
+                token_url: format!("{}/token", p.base),
+                userinfo_url: format!("{}/user", p.base),
+                oidc_issuer: None,
+                scopes: String::new(),
+                owners: owners.clone(),
+                provider_id: id.into(),
+                unqualified_ids: unqualified,
+                name: id.to_uppercase(),
+                forge_url: None,
+            })
+            .with_identities(identities.clone()),
+        )
+    };
+    let gh = provider(github, "default", true);
+    let fj = provider(forgejo, "forgejo", false);
+    router(
+        AppState::new(db, clock, logs)
+            .with_public_url("https://scarab.example.com")
+            .with_auth(gh.clone(), Arc::new(InMemorySessions::new()))
+            .with_oauth_login(gh)
+            .with_oauth_login(fj),
+    )
+}
+
+/// Problem (3) of ADR-0069, end to end: `alice` on Forgejo and `alice` on
+/// GitHub were one subject, so a bare `alice` owner entry made BOTH Owner.
+/// Now each provider mints in its own namespace, the browser flow carries
+/// which provider it went to through the one shared callback, and the API
+/// path names it explicitly.
+#[tokio::test]
+async fn two_providers_keep_two_alices_apart() {
+    let github = provider(None).await;
+    let forgejo = provider(None).await;
+    let app = two_provider_app(&github, &forgejo, vec!["alice".into()]);
+
+    // The login page's list, with the default marked.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/auth/providers")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "readable before sign-in");
+    let list = body_json(resp).await;
+    assert_eq!(
+        list,
+        serde_json::json!([
+            { "id": "default", "name": "DEFAULT", "default": true },
+            { "id": "forgejo", "name": "FORGEJO", "default": false },
+        ])
+    );
+
+    // Browser flow to Forgejo: the redirect goes to the Forgejo stub, and the
+    // callback (the SAME url) resolves through Forgejo, not the default.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/auth/login?provider=forgejo")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    let location = resp.headers()["location"].to_str().unwrap().to_string();
+    assert!(location.starts_with(&forgejo.base), "{location}");
+    let flow = parse_flow(&cookie_from(&resp, "scarab_oauth_state").unwrap());
+    assert_eq!(flow.provider, "forgejo");
+    let resp = callback(&app, &flow, "good-code").await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    let fj_session = cookie_from(&resp, "scarab_session").unwrap();
+    assert_eq!(*forgejo.userinfo_hits.lock().unwrap(), 1);
+    assert_eq!(*github.userinfo_hits.lock().unwrap(), 0);
+    assert!(
+        !may_write(&app, &fj_session).await,
+        "Forgejo's alice is `forgejo:alice`, not the `alice` owner entry"
+    );
+
+    // The API path: default provider when unnamed, Forgejo when named.
+    let gh = body_json(api_login(&app, "good-code").await).await;
+    assert_eq!(gh["subject"], "alice");
+    assert!(may_write(&app, gh["session"].as_str().unwrap()).await);
+    let named = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "credential": "good-code", "provider": "forgejo" })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(body_json(named).await["subject"], "forgejo:alice");
+
+    // An unknown provider is refused, never silently defaulted.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/auth/login?provider=gitlab")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }

@@ -68,6 +68,17 @@ export default function UserMenu() {
             {/* Per-account controls, moved off the top bar. Settings stays
                 hidden outright from non-admins (ADR-0060): nothing in there is
                 actionable or informative without `Administer`. */}
+            {/* Everyone's own sign-in accounts (ADR-0069): link another
+                provider, unlink one. Not admin-gated — it is about you. */}
+            <A
+              href="/account"
+              class="um-item um-link"
+              role="menuitem"
+              onClick={() => setOpen(false)}
+            >
+              <Icon icon="user" size={14} />
+              Account
+            </A>
             <Show when={canAdminister()}>
               <A
                 href="/settings"

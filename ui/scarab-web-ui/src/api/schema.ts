@@ -141,6 +141,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/auth/providers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List login providers (ADR-0069) */
+        get: operations["auth_providers"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/connections": {
         parameters: {
             query?: never;
@@ -402,6 +419,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/me/identities/link": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Begin linking another sign-in account (ADR-0069) */
+        post: operations["begin_link_identity"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/me/identities/{provider}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Unlink a sign-in account (ADR-0069) */
+        delete: operations["unlink_identity"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/orgs/{org}/bindings": {
         parameters: {
             query?: never;
@@ -416,6 +467,23 @@ export interface paths {
         post?: never;
         /** Natively revoke a role - a durable tombstone (ADR-0049) */
         delete: operations["delete_binding"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/principals": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Search users for a grant or approver entry (ADR-0069) */
+        get: operations["search_principals"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -486,7 +554,21 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Seed bindings from forge permissions (ADR-0049) */
+        /**
+         * Seed (and re-sync) bindings from forge collaborators (ADR-0049, ADR-0069)
+         * @description Each collaborator is resolved by the forge's **immutable** user id through
+         *     the login provider that IS this forge (`forge_url` = the connection's
+         *     `base_url`). Someone nobody has signed in as yet becomes an unclaimed
+         *     Principal holding exactly that identity — so whoever later signs in with
+         *     that forge account claims these roles, and a stranger who takes over the
+         *     login does not.
+         *
+         *     With no `subjects` filter this is a **re-sync**: an import row at this
+         *     Project for someone the forge no longer lists is deleted. Only on a complete
+         *     listing — any failed page fails the call and writes nothing. Native grants
+         *     and native revokes are never touched, and authorization keeps reading only
+         *     native storage: the forge is consulted here, not on the authz hot path.
+         */
         post: operations["import_bindings"];
         delete?: never;
         options?: never;
@@ -1356,6 +1438,15 @@ export interface components {
              */
             started_at: number;
         };
+        /** @description One login provider, as the login page offers it (ADR-0069). */
+        AuthProviderDto: {
+            /** @description The one used when a login names none. */
+            default: boolean;
+            /** @description Pass as `provider` to `GET`/`POST /v1/auth/login`. */
+            id: string;
+            /** @description The button label. */
+            name: string;
+        };
         /**
          * @description `GET /v1/connections/{id}/available-repos`: what the connection's credential
          *     reaches, and which of those Scarab already governs.
@@ -1400,6 +1491,18 @@ export interface components {
             webhook_registered: boolean;
         };
         BindingDto: {
+            /**
+             * @description `false` = created by a forge import and not signed into yet — the
+             *     Members panel's "not signed in yet". Absent when the store does not
+             *     know the subject.
+             */
+            claimed?: boolean | null;
+            /**
+             * @description The Principal's display name, when the identity store knows it
+             *     (ADR-0069). Absent for a pre-upgrade bare subject nobody has signed in
+             *     as since.
+             */
+            display_name?: string | null;
             /** @description Empty = org-scoped. */
             project: string;
             role: string;
@@ -1692,6 +1795,15 @@ export interface components {
             level: string;
             name: string;
         };
+        /** @description `POST /v1/me/identities/link` body. */
+        LinkIdentityRequest: {
+            /** @description The login provider to link an account from (`GET /v1/auth/providers`). */
+            provider: string;
+        };
+        /** @description Where the browser goes to prove the account. */
+        LinkIdentityResponse: {
+            authorize_url: string;
+        };
         LoginResponse: {
             /**
              * @description The session's CSRF token — browsers echo it in `x-csrf-token` on every
@@ -1726,6 +1838,11 @@ export interface components {
             can_administer: boolean;
             /** @description Human display name, when the identity provides one. */
             display_name?: string | null;
+            /**
+             * @description The provider accounts this Principal can sign in with (ADR-0069).
+             *     Empty when no identity store is wired (dev).
+             */
+            identities: components["schemas"]["PrincipalIdentityDto"][];
             /** @description The principal's Scarab-native roles (e.g. `["Owner"]`). */
             roles: string[];
             /** @description Stable, forge-agnostic identity subject. */
@@ -1853,6 +1970,21 @@ export interface components {
             reason: components["schemas"]["PlanReasonDto"];
             /** @description The step that re-runs (a gate re-arms and pauses instead of running). */
             step: string;
+        };
+        /** @description A Principal, as the grant/approver typeahead offers it (ADR-0069 §3). */
+        PrincipalDto: {
+            /** @description `false` = created by a forge import, not signed into yet. */
+            claimed: boolean;
+            display_name?: string | null;
+            /** @description What a grant or an approver entry stores. */
+            id: string;
+            identities: components["schemas"]["PrincipalIdentityDto"][];
+        };
+        /** @description One linked identity of a [`PrincipalDto`]. */
+        PrincipalIdentityDto: {
+            /** @description The person's handle there today (login / email) — display only. */
+            handle: string;
+            provider: string;
         };
         /** @description One registered project (governed repo, ADR-0046) in the repos list. */
         ProjectDto: {
@@ -2516,7 +2648,10 @@ export interface operations {
     };
     oauth_login_redirect: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description login provider id (ADR-0069); default = the only, or the unqualified_ids, provider */
+                provider?: string;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -2525,6 +2660,13 @@ export interface operations {
         responses: {
             /** @description redirect to the provider with a state cookie */
             302: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description unknown provider, or several and none named */
+            400: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2587,6 +2729,25 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    auth_providers: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuthProviderDto"][];
+                };
             };
         };
     };
@@ -3007,6 +3168,61 @@ export interface operations {
             };
         };
     };
+    begin_link_identity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LinkIdentityRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LinkIdentityResponse"];
+                };
+            };
+            /** @description not a browser session */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    unlink_identity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description unlinked */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not linked, or the only way to sign in */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     list_bindings: {
         parameters: {
             query?: never;
@@ -3062,6 +3278,35 @@ export interface operations {
         responses: {
             /** @description revoked */
             204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    search_principals: {
+        parameters: {
+            query: {
+                /** @description id or handle prefix, or a display-name fragment */
+                q: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PrincipalDto"][];
+                };
+            };
+            /** @description not an org admin */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3224,6 +3469,20 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["BindingDto"][];
                 };
+            };
+            /** @description no login provider is associated with this repo's forge */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the forge adapter cannot list collaborators */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };

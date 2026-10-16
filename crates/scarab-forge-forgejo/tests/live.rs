@@ -433,3 +433,115 @@ async fn a_registered_hook_delivers_a_signed_push_we_can_normalize() {
         other => panic!("a push delivery normalized to {other:?}"),
     }
 }
+
+// --- 4. who has access (ADR-0069 s7) --------------------------------------------
+
+/// A Forgejo user's numeric id, as `GET /api/v1/users/{name}` reports it —
+/// the id `/api/v1/user` hands a sign-in, and so the id an import must pin.
+async fn user_id(login: &str) -> String {
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "{}/api/v1/users/{login}",
+            env("SCARAB_TEST_FORGEJO_URL").trim_end_matches('/')
+        ))
+        .header(
+            "authorization",
+            format!("token {}", env("SCARAB_TEST_FORGEJO_TOKEN")),
+        )
+        .send()
+        .await
+        .expect("GET /users/{name}");
+    let body: serde_json::Value = resp.json().await.expect("user JSON");
+    body["id"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no numeric id for {login}: {body}"))
+        .to_string()
+}
+
+/// `list_collaborators` on a REAL org repo reaches everyone with access — the
+/// org owner (via the Owners team), a write team member, a read collaborator —
+/// each under the numeric id a sign-in would present, at the effective level.
+///
+/// The three wire guesses this pins (all made from docs, never from a live
+/// instance): that `/repos/{o}/{r}/teams` lists the Owners team too, that
+/// `/teams/{id}/members` returns `id` + `login`, and that the per-user
+/// permission endpoint answers for someone who is NOT a collaborator. Any one
+/// being wrong drops a person from the list — and a re-sync then revokes them.
+#[tokio::test(flavor = "multi_thread")]
+async fn list_collaborators_reaches_owner_team_member_and_collaborator() {
+    require_forgejo!();
+    let forge = ForgejoForge::new(
+        env("SCARAB_TEST_FORGEJO_URL"),
+        env("SCARAB_TEST_FORGEJO_TOKEN"),
+    );
+    let repo = RepoRef {
+        owner: env("SCARAB_TEST_FORGEJO_TEAM_ORG"),
+        name: env("SCARAB_TEST_FORGEJO_TEAM_REPO"),
+    };
+    let got = forge
+        .list_collaborators(&repo)
+        .await
+        .expect("the org repo's access list is readable with the admin token");
+    capture(
+        "collaborators-org.json",
+        &serde_json::to_string_pretty(&got).unwrap(),
+    );
+    let find = |login: &str| {
+        got.iter()
+            .find(|c| c.login == login)
+            .unwrap_or_else(|| panic!("{login} missing from {got:?}"))
+            .clone()
+    };
+
+    let owner = find(&env("SCARAB_TEST_FORGEJO_OWNER"));
+    assert!(
+        owner.permissions.admin,
+        "the org owner administers it: {owner:?}"
+    );
+    let member = find(&env("SCARAB_TEST_FORGEJO_TEAM_MEMBER"));
+    assert!(
+        member.permissions.write && !member.permissions.admin,
+        "team access is write: {member:?}"
+    );
+    let colin = find(&env("SCARAB_TEST_FORGEJO_COLLABORATOR"));
+    assert!(
+        colin.permissions.read && !colin.permissions.write,
+        "collaborator access is read: {colin:?}"
+    );
+    for c in [&owner, &member, &colin] {
+        assert_eq!(
+            c.external_id,
+            user_id(&c.login).await,
+            "pinned by the id a sign-in presents"
+        );
+    }
+}
+
+/// A USER-owned repo has no teams; its owner has access by ownership alone and
+/// must still be listed (as admin).
+#[tokio::test(flavor = "multi_thread")]
+async fn list_collaborators_includes_a_user_repos_owner() {
+    require_forgejo!();
+    let forge = ForgejoForge::new(
+        env("SCARAB_TEST_FORGEJO_URL"),
+        env("SCARAB_TEST_FORGEJO_TOKEN"),
+    );
+    let owner = env("SCARAB_TEST_FORGEJO_OWNER");
+    let got = forge
+        .list_collaborators(&RepoRef {
+            owner: owner.clone(),
+            name: env("SCARAB_TEST_FORGEJO_HOOK_REPO"),
+        })
+        .await
+        .expect("a user repo's access list is readable");
+    capture(
+        "collaborators-user.json",
+        &serde_json::to_string_pretty(&got).unwrap(),
+    );
+    let me = got
+        .iter()
+        .find(|c| c.login == owner)
+        .unwrap_or_else(|| panic!("owner {owner} missing from {got:?}"));
+    assert!(me.permissions.admin);
+    assert_eq!(me.external_id, user_id(&owner).await);
+}
