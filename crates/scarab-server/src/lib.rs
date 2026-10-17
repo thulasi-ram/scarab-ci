@@ -5034,6 +5034,11 @@ pub struct LoginRequest {
     /// from `GET /v1/auth/providers`. Absent = the default provider.
     #[serde(default)]
     pub provider: Option<String>,
+    /// The `redirect_uri` the client's own authorize request used, replayed
+    /// at the token endpoint (RFC 6749 §4.1.3 — strict providers such as
+    /// Authentik refuse the exchange without it).
+    #[serde(default)]
+    pub redirect_uri: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -5059,20 +5064,30 @@ async fn login(
     // A client that carries a verifier gets it replayed at the token endpoint;
     // otherwise this is exactly the pre-PKCE port call.
     let verifier = req.code_verifier.as_deref().filter(|v| !v.is_empty());
+    let redirect_uri = req.redirect_uri.as_deref().filter(|r| !r.is_empty());
     // A named provider exchanges through itself. Unnamed: the default provider
     // — which is what the composition root wires as `auth` — refusing the
     // ambiguity when several are configured and none is the default.
     let principal = match req.provider.as_deref().filter(|p| !p.is_empty()) {
         Some(id) => {
             let oauth = st.oauth_provider(Some(id))?.ok_or(ApiError::NotFound)?;
-            oauth.exchange(&req.credential, verifier, None).await
+            oauth
+                .exchange(&req.credential, redirect_uri, verifier, None)
+                .await
         }
-        None => match (st.oauth_provider(None)?, verifier) {
-            (Some(oauth), Some(v)) => oauth.exchange(&req.credential, Some(v), None).await,
+        None => match st.oauth_provider(None)? {
+            Some(oauth) if verifier.is_some() || redirect_uri.is_some() => {
+                oauth
+                    .exchange(&req.credential, redirect_uri, verifier, None)
+                    .await
+            }
             _ => auth.authenticate(&req.credential).await,
         },
     }
-    .map_err(|_| ApiError::Unauthorized)?;
+    .map_err(|e| {
+        tracing::warn!(error = %e, "API login: credential exchange failed");
+        ApiError::Unauthorized
+    })?;
     let now = st.clock.now().await.0;
     let session = mint_session(principal.clone(), now);
     sessions
@@ -5121,6 +5136,13 @@ fn set_session_cookies(headers: &mut HeaderMap, session: &Session) {
     }
 }
 
+/// The one registered callback every provider and every flow (sign-in and
+/// link) returns to. The authorize redirect and the token exchange must carry
+/// it byte-for-byte alike (RFC 6749 §4.1.3), so both build it here.
+fn oauth_callback_url(st: &AppState) -> String {
+    format!("{}/v1/auth/callback", st.public_url.trim_end_matches('/'))
+}
+
 /// `GET /v1/auth/login` (ADR-0049): begin the browser OAuth flow — mint the
 /// login secrets (`state` + PKCE verifier + OIDC nonce), keep them in one
 /// HttpOnly cookie (10 min), and redirect to the provider's authorize endpoint
@@ -5136,8 +5158,7 @@ async fn oauth_login_redirect(
     // The provider rides in the state cookie, so every provider shares the one
     // registered callback URL (ADR-0069).
     let flow = oauth::LoginFlow::generate().for_provider(provider.provider_id());
-    let redirect_uri = format!("{}/v1/auth/callback", st.public_url.trim_end_matches('/'));
-    let location = provider.authorize_redirect(&redirect_uri, &flow);
+    let location = provider.authorize_redirect(&oauth_callback_url(&st), &flow);
     let mut resp = (StatusCode::FOUND, ()).into_response();
     if let Ok(v) = axum::http::HeaderValue::from_str(&location) {
         resp.headers_mut().insert(axum::http::header::LOCATION, v);
@@ -5174,25 +5195,38 @@ async fn oauth_callback(
     let flow = cookie_value(&headers, "scarab_oauth_state")
         .as_deref()
         .and_then(oauth::LoginFlow::from_cookie);
-    let Some(flow) = flow.filter(|f| f.state == *state) else {
+    let Some(flow) = flow else {
+        tracing::warn!("OAuth callback: no valid scarab_oauth_state cookie (expired, blocked, or a different browser)");
         return Err(ApiError::Unauthorized);
     };
+    if flow.state != *state {
+        tracing::warn!(provider = %flow.provider, "OAuth callback: state does not match the login cookie");
+        return Err(ApiError::Unauthorized);
+    }
     if !flow.link.is_empty() {
         return link_callback(&st, &headers, &flow, code).await;
     }
     // The OAuth provider is the one that can honour PKCE/nonce; a non-OAuth
     // authenticator (dev fakes) still goes through the port unchanged.
     let principal = match st.oauth_provider(Some(flow.provider.as_str()))? {
-        Some(oauth) => oauth.exchange(code, flow.verifier(), flow.nonce()).await,
+        Some(oauth) => {
+            let redirect_uri = oauth_callback_url(&st);
+            oauth
+                .exchange(code, Some(&redirect_uri), flow.verifier(), flow.nonce())
+                .await
+        }
         None => auth.authenticate(code).await,
     }
-    .map_err(|_| ApiError::Unauthorized)?;
+    .map_err(|e| {
+        tracing::warn!(provider = %flow.provider, error = %e, "OAuth callback: code exchange failed");
+        ApiError::Unauthorized
+    })?;
     let now = st.clock.now().await.0;
     let session = mint_session(principal, now);
-    sessions
-        .put(&session)
-        .await
-        .map_err(|_| ApiError::Unauthorized)?;
+    sessions.put(&session).await.map_err(|e| {
+        tracing::warn!(error = %e, "OAuth callback: could not store the new session");
+        ApiError::Unauthorized
+    })?;
 
     let mut resp = (StatusCode::FOUND, ()).into_response();
     resp.headers_mut().insert(
@@ -5266,9 +5300,8 @@ async fn begin_link_identity(
     let flow = oauth::LoginFlow::generate()
         .for_provider(provider.provider_id())
         .for_link(&session_hash(&sid));
-    let redirect_uri = format!("{}/v1/auth/callback", st.public_url.trim_end_matches('/'));
     let mut resp = Json(LinkIdentityResponse {
-        authorize_url: provider.authorize_redirect(&redirect_uri, &flow),
+        authorize_url: provider.authorize_redirect(&oauth_callback_url(&st), &flow),
     })
     .into_response();
     let cookie = format!(
@@ -5301,9 +5334,17 @@ async fn link_callback(
         .oauth_provider(Some(flow.provider.as_str()))?
         .ok_or(ApiError::NotFound)?;
     let identity = provider
-        .exchange_identity(code, flow.verifier(), flow.nonce())
+        .exchange_identity(
+            code,
+            Some(&oauth_callback_url(st)),
+            flow.verifier(),
+            flow.nonce(),
+        )
         .await
-        .map_err(|_| ApiError::Unauthorized)?;
+        .map_err(|e| {
+            tracing::warn!(provider = %flow.provider, error = %e, "OAuth link callback: code exchange failed");
+            ApiError::Unauthorized
+        })?;
     let now = st.clock.now().await.0;
     let location = match store.link(&principal.subject, &identity, now).await {
         Ok(scarab_identity::LinkOutcome::Merged { from }) => {

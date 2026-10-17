@@ -53,6 +53,22 @@ fn percent_encode(v: &str) -> String {
     out
 }
 
+/// Why a provider endpoint said no, safe to log: the RFC 6749 §5.2 `error` /
+/// `error_description` pair when the body is one, else the first 200 chars of
+/// it. Never the request — that carries the client secret and the code.
+async fn oauth_error(resp: reqwest::Response) -> String {
+    let body = resp.text().await.unwrap_or_default();
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+        if let Some(error) = v.get("error").and_then(|e| e.as_str()) {
+            return match v.get("error_description").and_then(|d| d.as_str()) {
+                Some(d) if !d.is_empty() => format!("{error}: {d}"),
+                _ => error.to_string(),
+            };
+        }
+    }
+    body.chars().take(200).collect()
+}
+
 fn b64url(bytes: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
@@ -257,19 +273,29 @@ impl OAuthAuthenticator {
     }
 
     /// Exchange an authorization `code` for the provider identity and map it to
-    /// a [`Principal`], replaying the browser flow's PKCE `verifier` and
-    /// checking the `id_token` against its `expected_nonce`.
+    /// a [`Principal`], replaying the authorize request's `redirect_uri` and
+    /// the browser flow's PKCE `verifier`, and checking the `id_token` against
+    /// its `expected_nonce`.
     ///
-    /// Both are `Option` because the API/CLI `POST /v1/auth/login` path has no
-    /// browser flow to carry them ([`Authenticator::authenticate`] passes
-    /// `None`/`None`) — they are threaded through, never assumed.
+    /// `redirect_uri` must be byte-identical to the one sent to
+    /// [`authorize_redirect`](Self::authorize_redirect): RFC 6749 §4.1.3
+    /// requires it whenever the authorize request carried one. GitHub does not
+    /// enforce that; Authentik does, and refuses the client (`invalid_client`)
+    /// before it even looks at the code.
+    ///
+    /// All three are `Option` because the API/CLI `POST /v1/auth/login` path
+    /// has no browser flow to carry them ([`Authenticator::authenticate`]
+    /// passes `None`s) — they are threaded through, never assumed.
     pub async fn exchange(
         &self,
         code: &str,
+        redirect_uri: Option<&str>,
         verifier: Option<&str>,
         expected_nonce: Option<&str>,
     ) -> Result<Principal, IdentityError> {
-        let (claims, from_id_token) = self.exchange_claims(code, verifier, expected_nonce).await?;
+        let (claims, from_id_token) = self
+            .exchange_claims(code, redirect_uri, verifier, expected_nonce)
+            .await?;
         self.principal_for(&claims, from_id_token).await
     }
 
@@ -279,10 +305,13 @@ impl OAuthAuthenticator {
     pub async fn exchange_identity(
         &self,
         code: &str,
+        redirect_uri: Option<&str>,
         verifier: Option<&str>,
         expected_nonce: Option<&str>,
     ) -> Result<ProviderIdentity, IdentityError> {
-        let (claims, from_id_token) = self.exchange_claims(code, verifier, expected_nonce).await?;
+        let (claims, from_id_token) = self
+            .exchange_claims(code, redirect_uri, verifier, expected_nonce)
+            .await?;
         Ok(self.identity_from(&claims, from_id_token)?.0)
     }
 
@@ -291,6 +320,7 @@ impl OAuthAuthenticator {
     async fn exchange_claims(
         &self,
         code: &str,
+        redirect_uri: Option<&str>,
         verifier: Option<&str>,
         expected_nonce: Option<&str>,
     ) -> Result<(serde_json::Value, bool), IdentityError> {
@@ -300,6 +330,9 @@ impl OAuthAuthenticator {
             ("client_id", &self.cfg.client_id),
             ("client_secret", &self.cfg.client_secret),
         ];
+        if let Some(r) = redirect_uri.filter(|r| !r.is_empty()) {
+            pairs.push(("redirect_uri", r));
+        }
         // PKCE (RFC 7636): the provider recomputes S256(verifier) and compares
         // it to the challenge it stored at authorize time.
         if let Some(v) = verifier.filter(|v| !v.is_empty()) {
@@ -323,6 +356,9 @@ impl OAuthAuthenticator {
             .await
             .map_err(|e| IdentityError::Issuance(format!("token endpoint: {e}")))?;
         if !token_resp.status().is_success() {
+            let status = token_resp.status();
+            let why = oauth_error(token_resp).await;
+            tracing::warn!(provider = %self.cfg.provider_id, %status, error = %why, "OAuth token endpoint refused the code exchange");
             return Err(IdentityError::AuthFailed);
         }
         let token: serde_json::Value = token_resp
@@ -362,6 +398,9 @@ impl OAuthAuthenticator {
             .await
             .map_err(|e| IdentityError::Issuance(format!("userinfo endpoint: {e}")))?;
         if !user_resp.status().is_success() {
+            let status = user_resp.status();
+            let why = oauth_error(user_resp).await;
+            tracing::warn!(provider = %self.cfg.provider_id, %status, error = %why, "OAuth userinfo endpoint refused the access token");
             return Err(IdentityError::AuthFailed);
         }
         let user: serde_json::Value = user_resp
@@ -685,11 +724,11 @@ fn verified_email(claims: &serde_json::Value) -> Option<String> {
 #[async_trait]
 impl Authenticator for OAuthAuthenticator {
     /// The API/CLI shape (`POST /v1/auth/login`): no browser flow, hence no
-    /// PKCE verifier and no nonce to check. Callers that *do* have one (the
+    /// redirect URI to replay, no PKCE verifier and no nonce to check. Callers that *do* have one (the
     /// browser callback, or a CLI that ran its own authorize) use
     /// [`OAuthAuthenticator::exchange`] directly.
     async fn authenticate(&self, credential: &str) -> Result<Principal, IdentityError> {
-        self.exchange(credential, None, None).await
+        self.exchange(credential, None, None, None).await
     }
 }
 

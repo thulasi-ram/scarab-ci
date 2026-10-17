@@ -141,6 +141,8 @@ struct Provider {
     id_token: Arc<Mutex<Option<IdToken>>>,
     /// The `code_verifier` seen at `/token`, per exchange (`None` = absent).
     verifiers: Arc<Mutex<Vec<Option<String>>>>,
+    /// The `redirect_uri` seen at `/token`, per exchange, still form-encoded.
+    redirect_uris: Arc<Mutex<Vec<Option<String>>>>,
     /// How often userinfo was consulted — `0` is how "no silent fallback" is
     /// proven rather than asserted.
     userinfo_hits: Arc<Mutex<usize>>,
@@ -165,6 +167,7 @@ async fn provider(id_token: Option<IdToken>) -> Provider {
         base: base.clone(),
         id_token: Arc::new(Mutex::new(id_token)),
         verifiers: Arc::new(Mutex::new(Vec::new())),
+        redirect_uris: Arc::new(Mutex::new(Vec::new())),
         userinfo_hits: Arc::new(Mutex::new(0)),
         user: Arc::new(Mutex::new(
             serde_json::json!({ "id": 1001, "login": "alice", "name": "Alice A" }),
@@ -185,6 +188,10 @@ async fn provider(id_token: Option<IdToken>) -> Provider {
                         .lock()
                         .unwrap()
                         .push(form_field(&body, "code_verifier"));
+                    p.redirect_uris
+                        .lock()
+                        .unwrap()
+                        .push(form_field(&body, "redirect_uri"));
                     if !body.contains("code=good-code") {
                         return (StatusCode::BAD_REQUEST, "bad code").into_response();
                     }
@@ -574,6 +581,25 @@ async fn pkce_challenge_is_sent_and_the_verifier_round_trips() {
     );
 }
 
+/// RFC 6749 §4.1.3: an authorize request that carried `redirect_uri` obliges
+/// the token request to carry the same one. GitHub lets it slide; Authentik
+/// answers `invalid_client`, which surfaced as a bare 401 on every login. The
+/// exchange must replay exactly what the authorize redirect sent.
+#[tokio::test]
+async fn token_exchange_replays_the_authorize_redirect_uri() {
+    let p = provider(None).await;
+    let app = app_for(&p, vec![], false);
+
+    let (location, flow) = begin_login(&app).await;
+    let sent = form_field(location.split_once('?').unwrap().1, "redirect_uri")
+        .expect("authorize redirect carries redirect_uri");
+    assert_eq!(sent, "https%3A%2F%2Fscarab.example.com%2Fv1%2Fauth%2Fcallback");
+
+    let resp = callback(&app, &flow, "good-code").await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    assert_eq!(p.redirect_uris.lock().unwrap().as_slice(), &[Some(sent)]);
+}
+
 /// The API/CLI path has no server-side browser flow, so it stays usable with no
 /// verifier — and forwards one when the client ran its own authorize.
 #[tokio::test]
@@ -598,6 +624,7 @@ async fn api_login_works_without_a_verifier_and_forwards_one_when_given() {
                     serde_json::json!({
                         "credential": "good-code",
                         "code_verifier": "cli-held-verifier",
+                        "redirect_uri": "http://127.0.0.1:8976/cb",
                     })
                     .to_string(),
                 ))
@@ -609,6 +636,11 @@ async fn api_login_works_without_a_verifier_and_forwards_one_when_given() {
     assert_eq!(
         p.verifiers.lock().unwrap().as_slice(),
         &[None, Some("cli-held-verifier".into())]
+    );
+    assert_eq!(
+        p.redirect_uris.lock().unwrap().as_slice(),
+        &[None, Some("http%3A%2F%2F127.0.0.1%3A8976%2Fcb".into())],
+        "a CLI that ran its own authorize gets its redirect_uri replayed"
     );
 }
 

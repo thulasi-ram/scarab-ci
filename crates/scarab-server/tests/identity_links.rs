@@ -50,6 +50,16 @@ async fn stub(user: serde_json::Value) -> Stub {
         .route(
             "/token",
             post(|body: String| async move {
+                // Authentik's strictness (RFC 6749 §4.1.3): the exchange must
+                // replay the authorize request's redirect_uri, or the client is
+                // refused before the code is even looked at.
+                if !body.contains("redirect_uri=https%3A%2F%2Fscarab.example.com%2Fv1%2Fauth%2Fcallback") {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        axum::Json(serde_json::json!({ "error": "invalid_client" })),
+                    )
+                        .into_response();
+                }
                 if !body.contains("code=good-code") {
                     return (StatusCode::BAD_REQUEST, "bad code").into_response();
                 }
