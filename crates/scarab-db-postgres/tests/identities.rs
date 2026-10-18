@@ -247,3 +247,41 @@ async fn link_merges_a_claimed_single_identity_principal_with_its_tokens() {
     ));
     tdb.cleanup().await;
 }
+
+/// `resolve_principal` follows merges to the live Principal — and a merge
+/// chain that loops (a corrupt row; no code path writes one) is an error after
+/// a bounded walk, never a hang on the request that typed the subject.
+#[tokio::test]
+async fn resolve_principal_follows_merges_and_refuses_a_merge_cycle() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+    let a = db.sign_in(&ident("1", "a"), "github:a", 1).await.unwrap();
+    let b = db.sign_in(&ident("2", "b"), "github:b", 2).await.unwrap();
+
+    sqlx::query("UPDATE principals SET merged_into = $2 WHERE id = $1")
+        .bind(&a)
+        .bind(&b)
+        .execute(&tdb.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        scarab_identity::resolve_principal(&db, &a).await.unwrap(),
+        Some(b.clone()),
+        "a merged-away id resolves to its target"
+    );
+
+    sqlx::query("UPDATE principals SET merged_into = $2 WHERE id = $1")
+        .bind(&b)
+        .bind(&a)
+        .execute(&tdb.pool)
+        .await
+        .unwrap();
+    let err = scarab_identity::resolve_principal(&db, &a)
+        .await
+        .expect_err("a cycle must not resolve");
+    assert!(err.to_string().contains("does not end"), "{err}");
+}
