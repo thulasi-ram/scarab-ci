@@ -32,7 +32,9 @@ required         ci/changes             # the path-filter decision itself
 # Path-filtered by `changes` since git-bug 6729fc2 — a UI-only PR correctly
 # skips the Rust tier, a Rust-only PR correctly skips the UI tier, and a
 # Rust-or-UI PR always runs the contract gate. On a push to MAIN nothing is
-# filtered, so trunk still runs all three.
+# filtered, so trunk still runs all three — unless a passing PR run already
+# validated that exact git tree (ci.yml `record-validated-tree`), which is the
+# same evidence this gate accepted for the merge.
 #
 # `ci/test` and `ci/coverage` were ONE job as of git-bug b69c286 — the two ran
 # the same 1,056 tests, and `cargo llvm-cov nextest` fails on a red suite, so
