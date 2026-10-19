@@ -77,7 +77,7 @@ impl Drop for TestPg {
     fn drop(&mut self) {
         let admin_url = self.admin_url.clone();
         let dbname = self.dbname.clone();
-        let _ = std::thread::spawn(move || {
+        let cleanup = std::thread::spawn(move || {
             let Ok(rt) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -94,8 +94,26 @@ impl Drop for TestPg {
                     admin.close().await;
                 }
             });
-        })
-        .join();
+        });
+        // Wait WITHOUT stalling the test's runtime. This drop runs on a runtime
+        // worker while the router's background loops still hold a pool on that
+        // runtime; one of them can be mid-SCRAM-login right now. PG 15+ makes
+        // `DROP DATABASE` wait for every backend in the cluster to accept a
+        // ProcSignalBarrier, and a backend mid-login cannot until
+        // `authentication_timeout` (60s) kills it — so a plain `join()` here
+        // parked the very task that login needed, and every concurrent test's
+        // DROP stalled behind it: twenty tests at exactly 60.4s, 83% of CI test
+        // time. `block_in_place` hands this worker's tasks to another thread
+        // for the wait, so the login finishes and the DROP proceeds. Needs the
+        // multi-thread flavor — which every test in this crate uses for that
+        // reason; a current-thread caller falls back to the old blocking join.
+        let multi = tokio::runtime::Handle::try_current()
+            .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+        if multi {
+            let _ = tokio::task::block_in_place(|| cleanup.join());
+        } else {
+            let _ = cleanup.join();
+        }
     }
 }
 
