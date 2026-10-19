@@ -36,6 +36,11 @@ fn spawn_server(port: u16, db_url: &str, object_dir: &std::path::Path, log: &std
         .env("SCARAB_NAMESPACE", namespace())
         .env("SCARAB_DEV_INSECURE", "1")
         .env("KUBECONFIG", kubeconfig())
+        // The stack server's workspace service, not `.env`'s half of it (see
+        // `stack_workspace_env`): without the discovered URL every step Pod of
+        // this server hung undrainable — the run sat `slow:running` for the
+        // whole 240s budget on every e2e run since at least 2026-09-08.
+        .envs(stack_workspace_env())
         .env_remove("SCARAB_S3_BUCKET")
         .env_remove("SCARAB_S3_ENDPOINT")
         .env_remove("SCARAB_S3_ACCESS_KEY")
@@ -59,6 +64,24 @@ async fn wait_healthy(client: &reqwest::Client, base: &str, log: &std::path::Pat
         "spawned scarab-server never became healthy at {base}; log:\n{}",
         std::fs::read_to_string(log).unwrap_or_default()
     );
+}
+
+/// Prints this test's OWN server log if the test panics. The suite's failure
+/// trap tails the STACK server's log, which says nothing about this instance —
+/// and its log lives in a tempdir deleted on drop.
+struct LogOnPanic(std::path::PathBuf);
+
+impl Drop for LogOnPanic {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            let log = std::fs::read_to_string(&self.0).unwrap_or_default();
+            let tail: Vec<&str> = log.lines().rev().take(200).collect();
+            eprintln!("==> crash_resume's own scarab-server log (last 200 lines):");
+            for line in tail.iter().rev() {
+                eprintln!("{line}");
+            }
+        }
+    }
 }
 
 /// A free loopback port, chosen by the OS.
@@ -97,6 +120,8 @@ async fn crash_resume_completes_exactly_once() {
     let base = format!("http://127.0.0.1:{port}");
     let objects = tempfile::tempdir().expect("object dir");
     let log = objects.path().join("server.log");
+    // Declared after `objects` so it drops FIRST — the tempdir must still exist.
+    let _log_on_panic = LogOnPanic(log.clone());
     let client = client();
 
     let mut child = spawn_server(port, &db_url, objects.path(), &log);
