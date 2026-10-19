@@ -65,6 +65,7 @@ concurrency:
 jobs:
   poke:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       # The only permission needed: push one empty commit.
       contents: write

@@ -1,13 +1,18 @@
-# Full-stack E2E, nightly + on-demand (test-strategy Phase 2): the proc-mode
+# Full-stack E2E, weekly + on-demand (test-strategy Phase 2): the proc-mode
 # harness (compose Postgres+MinIO, a kind cluster, scarab-server as a host
 # process) driven by the env-gated `scarab-e2e` crate — CI parity with
 # `just e2e`. Deliberately NOT per-PR: it is the slowest tier, and a red
-# nightly is triaged as a real timing bug (zero auto-retries).
+# run is triaged as a real timing bug (zero auto-retries).
+#
+# WEEKLY, not nightly, because Actions minutes are limited: it failed all 18
+# nightly runs of Oct 1-19 2026 (~74 billed minutes) on the same red
+# `crash_resume` case — a nightly repeat of a known failure buys no new signal.
+# Dispatch it by hand after a fix; restore nightly once it is green and stays so.
 name: e2e
 
 on:
   schedule:
-    - cron: "23 2 * * *" # nightly
+    - cron: "23 2 * * 1" # weekly, Mondays
   workflow_dispatch:
 
 concurrency:

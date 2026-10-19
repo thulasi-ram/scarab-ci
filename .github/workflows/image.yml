@@ -14,7 +14,7 @@
 # This lets an arm64 host (e.g. Apple-silicon colima) pull the same tag CI
 # publishes for amd64.
 #
-# - PRs: build only, both arches, no push (catch a broken Dockerfile).
+# - PRs: build only, amd64 only, no push (catch a broken Dockerfile).
 # - push to main: build + push, tagged `edge` and by commit SHA (`sha-<sha>`).
 # - v* tags: build + push a release, tagged with the semver + `latest`.
 name: image
@@ -58,6 +58,7 @@ jobs:
   # only discover in a deploy. Selection is a PR-only economy.
   changes:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
       pull-requests: read
@@ -129,7 +130,11 @@ jobs:
   build:
     needs: changes
     if: needs.changes.outputs.images != '[]'
-    runs-on: ${{ matrix.runner }}
+    # Runner follows the platform. An expression, not `include:` — on a PR the
+    # arm64 platform is absent, and an `include` naming it would append a new,
+    # image-less combination (the same trap described at `matrix:` below).
+    runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    timeout-minutes: 45
     permissions:
       contents: read
       packages: write
@@ -144,12 +149,12 @@ jobs:
         # NEW combination with no `platform` and no `runner`. Hence the `case`
         # step below.
         image: ${{ fromJSON(needs.changes.outputs.images) }}
-        platform: [linux/amd64, linux/arm64]
-        include:
-          - platform: linux/amd64
-            runner: ubuntu-latest
-          - platform: linux/arm64
-            runner: ubuntu-24.04-arm
+        # PRs build amd64 ONLY (Actions minutes are limited): a PR build exists to
+        # catch a broken Dockerfile, and amd64 does that. arm64 still builds on
+        # every push to main and every tag — which is what publishes the arm64
+        # manifest the Ampere demo (deploy/demo-oracle) and Apple-silicon colima
+        # pull — so an arm-only break surfaces on the merge, not in a deploy.
+        platform: ${{ fromJSON(github.event_name == 'pull_request' && '["linux/amd64"]' || '["linux/amd64","linux/arm64"]') }}
     steps:
       - uses: actions/checkout@v4
 
@@ -224,6 +229,7 @@ jobs:
     if: github.event_name != 'pull_request'
     needs: [changes, build]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
       packages: write
@@ -290,6 +296,7 @@ jobs:
         (startsWith(github.ref, 'refs/tags/v') && needs.merge.result == 'success')
       )
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
       packages: write

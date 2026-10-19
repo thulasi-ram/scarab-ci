@@ -39,6 +39,7 @@ jobs:
   # correctly skipped from passing the gate having validated nothing.
   changes:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
       pull-requests: read
@@ -90,6 +91,7 @@ jobs:
   # is precisely how this job would start going green with failing tests.
   test-and-coverage:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: changes
     if: needs.changes.outputs.test_and_coverage == 'true'
     services:
@@ -189,6 +191,7 @@ jobs:
   # duplicate — which was also the ungated one — is the one that went.
   ui-tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     needs: changes
     if: needs.changes.outputs.ui == 'true'
     steps:
@@ -213,6 +216,7 @@ jobs:
   # deal as the `kind` job (git-bug a0b42ad).
   ui-e2e:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: changes
     if: needs.changes.outputs.ui == 'true'
     continue-on-error: true
@@ -234,6 +238,7 @@ jobs:
 
   openapi-drift:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: changes
     if: needs.changes.outputs.contracts == 'true'
     steps:
