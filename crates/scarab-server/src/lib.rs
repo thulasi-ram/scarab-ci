@@ -895,6 +895,10 @@ pub struct RunSummaryDto {
     /// trigger carried no headline and on runs created before headline-stamping.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger_title: Option<String>,
+    /// The Environment this run deploys into (ADR-0037) — present only for a
+    /// deploy run, whose pipeline declared `environment:`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
 }
 
 impl From<scarab_engine::RunSummary> for RunSummaryDto {
@@ -918,6 +922,7 @@ impl From<scarab_engine::RunSummary> for RunSummaryDto {
             origin_pr_base: s.pr_base,
             pipeline: s.pipeline,
             trigger_title: s.trigger_title,
+            environment: s.environment,
         }
     }
 }

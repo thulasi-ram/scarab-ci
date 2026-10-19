@@ -4376,6 +4376,13 @@
             "format": "int64",
             "description": "Run duration in millis: `updated_at - created_at`. For a terminal run\nthis is its total wall time; for an in-flight run, elapsed-to-last-update.\nDrives the dashboard's per-run bar heights (ADR-0046)."
           },
+          "environment": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Environment this run deploys into (ADR-0037) — present only for a\ndeploy run, whose pipeline declared `environment:`."
+          },
           "git_ref": {
             "type": [
               "string",

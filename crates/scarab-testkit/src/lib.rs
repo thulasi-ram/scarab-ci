@@ -137,6 +137,7 @@ fn fake_run_summary(st: &InMemoryState, run: &RunId, status: RunStatus) -> RunSu
         run_number: st.run_number.get(run).copied(),
         pipeline: st.run_pipeline.get(run).cloned(),
         trigger_title: st.run_trigger_title.get(run).cloned(),
+        environment: st.run_deploy.get(run).map(|d| d.environment.clone()),
     }
 }
 
