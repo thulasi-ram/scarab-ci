@@ -2,11 +2,15 @@
 // Environments, Secrets, Settings. Each run row shows its origin as a grid of
 // facts (author · ref · duration) under a header line (sha · status · trigger ·
 // when), fed by the origin fields RunSummaryDto now carries. Duration ticks live
-// for in-flight runs. The runs list carries a status filter; branch/trigger/PR
-// *filters* (removed in the ADR-0054 de-mock) can now be restored on top of
-// these fields. The header CTA is contextual to the active tab.
+// for in-flight runs. The runs list filters by status, author, branch, PR,
+// pipeline and environment. The header CTA is contextual to the active tab.
+//
+// The active tab and every filter live in the URL query (`?tab=secrets`,
+// `?pipeline=ci&env=production`), not in component signals — so a refresh, a
+// shared link and the back button all land where you were. The defaults (Runs
+// tab, no filter) are the absent params, which keeps the bare repo URL clean.
 import { createResource, createSignal, createEffect, onCleanup, For, Show } from "solid-js";
-import { useParams, useNavigate } from "@solidjs/router";
+import { useParams, useNavigate, useSearchParams } from "@solidjs/router";
 import { recordVisit } from "../visited";
 import {
   listRepoRuns,
@@ -32,6 +36,7 @@ import AsciiScene from "../components/AsciiScene";
 import ponderIdle from "../../../brand/ascii/generated/ponder-ponder.json";
 
 type Tab = "runs" | "environments" | "secrets" | "settings";
+type StatusFilter = "all" | "running" | "failed";
 
 const TABS: [Tab, string][] = [
   ["runs", "Runs"],
@@ -81,6 +86,11 @@ function distinct<T>(rows: RunSummary[], pick: (r: RunSummary) => T | null | und
   return [...seen];
 }
 
+// One search-param value as a string. The router types a param as possibly
+// repeated (`?a=1&a=2`); a hand-edited URL like that just takes the first.
+const one = (v: string | string[] | undefined): string =>
+  (Array.isArray(v) ? v[0] : v) ?? "";
+
 // Duration to show: a terminal run's total wall time (frozen `duration_ms`), or
 // a live run's elapsed since creation against the ticking `now`.
 function durationLabel(r: RunSummary, now: number): string {
@@ -109,16 +119,42 @@ export default function RepoView() {
     (k) => repoForgeUrl(k.org, k.repo).catch(() => null),
   );
 
-  const [tab, setTab] = createSignal<Tab>("runs");
-  const [statusFilter, setStatusFilter] = createSignal<"all" | "running" | "failed">("all");
+  // Tab + filters are URL state (see the header comment). An unknown `?tab=`
+  // falls back to Runs rather than rendering an empty page.
+  const [search, setSearch] = useSearchParams();
+  const tab = (): Tab => {
+    const t = one(search.tab);
+    return TABS.some(([k]) => k === t) ? (t as Tab) : "runs";
+  };
+  // A tab switch is a navigation (pushes history, so Back returns to the
+  // previous tab); a filter tweak replaces the entry so Back doesn't replay
+  // every keystroke of a search.
+  const setTab = (t: Tab) => setSearch({ tab: t === "runs" ? "" : t });
+  const filterSetter = (key: string) => (v: string) => setSearch({ [key]: v }, { replace: true });
+  const statusFilter = (): StatusFilter => {
+    const v = one(search.status);
+    return v === "running" || v === "failed" ? v : "all";
+  };
+  const setStatusFilter = (f: StatusFilter) => filterSetter("status")(f === "all" ? "" : f);
   // Origin filters, client-side over the already-fetched rows. `""` = "any";
-  // `prFilter` holds the PR number stringified (`<select>` values are strings).
-  const [authorFilter, setAuthorFilter] = createSignal("");
-  const [branchFilter, setBranchFilter] = createSignal("");
-  const [prFilter, setPrFilter] = createSignal("");
+  // `prFilter` holds the PR number stringified (search params are strings).
+  const authorFilter = () => one(search.author);
+  const setAuthorFilter = filterSetter("author");
+  const branchFilter = () => one(search.branch);
+  const setBranchFilter = filterSetter("branch");
+  const prFilter = () => one(search.pr);
+  const setPrFilter = filterSetter("pr");
+  const pipelineFilter = () => one(search.pipeline);
+  const setPipelineFilter = filterSetter("pipeline");
+  const envFilter = () => one(search.env);
+  const setEnvFilter = filterSetter("env");
   const [showEnvDialog, setShowEnvDialog] = createSignal(false);
   const [envEpoch, setEnvEpoch] = createSignal(0); // bump to refetch the env list after a create
   const [secretFocus, setSecretFocus] = createSignal(0);
+  // The two secret panels read the same store through separate fetches; each
+  // bumps the OTHER's epoch after a write so neither shows a stale view.
+  const [secretListEpoch, setSecretListEpoch] = createSignal(0);
+  const [secretMatrixEpoch, setSecretMatrixEpoch] = createSignal(0);
 
   // A 1s heartbeat so in-flight runs show a live, ticking elapsed time. Terminal
   // runs use their frozen `duration_ms` and ignore this.
@@ -132,16 +168,22 @@ export default function RepoView() {
   const authors = () => distinct(rows() ?? [], (r) => r.actor).sort();
   const branches = () => distinct(rows() ?? [], branchLabel).sort();
   const prNumbers = () => distinct(rows() ?? [], (r) => r.pr_number).sort((a, b) => b - a);
+  const pipelines = () => distinct(rows() ?? [], (r) => r.pipeline).sort();
+  const environments = () => distinct(rows() ?? [], (r) => r.environment).sort();
 
   const anyFilterOn = () =>
-    statusFilter() !== "all" || !!authorFilter() || !!branchFilter() || !!prFilter();
+    statusFilter() !== "all" ||
+    !!authorFilter() ||
+    !!branchFilter() ||
+    !!prFilter() ||
+    !!pipelineFilter() ||
+    !!envFilter();
 
-  const clearFilters = () => {
-    setStatusFilter("all");
-    setAuthorFilter("");
-    setBranchFilter("");
-    setPrFilter("");
-  };
+  const clearFilters = () =>
+    setSearch(
+      { status: "", author: "", branch: "", pr: "", pipeline: "", env: "" },
+      { replace: true },
+    );
 
   // All predicates AND together. Each origin field is independently nullable, so
   // an engaged filter simply excludes any row that can't match it (older runs
@@ -152,11 +194,15 @@ export default function RepoView() {
     const author = authorFilter();
     const branch = branchFilter();
     const pr = prFilter();
+    const pipeline = pipelineFilter();
+    const env = envFilter();
     return (rows() ?? []).filter((r) => {
       if (s !== "all" && r.status !== s) return false;
       if (author && r.actor !== author) return false;
       if (branch && branchLabel(r) !== branch) return false;
       if (pr && String(r.pr_number ?? "") !== pr) return false;
+      if (pipeline && r.pipeline !== pipeline) return false;
+      if (env && r.environment !== env) return false;
       return true;
     });
   };
@@ -227,6 +273,32 @@ export default function RepoView() {
               </button>
             )}
           </For>
+
+          <Show when={pipelines().length > 0}>
+            <SearchSelect
+              icon="workflow"
+              clearable
+              placeholder="any pipeline"
+              searchPlaceholder="Search pipelines…"
+              value={pipelineFilter()}
+              onChange={setPipelineFilter}
+              options={pipelines().map((p) => ({ value: p, label: p }))}
+            />
+          </Show>
+
+          {/* Only deploy runs carry an environment (their pipeline declared
+              `environment:`), so this appears once the repo has deployed. */}
+          <Show when={environments().length > 0}>
+            <SearchSelect
+              icon="rocket"
+              clearable
+              placeholder="any environment"
+              searchPlaceholder="Search environments…"
+              value={envFilter()}
+              onChange={setEnvFilter}
+              options={environments().map((e) => ({ value: e, label: e }))}
+            />
+          </Show>
 
           <Show when={authors().length > 0}>
             <SearchSelect
@@ -321,6 +393,14 @@ export default function RepoView() {
                                 <span class="pfact strong" title="pipeline">
                                   <Icon icon="workflow" size={12} />
                                   <span class="mono">{name()}</span>
+                                </span>
+                              )}
+                            </Show>
+                            <Show when={r.environment}>
+                              {(env) => (
+                                <span class="pfact" title="deploys to environment">
+                                  <Icon icon="rocket" size={12} />
+                                  <span class="mono">{env()}</span>
                                 </span>
                               )}
                             </Show>
@@ -420,8 +500,15 @@ export default function RepoView() {
           scope={{ org: org(), repo: repo() }}
           title={`Secrets · ${org()}/${repo()}`}
           focusPing={secretFocus()}
+          epoch={secretListEpoch()}
+          onChange={() => setSecretMatrixEpoch((n) => n + 1)}
         />
-        <SecretMatrixEditor org={org()} repo={repo()} />
+        <SecretMatrixEditor
+          org={org()}
+          repo={repo()}
+          epoch={secretMatrixEpoch()}
+          onChange={() => setSecretListEpoch((n) => n + 1)}
+        />
       </Show>
 
       {/* ---- Settings ---- */}
