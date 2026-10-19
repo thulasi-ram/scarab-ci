@@ -1126,8 +1126,10 @@ export async function unbindRepo(id: string, owner: string, name: string): Promi
 
 // --- Secret coverage matrix (ADR-0037) — and, since ADR-0060, the read model
 // behind the repo/environment secret EDITOR. Each key's *effective* status per
-// column after inheritance; never a value. Not in the generated OpenAPI client
-// (plain-fetched, as the events snapshot is). ---
+// column after inheritance; never a value. Not in the generated OpenAPI client,
+// so it goes through `send` — every route here authorizes as `Administer`, the
+// GET included, and a cookie session needs the CSRF token for that (a bare
+// `fetch` 403'd the whole editor under real login). ---
 
 /** The column id of the repo-scope default — reserved, so no env can collide. */
 export const REPO_DEFAULT_COLUMN = "";
@@ -1150,8 +1152,7 @@ const matrixUrl = (org: string, repo: string) =>
 
 /** Fetch a repo's secret coverage matrix (`GET …/secrets/matrix`). */
 export async function fetchSecretMatrix(org: string, repo: string): Promise<SecretMatrix> {
-  const res = await fetch(matrixUrl(org, repo));
-  if (!res.ok) throw new Error("failed to load secret matrix");
+  const res = await send(matrixUrl(org, repo), "GET");
   return (await res.json()) as SecretMatrix;
 }
 
@@ -1175,16 +1176,13 @@ export async function setSecretCellSilenced(
   silenced: boolean,
 ): Promise<void> {
   const env = column === REPO_DEFAULT_COLUMN ? undefined : column;
-  const res = silenced
-    ? await fetch(`${matrixUrl(org, repo)}/silenced`, {
-        method: "PUT",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ key, environment: env }),
-      })
-    : await fetch(
-        `${matrixUrl(org, repo)}/silenced?key=${encodeURIComponent(key)}` +
-          (env ? `&environment=${encodeURIComponent(env)}` : ""),
-        { method: "DELETE" },
-      );
-  if (!res.ok) throw new Error("failed to update the coverage marker");
+  if (silenced) {
+    await send(`${matrixUrl(org, repo)}/silenced`, "PUT", { key, environment: env });
+  } else {
+    await send(
+      `${matrixUrl(org, repo)}/silenced?key=${encodeURIComponent(key)}` +
+        (env ? `&environment=${encodeURIComponent(env)}` : ""),
+      "DELETE",
+    );
+  }
 }
