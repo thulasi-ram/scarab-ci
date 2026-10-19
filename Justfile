@@ -319,8 +319,10 @@ e2e:
     # code, and surface the server log first on a red run (down.sh removes it).
     trap 'code=$?; if [ "$code" -ne 0 ]; then echo "==> scarab-server log (suite failed):"; tail -n 200 deploy/local-proc/server.log 2>/dev/null || true; fi; bash deploy/local-proc/down.sh; exit "$code"' EXIT
     cargo build -p scarab-server -p scarab-cli
-    # The same env file the stack booted from — SCARAB_ADDR names the server.
-    set -a && source deploy/local-proc/.env && set +a
+    # The same env file the stack booted from — SCARAB_ADDR names the server —
+    # plus what up.sh DISCOVERED at boot (the Pod-facing workspace URL, the
+    # fetcher image), which a test that spawns its own server must reuse.
+    set -a && source deploy/local-proc/.env && source deploy/local-proc/.env.generated && set +a
     export SCARAB_E2E=1
     export SCARAB_E2E_URL="http://${SCARAB_ADDR/0.0.0.0/127.0.0.1}"
     export SCARAB_E2E_DATABASE_URL="$SCARAB_DATABASE_URL"

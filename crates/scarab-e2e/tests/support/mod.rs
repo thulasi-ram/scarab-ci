@@ -34,6 +34,31 @@ pub fn base_url() -> String {
     std::env::var("SCARAB_E2E_URL").unwrap_or_else(|_| "http://localhost:8080".into())
 }
 
+/// The workspace-service settings the stack's server was booted with, for a
+/// test that spawns ITS OWN server against the same kind cluster.
+///
+/// `up.sh` DISCOVERS the Pod-facing workspace URL by probing from a real Pod
+/// and exports it only into the stack server's process; `.env` carries the
+/// token secret but not the URL. A spawned server inheriting just `.env` turns
+/// the workspace flow ON (the secret selects it) with the default URL
+/// `http://scarab-workspace` — resolvable only in Helm mode — so its step Pods
+/// can never drain and sit `Running` forever. `.env.generated` records the
+/// discovered values for exactly this "a different process" case; `just e2e`
+/// sources it. Missing → panic: an opted-in tier must not boot a server that
+/// structurally cannot finish a step.
+pub fn stack_workspace_env() -> [(&'static str, String); 3] {
+    let need = |k: &str| {
+        std::env::var(k).unwrap_or_else(|_| {
+            panic!("{k} unset — `just e2e` sources deploy/local-proc/.env.generated (written by up.sh)")
+        })
+    };
+    [
+        ("SCARAB_WORKSPACE_URL", need("SCARAB_TEST_WORKSPACE_POD_URL")),
+        ("SCARAB_WORKSPACE_TOKEN_SECRET", need("SCARAB_TEST_WORKSPACE_SECRET")),
+        ("SCARAB_WSFETCH_IMAGE", need("SCARAB_TEST_WSFETCH_IMAGE")),
+    ]
+}
+
 /// The stack's Postgres URL. Doubles as the *maintenance* URL the
 /// crash/resume scenario carves its throwaway database from (the same
 /// pattern as `scarab-db-postgres/tests/common`).
