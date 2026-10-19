@@ -8,7 +8,7 @@
 # binary needs nothing but libc and CA roots for outbound TLS.
 
 # --- builder ---------------------------------------------------------------
-FROM rust:1-bookworm AS builder
+FROM rust:1-bookworm AS chef
 
 # ring (via rustls) compiles C; the bookworm base ships gcc, but install the
 # essentials explicitly so the build never silently depends on base contents.
@@ -21,18 +21,33 @@ WORKDIR /src
 # Pin the toolchain before copying sources so it caches independently.
 COPY rust-toolchain.toml ./
 RUN rustc --version
+RUN cargo install cargo-chef --locked --version 0.1.78
+
+# Dependency caching (cargo-chef). This build used a BuildKit cache mount on
+# target/, which in CI started EMPTY on every runner — `cache-to: type=gha`
+# exports image layers, never cache mounts — so every build was a cold release
+# compile of ~400 crates. `cook` compiles the dependency graph alone into an ordinary LAYER,
+# which the GHA layer cache does keep; its input is only the manifests +
+# lockfile (`recipe.json`), so a source-only change reuses it. No cache mount on
+# the final build: a mount over target/ would hide the cooked layer.
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+COPY --from=planner /src/recipe.json recipe.json
+RUN cargo chef cook --release --locked -p scarab-server \
+        --recipe-path recipe.json
 
 # Manifests + all workspace crates. `ui/` is npm (not a cargo member) and is
 # excluded by .dockerignore, so it never enters the build context.
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-# Build only the server binary in release mode. BuildKit cache mounts keep the
-# cargo registry and target dir warm across builds; copy the binary out of the
-# (ephemeral) target mount so it survives into the next stage.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
-    cargo build --release --locked -p scarab-server \
+# Build only the server binary in release mode, on top of the cooked
+# dependencies.
+RUN cargo build --release --locked -p scarab-server \
     && cp target/release/scarab-server /usr/local/bin/scarab-server
 
 # --- runtime ---------------------------------------------------------------

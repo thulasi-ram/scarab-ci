@@ -204,7 +204,10 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           outputs: ${{ github.event_name != 'pull_request' && format('type=image,name={0}/{1}/{2},push-by-digest=true,name-canonical=true,push=true', env.REGISTRY, github.repository_owner, matrix.image) || 'type=cacheonly' }}
           cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.platform }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ matrix.platform }}
+          # PRs READ main's layer cache but never write their own: the repo has
+          # 10 GB of Actions cache, and per-PR copies of the cooked-dependency
+          # layers (docker/server/Dockerfile) would evict main's.
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=gha,mode=max,scope={0}-{1}', matrix.image, matrix.platform) || '' }}
 
       - name: Export digest
         if: github.event_name != 'pull_request'
