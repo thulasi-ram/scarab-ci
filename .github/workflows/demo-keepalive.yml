@@ -12,10 +12,11 @@
 # 2. ORACLE RECLAIMS IDLE ALWAYS FREE INSTANCES. The published rule is a
 #    conjunction over a 7-day window, 95th percentile: CPU AND network AND
 #    memory all under the threshold. Sources disagree on the number (10% vs
-#    20%); the cadence below clears either, so it is not worth pinning down. An idle k3s box fails CPU and network
-#    comfortably; memory on 12 GB is the only one likely to save it on its own,
-#    and "probably fine" is not a plan for the box the demo lives on. Six real
-#    runs a day move all three.
+#    20%). An idle k3s box fails CPU and network comfortably; memory on 12 GB
+#    is the only one likely to save it on its own. This ran six times a day to
+#    clear either threshold; since 2026-10-19 it runs ONCE a day, the owner's
+#    call against the Actions-minutes budget. If Oracle reclaims the box, raise
+#    the cadence below first.
 #
 # ---------------------------------------------------------------------------
 # TODO — this SHOULD dispatch, and today it structurally cannot.
@@ -51,9 +52,10 @@ name: demo-keepalive
 
 on:
   schedule:
-    # Every 4 hours, off the hour — GitHub's scheduler is heavily contended at
-    # :00 and delays cron jobs by up to ~15 minutes there.
-    - cron: "23 */4 * * *"
+    # Once a day (owner decision 2026-10-19: Actions minutes are limited, and
+    # one real run a day is enough for the box). Off the hour — GitHub's
+    # scheduler is heavily contended at :00 and delays cron jobs there.
+    - cron: "23 6 * * *"
   workflow_dispatch:
 
 # One at a time, and never cancel a running one: the point is that the run
@@ -112,6 +114,6 @@ jobs:
 
 # ⚠ GitHub disables scheduled workflows in a repository with no commit activity
 # for 60 days, and emails the owner rather than failing loudly. This workflow
-# pushes to a branch every 4 hours, which is itself repository activity — so it
+# pushes to a branch every day, which is itself repository activity — so it
 # keeps its own schedule alive. Do not "clean up" the branch push into something
 # that writes nothing.
