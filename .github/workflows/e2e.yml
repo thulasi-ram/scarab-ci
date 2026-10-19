@@ -28,19 +28,27 @@ jobs:
       # workspace build exhausts the runner's disk (see ci.yml).
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
-      - name: Free runner disk space
+      # ONLY WHEN SHORT. The cleanup is slow (deleting ~30 GB of small files: 1.5-4
+      # billed minutes a run), and today's runner images are 145 GB disks (113 GB
+      # free AFTER this cleanup, measured 2026-10). Below 40 GB free it still runs
+      # in full — the ENOSPC history is real; the step logs the before figure.
+      - name: Free runner disk space (only if short)
         run: |
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup "$AGENT_TOOLSDIRECTORY"
-          # $AGENT_TOOLSDIRECTORY is /opt/hostedtoolcache, and `helm/kind-action`
-          # below installs kind THROUGH it: deleting it without putting the
-          # (empty) directory back fails the action outright — "Cache directory
-          # '/opt/hostedtoolcache' does not exist" — before a single test runs.
-          # Recreating it keeps the ~8GB the tree needs and the kind install.
-          if [ -n "${AGENT_TOOLSDIRECTORY:-}" ]; then
-            sudo mkdir -p "$AGENT_TOOLSDIRECTORY"
-            sudo chown "$(id -u):$(id -g)" "$AGENT_TOOLSDIRECTORY"
+          avail=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
+          echo "free before: ${avail}G"
+          if [ "$avail" -lt 40 ]; then
+            sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup "$AGENT_TOOLSDIRECTORY"
+            # $AGENT_TOOLSDIRECTORY is /opt/hostedtoolcache, and `helm/kind-action`
+            # below installs kind THROUGH it: deleting it without putting the
+            # (empty) directory back fails the action outright — "Cache directory
+            # '/opt/hostedtoolcache' does not exist" — before a single test runs.
+            # Recreating it keeps the ~8GB the tree needs and the kind install.
+            if [ -n "${AGENT_TOOLSDIRECTORY:-}" ]; then
+              sudo mkdir -p "$AGENT_TOOLSDIRECTORY"
+              sudo chown "$(id -u):$(id -g)" "$AGENT_TOOLSDIRECTORY"
+            fi
+            sudo docker system prune -af >/dev/null 2>&1 || true
           fi
-          sudo docker system prune -af >/dev/null 2>&1 || true
           df -h /
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

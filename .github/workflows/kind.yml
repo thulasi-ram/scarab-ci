@@ -114,10 +114,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The runner ships ~14GB free; a workspace debug build + kind + images
-      # need more. Drop the unused toolchains up front.
-      - name: Free runner disk
-        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+      # A workspace debug build + kind + images needed more than older runners'
+      # ~14GB free, so this dropped the unused toolchains up front.
+      # ONLY WHEN SHORT. The cleanup is slow (deleting ~30 GB of small files: 1.5-4
+      # billed minutes a run), and today's runner images are 145 GB disks (113 GB
+      # free AFTER this cleanup, measured 2026-10). Below 40 GB free it still runs
+      # in full — the ENOSPC history is real; the step logs the before figure.
+      - name: Free runner disk (only if short)
+        run: |
+          avail=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
+          echo "free before: ${avail}G"
+          if [ "$avail" -lt 40 ]; then
+            sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          fi
+          df -h /
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2

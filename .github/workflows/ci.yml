@@ -124,10 +124,18 @@ jobs:
       # exhausts the runner's disk (ENOSPC on first run).
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
-      - name: Free runner disk space
+      # ONLY WHEN SHORT. The cleanup is slow (deleting ~30 GB of small files: 1.5-4
+      # billed minutes a run), and today's runner images are 145 GB disks (113 GB
+      # free AFTER this cleanup, measured 2026-10). Below 40 GB free it still runs
+      # in full — the ENOSPC history is real; the step logs the before figure.
+      - name: Free runner disk space (only if short)
         run: |
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup "$AGENT_TOOLSDIRECTORY"
-          sudo docker system prune -af >/dev/null 2>&1 || true
+          avail=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
+          echo "free before: ${avail}G"
+          if [ "$avail" -lt 40 ]; then
+            sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup "$AGENT_TOOLSDIRECTORY"
+            sudo docker system prune -af >/dev/null 2>&1 || true
+          fi
           df -h /
       - uses: actions/checkout@v4
       # MinIO is a plain step, not a `services:` container: GitHub's service
