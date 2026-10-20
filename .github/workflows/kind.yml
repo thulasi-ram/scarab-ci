@@ -114,10 +114,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The runner ships ~14GB free; a workspace debug build + kind + images
-      # need more. Drop the unused toolchains up front.
-      - name: Free runner disk
-        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+      # A workspace debug build + kind + images needed more than older runners'
+      # ~14GB free, so this dropped the unused toolchains up front.
+      # ONLY WHEN SHORT. The cleanup is slow (deleting ~30 GB of small files: 1.5-4
+      # billed minutes a run), and today's runner images are 145 GB disks (113 GB
+      # free AFTER this cleanup, measured 2026-10). Below 40 GB free it still runs
+      # in full — the ENOSPC history is real; the step logs the before figure.
+      - name: Free runner disk (only if short)
+        run: |
+          avail=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
+          echo "free before: ${avail}G"
+          if [ "$avail" -lt 40 ]; then
+            sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          fi
+          df -h /
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -170,11 +180,10 @@ jobs:
       #
       # ⚠ Goes away with the node driver (git-bug 0628369), together with
       # docker/wsfetch/ and the executor's WorkspaceFetch.
-      # The GHA layer cache below is a BuildKit cache EXPORT, which the default
-      # `docker` driver cannot do — without this step the build fails with
-      # "Cache export is not supported for the docker driver" before any test
-      # runs. setup-buildx-action creates a `docker-container` builder, which
-      # supports both the export and the `load: true` this step needs. image.yml
+      # The GHA layer cache below is a BuildKit cache IMPORT, which the default
+      # `docker` driver cannot do — without this step the build fails before any
+      # test runs. setup-buildx-action creates a `docker-container` builder, which
+      # supports both the cache and the `load: true` this step needs. image.yml
       # already does the same before its builds.
       - uses: docker/setup-buildx-action@v4
 
@@ -185,8 +194,10 @@ jobs:
           file: docker/wsfetch/Dockerfile
           tags: ${{ env.WSFETCH_IMAGE }}
           load: true
-          cache-from: type=gha,scope=wsfetch
-          cache-to: type=gha,scope=wsfetch,mode=max
+          # image.yml's amd64 fetcher cache — the same Dockerfile, so one copy
+          # serves both (a private `wsfetch` scope was a second ~GB of the 10 GB
+          # repo cache). Read-only here: image.yml on main is what writes it.
+          cache-from: type=gha,scope=scarab-wsfetch-linux/amd64
 
       # Preload busybox too: nearly every live case runs it, and pulling it
       # once here dodges Docker Hub anonymous-pull throttling on the kubelet.

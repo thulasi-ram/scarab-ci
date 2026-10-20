@@ -9,9 +9,13 @@
 # the functional tier's InMemoryDb path mostly duplicates.
 name: mutants
 
+# DISPATCH ONLY — no schedule. Actions minutes are limited, and a real run is
+# up to 3 crates x `timeout-minutes: 350`: one fire could spend half a month's
+# free-tier budget. Until 2026-10 the scheduled run "succeeded" in ~1 minute
+# only because `cargo mutants` died creating its `--output` directory and the
+# `|| true` below swallowed it — the cost was hidden by the job never working.
+# Run it by hand, one `package` at a time, when you want the report.
 on:
-  schedule:
-    - cron: "0 3 1 * *" # monthly, 1st at 03:00 UTC
   workflow_dispatch:
     inputs:
       package:
@@ -47,6 +51,7 @@ jobs:
         if: ${{ env.skip != '1' }}
         # Report-only: swallow the exit code; the artifact + summary are the output.
         run: |
+          mkdir -p "mutants-out/${{ matrix.package }}"
           cargo mutants --package "${{ matrix.package }}" --timeout 300 --no-shuffle \
             --output "mutants-out/${{ matrix.package }}" || true
       - name: Summarize survivors

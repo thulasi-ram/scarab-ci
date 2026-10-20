@@ -14,7 +14,7 @@
 # This lets an arm64 host (e.g. Apple-silicon colima) pull the same tag CI
 # publishes for amd64.
 #
-# - PRs: build only, both arches, no push (catch a broken Dockerfile).
+# - PRs: build only, amd64 only, no push (catch a broken Dockerfile).
 # - push to main: build + push, tagged `edge` and by commit SHA (`sha-<sha>`).
 # - v* tags: build + push a release, tagged with the semver + `latest`.
 name: image
@@ -52,20 +52,37 @@ jobs:
   # The per-image filters live in `.github/path-filters.yml` — the same file
   # `ci.yml` reads, so "did the UI change?" has one answer in this repo.
   #
-  # ON A PUSH OR A TAG, ALL FOUR ARE BUILT. The `edge` / `sha-<sha>` / semver
-  # tags are how `kind.yml`, `just local-helm sha-<sha>` and the chart pin a
-  # build, and a tag that exists for some images and not others is a trap you
-  # only discover in a deploy. Selection is a PR-only economy.
+  # ON A PUSH OR A TAG, ALL FOUR GET EVERY TAG. The `edge` / `sha-<sha>` /
+  # semver tags are how `kind.yml`, `just local-helm sha-<sha>` and the chart
+  # pin a build, and a tag that exists for some images and not others is a trap
+  # you only discover in a deploy.
+  #
+  # But a push to main no longer REBUILDS all four (Actions minutes are
+  # limited). When the previous main push published `sha-<before>` for all four
+  # images, an image whose inputs did not change since then is RE-TAGGED from
+  # `sha-<before>` (seconds, no build) and only the changed ones are built. If
+  # any `sha-<before>` is missing — that run was cancelled by
+  # `cancel-in-progress`, or failed — everything is built, so a skipped change
+  # can never be papered over by a stale image. Tags and dispatches always
+  # build all four.
   changes:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
       pull-requests: read
+      packages: read
     outputs:
       images: ${{ steps.select.outputs.images }}
+      # Unchanged images to re-tag from `retag_from` instead of building.
+      retag: ${{ steps.select.outputs.retag }}
+      retag_from: ${{ steps.select.outputs.retag_from }}
       chart: ${{ steps.filter.outputs.chart == 'true' }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The main-push diff below compares against `github.event.before`.
+          fetch-depth: 0
 
       # A release tag must name ONE version everywhere: the image tags
       # (`metadata-action` semver), the chart version, and the chart's
@@ -93,25 +110,60 @@ jobs:
           done
           exit "$bad"
 
+      # Push to main only: did the previous push publish all four images? Only
+      # then is "unchanged since `before`" a license to re-tag.
+      - name: Is the previous main build complete?
+        id: prev
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          BEFORE: ${{ github.event.before }}
+          IMAGE_BASE: ${{ env.REGISTRY }}/${{ github.repository_owner }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          ok=true
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            echo "no usable previous commit: building all"
+            ok=false
+          else
+            echo "$GH_TOKEN" | docker login "$REGISTRY" -u "$ACTOR" --password-stdin >/dev/null
+            for img in scarab-server scarab-clone scarab-results-sidecar scarab-wsfetch; do
+              if ! docker buildx imagetools inspect "$IMAGE_BASE/$img:sha-$BEFORE" >/dev/null 2>&1; then
+                echo "$img:sha-$BEFORE was never published: building all"
+                ok=false
+              fi
+            done
+          fi
+          echo "ok=$ok" >> "$GITHUB_OUTPUT"
+
       - uses: dorny/paths-filter@v3
         id: filter
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' || steps.prev.outputs.ok == 'true'
         with:
           filters: .github/path-filters.yml
-      # Emits the JSON array the build matrix expands. Non-PR events short out
-      # to the full set before any filter output is read.
+          # Ignored on PRs (the action reads the PR's file list); on a main push
+          # it is the commit the previous images were built from.
+          base: ${{ github.event.before }}
+      # Emits the JSON array the build matrix expands, and the complementary
+      # re-tag set. Filtered selection on PRs and on a main push whose previous
+      # build is complete; the full set (nothing re-tagged) otherwise.
       - name: Select the images to build
         id: select
         env:
           ALL: '["scarab-server","scarab-clone","scarab-results-sidecar","scarab-wsfetch"]'
           IS_PR: ${{ github.event_name == 'pull_request' }}
+          PREV_OK: ${{ steps.prev.outputs.ok == 'true' }}
+          BEFORE: ${{ github.event.before }}
           SERVER: ${{ steps.filter.outputs.image_server }}
           CLONE: ${{ steps.filter.outputs.image_clone }}
           SIDECAR: ${{ steps.filter.outputs.image_results_sidecar }}
           WSFETCH: ${{ steps.filter.outputs.image_wsfetch }}
         run: |
           set -euo pipefail
-          if [ "$IS_PR" != "true" ]; then
+          retag='[]'
+          if [ "$IS_PR" != "true" ] && [ "$PREV_OK" != "true" ]; then
             images="$ALL"
           else
             images=$(jq -cn \
@@ -120,16 +172,26 @@ jobs:
               '[ {"scarab-server":$server, "scarab-clone":$clone,
                   "scarab-results-sidecar":$sidecar, "scarab-wsfetch":$wsfetch}
                  | to_entries[] | select(.value == "true") | .key ]')
+            if [ "$IS_PR" != "true" ]; then
+              retag=$(jq -cn --argjson all "$ALL" --argjson built "$images" '$all - $built')
+            fi
           fi
           echo "images=$images" >> "$GITHUB_OUTPUT"
+          echo "retag=$retag" >> "$GITHUB_OUTPUT"
+          echo "retag_from=sha-$BEFORE" >> "$GITHUB_OUTPUT"
           echo "building: $images" >> "$GITHUB_STEP_SUMMARY"
+          echo "re-tagging from sha-$BEFORE: $retag" >> "$GITHUB_STEP_SUMMARY"
 
   # Per-image, per-arch build on a native runner. On push/tags each build is
   # pushed by digest (no tag yet); PRs just validate the Dockerfile.
   build:
     needs: changes
     if: needs.changes.outputs.images != '[]'
-    runs-on: ${{ matrix.runner }}
+    # Runner follows the platform. An expression, not `include:` — on a PR the
+    # arm64 platform is absent, and an `include` naming it would append a new,
+    # image-less combination (the same trap described at `matrix:` below).
+    runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    timeout-minutes: 45
     permissions:
       contents: read
       packages: write
@@ -144,12 +206,12 @@ jobs:
         # NEW combination with no `platform` and no `runner`. Hence the `case`
         # step below.
         image: ${{ fromJSON(needs.changes.outputs.images) }}
-        platform: [linux/amd64, linux/arm64]
-        include:
-          - platform: linux/amd64
-            runner: ubuntu-latest
-          - platform: linux/arm64
-            runner: ubuntu-24.04-arm
+        # PRs build amd64 ONLY (Actions minutes are limited): a PR build exists to
+        # catch a broken Dockerfile, and amd64 does that. arm64 still builds on
+        # every push to main and every tag — which is what publishes the arm64
+        # manifest the Ampere demo (deploy/demo-oracle) and Apple-silicon colima
+        # pull — so an arm-only break surfaces on the merge, not in a deploy.
+        platform: ${{ fromJSON(github.event_name == 'pull_request' && '["linux/amd64"]' || '["linux/amd64","linux/arm64"]') }}
     steps:
       - uses: actions/checkout@v4
 
@@ -199,7 +261,10 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           outputs: ${{ github.event_name != 'pull_request' && format('type=image,name={0}/{1}/{2},push-by-digest=true,name-canonical=true,push=true', env.REGISTRY, github.repository_owner, matrix.image) || 'type=cacheonly' }}
           cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.platform }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ matrix.platform }}
+          # PRs READ main's layer cache but never write their own: the repo has
+          # 10 GB of Actions cache, and per-PR copies of the cooked-dependency
+          # layers (docker/server/Dockerfile) would evict main's.
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=gha,mode=max,scope={0}-{1}', matrix.image, matrix.platform) || '' }}
 
       - name: Export digest
         if: github.event_name != 'pull_request'
@@ -218,37 +283,38 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # Stitch each image's per-arch digests into one multi-arch manifest list and
-  # apply the human tags (edge / sha-<sha> / semver / latest).
+  # Stitch each built image's per-arch digests into one multi-arch manifest list
+  # and apply the human tags (edge / sha-<sha> / semver / latest); point the same
+  # tags at `sha-<before>` for the images `changes` chose to re-tag. ONE job, not
+  # one per image: each of those ran ~20s and billed a whole minute.
   merge:
-    if: github.event_name != 'pull_request'
+    if: >-
+      always() && github.event_name != 'pull_request' &&
+      needs.changes.result == 'success' &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped')
     needs: [changes, build]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
       packages: write
-    strategy:
-      fail-fast: false
-      matrix:
-        # The same set `build` produced digests for. On the non-PR events this
-        # job runs on that is always all four, but reading it from `changes`
-        # rather than repeating the literal means the two lists cannot drift.
-        image: ${{ fromJSON(needs.changes.outputs.images) }}
     steps:
-      - name: Download this image's digests
+      - name: Download the built digests
+        if: needs.changes.outputs.images != '[]'
         uses: actions/download-artifact@v8
         with:
           path: /tmp/digests
-          pattern: digests-${{ matrix.image }}-*
-          merge-multiple: true
+          pattern: digests-*
 
       - uses: docker/setup-buildx-action@v4
 
-      - name: Docker metadata (tags + labels)
+      # One metadata run for every image: `img` is a placeholder stripped below,
+      # so each image gets exactly the tag set metadata-action computes.
+      - name: Docker metadata (tags)
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}
+          images: img
           tags: |
             type=sha,format=long
             type=edge,branch=main
@@ -263,16 +329,29 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Create + push the manifest list
-        working-directory: /tmp/digests
+      - name: Create + push the manifest lists
+        env:
+          BUILT: ${{ needs.changes.outputs.images }}
+          RETAG: ${{ needs.changes.outputs.retag }}
+          RETAG_FROM: ${{ needs.changes.outputs.retag_from }}
+          IMAGE_BASE: ${{ env.REGISTRY }}/${{ github.repository_owner }}
+          VERSION: ${{ steps.meta.outputs.version }}
         run: |
-          docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}@sha256:%s ' *)
-
-      - name: Record image reference
-        run: |
-          echo "**${{ matrix.image }}**: \`${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}:${{ steps.meta.outputs.version }}\` (multi-arch)" >> "$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
+          mapfile -t tags < <(jq -r '.tags[] | sub("^img:"; "")' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          tag_args() { for t in "${tags[@]}"; do printf -- '-t\n%s\n' "$IMAGE_BASE/$1:$t"; done; }
+          for img in $(jq -r '.[]' <<< "$BUILT"); do
+            mapfile -t args < <(tag_args "$img")
+            mapfile -t sources < <(for f in /tmp/digests/digests-"$img"-[0-9]*/*; do
+              echo "$IMAGE_BASE/$img@sha256:$(basename "$f")"; done)
+            docker buildx imagetools create "${args[@]}" "${sources[@]}"
+            echo "**$img**: \`$IMAGE_BASE/$img:$VERSION\` (built, multi-arch)" >> "$GITHUB_STEP_SUMMARY"
+          done
+          for img in $(jq -r '.[]' <<< "$RETAG"); do
+            mapfile -t args < <(tag_args "$img")
+            docker buildx imagetools create "${args[@]}" "$IMAGE_BASE/$img:$RETAG_FROM"
+            echo "**$img**: \`$IMAGE_BASE/$img:$VERSION\` (unchanged, re-tagged from $RETAG_FROM)" >> "$GITHUB_STEP_SUMMARY"
+          done
 
   # The Helm chart. On a PR that touches it: lint + render, no push. On a `v*`
   # tag: the same, then package + push to oci://ghcr.io/<owner>/charts/scarab.
@@ -290,6 +369,7 @@ jobs:
         (startsWith(github.ref, 'refs/tags/v') && needs.merge.result == 'success')
       )
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
       packages: write

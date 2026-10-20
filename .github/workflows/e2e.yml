@@ -1,13 +1,18 @@
-# Full-stack E2E, nightly + on-demand (test-strategy Phase 2): the proc-mode
+# Full-stack E2E, weekly + on-demand (test-strategy Phase 2): the proc-mode
 # harness (compose Postgres+MinIO, a kind cluster, scarab-server as a host
 # process) driven by the env-gated `scarab-e2e` crate — CI parity with
 # `just e2e`. Deliberately NOT per-PR: it is the slowest tier, and a red
-# nightly is triaged as a real timing bug (zero auto-retries).
+# run is triaged as a real timing bug (zero auto-retries).
+#
+# WEEKLY, not nightly, because Actions minutes are limited: it failed all 18
+# nightly runs of Oct 1-19 2026 (~74 billed minutes) on the same red
+# `crash_resume` case — a nightly repeat of a known failure buys no new signal.
+# Dispatch it by hand after a fix; restore nightly once it is green and stays so.
 name: e2e
 
 on:
   schedule:
-    - cron: "23 2 * * *" # nightly
+    - cron: "23 2 * * 1" # weekly, Mondays
   workflow_dispatch:
 
 concurrency:
@@ -23,19 +28,27 @@ jobs:
       # workspace build exhausts the runner's disk (see ci.yml).
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
-      - name: Free runner disk space
+      # ONLY WHEN SHORT. The cleanup is slow (deleting ~30 GB of small files: 1.5-4
+      # billed minutes a run), and today's runner images are 145 GB disks (113 GB
+      # free AFTER this cleanup, measured 2026-10). Below 40 GB free it still runs
+      # in full — the ENOSPC history is real; the step logs the before figure.
+      - name: Free runner disk space (only if short)
         run: |
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup "$AGENT_TOOLSDIRECTORY"
-          # $AGENT_TOOLSDIRECTORY is /opt/hostedtoolcache, and `helm/kind-action`
-          # below installs kind THROUGH it: deleting it without putting the
-          # (empty) directory back fails the action outright — "Cache directory
-          # '/opt/hostedtoolcache' does not exist" — before a single test runs.
-          # Recreating it keeps the ~8GB the tree needs and the kind install.
-          if [ -n "${AGENT_TOOLSDIRECTORY:-}" ]; then
-            sudo mkdir -p "$AGENT_TOOLSDIRECTORY"
-            sudo chown "$(id -u):$(id -g)" "$AGENT_TOOLSDIRECTORY"
+          avail=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
+          echo "free before: ${avail}G"
+          if [ "$avail" -lt 40 ]; then
+            sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup "$AGENT_TOOLSDIRECTORY"
+            # $AGENT_TOOLSDIRECTORY is /opt/hostedtoolcache, and `helm/kind-action`
+            # below installs kind THROUGH it: deleting it without putting the
+            # (empty) directory back fails the action outright — "Cache directory
+            # '/opt/hostedtoolcache' does not exist" — before a single test runs.
+            # Recreating it keeps the ~8GB the tree needs and the kind install.
+            if [ -n "${AGENT_TOOLSDIRECTORY:-}" ]; then
+              sudo mkdir -p "$AGENT_TOOLSDIRECTORY"
+              sudo chown "$(id -u):$(id -g)" "$AGENT_TOOLSDIRECTORY"
+            fi
+            sudo docker system prune -af >/dev/null 2>&1 || true
           fi
-          sudo docker system prune -af >/dev/null 2>&1 || true
           df -h /
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

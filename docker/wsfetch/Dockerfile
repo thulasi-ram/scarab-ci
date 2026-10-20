@@ -33,7 +33,7 @@
 # rules rather than growing a second copy of them.
 
 # --- builder ---------------------------------------------------------------
-FROM rust:1-bookworm AS builder
+FROM rust:1-bookworm AS chef
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config \
@@ -44,13 +44,29 @@ WORKDIR /src
 # Pin the toolchain before the sources so it caches independently.
 COPY rust-toolchain.toml ./
 RUN rustc --version
+RUN cargo install cargo-chef --locked --version 0.1.78
+
+# Dependency caching (cargo-chef). This build used a BuildKit cache mount on
+# target/, which in CI started EMPTY on every runner — `cache-to: type=gha`
+# exports image layers, never cache mounts — so every build was a cold release
+# compile of ~400 crates. `cook` compiles the dependency graph alone into an ordinary LAYER,
+# which the GHA layer cache does keep; its input is only the manifests +
+# lockfile (`recipe.json`), so a source-only change reuses it. No cache mount on
+# the final build: a mount over target/ would hide the cooked layer.
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+COPY --from=planner /src/recipe.json recipe.json
+RUN cargo chef cook --release --locked -p scarab-workspace-client --bin scarab-wsfetch \
+        --recipe-path recipe.json
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
-    cargo build --release --locked -p scarab-workspace-client --bin scarab-wsfetch \
+RUN cargo build --release --locked -p scarab-workspace-client --bin scarab-wsfetch \
     && cp target/release/scarab-wsfetch /usr/local/bin/scarab-wsfetch
 
 # --- runtime ---------------------------------------------------------------
