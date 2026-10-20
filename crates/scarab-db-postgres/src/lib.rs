@@ -1216,7 +1216,7 @@ impl Db for PostgresDb {
         let rows = sqlx::query(
             "SELECT id, status, created_at, updated_at, tenant_org, tenant_project, run_number,
                     origin_trigger_kind, origin_actor, origin_ref, origin_sha, origin_pr_number,
-                    origin_pr_base, pipeline, trigger_title
+                    origin_pr_base, pipeline, trigger_title, deploy_environment
              FROM runs
              ORDER BY created_at DESC, id DESC
              LIMIT $1",
@@ -1237,7 +1237,7 @@ impl Db for PostgresDb {
         let rows = sqlx::query(
             "SELECT id, status, created_at, updated_at, tenant_org, tenant_project, run_number,
                     origin_trigger_kind, origin_actor, origin_ref, origin_sha, origin_pr_number,
-                    origin_pr_base, pipeline, trigger_title
+                    origin_pr_base, pipeline, trigger_title, deploy_environment
              FROM runs
              WHERE tenant_org = $1 AND tenant_project = $2
              ORDER BY created_at DESC, id DESC
@@ -2511,6 +2511,7 @@ fn run_summary_from_row(r: sqlx::postgres::PgRow) -> Result<RunSummary, DbError>
         pr_base: r.get::<Option<String>, _>("origin_pr_base"),
         pipeline: r.get::<Option<String>, _>("pipeline"),
         trigger_title: r.get::<Option<String>, _>("trigger_title"),
+        environment: r.get::<Option<String>, _>("deploy_environment"),
     })
 }
 

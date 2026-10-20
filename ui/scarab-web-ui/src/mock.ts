@@ -134,6 +134,10 @@ const strip = (pattern: string) =>
       status: c === "x" ? "failed" : c === "c" ? "cancelled" : "succeeded",
       duration_ms: 40000 + ((i * 37) % 11) * 22000,
       created_at: ago((i + 1) * 900000),
+      // Every third run is a deploy — a pipeline with `environment:` — so the
+      // runs list's pipeline/environment filters have something to offer.
+      pipeline: i % 3 === 2 ? "deploy" : "ci",
+      ...(i % 3 === 2 ? { environment: i % 2 ? "production" : "staging" } : {}),
     })),
   });
 const repoRuns: Record<string, ReturnType<typeof strip>> = {

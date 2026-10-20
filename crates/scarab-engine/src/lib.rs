@@ -135,6 +135,11 @@ pub struct RunSummary {
     /// carried no headline and on pre-stamping runs.
     #[serde(default)]
     pub trigger_title: Option<String>,
+    /// The Environment this run deploys into — set only for a deploy run (its
+    /// pipeline declared `environment:`, ADR-0037), from the run's deploy
+    /// context. `None` for ordinary CI runs.
+    #[serde(default)]
+    pub environment: Option<String>,
 }
 
 /// Lifecycle status of a single step.

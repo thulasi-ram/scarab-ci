@@ -2163,6 +2163,11 @@ export interface components {
              *     Drives the dashboard's per-run bar heights (ADR-0046).
              */
             duration_ms: number;
+            /**
+             * @description The Environment this run deploys into (ADR-0037) — present only for a
+             *     deploy run, whose pipeline declared `environment:`.
+             */
+            environment?: string | null;
             /** @description The symbolic branch/tag ref the run ran on. */
             git_ref?: string | null;
             id: string;
