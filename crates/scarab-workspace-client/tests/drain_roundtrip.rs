@@ -195,7 +195,7 @@ fn build_workspace(root: &std::path::Path) {
 /// canonical form it wrote. Any of those forks the published root between the
 /// in-Pod helper and every CP-side reader of the same snapshot, and this
 /// equality is the only place the two constructions meet.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn the_helper_prune_root_equals_the_control_plane_prune_root() {
     let Some(h) = Harness::start().await else { return };
     let ws = tempfile::tempdir().unwrap();
@@ -247,7 +247,7 @@ async fn the_helper_prune_root_equals_the_control_plane_prune_root() {
 /// `content_identity` reads right back), which would silently re-grow the
 /// per-directory sequential round-trip ADR-0061 s2 deleted — and, in-Pod,
 /// 403 against a fence token that has no ledger read grant yet.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn the_seeded_memo_serves_the_prune_walk_with_zero_http_tree_gets() {
     let Some(h) = Harness::start().await else { return };
     let ws = tempfile::tempdir().unwrap();
@@ -306,7 +306,7 @@ async fn the_seeded_memo_serves_the_prune_walk_with_zero_http_tree_gets() {
 /// 422s every incremental drain. The feed-path baseline (act 2) is asserted
 /// first so "delta == all trees" is measured against a dedup that provably
 /// works, not against a router that never dedups.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_drain_re_puts_every_closure_tree_even_when_warm_already_has_them() {
     let Some(h) = Harness::start().await else { return };
     let ws = tempfile::tempdir().unwrap();
@@ -391,7 +391,7 @@ async fn a_drain_re_puts_every_closure_tree_even_when_warm_already_has_them() {
 /// Depot's persisted one — a field the handler drops, a record keyed to the
 /// wrong fence, or a GET that synthesises instead of reading what was
 /// persisted. The equality at the bottom is byte-for-byte the posted struct.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_drain_record_round_trips_ingest_prune_record_get() {
     let Some(h) = Harness::start().await else { return };
     let ws = tempfile::tempdir().unwrap();
@@ -462,7 +462,7 @@ async fn a_drain_record_round_trips_ingest_prune_record_get() {
 /// matching route — the Depot answers 404, `drain_record` maps that to
 /// `Ok(None)`, and the `expect` fails: exactly the "record exists but can
 /// never be read" loop-to-dead-letter this addressing exists to prevent.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_drain_record_for_a_step_id_containing_a_slash_round_trips() {
     let Some(h) = Harness::start().await else { return };
     let ws = tempfile::tempdir().unwrap();
@@ -519,7 +519,7 @@ async fn a_drain_record_for_a_step_id_containing_a_slash_round_trips() {
 /// replica-local file (record GET through B answers `None`; owner GET
 /// collapses to 403), or the dual-read losing its pack arm (owner GET through
 /// B regresses to 404 — the replica-independence part 4 paid for).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_drain_recorded_through_one_replica_is_readable_through_another() {
     let Some(a) = Harness::start().await else { return };
     let b = a.replica().await;
@@ -659,7 +659,7 @@ async fn member_rows_for(pool: &sqlx::PgPool, hex: &str) -> i64 {
 /// 404s); labelling by upload order instead of the pruned closure (either
 /// assertion); `/have` answering warm instead of the durable index (the
 /// closing assertions fire).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_pruned_drain_packs_its_closure_and_a_cold_replica_serves_every_address() {
     use scarab_storage::content::ContentSource;
     use scarab_storage::{BlobHash, Cas};
@@ -806,7 +806,7 @@ async fn a_pruned_drain_packs_its_closure_and_a_cold_replica_serves_every_addres
 /// slice-3 gap: warm presence skipping a durable upload); folding the warm
 /// answer into the durable field (A's scratch would vanish from
 /// `missing_blobs` and never pack).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn have_answers_the_durable_index_identically_across_replicas() {
     let Some(a) = Harness::start().await else { return };
     let ws = tempfile::tempdir().unwrap();
@@ -907,7 +907,7 @@ async fn have_answers_the_durable_index_identically_across_replicas() {
 /// (the fenceless `/have` counts staging as durable — dedup against a drain
 /// that may never finish, the one unrecoverable direction); flipping
 /// `committed` anywhere but the record transaction.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn pack_bytes_land_strictly_before_any_index_row() {
     use scarab_storage::{ObjectStore as _, StorageError};
 
@@ -1086,7 +1086,7 @@ async fn pack_bytes_land_strictly_before_any_index_row() {
 /// The durability label is validated at the door: a value that is neither
 /// `durable` nor `cache-only` is a 400 — never silently rounded to either
 /// promise — and both real values are accepted.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn an_unknown_durability_label_is_refused_at_the_door() {
     let Some(h) = Harness::start().await else { return };
     let data = b"labelled bytes".to_vec();
@@ -1143,7 +1143,7 @@ async fn an_unknown_durability_label_is_refused_at_the_door() {
 /// B's pack missing from the receipt); the flip leaking outside the record
 /// transaction (rows stay staged after the POST); the ticker never staging
 /// an idle tail (the bounded poll below times out).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_scattered_drain_commits_through_one_replica() {
     use scarab_storage::{BlobHash, Cas as _};
 
@@ -1312,7 +1312,7 @@ async fn a_scattered_drain_commits_through_one_replica() {
 /// warm-only (this POST 422s "tree ... neither in the warm tier nor
 /// readable" forever — the pre-afb13c2 multi-replica hang, tree-shaped);
 /// the commit doc requiring a live session on the POST replica.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_drain_whose_puts_all_landed_elsewhere_commits_through_a_cold_replica() {
     use scarab_storage::Cas as _;
     use scarab_storage::ObjectStore as _;
@@ -1403,7 +1403,7 @@ async fn a_drain_whose_puts_all_landed_elsewhere_commits_through_a_cold_replica(
 /// staging and the record POST 422s); drop the rowed-object or quiet-fence
 /// filter from the byte scan (the staged pack's bytes go and replica C's
 /// member reads 404).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_mid_flight_scattered_drain_survives_both_reclaim_passes() {
     use scarab_storage::{BlobHash, Cas as _};
     use std::collections::HashSet;
@@ -1571,7 +1571,7 @@ fn build_cached_workspace(root: &std::path::Path) {
 /// (the cache blob gains a pack row); skip the exclusion (pruned_root absent,
 /// the cache subtree lands in the published closure); drop the cache_roots
 /// report (the save side has nothing to record).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_cache_dir_is_excluded_from_the_publish_and_never_packs() {
     let Some(h) = Harness::start().await else { return };
     let ws = tempfile::tempdir().unwrap();
@@ -1663,7 +1663,7 @@ async fn a_cache_dir_is_excluded_from_the_publish_and_never_packs() {
 /// and the CP would upsert a poisoned mapping); checking warm presence
 /// instead of the ledger (the foreign tree IS warm — the refusal below would
 /// wave it through).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_forged_cache_root_422s_the_whole_drain() {
     let Some(h) = Harness::start().await else { return };
     let ws = tempfile::tempdir().unwrap();
@@ -1751,7 +1751,7 @@ async fn a_forged_cache_root_422s_the_whole_drain() {
 /// restore (the MISS — a logged degradation, never an error); and the re-run
 /// over identical content drains clean with the IDENTICAL published identity
 /// and the identical re-saved cache root. Slower, never wrong.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_wiped_warm_tier_degrades_to_a_miss_and_the_rerun_publishes_identically() {
     let Some(h) = Harness::start().await else { return };
     let ws = tempfile::tempdir().unwrap();
@@ -1879,7 +1879,7 @@ async fn a_wiped_warm_tier_degrades_to_a_miss_and_the_rerun_publishes_identicall
 /// (the lost blob would be skipped and the record 422s forever), and 409
 /// reverting to an error (a lost 2xx then re-drives a COMPLETED drain into
 /// exit 12 laps).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_depot_restart_mid_drain_re_drives_from_scratch_and_a_lost_2xx_is_posted() {
     let Some(a) = Harness::start().await else { return };
     let ws = tempfile::tempdir().unwrap();

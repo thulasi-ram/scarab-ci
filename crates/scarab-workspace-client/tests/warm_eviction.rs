@@ -167,7 +167,7 @@ async fn drain_and_record(
 ///
 /// Mutation killed: any read path that trusts warm presence as durable
 /// presence (the GET would 404 the moment the sweep ran).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn an_evicted_durable_snapshot_reads_back_from_its_pack_and_reheals_warm() {
     let Some(h) = Harness::start().await else { return };
     let ws = tempfile::tempdir().unwrap();
@@ -211,7 +211,7 @@ async fn an_evicted_durable_snapshot_reads_back_from_its_pack_and_reheals_warm()
 /// keeps the bytes alive until it closes. The client reads one chunk, the
 /// pass runs (the file leaves the directory), and the remaining chunks still
 /// arrive, byte-complete.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn an_eviction_mid_stream_does_not_tear_the_read() {
     let Some(h) = Harness::start().await else { return };
 
@@ -262,7 +262,7 @@ async fn an_eviction_mid_stream_does_not_tear_the_read() {
 /// Exercised through the explicit `x-scarab-durability: cache-only` LABEL and
 /// nothing newer: the restore side's tolerance of exactly this miss is owned
 /// by the keyed-Cache work and is deliberately NOT depended on here.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn an_evicted_cache_only_tree_is_an_honest_have_miss_and_feed_404() {
     let Some(h) = Harness::start().await else { return };
 
@@ -330,7 +330,7 @@ async fn an_evicted_cache_only_tree_is_an_honest_have_miss_and_feed_404() {
 /// Mutation killed: durable dedup answering from warm presence — the skipped
 /// uploads would then dangle (nothing durable behind them) or the drain would
 /// wastefully re-upload everything the moment the sweep ran.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn have_then_evict_then_drain_still_commits_on_the_index_not_on_warm() {
     let Some(h) = Harness::start().await else { return };
     let ws = tempfile::tempdir().unwrap();

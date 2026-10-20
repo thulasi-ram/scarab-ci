@@ -178,7 +178,7 @@ fn mode_of(path: &std::path::Path) -> u32 {
 /// s7 proved this survives the CAS. Through the *service* is a separate claim —
 /// different canonicalisation, different serialisation, a different metadata
 /// restore path — and it needs its own test, which is this one.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_snapshot_round_trips_through_the_service_with_metadata_intact() {
     let Some(h) = Harness::start().await else { return };
     let source = tempfile::tempdir().unwrap();
@@ -257,7 +257,7 @@ async fn a_snapshot_round_trips_through_the_service_with_metadata_intact() {
 /// A tree hash written through the service must be the SAME hash the plain
 /// object-storage CAS would produce. If it is not, the two data paths have
 /// forked and a snapshot written one way is invisible the other way.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_snapshot_written_through_the_service_has_the_same_root_as_one_written_direct() {
     let Some(h) = Harness::start().await else { return };
     let source = tempfile::tempdir().unwrap();
@@ -302,7 +302,7 @@ async fn a_snapshot_written_through_the_service_has_the_same_root_as_one_written
 }
 
 /// `have` reports MISSING, and it reports it correctly in both directions.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn have_reports_exactly_what_is_missing() {
     let Some(h) = Harness::start().await else { return };
     let client = h.browse_client();
@@ -379,7 +379,7 @@ async fn have_reports_exactly_what_is_missing() {
 /// `/flat` returns the WHOLE subtree in one call — the endpoint the entire
 /// performance argument rests on. Without it, materialising a checkout is one
 /// round trip per directory.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn flat_returns_the_whole_subtree_in_one_call() {
     let Some(h) = Harness::start().await else { return };
     let source = tempfile::tempdir().unwrap();
@@ -437,7 +437,7 @@ async fn flat_returns_the_whole_subtree_in_one_call() {
 
 /// ADR-0061's retention table: "a warm miss is slower, never wrong". Prove both
 /// halves — the read succeeds, and afterwards warm can answer on its own.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_cold_only_snapshot_is_served_and_backfills_the_warm_tier() {
     let Some(h) = Harness::start().await else { return };
     let source = tempfile::tempdir().unwrap();
@@ -498,7 +498,7 @@ async fn a_cold_only_snapshot_is_served_and_backfills_the_warm_tier() {
 
 /// PUT rejects corruption at the door, which is the reason the hash is in the
 /// path rather than in the response.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_body_that_does_not_hash_to_its_address_is_rejected() {
     let Some(h) = Harness::start().await else { return };
     let wrong = "a".repeat(64);
@@ -514,7 +514,7 @@ async fn a_body_that_does_not_hash_to_its_address_is_rejected() {
 }
 
 /// PUT is idempotent: 201 the first time, 200 when the service already had it.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn put_is_idempotent_and_says_which_happened() {
     let Some(h) = Harness::start().await else { return };
     let body = b"idempotent".to_vec();
@@ -547,7 +547,7 @@ async fn put_is_idempotent_and_says_which_happened() {
 /// ADR-0067 part 12: a tagged address (`sha256:<hex>`) names the SAME object a
 /// bare address stored — on PUT, GET, tree GET and `/have`. Two spellings, one
 /// identity; the alternative is one object forked under two warm keys.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_tagged_address_names_the_same_object_as_its_bare_form() {
     let Some(h) = Harness::start().await else { return };
     let body = b"tagged and bare are one object".to_vec();
@@ -646,7 +646,7 @@ async fn a_tagged_address_names_the_same_object_as_its_bare_form() {
 /// An unknown algorithm tag is a 400 at the door, never a miss and never a
 /// silent filing under a SHA-256 key its bytes do not hash to (ADR-0067
 /// part 12 — `blake3:` is the intended follow-up, not an accepted input).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn an_unknown_algorithm_tag_is_a_400() {
     let Some(h) = Harness::start().await else { return };
     let addr = format!("blake3:{}", "a".repeat(64));
@@ -676,7 +676,7 @@ async fn an_unknown_algorithm_tag_is_a_400() {
 
 /// No token, a forged token and an expired token are all 401 — and a valid token
 /// that does not name the root is 403, which is a different fact.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn the_token_is_actually_enforced() {
     let Some(h) = Harness::start().await else { return };
     let source = tempfile::tempdir().unwrap();
@@ -745,7 +745,7 @@ async fn the_token_is_actually_enforced() {
 /// A tree's bytes are its hash preimage, so `GET` must return them **verbatim**.
 /// If the service re-serialised, the returned bytes would not hash to the
 /// address they were fetched by.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn tree_bytes_come_back_verbatim() {
     let Some(h) = Harness::start().await else { return };
     let client = h.browse_client();
@@ -797,7 +797,7 @@ async fn tree_bytes_come_back_verbatim() {
 
 /// `ContentSource` is a real lazy port, not a facade with the right signature:
 /// a range read must transfer the range, and a size must not transfer content.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn ranged_reads_and_sizes_work_without_transferring_the_whole_blob() {
     let Some(h) = Harness::start().await else { return };
     let client = h.browse_client();
@@ -824,7 +824,7 @@ async fn ranged_reads_and_sizes_work_without_transferring_the_whole_blob() {
 /// A missing object is `NotFound`, and an unreachable service is NOT — the
 /// distinction is what stops `TieredCas` treating "the network is down" as "the
 /// tier is empty" and silently falling through.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn absent_is_not_found_and_unreachable_is_not_absent() {
     let Some(h) = Harness::start().await else { return };
     let client = h.browse_client();
@@ -845,7 +845,7 @@ async fn absent_is_not_found_and_unreachable_is_not_absent() {
 
 /// Readiness is warm-writable + cold-reachable, and it must not be the control
 /// plane's DB check — this role has no database at all.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn healthz_and_readyz_answer_without_a_database() {
     let Some(h) = Harness::start().await else { return };
     let raw = h.raw();
@@ -881,7 +881,7 @@ async fn healthz_and_readyz_answer_without_a_database() {
 
 /// A hash in a URL is the one thing standing between a path segment and the
 /// service's filesystem.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_malformed_hash_is_rejected_before_anything_touches_the_filesystem() {
     let Some(h) = Harness::start().await else { return };
     for bad in ["short", &"A".repeat(64), &"g".repeat(64)] {
@@ -897,7 +897,7 @@ async fn a_malformed_hash_is_rejected_before_anything_touches_the_filesystem() {
 }
 
 /// The cap exists so one request cannot ask about an unbounded set.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn an_oversized_have_batch_is_refused() {
     let Some(h) = Harness::start().await else { return };
     let blobs: Vec<String> = (0..10_001).map(|i| format!("{i:064x}")).collect();
@@ -915,7 +915,7 @@ async fn an_oversized_have_batch_is_refused() {
 /// Overlaying two snapshots into one directory is how `needs:` with several
 /// inputs works (merge-in-order, ADR-0007) — and the second one has to be able
 /// to replace a read-only file and a symlink the first left behind.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_later_snapshot_can_overlay_a_read_only_file_and_a_symlink() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -1005,7 +1005,7 @@ async fn a_later_snapshot_can_overlay_a_read_only_file_and_a_symlink() {
 /// the adapter captures the pre-existing mode and restores it when the tree
 /// records none; the client used to widen and then apply `dir.mode`, which for
 /// `None` is "apply nothing" — leaving the directory permanently `0o700`.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_directory_with_no_recorded_mode_is_restored_not_left_widened() {
     use scarab_storage::{TreeEntry, TreeTarget};
     use std::os::unix::fs::PermissionsExt;
