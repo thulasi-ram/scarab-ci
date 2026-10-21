@@ -5,15 +5,18 @@
 // Two panels: the **Environment board** (per target: what is live, which
 // Deployment made it live, and anything newer still in flight) and, below it,
 // one Environment's **Deployments**, newest first, each expandable into the
-// stages its source reported. The Environment is URL state (`?env=`), so a
-// link from a repo's Environments tab lands on the right one; absent, the
-// first Environment on the board is shown.
+// stages its source reported. The Org and the Environment are URL state
+// (`?org=`, `?env=`), so a link from a repo's Environments tab lands on the
+// right board even for a user in several orgs; absent, the org falls back to
+// one the caller administers or belongs to, and the first Environment on the
+// board is shown.
 //
 // Everything here is the server's record, shown — the status, Unexplained and
 // Unconfirmed are core's verdicts (CONTEXT.md §4.6), not re-derived.
 import { createMemo, createResource, createSignal, For, Show } from "solid-js";
 import { A, useSearchParams } from "@solidjs/router";
 import {
+  DeploymentsForbiddenError,
   getEnvironmentBoard,
   listEnvironmentDeployments,
   listProjects,
@@ -42,12 +45,15 @@ const one = (v: string | string[] | undefined): string => (Array.isArray(v) ? v[
 export default function Deployments() {
   const [search, setSearch] = useSearchParams();
   const [projects] = createResource(() => listProjects().catch(() => [] as Project[]));
-  // Wait for the identity before falling back to a project's org, so the page
-  // never reads one org and then flips to another.
+  // `?org=` decides at once. Otherwise wait for the identity before falling
+  // back to a project's org, so the page never reads one org and then flips
+  // to another.
   const org = createMemo(() =>
-    me.loading || projects.loading
-      ? undefined
-      : pickOrg(me()?.admin_orgs, (projects() ?? []).map((p) => p.org)),
+    one(search.org)
+      ? one(search.org)
+      : me.loading || projects.loading
+        ? undefined
+        : pickOrg(undefined, me()?.admin_orgs, (projects() ?? []).map((p) => p.org)),
   );
 
   const [board] = createResource(org, (o) => getEnvironmentBoard(o));
@@ -73,6 +79,13 @@ export default function Deployments() {
 
       <div class="page-head">
         <h1>Deployments</h1>
+        <Show when={org()}>
+          {(o) => (
+            <span class="mono subtle" title="The organization whose Environments this page shows">
+              {o()}
+            </span>
+          )}
+        </Show>
       </div>
       <p class="page-sub">what is live on each target, and how it got there</p>
 
@@ -88,7 +101,19 @@ export default function Deployments() {
       >
         {(o) => (
           <Show when={!board.loading} fallback={<p class="empty">loading…</p>}>
-            <Show when={!board.error} fallback={<p class="error">Could not load the environment board.</p>}>
+            <Show
+              when={!board.error}
+              fallback={
+                board.error instanceof DeploymentsForbiddenError ? (
+                  <p class="empty">
+                    You cannot read <span class="mono">{o()}</span>'s deployments. Reading them needs access
+                    to the whole organization; access to a single repository is not enough yet.
+                  </p>
+                ) : (
+                  <p class="error">Could not load the environment board.</p>
+                )
+              }
+            >
               <Show
                 when={board() !== null}
                 fallback={<p class="empty">This server does not record deployments.</p>}

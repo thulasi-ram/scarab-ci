@@ -530,6 +530,16 @@ export type DeploymentTarget = components["schemas"]["DeploymentTargetDto"];
 /** One target's line on the Environment board: what is live, what is newest. */
 export type BoardRow = components["schemas"]["EnvironmentBoardRowDto"];
 
+/** The caller may not read this org's Deployment record (403). Reading needs
+ *  Read on the Org; a member bound only to a Project is refused until
+ *  Environment eligibility (ADR-0071) says who may read an Environment. */
+export class DeploymentsForbiddenError extends Error {
+  constructor(readonly org: string) {
+    super(`no read access to ${org}'s deployments`);
+    this.name = "DeploymentsForbiddenError";
+  }
+}
+
 /**
  * The Environment board (`GET /v1/orgs/{org}/board`), every Environment with
  * any Deployment unless `environment` narrows it.
@@ -546,6 +556,7 @@ export async function getEnvironmentBoard(
     params: { path: { org }, query: environment ? { environment } : {} },
   });
   if (response.status === 404) return null;
+  if (response.status === 403) throw new DeploymentsForbiddenError(org);
   if (error || !data) {
     throw new Error(errorText(error) || "failed to load the environment board");
   }
@@ -569,6 +580,7 @@ export async function listEnvironmentDeployments(
     },
   );
   if (response.status === 404) return null;
+  if (response.status === 403) throw new DeploymentsForbiddenError(org);
   if (error || !data) {
     throw new Error(errorText(error) || `failed to list deployments in ${env}`);
   }
