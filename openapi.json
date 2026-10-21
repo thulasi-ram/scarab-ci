@@ -1073,7 +1073,7 @@
             }
           },
           "400": {
-            "description": "invalid name, deadline or source"
+            "description": "invalid name, deadline or source, or a source naming no installation in the org"
           },
           "403": {
             "description": "not an org admin"
@@ -1133,6 +1133,64 @@
           },
           "409": {
             "description": "the Environment has Deployments"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/environments/{env}/deployment-targets": {
+      "get": {
+        "tags": [
+          "Deployments"
+        ],
+        "summary": "An Environment's reported DeploymentTargets and their owners (ADR-0072)",
+        "operationId": "environment_deployment_targets",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/DeploymentSourceTargetDto"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "no Read on the org"
+          },
+          "404": {
+            "description": "plugins not configured"
           }
         },
         "security": [
@@ -1283,6 +1341,441 @@
           },
           "404": {
             "description": "no such Deployment in this Environment"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/plugin-catalog": {
+      "get": {
+        "tags": [
+          "Plugins"
+        ],
+        "summary": "The installable (first-party) plugins (ADR-0072)",
+        "operationId": "plugin_catalog",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PluginCatalogEntryDto"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "plugins not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/plugins": {
+      "get": {
+        "tags": [
+          "Plugins"
+        ],
+        "summary": "List an org's plugin installations (ADR-0072)",
+        "operationId": "list_plugins",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PluginInstallationDto"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "plugins not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "Plugins"
+        ],
+        "summary": "Install a first-party plugin (ADR-0072)",
+        "description": "Third-party installs are off (403), and so are installs while\n`SCARAB_PLUGINS=off` (409). The response lists any Environment source\nthat already named this installation — written before it existed — which\nit now feeds.",
+        "operationId": "install_plugin",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InstallPluginRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginInstallationDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "invalid name or config"
+          },
+          "403": {
+            "description": "not an org admin, or not a first-party plugin pinned by digest"
+          },
+          "404": {
+            "description": "plugins not configured"
+          },
+          "409": {
+            "description": "the name is taken or retired, or plugins are off"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/plugins/{name}": {
+      "get": {
+        "tags": [
+          "Plugins"
+        ],
+        "summary": "One plugin installation (ADR-0072)",
+        "operationId": "get_plugin",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "installation name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginInstallationDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "no such installation, or plugins not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "Plugins"
+        ],
+        "summary": "Uninstall a plugin; its name is retired (ADR-0072)",
+        "operationId": "uninstall_plugin",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "installation name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UninstalledPluginDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "no such installation, or plugins not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/plugins/{name}/enable": {
+      "post": {
+        "tags": [
+          "Plugins"
+        ],
+        "summary": "Re-enable a killed plugin installation (ADR-0072)",
+        "operationId": "enable_plugin",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "installation name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginInstallationDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "no such installation, or plugins not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/plugins/{name}/kill": {
+      "post": {
+        "tags": [
+          "Plugins"
+        ],
+        "summary": "Kill a plugin installation at once (ADR-0072)",
+        "operationId": "kill_plugin",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "installation name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginInstallationDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "no such installation, or plugins not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/plugins/{name}/unmapped-groupings": {
+      "get": {
+        "tags": [
+          "Plugins"
+        ],
+        "summary": "A plugin's vendor groupings no Environment lists (ADR-0071 §5)",
+        "operationId": "unmapped_groupings",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "installation name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/UnmappedGroupingDto"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "no such installation, or plugins not configured"
           }
         },
         "security": [
@@ -4018,6 +4511,32 @@
           }
         }
       },
+      "ConnectionSlotDto": {
+        "type": "object",
+        "description": "A named external system the plugin reaches through the broker.",
+        "required": [
+          "name",
+          "auth_schemes",
+          "read_rules"
+        ],
+        "properties": {
+          "auth_schemes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "name": {
+            "type": "string"
+          },
+          "read_rules": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RequestRuleDto"
+            }
+          }
+        }
+      },
       "ConsumedDto": {
         "type": "object",
         "description": "What an attempt consumed (ADR-0056): the map `upstream step id → attempt\nid` stamped at its launch — the durable answer to \"which generation of\n`build` did `test` actually build on?\" after a mid-run restart leaves the\nrun a patchwork of attempt generations. `attempt` names the attempt the\nmap belongs to; empty map = nothing recorded (no upstream evidence, or a\npre-ADR-0056 attempt).",
@@ -4225,6 +4744,85 @@
           }
         }
       },
+      "DeploymentSourceTargetDto": {
+        "type": "object",
+        "description": "A DeploymentTarget a source reports into an Environment: who reports it,\nits owners and declared version scheme, and its last reported status.",
+        "required": [
+          "source",
+          "principal",
+          "target_id",
+          "vendor_grouping",
+          "owner_projects",
+          "last_sequence",
+          "updated_at"
+        ],
+        "properties": {
+          "last_label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_sequence": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "last_status": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`in_progress` / `live` / `failed`, as last reported."
+          },
+          "last_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "owner_projects": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Projects (`org/repo`) that own the target, as the source last said."
+          },
+          "owners_reported_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix-ms the owners were last reported."
+          },
+          "principal": {
+            "type": "string",
+            "description": "`plugin:<name>`."
+          },
+          "source": {
+            "type": "string",
+            "description": "The reporting installation's name — the target's `source`."
+          },
+          "target_id": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix-ms."
+          },
+          "vendor_grouping": {
+            "type": "string"
+          },
+          "version_scheme": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
       "DeploymentStatusDto": {
         "type": "string",
         "description": "A Deployment's fixed, vendor-neutral status (ADR-0070 §5).",
@@ -4380,7 +4978,7 @@
         "properties": {
           "installation": {
             "type": "string",
-            "description": "The PluginInstallation's name: a DNS-1123 label (lowercase letters,\ndigits, `-`; at most 63). Not yet checked against real installations."
+            "description": "The PluginInstallation's name: a DNS-1123 label (lowercase letters,\ndigits, `-`; at most 63), installed in this org — a PUT naming one\nthat is not is refused (400)."
           },
           "vendor_grouping": {
             "type": "string",
@@ -4427,6 +5025,64 @@
             "type": "string"
           }
         }
+      },
+      "InstallPluginRequest": {
+        "type": "object",
+        "description": "`POST /v1/orgs/{org}/plugins`.",
+        "required": [
+          "name",
+          "plugin",
+          "image"
+        ],
+        "properties": {
+          "config": {
+            "type": "object",
+            "description": "Values for the manifest's `config_keys`; omitted = none.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "image": {
+            "type": "string",
+            "description": "`<catalog image_repository>@sha256:<64 hex>`."
+          },
+          "name": {
+            "type": "string",
+            "description": "The installation's name: a DNS-1123 label, unique in the org and\nnever reused once uninstalled."
+          },
+          "plugin": {
+            "type": "string",
+            "description": "The catalog plugin (`argocd`)."
+          }
+        },
+        "additionalProperties": false
+      },
+      "InstallationDeploymentSourceDto": {
+        "type": "object",
+        "description": "An Environment source that routes one of the installation's groupings.",
+        "required": [
+          "environment",
+          "vendor_grouping"
+        ],
+        "properties": {
+          "environment": {
+            "type": "string"
+          },
+          "vendor_grouping": {
+            "type": "string"
+          }
+        }
+      },
+      "InstallationStateDto": {
+        "type": "string",
+        "description": "Whether an installation's reports and broker calls are accepted.",
+        "enum": [
+          "enabled",
+          "killed"
+        ]
       },
       "LinkIdentityRequest": {
         "type": "object",
@@ -4750,6 +5406,188 @@
           }
         }
       },
+      "PluginCapabilityDto": {
+        "type": "string",
+        "description": "One entry of the closed PluginCapability vocabulary (ADR-0072 §2).",
+        "enum": [
+          "report_deployments",
+          "subscribe_events",
+          "offer_actions",
+          "use_connection",
+          "contribute_ui",
+          "approve_gates"
+        ]
+      },
+      "PluginCatalogEntryDto": {
+        "type": "object",
+        "description": "A plugin this Scarab can install.",
+        "required": [
+          "plugin",
+          "description",
+          "image_repository",
+          "manifest",
+          "first_party"
+        ],
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "first_party": {
+            "type": "boolean",
+            "description": "Always true today: third-party installs are off."
+          },
+          "image_repository": {
+            "type": "string",
+            "description": "Install as `<image_repository>@sha256:<digest>`."
+          },
+          "manifest": {
+            "$ref": "#/components/schemas/PluginManifestDto"
+          },
+          "plugin": {
+            "type": "string",
+            "description": "The catalog key `POST …/plugins` names as `plugin`."
+          }
+        }
+      },
+      "PluginInstallationDto": {
+        "type": "object",
+        "description": "A PluginInstallation (ADR-0072 §10).",
+        "required": [
+          "id",
+          "org",
+          "name",
+          "plugin",
+          "principal",
+          "image",
+          "manifest",
+          "manifest_sha256",
+          "config",
+          "state",
+          "runtime_status",
+          "runtime_message",
+          "approved_by",
+          "approved_at",
+          "deployment_sources"
+        ],
+        "properties": {
+          "approved_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix-ms."
+          },
+          "approved_by": {
+            "type": "string"
+          },
+          "config": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "deployment_sources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InstallationDeploymentSourceDto"
+            },
+            "description": "The Environment sources that name this installation — at install,\nthe ones written before it existed, which it now feeds."
+          },
+          "id": {
+            "type": "string",
+            "description": "Server-minted, 10 hex; names the installation's ServiceAccount."
+          },
+          "image": {
+            "type": "string"
+          },
+          "killed_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix-ms."
+          },
+          "killed_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "manifest": {
+            "$ref": "#/components/schemas/PluginManifestDto"
+          },
+          "manifest_sha256": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string",
+            "description": "Unique in the org and never reused; reports carry it as their\nDeploymentTarget `source`."
+          },
+          "org": {
+            "type": "string"
+          },
+          "plugin": {
+            "type": "string",
+            "description": "The catalog plugin."
+          },
+          "principal": {
+            "type": "string",
+            "description": "`plugin:<name>` — what it acts as in audit."
+          },
+          "probe_passed_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix-ms the isolation probe last passed."
+          },
+          "runtime_message": {
+            "type": "string"
+          },
+          "runtime_status": {
+            "$ref": "#/components/schemas/RuntimeStatusDto"
+          },
+          "state": {
+            "$ref": "#/components/schemas/InstallationStateDto"
+          }
+        }
+      },
+      "PluginManifestDto": {
+        "type": "object",
+        "description": "What the plugin asks for — exactly what an admin approves with the\ndigest (ADR-0072 §1-2).",
+        "required": [
+          "plugin",
+          "capabilities",
+          "connections",
+          "config_keys"
+        ],
+        "properties": {
+          "capabilities": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PluginCapabilityDto"
+            }
+          },
+          "config_keys": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "connections": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConnectionSlotDto"
+            }
+          },
+          "plugin": {
+            "type": "string"
+          }
+        }
+      },
       "PrincipalDto": {
         "type": "object",
         "description": "A Principal, as the grant/approver typeahead offers it (ADR-0069 §3).",
@@ -4941,6 +5779,22 @@
               "$ref": "#/components/schemas/RefDto"
             },
             "description": "Branches first, then tags; each group name-sorted."
+          }
+        }
+      },
+      "RequestRuleDto": {
+        "type": "object",
+        "description": "An allowed read on a connection: method + path pattern (`*` = one\nsegment).",
+        "required": [
+          "method",
+          "path"
+        ],
+        "properties": {
+          "method": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
           }
         }
       },
@@ -5206,6 +6060,18 @@
             "description": "The run **Headline** (ADR-0057) — the one human line saying what this run\nis about (a push's commit subject; later a PR title / dispatch reason),\ndisambiguated by the trigger kind. Display/audit only; absent when the\ntrigger carried no headline and on runs created before headline-stamping."
           }
         }
+      },
+      "RuntimeStatusDto": {
+        "type": "string",
+        "description": "What the plugin runtime last observed of the workload.",
+        "enum": [
+          "pending",
+          "probing",
+          "running",
+          "probe_failed",
+          "error",
+          "stopped"
+        ]
       },
       "SecretListResponse": {
         "type": "object",
@@ -5601,6 +6467,61 @@
           }
         }
       },
+      "UninstalledPluginDto": {
+        "type": "object",
+        "description": "What an uninstall removed.",
+        "required": [
+          "name",
+          "removed_deployment_sources"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "removed_deployment_sources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InstallationDeploymentSourceDto"
+            },
+            "description": "The Environment sources that named it — removed with it."
+          }
+        }
+      },
+      "UnmappedGroupingDto": {
+        "type": "object",
+        "description": "A grouping the installation reports on that no Environment lists.",
+        "required": [
+          "vendor_grouping",
+          "reports",
+          "first_at",
+          "last_at",
+          "last_target_id"
+        ],
+        "properties": {
+          "first_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix-ms."
+          },
+          "last_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix-ms."
+          },
+          "last_target_id": {
+            "type": "string"
+          },
+          "reports": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Reports dropped for it so far.",
+            "minimum": 0
+          },
+          "vendor_grouping": {
+            "type": "string"
+          }
+        }
+      },
       "WorkspaceEntryDto": {
         "type": "object",
         "description": "One entry in a workspace directory listing — the merkle-tree children under a\nstep's output snapshot (ADR-0029).",
@@ -5682,6 +6603,10 @@
     {
       "name": "Deployments",
       "description": "The vendor-neutral Deployment record (ADR-0070): what is live on each DeploymentTarget, how it got there, and the Environment board."
+    },
+    {
+      "name": "Plugins",
+      "description": "PluginInstallations (ADR-0072): the first-party catalog, install and uninstall, the kill switch, and the vendor groupings no Environment lists yet."
     },
     {
       "name": "Secrets",

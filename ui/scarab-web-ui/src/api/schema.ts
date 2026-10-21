@@ -530,6 +530,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/orgs/{org}/environments/{env}/deployment-targets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** An Environment's reported DeploymentTargets and their owners (ADR-0072) */
+        get: operations["environment_deployment_targets"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/orgs/{org}/environments/{env}/deployments": {
         parameters: {
             query?: never;
@@ -556,6 +573,116 @@ export interface paths {
         };
         /** One Deployment and its stages (ADR-0070) */
         get: operations["get_deployment"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/plugin-catalog": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The installable (first-party) plugins (ADR-0072) */
+        get: operations["plugin_catalog"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/plugins": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List an org's plugin installations (ADR-0072) */
+        get: operations["list_plugins"];
+        put?: never;
+        /**
+         * Install a first-party plugin (ADR-0072)
+         * @description Third-party installs are off (403), and so are installs while
+         *     `SCARAB_PLUGINS=off` (409). The response lists any Environment source
+         *     that already named this installation — written before it existed — which
+         *     it now feeds.
+         */
+        post: operations["install_plugin"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/plugins/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** One plugin installation (ADR-0072) */
+        get: operations["get_plugin"];
+        put?: never;
+        post?: never;
+        /** Uninstall a plugin; its name is retired (ADR-0072) */
+        delete: operations["uninstall_plugin"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/plugins/{name}/enable": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Re-enable a killed plugin installation (ADR-0072) */
+        post: operations["enable_plugin"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/plugins/{name}/kill": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Kill a plugin installation at once (ADR-0072) */
+        post: operations["kill_plugin"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/plugins/{name}/unmapped-groupings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** A plugin's vendor groupings no Environment lists (ADR-0071 §5) */
+        get: operations["unmapped_groupings"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1755,6 +1882,12 @@ export interface components {
             owner: string;
             project: string;
         };
+        /** @description A named external system the plugin reaches through the broker. */
+        ConnectionSlotDto: {
+            auth_schemes: string[];
+            name: string;
+            read_rules: components["schemas"]["RequestRuleDto"][];
+        };
         /**
          * @description What an attempt consumed (ADR-0056): the map `upstream step id → attempt
          *     id` stamped at its launch — the durable answer to "which generation of
@@ -1896,6 +2029,37 @@ export interface components {
             step: string;
         };
         /**
+         * @description A DeploymentTarget a source reports into an Environment: who reports it,
+         *     its owners and declared version scheme, and its last reported status.
+         */
+        DeploymentSourceTargetDto: {
+            last_label?: string | null;
+            /** Format: int64 */
+            last_sequence: number;
+            /** @description `in_progress` / `live` / `failed`, as last reported. */
+            last_status?: string | null;
+            last_version?: string | null;
+            /** @description Projects (`org/repo`) that own the target, as the source last said. */
+            owner_projects: string[];
+            /**
+             * Format: int64
+             * @description Unix-ms the owners were last reported.
+             */
+            owners_reported_at?: number | null;
+            /** @description `plugin:<name>`. */
+            principal: string;
+            /** @description The reporting installation's name — the target's `source`. */
+            source: string;
+            target_id: string;
+            /**
+             * Format: int64
+             * @description Unix-ms.
+             */
+            updated_at: number;
+            vendor_grouping: string;
+            version_scheme?: string | null;
+        };
+        /**
          * @description A Deployment's fixed, vendor-neutral status (ADR-0070 §5).
          * @enum {string}
          */
@@ -1986,7 +2150,8 @@ export interface components {
         EnvironmentDeploymentSourceDto: {
             /**
              * @description The PluginInstallation's name: a DNS-1123 label (lowercase letters,
-             *     digits, `-`; at most 63). Not yet checked against real installations.
+             *     digits, `-`; at most 63), installed in this org — a PUT naming one
+             *     that is not is refused (400).
              */
             installation: string;
             /**
@@ -2010,6 +2175,32 @@ export interface components {
             level: string;
             name: string;
         };
+        /** @description `POST /v1/orgs/{org}/plugins`. */
+        InstallPluginRequest: {
+            /** @description Values for the manifest's `config_keys`; omitted = none. */
+            config?: {
+                [key: string]: string;
+            };
+            /** @description `<catalog image_repository>@sha256:<64 hex>`. */
+            image: string;
+            /**
+             * @description The installation's name: a DNS-1123 label, unique in the org and
+             *     never reused once uninstalled.
+             */
+            name: string;
+            /** @description The catalog plugin (`argocd`). */
+            plugin: string;
+        };
+        /** @description An Environment source that routes one of the installation's groupings. */
+        InstallationDeploymentSourceDto: {
+            environment: string;
+            vendor_grouping: string;
+        };
+        /**
+         * @description Whether an installation's reports and broker calls are accepted.
+         * @enum {string}
+         */
+        InstallationStateDto: "enabled" | "killed";
         /** @description `POST /v1/me/identities/link` body. */
         LinkIdentityRequest: {
             /** @description The login provider to link an account from (`GET /v1/auth/providers`). */
@@ -2212,6 +2403,78 @@ export interface components {
             /** @description The step that re-runs (a gate re-arms and pauses instead of running). */
             step: string;
         };
+        /**
+         * @description One entry of the closed PluginCapability vocabulary (ADR-0072 §2).
+         * @enum {string}
+         */
+        PluginCapabilityDto: "report_deployments" | "subscribe_events" | "offer_actions" | "use_connection" | "contribute_ui" | "approve_gates";
+        /** @description A plugin this Scarab can install. */
+        PluginCatalogEntryDto: {
+            description: string;
+            /** @description Always true today: third-party installs are off. */
+            first_party: boolean;
+            /** @description Install as `<image_repository>@sha256:<digest>`. */
+            image_repository: string;
+            manifest: components["schemas"]["PluginManifestDto"];
+            /** @description The catalog key `POST …/plugins` names as `plugin`. */
+            plugin: string;
+        };
+        /** @description A PluginInstallation (ADR-0072 §10). */
+        PluginInstallationDto: {
+            /**
+             * Format: int64
+             * @description Unix-ms.
+             */
+            approved_at: number;
+            approved_by: string;
+            config: {
+                [key: string]: string;
+            };
+            /**
+             * @description The Environment sources that name this installation — at install,
+             *     the ones written before it existed, which it now feeds.
+             */
+            deployment_sources: components["schemas"]["InstallationDeploymentSourceDto"][];
+            /** @description Server-minted, 10 hex; names the installation's ServiceAccount. */
+            id: string;
+            image: string;
+            /**
+             * Format: int64
+             * @description Unix-ms.
+             */
+            killed_at?: number | null;
+            killed_by?: string | null;
+            manifest: components["schemas"]["PluginManifestDto"];
+            manifest_sha256: string;
+            /**
+             * @description Unique in the org and never reused; reports carry it as their
+             *     DeploymentTarget `source`.
+             */
+            name: string;
+            org: string;
+            /** @description The catalog plugin. */
+            plugin: string;
+            /** @description `plugin:<name>` — what it acts as in audit. */
+            principal: string;
+            /**
+             * Format: int64
+             * @description Unix-ms the isolation probe last passed.
+             */
+            probe_passed_at?: number | null;
+            runtime_message: string;
+            runtime_status: components["schemas"]["RuntimeStatusDto"];
+            state: components["schemas"]["InstallationStateDto"];
+        };
+        /**
+         * @description What the plugin asks for — exactly what an admin approves with the
+         *     digest (ADR-0072 §1-2).
+         */
+        PluginManifestDto: {
+            capabilities: components["schemas"]["PluginCapabilityDto"][];
+            config_keys: string[];
+            connections: components["schemas"]["ConnectionSlotDto"][];
+            plugin: string;
+        };
         /** @description A Principal, as the grant/approver typeahead offers it (ADR-0069 §3). */
         PrincipalDto: {
             /** @description `false` = created by a forge import, not signed into yet. */
@@ -2305,6 +2568,14 @@ export interface components {
         RefsResponse: {
             /** @description Branches first, then tags; each group name-sorted. */
             refs: components["schemas"]["RefDto"][];
+        };
+        /**
+         * @description An allowed read on a connection: method + path pattern (`*` = one
+         *     segment).
+         */
+        RequestRuleDto: {
+            method: string;
+            path: string;
         };
         /**
          * @description `GET …/steps/{step}/rerun-plan` body: what a rerun/retry of this step would
@@ -2476,6 +2747,11 @@ export interface components {
              */
             trigger_title?: string | null;
         };
+        /**
+         * @description What the plugin runtime last observed of the workload.
+         * @enum {string}
+         */
+        RuntimeStatusDto: "pending" | "probing" | "running" | "probe_failed" | "error" | "stopped";
         /**
          * @description `GET /v1/secrets` body: the secret **names** at a scope. Values are never
          *     listed.
@@ -2740,6 +3016,32 @@ export interface components {
              *     (ADR-0058) — the DAG's service edges. Empty for a step that uses none.
              */
             uses?: string[];
+        };
+        /** @description What an uninstall removed. */
+        UninstalledPluginDto: {
+            name: string;
+            /** @description The Environment sources that named it — removed with it. */
+            removed_deployment_sources: components["schemas"]["InstallationDeploymentSourceDto"][];
+        };
+        /** @description A grouping the installation reports on that no Environment lists. */
+        UnmappedGroupingDto: {
+            /**
+             * Format: int64
+             * @description Unix-ms.
+             */
+            first_at: number;
+            /**
+             * Format: int64
+             * @description Unix-ms.
+             */
+            last_at: number;
+            last_target_id: string;
+            /**
+             * Format: int64
+             * @description Reports dropped for it so far.
+             */
+            reports: number;
+            vendor_grouping: string;
         };
         /**
          * @description One entry in a workspace directory listing — the merkle-tree children under a
@@ -3697,7 +3999,7 @@ export interface operations {
                     "application/json": components["schemas"]["OrgEnvironmentDto"];
                 };
             };
-            /** @description invalid name, deadline or source */
+            /** @description invalid name, deadline or source, or a source naming no installation in the org */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -3764,6 +4066,44 @@ export interface operations {
             };
             /** @description the Environment has Deployments */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    environment_deployment_targets: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description environment name */
+                env: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeploymentSourceTargetDto"][];
+                };
+            };
+            /** @description no Read on the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description plugins not configured */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3850,6 +4190,322 @@ export interface operations {
                 content?: never;
             };
             /** @description no such Deployment in this Environment */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    plugin_catalog: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PluginCatalogEntryDto"][];
+                };
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description plugins not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_plugins: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PluginInstallationDto"][];
+                };
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description plugins not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    install_plugin: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InstallPluginRequest"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PluginInstallationDto"];
+                };
+            };
+            /** @description invalid name or config */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin, or not a first-party plugin pinned by digest */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description plugins not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the name is taken or retired, or plugins are off */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_plugin: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description installation name */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PluginInstallationDto"];
+                };
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such installation, or plugins not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    uninstall_plugin: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description installation name */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UninstalledPluginDto"];
+                };
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such installation, or plugins not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    enable_plugin: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description installation name */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PluginInstallationDto"];
+                };
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such installation, or plugins not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    kill_plugin: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description installation name */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PluginInstallationDto"];
+                };
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such installation, or plugins not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    unmapped_groupings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description installation name */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnmappedGroupingDto"][];
+                };
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such installation, or plugins not configured */
             404: {
                 headers: {
                     [name: string]: unknown;
