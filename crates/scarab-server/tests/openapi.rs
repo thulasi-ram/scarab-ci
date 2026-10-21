@@ -144,3 +144,64 @@ fn cli_emits_openapi_json_file() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The plugin admin API (ADR-0072) is on the documented surface under its
+/// own group, with typed bodies; the broker's plugin-facing routes are not —
+/// they live on a separate listener, never the public API.
+#[test]
+fn openapi_document_has_the_plugin_admin_api_but_not_the_broker() {
+    let doc: serde_json::Value = serde_json::from_str(&scarab_server::openapi_json()).unwrap();
+
+    let paths = &doc["paths"];
+    for (p, method) in [
+        ("/v1/orgs/{org}/plugin-catalog", "get"),
+        ("/v1/orgs/{org}/plugins", "get"),
+        ("/v1/orgs/{org}/plugins", "post"),
+        ("/v1/orgs/{org}/plugins/{name}", "get"),
+        ("/v1/orgs/{org}/plugins/{name}", "delete"),
+        ("/v1/orgs/{org}/plugins/{name}/kill", "post"),
+        ("/v1/orgs/{org}/plugins/{name}/enable", "post"),
+        ("/v1/orgs/{org}/plugins/{name}/unmapped-groupings", "get"),
+    ] {
+        let op = &paths[p][method];
+        assert!(op.is_object(), "missing {method} {p}");
+        assert_eq!(op["tags"], serde_json::json!(["Plugins"]), "{method} {p}");
+    }
+    assert_eq!(
+        paths["/v1/orgs/{org}/environments/{env}/deployment-targets"]["get"]["tags"],
+        serde_json::json!(["Deployments"])
+    );
+    assert!(
+        paths
+            .as_object()
+            .unwrap()
+            .keys()
+            .all(|p| !p.starts_with("/_scarab/")),
+        "the broker is not part of the public API"
+    );
+
+    let schemas = &doc["components"]["schemas"];
+    for s in [
+        "PluginInstallationDto",
+        "InstallPluginRequest",
+        "PluginCatalogEntryDto",
+        "PluginManifestDto",
+        "PluginCapabilityDto",
+        "UninstalledPluginDto",
+        "UnmappedGroupingDto",
+        "DeploymentSourceTargetDto",
+    ] {
+        assert!(schemas.get(s).is_some(), "missing schema {s}");
+    }
+    assert_eq!(
+        schemas["PluginCapabilityDto"]["enum"],
+        serde_json::json!([
+            "report_deployments",
+            "subscribe_events",
+            "offer_actions",
+            "use_connection",
+            "contribute_ui",
+            "approve_gates"
+        ])
+    );
+}
