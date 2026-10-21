@@ -9447,6 +9447,7 @@ mod tests {
             retention_config_file: None,
             cas_concurrency: 4,
             connections: vec![],
+            plugins: crate::config::PluginsConfig::off(),
         };
 
         let err = run(&config)

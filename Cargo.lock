@@ -2886,6 +2886,7 @@ dependencies = [
  "scarab-forge-github",
  "scarab-identity",
  "scarab-pipeline",
+ "scarab-plugin",
  "scarab-project",
  "scarab-secrets",
  "scarab-secrets-postgres",

@@ -32,7 +32,8 @@ use super::{authorize_scoped, rbac_scope, ApiError, AppState};
 #[serde(deny_unknown_fields)]
 pub struct EnvironmentDeploymentSourceDto {
     /// The PluginInstallation's name: a DNS-1123 label (lowercase letters,
-    /// digits, `-`; at most 63). Not yet checked against real installations.
+    /// digits, `-`; at most 63), installed in this org — a PUT naming one
+    /// that is not is refused (400).
     pub installation: String,
     /// The vendor's grouping that maps into this Environment (an Argo CD
     /// project, say). Opaque; matched exactly, no wildcards. No leading or
@@ -185,7 +186,7 @@ pub(crate) async fn get_org_environment(
     summary = "Create or replace an org Environment (ADR-0071)",
     responses(
         (status = 200, body = OrgEnvironmentDto),
-        (status = 400, description = "invalid name, deadline or source"),
+        (status = 400, description = "invalid name, deadline or source, or a source naming no installation in the org"),
         (status = 403, description = "not an org admin"),
         (status = 404, description = "org Environments not configured"),
         (status = 409, description = "a source is already listed by another Environment")
@@ -225,6 +226,16 @@ pub(crate) async fn put_org_environment(
         updated_by: principal.subject,
     };
     environment.validate().map_err(org_environment_api_error)?;
+    // F1 (c-min audit): a source must name an installation in this org.
+    crate::plugins::check_sources_are_installed(
+        &st,
+        &environment.org,
+        environment
+            .deployment_sources
+            .iter()
+            .map(|s| s.installation.as_str()),
+    )
+    .await?;
     let stored = store
         .put_org_environment(&environment)
         .await

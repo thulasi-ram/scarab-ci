@@ -636,3 +636,106 @@ async fn unwired_store_is_404() {
         assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}");
     }
 }
+
+/// The org Environment store is down while the Deployment record is not.
+struct OrgEnvironmentsDown;
+
+#[async_trait::async_trait]
+impl scarab_project::OrgEnvironmentStore for OrgEnvironmentsDown {
+    async fn put_org_environment(
+        &self,
+        _: &scarab_project::OrgEnvironment,
+    ) -> Result<scarab_project::OrgEnvironment, scarab_project::OrgEnvironmentError> {
+        Err(down())
+    }
+    async fn get_org_environment(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<Option<scarab_project::OrgEnvironment>, scarab_project::OrgEnvironmentError> {
+        Err(down())
+    }
+    async fn list_org_environments(
+        &self,
+        _: &str,
+    ) -> Result<Vec<scarab_project::OrgEnvironment>, scarab_project::OrgEnvironmentError> {
+        Err(down())
+    }
+    async fn delete_org_environment(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<bool, scarab_project::OrgEnvironmentError> {
+        Err(down())
+    }
+    async fn environment_for_deployment_source(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> Result<Option<String>, scarab_project::OrgEnvironmentError> {
+        Err(down())
+    }
+}
+
+fn down() -> scarab_project::OrgEnvironmentError {
+    scarab_project::OrgEnvironmentError::Store("connection refused".into())
+}
+
+/// A Deployment record with one (empty) Environment, `prod`.
+struct OneEmptyEnvironment;
+
+#[async_trait::async_trait]
+impl DeploymentStore for OneEmptyEnvironment {
+    async fn append(
+        &self,
+        _: &str,
+        _: &DeploymentInput,
+        _: scarab_deployment::Millis,
+    ) -> Result<scarab_deployment::LoggedDeploymentInput, scarab_deployment::DeploymentStoreError>
+    {
+        Err(scarab_deployment::DeploymentStoreError::Store(
+            "read-only fake".into(),
+        ))
+    }
+    async fn inputs(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<
+        Vec<scarab_deployment::LoggedDeploymentInput>,
+        scarab_deployment::DeploymentStoreError,
+    > {
+        Ok(vec![])
+    }
+    async fn environments(
+        &self,
+        _: &str,
+    ) -> Result<Vec<String>, scarab_deployment::DeploymentStoreError> {
+        Ok(vec!["prod".into()])
+    }
+}
+
+/// A failed deadline lookup is a 500, never a silent fallback to the default
+/// deadline: a status folded against the wrong deadline would read `stalled`
+/// (or not) for no reason anyone could see (c-min audit). Needs no database.
+#[tokio::test]
+async fn a_failed_deadline_lookup_is_a_500_not_the_default_deadline() {
+    let app = router(
+        app_state(Arc::new(InMemoryDb::new()), Arc::new(FakeClock::new(0)))
+            .with_deployments(Arc::new(OneEmptyEnvironment))
+            .with_org_environments(Arc::new(OrgEnvironmentsDown)),
+    );
+    for uri in [
+        "/v1/orgs/acme/board",
+        "/v1/orgs/acme/board?environment=prod",
+        "/v1/orgs/acme/environments/prod/deployments",
+    ] {
+        let (status, body) = call(&app, "GET", uri, None, None).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{uri}: {body}");
+        assert!(
+            body.as_str().unwrap().contains("connection refused"),
+            "{uri}: {body}"
+        );
+    }
+}

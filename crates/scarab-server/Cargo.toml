@@ -59,6 +59,9 @@ scarab-project = { workspace = true }
 # ADR-0070: the Deployment record — its store port and the fold every read
 # runs (the board and the Deployments view).
 scarab-deployment = { workspace = true }
+# ADR-0072: PluginInstallations, the report wire shape and its rules, and the
+# PluginStore / PluginTokenVerifier ports the broker and admin API speak.
+scarab-plugin = { workspace = true }
 scarab-db-postgres = { workspace = true }
 scarab-forge-github = { workspace = true }
 scarab-forge-forgejo = { workspace = true }
