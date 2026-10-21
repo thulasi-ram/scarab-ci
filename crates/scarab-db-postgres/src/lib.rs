@@ -32,6 +32,9 @@ use scarab_project::{Deployment, Environment, EnvironmentStore, ProjectError};
 
 /// `OrgEnvironmentStore` (ADR-0071): the minimal org-level Environment.
 mod org_environments;
+/// `PluginStore` (ADR-0072): PluginInstallations, the kill switch, and report
+/// ingest into the Deployment record.
+mod plugins;
 
 /// The embedded, ordered set of forward-only migrations. `MIGRATOR.run(pool)`
 /// applies all pending ones (tracked in `_sqlx_migrations`); tests can also walk

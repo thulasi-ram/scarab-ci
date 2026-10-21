@@ -1,0 +1,680 @@
+//! [`PluginStore`] on Postgres (ADR-0072, migration 0055): the
+//! PluginInstallation registry with its kill switch, and report ingest into
+//! the Deployment record.
+//!
+//! **Ingest is one transaction per batch.** It locks the installation row
+//! first — the kill switch is re-read under that lock, so a kill that commits
+//! first refuses the batch, and one that commits after waits for it — then,
+//! per item, the target's cursor row, then (inside the append) the Org's
+//! Deployment counter row. Every ingest of an installation holds its
+//! installation row, so cursor rows are uncontended across transactions, and
+//! request appends take only the counter: no lock cycle can form (migration
+//! 0055). The org and the source written into the record come from the locked
+//! installation row, never from a report.
+
+use std::collections::BTreeMap;
+
+use async_trait::async_trait;
+use serde_json::Value;
+use sqlx::Row;
+
+use scarab_deployment::{
+    DeploymentInput, DeploymentStatusReport, DeploymentTarget, DeploymentVersion,
+};
+use scarab_plugin::{
+    DeploymentSourceTarget, InstallationDeploymentSource, InstallationState, PluginInstallation,
+    PluginManifest, PluginStore, PluginStoreError, ReportIngest, ReportItem, ReportItemOutcome,
+    ReportOutcome, RuntimeStatus, UnmappedGrouping,
+};
+
+use crate::{append_deployment_input, PostgresDb};
+
+fn plugin_store_err(e: sqlx::Error) -> PluginStoreError {
+    PluginStoreError::Store(e.to_string())
+}
+
+const INSTALLATION_COLUMNS: &str = "id, org, name, plugin, image, manifest, manifest_sha256, \
+     config, state, runtime_status, runtime_message, probe_passed_at, approved_by, approved_at, \
+     killed_by, killed_at";
+
+/// One `plugin_installations` row back into the domain. A row whose manifest,
+/// config or state this binary cannot read is reported, never defaulted: a
+/// guessed manifest would be an approval nobody gave.
+fn installation_from_row(
+    r: &sqlx::postgres::PgRow,
+) -> Result<PluginInstallation, PluginStoreError> {
+    let id: String = r.get("id");
+    let unreadable = |what: &str, e: String| {
+        PluginStoreError::Store(format!("plugin installation {id}: unreadable {what}: {e}"))
+    };
+    let manifest: PluginManifest = serde_json::from_value(r.get::<Value, _>("manifest"))
+        .map_err(|e| unreadable("manifest", e.to_string()))?;
+    let config: BTreeMap<String, String> = serde_json::from_value(r.get::<Value, _>("config"))
+        .map_err(|e| unreadable("config", e.to_string()))?;
+    let state: String = r.get("state");
+    let state = InstallationState::parse(&state)
+        .ok_or_else(|| unreadable("state", format!("{state:?}")))?;
+    let runtime_status: String = r.get("runtime_status");
+    let runtime_status = RuntimeStatus::parse(&runtime_status)
+        .ok_or_else(|| unreadable("runtime status", format!("{runtime_status:?}")))?;
+    Ok(PluginInstallation {
+        org: r.get("org"),
+        name: r.get("name"),
+        plugin: r.get("plugin"),
+        image: r.get("image"),
+        manifest,
+        manifest_sha256: r.get("manifest_sha256"),
+        config,
+        state,
+        runtime_status,
+        runtime_message: r.get("runtime_message"),
+        probe_passed_at: r.get("probe_passed_at"),
+        approved_by: r.get("approved_by"),
+        approved_at: r.get("approved_at"),
+        killed_by: r.get("killed_by"),
+        killed_at: r.get("killed_at"),
+        id,
+    })
+}
+
+const TARGET_COLUMNS: &str = "t.installation_id, i.name AS installation, t.target_id, \
+     t.vendor_grouping, t.environment, t.last_sequence, t.version_scheme, t.last_version, \
+     t.last_status, t.last_label, t.owner_projects, t.owners_reported_at, t.updated_at";
+
+fn target_from_row(r: &sqlx::postgres::PgRow) -> DeploymentSourceTarget {
+    let mut owner_projects: Vec<String> = r.get("owner_projects");
+    owner_projects.sort();
+    DeploymentSourceTarget {
+        installation_id: r.get("installation_id"),
+        installation: r.get("installation"),
+        target_id: r.get("target_id"),
+        vendor_grouping: r.get("vendor_grouping"),
+        environment: r.get("environment"),
+        // The CHECK keeps it positive.
+        last_sequence: r.get::<i64, _>("last_sequence") as u64,
+        version_scheme: r.get("version_scheme"),
+        last_version: r.get("last_version"),
+        last_status: r.get("last_status"),
+        last_label: r.get("last_label"),
+        owner_projects,
+        owners_reported_at: r.get("owners_reported_at"),
+        updated_at: r.get("updated_at"),
+    }
+}
+
+#[async_trait]
+impl PluginStore for PostgresDb {
+    async fn install(
+        &self,
+        installation: &PluginInstallation,
+    ) -> Result<PluginInstallation, PluginStoreError> {
+        installation
+            .validate()
+            .map_err(|e| PluginStoreError::Invalid(e.to_string()))?;
+        let manifest = serde_json::to_value(&installation.manifest)
+            .map_err(|e| PluginStoreError::Store(e.to_string()))?;
+        let config = serde_json::to_value(&installation.config)
+            .map_err(|e| PluginStoreError::Store(e.to_string()))?;
+        let mut tx = self.pool().begin().await.map_err(plugin_store_err)?;
+        // Claim the name in the ledger first: its PRIMARY KEY is what makes a
+        // name single-use per Org for good, live or retired. `DO NOTHING`
+        // covers both the name and the id constraint; which one hit is read
+        // back below.
+        let claimed = sqlx::query(
+            "INSERT INTO plugin_installation_names (org, name, installation_id, installed_at)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(&installation.org)
+        .bind(&installation.name)
+        .bind(&installation.id)
+        .bind(installation.approved_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(plugin_store_err)?
+        .rows_affected();
+        if claimed == 0 {
+            let retired: Option<Option<i64>> = sqlx::query_scalar(
+                "SELECT retired_at FROM plugin_installation_names WHERE org = $1 AND name = $2",
+            )
+            .bind(&installation.org)
+            .bind(&installation.name)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(plugin_store_err)?;
+            return Err(match retired {
+                Some(Some(_)) => PluginStoreError::NameRetired(installation.name.clone()),
+                Some(None) => PluginStoreError::NameTaken(installation.name.clone()),
+                None => PluginStoreError::IdTaken,
+            });
+        }
+        sqlx::query(
+            "INSERT INTO plugin_installations
+                 (org, name, id, plugin, image, manifest, manifest_sha256, config, state,
+                  runtime_status, runtime_message, probe_passed_at, approved_by, approved_at,
+                  killed_by, killed_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
+        )
+        .bind(&installation.org)
+        .bind(&installation.name)
+        .bind(&installation.id)
+        .bind(&installation.plugin)
+        .bind(&installation.image)
+        .bind(manifest)
+        .bind(&installation.manifest_sha256)
+        .bind(config)
+        .bind(installation.state.as_str())
+        .bind(installation.runtime_status.as_str())
+        .bind(&installation.runtime_message)
+        .bind(installation.probe_passed_at)
+        .bind(&installation.approved_by)
+        .bind(installation.approved_at)
+        .bind(&installation.killed_by)
+        .bind(installation.killed_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(plugin_store_err)?;
+        tx.commit().await.map_err(plugin_store_err)?;
+        Ok(installation.clone())
+    }
+
+    async fn installation(
+        &self,
+        org: &str,
+        name: &str,
+    ) -> Result<Option<PluginInstallation>, PluginStoreError> {
+        let sql = format!(
+            "SELECT {INSTALLATION_COLUMNS} FROM plugin_installations WHERE org = $1 AND name = $2"
+        );
+        sqlx::query(&sql)
+            .bind(org)
+            .bind(name)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(plugin_store_err)?
+            .as_ref()
+            .map(installation_from_row)
+            .transpose()
+    }
+
+    async fn installation_by_id(
+        &self,
+        id: &str,
+    ) -> Result<Option<PluginInstallation>, PluginStoreError> {
+        let sql = format!("SELECT {INSTALLATION_COLUMNS} FROM plugin_installations WHERE id = $1");
+        sqlx::query(&sql)
+            .bind(id)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(plugin_store_err)?
+            .as_ref()
+            .map(installation_from_row)
+            .transpose()
+    }
+
+    async fn installations(&self, org: &str) -> Result<Vec<PluginInstallation>, PluginStoreError> {
+        let sql = format!(
+            "SELECT {INSTALLATION_COLUMNS} FROM plugin_installations WHERE org = $1 ORDER BY name"
+        );
+        sqlx::query(&sql)
+            .bind(org)
+            .fetch_all(self.pool())
+            .await
+            .map_err(plugin_store_err)?
+            .iter()
+            .map(installation_from_row)
+            .collect()
+    }
+
+    async fn set_installation_state(
+        &self,
+        org: &str,
+        name: &str,
+        state: InstallationState,
+        by: &str,
+        at: i64,
+    ) -> Result<Option<PluginInstallation>, PluginStoreError> {
+        // A repeat kill keeps the first `killed_by`/`killed_at`: who stopped
+        // it is the fact worth keeping. Enabling clears both.
+        let sql = format!(
+            "UPDATE plugin_installations SET
+                 state = $3,
+                 killed_by = CASE WHEN $3 = 'killed' THEN COALESCE(killed_by, $4) END,
+                 killed_at = CASE WHEN $3 = 'killed' THEN COALESCE(killed_at, $5) END
+             WHERE org = $1 AND name = $2
+             RETURNING {INSTALLATION_COLUMNS}"
+        );
+        sqlx::query(&sql)
+            .bind(org)
+            .bind(name)
+            .bind(state.as_str())
+            .bind(by)
+            .bind(at)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(plugin_store_err)?
+            .as_ref()
+            .map(installation_from_row)
+            .transpose()
+    }
+
+    async fn uninstall(
+        &self,
+        org: &str,
+        name: &str,
+        by: &str,
+        at: i64,
+    ) -> Result<Option<Vec<InstallationDeploymentSource>>, PluginStoreError> {
+        let mut tx = self.pool().begin().await.map_err(plugin_store_err)?;
+        // Cursors, receipts and unmapped counts go with it (ON DELETE
+        // CASCADE). The DELETE takes the installation row's lock, so an
+        // ingest in flight finishes first and none starts after.
+        let deleted: Option<String> = sqlx::query_scalar(
+            "DELETE FROM plugin_installations WHERE org = $1 AND name = $2 RETURNING id",
+        )
+        .bind(org)
+        .bind(name)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(plugin_store_err)?;
+        if deleted.is_none() {
+            return Ok(None);
+        }
+        // Every source naming it goes too: a source naming a retired name
+        // could never route again, and leaving it would read as if it might.
+        let mut removed: Vec<InstallationDeploymentSource> = sqlx::query(
+            "DELETE FROM environment_deployment_sources WHERE org = $1 AND installation = $2
+             RETURNING environment, vendor_grouping",
+        )
+        .bind(org)
+        .bind(name)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(plugin_store_err)?
+        .iter()
+        .map(|r| InstallationDeploymentSource {
+            environment: r.get("environment"),
+            vendor_grouping: r.get("vendor_grouping"),
+        })
+        .collect();
+        removed.sort();
+        sqlx::query(
+            "UPDATE plugin_installation_names SET retired_at = $3, retired_by = $4
+             WHERE org = $1 AND name = $2",
+        )
+        .bind(org)
+        .bind(name)
+        .bind(at)
+        .bind(by)
+        .execute(&mut *tx)
+        .await
+        .map_err(plugin_store_err)?;
+        tx.commit().await.map_err(plugin_store_err)?;
+        Ok(Some(removed))
+    }
+
+    async fn deployment_sources_naming(
+        &self,
+        org: &str,
+        name: &str,
+    ) -> Result<Vec<InstallationDeploymentSource>, PluginStoreError> {
+        Ok(sqlx::query(
+            "SELECT environment, vendor_grouping FROM environment_deployment_sources
+             WHERE org = $1 AND installation = $2
+             ORDER BY environment, vendor_grouping",
+        )
+        .bind(org)
+        .bind(name)
+        .fetch_all(self.pool())
+        .await
+        .map_err(plugin_store_err)?
+        .iter()
+        .map(|r| InstallationDeploymentSource {
+            environment: r.get("environment"),
+            vendor_grouping: r.get("vendor_grouping"),
+        })
+        .collect())
+    }
+
+    async fn ingest_report(
+        &self,
+        installation_id: &str,
+        items: &[ReportIngest],
+        received_at: i64,
+    ) -> Result<Vec<ReportItemOutcome>, PluginStoreError> {
+        let mut tx = self.pool().begin().await.map_err(plugin_store_err)?;
+        // The installation, locked: the kill switch re-read under the lock a
+        // kill takes, and the org + name every report is written under.
+        let Some(installation) = sqlx::query(
+            "SELECT org, name, state FROM plugin_installations WHERE id = $1 FOR UPDATE",
+        )
+        .bind(installation_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(plugin_store_err)?
+        else {
+            return Err(PluginStoreError::NotFound);
+        };
+        if installation.get::<String, _>("state") != InstallationState::Enabled.as_str() {
+            return Err(PluginStoreError::Killed);
+        }
+        let org: String = installation.get("org");
+        let name: String = installation.get("name");
+
+        let mut outcomes = Vec::with_capacity(items.len());
+        for ingest in items {
+            let item = &ingest.item;
+            let key = item.idempotency_key();
+            // 1. The receipt. Under the installation lock no other batch of
+            //    this installation can be writing one, and a key repeated
+            //    within this batch sees its own earlier row.
+            if let Some(receipt) = sqlx::query(
+                "SELECT content_sha256, outcome, input_seq FROM plugin_report_receipts
+                 WHERE installation_id = $1 AND idempotency_key = $2",
+            )
+            .bind(installation_id)
+            .bind(key)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(plugin_store_err)?
+            {
+                if receipt.get::<String, _>("content_sha256") != ingest.content_sha256 {
+                    // Dropping `tx` rolls the whole batch back.
+                    return Err(PluginStoreError::IdempotencyConflict {
+                        idempotency_key: key.to_string(),
+                    });
+                }
+                outcomes.push(ReportItemOutcome {
+                    outcome: ReportOutcome::Duplicate,
+                    input_seq: receipt.get::<Option<i64>, _>("input_seq").map(|s| s as u64),
+                    reason: Some(format!(
+                        "first received as {}",
+                        receipt.get::<String, _>("outcome")
+                    )),
+                });
+                continue;
+            }
+
+            // 2. The cursor. Not newer than the last accepted → stale.
+            let sequence = item.sequence() as i64;
+            let last: Option<i64> = sqlx::query_scalar(
+                "SELECT last_sequence FROM deployment_source_targets
+                 WHERE installation_id = $1 AND target_id = $2
+                 FOR UPDATE",
+            )
+            .bind(installation_id)
+            .bind(item.target_id())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(plugin_store_err)?;
+            if last.is_some_and(|last| sequence <= last) {
+                insert_receipt(
+                    &mut tx,
+                    installation_id,
+                    ingest,
+                    ReportOutcome::Stale,
+                    None,
+                    received_at,
+                )
+                .await?;
+                outcomes.push(ReportItemOutcome {
+                    outcome: ReportOutcome::Stale,
+                    input_seq: None,
+                    reason: last.map(|l| format!("sequence {sequence} is not newer than {l}")),
+                });
+                continue;
+            }
+
+            // 3. Route by the sources an Environment lists *now* (ADR-0071
+            //    §5) — the same single-statement lookup as
+            //    `environment_for_deployment_source`, in this transaction.
+            let environment: Option<String> = sqlx::query_scalar(
+                "SELECT environment FROM environment_deployment_sources
+                 WHERE org = $1 AND installation = $2 AND vendor_grouping = $3",
+            )
+            .bind(&org)
+            .bind(&name)
+            .bind(item.vendor_grouping())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(plugin_store_err)?;
+
+            // 4. Record it, or count the drop.
+            let (outcome, input_seq) = match (&environment, item) {
+                (None, _) => {
+                    sqlx::query(
+                        "INSERT INTO deployment_source_unmapped AS u
+                             (installation_id, vendor_grouping, org, reports, first_at, last_at,
+                              last_target_id)
+                         VALUES ($1, $2, $3, 1, $4, $4, $5)
+                         ON CONFLICT (installation_id, vendor_grouping) DO UPDATE SET
+                             reports = u.reports + 1,
+                             last_at = GREATEST(u.last_at, EXCLUDED.last_at),
+                             last_target_id = EXCLUDED.last_target_id",
+                    )
+                    .bind(installation_id)
+                    .bind(item.vendor_grouping())
+                    .bind(&org)
+                    .bind(received_at)
+                    .bind(item.target_id())
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(plugin_store_err)?;
+                    (ReportOutcome::Unmapped, None)
+                }
+                (Some(environment), ReportItem::Status(status)) => {
+                    let input = DeploymentInput::Report {
+                        target: DeploymentTarget {
+                            environment: environment.clone(),
+                            source: name.clone(),
+                            id: status.target_id.clone(),
+                        },
+                        version: DeploymentVersion(status.version.clone()),
+                        report: DeploymentStatusReport {
+                            status: status.status.into(),
+                            label: status.label.clone(),
+                            link: status.link.clone(),
+                            // Kept as `report_source_at`, display-only; the
+                            // append stamps `received_at` (ADR-0070 §8).
+                            at: status.source_at,
+                        },
+                    };
+                    let logged = append_deployment_input(&mut tx, &org, &input, received_at)
+                        .await
+                        .map_err(|e| PluginStoreError::Store(e.to_string()))?;
+                    (ReportOutcome::Accepted, Some(logged.seq))
+                }
+                (Some(_), ReportItem::Ownership(_)) => (ReportOutcome::Accepted, None),
+            };
+            if environment.is_some() {
+                // Mapped now: whatever was counted against it is history.
+                sqlx::query(
+                    "DELETE FROM deployment_source_unmapped
+                     WHERE installation_id = $1 AND vendor_grouping = $2",
+                )
+                .bind(installation_id)
+                .bind(item.vendor_grouping())
+                .execute(&mut *tx)
+                .await
+                .map_err(plugin_store_err)?;
+            }
+
+            // 5. Advance the cursor, and keep where the target routes, its
+            //    scheme, its last status and its owners. A field the item does
+            //    not carry keeps its stored value.
+            let status = match item {
+                ReportItem::Status(s) => Some(s),
+                ReportItem::Ownership(_) => None,
+            };
+            let owners: Option<Vec<String>> = item.owners().map(|o| {
+                let mut o = o.to_vec();
+                o.sort();
+                o
+            });
+            sqlx::query(
+                "INSERT INTO deployment_source_targets AS t
+                     (installation_id, target_id, org, vendor_grouping, environment, last_sequence,
+                      version_scheme, last_version, last_status, last_label, owner_projects,
+                      owners_reported_at, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($11::text[], '{}'),
+                         CASE WHEN $11::text[] IS NULL THEN NULL ELSE $12::bigint END, $12)
+                 ON CONFLICT (installation_id, target_id) DO UPDATE SET
+                     vendor_grouping = EXCLUDED.vendor_grouping,
+                     environment = EXCLUDED.environment,
+                     last_sequence = EXCLUDED.last_sequence,
+                     version_scheme = COALESCE(EXCLUDED.version_scheme, t.version_scheme),
+                     last_version = COALESCE(EXCLUDED.last_version, t.last_version),
+                     last_status = COALESCE(EXCLUDED.last_status, t.last_status),
+                     last_label = COALESCE(EXCLUDED.last_label, t.last_label),
+                     owner_projects = CASE WHEN $11::text[] IS NULL THEN t.owner_projects
+                                           ELSE EXCLUDED.owner_projects END,
+                     owners_reported_at = COALESCE(EXCLUDED.owners_reported_at,
+                                                   t.owners_reported_at),
+                     updated_at = EXCLUDED.updated_at",
+            )
+            .bind(installation_id)
+            .bind(item.target_id())
+            .bind(&org)
+            .bind(item.vendor_grouping())
+            .bind(&environment)
+            .bind(sequence)
+            .bind(status.map(|s| s.version_scheme.as_str()))
+            .bind(status.map(|s| s.version.as_str()))
+            .bind(status.map(|s| s.status.as_str()))
+            .bind(status.map(|s| s.label.as_str()))
+            .bind(owners)
+            .bind(received_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(plugin_store_err)?;
+
+            insert_receipt(
+                &mut tx,
+                installation_id,
+                ingest,
+                outcome,
+                input_seq,
+                received_at,
+            )
+            .await?;
+            outcomes.push(ReportItemOutcome {
+                outcome,
+                input_seq,
+                reason: None,
+            });
+        }
+        tx.commit().await.map_err(plugin_store_err)?;
+        Ok(outcomes)
+    }
+
+    async fn source_targets(
+        &self,
+        installation_id: &str,
+    ) -> Result<Vec<DeploymentSourceTarget>, PluginStoreError> {
+        let sql = format!(
+            "SELECT {TARGET_COLUMNS} FROM deployment_source_targets t
+             JOIN plugin_installations i ON i.id = t.installation_id
+             WHERE t.installation_id = $1
+             ORDER BY t.target_id"
+        );
+        Ok(sqlx::query(&sql)
+            .bind(installation_id)
+            .fetch_all(self.pool())
+            .await
+            .map_err(plugin_store_err)?
+            .iter()
+            .map(target_from_row)
+            .collect())
+    }
+
+    async fn environment_targets(
+        &self,
+        org: &str,
+        environment: &str,
+    ) -> Result<Vec<DeploymentSourceTarget>, PluginStoreError> {
+        let sql = format!(
+            "SELECT {TARGET_COLUMNS} FROM deployment_source_targets t
+             JOIN plugin_installations i ON i.id = t.installation_id
+             WHERE t.org = $1 AND t.environment = $2
+             ORDER BY i.name, t.target_id"
+        );
+        Ok(sqlx::query(&sql)
+            .bind(org)
+            .bind(environment)
+            .fetch_all(self.pool())
+            .await
+            .map_err(plugin_store_err)?
+            .iter()
+            .map(target_from_row)
+            .collect())
+    }
+
+    async fn unmapped_groupings(
+        &self,
+        installation_id: &str,
+    ) -> Result<Vec<UnmappedGrouping>, PluginStoreError> {
+        // Filtered by the sources as they are NOW, so a grouping an admin has
+        // just mapped drops off without waiting for its next report.
+        Ok(sqlx::query(
+            "SELECT u.vendor_grouping, u.reports, u.first_at, u.last_at, u.last_target_id
+             FROM deployment_source_unmapped u
+             JOIN plugin_installations i ON i.id = u.installation_id
+             WHERE u.installation_id = $1
+               AND NOT EXISTS (
+                   SELECT 1 FROM environment_deployment_sources s
+                   WHERE s.org = i.org AND s.installation = i.name
+                     AND s.vendor_grouping = u.vendor_grouping)
+             ORDER BY u.vendor_grouping",
+        )
+        .bind(installation_id)
+        .fetch_all(self.pool())
+        .await
+        .map_err(plugin_store_err)?
+        .iter()
+        .map(|r| UnmappedGrouping {
+            vendor_grouping: r.get("vendor_grouping"),
+            reports: r.get::<i64, _>("reports") as u64,
+            first_at: r.get("first_at"),
+            last_at: r.get("last_at"),
+            last_target_id: r.get("last_target_id"),
+        })
+        .collect())
+    }
+
+    async fn prune_report_receipts(&self, received_before: i64) -> Result<u64, PluginStoreError> {
+        Ok(
+            sqlx::query("DELETE FROM plugin_report_receipts WHERE received_at < $1")
+                .bind(received_before)
+                .execute(self.pool())
+                .await
+                .map_err(plugin_store_err)?
+                .rows_affected(),
+        )
+    }
+}
+
+/// Record that `ingest`'s idempotency key was used, and what came of it.
+async fn insert_receipt(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    installation_id: &str,
+    ingest: &ReportIngest,
+    outcome: ReportOutcome,
+    input_seq: Option<u64>,
+    received_at: i64,
+) -> Result<(), PluginStoreError> {
+    sqlx::query(
+        "INSERT INTO plugin_report_receipts
+             (installation_id, idempotency_key, content_sha256, outcome, input_seq, received_at)
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(installation_id)
+    .bind(ingest.item.idempotency_key())
+    .bind(&ingest.content_sha256)
+    .bind(outcome.as_str())
+    .bind(input_seq.map(|s| s as i64))
+    .bind(received_at)
+    .execute(&mut **tx)
+    .await
+    .map_err(plugin_store_err)?;
+    Ok(())
+}
