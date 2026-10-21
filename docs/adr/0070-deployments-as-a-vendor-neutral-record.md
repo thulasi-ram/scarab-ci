@@ -86,10 +86,27 @@ exactly one Environment.)
 - **Rollback is a new Deployment** of an older DeploymentVersion. An old Deployment is
   never edited back to life.
 - A Deployment **outlives** the Deploy Run that requested it, and may have **no** Deploy
-  Run at all. A report that creates one makes an **Unexplained** Deployment. It **stays**
-  Unexplained: a request that later joins it is recorded as a separate claim beside it,
-  never as its explanation. Otherwise any request that happened to name the same version
-  would launder a hand-applied hotfix (ADR-0071 §4).
+  Run at all. A report that creates one makes an **Unexplained** Deployment.
+- **Explanation is decided by timing.** A request that joins a report-created Deployment
+  explains it only if its Step **started at or before core first received** that
+  Deployment (effective time ≤ creation time): the Step was already running when the
+  source showed the change, so it can be what made it. That is the same test that makes a
+  late request history rather than a rollback (§7, INV-DEP-11), and it covers the normal
+  Argo flow, where the source reports after the Step starts but before it succeeds. A
+  request whose Step started **after** is recorded as a **claim**: it stays among the
+  requesters, so a DeploymentGate on it still resolves, but it never explains the
+  Deployment, which **stays Unexplained**. Otherwise any request that happened to name the
+  same version would launder a hand-applied hotfix (ADR-0071 §4). The decision is made as
+  inputs arrive and is **sticky** (INV-DEP-12): a rerun Step's later request never
+  un-explains a Deployment, and a requester that explained it is never demoted to a claim.
+  With two requesters, any one that qualifies explains it. "Made live by" lists only the
+  requesters that are not claims.
+- **Known limits of the timing rule.** A retried Attempt whose new start is after the
+  source's report reads as a claim, although its first Attempt made the change. Widening
+  the effective time to the first Attempt would open the gate window over that Attempt's
+  failure (§8), so the fix is deferred to the DeploymentRequest writer (MMP slice (b)). A
+  long-running Step that spans a hand-applied change of the same version explains it; the
+  record cannot tell the two apart, and that ambiguity is inherent.
 
 ### 3. DeploymentTarget: the smallest unit that independently succeeds or fails
 
@@ -246,10 +263,13 @@ Whatever happens first decides. A failure that predates the window never fails t
 a re-deploy after fixing a missing secret is not failed by the earlier failure.
 
 **"Before" and "after" mean received before and after.** Core stamps every input, request
-or report, with its **receipt time**: the store stamps it, on one clock, in the
-transaction that appends the input, and keeps it monotone per Org, so receipt order and
-arrival order agree. The request's effective time, the gate Attempt's start and the
-gate's `now` come from that same control-plane clock. A source's own timestamp is display
+or report, with its **receipt time**: the caller reads it from the control-plane clock
+right before the append, and the store keeps it monotone per Org (the later of it and the
+Org's last stamp) in the transaction that appends the input, so receipt order and arrival
+order agree. A receipt time more than a minute ahead of the database's own clock is
+refused, so one replica's runaway clock cannot push every later stamp into the future.
+The request's effective time, the gate Attempt's start and the gate's `now` come from
+that same control-plane clock. A source's own timestamp is display
 only. The fold requires non-decreasing time and clamps an input that arrives backdated up
 to the last one rather than trusting it. Two inputs can still share a millisecond, so ties
 are broken by arrival sequence, and a deadline sorts before every input stamped the same
@@ -350,6 +370,7 @@ crate disagree, the crate wins and this ADR is stale.
   verdict per Attempt (§8).
 - **INV-DEP-11** A late request joins the Deployment the source already saw. It is not a
   rollback.
+- **INV-DEP-12** A claim never explains a Deployment, and nothing un-explains one (§2).
 
 The property suite found three real holes before any persistence existed: an older
 version reported live again rejoining its old Deployment (INV-DEP-3), a gate verdict
@@ -358,7 +379,7 @@ and a late request being treated as a rollback (INV-DEP-11). A second audit foun
 fourth: inputs folded in arrival order but judged on the source's clock, so a backdated
 report could flip a verdict. Receipt-time stamping and the fold's clamp close it; a
 scenario test covers one case, and a property test over backdated and non-monotone inputs
-is still owed.
+holds INV-DEP-1..11 after the clamp.
 
 ### 13. One Environment per Run now; one per `invoke` segment in the target state
 
