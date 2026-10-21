@@ -68,6 +68,12 @@ scarab-workspace-client = { path = "crates/scarab-workspace-client" }
 scarab-executor-k8s = { path = "crates/scarab-executor-k8s" }
 scarab-executor-local = { path = "crates/scarab-executor-local" }
 scarab-testkit = { path = "crates/scarab-testkit" }
+scarab-deployment = { path = "crates/scarab-deployment" }
+
+# --- test-only ---------------------------------------------------------------
+# Property testing for pure domain folds (invariant suites). Dev-dependency
+# only; never linked into a binary.
+proptest = { version = "1", default-features = false, features = ["std"] }
 
 # --- infra (only inside adapter / binary crates) ---------------------------
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "sync", "net"] }

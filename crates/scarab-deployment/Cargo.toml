@@ -1,0 +1,17 @@
+[package]
+name = "scarab-deployment"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+# Pure domain crate (CONTEXT §4.6): the vendor-neutral Deployment record as a
+# fold over requests and source reports. No dependencies at all — not even
+# serde yet; persistence and the wire shape come with the adapter that needs
+# them.
+[dependencies]
+
+[dev-dependencies]
+# Property tests for the numbered invariants in `src/lib.rs`. Dev-only: it is
+# a test harness, never linked into a binary, so it does not cross the
+# purity boundary.
+proptest = { workspace = true }
