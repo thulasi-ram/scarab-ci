@@ -14,11 +14,23 @@
 -- repo_run_counters pattern) and holds its row lock until commit, so appends
 -- within one Org commit strictly in seq order. Orgs never contend.
 --
+-- CORE STAMPS TIME. `at` is the time the input was RECEIVED, taken inside
+-- that same upsert as GREATEST(the database clock, the Org's `last_at`) — so
+-- it never goes backwards within an Org, and seq order and time order are one
+-- order, which the fold requires (`DeploymentLedger::apply`). The `at` a
+-- caller supplies is not stored as `at`: a source's clock (Argo's, a
+-- plugin's) is not the control plane's, and the fold must never decide
+-- "before"/"after" by clock skew. A report's own timestamp is kept as
+-- `report_source_at`, display-only. A request's `effective_at` is from the
+-- control plane's clock and is clamped to no later than the stamped `at`.
+--
 -- The legacy `deployments` table (0012, 0016) is untouched: it stays readable as
 -- approval history (ADR-0070 §1, ADR-0071 §9). Nothing here references it.
 CREATE TABLE deployment_input_counters (
     org      TEXT   PRIMARY KEY,
-    last_seq BIGINT NOT NULL
+    last_seq BIGINT NOT NULL,
+    -- Unix-ms of the Org's last stamped `at`; the floor for the next one.
+    last_at  BIGINT NOT NULL
 );
 
 CREATE TABLE deployment_inputs (
@@ -30,8 +42,7 @@ CREATE TABLE deployment_inputs (
     target_id     TEXT   NOT NULL,
     version       TEXT   NOT NULL,
     kind          TEXT   NOT NULL CHECK (kind IN ('request', 'report')),
-    -- Unix-ms: when a request was recorded (its Step succeeded) / when a
-    -- report was made.
+    -- Unix-ms receipt time, stamped by the append (see above).
     at            BIGINT NOT NULL,
     -- request only: the requesting Deploy Run step, and when it started.
     requester_run  TEXT,
@@ -42,15 +53,19 @@ CREATE TABLE deployment_inputs (
     report_status TEXT CHECK (report_status IN ('in_progress', 'live', 'failed')),
     report_label  TEXT,
     report_link   TEXT,
+    -- report only: the source's own timestamp. Shown, never compared.
+    report_source_at BIGINT,
     PRIMARY KEY (org, seq),
     CHECK (
         (kind = 'request'
             AND requester_run IS NOT NULL AND requester_step IS NOT NULL
             AND effective_at IS NOT NULL
-            AND report_status IS NULL AND report_label IS NULL AND report_link IS NULL)
+            AND report_status IS NULL AND report_label IS NULL AND report_link IS NULL
+            AND report_source_at IS NULL)
         OR
         (kind = 'report'
             AND report_status IS NOT NULL AND report_label IS NOT NULL
+            AND report_source_at IS NOT NULL
             AND requester_run IS NULL AND requester_step IS NULL AND effective_at IS NULL)
     )
 );

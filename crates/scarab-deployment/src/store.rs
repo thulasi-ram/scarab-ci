@@ -11,6 +11,17 @@
 //! public id is the seq of the input that created it, and that is stable only
 //! if every reader sees a gap-free prefix of the log (a later input can never
 //! become visible before an earlier one).
+//!
+//! **Core stamps time.** An input's `at` is the time the store *received* it,
+//! taken from one clock and monotone per Org, so the log's arrival order and
+//! its time order are the same order — which the fold requires
+//! ([`DeploymentLedger::apply`](crate::DeploymentLedger::apply)). The `at` a
+//! caller passes is ignored: a source's clock (Argo's, a plugin's) is not the
+//! control plane's, and comparing the two would decide "before" and "after"
+//! by clock skew. What a source said its time was is kept, display-only, as
+//! [`LoggedDeploymentInput::report_source_at`]. A request's `effective_at`
+//! comes from the control plane's own clock and is kept, clamped to no later
+//! than the stamped `at`.
 
 use std::fmt;
 
@@ -18,12 +29,16 @@ use async_trait::async_trait;
 
 use crate::DeploymentInput;
 
-/// One input as the log holds it: the input plus its Org-scoped sequence
-/// number, assigned at append and never reused.
+/// One input as the log holds it: the input as stamped (its `at` is the
+/// receipt time) plus its Org-scoped sequence number, assigned at append and
+/// never reused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoggedDeploymentInput {
     pub seq: u64,
     pub input: DeploymentInput,
+    /// For a report: the time the *source* gave it, shown and never compared.
+    /// `None` for a request (whose times are all core's own).
+    pub report_source_at: Option<crate::Millis>,
 }
 
 /// A [`DeploymentStore`] failure. Hand-written rather than `thiserror` so
@@ -47,10 +62,14 @@ impl std::error::Error for DeploymentStoreError {}
 /// The append-only DeploymentInput log, per Org.
 #[async_trait]
 pub trait DeploymentStore: Send + Sync {
-    /// Append `input` to `org`'s log, returning the seq it was given. Seqs
-    /// start at 1 per Org and are committed in order.
-    async fn append(&self, org: &str, input: &DeploymentInput)
-        -> Result<u64, DeploymentStoreError>;
+    /// Append `input` to `org`'s log, returning it as logged: its seq (from
+    /// 1 per Org, committed in order) and its stamped receipt time (see the
+    /// module docs — the `at` passed in is not what is stored).
+    async fn append(
+        &self,
+        org: &str,
+        input: &DeploymentInput,
+    ) -> Result<LoggedDeploymentInput, DeploymentStoreError>;
 
     /// Every input for `environment` in `org`, in seq order. Folding one
     /// Environment's inputs alone is exact: a DeploymentTarget belongs to

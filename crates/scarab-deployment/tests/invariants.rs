@@ -529,6 +529,38 @@ fn a_rerequest_of_what_is_already_live_passes_at_once() {
 }
 
 #[test]
+fn a_backdated_input_is_clamped_and_cannot_flip_a_verdict() {
+    // The store stamps every input with core's receipt time, so the fold sees
+    // time and arrival order agree. If a backdated input reached the fold
+    // anyway (a source's clock behind core's), trusting its time would slot a
+    // failure in *before* a request whose gate already passed — and the
+    // verdict would flip to `stalled` a deadline later (INV-DEP-10). The fold
+    // clamps it up to the last time it has seen instead.
+    let mut l = DeploymentLedger::new();
+    let d = l.apply(report("api", "c1", Live, 0));
+    l.apply(request("api", "c1", "r1", 30));
+    let passed = Some(DeploymentGateVerdict::Passed { at: 30 });
+    assert_eq!(
+        l.get(d)
+            .unwrap()
+            .gate_verdict(&requester("r1"), 30, DEADLINE),
+        passed
+    );
+
+    l.apply(report("api", "c1", Failed, 20));
+    let deployment = l.get(d).unwrap();
+    assert_eq!(
+        deployment.reports.last().unwrap().at,
+        30,
+        "clamped up to the last input's time"
+    );
+    assert_eq!(
+        deployment.gate_verdict(&requester("r1"), 30 + 2 * DEADLINE, DEADLINE),
+        passed
+    );
+}
+
+#[test]
 fn with_a_gitops_commit_scheme_an_unrelated_commit_supersedes_the_request() {
     // Audit finding 1, and why the DeploymentVersion scheme is declared by the
     // source (decided 2026-10-22, provisional). Under a "gitops commit" scheme

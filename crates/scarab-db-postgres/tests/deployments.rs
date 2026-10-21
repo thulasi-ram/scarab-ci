@@ -62,6 +62,22 @@ fn report(
     }
 }
 
+/// `input` as the store should have logged it: the caller's `at` replaced by
+/// the receipt time `at`, a request's `effective_at` clamped to it.
+fn stamped(input: &DeploymentInput, receipt: i64) -> DeploymentInput {
+    let mut input = input.clone();
+    match &mut input {
+        DeploymentInput::Request {
+            at, effective_at, ..
+        } => {
+            *at = receipt;
+            *effective_at = (*effective_at).min(receipt);
+        }
+        DeploymentInput::Report { report, .. } => report.at = receipt,
+    }
+    input
+}
+
 #[tokio::test]
 async fn inputs_round_trip_and_seq_is_per_org_from_one() {
     let Some(tdb) = fresh_db().await else {
@@ -90,12 +106,21 @@ async fn inputs_round_trip_and_seq_is_per_org_from_one() {
         130,
     );
 
-    assert_eq!(db.append("acme", &asked).await.unwrap(), 1);
-    assert_eq!(db.append("acme", &in_progress).await.unwrap(), 2);
-    // Another Org's log starts its own count: ids are Org-scoped.
-    assert_eq!(db.append("globex", &asked).await.unwrap(), 1);
-    assert_eq!(db.append("acme", &live).await.unwrap(), 3);
-    assert_eq!(db.append("acme", &failed).await.unwrap(), 4);
+    let mut appended = Vec::new();
+    for (org, input, seq) in [
+        ("acme", &asked, 1),
+        ("acme", &in_progress, 2),
+        // Another Org's log starts its own count: ids are Org-scoped.
+        ("globex", &asked, 1),
+        ("acme", &live, 3),
+        ("acme", &failed, 4),
+    ] {
+        let logged = db.append(org, input).await.unwrap();
+        assert_eq!(logged.seq, seq);
+        if org == "acme" {
+            appended.push(logged);
+        }
+    }
 
     let prod = db.inputs("acme", "prod").await.unwrap();
     assert_eq!(
@@ -103,14 +128,34 @@ async fn inputs_round_trip_and_seq_is_per_org_from_one() {
         vec![1, 2, 3],
         "one Environment's inputs only, in seq order"
     );
-    assert_eq!(prod[0].input, asked);
-    assert_eq!(prod[1].input, in_progress, "a link survives");
-    assert_eq!(prod[2].input, live, "an absent link stays absent");
+    assert_eq!(prod, appended[..3], "append returns exactly what is logged");
+
+    // Core stamped the time: the caller's `at` (100, 110, …) is not what is
+    // stored — the database clock is — and it never goes backwards.
+    let receipts: Vec<i64> = appended.iter().map(|l| l.input.at()).collect();
+    assert!(receipts.iter().all(|&at| at > 1_000_000_000_000));
+    assert!(receipts.windows(2).all(|w| w[0] <= w[1]), "{receipts:?}");
+
+    // Everything else round-trips; a report keeps its source's time aside.
+    assert_eq!(prod[0].input, stamped(&asked, receipts[0]));
+    assert_eq!(prod[0].report_source_at, None);
+    assert_eq!(
+        prod[1].input,
+        stamped(&in_progress, receipts[1]),
+        "a link survives"
+    );
+    assert_eq!(prod[1].report_source_at, Some(110));
+    assert_eq!(
+        prod[2].input,
+        stamped(&live, receipts[2]),
+        "an absent link stays absent"
+    );
 
     let staging = db.inputs("acme", "staging").await.unwrap();
     assert_eq!(staging.len(), 1);
     assert_eq!(staging[0].seq, 4);
-    assert_eq!(staging[0].input, failed);
+    assert_eq!(staging[0].input, stamped(&failed, receipts[3]));
+    assert_eq!(staging[0].report_source_at, Some(130));
 
     assert_eq!(
         db.environments("acme").await.unwrap(),
@@ -126,9 +171,49 @@ async fn inputs_round_trip_and_seq_is_per_org_from_one() {
     tdb.cleanup().await;
 }
 
+/// A request's `effective_at` can never be later than when core received it:
+/// a step cannot have started after its success was recorded.
+#[tokio::test]
+async fn a_request_effective_after_its_receipt_is_clamped() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+
+    let far_future = i64::MAX / 2;
+    let logged = db
+        .append(
+            "acme",
+            &DeploymentInput::Request {
+                target: target("prod", "web"),
+                version: DeploymentVersion("v1".into()),
+                requester: DeploymentRequester {
+                    run: "run-1".into(),
+                    step: "bump".into(),
+                },
+                effective_at: far_future,
+                at: far_future,
+            },
+        )
+        .await
+        .unwrap();
+    let DeploymentInput::Request {
+        effective_at, at, ..
+    } = logged.input
+    else {
+        panic!("a request comes back a request");
+    };
+    assert!(at < far_future, "the caller's `at` is ignored");
+    assert_eq!(effective_at, at);
+
+    tdb.cleanup().await;
+}
+
 /// The public id of a Deployment is the seq of the input that created it, so
 /// concurrent appends must still hand out exactly 1..=N with no gap and no
-/// duplicate — the counter row serialises them.
+/// duplicate — the counter row serialises them, and their stamped times too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_appends_get_exactly_one_through_n() {
     let Some(tdb) = fresh_db().await else {
@@ -148,6 +233,7 @@ async fn concurrent_appends_get_exactly_one_through_n() {
                 )
                 .await
                 .unwrap()
+                .seq
             })
         })
         .collect();
@@ -158,14 +244,19 @@ async fn concurrent_appends_get_exactly_one_through_n() {
     seqs.sort_unstable();
     assert_eq!(seqs, (1..=50).collect::<Vec<u64>>());
 
-    let logged: Vec<u64> = db
-        .inputs("acme", "prod")
-        .await
-        .unwrap()
-        .iter()
-        .map(|l| l.seq)
-        .collect();
-    assert_eq!(logged, (1..=50).collect::<Vec<u64>>());
+    let logged = db.inputs("acme", "prod").await.unwrap();
+    assert_eq!(
+        logged.iter().map(|l| l.seq).collect::<Vec<_>>(),
+        (1..=50).collect::<Vec<u64>>()
+    );
+    // Racing appends still agree on time order and seq order — what the fold
+    // requires of its input.
+    assert!(
+        logged
+            .windows(2)
+            .all(|w| w[0].input.at() <= w[1].input.at()),
+        "receipt times went backwards across seqs"
+    );
 
     tdb.cleanup().await;
 }
@@ -193,10 +284,12 @@ async fn malformed_rows_are_rejected_by_the_table() {
             sqlx::query(
                 "INSERT INTO deployment_inputs
                      (org, seq, environment, target_source, target_id, version, kind, at,
-                      requester_run, requester_step, effective_at, report_status, report_label)
+                      requester_run, requester_step, effective_at,
+                      report_status, report_label, report_source_at)
                  VALUES ('acme', $1, 'prod', 'argocd-prod', 'web', 'v1', $2, 0,
                          $3, $3, CASE WHEN $3 IS NULL THEN NULL ELSE 0 END,
-                         $4, CASE WHEN $4 IS NULL THEN NULL ELSE 'x' END)",
+                         $4, CASE WHEN $4 IS NULL THEN NULL ELSE 'x' END,
+                         CASE WHEN $4 IS NULL THEN NULL ELSE 0 END)",
             )
             .bind(seq)
             .bind(kind)
