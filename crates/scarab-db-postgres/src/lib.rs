@@ -30,6 +30,9 @@ use scarab_forge::{
 };
 use scarab_project::{Deployment, Environment, EnvironmentStore, ProjectError};
 
+/// `OrgEnvironmentStore` (ADR-0071): the minimal org-level Environment.
+mod org_environments;
+
 /// The embedded, ordered set of forward-only migrations. `MIGRATOR.run(pool)`
 /// applies all pending ones (tracked in `_sqlx_migrations`); tests can also walk
 /// `MIGRATOR.iter()` to apply schema versions one at a time.
