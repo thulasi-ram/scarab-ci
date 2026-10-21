@@ -89,7 +89,9 @@ use std::collections::BTreeMap;
 pub mod store;
 pub mod view;
 
-pub use store::{DeploymentStore, DeploymentStoreError, LoggedDeploymentInput};
+pub use store::{
+    DeploymentStore, DeploymentStoreError, LoggedDeploymentInput, RECEIVED_AT_MAX_LEAD_MS,
+};
 pub use view::{
     fold_environment, DeploymentRequesterView, DeploymentStatusReportView, DeploymentView,
     EnvironmentBoardRow, EnvironmentDeployments,
