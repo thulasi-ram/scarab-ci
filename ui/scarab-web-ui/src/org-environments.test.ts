@@ -20,7 +20,7 @@ const form = (o: Partial<OrgEnvironmentForm> = {}): OrgEnvironmentForm => ({
 });
 
 describe("toPutBody", () => {
-  it("sends every field, minutes as milliseconds, text trimmed", () => {
+  it("sends every field, minutes as milliseconds, free text trimmed", () => {
     // A full replace: an omitted field would be reset server-side, so the
     // body must always carry the deadline and the source list.
     expect(
@@ -28,7 +28,10 @@ describe("toPutBody", () => {
         form({
           description: "  the one prod ",
           deadlineMinutes: 5,
-          sources: [{ installation: " argocd-prod ", vendor_grouping: " prod " }],
+          // The vendor grouping is a routing key matched exactly, so it is sent
+          // as typed (whitespace around it is an error, tested below); only the
+          // free-text fields are trimmed.
+          sources: [{ installation: " argocd-prod ", vendor_grouping: "prod" }],
         }),
       ),
     ).toEqual({
