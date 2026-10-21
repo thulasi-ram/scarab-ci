@@ -64,6 +64,9 @@ pub mod logs;
 pub mod metrics;
 pub mod oauth;
 pub mod oidc;
+/// ADR-0071: the minimal org-level Environment — its admin/read API and the
+/// EnvironmentDeploymentDeadline the Deployment read fold uses.
+pub mod org_environments;
 pub mod retention;
 pub mod secret_executor;
 /// `--role workspace`: the ADR-0061 workspace service. Its own router, its own
@@ -138,6 +141,11 @@ pub struct AppState {
     /// The Deployment record's input log (ADR-0070). `None` disables the
     /// Deployments endpoints (404) — the board and the Deployments view.
     pub deployments: Option<Arc<dyn scarab_deployment::DeploymentStore>>,
+    /// Org-level Environments (ADR-0071, MMP step 1): name, deadline and
+    /// EnvironmentDeploymentSources. `None` disables
+    /// `/v1/orgs/{org}/environments[/{env}]` (404), and every Environment's
+    /// Deployments fold with the default deadline.
+    pub org_environments: Option<Arc<dyn scarab_project::OrgEnvironmentStore>>,
     /// "Intentionally unset" markers for the secret coverage matrix (ADR-0037 D).
     /// Advisory annotations only — `None` disables marking, and the matrix simply
     /// reports nothing silenced. Never consulted on a run path.
@@ -238,6 +246,7 @@ impl AppState {
             api_tokens: None,
             environments: None,
             deployments: None,
+            org_environments: None,
             secret_coverage: None,
             oidc: None,
             gate_token_secret: None,
@@ -317,6 +326,17 @@ impl AppState {
         deployments: Arc<dyn scarab_deployment::DeploymentStore>,
     ) -> Self {
         self.deployments = Some(deployments);
+        self
+    }
+
+    /// Enable the org-level Environment endpoints (ADR-0071), and let each
+    /// Environment's own EnvironmentDeploymentDeadline drive the Deployment
+    /// read fold.
+    pub fn with_org_environments(
+        mut self,
+        org_environments: Arc<dyn scarab_project::OrgEnvironmentStore>,
+    ) -> Self {
+        self.org_environments = Some(org_environments);
         self
     }
 
@@ -7245,13 +7265,12 @@ async fn fold_environment_deployments(
         .inputs(org, environment)
         .await
         .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;
+    // The Environment's own deadline, or the default for a name with no
+    // OrgEnvironment (ADR-0071).
+    let deadline =
+        org_environments::deadline_from_org_environment(st, org, environment).await?;
     let now = st.clock.now().await.0;
-    // No Environment carries its own deadline yet (ADR-0071): one default.
-    Ok(scarab_deployment::fold_environment(
-        &inputs,
-        now,
-        scarab_deployment::DEFAULT_DEPLOYMENT_DEADLINE_MS,
-    ))
+    Ok(scarab_deployment::fold_environment(&inputs, now, deadline))
 }
 
 /// The Project of every run that requested one of `views`, in one query for
@@ -9067,8 +9086,9 @@ const TAG_GROUPS: &[(&str, &str)] = &[
     ),
     (
         "Environments",
-        "Environments and their protection rules, plus their legacy approval \
-         history.",
+        "Org-level Environments (ADR-0071) with their deployment deadline and \
+         sources; per-repo Environments and their protection rules, plus their \
+         legacy approval history.",
     ),
     (
         "Deployments",
@@ -9305,6 +9325,10 @@ impl utoipa::Modify for SecuritySchemes {
         list_environments,
         delete_environment,
         list_deployments,
+        org_environments::list_org_environments,
+        org_environments::get_org_environment,
+        org_environments::put_org_environment,
+        org_environments::delete_org_environment,
         get_environment_board,
         list_environment_deployments,
         get_deployment,
@@ -9415,7 +9439,10 @@ impl utoipa::Modify for SecuritySchemes {
         DeploymentTargetDto,
         DeploymentRequesterDto,
         DeploymentStatusReportDto,
-        EnvironmentBoardRowDto
+        EnvironmentBoardRowDto,
+        org_environments::OrgEnvironmentDto,
+        org_environments::EnvironmentDeploymentSourceDto,
+        org_environments::PutOrgEnvironmentRequest
     ))
 )]
 pub struct ApiDoc;
@@ -9532,6 +9559,16 @@ fn router_inner(state: AppState) -> Router {
         .route(
             "/v1/repos/{org}/{repo}/environments/{name}/deployments",
             get(list_deployments),
+        )
+        .route(
+            "/v1/orgs/{org}/environments",
+            get(org_environments::list_org_environments),
+        )
+        .route(
+            "/v1/orgs/{org}/environments/{env}",
+            axum::routing::put(org_environments::put_org_environment)
+                .get(org_environments::get_org_environment)
+                .delete(org_environments::delete_org_environment),
         )
         .route("/v1/orgs/{org}/board", get(get_environment_board))
         .route(

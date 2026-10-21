@@ -10,10 +10,12 @@
 // rather than a wall of failed fetches. Layout hides the nav entry too — belt
 // and braces, not a security boundary.
 //
-// Three sections today: **Connections** (which forges Scarab is wired to, and
-// what they cover), **API tokens** (ADR-0049 — the credential a machine can
-// hold, minted here and nowhere else) and **Org Secrets** (the top of the
-// `env → repo → org` inheritance chain, until now settable only by raw HTTP).
+// Sections today: **Connections** (which forges Scarab is wired to, and
+// what they cover), **Members**, **Environments** (ADR-0071 — the org-level
+// places deployments land in: deadline and reporting sources), **API tokens**
+// (ADR-0049 — the credential a machine can hold, minted here and nowhere else)
+// and **Org Secrets** (the top of the `env → repo → org` inheritance chain,
+// until now settable only by raw HTTP).
 // Connections comes first: without one there are no Projects, so nothing else
 // here has anything to act on. Tokens sit above secrets because they are the
 // only thing on this page that hands out authority rather than data.
@@ -23,6 +25,7 @@ import ScopedSecrets from "../components/ScopedSecrets";
 import Connections from "../components/Connections";
 import ApiTokens from "../components/ApiTokens";
 import Members from "../components/Members";
+import OrgEnvironments from "../components/OrgEnvironments";
 import Icon from "../components/Icon";
 
 export default function Settings() {
@@ -80,6 +83,9 @@ export default function Settings() {
                 {/* Who holds what (ADR-0049/0069) — first among the org panels,
                     because every other permission on this page is someone's. */}
                 <Members org={o()} />
+                {/* Org-level Environments (ADR-0071): org admins administer
+                    them until an Environment gets an RBAC scope of its own. */}
+                <OrgEnvironments org={o()} />
                 <ApiTokens org={o()} />
                 <ScopedSecrets
                   scope={{ org: o() }}

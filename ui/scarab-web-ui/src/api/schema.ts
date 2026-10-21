@@ -489,6 +489,47 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/orgs/{org}/environments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List an org's Environments (ADR-0071) */
+        get: operations["list_org_environments"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/environments/{env}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** One org Environment (ADR-0071) */
+        get: operations["get_org_environment"];
+        /** Create or replace an org Environment (ADR-0071) */
+        put: operations["put_org_environment"];
+        post?: never;
+        /**
+         * Delete an org Environment with no Deployments (ADR-0071)
+         * @description Refused (409) while the Deployment record holds anything for the name:
+         *     the record is keyed by name, so deleting and re-creating the Environment
+         *     would silently re-adopt that history under whatever the new one says.
+         */
+        delete: operations["delete_org_environment"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/orgs/{org}/environments/{env}/deployments": {
         parameters: {
             query?: never;
@@ -1941,6 +1982,20 @@ export interface components {
             newest?: null | components["schemas"]["DeploymentDto"];
             target: components["schemas"]["DeploymentTargetDto"];
         };
+        /** @description A source allowed to report into an Environment (ADR-0071 §5). */
+        EnvironmentDeploymentSourceDto: {
+            /**
+             * @description The PluginInstallation's name: a DNS-1123 label (lowercase letters,
+             *     digits, `-`; at most 63). Not yet checked against real installations.
+             */
+            installation: string;
+            /**
+             * @description The vendor's grouping that maps into this Environment (an Argo CD
+             *     project, say). Opaque; matched exactly, no wildcards. No leading or
+             *     trailing whitespace (refused, never trimmed).
+             */
+            vendor_grouping: string;
+        };
         /** @description One expired Workspace Snapshot behind a widened rerun (ADR-0061 s5). */
         ExpiredInputDto: {
             /** @description The step whose input workspace is incomplete. */
@@ -2046,6 +2101,32 @@ export interface components {
              *     or by any later API call: a lost token is re-minted, never re-read.
              */
             token: string;
+        };
+        /** @description An org-level Environment in its minimal shape (ADR-0071, MMP step 1). */
+        OrgEnvironmentDto: {
+            /**
+             * Format: int64
+             * @description Unix-ms.
+             */
+            created_at: number;
+            /**
+             * Format: int64
+             * @description The EnvironmentDeploymentDeadline: how long a Deployment here may stay
+             *     `requested` or `in_progress` before it reads `stalled`.
+             */
+            deployment_deadline_ms: number;
+            /** @description Sorted by installation, then vendor grouping. */
+            deployment_sources: components["schemas"]["EnvironmentDeploymentSourceDto"][];
+            description: string;
+            name: string;
+            org: string;
+            /**
+             * Format: int64
+             * @description Unix-ms.
+             */
+            updated_at: number;
+            /** @description Who last wrote it (a Principal subject). */
+            updated_by: string;
         };
         /**
          * @description `GET /v1/repos/{org}/{repo}/pipelines?ref=` body: the manually-dispatchable
@@ -2167,6 +2248,24 @@ export interface components {
              *     host, which differs from the web host on GitHub).
              */
             repo_url: string;
+        };
+        /**
+         * @description `PUT /v1/orgs/{org}/environments/{env}`: the whole Environment, replaced.
+         *     An omitted optional field takes its default — it does not keep the stored
+         *     value. Unknown fields are refused, so a misspelt field is a 4xx rather
+         *     than a silently reset deadline.
+         */
+        PutOrgEnvironmentRequest: {
+            /**
+             * Format: int64
+             * @description 60000 (1 minute) to 604800000 (7 days); omitted = the server default
+             *     (one hour).
+             */
+            deployment_deadline_ms?: number | null;
+            /** @description The complete list; it replaces the stored one. `[]` clears it. */
+            deployment_sources: components["schemas"]["EnvironmentDeploymentSourceDto"][];
+            /** @description Free text; omitted = empty. */
+            description?: string | null;
         };
         /**
          * @description `POST /v1/secrets` body: define (or overwrite) a secret at a scope. The
@@ -3491,6 +3590,180 @@ export interface operations {
             };
             /** @description deployments not configured */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_org_environments: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrgEnvironmentDto"][];
+                };
+            };
+            /** @description no Read on the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description org Environments not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_org_environment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description environment name */
+                env: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrgEnvironmentDto"];
+                };
+            };
+            /** @description no Read on the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such Environment, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    put_org_environment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description environment name */
+                env: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PutOrgEnvironmentRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrgEnvironmentDto"];
+                };
+            };
+            /** @description invalid name, deadline or source */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description org Environments not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a source is already listed by another Environment */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_org_environment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description environment name */
+                env: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such Environment, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the Environment has Deployments */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -922,6 +922,229 @@
         ]
       }
     },
+    "/v1/orgs/{org}/environments": {
+      "get": {
+        "tags": [
+          "Environments"
+        ],
+        "summary": "List an org's Environments (ADR-0071)",
+        "operationId": "list_org_environments",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/OrgEnvironmentDto"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "no Read on the org"
+          },
+          "404": {
+            "description": "org Environments not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/environments/{env}": {
+      "get": {
+        "tags": [
+          "Environments"
+        ],
+        "summary": "One org Environment (ADR-0071)",
+        "operationId": "get_org_environment",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrgEnvironmentDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "no Read on the org"
+          },
+          "404": {
+            "description": "no such Environment, or not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "Environments"
+        ],
+        "summary": "Create or replace an org Environment (ADR-0071)",
+        "operationId": "put_org_environment",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PutOrgEnvironmentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrgEnvironmentDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "invalid name, deadline or source"
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "org Environments not configured"
+          },
+          "409": {
+            "description": "a source is already listed by another Environment"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "Environments"
+        ],
+        "summary": "Delete an org Environment with no Deployments (ADR-0071)",
+        "description": "Refused (409) while the Deployment record holds anything for the name:\nthe record is keyed by name, so deleting and re-creating the Environment\nwould silently re-adopt that history under whatever the new one says.",
+        "operationId": "delete_org_environment",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "deleted"
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "no such Environment, or not configured"
+          },
+          "409": {
+            "description": "the Environment has Deployments"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/orgs/{org}/environments/{env}/deployments": {
       "get": {
         "tags": [
@@ -4147,6 +4370,25 @@
           }
         }
       },
+      "EnvironmentDeploymentSourceDto": {
+        "type": "object",
+        "description": "A source allowed to report into an Environment (ADR-0071 §5).",
+        "required": [
+          "installation",
+          "vendor_grouping"
+        ],
+        "properties": {
+          "installation": {
+            "type": "string",
+            "description": "The PluginInstallation's name: a DNS-1123 label (lowercase letters,\ndigits, `-`; at most 63). Not yet checked against real installations."
+          },
+          "vendor_grouping": {
+            "type": "string",
+            "description": "The vendor's grouping that maps into this Environment (an Argo CD\nproject, say). Opaque; matched exactly, no wildcards. No leading or\ntrailing whitespace (refused, never trimmed)."
+          }
+        },
+        "additionalProperties": false
+      },
       "ExpiredInputDto": {
         "type": "object",
         "description": "One expired Workspace Snapshot behind a widened rerun (ADR-0061 s5).",
@@ -4327,6 +4569,57 @@
           "token": {
             "type": "string",
             "description": "The credential. Returned once, here. Scarab keeps only its SHA-256, so\nthis exact string cannot be recovered from the database, from a backup,\nor by any later API call: a lost token is re-minted, never re-read."
+          }
+        }
+      },
+      "OrgEnvironmentDto": {
+        "type": "object",
+        "description": "An org-level Environment in its minimal shape (ADR-0071, MMP step 1).",
+        "required": [
+          "org",
+          "name",
+          "description",
+          "deployment_deadline_ms",
+          "deployment_sources",
+          "created_at",
+          "updated_at",
+          "updated_by"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix-ms."
+          },
+          "deployment_deadline_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The EnvironmentDeploymentDeadline: how long a Deployment here may stay\n`requested` or `in_progress` before it reads `stalled`."
+          },
+          "deployment_sources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EnvironmentDeploymentSourceDto"
+            },
+            "description": "Sorted by installation, then vendor grouping."
+          },
+          "description": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "org": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix-ms."
+          },
+          "updated_by": {
+            "type": "string",
+            "description": "Who last wrote it (a Principal subject)."
           }
         }
       },
@@ -4542,6 +4835,38 @@
             "description": "The forge WEB base for this repo (e.g. `https://github.com/owner/name`) —\nwhat the UI appends `/commit/<sha>` or `/pull/<n>` to for deep links.\nDerived from the connection's kind + base_url (the stored base is the API\nhost, which differs from the web host on GitHub)."
           }
         }
+      },
+      "PutOrgEnvironmentRequest": {
+        "type": "object",
+        "description": "`PUT /v1/orgs/{org}/environments/{env}`: the whole Environment, replaced.\nAn omitted optional field takes its default — it does not keep the stored\nvalue. Unknown fields are refused, so a misspelt field is a 4xx rather\nthan a silently reset deadline.",
+        "required": [
+          "deployment_sources"
+        ],
+        "properties": {
+          "deployment_deadline_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "60000 (1 minute) to 604800000 (7 days); omitted = the server default\n(one hour)."
+          },
+          "deployment_sources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EnvironmentDeploymentSourceDto"
+            },
+            "description": "The complete list; it replaces the stored one. `[]` clears it."
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Free text; omitted = empty."
+          }
+        },
+        "additionalProperties": false
       },
       "PutSecretRequest": {
         "type": "object",
@@ -5352,7 +5677,7 @@
     },
     {
       "name": "Environments",
-      "description": "Environments and their protection rules, plus their legacy approval history."
+      "description": "Org-level Environments (ADR-0071) with their deployment deadline and sources; per-repo Environments and their protection rules, plus their legacy approval history."
     },
     {
       "name": "Deployments",

@@ -78,6 +78,49 @@ fn openapi_document_has_the_deployment_record() {
     );
 }
 
+/// Org-level Environments (ADR-0071) are on the documented surface with typed
+/// bodies, grouped with Environments — not with the Deployment record that
+/// shares their path prefix.
+#[test]
+fn openapi_document_has_org_environments() {
+    let doc: serde_json::Value = serde_json::from_str(&scarab_server::openapi_json()).unwrap();
+
+    let paths = &doc["paths"];
+    for (p, method) in [
+        ("/v1/orgs/{org}/environments", "get"),
+        ("/v1/orgs/{org}/environments/{env}", "get"),
+        ("/v1/orgs/{org}/environments/{env}", "put"),
+        ("/v1/orgs/{org}/environments/{env}", "delete"),
+    ] {
+        let op = &paths[p][method];
+        assert!(op.is_object(), "missing {method} {p}");
+        assert_eq!(
+            op["tags"],
+            serde_json::json!(["Environments"]),
+            "{method} {p}"
+        );
+    }
+    assert_eq!(
+        paths["/v1/orgs/{org}/environments/{env}"]["put"]["requestBody"]["content"]
+            ["application/json"]["schema"]["$ref"],
+        serde_json::json!("#/components/schemas/PutOrgEnvironmentRequest")
+    );
+
+    let schemas = &doc["components"]["schemas"];
+    for s in [
+        "OrgEnvironmentDto",
+        "EnvironmentDeploymentSourceDto",
+        "PutOrgEnvironmentRequest",
+    ] {
+        assert!(schemas.get(s).is_some(), "missing schema {s}");
+    }
+    // A full replace: the source list is the one field a caller must state.
+    assert_eq!(
+        schemas["PutOrgEnvironmentRequest"]["required"],
+        serde_json::json!(["deployment_sources"])
+    );
+}
+
 #[test]
 fn cli_emits_openapi_json_file() {
     let dir = std::env::temp_dir().join(format!("scarab-openapi-{}", std::process::id()));

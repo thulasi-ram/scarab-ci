@@ -11,6 +11,12 @@
 // one the caller administers or belongs to, and the first Environment on the
 // board is shown.
 //
+// The Environment pills are the org's registered Environments (ADR-0071)
+// united with every name the record carries, so a registered Environment with
+// nothing deployed yet is still pickable, and a name with no org Environment
+// is marked: its Deployments stall by the default deadline. A caller who
+// cannot read the org's Environments still gets the record's names, unmarked.
+//
 // Everything here is the server's record, shown — the status, Unexplained and
 // Unconfirmed are core's verdicts (CONTEXT.md §4.6), not re-derived.
 import { createMemo, createResource, createSignal, For, Show } from "solid-js";
@@ -19,6 +25,7 @@ import {
   DeploymentsForbiddenError,
   getEnvironmentBoard,
   listEnvironmentDeployments,
+  listOrgEnvironments,
   listProjects,
   type Deployment,
   type DeploymentRequester,
@@ -36,6 +43,7 @@ import {
   safeHref,
   targetLabel,
 } from "../deployments";
+import { envPills } from "../org-environments";
 import StatusBadge from "../components/StatusBadge";
 import Icon from "../components/Icon";
 import Doodle from "../components/Doodle";
@@ -59,13 +67,18 @@ export default function Deployments() {
   const [board] = createResource(org, (o) => getEnvironmentBoard(o));
   const groups = createMemo(() => groupBoard(board() ?? []));
 
-  /** The Environment whose Deployments are listed: `?env=`, else the first. */
-  const env = () => one(search.env) || groups()[0]?.environment || "";
-  const envNames = createMemo(() => {
-    const names = groups().map((g) => g.environment);
-    const picked = one(search.env);
-    return picked && !names.includes(picked) ? [...names, picked].sort() : names;
-  });
+  /** The Environment whose Deployments are listed: `?env=`, else the first
+   *  on the board, else the first registered one. */
+  const env = () => one(search.env) || groups()[0]?.environment || pills()[0]?.name || "";
+  // `null` (not wired, or no access to them) leaves the pills unmarked.
+  const [orgEnvs] = createResource(org, (o) => listOrgEnvironments(o).catch(() => null));
+  const pills = createMemo(() =>
+    envPills(
+      orgEnvs.loading ? null : orgEnvs(),
+      groups().map((g) => g.environment),
+      one(search.env) || undefined,
+    ),
+  );
   const pickEnv = (e: string) => setSearch({ env: e });
 
   const [list] = createResource(
@@ -119,7 +132,7 @@ export default function Deployments() {
                 fallback={<p class="empty">This server does not record deployments.</p>}
               >
                 <Show
-                  when={groups().length > 0 || one(search.env)}
+                  when={groups().length > 0 || pills().length > 0}
                   fallback={<p class="empty">Nothing has been deployed yet.</p>}
                 >
                   <For each={groups()}>
@@ -191,10 +204,15 @@ export default function Deployments() {
                   </For>
 
                   <div class="filters dep-envs">
-                    <For each={envNames()}>
-                      {(e) => (
-                        <button class={`fpill ${env() === e ? "on" : ""}`} onClick={() => pickEnv(e)}>
-                          {e}
+                    <For each={pills()}>
+                      {(p) => (
+                        <button
+                          class="fpill"
+                          classList={{ on: env() === p.name, "oenv-unregistered": p.registered === false }}
+                          title={p.title}
+                          onClick={() => pickEnv(p.name)}
+                        >
+                          {p.name}
                         </button>
                       )}
                     </For>

@@ -736,6 +736,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The Deployment record's input log (ADR-0070): the Environment board
         // and the Deployments view fold it on every read.
         .with_deployments(pg.clone())
+        // Org-level Environments (ADR-0071): their admin API, and the
+        // per-Environment deadline that fold stalls by.
+        .with_org_environments(pg.clone())
         // The ForgeConnection registry (ADR-0046): RepoRef→Project resolution,
         // installation auto-registration, webhook replay dedup.
         .with_forge_connections(pg.clone())
