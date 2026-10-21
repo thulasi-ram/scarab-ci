@@ -71,7 +71,10 @@ CREATE TABLE deployment_inputs (
             AND report_status IS NOT NULL AND report_label IS NOT NULL
             AND report_source_at IS NOT NULL
             AND requester_run IS NULL AND requester_step IS NULL AND effective_at IS NULL)
-    )
+    ),
+    -- A step cannot have started after its success was recorded: the append
+    -- clamps `effective_at` to the stamp, and the table holds it to that.
+    CHECK (kind <> 'request' OR effective_at <= at)
 );
 
 -- Reads fold one Environment at a time, in seq order.

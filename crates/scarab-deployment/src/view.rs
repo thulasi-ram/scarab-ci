@@ -40,7 +40,9 @@ pub struct DeploymentRequesterView {
 pub struct DeploymentStatusReportView {
     pub report: DeploymentStatusReport,
     /// The source's own timestamp — display-only, never compared (its clock
-    /// is not core's). `None` when the input carried none.
+    /// is not core's). Every report carries one, so it is `Some` for a
+    /// report read from a store; it is optional only because the logged
+    /// input it comes from is shared with requests, which have none.
     pub source_at: Option<Millis>,
 }
 
@@ -105,9 +107,13 @@ impl EnvironmentDeployments {
 /// Deployments and board as of `now`, under `deadline` (the
 /// EnvironmentDeploymentDeadline).
 ///
-/// Exact for any slice of the log that is closed under DeploymentTarget,
-/// since the fold only relates inputs on the same target; an Environment's
-/// log is such a slice because a target belongs to exactly one Environment.
+/// Exact for any slice of a receipt-ordered log that is closed under
+/// DeploymentTarget, since the fold only relates inputs on the same target;
+/// an Environment's log is such a slice because a target belongs to exactly
+/// one Environment. "Receipt-ordered" — `at` non-decreasing in seq, which the
+/// store guarantees — matters: the fold's backdating clamp is ledger-wide, so
+/// with a backdated input another target's earlier input would raise its
+/// floor in a whole-Environment fold and not in a one-target fold.
 pub fn fold_environment(
     inputs: &[LoggedDeploymentInput],
     now: Millis,

@@ -324,9 +324,73 @@ async fn concurrent_appends_get_exactly_one_through_n() {
     tdb.cleanup().await;
 }
 
+/// One `deployment_inputs` row with every per-kind column spelled out, so each
+/// rejected case below differs from a well-formed row in exactly the way its
+/// message names.
+#[derive(Clone, Copy)]
+struct RawInputRow {
+    kind: &'static str,
+    at: i64,
+    requester_run: Option<&'static str>,
+    requester_step: Option<&'static str>,
+    effective_at: Option<i64>,
+    report_status: Option<&'static str>,
+    report_label: Option<&'static str>,
+    report_link: Option<&'static str>,
+    report_source_at: Option<i64>,
+}
+
+const WELL_FORMED_REQUEST: RawInputRow = RawInputRow {
+    kind: "request",
+    at: 10,
+    requester_run: Some("run-1"),
+    requester_step: Some("bump"),
+    effective_at: Some(5),
+    report_status: None,
+    report_label: None,
+    report_link: None,
+    report_source_at: None,
+};
+
+const WELL_FORMED_REPORT: RawInputRow = RawInputRow {
+    kind: "report",
+    at: 10,
+    requester_run: None,
+    requester_step: None,
+    effective_at: None,
+    report_status: Some("live"),
+    report_label: Some("healthy"),
+    report_link: Some("https://argo.example/web"),
+    report_source_at: Some(9),
+};
+
+async fn insert_raw(pool: &sqlx::PgPool, seq: i64, row: RawInputRow) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO deployment_inputs
+             (org, seq, environment, target_source, target_id, version, kind, at,
+              requester_run, requester_step, effective_at,
+              report_status, report_label, report_link, report_source_at)
+         VALUES ('acme', $1, 'prod', 'argocd-prod', 'web', 'v1', $2, $3,
+                 $4, $5, $6, $7, $8, $9, $10)",
+    )
+    .bind(seq)
+    .bind(row.kind)
+    .bind(row.at)
+    .bind(row.requester_run)
+    .bind(row.requester_step)
+    .bind(row.effective_at)
+    .bind(row.report_status)
+    .bind(row.report_label)
+    .bind(row.report_link)
+    .bind(row.report_source_at)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
 /// The table refuses rows that are neither a whole request nor a whole report
 /// — including a source-asserted status a source may not assert (INV-DEP-6
-/// at rest).
+/// at rest) and a request whose step "started" after it was recorded.
 #[tokio::test]
 async fn malformed_rows_are_rejected_by_the_table() {
     let Some(tdb) = fresh_db().await else {
@@ -335,63 +399,119 @@ async fn malformed_rows_are_rejected_by_the_table() {
     };
     let db = PostgresDb::with_pool(tdb.pool.clone());
     db.migrate().await.unwrap();
-
-    let insert = |seq: i64, kind: &str, run: Option<&str>, status: Option<&str>| {
-        let (kind, run, status) = (
-            kind.to_string(),
-            run.map(String::from),
-            status.map(String::from),
-        );
-        let pool = tdb.pool.clone();
-        async move {
-            sqlx::query(
-                "INSERT INTO deployment_inputs
-                     (org, seq, environment, target_source, target_id, version, kind, at,
-                      requester_run, requester_step, effective_at,
-                      report_status, report_label, report_source_at)
-                 VALUES ('acme', $1, 'prod', 'argocd-prod', 'web', 'v1', $2, 0,
-                         $3, $3, CASE WHEN $3 IS NULL THEN NULL ELSE 0 END,
-                         $4, CASE WHEN $4 IS NULL THEN NULL ELSE 'x' END,
-                         CASE WHEN $4 IS NULL THEN NULL ELSE 0 END)",
-            )
-            .bind(seq)
-            .bind(kind)
-            .bind(run)
-            .bind(status)
-            .execute(&pool)
-            .await
-        }
-    };
+    let pool = &tdb.pool;
 
     // The well-formed shapes go in, so the rejections below are the CHECKs.
-    insert(1, "request", Some("run-1"), None).await.unwrap();
-    insert(2, "report", None, Some("live")).await.unwrap();
+    insert_raw(pool, 1, WELL_FORMED_REQUEST).await.unwrap();
+    insert_raw(pool, 2, WELL_FORMED_REPORT).await.unwrap();
+    let linkless = RawInputRow {
+        report_link: None,
+        ..WELL_FORMED_REPORT
+    };
+    insert_raw(pool, 3, linkless).await.unwrap();
+    let started_as_recorded = RawInputRow {
+        effective_at: Some(10),
+        ..WELL_FORMED_REQUEST
+    };
+    insert_raw(pool, 4, started_as_recorded).await.unwrap();
 
-    assert!(
-        insert(3, "request", None, None).await.is_err(),
-        "no requester"
-    );
-    assert!(
-        insert(4, "request", Some("run-1"), Some("live"))
-            .await
-            .is_err(),
-        "a request carrying a report"
-    );
-    assert!(insert(5, "report", None, None).await.is_err(), "no status");
-    assert!(
-        insert(6, "report", Some("run-1"), Some("live"))
-            .await
-            .is_err(),
-        "a report carrying a requester"
-    );
-    assert!(
-        insert(7, "report", None, Some("superseded")).await.is_err(),
-        "superseded is core-derived"
-    );
-    assert!(
-        insert(8, "approval", None, None).await.is_err(),
-        "unknown kind"
-    );
+    let rejected = [
+        (
+            RawInputRow {
+                requester_run: None,
+                ..WELL_FORMED_REQUEST
+            },
+            "a request with no requester run",
+        ),
+        (
+            RawInputRow {
+                requester_step: None,
+                ..WELL_FORMED_REQUEST
+            },
+            "a request with no requester step",
+        ),
+        (
+            RawInputRow {
+                effective_at: None,
+                ..WELL_FORMED_REQUEST
+            },
+            "a request with no effective time",
+        ),
+        (
+            RawInputRow {
+                effective_at: Some(11),
+                ..WELL_FORMED_REQUEST
+            },
+            "a request effective after it was recorded",
+        ),
+        (
+            RawInputRow {
+                report_status: Some("live"),
+                ..WELL_FORMED_REQUEST
+            },
+            "a request carrying a report status",
+        ),
+        (
+            RawInputRow {
+                report_link: Some("https://argo.example/web"),
+                ..WELL_FORMED_REQUEST
+            },
+            "a request carrying a report link",
+        ),
+        (
+            RawInputRow {
+                report_status: None,
+                ..WELL_FORMED_REPORT
+            },
+            "a report with no status",
+        ),
+        (
+            RawInputRow {
+                report_label: None,
+                ..WELL_FORMED_REPORT
+            },
+            "a report with no label",
+        ),
+        (
+            RawInputRow {
+                report_source_at: None,
+                ..WELL_FORMED_REPORT
+            },
+            "a report with no source time",
+        ),
+        (
+            RawInputRow {
+                requester_run: Some("run-1"),
+                requester_step: Some("bump"),
+                ..WELL_FORMED_REPORT
+            },
+            "a report carrying a requester",
+        ),
+        (
+            RawInputRow {
+                effective_at: Some(5),
+                ..WELL_FORMED_REPORT
+            },
+            "a report carrying an effective time",
+        ),
+        (
+            RawInputRow {
+                report_status: Some("superseded"),
+                ..WELL_FORMED_REPORT
+            },
+            "superseded is core-derived",
+        ),
+        (
+            RawInputRow {
+                kind: "approval",
+                ..WELL_FORMED_REQUEST
+            },
+            "an unknown kind",
+        ),
+    ];
+    for (seq, (row, case)) in (10..).zip(rejected) {
+        assert!(insert_raw(pool, seq, row).await.is_err(), "{case}");
+    }
 
     tdb.cleanup().await;
 }
