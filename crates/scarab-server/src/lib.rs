@@ -7216,13 +7216,21 @@ pub struct EnvironmentBoardQuery {
 }
 
 /// `GET …/environments/{env}/deployments` filter: one DeploymentTarget's
-/// history. Either field narrows on its own.
+/// history (either field narrows on its own), and how many to return.
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct DeploymentListQuery {
     pub target_source: Option<String>,
     pub target_id: Option<String>,
+    /// At most this many, newest first (default 200, capped at 1000). Bounds
+    /// the response only: the server still folds the Environment's whole log
+    /// to derive each status.
+    pub limit: Option<usize>,
 }
+
+/// [`DeploymentListQuery::limit`]'s default and cap.
+const DEPLOYMENT_LIST_DEFAULT_LIMIT: usize = 200;
+const DEPLOYMENT_LIST_MAX_LIMIT: usize = 1000;
 
 /// Fold one Environment's log as of the server's `now`.
 async fn fold_environment_deployments(
@@ -7244,9 +7252,9 @@ async fn fold_environment_deployments(
     ))
 }
 
-/// The Project of every run that requested one of `views`, looked up once
-/// per run. A run stamped into another Org (or not stamped) maps to `None`:
-/// a link built from this Org's path would point at the wrong run.
+/// The Project of every run that requested one of `views`, in one query for
+/// the whole HTTP request. A run stamped into another Org (or not stamped) is
+/// absent: a link built from this Org's path would point at the wrong run.
 ///
 /// Takes a collected slice rather than an iterator: an iterator adapter whose
 /// closure borrows a `DeploymentView`, held across the `.await`, trips rustc's
@@ -7256,24 +7264,23 @@ async fn requester_projects(
     st: &AppState,
     org: &str,
     views: &[&scarab_deployment::DeploymentView],
-) -> Result<std::collections::HashMap<String, Option<String>>, ApiError> {
-    let mut projects = std::collections::HashMap::new();
-    for view in views {
-        for r in &view.requesters {
-            if projects.contains_key(&r.requester.run) {
-                continue;
-            }
-            let tenant = st.db.run_tenant(&RunId(r.requester.run.clone())).await?;
-            let project = tenant.and_then(|(o, p)| (o == org).then_some(p));
-            projects.insert(r.requester.run.clone(), project);
-        }
-    }
-    Ok(projects)
+) -> Result<std::collections::HashMap<String, String>, ApiError> {
+    let runs: std::collections::BTreeSet<&str> = views
+        .iter()
+        .flat_map(|v| v.requesters.iter().map(|r| r.requester.run.as_str()))
+        .collect();
+    let runs: Vec<RunId> = runs.into_iter().map(|r| RunId(r.to_string())).collect();
+    let tenants = st.db.run_tenants(&runs).await?;
+    Ok(tenants
+        .into_iter()
+        .filter(|(_, (o, _))| o == org)
+        .map(|(run, (_, project))| (run.0, project))
+        .collect())
 }
 
 fn deployment_dto(
     view: &scarab_deployment::DeploymentView,
-    projects: &std::collections::HashMap<String, Option<String>>,
+    projects: &std::collections::HashMap<String, String>,
 ) -> DeploymentDto {
     DeploymentDto {
         id: view.id,
@@ -7287,7 +7294,7 @@ fn deployment_dto(
                 run: r.requester.run.clone(),
                 step: r.requester.step.clone(),
                 effective_at: r.effective_at,
-                project: projects.get(&r.requester.run).cloned().flatten(),
+                project: projects.get(&r.requester.run).cloned(),
                 claim: r.claim,
             })
             .collect(),
@@ -7340,26 +7347,31 @@ async fn get_environment_board(
             .await
             .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?,
     };
-    let mut rows = Vec::new();
+    let mut board = Vec::new();
     for environment in &environments {
         let folded = fold_environment_deployments(&st, store.as_ref(), &org, environment).await?;
-        let shown: Vec<_> = folded
-            .board
-            .iter()
-            .flat_map(|row| row.live.iter().chain(row.newest.iter()))
-            .collect();
-        let projects = requester_projects(&st, &org, &shown).await?;
-        rows.extend(folded.board.iter().map(|row| EnvironmentBoardRowDto {
-            target: (&row.target).into(),
-            live: row.live.as_ref().map(|d| deployment_dto(d, &projects)),
-            newest: row.newest.as_ref().map(|d| deployment_dto(d, &projects)),
-        }));
+        board.extend(folded.board);
     }
-    Ok(Json(rows))
+    // One requester lookup for the whole board, not one per Environment.
+    let shown: Vec<_> = board
+        .iter()
+        .flat_map(|row| row.live.iter().chain(row.newest.iter()))
+        .collect();
+    let projects = requester_projects(&st, &org, &shown).await?;
+    Ok(Json(
+        board
+            .iter()
+            .map(|row| EnvironmentBoardRowDto {
+                target: (&row.target).into(),
+                live: row.live.as_ref().map(|d| deployment_dto(d, &projects)),
+                newest: row.newest.as_ref().map(|d| deployment_dto(d, &projects)),
+            })
+            .collect(),
+    ))
 }
 
 /// An Environment's Deployments, newest first, optionally narrowed to one
-/// DeploymentTarget. Read on the Org.
+/// DeploymentTarget, at most `limit` of them. Read on the Org.
 #[utoipa::path(
     get,
     path = "/v1/orgs/{org}/environments/{env}/deployments",
@@ -7394,6 +7406,11 @@ async fn list_environment_deployments(
                 .is_none_or(|s| *s == d.target.source)
                 && q.target_id.as_ref().is_none_or(|i| *i == d.target.id)
         })
+        .take(
+            q.limit
+                .unwrap_or(DEPLOYMENT_LIST_DEFAULT_LIMIT)
+                .min(DEPLOYMENT_LIST_MAX_LIMIT),
+        )
         .collect();
     let projects = requester_projects(&st, &org, &shown).await?;
     Ok(Json(

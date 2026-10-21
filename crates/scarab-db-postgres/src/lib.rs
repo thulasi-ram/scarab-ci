@@ -873,6 +873,37 @@ impl Db for PostgresDb {
         }))
     }
 
+    async fn run_tenants(
+        &self,
+        runs: &[RunId],
+    ) -> Result<std::collections::HashMap<RunId, (String, String)>, DbError> {
+        if runs.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let ids: Vec<&str> = runs.iter().map(|r| r.0.as_str()).collect();
+        let rows = sqlx::query(
+            "SELECT id, tenant_org, tenant_project FROM runs
+             WHERE id = ANY($1)
+               AND tenant_org IS NOT NULL AND tenant_project IS NOT NULL",
+        )
+        .bind(&ids)
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    RunId(r.get::<String, _>("id")),
+                    (
+                        r.get::<String, _>("tenant_org"),
+                        r.get::<String, _>("tenant_project"),
+                    ),
+                )
+            })
+            .collect())
+    }
+
     async fn allocate_run_number(
         &self,
         run: &RunId,

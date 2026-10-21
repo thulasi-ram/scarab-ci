@@ -426,6 +426,15 @@ pub trait Db: Send + Sync {
     /// The run's owning tenant, if stamped.
     async fn run_tenant(&self, run: &RunId) -> Result<Option<(String, String)>, DbError>;
 
+    /// [`Self::run_tenant`] for many runs in one round trip: each stamped run
+    /// maps to its `(org, project)`; an unknown or unstamped run is absent. For
+    /// a read that annotates a list (the Deployment record's requester links),
+    /// where one query per run grows with history.
+    async fn run_tenants(
+        &self,
+        runs: &[RunId],
+    ) -> Result<std::collections::HashMap<RunId, (String, String)>, DbError>;
+
     /// Allocate and stamp this run's **per-repo run number** (ADR-0057
     /// amendment), returning the assigned `#N`. Called once, right after the
     /// tenant is known (that is where `(org, project)` first exist). Backed by a

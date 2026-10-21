@@ -1872,6 +1872,7 @@ export interface components {
             /**
              * Format: int64
              * @description Unix-ms the source stamped on it, by its own clock. Display only.
+             *     Present on every recorded report.
              */
             source_at?: number | null;
             status: components["schemas"]["SourceAssertedStatusDto"];
@@ -3498,6 +3499,12 @@ export interface operations {
             query?: {
                 target_source?: string;
                 target_id?: string;
+                /**
+                 * @description At most this many, newest first (default 200, capped at 1000). Bounds
+                 *     the response only: the server still folds the Environment's whole log
+                 *     to derive each status.
+                 */
+                limit?: number;
             };
             header?: never;
             path: {

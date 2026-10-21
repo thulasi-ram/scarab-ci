@@ -754,6 +754,17 @@ impl Db for InMemoryDb {
         Ok(self.state.lock().unwrap().run_tenant.get(run).cloned())
     }
 
+    async fn run_tenants(
+        &self,
+        runs: &[RunId],
+    ) -> Result<HashMap<RunId, (String, String)>, DbError> {
+        let st = self.state.lock().unwrap();
+        Ok(runs
+            .iter()
+            .filter_map(|run| Some((run.clone(), st.run_tenant.get(run)?.clone())))
+            .collect())
+    }
+
     async fn allocate_run_number(
         &self,
         run: &RunId,
