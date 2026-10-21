@@ -19,6 +19,8 @@ import type { components } from "./api/schema";
 type RunStatusDto = components["schemas"]["RunStatusResponse"];
 type ArtifactDto = components["schemas"]["ArtifactDto"];
 type ServiceStatusDto = components["schemas"]["ServiceStatusDto"];
+type DeploymentDto = components["schemas"]["DeploymentDto"];
+type BoardRowDto = components["schemas"]["EnvironmentBoardRowDto"];
 
 const now = Date.now();
 const ago = (ms: number) => now - ms;
@@ -442,6 +444,177 @@ const deployments: Record<string, unknown[]> = {
   preview: [],
 };
 
+// ── Deployment record (ADR-0070) — /deployments and the Environment board ──
+// Org-scoped ids (the org's input sequence) — so a higher id was created later,
+// exactly as the server's receipt-time stamps make it. production covers every
+// row shape the page distinguishes: a requested rollout reported in stages up
+// to live; an Unexplained live (Argo selfHeal reverted it, no Deploy Run asked)
+// that a later run named — a claim, not an explanation; a stalled rollout
+// behind an older live; an Unconfirmed request on a brand-new target; and
+// superseded rows that were, and never were, live. staging has one live. The
+// board sends `newest: null` when the newest is the live one, as the server
+// does.
+const argo = (environment: string, id: string) => ({ environment, source: "argocd", id });
+const req = (run: string, project: string | null, at: number, claim = false) => ({
+  run,
+  step: "deploy",
+  effective_at: at,
+  project,
+  claim,
+});
+const report = (
+  status: "in_progress" | "live" | "failed",
+  label: string,
+  at: number,
+  link: string | null = null,
+) => ({ status, label, at, source_at: at - 1500, link });
+const ARGO_UI = "https://argocd.acme.example/applications";
+
+const depOrders13: DeploymentDto = {
+  id: 13,
+  target: argo("production", "orders-api"),
+  version: "sha-4f2a1c9",
+  status: "live",
+  requesters: [req(RUN_ID, "orders-api", ago(42 * min))],
+  reports: [
+    report("in_progress", "sync wave 1: config", ago(41 * min), `${ARGO_UI}/orders-api`),
+    report("in_progress", "sync wave 5: migrate", ago(39 * min), `${ARGO_UI}/orders-api`),
+    report("live", "Healthy · Synced", ago(36 * min), `${ARGO_UI}/orders-api`),
+  ],
+  created_at: ago(42 * min),
+  was_ever_live: true,
+  unexplained: false,
+  unconfirmed: false,
+};
+const depOrders9: DeploymentDto = {
+  id: 9,
+  target: argo("production", "orders-api"),
+  version: "sha-1b7e300",
+  status: "superseded",
+  requesters: [req("01984d00bb11", "orders-api", ago(26 * 60 * min))],
+  reports: [report("live", "Healthy · Synced", ago(26 * 60 * min - 4 * min))],
+  created_at: ago(26 * 60 * min),
+  // Live until #13 was reported live, not when #13 was requested.
+  superseded_at: ago(36 * min),
+  was_ever_live: true,
+  unexplained: false,
+  unconfirmed: false,
+};
+const depOrders10: DeploymentDto = {
+  id: 10,
+  target: argo("production", "orders-api"),
+  version: "sha-2c0d4e1",
+  status: "superseded",
+  requesters: [req("01984e00aa22", "orders-api", ago(20 * 60 * min))],
+  reports: [
+    report("in_progress", "sync wave 5: migrate", ago(20 * 60 * min - 2 * min)),
+    report("failed", "migration 0042 timed out", ago(20 * 60 * min - 9 * min)),
+  ],
+  created_at: ago(20 * 60 * min),
+  superseded_at: ago(42 * min),
+  was_ever_live: false,
+  unexplained: false,
+  unconfirmed: false,
+};
+const depGateway14: DeploymentDto = {
+  id: 14,
+  target: argo("production", "edge-gateway"),
+  version: "sha-9c0ffee",
+  status: "live",
+  // A run that only started after Argo showed the revert named the same
+  // version: listed as a claim, and the Deployment stays Unexplained.
+  requesters: [req("01984f20ab99", "edge-gateway", ago(10 * min), true)],
+  reports: [report("live", "selfHeal: reverted to git", ago(18 * min), `${ARGO_UI}/edge-gateway`)],
+  created_at: ago(18 * min),
+  was_ever_live: true,
+  unexplained: true,
+  unconfirmed: false,
+};
+const depGateway8: DeploymentDto = {
+  id: 8,
+  target: argo("production", "edge-gateway"),
+  version: "sha-ab12cd3",
+  status: "superseded",
+  requesters: [req("01984c00cc33", "edge-gateway", ago(3 * 24 * 60 * min))],
+  reports: [report("live", "Healthy · Synced", ago(3 * 24 * 60 * min - 3 * min))],
+  created_at: ago(3 * 24 * 60 * min),
+  superseded_at: ago(18 * min),
+  was_ever_live: true,
+  unexplained: false,
+  unconfirmed: false,
+};
+const depInventory12: DeploymentDto = {
+  id: 12,
+  target: argo("production", "inventory-svc"),
+  version: "sha-77ab001",
+  status: "stalled",
+  // A requester whose run is not stamped with a project: shown, not linked.
+  requesters: [req("01984f00dd44", null, ago(95 * min))],
+  reports: [report("in_progress", "sync wave 2: waiting for healthy", ago(93 * min))],
+  created_at: ago(95 * min),
+  was_ever_live: false,
+  unexplained: false,
+  unconfirmed: false,
+};
+const depInventory7: DeploymentDto = {
+  id: 7,
+  target: argo("production", "inventory-svc"),
+  version: "sha-5d5d5d5",
+  status: "live",
+  requesters: [req("01984b00ee55", "inventory-svc", ago(4 * 24 * 60 * min))],
+  reports: [report("live", "Healthy · Synced", ago(4 * 24 * 60 * min - 5 * min))],
+  created_at: ago(4 * 24 * 60 * min),
+  was_ever_live: true,
+  unexplained: false,
+  unconfirmed: false,
+};
+const depMessaging15: DeploymentDto = {
+  id: 15,
+  target: argo("production", "messaging"),
+  version: "sha-e1e1e10",
+  status: "requested",
+  requesters: [req("01984f30ff66", "messaging", ago(6 * min))],
+  reports: [],
+  created_at: ago(6 * min),
+  was_ever_live: false,
+  unexplained: false,
+  unconfirmed: true,
+};
+const depStagingOrders11: DeploymentDto = {
+  id: 11,
+  target: argo("staging", "orders-api"),
+  version: "sha-4f2a1c9",
+  status: "live",
+  requesters: [req("01984f05aa77", "orders-api", ago(3 * 60 * min))],
+  reports: [report("live", "Healthy · Synced", ago(3 * 60 * min - 2 * min))],
+  created_at: ago(3 * 60 * min),
+  was_ever_live: true,
+  unexplained: false,
+  unconfirmed: false,
+};
+
+/** Each Environment's Deployments, newest first (the list endpoint's order). */
+const envDeployments: Record<string, DeploymentDto[]> = {
+  production: [
+    depMessaging15,
+    depGateway14,
+    depOrders13,
+    depInventory12,
+    depOrders10,
+    depOrders9,
+    depGateway8,
+    depInventory7,
+  ],
+  staging: [depStagingOrders11],
+};
+const board: BoardRowDto[] = [
+  { target: depOrders13.target, live: depOrders13, newest: null },
+  { target: depGateway14.target, live: depGateway14, newest: null },
+  { target: depInventory12.target, live: depInventory7, newest: depInventory12 },
+  { target: depMessaging15.target, live: null, newest: depMessaging15 },
+  { target: depStagingOrders11.target, live: depStagingOrders11, newest: null },
+];
+
 const secretNames = { names: ["GHCR_TOKEN", "DATABASE_URL", "SLACK_WEBHOOK_URL"] };
 // Org scope (no `repo=`) holds the org-wide base of the inheritance chain — the
 // Settings page's Org Secrets section (ADR-0060).
@@ -681,6 +854,26 @@ function route(pathname: string, search: string, method: string): Response | nul
     return json(apiTokens);
   }
   if (/^\/v1\/orgs\/[^/]+\/tokens\/[^/]+$/.test(p)) return json({}, { status: 204 });
+
+  // Deployment record (ADR-0070): the board, an env's list, one Deployment.
+  if (/^\/v1\/orgs\/[^/]+\/board$/.test(p)) {
+    const env = new URLSearchParams(search).get("environment");
+    return json(env ? board.filter((r) => r.target.environment === env) : board);
+  }
+  if ((m = p.match(/^\/v1\/orgs\/[^/]+\/environments\/([^/]+)\/deployments$/))) {
+    const q = new URLSearchParams(search);
+    const src = q.get("target_source");
+    const tid = q.get("target_id");
+    return json(
+      (envDeployments[decodeURIComponent(m[1]!)] ?? []).filter(
+        (d) => (!src || d.target.source === src) && (!tid || d.target.id === tid),
+      ),
+    );
+  }
+  if ((m = p.match(/^\/v1\/orgs\/[^/]+\/environments\/([^/]+)\/deployments\/(\d+)$/))) {
+    const d = (envDeployments[decodeURIComponent(m[1]!)] ?? []).find((x) => x.id === Number(m![2]));
+    return d ? json(d) : new Response(null, { status: 404 });
+  }
 
   if (p === "/v1/connections") return json(connections);
   if (/^\/v1\/connections\/[^/]+\/available-repos$/.test(p)) return json(availableRepos);

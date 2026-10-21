@@ -733,6 +733,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Enables /v1/environments/* and admission enforcement for
         // env-targeting runs (ADR-0024).
         .with_environments(pg.clone())
+        // The Deployment record's input log (ADR-0070): the Environment board
+        // and the Deployments view fold it on every read.
+        .with_deployments(pg.clone())
         // The ForgeConnection registry (ADR-0046): RepoRef→Project resolution,
         // installation auto-registration, webhook replay dedup.
         .with_forge_connections(pg.clone())

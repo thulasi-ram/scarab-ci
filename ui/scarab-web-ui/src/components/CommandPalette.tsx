@@ -16,6 +16,7 @@ type Item =
 
 /** Static destinations, offered only when the caller may actually reach them. */
 const PAGES: { label: string; sub: string; href: string; admin: boolean }[] = [
+  { label: "Deployments", sub: "what is live in each environment", href: "/deployments", admin: false },
   { label: "Settings", sub: "organization-wide configuration", href: "/settings", admin: true },
 ];
 

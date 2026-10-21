@@ -135,6 +135,9 @@ pub struct AppState {
     /// Environments + deployment history store. `None` disables the environment
     /// endpoints.
     pub environments: Option<Arc<dyn scarab_project::EnvironmentStore>>,
+    /// The Deployment record's input log (ADR-0070). `None` disables the
+    /// Deployments endpoints (404) — the board and the Deployments view.
+    pub deployments: Option<Arc<dyn scarab_deployment::DeploymentStore>>,
     /// "Intentionally unset" markers for the secret coverage matrix (ADR-0037 D).
     /// Advisory annotations only — `None` disables marking, and the matrix simply
     /// reports nothing silenced. Never consulted on a run path.
@@ -234,6 +237,7 @@ impl AppState {
             sessions: None,
             api_tokens: None,
             environments: None,
+            deployments: None,
             secret_coverage: None,
             oidc: None,
             gate_token_secret: None,
@@ -303,6 +307,16 @@ impl AppState {
         environments: Arc<dyn scarab_project::EnvironmentStore>,
     ) -> Self {
         self.environments = Some(environments);
+        self
+    }
+
+    /// Enable the Deployments endpoints (ADR-0070): the Environment board and
+    /// the Deployments view, folded from `deployments`' input log.
+    pub fn with_deployments(
+        mut self,
+        deployments: Arc<dyn scarab_deployment::DeploymentStore>,
+    ) -> Self {
+        self.deployments = Some(deployments);
         self
     }
 
@@ -7017,10 +7031,13 @@ async fn delete_environment(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// An environment's deployment history, most recent first (ADR-0037). This
-/// replaces the old `POST …/deploy` admission endpoint: admission now happens in
-/// the run's gate-approval path, so this surface is **read-only**. Read cap.
-#[utoipa::path(get, path = "/v1/repos/{org}/{repo}/environments/{name}/deployments", summary = "An environment's deployment history (ADR-0037)", responses((status = 200, description = "most recent first")))]
+/// Legacy approval history (ADR-0070 §1): who approved which run into this
+/// environment, most recent first (ADR-0037). Despite the path, nothing here is
+/// a Deployment — a row is written when a manual gate is approved and records no
+/// target, version or outcome. The Deployment record is
+/// `/v1/orgs/{org}/environments/{env}/deployments`. Kept readable, read-only;
+/// admission happens in the run's gate-approval path. Read cap.
+#[utoipa::path(get, path = "/v1/repos/{org}/{repo}/environments/{name}/deployments", summary = "Legacy approval history (ADR-0070 §1)", responses((status = 200, description = "most recent first")))]
 async fn list_deployments(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -7034,6 +7051,420 @@ async fn list_deployments(
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(Json(history))
+}
+
+// ---------------------------------------------------------------------------
+// Deployments (ADR-0070): the vendor-neutral Deployment record, read side.
+// ---------------------------------------------------------------------------
+//
+// Every read refolds the Environment's input log with `scarab-deployment` at
+// the server's `now`, so a status here is always the fold's verdict — none is
+// stored. Org-scoped: a Deployment belongs to an Environment, and an
+// Environment's log is per Org (ADR-0071). Read needs only Read on the Org;
+// until EnvironmentProjectEligibility exists (ADR-0071), a member bound only
+// to a Project is refused.
+
+/// A Deployment's fixed, vendor-neutral status (ADR-0070 §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DeploymentStatusDto {
+    /// Asked for; no source report yet.
+    Requested,
+    InProgress,
+    Live,
+    /// The source gave up.
+    Failed,
+    /// Not converged within the EnvironmentDeploymentDeadline; can recover.
+    Stalled,
+    /// A newer Deployment took its place on the DeploymentTarget. Final.
+    Superseded,
+}
+
+impl From<scarab_deployment::DeploymentStatus> for DeploymentStatusDto {
+    fn from(s: scarab_deployment::DeploymentStatus) -> Self {
+        use scarab_deployment::DeploymentStatus as S;
+        match s {
+            S::Requested => Self::Requested,
+            S::InProgress => Self::InProgress,
+            S::Live => Self::Live,
+            S::Failed => Self::Failed,
+            S::Stalled => Self::Stalled,
+            S::Superseded => Self::Superseded,
+        }
+    }
+}
+
+/// The statuses a source may assert in a report (INV-DEP-6) — a subset of
+/// [`DeploymentStatusDto`], typed apart so the wire says so too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceAssertedStatusDto {
+    InProgress,
+    Live,
+    Failed,
+}
+
+impl From<scarab_deployment::SourceAssertedStatus> for SourceAssertedStatusDto {
+    fn from(s: scarab_deployment::SourceAssertedStatus) -> Self {
+        use scarab_deployment::SourceAssertedStatus as S;
+        match s {
+            S::InProgress => Self::InProgress,
+            S::Live => Self::Live,
+            S::Failed => Self::Failed,
+        }
+    }
+}
+
+/// The smallest unit a Deployment can independently succeed or fail on.
+/// `source` + `id` are opaque and source-supplied.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DeploymentTargetDto {
+    pub environment: String,
+    pub source: String,
+    pub id: String,
+}
+
+impl From<&scarab_deployment::DeploymentTarget> for DeploymentTargetDto {
+    fn from(t: &scarab_deployment::DeploymentTarget) -> Self {
+        Self {
+            environment: t.environment.clone(),
+            source: t.source.clone(),
+            id: t.id.clone(),
+        }
+    }
+}
+
+/// A Deploy Run step that requested a Deployment.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DeploymentRequesterDto {
+    pub run: String,
+    pub step: String,
+    /// Unix-ms the requesting Step started.
+    pub effective_at: i64,
+    /// The Project the run belongs to, when it is stamped and in this Org —
+    /// what a link to the run (`/{org}/{project}/runs/{run}`) needs.
+    pub project: Option<String>,
+    /// Only a claim: the request joined a Deployment a source report created,
+    /// and its Step started after Scarab first saw that Deployment — so it
+    /// did not make it live and does not explain it (ADR-0070 §2).
+    pub claim: bool,
+}
+
+/// One stage of a Deployment as its source reported it.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DeploymentStatusReportDto {
+    pub status: SourceAssertedStatusDto,
+    /// Free-form; shown, never interpreted.
+    pub label: String,
+    /// Where the source shows this stage. Only an `http`/`https` URL is
+    /// passed on; any other scheme reads as absent.
+    pub link: Option<String>,
+    /// Unix-ms Scarab received the report — the time the record is ordered by.
+    pub at: i64,
+    /// Unix-ms the source stamped on it, by its own clock. Display only.
+    /// Present on every recorded report.
+    pub source_at: Option<i64>,
+}
+
+/// One Deployment: a DeploymentVersion made (or asked to be made) live on a
+/// DeploymentTarget, and what was reported about it since (ADR-0070 §2).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DeploymentDto {
+    /// Org-scoped and stable: the sequence number of the input that created
+    /// it.
+    pub id: u64,
+    pub target: DeploymentTargetDto,
+    /// Opaque, in the source's scheme; compared only for equality.
+    pub version: String,
+    pub status: DeploymentStatusDto,
+    /// In the order their requests arrived, claims included. Who made it
+    /// live is the requesters that are not claims; `unexplained` says
+    /// whether there is one.
+    pub requesters: Vec<DeploymentRequesterDto>,
+    /// The stages, oldest first.
+    pub reports: Vec<DeploymentStatusReportDto>,
+    /// Unix-ms.
+    pub created_at: i64,
+    /// Unix-ms a newer Deployment took its place, if one has.
+    pub superseded_at: Option<i64>,
+    /// Whether it was ever reported live.
+    pub was_ever_live: bool,
+    /// Display term: no Deploy Run's request explains it — a change made
+    /// outside Scarab. It may still carry claims.
+    pub unexplained: bool,
+    /// Display term: requested on a DeploymentTarget its source has never
+    /// reported on.
+    pub unconfirmed: bool,
+}
+
+/// One DeploymentTarget's line on the Environment board.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EnvironmentBoardRowDto {
+    pub target: DeploymentTargetDto,
+    /// What is live there now, if anything.
+    pub live: Option<DeploymentDto>,
+    /// The newest Deployment, only when it is not the live one — a change in
+    /// flight, stalled or failed.
+    pub newest: Option<DeploymentDto>,
+}
+
+/// `GET /v1/orgs/{org}/board` filter.
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct EnvironmentBoardQuery {
+    /// Only this Environment's rows; omitted = every Environment with any
+    /// Deployment.
+    pub environment: Option<String>,
+}
+
+/// `GET …/environments/{env}/deployments` filter: one DeploymentTarget's
+/// history (either field narrows on its own), and how many to return.
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct DeploymentListQuery {
+    pub target_source: Option<String>,
+    pub target_id: Option<String>,
+    /// At most this many, newest first (default 200, capped at 1000). Bounds
+    /// the response only: the server still folds the Environment's whole log
+    /// to derive each status.
+    pub limit: Option<usize>,
+}
+
+/// [`DeploymentListQuery::limit`]'s default and cap.
+const DEPLOYMENT_LIST_DEFAULT_LIMIT: usize = 200;
+const DEPLOYMENT_LIST_MAX_LIMIT: usize = 1000;
+
+/// Fold one Environment's log as of the server's `now`.
+async fn fold_environment_deployments(
+    st: &AppState,
+    store: &dyn scarab_deployment::DeploymentStore,
+    org: &str,
+    environment: &str,
+) -> Result<scarab_deployment::EnvironmentDeployments, ApiError> {
+    let inputs = store
+        .inputs(org, environment)
+        .await
+        .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;
+    let now = st.clock.now().await.0;
+    // No Environment carries its own deadline yet (ADR-0071): one default.
+    Ok(scarab_deployment::fold_environment(
+        &inputs,
+        now,
+        scarab_deployment::DEFAULT_DEPLOYMENT_DEADLINE_MS,
+    ))
+}
+
+/// The Project of every run that requested one of `views`, in one query for
+/// the whole HTTP request. A run stamped into another Org (or not stamped) is
+/// absent: a link built from this Org's path would point at the wrong run.
+///
+/// Takes a collected slice rather than an iterator: an iterator adapter whose
+/// closure borrows a `DeploymentView`, held across the `.await`, trips rustc's
+/// higher-ranked lifetime check when axum requires the handler future to be
+/// `Send` ("one type is more general than the other").
+async fn requester_projects(
+    st: &AppState,
+    org: &str,
+    views: &[&scarab_deployment::DeploymentView],
+) -> Result<std::collections::HashMap<String, String>, ApiError> {
+    let runs: std::collections::BTreeSet<&str> = views
+        .iter()
+        .flat_map(|v| v.requesters.iter().map(|r| r.requester.run.as_str()))
+        .collect();
+    let runs: Vec<RunId> = runs.into_iter().map(|r| RunId(r.to_string())).collect();
+    let tenants = st.db.run_tenants(&runs).await?;
+    Ok(tenants
+        .into_iter()
+        .filter(|(_, (o, _))| o == org)
+        .map(|(run, (_, project))| (run.0, project))
+        .collect())
+}
+
+/// A source-supplied report link, passed on only if it is an `http(s)` URL.
+/// Sources are untrusted plugins (ADR-0072): a `javascript:` or `data:` link
+/// rendered as an href would run as script on Scarab's origin. Anything else
+/// is dropped rather than escaped — the record keeps it; the API does not
+/// hand it to a browser.
+fn safe_link(link: Option<&str>) -> Option<String> {
+    let link = link?.trim();
+    let scheme_len = link.find(':')?;
+    let scheme = &link[..scheme_len];
+    (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+        .then(|| link.to_string())
+}
+
+fn deployment_dto(
+    view: &scarab_deployment::DeploymentView,
+    projects: &std::collections::HashMap<String, String>,
+) -> DeploymentDto {
+    DeploymentDto {
+        id: view.id,
+        target: (&view.target).into(),
+        version: view.version.0.clone(),
+        status: view.status.into(),
+        requesters: view
+            .requesters
+            .iter()
+            .map(|r| DeploymentRequesterDto {
+                run: r.requester.run.clone(),
+                step: r.requester.step.clone(),
+                effective_at: r.effective_at,
+                project: projects.get(&r.requester.run).cloned(),
+                claim: r.claim,
+            })
+            .collect(),
+        reports: view
+            .reports
+            .iter()
+            .map(|r| DeploymentStatusReportDto {
+                status: r.report.status.into(),
+                label: r.report.label.clone(),
+                link: safe_link(r.report.link.as_deref()),
+                at: r.report.at,
+                source_at: r.source_at,
+            })
+            .collect(),
+        created_at: view.created_at,
+        superseded_at: view.superseded_at,
+        was_ever_live: view.was_ever_live,
+        unexplained: view.unexplained,
+        unconfirmed: view.unconfirmed,
+    }
+}
+
+/// The Environment board (ADR-0070): per DeploymentTarget, what is live and
+/// what is on its way, across the Org's Environments (or one). Rows are
+/// ordered by Environment, then source, then target id. Read on the Org.
+#[utoipa::path(
+    get,
+    path = "/v1/orgs/{org}/board",
+    params(("org" = String, Path, description = "org"), EnvironmentBoardQuery),
+    summary = "The Environment board: what is live on each DeploymentTarget (ADR-0070)",
+    responses(
+        (status = 200, body = [EnvironmentBoardRowDto]),
+        (status = 403, description = "no Read on the org"),
+        (status = 404, description = "deployments not configured")
+    )
+)]
+async fn get_environment_board(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(org): Path<String>,
+    Query(q): Query<EnvironmentBoardQuery>,
+) -> Result<Json<Vec<EnvironmentBoardRowDto>>, ApiError> {
+    let scope = rbac_scope(&org, None);
+    authorize_scoped(&st, &headers, Action::Read, Some(&scope)).await?;
+    let store = st.deployments.as_ref().ok_or(ApiError::NotFound)?;
+    let environments = match q.environment {
+        Some(environment) => vec![environment],
+        None => store
+            .environments(&org)
+            .await
+            .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?,
+    };
+    let mut board = Vec::new();
+    for environment in &environments {
+        let folded = fold_environment_deployments(&st, store.as_ref(), &org, environment).await?;
+        board.extend(folded.board);
+    }
+    // One requester lookup for the whole board, not one per Environment.
+    let shown: Vec<_> = board
+        .iter()
+        .flat_map(|row| row.live.iter().chain(row.newest.iter()))
+        .collect();
+    let projects = requester_projects(&st, &org, &shown).await?;
+    Ok(Json(
+        board
+            .iter()
+            .map(|row| EnvironmentBoardRowDto {
+                target: (&row.target).into(),
+                live: row.live.as_ref().map(|d| deployment_dto(d, &projects)),
+                newest: row.newest.as_ref().map(|d| deployment_dto(d, &projects)),
+            })
+            .collect(),
+    ))
+}
+
+/// An Environment's Deployments, newest first, optionally narrowed to one
+/// DeploymentTarget, at most `limit` of them. Read on the Org.
+#[utoipa::path(
+    get,
+    path = "/v1/orgs/{org}/environments/{env}/deployments",
+    params(
+        ("org" = String, Path, description = "org"),
+        ("env" = String, Path, description = "environment name"),
+        DeploymentListQuery
+    ),
+    summary = "An Environment's Deployments, newest first (ADR-0070)",
+    responses(
+        (status = 200, body = [DeploymentDto]),
+        (status = 403, description = "no Read on the org"),
+        (status = 404, description = "deployments not configured")
+    )
+)]
+async fn list_environment_deployments(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((org, env)): Path<(String, String)>,
+    Query(q): Query<DeploymentListQuery>,
+) -> Result<Json<Vec<DeploymentDto>>, ApiError> {
+    let scope = rbac_scope(&org, None);
+    authorize_scoped(&st, &headers, Action::Read, Some(&scope)).await?;
+    let store = st.deployments.as_ref().ok_or(ApiError::NotFound)?;
+    let folded = fold_environment_deployments(&st, store.as_ref(), &org, &env).await?;
+    let shown: Vec<_> = folded
+        .deployments
+        .iter()
+        .filter(|d| {
+            q.target_source
+                .as_ref()
+                .is_none_or(|s| *s == d.target.source)
+                && q.target_id.as_ref().is_none_or(|i| *i == d.target.id)
+        })
+        .take(
+            q.limit
+                .unwrap_or(DEPLOYMENT_LIST_DEFAULT_LIMIT)
+                .min(DEPLOYMENT_LIST_MAX_LIMIT),
+        )
+        .collect();
+    let projects = requester_projects(&st, &org, &shown).await?;
+    Ok(Json(
+        shown
+            .into_iter()
+            .map(|d| deployment_dto(d, &projects))
+            .collect(),
+    ))
+}
+
+/// One Deployment, with its requesters and its reports in order. Read on the
+/// Org.
+#[utoipa::path(
+    get,
+    path = "/v1/orgs/{org}/environments/{env}/deployments/{id}",
+    params(
+        ("org" = String, Path, description = "org"),
+        ("env" = String, Path, description = "environment name"),
+        ("id" = u64, Path, description = "Deployment id")
+    ),
+    summary = "One Deployment and its stages (ADR-0070)",
+    responses(
+        (status = 200, body = DeploymentDto),
+        (status = 403, description = "no Read on the org"),
+        (status = 404, description = "no such Deployment in this Environment")
+    )
+)]
+async fn get_deployment(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((org, env, id)): Path<(String, String, u64)>,
+) -> Result<Json<DeploymentDto>, ApiError> {
+    let scope = rbac_scope(&org, None);
+    authorize_scoped(&st, &headers, Action::Read, Some(&scope)).await?;
+    let store = st.deployments.as_ref().ok_or(ApiError::NotFound)?;
+    let folded = fold_environment_deployments(&st, store.as_ref(), &org, &env).await?;
+    let view = folded.get(id).ok_or(ApiError::NotFound)?;
+    let projects = requester_projects(&st, &org, &[view]).await?;
+    Ok(Json(deployment_dto(view, &projects)))
 }
 
 /// The secret coverage matrix for a repo (ADR-0037 D, editable since ADR-0060):
@@ -8636,7 +9067,13 @@ const TAG_GROUPS: &[(&str, &str)] = &[
     ),
     (
         "Environments",
-        "Environments and their protection rules, plus deployment history.",
+        "Environments and their protection rules, plus their legacy approval \
+         history.",
+    ),
+    (
+        "Deployments",
+        "The vendor-neutral Deployment record (ADR-0070): what is live on each \
+         DeploymentTarget, how it got there, and the Environment board.",
     ),
     (
         "Secrets",
@@ -8686,6 +9123,13 @@ fn tag_for_path(path: &str) -> Option<&'static str> {
         "Auth & Identity"
     } else if matches!(path, "/healthz" | "/readyz" | "/metrics") {
         "System"
+    } else if path.starts_with("/v1/orgs/")
+        && (path.contains("/deployments") || path.ends_with("/board"))
+    {
+        // Before `/environments`: the Org-level Deployment record shares that
+        // path segment with the repo-scoped legacy approval history, which
+        // stays under Environments.
+        "Deployments"
     } else if path.contains("/environments") {
         "Environments"
     } else if path.contains("/secrets") {
@@ -8861,6 +9305,9 @@ impl utoipa::Modify for SecuritySchemes {
         list_environments,
         delete_environment,
         list_deployments,
+        get_environment_board,
+        list_environment_deployments,
+        get_deployment,
         secret_matrix,
         silence_secret_cell,
         unsilence_secret_cell,
@@ -8961,7 +9408,14 @@ impl utoipa::Modify for SecuritySchemes {
         PrincipalIdentityDto,
         MintTokenRequest,
         MintedTokenDto,
-        ApiTokenDto
+        ApiTokenDto,
+        DeploymentDto,
+        DeploymentStatusDto,
+        SourceAssertedStatusDto,
+        DeploymentTargetDto,
+        DeploymentRequesterDto,
+        DeploymentStatusReportDto,
+        EnvironmentBoardRowDto
     ))
 )]
 pub struct ApiDoc;
@@ -9078,6 +9532,15 @@ fn router_inner(state: AppState) -> Router {
         .route(
             "/v1/repos/{org}/{repo}/environments/{name}/deployments",
             get(list_deployments),
+        )
+        .route("/v1/orgs/{org}/board", get(get_environment_board))
+        .route(
+            "/v1/orgs/{org}/environments/{env}/deployments",
+            get(list_environment_deployments),
+        )
+        .route(
+            "/v1/orgs/{org}/environments/{env}/deployments/{id}",
+            get(get_deployment),
         )
         .route(
             "/v1/connections",

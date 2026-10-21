@@ -1,0 +1,21 @@
+[package]
+name = "scarab-deployment"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+# Pure domain crate (CONTEXT §4.6): the vendor-neutral Deployment record as a
+# fold over requests and source reports. Still no serde: the wire shape is the
+# server's DTOs and the storage shape is the Postgres adapter's columns, so
+# neither leaks a format into the rules.
+[dependencies]
+# The `DeploymentStore` port (src/store.rs) is an async trait, like every other
+# store port in the workspace. A proc macro only — no runtime, no I/O — and one
+# of the four crates the workspace header admits into pure crates.
+async-trait = { workspace = true }
+
+[dev-dependencies]
+# Property tests for the numbered invariants in `src/lib.rs`. Dev-only: it is
+# a test harness, never linked into a binary, so it does not cross the
+# purity boundary.
+proptest = { workspace = true }

@@ -18,6 +18,7 @@ use serde_json::Value;
 use sqlx::migrate::Migrator;
 use sqlx::{PgPool, Row};
 
+use scarab_deployment::{DeploymentStore, DeploymentStoreError};
 use scarab_engine::ports::Lease;
 use scarab_engine::{
     Attempt, AttemptId, AttemptOutcome, ConcurrencyPolicy, Db, DbError, EventKind, EventPayload,
@@ -870,6 +871,37 @@ impl Db for PostgresDb {
                 _ => None,
             }
         }))
+    }
+
+    async fn run_tenants(
+        &self,
+        runs: &[RunId],
+    ) -> Result<std::collections::HashMap<RunId, (String, String)>, DbError> {
+        if runs.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let ids: Vec<&str> = runs.iter().map(|r| r.0.as_str()).collect();
+        let rows = sqlx::query(
+            "SELECT id, tenant_org, tenant_project FROM runs
+             WHERE id = ANY($1)
+               AND tenant_org IS NOT NULL AND tenant_project IS NOT NULL",
+        )
+        .bind(&ids)
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    RunId(r.get::<String, _>("id")),
+                    (
+                        r.get::<String, _>("tenant_org"),
+                        r.get::<String, _>("tenant_project"),
+                    ),
+                )
+            })
+            .collect())
     }
 
     async fn allocate_run_number(
@@ -2393,6 +2425,270 @@ impl EnvironmentStore for PostgresDb {
                 })
             })
             .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DeploymentStore (ADR-0070): the Deployment record's append-only input log.
+// ---------------------------------------------------------------------------
+
+/// The `deployment_inputs` columns [`deployment_input_from_row`] reads — one
+/// list, so the append's `RETURNING` and the read's `SELECT` cannot drift.
+const DEPLOYMENT_INPUT_COLUMNS: &str =
+    "seq, environment, target_source, target_id, version, kind, at,
+     requester_run, requester_step, effective_at,
+     report_status, report_label, report_link, report_source_at";
+
+/// Append one DeploymentInput to `org`'s log on `conn`, as received at
+/// `received_at`, returning it as logged — seq and stamped times included.
+///
+/// One statement: the CTE bumps (or creates) the Org's counter row and the
+/// insert takes the seq and receipt time it returned. The counter row stays
+/// locked until `conn`'s transaction commits, which is what makes seq equal
+/// commit order within an Org (migration 0053). Takes a bare connection rather
+/// than the pool so a caller can append inside a transaction of its own —
+/// recording a DeploymentRequest in the same commit as the Step success that
+/// produced it — and still share the one counter.
+///
+/// **Isolation.** Run it under READ COMMITTED (Postgres's default). There a
+/// concurrent append to the same Org waits on the counter row and then
+/// re-reads it, so seqs stay gap-free. Under REPEATABLE READ or SERIALIZABLE
+/// the same upsert fails with a serialization error (40001) instead of
+/// waiting; a caller that needs those levels must retry the whole
+/// transaction.
+///
+/// **Core stamps time** (migration 0053): the stored `at` is
+/// GREATEST(`received_at`, the Org's last `at`), never `input.at()`.
+/// `received_at` is the control plane's clock (ADR-0070 §8) — the one a
+/// request's `effective_at` and a reader's `now` also come from — so read it
+/// right before this call, not at the start of a long transaction: an early
+/// reading is still monotone through the GREATEST, but needlessly early. It is
+/// refused when more than [`RECEIVED_AT_MAX_LEAD_MS`] ahead of the database's
+/// own clock: one replica with a runaway clock would otherwise ratchet the
+/// Org's `last_at` into the future and stamp every later input late. A
+/// report's own `at` is kept as `report_source_at`; a request's
+/// `effective_at` is clamped to no later than the stamp.
+///
+/// [`RECEIVED_AT_MAX_LEAD_MS`]: scarab_deployment::RECEIVED_AT_MAX_LEAD_MS
+pub async fn append_deployment_input(
+    conn: &mut sqlx::PgConnection,
+    org: &str,
+    input: &scarab_deployment::DeploymentInput,
+    received_at: scarab_deployment::Millis,
+) -> Result<scarab_deployment::LoggedDeploymentInput, DeploymentStoreError> {
+    use scarab_deployment::{DeploymentInput, RECEIVED_AT_MAX_LEAD_MS};
+    let target = input.target();
+    let (kind, requester, effective_at, report) = match input {
+        DeploymentInput::Request {
+            requester,
+            effective_at,
+            ..
+        } => ("request", Some(requester), Some(*effective_at), None),
+        DeploymentInput::Report { report, .. } => ("report", None, None, Some(report)),
+    };
+    // The counter upsert's SELECT yields no row when `received_at` runs too
+    // far ahead, so nothing is bumped or inserted and the statement returns
+    // no row — the refusal below.
+    let sql = format!(
+        "WITH c AS (
+             INSERT INTO deployment_input_counters (org, last_seq, last_at)
+             SELECT $1, 1, $14::bigint
+             WHERE $14::bigint
+                 <= (extract(epoch FROM clock_timestamp()) * 1000)::bigint + $15::bigint
+             ON CONFLICT (org) DO UPDATE
+                 SET last_seq = deployment_input_counters.last_seq + 1,
+                     last_at = GREATEST(EXCLUDED.last_at, deployment_input_counters.last_at)
+             RETURNING last_seq, last_at
+         )
+         INSERT INTO deployment_inputs
+             (org, seq, environment, target_source, target_id, version, kind, at,
+              requester_run, requester_step, effective_at,
+              report_status, report_label, report_link, report_source_at)
+         SELECT $1, c.last_seq, $2, $3, $4, $5, $6, c.last_at, $7, $8,
+                -- LEAST ignores NULLs, so a report's NULL needs the CASE.
+                CASE WHEN $9::bigint IS NULL THEN NULL ELSE LEAST($9::bigint, c.last_at) END,
+                $10, $11, $12, $13
+         FROM c
+         RETURNING {DEPLOYMENT_INPUT_COLUMNS}"
+    );
+    let row = sqlx::query(&sql)
+        .bind(org)
+        .bind(&target.environment)
+        .bind(&target.source)
+        .bind(&target.id)
+        .bind(&input.version().0)
+        .bind(kind)
+        .bind(requester.map(|r| r.run.as_str()))
+        .bind(requester.map(|r| r.step.as_str()))
+        .bind(effective_at)
+        .bind(report.map(|r| source_asserted_status_str(r.status)))
+        .bind(report.map(|r| r.label.as_str()))
+        .bind(report.and_then(|r| r.link.as_deref()))
+        .bind(report.map(|r| r.at))
+        .bind(received_at)
+        .bind(RECEIVED_AT_MAX_LEAD_MS)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(deployment_store_err)?;
+    let Some(row) = row else {
+        // Best effort, for the log line only: the refusal stands either way.
+        let store_now = sqlx::query_scalar::<_, i64>(
+            "SELECT (extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .ok();
+        tracing::warn!(
+            org,
+            received_at,
+            store_now,
+            max_lead_ms = RECEIVED_AT_MAX_LEAD_MS,
+            "deployment input refused: received_at runs ahead of the database clock"
+        );
+        return Err(DeploymentStoreError::ReceivedAtAhead {
+            received_at,
+            store_now,
+        });
+    };
+    deployment_input_from_row(&row)
+}
+
+fn source_asserted_status_str(s: scarab_deployment::SourceAssertedStatus) -> &'static str {
+    use scarab_deployment::SourceAssertedStatus;
+    match s {
+        SourceAssertedStatus::InProgress => "in_progress",
+        SourceAssertedStatus::Live => "live",
+        SourceAssertedStatus::Failed => "failed",
+    }
+}
+
+fn source_asserted_status_from_str(
+    s: &str,
+) -> Result<scarab_deployment::SourceAssertedStatus, DeploymentStoreError> {
+    use scarab_deployment::SourceAssertedStatus;
+    match s {
+        "in_progress" => Ok(SourceAssertedStatus::InProgress),
+        "live" => Ok(SourceAssertedStatus::Live),
+        "failed" => Ok(SourceAssertedStatus::Failed),
+        other => Err(DeploymentStoreError::Store(format!(
+            "unknown deployment report status {other:?}"
+        ))),
+    }
+}
+
+/// One `deployment_inputs` row back into the domain input. The table's CHECK
+/// guarantees the per-kind columns are present; a row that still lacks one
+/// is reported, never defaulted — a guessed requester would be a false
+/// attribution.
+fn deployment_input_from_row(
+    r: &sqlx::postgres::PgRow,
+) -> Result<scarab_deployment::LoggedDeploymentInput, DeploymentStoreError> {
+    use scarab_deployment::{
+        DeploymentInput, DeploymentRequester, DeploymentStatusReport, DeploymentTarget,
+        DeploymentVersion, LoggedDeploymentInput,
+    };
+    let seq = r.get::<i64, _>("seq");
+    let missing =
+        |col: &str| DeploymentStoreError::Store(format!("deployment input {seq}: {col} is NULL"));
+    let target = DeploymentTarget {
+        environment: r.get::<String, _>("environment"),
+        source: r.get::<String, _>("target_source"),
+        id: r.get::<String, _>("target_id"),
+    };
+    let version = DeploymentVersion(r.get::<String, _>("version"));
+    let at = r.get::<i64, _>("at");
+    let input = match r.get::<String, _>("kind").as_str() {
+        "request" => DeploymentInput::Request {
+            target,
+            version,
+            requester: DeploymentRequester {
+                run: r
+                    .get::<Option<String>, _>("requester_run")
+                    .ok_or_else(|| missing("requester_run"))?,
+                step: r
+                    .get::<Option<String>, _>("requester_step")
+                    .ok_or_else(|| missing("requester_step"))?,
+            },
+            effective_at: r
+                .get::<Option<i64>, _>("effective_at")
+                .ok_or_else(|| missing("effective_at"))?,
+            at,
+        },
+        "report" => DeploymentInput::Report {
+            target,
+            version,
+            report: DeploymentStatusReport {
+                status: source_asserted_status_from_str(
+                    &r.get::<Option<String>, _>("report_status")
+                        .ok_or_else(|| missing("report_status"))?,
+                )?,
+                label: r
+                    .get::<Option<String>, _>("report_label")
+                    .ok_or_else(|| missing("report_label"))?,
+                link: r.get::<Option<String>, _>("report_link"),
+                at,
+            },
+        },
+        other => {
+            return Err(DeploymentStoreError::Store(format!(
+                "deployment input {seq}: unknown kind {other:?}"
+            )))
+        }
+    };
+    Ok(LoggedDeploymentInput {
+        seq: seq as u64,
+        input,
+        report_source_at: r.get::<Option<i64>, _>("report_source_at"),
+    })
+}
+
+fn deployment_store_err(e: sqlx::Error) -> DeploymentStoreError {
+    DeploymentStoreError::Store(e.to_string())
+}
+
+#[async_trait]
+impl DeploymentStore for PostgresDb {
+    async fn append(
+        &self,
+        org: &str,
+        input: &scarab_deployment::DeploymentInput,
+        received_at: scarab_deployment::Millis,
+    ) -> Result<scarab_deployment::LoggedDeploymentInput, DeploymentStoreError> {
+        let mut conn = self.pool().acquire().await.map_err(deployment_store_err)?;
+        append_deployment_input(&mut conn, org, input, received_at).await
+    }
+
+    async fn inputs(
+        &self,
+        org: &str,
+        environment: &str,
+    ) -> Result<Vec<scarab_deployment::LoggedDeploymentInput>, DeploymentStoreError> {
+        let sql = format!(
+            "SELECT {DEPLOYMENT_INPUT_COLUMNS} FROM deployment_inputs
+             WHERE org = $1 AND environment = $2
+             ORDER BY seq"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(org)
+            .bind(environment)
+            .fetch_all(self.pool())
+            .await
+            .map_err(deployment_store_err)?;
+        rows.iter().map(deployment_input_from_row).collect()
+    }
+
+    async fn environments(&self, org: &str) -> Result<Vec<String>, DeploymentStoreError> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT environment FROM deployment_inputs WHERE org = $1 ORDER BY environment",
+        )
+        .bind(org)
+        .fetch_all(self.pool())
+        .await
+        .map_err(deployment_store_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| r.get::<String, _>("environment"))
+            .collect())
     }
 }
 

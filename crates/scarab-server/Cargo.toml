@@ -56,6 +56,9 @@ scarab-identity = { workspace = true }
 scarab-secrets = { workspace = true }
 scarab-storage = { workspace = true }
 scarab-project = { workspace = true }
+# ADR-0070: the Deployment record — its store port and the fold every read
+# runs (the board and the Deployments view).
+scarab-deployment = { workspace = true }
 scarab-db-postgres = { workspace = true }
 scarab-forge-github = { workspace = true }
 scarab-forge-forgejo = { workspace = true }

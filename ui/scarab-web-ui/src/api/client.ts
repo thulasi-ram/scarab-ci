@@ -487,8 +487,11 @@ export async function putEnvironment(
   );
 }
 
-/** A recorded deployment into an environment (`at` is epoch millis). */
-export type Deployment = {
+/** One approval recorded when a run into an environment was admitted (`at` is
+ *  epoch millis). The LEGACY `…/environments/{name}/deployments` route: it
+ *  records what was *approved*, not what went live — that is the Deployment
+ *  record below (ADR-0070), which this route predates. */
+export type ApprovalRecord = {
   org: string;
   project: string;
   environment: string;
@@ -498,17 +501,90 @@ export type Deployment = {
   at: number;
 };
 
-/** An environment's deployment history, most recent first (`GET …/deployments`). */
-export async function listDeployments(
+/** An environment's approval history, most recent first (legacy
+ *  `GET /v1/repos/{org}/{repo}/environments/{name}/deployments`). */
+export async function listApprovalHistory(
   org: string,
   repo: string,
   name: string,
-): Promise<Deployment[]> {
+): Promise<ApprovalRecord[]> {
   const res = await fetch(
     `/v1/repos/${encodeURIComponent(org)}/${encodeURIComponent(repo)}/environments/${encodeURIComponent(name)}/deployments`,
   );
-  if (!res.ok) throw new Error("failed to list deployments");
-  return (await res.json()) as Deployment[];
+  if (!res.ok) throw new Error("failed to list approval history");
+  return (await res.json()) as ApprovalRecord[];
+}
+
+// --- Deployments (ADR-0070) — what is live on each DeploymentTarget, and how
+// it got there. Org-scoped: an Environment's Deployments span every Project
+// that deploys into it. ---
+
+/** One Deployment: a version made (or asked to be made) live on a target. */
+export type Deployment = components["schemas"]["DeploymentDto"];
+export type DeploymentStatus = components["schemas"]["DeploymentStatusDto"];
+/** One stage of a Deployment as its source reported it. */
+export type DeploymentReport = components["schemas"]["DeploymentStatusReportDto"];
+/** The Deploy Run step that asked for a Deployment. */
+export type DeploymentRequester = components["schemas"]["DeploymentRequesterDto"];
+export type DeploymentTarget = components["schemas"]["DeploymentTargetDto"];
+/** One target's line on the Environment board: what is live, what is newest. */
+export type BoardRow = components["schemas"]["EnvironmentBoardRowDto"];
+
+/** The caller may not read this org's Deployment record (403). Reading needs
+ *  Read on the Org; a member bound only to a Project is refused until
+ *  Environment eligibility (ADR-0071) says who may read an Environment. */
+export class DeploymentsForbiddenError extends Error {
+  constructor(readonly org: string) {
+    super(`no read access to ${org}'s deployments`);
+    this.name = "DeploymentsForbiddenError";
+  }
+}
+
+/**
+ * The Environment board (`GET /v1/orgs/{org}/board`), every Environment with
+ * any Deployment unless `environment` narrows it.
+ *
+ * `null` when the server has no Deployment record wired (a 404 before it
+ * authorizes anything) — "this server does not track deployments", which is
+ * not the same answer as "nothing has deployed".
+ */
+export async function getEnvironmentBoard(
+  org: string,
+  environment?: string,
+): Promise<BoardRow[] | null> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/board", {
+    params: { path: { org }, query: environment ? { environment } : {} },
+  });
+  if (response.status === 404) return null;
+  if (response.status === 403) throw new DeploymentsForbiddenError(org);
+  if (error || !data) {
+    throw new Error(errorText(error) || "failed to load the environment board");
+  }
+  return data;
+}
+
+/** An Environment's Deployments, newest first, optionally one target's only.
+ *  `null` = deployments not configured on this server (as above). */
+export async function listEnvironmentDeployments(
+  org: string,
+  env: string,
+  target?: { source: string; id: string },
+): Promise<Deployment[] | null> {
+  const { data, error, response } = await api.GET(
+    "/v1/orgs/{org}/environments/{env}/deployments",
+    {
+      params: {
+        path: { org, env },
+        query: target ? { target_source: target.source, target_id: target.id } : {},
+      },
+    },
+  );
+  if (response.status === 404) return null;
+  if (response.status === 403) throw new DeploymentsForbiddenError(org);
+  if (error || !data) {
+    throw new Error(errorText(error) || `failed to list deployments in ${env}`);
+  }
+  return data;
 }
 
 /** Fetch a run's status + steps (dogfoods `GET /v1/runs/{id}`). */

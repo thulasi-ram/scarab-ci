@@ -472,6 +472,57 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/orgs/{org}/board": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The Environment board: what is live on each DeploymentTarget (ADR-0070) */
+        get: operations["get_environment_board"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/environments/{env}/deployments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** An Environment's Deployments, newest first (ADR-0070) */
+        get: operations["list_environment_deployments"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/environments/{env}/deployments/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** One Deployment and its stages (ADR-0070) */
+        get: operations["get_deployment"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/orgs/{org}/principals": {
         parameters: {
             query?: never;
@@ -641,7 +692,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** An environment's deployment history (ADR-0037) */
+        /** Legacy approval history (ADR-0070 §1) */
         get: operations["list_deployments"];
         put?: never;
         post?: never;
@@ -1737,6 +1788,109 @@ export interface components {
             id: string;
         };
         /**
+         * @description One Deployment: a DeploymentVersion made (or asked to be made) live on a
+         *     DeploymentTarget, and what was reported about it since (ADR-0070 §2).
+         */
+        DeploymentDto: {
+            /**
+             * Format: int64
+             * @description Unix-ms.
+             */
+            created_at: number;
+            /**
+             * Format: int64
+             * @description Org-scoped and stable: the sequence number of the input that created
+             *     it.
+             */
+            id: number;
+            /** @description The stages, oldest first. */
+            reports: components["schemas"]["DeploymentStatusReportDto"][];
+            /**
+             * @description In the order their requests arrived, claims included. Who made it
+             *     live is the requesters that are not claims; `unexplained` says
+             *     whether there is one.
+             */
+            requesters: components["schemas"]["DeploymentRequesterDto"][];
+            status: components["schemas"]["DeploymentStatusDto"];
+            /**
+             * Format: int64
+             * @description Unix-ms a newer Deployment took its place, if one has.
+             */
+            superseded_at?: number | null;
+            target: components["schemas"]["DeploymentTargetDto"];
+            /**
+             * @description Display term: requested on a DeploymentTarget its source has never
+             *     reported on.
+             */
+            unconfirmed: boolean;
+            /**
+             * @description Display term: no Deploy Run's request explains it — a change made
+             *     outside Scarab. It may still carry claims.
+             */
+            unexplained: boolean;
+            /** @description Opaque, in the source's scheme; compared only for equality. */
+            version: string;
+            /** @description Whether it was ever reported live. */
+            was_ever_live: boolean;
+        };
+        /** @description A Deploy Run step that requested a Deployment. */
+        DeploymentRequesterDto: {
+            /**
+             * @description Only a claim: the request joined a Deployment a source report created,
+             *     and its Step started after Scarab first saw that Deployment — so it
+             *     did not make it live and does not explain it (ADR-0070 §2).
+             */
+            claim: boolean;
+            /**
+             * Format: int64
+             * @description Unix-ms the requesting Step started.
+             */
+            effective_at: number;
+            /**
+             * @description The Project the run belongs to, when it is stamped and in this Org —
+             *     what a link to the run (`/{org}/{project}/runs/{run}`) needs.
+             */
+            project?: string | null;
+            run: string;
+            step: string;
+        };
+        /**
+         * @description A Deployment's fixed, vendor-neutral status (ADR-0070 §5).
+         * @enum {string}
+         */
+        DeploymentStatusDto: "requested" | "in_progress" | "live" | "failed" | "stalled" | "superseded";
+        /** @description One stage of a Deployment as its source reported it. */
+        DeploymentStatusReportDto: {
+            /**
+             * Format: int64
+             * @description Unix-ms Scarab received the report — the time the record is ordered by.
+             */
+            at: number;
+            /** @description Free-form; shown, never interpreted. */
+            label: string;
+            /**
+             * @description Where the source shows this stage. Only an `http`/`https` URL is
+             *     passed on; any other scheme reads as absent.
+             */
+            link?: string | null;
+            /**
+             * Format: int64
+             * @description Unix-ms the source stamped on it, by its own clock. Display only.
+             *     Present on every recorded report.
+             */
+            source_at?: number | null;
+            status: components["schemas"]["SourceAssertedStatusDto"];
+        };
+        /**
+         * @description The smallest unit a Deployment can independently succeed or fail on.
+         *     `source` + `id` are opaque and source-supplied.
+         */
+        DeploymentTargetDto: {
+            environment: string;
+            id: string;
+            source: string;
+        };
+        /**
          * @description Which trigger a dispatch opts into: a human [`Manual`](DispatchKind::Manual)
          *     dispatch (the default) or its programmatic [`Api`](DispatchKind::Api) sibling
          *     (ADR-0043 §4). The named pipeline must declare the matching `on:` trigger to
@@ -1780,6 +1934,12 @@ export interface components {
              *     the run pins to that commit.
              */
             ref: string;
+        };
+        /** @description One DeploymentTarget's line on the Environment board. */
+        EnvironmentBoardRowDto: {
+            live?: null | components["schemas"]["DeploymentDto"];
+            newest?: null | components["schemas"]["DeploymentDto"];
+            target: components["schemas"]["DeploymentTargetDto"];
         };
         /** @description One expired Workspace Snapshot behind a widened rerun (ADR-0061 s5). */
         ExpiredInputDto: {
@@ -2346,6 +2506,12 @@ export interface components {
              */
             retention_days: number;
         };
+        /**
+         * @description The statuses a source may assert in a report (INV-DEP-6) — a subset of
+         *     [`DeploymentStatusDto`], typed apart so the wire says so too.
+         * @enum {string}
+         */
+        SourceAssertedStatusDto: "in_progress" | "live" | "failed";
         /** @description One step (IR subset): the step contract is an OCI `image` + `command`. */
         StepDto: {
             command?: string[];
@@ -3283,6 +3449,135 @@ export interface operations {
         responses: {
             /** @description revoked */
             204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_environment_board: {
+        parameters: {
+            query?: {
+                /**
+                 * @description Only this Environment's rows; omitted = every Environment with any
+                 *     Deployment.
+                 */
+                environment?: string;
+            };
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EnvironmentBoardRowDto"][];
+                };
+            };
+            /** @description no Read on the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description deployments not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_environment_deployments: {
+        parameters: {
+            query?: {
+                target_source?: string;
+                target_id?: string;
+                /**
+                 * @description At most this many, newest first (default 200, capped at 1000). Bounds
+                 *     the response only: the server still folds the Environment's whole log
+                 *     to derive each status.
+                 */
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description environment name */
+                env: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeploymentDto"][];
+                };
+            };
+            /** @description no Read on the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description deployments not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_deployment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description environment name */
+                env: string;
+                /** @description Deployment id */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeploymentDto"];
+                };
+            };
+            /** @description no Read on the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such Deployment in this Environment */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
