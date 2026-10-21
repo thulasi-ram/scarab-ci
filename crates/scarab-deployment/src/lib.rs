@@ -119,12 +119,13 @@ pub use view::{
 /// Milliseconds since the epoch. Time is an input to the fold, never read.
 pub type Millis = i64;
 
-/// The EnvironmentDeploymentDeadline every Environment gets until the
-/// Environment carries its own (ADR-0070 §10; the field arrives with
-/// org-level Environments, ADR-0071). One hour: comfortably above the ~31
-/// minutes of backoff an Argo sync with a retry limit of 5 can spend before
-/// it gives up, so a sync that is still retrying reads `in_progress`, not
-/// `stalled`.
+/// The EnvironmentDeploymentDeadline an Environment gets when it does not set
+/// its own (ADR-0070 §10): the only default there is. The server applies it
+/// when an org-level Environment is written without a deadline, and when a
+/// name in the Deployment record has no org-level Environment at all
+/// (ADR-0071). One hour: comfortably above the ~31 minutes of backoff an Argo
+/// sync with a retry limit of 5 can spend before it gives up, so a sync that
+/// is still retrying reads `in_progress`, not `stalled`.
 pub const DEFAULT_DEPLOYMENT_DEADLINE_MS: Millis = 60 * 60 * 1000;
 
 /// The smallest unit a Deployment can independently succeed or fail on
