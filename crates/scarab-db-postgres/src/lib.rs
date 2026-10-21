@@ -18,6 +18,7 @@ use serde_json::Value;
 use sqlx::migrate::Migrator;
 use sqlx::{PgPool, Row};
 
+use scarab_deployment::{DeploymentStore, DeploymentStoreError};
 use scarab_engine::ports::Lease;
 use scarab_engine::{
     Attempt, AttemptId, AttemptOutcome, ConcurrencyPolicy, Db, DbError, EventKind, EventPayload,
@@ -2393,6 +2394,207 @@ impl EnvironmentStore for PostgresDb {
                 })
             })
             .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DeploymentStore (ADR-0070): the Deployment record's append-only input log.
+// ---------------------------------------------------------------------------
+
+/// Append one DeploymentInput to `org`'s log on `conn`, returning its seq.
+///
+/// One statement: the CTE bumps (or creates) the Org's counter row and the
+/// insert takes the number it returned. The counter row stays locked until
+/// `conn`'s transaction commits, which is what makes seq equal commit order
+/// within an Org (migration 0053). Takes a bare connection rather than the
+/// pool so a caller can append inside a transaction of its own — recording a
+/// DeploymentRequest in the same commit as the Step success that produced it
+/// — and still share the one counter.
+pub async fn append_deployment_input(
+    conn: &mut sqlx::PgConnection,
+    org: &str,
+    input: &scarab_deployment::DeploymentInput,
+) -> Result<u64, sqlx::Error> {
+    use scarab_deployment::DeploymentInput;
+    let target = input.target();
+    let (kind, requester, effective_at, report) = match input {
+        DeploymentInput::Request {
+            requester,
+            effective_at,
+            ..
+        } => ("request", Some(requester), Some(*effective_at), None),
+        DeploymentInput::Report { report, .. } => ("report", None, None, Some(report)),
+    };
+    let seq: i64 = sqlx::query_scalar(
+        "WITH c AS (
+             INSERT INTO deployment_input_counters (org, last_seq) VALUES ($1, 1)
+             ON CONFLICT (org) DO UPDATE
+                 SET last_seq = deployment_input_counters.last_seq + 1
+             RETURNING last_seq
+         )
+         INSERT INTO deployment_inputs
+             (org, seq, environment, target_source, target_id, version, kind, at,
+              requester_run, requester_step, effective_at,
+              report_status, report_label, report_link)
+         SELECT $1, c.last_seq, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13 FROM c
+         RETURNING seq",
+    )
+    .bind(org)
+    .bind(&target.environment)
+    .bind(&target.source)
+    .bind(&target.id)
+    .bind(&input.version().0)
+    .bind(kind)
+    .bind(input.at())
+    .bind(requester.map(|r| r.run.as_str()))
+    .bind(requester.map(|r| r.step.as_str()))
+    .bind(effective_at)
+    .bind(report.map(|r| source_asserted_status_str(r.status)))
+    .bind(report.map(|r| r.label.as_str()))
+    .bind(report.and_then(|r| r.link.as_deref()))
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(seq as u64)
+}
+
+fn source_asserted_status_str(s: scarab_deployment::SourceAssertedStatus) -> &'static str {
+    use scarab_deployment::SourceAssertedStatus;
+    match s {
+        SourceAssertedStatus::InProgress => "in_progress",
+        SourceAssertedStatus::Live => "live",
+        SourceAssertedStatus::Failed => "failed",
+    }
+}
+
+fn source_asserted_status_from_str(
+    s: &str,
+) -> Result<scarab_deployment::SourceAssertedStatus, DeploymentStoreError> {
+    use scarab_deployment::SourceAssertedStatus;
+    match s {
+        "in_progress" => Ok(SourceAssertedStatus::InProgress),
+        "live" => Ok(SourceAssertedStatus::Live),
+        "failed" => Ok(SourceAssertedStatus::Failed),
+        other => Err(DeploymentStoreError::Store(format!(
+            "unknown deployment report status {other:?}"
+        ))),
+    }
+}
+
+/// One `deployment_inputs` row back into the domain input. The table's CHECK
+/// guarantees the per-kind columns are present; a row that still lacks one
+/// is reported, never defaulted — a guessed requester would be a false
+/// attribution.
+fn deployment_input_from_row(
+    r: &sqlx::postgres::PgRow,
+) -> Result<scarab_deployment::LoggedDeploymentInput, DeploymentStoreError> {
+    use scarab_deployment::{
+        DeploymentInput, DeploymentRequester, DeploymentStatusReport, DeploymentTarget,
+        DeploymentVersion, LoggedDeploymentInput,
+    };
+    let seq = r.get::<i64, _>("seq");
+    let missing =
+        |col: &str| DeploymentStoreError::Store(format!("deployment input {seq}: {col} is NULL"));
+    let target = DeploymentTarget {
+        environment: r.get::<String, _>("environment"),
+        source: r.get::<String, _>("target_source"),
+        id: r.get::<String, _>("target_id"),
+    };
+    let version = DeploymentVersion(r.get::<String, _>("version"));
+    let at = r.get::<i64, _>("at");
+    let input = match r.get::<String, _>("kind").as_str() {
+        "request" => DeploymentInput::Request {
+            target,
+            version,
+            requester: DeploymentRequester {
+                run: r
+                    .get::<Option<String>, _>("requester_run")
+                    .ok_or_else(|| missing("requester_run"))?,
+                step: r
+                    .get::<Option<String>, _>("requester_step")
+                    .ok_or_else(|| missing("requester_step"))?,
+            },
+            effective_at: r
+                .get::<Option<i64>, _>("effective_at")
+                .ok_or_else(|| missing("effective_at"))?,
+            at,
+        },
+        "report" => DeploymentInput::Report {
+            target,
+            version,
+            report: DeploymentStatusReport {
+                status: source_asserted_status_from_str(
+                    &r.get::<Option<String>, _>("report_status")
+                        .ok_or_else(|| missing("report_status"))?,
+                )?,
+                label: r
+                    .get::<Option<String>, _>("report_label")
+                    .ok_or_else(|| missing("report_label"))?,
+                link: r.get::<Option<String>, _>("report_link"),
+                at,
+            },
+        },
+        other => {
+            return Err(DeploymentStoreError::Store(format!(
+                "deployment input {seq}: unknown kind {other:?}"
+            )))
+        }
+    };
+    Ok(LoggedDeploymentInput {
+        seq: seq as u64,
+        input,
+    })
+}
+
+fn deployment_store_err(e: sqlx::Error) -> DeploymentStoreError {
+    DeploymentStoreError::Store(e.to_string())
+}
+
+#[async_trait]
+impl DeploymentStore for PostgresDb {
+    async fn append(
+        &self,
+        org: &str,
+        input: &scarab_deployment::DeploymentInput,
+    ) -> Result<u64, DeploymentStoreError> {
+        let mut conn = self.pool().acquire().await.map_err(deployment_store_err)?;
+        append_deployment_input(&mut conn, org, input)
+            .await
+            .map_err(deployment_store_err)
+    }
+
+    async fn inputs(
+        &self,
+        org: &str,
+        environment: &str,
+    ) -> Result<Vec<scarab_deployment::LoggedDeploymentInput>, DeploymentStoreError> {
+        let rows = sqlx::query(
+            "SELECT seq, environment, target_source, target_id, version, kind, at,
+                    requester_run, requester_step, effective_at,
+                    report_status, report_label, report_link
+             FROM deployment_inputs
+             WHERE org = $1 AND environment = $2
+             ORDER BY seq",
+        )
+        .bind(org)
+        .bind(environment)
+        .fetch_all(self.pool())
+        .await
+        .map_err(deployment_store_err)?;
+        rows.iter().map(deployment_input_from_row).collect()
+    }
+
+    async fn environments(&self, org: &str) -> Result<Vec<String>, DeploymentStoreError> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT environment FROM deployment_inputs WHERE org = $1 ORDER BY environment",
+        )
+        .bind(org)
+        .fetch_all(self.pool())
+        .await
+        .map_err(deployment_store_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| r.get::<String, _>("environment"))
+            .collect())
     }
 }
 

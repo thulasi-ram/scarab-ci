@@ -9,6 +9,9 @@ scarab-engine = { workspace = true }
 scarab-project = { workspace = true }
 scarab-forge = { workspace = true }
 scarab-identity = { workspace = true }
+# ADR-0070: the Deployment record's input log (`DeploymentStore`). The fold
+# stays in the pure crate; this adapter only stores and returns inputs.
+scarab-deployment = { workspace = true }
 async-trait = { workspace = true }
 sqlx = { workspace = true }
 serde_json = { workspace = true }
