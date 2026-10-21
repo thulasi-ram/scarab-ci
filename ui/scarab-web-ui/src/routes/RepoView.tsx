@@ -33,6 +33,7 @@ import ScopedSecrets from "../components/ScopedSecrets";
 import SecretMatrixEditor from "../components/SecretMatrixEditor";
 import Doodle from "../components/Doodle";
 import AsciiScene from "../components/AsciiScene";
+import { deploymentsHref } from "../deployments";
 import ponderIdle from "../../../brand/ascii/generated/ponder-ponder.json";
 
 type Tab = "runs" | "environments" | "secrets" | "settings";
@@ -576,7 +577,7 @@ function EnvPanel(props: { org: string; repo: string; env: RepoEnvironment }) {
           <Show when={(history() ?? []).length > 0}>
             <span class="subtle mono">last approved {history()![0]!.git_ref}</span>
           </Show>
-          <A class="env-deploy-link" href={`/deployments?env=${encodeURIComponent(props.env.name)}`}>
+          <A class="env-deploy-link" href={deploymentsHref(props.org, props.env.name)}>
             <Icon icon="rocket" size={12} /> deployments
           </A>
         </span>

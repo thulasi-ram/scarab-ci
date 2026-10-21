@@ -119,9 +119,23 @@ export function groupBoard(rows: readonly BoardRow[]): { environment: string; ro
     }));
 }
 
-/** The Org the page reads: the one the caller administers, else the first org
- *  any visible Project belongs to (a member who administers nothing still
- *  reads their org's Deployments). `undefined` = no org yet. */
-export function pickOrg(adminOrgs: readonly string[] | undefined, projectOrgs: readonly string[]): string | undefined {
-  return adminOrgs?.[0] ?? projectOrgs[0];
+/** The Org the page reads: the one the URL names (`?org=`, set by every link
+ *  into the page — a user in several orgs must land on the right board), else
+ *  the one the caller administers, else the first org any visible Project
+ *  belongs to (a member who administers nothing still reads their org's
+ *  Deployments). `undefined` = no org yet. */
+export function pickOrg(
+  requestedOrg: string | undefined,
+  adminOrgs: readonly string[] | undefined,
+  projectOrgs: readonly string[],
+): string | undefined {
+  return requestedOrg || (adminOrgs?.[0] ?? projectOrgs[0]);
+}
+
+/** The page's own URL for one Org's Environment: what a link from elsewhere
+ *  (a repo's Environments tab) points at. */
+export function deploymentsHref(org: string, env?: string): string {
+  const q = new URLSearchParams({ org });
+  if (env) q.set("env", env);
+  return `/deployments?${q.toString()}`;
 }

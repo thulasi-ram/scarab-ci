@@ -9,6 +9,7 @@ import {
   madeLiveBy,
   pickOrg,
   safeHref,
+  deploymentsHref,
 } from "./deployments";
 
 const dep = (over: Partial<Deployment> = {}): Deployment => ({
@@ -138,9 +139,21 @@ describe("groupBoard", () => {
 });
 
 describe("pickOrg", () => {
-  it("prefers the administered org, then a visible project's org", () => {
-    expect(pickOrg(["acme"], ["other"])).toBe("acme");
-    expect(pickOrg([], ["other"])).toBe("other");
-    expect(pickOrg(undefined, [])).toBeUndefined();
+  it("takes the org the URL names over any fallback", () => {
+    // A user who administers beta, following acme/web's production link.
+    expect(pickOrg("acme", ["beta"], ["beta"])).toBe("acme");
+  });
+
+  it("otherwise prefers the administered org, then a visible project's org", () => {
+    expect(pickOrg(undefined, ["acme"], ["other"])).toBe("acme");
+    expect(pickOrg("", [], ["other"])).toBe("other");
+    expect(pickOrg(undefined, undefined, [])).toBeUndefined();
+  });
+});
+
+describe("deploymentsHref", () => {
+  it("carries the org, and the environment when given", () => {
+    expect(deploymentsHref("acme", "production")).toBe("/deployments?org=acme&env=production");
+    expect(deploymentsHref("a b")).toBe("/deployments?org=a+b");
   });
 });
