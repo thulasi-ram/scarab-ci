@@ -86,30 +86,67 @@ exactly one Environment.)
 - **Rollback is a new Deployment** of an older DeploymentVersion. An old Deployment is
   never edited back to life.
 - A Deployment **outlives** the Deploy Run that requested it, and may have **no** Deploy
-  Run at all. A report that creates one makes an **Unexplained** Deployment.
+  Run at all. A report that creates one makes an **Unexplained** Deployment. It **stays**
+  Unexplained: a request that later joins it is recorded as a separate claim beside it,
+  never as its explanation. Otherwise any request that happened to name the same version
+  would launder a hand-applied hotfix (ADR-0071 §4).
 
 ### 3. DeploymentTarget: the smallest unit that independently succeeds or fails
 
 One Argo Application, one Helm release, one ECS service. Its identity is opaque and
 source-supplied, *(source, id)*. Core compares it and never parses it. It comes into
 existence the first time it is named, by a request or a report. There is no prior
-registration. A rename at the source is a new DeploymentTarget. Fan-out (one Environment
+registration. A rename at the source is a new DeploymentTarget. So is a **re-home**: when
+the source reports a known target under a grouping that maps to another Environment (an
+Argo Application moved to another Argo project), it is recorded as a new DeploymentTarget
+in the new Environment and the old one ends. Its history stays where it was; nothing is
+moved, and the move is not a standing conflict. Fan-out (one Environment
 across regions or clusters) is several DeploymentTargets, not a grouping concept.
 
 ### 4. DeploymentVersion: an opaque label in a scheme the source declares (PROVISIONAL)
 
 A DeploymentVersion is an opaque label, compared only for equality. Its **scheme is
-declared by the source, per DeploymentTarget**, and requesters must use that scheme. A
-requester and a source that disagree on the scheme never correlate.
+declared by the source, per DeploymentTarget**, and requesters must use that scheme. The
+source publishes a **scheme id** with each target. A request whose version does not fit
+the target's scheme is **rejected when it is recorded**, instead of waiting silently on a
+version the source will never report.
 
-The first-party Argo plugin's default scheme is **the set of image digests the
-Application runs** (`status.summary.images`). This is immune to unrelated commits on a
-shared gitops repository: under a gitops-commit scheme, an unrelated team's merge to
-`devops-gitops` would change every Application's version and break correlation (audit
-finding 1, a blocker). A per-target option is *the last commit touching the target's
-path*. Artifact digests attach to a Deployment as **evidence**, zero or more, never as
-identity. A config-only change and a multi-image service are therefore both ordinary
-Deployments.
+The first-party Argo plugin's default scheme is **the set of image references in the pod
+templates of the Application's target manifests**: what Argo rendered from git (its
+`manifests`, or the `targetState` of its managed resources), not what is running. It is
+deliberately **not** `status.summary.images`, which is collected from live Pods: during a
+rolling update it is the union of old and new, it includes sidecars a mutating webhook
+injected, Sync-hook Job Pods flicker in and out of it, and a scale-to-zero app has an
+empty set. Each of those would create a spurious Deployment that supersedes the requested
+one and fails its DeploymentGate. The target-manifest set avoids all four, and shows the
+new version as soon as Argo refreshes, before the sync. Like any per-target scheme, it
+also avoids the gitops-commit problem: on a shared gitops repository an unrelated team's
+merge would change every Application's version (audit finding 1, a blocker).
+
+Its blind spots, stated plainly:
+
+- **Tags, not digests.** The references are the strings written in the manifest, usually
+  tags. A tag re-pushed to new bytes is the same DeploymentVersion.
+- **Config-only changes are invisible.** A values, ConfigMap or replica change leaves the
+  image set as it was. A request for it joins the Deployment already live, and a
+  DeploymentGate on it passes at once, before Argo applies anything. **A DeploymentGate
+  proves "V is live", not "my change took effect".**
+- **The requester must predict the whole rendered set**, including every image the chart
+  renders that the change did not touch.
+- **The path-commit option has its own gaps.** *The last commit touching the target's
+  path* sees config changes, but misses kustomize bases outside the path, multi-source
+  Applications and remote charts, and needs git read access because Argo does not expose
+  it. It is no rollout signal either: whether a version is serving is the reporter's job
+  (§11).
+
+Artifact digests attach to a Deployment as **evidence**, zero or more, never as identity.
+
+**The known weakness is equality-only correlation**, which forces the requester to predict
+how the source will render its change. The leading alternative, to be evaluated with real
+data, is **source acknowledgement**: the source maps a request, or the commit that carried
+it, to the version it actually rendered, in the style of GitHub Deployments. The
+observed-only board (Implementation horizon, step 2) exists partly to gather that
+evidence before DeploymentGates bake a scheme into Steps.
 
 **This decision is provisional.** The owner's words: *"not grasping the gravity… once
 it's used practically I will know."* Revisit after the first real use against Treebo's
@@ -141,7 +178,9 @@ reported) are display terms, not statuses.
 ### 6. DeploymentStatusReport: a status plus a label
 
 A report is a DeploymentStatus, a free-form label ("canary 2/4 at 25%", "hook migrate:
-secret missing"), an optional link, and a time. The ordered reports are the Deployment's
+secret missing"), an optional link, and the source's own time. The source's time is
+**display only**; core orders every input by the time it received it (§8). The ordered
+reports are the Deployment's
 **stages** as shown to QA. Core displays the label and never interprets it. **New vendor
 states become labels, never statuses.**
 
@@ -171,11 +210,16 @@ steps:
 - **The DeploymentTarget is static**: a literal or a launch input. Ownership (ADR-0071)
   and the Environment check therefore happen at Run creation, before any Pod.
 - **Effective time.** A request carries the time its Step *started* (when the change was
-  made) as well as the time it was recorded (when the Step succeeded). If the key's newest
-  Deployment is already final, the request still **joins it as history** when the source
-  first saw that Deployment at or after the effective time: the source simply got there
-  before the request was recorded. Only an *older* final Deployment makes the request a
-  genuine rollback (INV-DEP-11).
+  made) as well as the time it was recorded (when the Step succeeded). Both are
+  control-plane times, and the effective time is clamped to be no later than the
+  request's receipt time; a source's clock never enters the comparison. If the key's
+  newest Deployment is already final, the request still **joins it as history** when core
+  first received that Deployment at or after the effective time: the source simply got
+  there before the request was recorded. Only an *older* final Deployment makes the
+  request a genuine rollback (INV-DEP-11).
+- **Scheme check.** A version that does not fit the target's published scheme id (§4), or
+  the source's default scheme for a target it has not named yet, is rejected when the
+  request is recorded, and the Step fails as **DeploymentRequest incomplete** below.
 - **Incomplete request.** If the Step exits 0 but its DeploymentRequest cannot be
   completed (a referenced result is missing), the Step fails with the failure class
   **DeploymentRequest incomplete**. It is **never auto-retried**: the change has probably
@@ -183,8 +227,8 @@ steps:
   does not declare, before any Run exists. This needs a per-Step declaration of emitted
   results, which Steps do not have today (ADR-0041's results are an open map).
 - **Environment mismatch.** A DeploymentTarget already known in **another** Environment
-  is rejected at Run creation. One discovered there later is flagged as a conflict and
-  never moved.
+  is rejected at Run creation. A target the source later reports under another
+  Environment is re-homed (§3), never moved.
 
 ### 8. DeploymentGate: core resolves it, looking only forward
 
@@ -199,13 +243,27 @@ Its window opens at **max(request effective time, gate Attempt start)**. From th
   EnvironmentDeploymentDeadline has elapsed since it. The source's label is the reason.
 
 Whatever happens first decides. A failure that predates the window never fails the gate:
-a re-deploy after fixing a missing secret is not failed by the earlier failure. "Before"
-and "after" are judged on `(time, arrival sequence)`, never on time alone, because two
-inputs can share a millisecond. A deadline sorts before every input stamped the same
+a re-deploy after fixing a missing secret is not failed by the earlier failure.
+
+**"Before" and "after" mean received before and after.** Core stamps every input, request
+or report, with its **receipt time**: the store stamps it, on one clock, in the
+transaction that appends the input, and keeps it monotone per Org, so receipt order and
+arrival order agree. The request's effective time, the gate Attempt's start and the
+gate's `now` come from that same control-plane clock. A source's own timestamp is display
+only. The fold requires non-decreasing time and clamps an input that arrives backdated up
+to the last one rather than trusting it. Two inputs can still share a millisecond, so ties
+are broken by arrival sequence, and a deadline sorts before every input stamped the same
 time.
 
-The verdict is **frozen per Attempt**. The Deployment's status may move on: a Run that
-went red on `stalled` stays red even if the Deployment later goes `live`. **Retry is a
+The cost of ordering by receipt: a stale `failed` that reaches core late counts as
+*after* the window and can fail a fresh gate. The DeploymentReporterContract's "source
+order, never replay older history" (§11) is what prevents that, and so it is
+load-bearing.
+
+The verdict is **journaled per Attempt** when it is first reached, and never re-derived
+from the log afterwards: a gate tick can race an append, and a verdict the engine has
+already acted on must not flip. The Deployment's status may move on: a Run that went red
+on `stalled` stays red even if the Deployment later goes `live`. **Retry is a
 new Attempt that waits afresh** on the same Deployment, and its later Attempt start opens
 a new window. The recovery path is: fix the secret, Resync (a PluginAction, ADR-0072),
 Retry the gate. The deploy Step does not run again.
@@ -226,16 +284,19 @@ These changes apply to **all** gate kinds, not only DeploymentGate:
   evaluated whether the Run is running or suspended. This replaces the Run-level
   `suspended_at` and the `find()` of the first matching gate (`scheduler.rs:2858-2908`)
   and the whole-Run suspension in the pre-pass (`scheduler.rs:1662-1677`).
-- A verdict is final **per Attempt**. A Retry of a failed gate is a new Attempt that waits
-  afresh: a rejected approval asks again.
+- A verdict is final **per Attempt**, journaled when first reached. A Retry of a failed
+  gate is a new Attempt that waits afresh: a rejected approval asks again.
 
 ### 10. EnvironmentDeploymentDeadline: the stall clock
 
 How long a Deployment in an Environment may stay `requested` or `in_progress` before core
 marks it `stalled`. It is measured from creation and **restarted by every request that
-joins**. A later `live` or `failed` report still recovers a stalled Deployment. It is set
-on the Environment and tightenable per Project through the EnvironmentProjectOverlay
-(ADR-0071).
+joins**. A later `live` or `failed` report still recovers a stalled Deployment.
+
+It is set on the Environment, and that **baseline deadline alone drives a Deployment's
+status**, so one Deployment has one status whoever looks at it. A Project's
+EnvironmentProjectOverlay (ADR-0071) may set a tighter deadline, which applies **only to
+that Project's DeploymentGates**.
 
 ### 11. DeploymentReporterContract: what every reporter promises
 
@@ -246,10 +307,20 @@ behaviour is the same across CD tools:
   intervention. For Argo, that means retries are exhausted or the sync was terminated by
   timeout. Until then, report `in_progress` with the reason as the label.
 - Report `live` **only when the requested DeploymentVersion is actually serving**:
-  applied, healthy, and running the requested digests where the source can tell. For Argo,
-  that is synced, healthy and running the requested digests.
+  applied and healthy at that version, where the source can tell. For Argo, that is
+  synced to a target whose version is the requested one, and healthy.
 - `live → failed` is allowed.
 - A re-apply of the same DeploymentVersion is a report, not a new Deployment.
+- Report **transitions only**, never every reconcile. Argo reconciles about every three
+  minutes; a report per reconcile adds no fact and grows every Environment's log.
+- Report **in source order** and **never replay older history**. Core judges before and
+  after by receipt time (§8), so a stale report delivered late reads as new.
+- Each report carries an **idempotency key** and a **source sequence** per
+  *(installation, DeploymentTarget)*. Core drops a repeat, and a report whose sequence is
+  not newer than the last one it accepted, so an at-least-once retry cannot flip `live`
+  back to `failed`.
+- Reports reach core by push under an identity core verifies, and core sets the report's
+  source from that identity, never from the report (ADR-0072 §11).
 
 The first-party Argo plugin is the contract's reference implementation.
 
@@ -272,16 +343,22 @@ crate disagree, the crate wins and this ADR is stale.
   latest report is neither `live` nor `failed`.
 - **INV-DEP-8** No input is lost: every request and every report lands on exactly one
   Deployment with its key.
-- **INV-DEP-9** A DeploymentGate looks forward. A failure that predates its request never
-  fails it.
-- **INV-DEP-10** A DeploymentGate verdict, once reached, never changes.
+- **INV-DEP-9** A DeploymentGate looks forward. A failure **received before** its window
+  opens never fails it; one **received after** may.
+- **INV-DEP-10** A DeploymentGate verdict, once reached, never changes. The fold keeps
+  this only for inputs in receipt order; the engine keeps it outright by journaling the
+  verdict per Attempt (§8).
 - **INV-DEP-11** A late request joins the Deployment the source already saw. It is not a
   rollback.
 
 The property suite found three real holes before any persistence existed: an older
 version reported live again rejoining its old Deployment (INV-DEP-3), a gate verdict
 flipping between two inputs in the same millisecond (INV-DEP-10, hence the total order),
-and a late request being treated as a rollback (INV-DEP-11).
+and a late request being treated as a rollback (INV-DEP-11). A second audit found a
+fourth: inputs folded in arrival order but judged on the source's clock, so a backdated
+report could flip a verdict. Receipt-time stamping and the fold's clamp close it; a
+scenario test covers one case, and a property test over backdated and non-monotone inputs
+is still owed.
 
 ### 13. One Environment per Run now; one per `invoke` segment in the target state
 
@@ -305,6 +382,12 @@ cut** keeps ADR-0037's one Environment per Run. Promotion is chained Deploy Runs
   for the Pipeline check.
 - A provisional decision (the version scheme) is load-bearing for correlation. It is
   isolated in the reporter and the requester so that revising it does not touch the fold.
+  Under the default scheme a DeploymentGate cannot see a config-only change (§4).
+- Every board read and every gate tick refolds the Environment's whole input log.
+  "Transitions only" (§11) bounds its growth; a snapshot or cached fold is a known
+  follow-up.
+- Ordering by receipt time makes the reporter contract's "source order, never replay"
+  load-bearing (§8).
 - Known gaps this ADR does not close: approvers are opt-in, so an Environment with
   approvers does not force a gate into a Pipeline that omits one (git-bug `cd43bf3`); and
   external gate release skips `admits()` (git-bug `220917f`). Both matter more once gates
@@ -328,7 +411,20 @@ cut** keeps ADR-0037's one Environment per Run. Promotion is chained Deploy Runs
   version returns.
 - **Gitops commit as the default version scheme.** Rejected as the Argo default. On a
   shared gitops repository, every unrelated merge changes the version of every target
-  (audit finding 1). It is kept as a per-target option (*last commit touching the path*).
+  (audit finding 1). It is kept as a per-target option (*last commit touching the path*),
+  with the gaps listed in §4.
+- **`status.summary.images` as the Argo default.** Rejected. It is read from live Pods:
+  the old∪new union during a rollout, injected sidecars, Sync-hook Pods and empty sets for
+  scale-to-zero apps each create a spurious Deployment that supersedes the requested one.
+- **Source acknowledgement** (the source maps a request or commit to the version it
+  rendered). Not rejected: the leading alternative to equality-only correlation, deferred
+  until real use gives data to judge it (§4).
+- **Ordering inputs by the source's timestamp.** Rejected. Source and control-plane clocks
+  skew, and a skewed report turned a late request into a phantom rollback. Core's receipt
+  time orders; the source's time is display only.
+- **Re-deriving a gate verdict from the log on every tick.** Rejected. A tick can race an
+  append, and a backlogged input could flip a verdict already acted on. The verdict is
+  journaled per Attempt.
 - **Admin-registered DeploymentTargets.** Rejected. A target is born when first named.
   Registration duplicates the source's own inventory and drifts from it.
 - **A gate that looks backwards** (fail on any `failed` on the Deployment). Rejected. A
@@ -338,12 +434,25 @@ cut** keeps ADR-0037's one Environment per Run. Promotion is chained Deploy Runs
 
 ## Implementation horizon
 
-- **MMP:** the Deployment record persisted from the fold; a read API; a Deployments view
-  and an Environment board. `deployment_requests`, DeploymentGate, and the general gate
-  changes (gates can fail, per-gate clocks, holding only dependents). The
-  DeploymentReporterContract, with the first-party Argo reporter as its implementation
-  (ADR-0072).
+- **MMP, in this order.** Each step leaves something usable, and real data arrives before
+  the riskiest step depends on it.
+  1. **A minimal org-level Environment** (ADR-0071): its name and its
+     EnvironmentDeploymentSources. Deployment inputs are keyed by Org and Environment
+     name, so this comes first; reads use org Read.
+  2. **The first-party Argo reporter (ADR-0072) together with the read side**: the
+     Deployment record persisted from the fold, a read API, a Deployments view and an
+     Environment board. The DeploymentReporterContract ships here. This is an
+     **observed-only board** (every Deployment is Unexplained) that needs no Pipeline
+     change, and it gives real evidence on the provisional version scheme.
+  3. **The full Environment migration** (ADR-0071): eligibility, overlays, privilege
+     grants.
+  4. **The Run side**: `deployment_requests`, DeploymentGate, and the general gate changes
+     (gates can fail, per-gate clocks, holding only dependents, verdicts journaled per
+     Attempt).
 - **MLP:** gate Retry (the Attempt-start window) together with the Resync PluginAction
   that makes the recovery path usable.
+- **Known follow-up:** a snapshot or cached fold, so a board read or gate tick does not
+  refold the whole log.
 - **Target state:** an Environment per `invoke` segment; the path-commit version option.
-- **Revisit:** the DeploymentVersion scheme, after the first real use.
+- **Revisit:** the DeploymentVersion scheme, after the first real use, with source
+  acknowledgement as the leading alternative.

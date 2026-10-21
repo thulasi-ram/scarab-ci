@@ -150,8 +150,16 @@ method, path pattern and, optionally, a body schema.
 
 - **Read rules** apply at any time.
 - **Write rules** are declared **per PluginAction** and are open **only while that action
-  is being invoked**. Their paths may name `{target.id}`, which **the broker fills** from
-  the invoked DeploymentTarget. The Plugin cannot aim a write at another target.
+  is being invoked**. A write rule may bind `{target.id}` in the **path**, in a **query
+  parameter** and in a **body field**, wherever the vendor's API names the object (Argo
+  names the Application in the path, and its namespace in the `appNamespace` query
+  parameter). **The broker fills** each binding from the invoked DeploymentTarget and
+  rejects a request whose bound value differs. In the path, the id is
+  **percent-encoded as one segment**: target ids are plugin-supplied, and an id such as
+  `a/../../b` must not let a write rule reach `b`.
+- **Each invocation gets its own broker credential**, carrying the Attempt's fence. The
+  broker therefore knows which invocation, and so which target, a request belongs to,
+  even when two run at once. The Plugin cannot aim a write at another target.
 
 The rules are the second line of defence. Vendor-side least privilege (an Argo role that
 can sync but not override) is the first.
@@ -181,8 +189,11 @@ A **PluginUiContribution** declares one **PluginUiTrustTier**:
   mounted at a **UiExtensionPoint**: a Deployment row's expansion, a Run panel, an
   Environment board column, an org tab, or a Step panel. It owns its own DOM inside the
   frame (any UI library) and receives core's design tokens so it looks native. It talks
-  to core only through a narrow bridge: context, plus its own declared PluginActions. It
-  **cannot act as the viewer and cannot read Scarab.** One org admin approves.
+  to core only through a narrow bridge: context, plus **proposals** of its own declared
+  PluginActions. The bridge only proposes. Core renders the confirmation **outside the
+  frame**, and the action runs only when the viewer confirms there, so frame code cannot
+  fire an action without a real click (§4: a Plugin never invokes its own PluginActions).
+  It **cannot act as the viewer and cannot read Scarab.** One org admin approves.
 - **`trusted_dom`**. Same-origin code that can change any page and **can do anything any
   viewer of that page can do.** It is equivalent to adding code to Scarab itself. It is
   allowed only for publishers the **operator** names, needs **dual org-admin approval**,
@@ -207,7 +218,13 @@ forced re-login where the identity provider supports one. It is required for:
 
 **API tokens cannot perform crown-jewel operations at all.** Tightening needs no
 step-up. The one pre-authorised machine exception is a PluginPrincipal named as an
-approver (§3): naming it was itself a stepped-up act.
+approver (§3). Naming it is a **tightening**, because approvers are ALL-of, so it needs
+no step-up. What was stepped up is the install that approved the `approve_gates`
+capability (§10).
+
+A local deployment run with `SCARAB_DEV_INSECURE` acts as a synthetic Owner and has no
+interactive human to step up. It is not a production mode, and step-up does not apply to
+it.
 
 Step-up defends against stolen tokens, CSRF and unattended sessions. It does **not**
 defend against `trusted_dom` code, which can change what is being confirmed.
@@ -218,6 +235,7 @@ defend against `trusted_dom` code, which can change what is being confirmed.
 - **One shared `scarab-plugins` namespace**, separate from Scarab's own, under the
   `restricted` Pod Security Admission level.
 - Each Plugin runs under a ServiceAccount with **no RBAC** and **no token automount**.
+  It receives only a projected token for the broker (§11).
 - **NetworkPolicy is default-deny**, including Plugin to Plugin. Egress is allowed to DNS
   and the CredentialBroker only. Ingress is allowed from the control plane only.
 - **A fail-closed isolation probe.** At install and at every start, core runs a probe Pod
@@ -240,7 +258,30 @@ defend against `trusted_dom` code, which can change what is being confirmed.
 - **Operator ceiling.** Above org admins, the operator decides which publishers may be
   trusted at all and whether elevated tiers exist on this deployment.
 - **Kill switch.** An installation can be stopped at once, without an upgrade or an
-  uninstall.
+  uninstall. It revokes at the token-to-installation mapping (§11), so the installation's
+  reports and broker requests stop being accepted even before its token expires.
+
+### 11. Reports reach core by push, under an identity core sets
+
+- **Push to the broker.** A reporting Plugin pushes DeploymentStatusReports to a reserved
+  path on the broker's address (for example `/_scarab/plugin/v1/reports`). The broker is
+  core and already the only egress §9 allows, so ingress to Plugins stays control-plane
+  only, and no Plugin has to be a server.
+- **Projected ServiceAccount token.** The Plugin authenticates with a projected token:
+  audience `scarab-broker`, short TTL. Projection works with automount off and under the
+  `restricted` level, and the ServiceAccount still has no RBAC. Core verifies the token
+  with TokenReview (the chart grants the control plane `system:auth-delegator`) or
+  against the cluster's JWKS.
+- **Core sets the source.** Core maps the ServiceAccount to its PluginInstallation and
+  sets each report's `source` from that mapping, **never from the report's body**
+  (ADR-0071 §5). The same mapping selects which manifest's read rules apply to the
+  Plugin's other broker requests.
+- **Idempotent and sequenced.** Each report carries an idempotency key and a source
+  sequence per *(installation, DeploymentTarget)*, and follows the
+  DeploymentReporterContract (ADR-0070 §11): transitions only, in source order, never
+  replaying older history.
+- **Known follow-up:** every board read and gate tick refolds the Environment's input
+  log. "Transitions only" bounds its growth; a snapshot or cached fold is still owed.
 
 ## Consequences
 
@@ -257,9 +298,8 @@ defend against `trusted_dom` code, which can change what is being confirmed.
   exist. Until then only first-party plugins run.
 - New surface: a plugin runtime, a broker, a capability check, `plugin_action`, UI
   extension points, step-up. This is the largest new subsystem since the engine.
-- Open: how reports reach core within the network policy (pushed through the broker's
-  address, or pulled by the control plane over the ingress edge). Either fits §9; it is
-  an implementation choice.
+- Verifying projected tokens needs TokenReview RBAC (`system:auth-delegator`) for the
+  control plane in the chart, or JWKS access.
 
 ## Alternatives considered
 
@@ -291,16 +331,25 @@ defend against `trusted_dom` code, which can change what is being confirmed.
   must sit on a Run's Attempt so governance and fencing apply.
 - **Auto-applying new digests from a trusted publisher.** Rejected. A new digest is new
   code, and approval is of *(digest, manifest)*.
+- **Pulling reports** (the control plane polls each Plugin). Rejected. Every Plugin would
+  have to be a server, and ingress to Plugins would widen beyond what §9 needs.
+- **A `source` field in the report body.** Rejected. A Plugin could claim to be another
+  source; core sets it from the verified identity.
+- **A framed bridge that invokes actions directly.** Rejected. Frame code could fire an
+  action as the viewer with no click; the bridge only proposes.
 
 ## Implementation horizon
 
 - **MMP:** the plugin runtime (PluginInstallation, PluginPrincipal, `report_deployments`,
   the `scarab-plugins` namespace, NetworkPolicy and the isolation probe, kill switch);
-  the CredentialBroker with **read** rules only; the first-party Argo reporter. Third-party
-  installs **off**.
-- **MLP:** `offer_actions`, `plugin_action` and UI buttons; per-action write rules;
-  Environment-scoped PluginConnections; Resync and Argo Rollouts promote/abort; `framed`
-  UI.
+  report push with projected-token authentication (§11); the CredentialBroker with
+  **read** rules only; the first-party Argo reporter. Third-party installs **off**. This
+  lands at step 2 of ADR-0070's order, right after the minimal org-level Environment and
+  together with the read views: an observed-only board, before any Run-side change.
+- **MLP:** `offer_actions`, `plugin_action` and UI buttons; per-action write rules with
+  `{target.id}` bound in path, query and body and a per-invocation fenced broker
+  credential; Environment-scoped PluginConnections; Resync and Argo Rollouts
+  promote/abort; `framed` UI with a propose-only bridge.
 - **Target state:** StepUpConfirmation; PluginPublisher signatures and the operator
   ceiling (which together switch third-party installs on); `approve_gates`;
   `subscribe_events`; `delivered` credentials; `trusted_dom`.

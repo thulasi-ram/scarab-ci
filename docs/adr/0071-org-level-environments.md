@@ -41,8 +41,10 @@ an Environment governed only a Run. ADR-0070 makes an Environment the owner of
 ### 1. An Environment is an org-level place
 
 An **Environment** is an org-level place that deployments land in (staging, prod). It
-owns its protection rules (approvers, wait timer, allowed refs, concurrency, OIDC subject),
-the DeploymentTargets in it, and the Deployments to them. **Projects ask; the Environment
+owns its protection rules (approvers, wait timer, allowed refs, `require_reason`,
+concurrency, EnvironmentDeploymentDeadline), the DeploymentTargets in it, and the
+Deployments to them. It does not own an OIDC subject: the subject is still minted per
+repository from the Run's coordinates (§11). **Projects ask; the Environment
 decides.** A Pipeline's `environment: prod` is the *request*. The Environment's own
 records are the *authority*.
 
@@ -59,10 +61,21 @@ from: *all projects*, or an explicit list in which project-name globs are allowe
 ### 3. EnvironmentProjectOverlay: per-project, tighten-only
 
 A Project may carry an **EnvironmentProjectOverlay** over an Environment's protection
-rules. It can only tighten: approvers accumulate, allowed refs narrow (the intersection),
-and the stricter wait timer, concurrency and EnvironmentDeploymentDeadline win. A Project
-can make *its* deploys stricter than the baseline, never looser. With no overlay, the
-baseline applies as-is.
+rules. It can only tighten:
+
+- **Approvers accumulate.**
+- **Allowed refs:** a ref is allowed only if it **matches the baseline and matches the
+  overlay**, where an empty list means any ref. This is never computed as an intersection
+  of lists: baseline `[refs/heads/main]` and overlay `[refs/tags/*]` intersect to `[]`,
+  which would read as "any ref" and fail open.
+- **`require_reason`** holds if either the baseline or the overlay sets it.
+- **The stricter wait timer and concurrency win.**
+- **A tighter EnvironmentDeploymentDeadline** applies only to that Project's
+  DeploymentGates. A Deployment's own status uses the baseline deadline, so one
+  Deployment has one status whoever requested it (ADR-0070 §10).
+
+A Project can make *its* deploys stricter than the baseline, never looser. With no
+overlay, the baseline applies as-is.
 
 ### 4. DeploymentTargetProjectOwnership is mirrored from the source
 
@@ -71,6 +84,12 @@ on, and invoke actions against, a DeploymentTarget. It is **reported by the sour
 (derived from the vendor's own metadata, for example an annotation the PluginInstallation
 is configured to read) and never assigned in Scarab. Scarab mirrors the source's
 authority and does not invent a parallel one. It may name several Projects.
+
+**Where that authority really sits.** Mirroring the source means ownership is, in effect,
+**write access to the gitops source** the metadata lives in. In a shared gitops
+repository that is whoever can merge there, and a deploy Step that writes to the
+repository can write an owner annotation into its own commit. Scarab does not make that
+authority stronger than it is; it only refuses to invent a weaker parallel one.
 
 | Act | Needs |
 |---|---|
@@ -85,6 +104,11 @@ exclude the requester. A request is rejected only when **other** Projects own th
 **No PluginAction is offered on a DeploymentTarget with no owners.** The fix is for the
 source to report one, not a side door around Runs.
 
+**A request never explains a Deployment a report created.** If a request joins one, it is
+recorded as a separate claim beside it, and the Deployment stays Unexplained (ADR-0070
+§2). Otherwise any eligible Project could name an unowned target's live version and turn
+a hand-applied hotfix into an explained deploy.
+
 ### 5. EnvironmentDeploymentSources: which sources may report here
 
 An Environment lists its **EnvironmentDeploymentSources**: each is a PluginInstallation
@@ -93,9 +117,21 @@ plus the vendor grouping that maps into this Environment (for example Argo proje
 is recorded**.
 
 The **source name is the PluginInstallation's name, assigned by Scarab**, never chosen by
-the Plugin. A plugin therefore cannot claim to be another source, and two installations
-of one plugin are two sources. This is the consent half of reporting: a plugin with
-`report_deployments` (ADR-0072) can report only into the Environments that list it.
+the Plugin. Core sets it on each report from the identity that delivered the report,
+never from the report's body (ADR-0072 §11). A plugin therefore cannot claim to be another
+source, and two installations of one plugin are two sources. This is the consent half of
+reporting: a plugin with `report_deployments` (ADR-0072) can report only into the
+Environments that list it.
+
+**The consent unit is the installation.** The vendor grouping is asserted by the plugin,
+so listing *(installation, grouping)* trusts the installation to report groupings
+honestly; it does not stop that installation from reporting another grouping's target as
+this one. One installation per Environment makes the two the same, and is recommended.
+
+**A source moving a target re-homes it.** When a source reports a known DeploymentTarget
+under a grouping that maps to another Environment (an Argo Application moved to another
+Argo project), it is recorded as a new DeploymentTarget in the new Environment and the
+old one ends (ADR-0070 §3). It is not a permanent conflict.
 
 ### 6. Secrets: two Environment scopes and a four-step resolution order
 
@@ -113,12 +149,13 @@ redactor, and run the usage-driven completeness check. Known gap, not addressed 
 secrets reach the step container as plaintext Pod environment variables (git-bug
 `bcf2c11`).
 
-### 7. RBAC gains an Environment scope
+### 7. RBAC gains an Environment scope (MLP)
 
-`Scope` (`crates/scarab-identity/src/lib.rs:67`) is Org or Project today. It gains
-**Environment**: *Administer on Environment X*. This lets prod be delegated to a platform
-team without making it org admin. Org admins hold it implicitly. Until this lands, org
-admins administer Environments.
+`Scope` (`crates/scarab-identity/src/lib.rs:67`) is Org or Project today, and no finer
+scope exists. In the MLP it gains **Environment**: *Administer on Environment X*. This
+lets prod be delegated to a platform team without making it org admin. Org admins hold it
+implicitly. Until this lands, **org admins administer Environments**, and "the
+Environment's admin" elsewhere in these ADRs means an org admin.
 
 ### 8. EnvironmentProjectPrivilegeGrants: privileges per Project within an Environment
 
@@ -136,24 +173,44 @@ An Environment's concurrency limits in-flight Deployments **on one DeploymentTar
 deploying to prod do not queue behind each other. This is the first time the rule is
 read at all.
 
-### 10. Migration with no behaviour change
+- **In-flight** means `requested` or `in_progress` and not past the
+  EnvironmentDeploymentDeadline. A `stalled` Deployment does not count, so one
+  version-scheme mismatch cannot block a target for Scarab deploys indefinitely.
+- **Unset means no limit.** Concurrency is an explicit opt-in.
 
-Existing installations migrate without changing what any Run does:
+### 10. Migration that keeps what every Run does today
+
+Existing installations migrate so that every Run the migration can see is admitted and
+governed exactly as before:
 
 1. Create **one org Environment per distinct name** (all Projects' `prod` become one
-   `prod`), with an **empty, permissive baseline**: no approvers, all refs, no timer.
-2. Each Project's old rules become **that Project's EnvironmentProjectOverlay**. Because
-   the baseline is permissive and overlays only tighten, each Project's effective rules
-   equal its old rules.
-3. Old environment secrets move to **EnvironmentProjectSecretScope**.
-4. Old privilege whitelists and `permit_k8s_overlay` become **that Project's
+   `prod`), with an **empty, permissive baseline**: no approvers, all refs, no timer, no
+   `require_reason`, no concurrency limit.
+2. Each Project's old rules become **that Project's EnvironmentProjectOverlay**, including
+   `require_reason`. Because the baseline is permissive and overlays only tighten, each
+   Project's effective rules equal its old rules.
+3. **Concurrency migrates as unset.** The UI stored 1 for every Environment and coerced 0
+   to 1 (`ui/scarab-web-ui/src/routes/RepoView.tsx`), and nothing ever read the value
+   (`ProtectionRules.concurrency`). Carrying it over would start throttling every target
+   the day §9 first reads it. An admin opts in.
+4. Old environment secrets move to **EnvironmentProjectSecretScope**.
+5. Old privilege whitelists and `permit_k8s_overlay` become **that Project's
    EnvironmentProjectPrivilegeGrants**.
-5. **EnvironmentProjectEligibility = exactly the Projects that had that Environment.**
-6. Old `deployments` rows stay readable as **legacy approval history** (ADR-0070 §1).
+6. **EnvironmentProjectEligibility** is every Project that defined the name, plus every
+   Project whose Runs named it without a definition. A name that is only ever
+   **referenced**, never defined, gets eligibility **all projects**: today admission
+   treats it as a deploy with no protection rules (`resolve_governance`,
+   `crates/scarab-server/src/lib.rs`, around lines 3879-3908), so "only the Projects that
+   had it" would start rejecting those Runs. The migration finds referenced-only names in
+   Run history. A name referenced only by a Pipeline that has never run is invisible to
+   it; that Pipeline's first Run is rejected until an admin creates the Environment. This
+   is the one behaviour change.
+7. Old `deployments` rows stay readable as **legacy approval history** (ADR-0070 §1).
    They are not converted into Deployments, because they carry no target or version.
-7. A **split report** lists every name that merged across Projects, so an admin can
+8. A **split report** lists every name that merged across Projects, so an admin can
    split places that are genuinely different (for example a `prod` that is really
-   `prod-eu` in one repository).
+   `prod-eu` in one repository). It also lists names migrated with eligibility *all
+   projects*.
 
 ### 11. OIDC subject unchanged
 
@@ -171,11 +228,13 @@ moving to org level changes nothing in it, so no cloud trust policy needs editin
 - New Environments are fail-closed. An admin must make Projects eligible before any
   Deploy Run is admitted, and that is a new onboarding step.
 - Ownership depends on the source reporting it. A target whose source reports no owner
-  can be requested (Unconfirmed) but never acted on through a PluginAction.
+  can be requested (Unconfirmed) but never acted on through a PluginAction. Ownership is
+  only as strong as write access to the gitops source (§4).
 - The API surface moves from `/v1/repos/{org}/{repo}/environments/...` to an org-level
   Environment resource with per-Project overlays, grants and secret scopes beneath it.
 - The split report is the one place the migration asks an admin to think. Everything
-  else is mechanical.
+  else is mechanical. The one behaviour change is a name referenced only by a Pipeline
+  that has never run (§10).
 - Known gap that becomes more visible: an Environment's approvers do not force a gate
   into a Pipeline that omits one (git-bug `cd43bf3`).
 
@@ -204,14 +263,25 @@ moving to org level changes nothing in it, so no cloud trust policy needs editin
 - **Migrate with a strict merged baseline** (union of approvers, intersection of refs).
   Rejected. It changes behaviour for every Project at once. A permissive baseline plus
   per-Project overlays reproduces today exactly.
+- **Migrate concurrency as stored.** Rejected. The stored 1 was a UI default nobody chose
+  and nothing read; enforcing it would throttle every target at once.
+- **A source moving a target is a standing conflict.** Rejected. Moving an Application
+  between Argo projects is routine; it is recorded as a re-home (§5).
 
 ## Implementation horizon
 
-- **MMP:** org-level Environments and the migration (with the split report);
-  EnvironmentProjectEligibility; EnvironmentProjectOverlay; EnvironmentDeploymentSources;
-  DeploymentTargetProjectOwnership mirrored from the source; EnvironmentProjectSecretScope
-  (the renamed scope); EnvironmentProjectPrivilegeGrants; per-DeploymentTarget
-  concurrency. Org admins administer Environments.
+- **MMP**, in ADR-0070's order:
+  1. **Minimal org-level Environment**: the name and its EnvironmentDeploymentSources,
+     enough to key Deployments and route reports. Reads use org Read.
+  2. (ADR-0070/0072: the first-party reporter and the read views, an observed-only
+     board. DeploymentTargetProjectOwnership starts being reported here.)
+  3. **The full migration** (with the split report): EnvironmentProjectEligibility;
+     EnvironmentProjectOverlay; EnvironmentProjectSecretScope (the renamed scope);
+     EnvironmentProjectPrivilegeGrants.
+  4. (ADR-0070: the Run side.) Ownership and per-DeploymentTarget concurrency are
+     enforced from here, because only requests need them.
+
+  Org admins administer Environments throughout.
 - **MLP:** the RBAC Environment scope (*Administer on Environment X*).
 - **Target state:** EnvironmentSecretScope (org-wide per Environment) and the
   four-step resolution order; StepUpConfirmation for anything that loosens an Environment
