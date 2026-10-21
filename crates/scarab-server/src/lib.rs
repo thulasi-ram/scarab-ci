@@ -7160,6 +7160,7 @@ pub struct DeploymentStatusReportDto {
     /// Unix-ms Scarab received the report — the time the record is ordered by.
     pub at: i64,
     /// Unix-ms the source stamped on it, by its own clock. Display only.
+    /// Present on every recorded report.
     pub source_at: Option<i64>,
 }
 
