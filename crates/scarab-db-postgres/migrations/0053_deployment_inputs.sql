@@ -1,0 +1,59 @@
+-- ADR-0070: the Deployment record, persisted as its INPUT LOG.
+--
+-- What is stored is every DeploymentRequest and DeploymentStatusReport,
+-- append-only — never a Deployment or a status. Reads refold the log with the
+-- pure `scarab-deployment` crate, so the rules live in exactly one place and a
+-- stored row can never disagree with them. Same shape as the `events` table
+-- (0001): the log is the truth, everything else is derived.
+--
+-- `seq` is per Org and IS the commit order. A Deployment's public id is the
+-- seq of the input that created it, which is stable only if no reader ever
+-- sees seq N+1 without seq N. A BIGSERIAL hands out numbers at INSERT time
+-- and can commit them out of order; this counter row cannot: an append
+-- upserts it (`ON CONFLICT … DO UPDATE … RETURNING`, the 0034
+-- repo_run_counters pattern) and holds its row lock until commit, so appends
+-- within one Org commit strictly in seq order. Orgs never contend.
+--
+-- The legacy `deployments` table (0012, 0016) is untouched: it stays readable as
+-- approval history (ADR-0070 §1, ADR-0071 §9). Nothing here references it.
+CREATE TABLE deployment_input_counters (
+    org      TEXT   PRIMARY KEY,
+    last_seq BIGINT NOT NULL
+);
+
+CREATE TABLE deployment_inputs (
+    org           TEXT   NOT NULL,
+    seq           BIGINT NOT NULL,
+    -- The DeploymentTarget, which carries its Environment.
+    environment   TEXT   NOT NULL,
+    target_source TEXT   NOT NULL,
+    target_id     TEXT   NOT NULL,
+    version       TEXT   NOT NULL,
+    kind          TEXT   NOT NULL CHECK (kind IN ('request', 'report')),
+    -- Unix-ms: when a request was recorded (its Step succeeded) / when a
+    -- report was made.
+    at            BIGINT NOT NULL,
+    -- request only: the requesting Deploy Run step, and when it started.
+    requester_run  TEXT,
+    requester_step TEXT,
+    effective_at   BIGINT,
+    -- report only. The CHECK spells out INV-DEP-6 at rest: a source can only
+    -- assert these three.
+    report_status TEXT CHECK (report_status IN ('in_progress', 'live', 'failed')),
+    report_label  TEXT,
+    report_link   TEXT,
+    PRIMARY KEY (org, seq),
+    CHECK (
+        (kind = 'request'
+            AND requester_run IS NOT NULL AND requester_step IS NOT NULL
+            AND effective_at IS NOT NULL
+            AND report_status IS NULL AND report_label IS NULL AND report_link IS NULL)
+        OR
+        (kind = 'report'
+            AND report_status IS NOT NULL AND report_label IS NOT NULL
+            AND requester_run IS NULL AND requester_step IS NULL AND effective_at IS NULL)
+    )
+);
+
+-- Reads fold one Environment at a time, in seq order.
+CREATE INDEX deployment_inputs_env_idx ON deployment_inputs (org, environment, seq);
