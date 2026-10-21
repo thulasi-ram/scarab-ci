@@ -4,6 +4,11 @@
 // dead_lettered (the operator signal) and cancelled render with the danger
 // style; suspended (waiting on a gate) renders as in-motion. Unknown statuses
 // fall back to skipped.
+//
+// Deployment statuses (ADR-0070) share the palette rather than adding one:
+// live is the good terminal, in_progress/requested are in motion, stalled is
+// red (it missed its deadline, though it can still recover), and superseded is
+// muted — a newer Deployment took its place, which is history, not a fault.
 const CLASS_OF: Record<string, string> = {
   succeeded: "succeeded",
   failed: "failed",
@@ -13,6 +18,11 @@ const CLASS_OF: Record<string, string> = {
   pending: "pending",
   suspended: "pending",
   skipped: "skipped",
+  live: "succeeded",
+  in_progress: "running",
+  requested: "pending",
+  stalled: "failed",
+  superseded: "skipped",
 };
 
 export default function StatusBadge(props: { status: string }) {
