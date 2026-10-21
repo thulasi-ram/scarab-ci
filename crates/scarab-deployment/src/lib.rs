@@ -83,8 +83,25 @@
 
 use std::collections::BTreeMap;
 
+pub mod store;
+pub mod view;
+
+pub use store::{DeploymentStore, DeploymentStoreError, LoggedDeploymentInput};
+pub use view::{
+    fold_environment, DeploymentRequesterView, DeploymentView, EnvironmentBoardRow,
+    EnvironmentDeployments,
+};
+
 /// Milliseconds since the epoch. Time is an input to the fold, never read.
 pub type Millis = i64;
+
+/// The EnvironmentDeploymentDeadline every Environment gets until the
+/// Environment carries its own (ADR-0070 §10; the field arrives with
+/// org-level Environments, ADR-0071). One hour: comfortably above the ~31
+/// minutes of backoff an Argo sync with a retry limit of 5 can spend before
+/// it gives up, so a sync that is still retrying reads `in_progress`, not
+/// `stalled`.
+pub const DEFAULT_DEPLOYMENT_DEADLINE_MS: Millis = 60 * 60 * 1000;
 
 /// The smallest unit a Deployment can independently succeed or fail on
 /// (CONTEXT §4.6). Opaque and source-supplied: core compares it, never
@@ -131,11 +148,14 @@ pub enum DeploymentStatus {
 }
 
 /// One report from a source about a Deployment. The label is free-form and
-/// shown, never interpreted.
+/// shown, never interpreted; so is the link.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeploymentStatusReport {
     pub status: SourceAssertedStatus,
     pub label: String,
+    /// Where the source shows this stage (an Argo operation, a Helm release
+    /// page). Optional and opaque: core displays it and never follows it.
+    pub link: Option<String>,
     pub at: Millis,
 }
 

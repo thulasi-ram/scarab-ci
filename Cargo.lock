@@ -2676,6 +2676,7 @@ dependencies = [
 name = "scarab-deployment"
 version = "0.1.1"
 dependencies = [
+ "async-trait",
  "proptest",
 ]
 
