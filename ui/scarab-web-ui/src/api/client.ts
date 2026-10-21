@@ -658,6 +658,116 @@ export async function deleteOrgEnvironment(org: string, env: string): Promise<vo
   }
 }
 
+// --- Plugins (ADR-0072, Deployments MMP d1) — an org's PluginInstallations:
+// approvals of one pinned digest of a first-party plugin, with a kill switch.
+// Every write's refusal text (403 third-party / 409 name taken or retired) is
+// passed through verbatim — it is the answer to "why will this not install". ---
+
+/** A plugin this Scarab can install (first-party only, today). */
+export type PluginCatalogEntry = components["schemas"]["PluginCatalogEntryDto"];
+/** An org's approval to run one pinned digest of a plugin. */
+export type PluginInstallation = components["schemas"]["PluginInstallationDto"];
+/** What an uninstall removed with it. */
+export type UninstalledPlugin = components["schemas"]["UninstalledPluginDto"];
+/** A grouping an installation reports on that no Environment lists. */
+export type UnmappedGrouping = components["schemas"]["UnmappedGroupingDto"];
+/** A DeploymentTarget a source reports into an Environment, with its owners. */
+export type DeploymentSourceTarget = components["schemas"]["DeploymentSourceTargetDto"];
+
+/** The installable plugins (`GET …/plugin-catalog`); `null` = this server
+ *  runs no plugins (404). */
+export async function listPluginCatalog(org: string): Promise<PluginCatalogEntry[] | null> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/plugin-catalog", {
+    params: { path: { org } },
+  });
+  if (response.status === 404) return null;
+  if (error || !data) throw new Error(errorText(error) || "failed to load the plugin catalog");
+  return data;
+}
+
+/** The org's installations (`GET …/plugins`); `null` = plugins not
+ *  configured on this server (404) — not "none installed". */
+export async function listPlugins(org: string): Promise<PluginInstallation[] | null> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/plugins", {
+    params: { path: { org } },
+  });
+  if (response.status === 404) return null;
+  if (error || !data) throw new Error(errorText(error) || "failed to load the org's plugins");
+  return data;
+}
+
+/** Install a first-party plugin pinned by digest (`POST …/plugins`). */
+export async function installPlugin(
+  org: string,
+  body: components["schemas"]["InstallPluginRequest"],
+): Promise<PluginInstallation> {
+  const { data, error, response } = await api.POST("/v1/orgs/{org}/plugins", {
+    params: { path: { org } },
+    body,
+  });
+  if (error || !data) {
+    throw new Error(errorText(error) || `could not install ${body.name} (${response.status})`);
+  }
+  return data;
+}
+
+/** Kill an installation at once (`POST …/plugins/{name}/kill`): its reports
+ *  and broker calls are refused from the next request on. */
+export async function killPlugin(org: string, name: string): Promise<PluginInstallation> {
+  const { data, error, response } = await api.POST("/v1/orgs/{org}/plugins/{name}/kill", {
+    params: { path: { org, name } },
+  });
+  if (error || !data) throw new Error(errorText(error) || `could not kill ${name} (${response.status})`);
+  return data;
+}
+
+/** Re-enable a killed installation (`POST …/plugins/{name}/enable`). */
+export async function enablePlugin(org: string, name: string): Promise<PluginInstallation> {
+  const { data, error, response } = await api.POST("/v1/orgs/{org}/plugins/{name}/enable", {
+    params: { path: { org, name } },
+  });
+  if (error || !data) throw new Error(errorText(error) || `could not enable ${name} (${response.status})`);
+  return data;
+}
+
+/** Uninstall (`DELETE …/plugins/{name}`). The name is retired for good, and
+ *  the Environment sources that named it are removed with it. */
+export async function uninstallPlugin(org: string, name: string): Promise<UninstalledPlugin> {
+  const { data, error, response } = await api.DELETE("/v1/orgs/{org}/plugins/{name}", {
+    params: { path: { org, name } },
+  });
+  if (error || !data) throw new Error(errorText(error) || `could not uninstall ${name} (${response.status})`);
+  return data;
+}
+
+/** The groupings `name` reports on that no Environment lists — reports for
+ *  them are dropped (`GET …/plugins/{name}/unmapped-groupings`). */
+export async function listUnmappedGroupings(org: string, name: string): Promise<UnmappedGrouping[]> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/plugins/{name}/unmapped-groupings", {
+    params: { path: { org, name } },
+  });
+  if (error || !data) {
+    throw new Error(errorText(error) || `failed to load ${name}'s unmapped groupings (${response.status})`);
+  }
+  return data;
+}
+
+/** An Environment's reported DeploymentTargets and their owners. `null` when
+ *  the caller cannot read them (403) or plugins are not configured (404) —
+ *  the board then shows no owners rather than an error. */
+export async function listDeploymentTargets(
+  org: string,
+  env: string,
+): Promise<DeploymentSourceTarget[] | null> {
+  const { data, error, response } = await api.GET(
+    "/v1/orgs/{org}/environments/{env}/deployment-targets",
+    { params: { path: { org, env } } },
+  );
+  if (response.status === 403 || response.status === 404) return null;
+  if (error || !data) throw new Error(errorText(error) || `failed to load ${env}'s targets`);
+  return data;
+}
+
 /** Fetch a run's status + steps (dogfoods `GET /v1/runs/{id}`). */
 export async function getRun(id: string): Promise<RunStatus> {
   const { data, error } = await api.GET("/v1/runs/{id}", {

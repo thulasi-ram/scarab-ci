@@ -12,26 +12,33 @@
 //
 // Sections today: **Connections** (which forges Scarab is wired to, and
 // what they cover), **Members**, **Environments** (ADR-0071 — the org-level
-// places deployments land in: deadline and reporting sources), **API tokens**
+// places deployments land in: deadline and reporting sources), **Plugins**
+// (ADR-0072 — the installations that report into them, and their kill switch),
+// **API tokens**
 // (ADR-0049 — the credential a machine can hold, minted here and nowhere else)
 // and **Org Secrets** (the top of the `env → repo → org` inheritance chain,
 // until now settable only by raw HTTP).
 // Connections comes first: without one there are no Projects, so nothing else
 // here has anything to act on. Tokens sit above secrets because they are the
 // only thing on this page that hands out authority rather than data.
-import { createResource, Show } from "solid-js";
+import { createResource, createSignal, Show } from "solid-js";
 import { getMe } from "../api/client";
 import ScopedSecrets from "../components/ScopedSecrets";
 import Connections from "../components/Connections";
 import ApiTokens from "../components/ApiTokens";
 import Members from "../components/Members";
 import OrgEnvironments from "../components/OrgEnvironments";
+import Plugins from "../components/Plugins";
 import Icon from "../components/Icon";
 
 export default function Settings() {
   const [me] = createResource(getMe);
   /** The one implicit Org, once anything is bound to it. */
   const org = () => me()?.admin_orgs[0];
+  /** Bumped when the Plugins panel changes an Environment's sources (the
+   *  unmapped-grouping shortcut, an uninstall): the Environments panel saves
+   *  by FULL replace, so it must not keep editing a stale copy. */
+  const [envEpoch, setEnvEpoch] = createSignal(0);
 
   return (
     <section class="page">
@@ -85,7 +92,10 @@ export default function Settings() {
                 <Members org={o()} />
                 {/* Org-level Environments (ADR-0071): org admins administer
                     them until an Environment gets an RBAC scope of its own. */}
-                <OrgEnvironments org={o()} />
+                <OrgEnvironments org={o()} epoch={envEpoch()} />
+                {/* Plugins (ADR-0072): what reports into those Environments —
+                    installed, killed and routed here. */}
+                <Plugins org={o()} onEnvironmentsChanged={() => setEnvEpoch((e) => e + 1)} />
                 <ApiTokens org={o()} />
                 <ScopedSecrets
                   scope={{ org: o() }}
