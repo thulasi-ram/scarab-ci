@@ -1,9 +1,12 @@
 //! The numbered invariants of `scarab-deployment` (see the crate docs), as
 //! property tests over random interleavings of requests and source reports,
-//! plus the named scenarios that pin the join and supersession rules.
+//! plus the named scenarios that pin the join, supersession and explanation
+//! rules.
 //!
 //! Every property checks its invariant after **every** input, not only at the
-//! end: a ledger that is briefly wrong is wrong.
+//! end: a ledger that is briefly wrong is wrong. Each runs over inputs in
+//! receipt order (what the store hands the fold) and again, all together,
+//! over inputs whose times go backwards — which the fold must clamp.
 
 use proptest::prelude::*;
 use scarab_deployment::*;
@@ -92,19 +95,31 @@ fn input_at(at: Millis) -> impl Strategy<Value = DeploymentInput> {
     ]
 }
 
-/// Inputs with non-decreasing timestamps (time only moves forward).
+/// Turn per-input time steps into absolute timestamps, starting at 0.
+fn stamps(deltas: Vec<i64>) -> Vec<Millis> {
+    let mut at = 0;
+    deltas
+        .into_iter()
+        .map(|d| {
+            at += d;
+            at
+        })
+        .collect()
+}
+
+/// Inputs with non-decreasing timestamps (time only moves forward) — what
+/// the store hands the fold, since core stamps every input on receipt.
 fn inputs() -> impl Strategy<Value = Vec<DeploymentInput>> {
-    prop::collection::vec(0i64..40, 0..40).prop_flat_map(|deltas| {
-        let mut at = 0;
-        let stamps: Vec<Millis> = deltas
-            .into_iter()
-            .map(|d| {
-                at += d;
-                at
-            })
-            .collect();
-        stamps.into_iter().map(input_at).collect::<Vec<_>>()
-    })
+    prop::collection::vec(0i64..40, 0..40)
+        .prop_flat_map(|deltas| stamps(deltas).into_iter().map(input_at).collect::<Vec<_>>())
+}
+
+/// Inputs whose timestamps may go backwards — a source's clock behind core's,
+/// or an input that slipped past the store's stamp. The fold must clamp them
+/// rather than trust them, and every invariant must still hold.
+fn backdated_inputs() -> impl Strategy<Value = Vec<DeploymentInput>> {
+    prop::collection::vec(-40i64..40, 0..40)
+        .prop_flat_map(|deltas| stamps(deltas).into_iter().map(input_at).collect::<Vec<_>>())
 }
 
 fn targets(ledger: &DeploymentLedger) -> Vec<DeploymentTarget> {
@@ -118,229 +133,471 @@ fn targets(ledger: &DeploymentLedger) -> Vec<DeploymentTarget> {
     ts
 }
 
-/// Fold `inputs`, calling `check` on the ledger after every one.
+/// Core's "now" as each input is folded: the latest time seen so far. Equal to
+/// each input's own time when they never go backwards; for backdated inputs it
+/// is the time the fold clamps them up to — so a reader asking "as of now"
+/// never asks about a moment before one the fold already decided on.
+fn core_now(inputs: &[DeploymentInput]) -> Vec<Millis> {
+    let mut now = Millis::MIN;
+    inputs
+        .iter()
+        .map(|i| {
+            now = now.max(i.at());
+            now
+        })
+        .collect()
+}
+
+/// Fold `inputs`, calling `check` on the ledger after every one with core's
+/// "now".
 fn fold_checking(inputs: &[DeploymentInput], mut check: impl FnMut(&DeploymentLedger, Millis)) {
     let mut ledger = DeploymentLedger::new();
-    for input in inputs {
-        let now = input.at();
+    for (input, now) in inputs.iter().zip(core_now(inputs)) {
         ledger.apply(input.clone());
         check(&ledger, now);
+    }
+}
+
+// ---- the invariants, each checked after every input ------------------------
+
+/// INV-DEP-1: at most one live Deployment per target.
+fn check_inv_dep_1(inputs: &[DeploymentInput]) {
+    fold_checking(inputs, |ledger, now| {
+        for t in targets(ledger) {
+            let live = ledger
+                .deployments()
+                .iter()
+                .filter(|d| d.target == t && d.status(now, DEADLINE) == DeploymentStatus::Live)
+                .count();
+            assert!(live <= 1, "{live} live deployments on {t:?}");
+        }
+    });
+}
+
+/// INV-DEP-2: superseded is absorbing — status and reports never change again
+/// (a late request may still add itself as a requester).
+fn check_inv_dep_2(inputs: &[DeploymentInput], later: Millis) {
+    let mut frozen: Vec<Deployment> = Vec::new();
+    fold_checking(inputs, |ledger, now| {
+        for f in &frozen {
+            let d = ledger.get(f.id).expect("deployments are never removed");
+            assert_eq!(d.reports, f.reports, "a superseded deployment changed");
+            assert_eq!(d.superseded_at, f.superseded_at);
+            assert_eq!(
+                d.status(now + later, DEADLINE),
+                DeploymentStatus::Superseded
+            );
+        }
+        frozen = ledger
+            .deployments()
+            .iter()
+            .filter(|d| d.status(now, DEADLINE) == DeploymentStatus::Superseded)
+            .cloned()
+            .collect();
+    });
+}
+
+/// INV-DEP-3: the newest Deployment on a target is never superseded.
+fn check_inv_dep_3(inputs: &[DeploymentInput]) {
+    fold_checking(inputs, |ledger, now| {
+        for t in targets(ledger) {
+            let newest = ledger.newest_on(&t).unwrap();
+            assert_ne!(newest.status(now, DEADLINE), DeploymentStatus::Superseded);
+        }
+    });
+}
+
+/// INV-DEP-4: at most one non-superseded Deployment per (target, version).
+fn check_inv_dep_4(inputs: &[DeploymentInput]) {
+    fold_checking(inputs, |ledger, now| {
+        let mut open: Vec<_> = ledger
+            .deployments()
+            .iter()
+            .filter(|d| d.status(now, DEADLINE) != DeploymentStatus::Superseded)
+            .map(|d| (d.target.clone(), d.version.clone()))
+            .collect();
+        let n = open.len();
+        open.sort();
+        open.dedup();
+        assert_eq!(open.len(), n, "two open deployments share a key");
+    });
+}
+
+/// INV-DEP-5: an open Deployment other than the newest is live, so at most two
+/// are open per target.
+fn check_inv_dep_5(inputs: &[DeploymentInput]) {
+    fold_checking(inputs, |ledger, now| {
+        for t in targets(ledger) {
+            let newest = ledger.newest_on(&t).unwrap().id;
+            let open: Vec<_> = ledger
+                .deployments()
+                .iter()
+                .filter(|d| {
+                    d.target == t && d.status(now, DEADLINE) != DeploymentStatus::Superseded
+                })
+                .collect();
+            assert!(open.len() <= 2, "{} open deployments on {t:?}", open.len());
+            for d in open {
+                assert!(
+                    d.id == newest || d.latest_report() == Some(SourceAssertedStatus::Live),
+                    "{:?} is open, not newest, and not live",
+                    d.id
+                );
+            }
+        }
+    });
+}
+
+/// INV-DEP-7: stalled only past the deadline, and only while the latest report
+/// is neither live nor failed.
+fn check_inv_dep_7(inputs: &[DeploymentInput], probe: Millis) {
+    fold_checking(inputs, |ledger, now| {
+        let at = now + probe;
+        for d in ledger.deployments() {
+            if d.status(at, DEADLINE) == DeploymentStatus::Stalled {
+                assert!(at - d.stall_clock_from >= DEADLINE);
+                assert!(!matches!(
+                    d.latest_report(),
+                    Some(SourceAssertedStatus::Live | SourceAssertedStatus::Failed)
+                ));
+            }
+        }
+    });
+}
+
+/// INV-DEP-8: no input is lost — each lands on exactly one Deployment with its
+/// key. A report is matched on everything but its time, which the fold may
+/// have clamped.
+fn check_inv_dep_8(inputs: &[DeploymentInput]) {
+    let mut ledger = DeploymentLedger::new();
+    for input in inputs {
+        let id = ledger.apply(input.clone());
+        let d = ledger.get(id).unwrap();
+        assert_eq!(&d.target, input.target());
+        assert_eq!(&d.version, input.version());
+        match input {
+            DeploymentInput::Request { requester, .. } => {
+                assert!(d.requesters.contains_key(requester))
+            }
+            DeploymentInput::Report { report, .. } => {
+                let landed = d.reports.last().unwrap();
+                assert_eq!(
+                    (landed.status, &landed.label, &landed.link),
+                    (report.status, &report.label, &report.link)
+                );
+                assert!(landed.at >= report.at, "a report's time was lowered");
+            }
+        }
+    }
+    let reports: usize = ledger.deployments().iter().map(|d| d.reports.len()).sum();
+    let expected = inputs
+        .iter()
+        .filter(|i| matches!(i, DeploymentInput::Report { .. }))
+        .count();
+    assert_eq!(reports, expected);
+}
+
+/// INV-DEP-9 and INV-DEP-10: every DeploymentGate looks only forward from its
+/// request's effective time, and its verdict never changes once reached.
+fn check_inv_dep_9_10(inputs: &[DeploymentInput], probe: Millis) {
+    let mut ledger = DeploymentLedger::new();
+    // (deployment, requester, effective_at, first verdict seen). A step that
+    // requests again is a new attempt with a new gate, so it replaces its own
+    // earlier entry.
+    type Gate = (
+        DeploymentId,
+        DeploymentRequester,
+        Millis,
+        Option<DeploymentGateVerdict>,
+    );
+    let mut gates: Vec<Gate> = Vec::new();
+    for (input, now) in inputs.iter().zip(core_now(inputs)) {
+        let id = ledger.apply(input.clone());
+        if let DeploymentInput::Request {
+            requester,
+            effective_at,
+            ..
+        } = input
+        {
+            gates.retain(|(_, r, _, _)| r != requester);
+            gates.push((id, requester.clone(), *effective_at, None));
+        }
+        for (id, requester, effective_at, seen) in gates.iter_mut() {
+            let d = ledger.get(*id).unwrap();
+            let Some(v) = d.gate_verdict(requester, now, DEADLINE) else {
+                assert!(seen.is_none(), "a verdict was withdrawn");
+                continue;
+            };
+            if let Some(first) = seen {
+                assert_eq!(*first, v, "a gate verdict changed");
+            }
+            *seen = Some(v);
+            match v {
+                DeploymentGateVerdict::Passed { at } => {
+                    assert!(at >= *effective_at);
+                    assert!(d
+                        .reports
+                        .iter()
+                        .any(|r| r.status == SourceAssertedStatus::Live && r.at <= at));
+                }
+                DeploymentGateVerdict::Failed {
+                    reason: DeploymentGateFailure::Failed,
+                    at,
+                } => {
+                    assert!(d
+                        .reports
+                        .iter()
+                        .any(|r| r.status == SourceAssertedStatus::Failed
+                            && r.at == at
+                            && r.at >= *effective_at));
+                }
+                DeploymentGateVerdict::Failed {
+                    reason: DeploymentGateFailure::Stalled,
+                    at,
+                } => {
+                    assert_eq!(at, *effective_at + DEADLINE);
+                    assert!(now >= at);
+                }
+                DeploymentGateVerdict::Failed {
+                    reason: DeploymentGateFailure::Superseded,
+                    ..
+                } => {
+                    assert!(d.superseded_at.is_some());
+                }
+            }
+        }
+    }
+    // Looking further into the future never withdraws or changes one.
+    let end = core_now(inputs).last().copied().unwrap_or(0);
+    for (id, requester, _, seen) in &gates {
+        let later = ledger
+            .get(*id)
+            .unwrap()
+            .gate_verdict(requester, end + probe, DEADLINE);
+        if let Some(first) = seen {
+            assert_eq!(later, Some(*first));
+        }
+    }
+}
+
+/// INV-DEP-11: a request never creates a Deployment when its key's newest
+/// Deployment was first seen at or after the request's effective time.
+fn check_inv_dep_11(inputs: &[DeploymentInput]) {
+    let mut ledger = DeploymentLedger::new();
+    for input in inputs {
+        let before = ledger.deployments().len();
+        let seen_after = match input {
+            DeploymentInput::Request {
+                target,
+                version,
+                effective_at,
+                ..
+            } => ledger
+                .deployments()
+                .iter()
+                .rev()
+                .find(|d| &d.target == target && &d.version == version)
+                .filter(|d| d.created_at >= *effective_at)
+                .map(|d| d.id),
+            DeploymentInput::Report { .. } => None,
+        };
+        let id = ledger.apply(input.clone());
+        if let Some(existing) = seen_after {
+            assert_eq!(id, existing);
+            assert_eq!(ledger.deployments().len(), before);
+        }
+    }
+}
+
+/// INV-DEP-12: a claim never explains a Deployment, and nothing un-explains
+/// one. Checked against an independent statement of the rule: a Deployment a
+/// request created is explained; one a report created is explained exactly
+/// when some requester is not a claim; and a request is a claim exactly when
+/// it lands on a report-created Deployment after core first saw it, unless
+/// that same requester had already explained it.
+fn check_inv_dep_12(inputs: &[DeploymentInput]) {
+    let mut ledger = DeploymentLedger::new();
+    // Indexed by DeploymentId (a ledger position).
+    let mut created_by_report: Vec<bool> = Vec::new();
+    let mut was_explained: Vec<bool> = Vec::new();
+    for input in inputs {
+        let before = ledger.deployments().len();
+        let prior_mark = match input {
+            DeploymentInput::Request {
+                target,
+                version,
+                requester,
+                ..
+            } => ledger
+                .deployments()
+                .iter()
+                .rev()
+                .find(|d| &d.target == target && &d.version == version)
+                .and_then(|d| d.requesters.get(requester).map(|m| (d.id, *m))),
+            DeploymentInput::Report { .. } => None,
+        };
+        let id = ledger.apply(input.clone());
+        if ledger.deployments().len() > before {
+            created_by_report.push(matches!(input, DeploymentInput::Report { .. }));
+            was_explained.push(false);
+        }
+        if let DeploymentInput::Request {
+            requester,
+            effective_at,
+            ..
+        } = input
+        {
+            let d = ledger.get(id).unwrap();
+            let mark = d.requesters[requester];
+            let already_explained_by_it = prior_mark.is_some_and(|(on, m)| on == id && !m.claim);
+            let expected_claim = created_by_report[id.0 as usize]
+                && *effective_at > d.created_at
+                && !already_explained_by_it;
+            assert_eq!(mark.claim, expected_claim, "claim flag for {requester:?}");
+            if mark.claim {
+                assert_eq!(
+                    !d.is_unexplained(),
+                    was_explained[id.0 as usize],
+                    "a claim changed whether {id:?} is explained"
+                );
+            }
+        }
+        for d in ledger.deployments() {
+            let i = d.id.0 as usize;
+            let explained = !d.is_unexplained();
+            assert!(
+                explained || !was_explained[i],
+                "{:?} was un-explained",
+                d.id
+            );
+            if created_by_report[i] {
+                assert_eq!(explained, d.requesters.values().any(|m| !m.claim));
+            } else {
+                assert!(explained, "a request-created {:?} is unexplained", d.id);
+            }
+            was_explained[i] = explained;
+        }
     }
 }
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
 
-    /// INV-DEP-1: at most one live Deployment per target.
     #[test]
     fn inv_dep_1_at_most_one_live_per_target(inputs in inputs()) {
-        fold_checking(&inputs, |ledger, now| {
-            for t in targets(ledger) {
-                let live = ledger
-                    .deployments()
-                    .iter()
-                    .filter(|d| d.target == t && d.status(now, DEADLINE) == DeploymentStatus::Live)
-                    .count();
-                assert!(live <= 1, "{live} live deployments on {t:?}");
-            }
-        });
+        check_inv_dep_1(&inputs);
     }
 
-    /// INV-DEP-2: superseded is absorbing — status and reports never change
-    /// again (a late request may still add itself as a requester).
     #[test]
     fn inv_dep_2_superseded_is_absorbing(inputs in inputs(), later in 0i64..1000) {
-        let mut frozen: Vec<Deployment> = Vec::new();
-        fold_checking(&inputs, |ledger, now| {
-            for f in &frozen {
-                let d = ledger.get(f.id).expect("deployments are never removed");
-                assert_eq!(d.reports, f.reports, "a superseded deployment changed");
-                assert_eq!(d.superseded_at, f.superseded_at);
-                assert_eq!(d.status(now + later, DEADLINE), DeploymentStatus::Superseded);
-            }
-            frozen = ledger
-                .deployments()
-                .iter()
-                .filter(|d| d.status(now, DEADLINE) == DeploymentStatus::Superseded)
-                .cloned()
-                .collect();
-        });
+        check_inv_dep_2(&inputs, later);
     }
 
-    /// INV-DEP-3: the newest Deployment on a target is never superseded.
     #[test]
     fn inv_dep_3_newest_is_never_superseded(inputs in inputs()) {
-        fold_checking(&inputs, |ledger, now| {
-            for t in targets(ledger) {
-                let newest = ledger.newest_on(&t).unwrap();
-                assert_ne!(newest.status(now, DEADLINE), DeploymentStatus::Superseded);
-            }
-        });
+        check_inv_dep_3(&inputs);
     }
 
-    /// INV-DEP-4: at most one non-superseded Deployment per
-    /// (target, version).
     #[test]
     fn inv_dep_4_one_open_deployment_per_key(inputs in inputs()) {
-        fold_checking(&inputs, |ledger, now| {
-            let mut open: Vec<_> = ledger
-                .deployments()
-                .iter()
-                .filter(|d| d.status(now, DEADLINE) != DeploymentStatus::Superseded)
-                .map(|d| (d.target.clone(), d.version.clone()))
-                .collect();
-            let n = open.len();
-            open.sort();
-            open.dedup();
-            assert_eq!(open.len(), n, "two open deployments share a key");
-        });
+        check_inv_dep_4(&inputs);
     }
 
-    /// INV-DEP-5: an open Deployment other than the newest is live, so at
-    /// most two are open per target.
     #[test]
     fn inv_dep_5_open_deployments_are_newest_or_live(inputs in inputs()) {
-        fold_checking(&inputs, |ledger, now| {
-            for t in targets(ledger) {
-                let newest = ledger.newest_on(&t).unwrap().id;
-                let open: Vec<_> = ledger
-                    .deployments()
-                    .iter()
-                    .filter(|d| d.target == t && d.status(now, DEADLINE) != DeploymentStatus::Superseded)
-                    .collect();
-                assert!(open.len() <= 2, "{} open deployments on {t:?}", open.len());
-                for d in open {
-                    assert!(
-                        d.id == newest || d.latest_report() == Some(SourceAssertedStatus::Live),
-                        "{:?} is open, not newest, and not live",
-                        d.id
-                    );
-                }
-            }
-        });
+        check_inv_dep_5(&inputs);
     }
 
-    /// INV-DEP-7: stalled only past the deadline, and only while the latest
-    /// report is neither live nor failed.
     #[test]
     fn inv_dep_7_stalled_only_past_deadline(inputs in inputs(), probe in 0i64..300) {
-        fold_checking(&inputs, |ledger, now| {
-            let at = now + probe;
-            for d in ledger.deployments() {
-                if d.status(at, DEADLINE) == DeploymentStatus::Stalled {
-                    assert!(at - d.stall_clock_from >= DEADLINE);
-                    assert!(!matches!(
-                        d.latest_report(),
-                        Some(SourceAssertedStatus::Live | SourceAssertedStatus::Failed)
-                    ));
-                }
-            }
-        });
+        check_inv_dep_7(&inputs, probe);
     }
 
-    /// INV-DEP-8: no input is lost — each lands on exactly one Deployment
-    /// with its key.
     #[test]
     fn inv_dep_8_no_input_is_lost(inputs in inputs()) {
-        let mut ledger = DeploymentLedger::new();
-        for input in &inputs {
-            let id = ledger.apply(input.clone());
-            let d = ledger.get(id).unwrap();
-            assert_eq!(&d.target, input.target());
-            assert_eq!(&d.version, input.version());
-            match input {
-                DeploymentInput::Request { requester, .. } => assert!(d.requesters.contains_key(requester)),
-                DeploymentInput::Report { report, .. } => assert_eq!(d.reports.last(), Some(report)),
-            }
-        }
-        let reports: usize = ledger.deployments().iter().map(|d| d.reports.len()).sum();
-        let expected = inputs
-            .iter()
-            .filter(|i| matches!(i, DeploymentInput::Report { .. }))
-            .count();
-        assert_eq!(reports, expected);
+        check_inv_dep_8(&inputs);
     }
 
-    /// INV-DEP-9 and INV-DEP-10: every DeploymentGate looks only forward from
-    /// its request's effective time, and its verdict never changes once
-    /// reached.
     #[test]
     fn inv_dep_9_10_gates_look_forward_and_freeze(inputs in inputs(), probe in 0i64..300) {
-        let mut ledger = DeploymentLedger::new();
-        // (deployment, requester, effective_at, first verdict seen). A step
-        // that requests again is a new attempt with a new gate, so it replaces
-        // its own earlier entry.
-        type Gate = (DeploymentId, DeploymentRequester, Millis, Option<DeploymentGateVerdict>);
-        let mut gates: Vec<Gate> = Vec::new();
-        for input in &inputs {
-            let id = ledger.apply(input.clone());
-            if let DeploymentInput::Request { requester, effective_at, .. } = input {
-                gates.retain(|(_, r, _, _)| r != requester);
-                gates.push((id, requester.clone(), *effective_at, None));
-            }
-            let now = input.at();
-            for (id, requester, effective_at, seen) in gates.iter_mut() {
-                let d = ledger.get(*id).unwrap();
-                let Some(v) = d.gate_verdict(requester, now, DEADLINE) else {
-                    assert!(seen.is_none(), "a verdict was withdrawn");
-                    continue;
-                };
-                if let Some(first) = seen {
-                    assert_eq!(*first, v, "a gate verdict changed");
-                }
-                *seen = Some(v);
-                match v {
-                    DeploymentGateVerdict::Passed { at } => {
-                        assert!(at >= *effective_at);
-                        assert!(d.reports.iter().any(|r| r.status == SourceAssertedStatus::Live && r.at <= at));
-                    }
-                    DeploymentGateVerdict::Failed { reason: DeploymentGateFailure::Failed, at } => {
-                        assert!(d.reports.iter().any(|r| r.status == SourceAssertedStatus::Failed
-                            && r.at == at && r.at >= *effective_at));
-                    }
-                    DeploymentGateVerdict::Failed { reason: DeploymentGateFailure::Stalled, at } => {
-                        assert_eq!(at, *effective_at + DEADLINE);
-                        assert!(now >= at);
-                    }
-                    DeploymentGateVerdict::Failed { reason: DeploymentGateFailure::Superseded, .. } => {
-                        assert!(d.superseded_at.is_some());
-                    }
-                }
-            }
-        }
-        // Looking further into the future never withdraws or changes one.
-        let end = inputs.last().map_or(0, |i| i.at());
-        for (id, requester, _, seen) in &gates {
-            let later = ledger.get(*id).unwrap().gate_verdict(requester, end + probe, DEADLINE);
-            if let Some(first) = seen {
-                assert_eq!(later, Some(*first));
-            }
-        }
+        check_inv_dep_9_10(&inputs, probe);
     }
 
-    /// INV-DEP-11: a request never creates a Deployment when its key's newest
-    /// Deployment was first seen at or after the request's effective time.
     #[test]
     fn inv_dep_11_a_late_request_joins_rather_than_rolls_back(inputs in inputs()) {
-        let mut ledger = DeploymentLedger::new();
-        for input in &inputs {
-            let before = ledger.deployments().len();
-            let seen_after = match input {
-                DeploymentInput::Request { target, version, effective_at, .. } => ledger
-                    .deployments()
-                    .iter()
-                    .rev()
-                    .find(|d| &d.target == target && &d.version == version)
-                    .filter(|d| d.created_at >= *effective_at)
-                    .map(|d| d.id),
-                DeploymentInput::Report { .. } => None,
-            };
-            let id = ledger.apply(input.clone());
-            if let Some(existing) = seen_after {
-                assert_eq!(id, existing);
-                assert_eq!(ledger.deployments().len(), before);
+        check_inv_dep_11(&inputs);
+    }
+
+    #[test]
+    fn inv_dep_12_a_claim_never_explains(inputs in inputs()) {
+        check_inv_dep_12(&inputs);
+    }
+
+    /// The fold's clamp, end to end: inputs whose times go backwards still
+    /// keep every invariant, judged at core's "now" (the latest time seen).
+    /// INV-DEP-6 is the type system's.
+    #[test]
+    fn backdated_inputs_keep_every_invariant_after_the_clamp(
+        inputs in backdated_inputs(),
+        later in 0i64..1000,
+        probe in 0i64..300,
+    ) {
+        check_inv_dep_1(&inputs);
+        check_inv_dep_2(&inputs, later);
+        check_inv_dep_3(&inputs);
+        check_inv_dep_4(&inputs);
+        check_inv_dep_5(&inputs);
+        check_inv_dep_7(&inputs, probe);
+        check_inv_dep_8(&inputs);
+        check_inv_dep_9_10(&inputs, probe);
+        check_inv_dep_11(&inputs);
+        check_inv_dep_12(&inputs);
+    }
+
+    /// A Deployment's public id is the seq of the input that created it, so
+    /// folding one DeploymentTarget's slice of the log must give the same
+    /// Deployments — whole views, not just ids — and the same board row as
+    /// folding the whole Environment. Holds for logs in receipt order (what
+    /// the store returns); a backdated input on another target would raise the
+    /// fold's clamp floor in one fold and not the other.
+    #[test]
+    fn a_targets_slice_folds_to_the_same_views_as_the_environment(
+        inputs in inputs(),
+        gaps in prop::collection::vec(1u64..4, 40),
+        probe in 0i64..300,
+    ) {
+        let mut seq = 0;
+        let log: Vec<LoggedDeploymentInput> = inputs
+            .into_iter()
+            .zip(gaps)
+            .map(|(input, gap)| {
+                // Sparse, like a real Org's log shared with other Environments.
+                seq += gap;
+                let report_source_at = match &input {
+                    DeploymentInput::Report { report, .. } => Some(report.at - 3),
+                    DeploymentInput::Request { .. } => None,
+                };
+                LoggedDeploymentInput { seq, input, report_source_at }
+            })
+            .collect();
+        let now = log.last().map_or(0, |l| l.input.at()) + probe;
+        let whole = fold_environment(&log, now, DEADLINE);
+        let mut sliced_total = 0;
+        for target in ["api", "worker"] {
+            let slice: Vec<_> = log
+                .iter()
+                .filter(|l| l.input.target().id == target)
+                .cloned()
+                .collect();
+            let sliced = fold_environment(&slice, now, DEADLINE);
+            sliced_total += sliced.deployments.len();
+            for view in &sliced.deployments {
+                prop_assert_eq!(Some(view), whole.get(view.id));
             }
+            let whole_rows: Vec<_> = whole.board.iter().filter(|r| r.target.id == target).collect();
+            prop_assert_eq!(sliced.board.iter().collect::<Vec<_>>(), whole_rows);
         }
+        prop_assert_eq!(sliced_total, whole.deployments.len());
     }
 }
 
