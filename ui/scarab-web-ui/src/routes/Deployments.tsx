@@ -24,6 +24,7 @@ import { A, useSearchParams } from "@solidjs/router";
 import {
   DeploymentsForbiddenError,
   getEnvironmentBoard,
+  listDeploymentTargets,
   listEnvironmentDeployments,
   listOrgEnvironments,
   listProjects,
@@ -44,6 +45,7 @@ import {
   targetLabel,
 } from "../deployments";
 import { envPills } from "../org-environments";
+import { targetKey, targetOwners } from "../plugins";
 import StatusBadge from "../components/StatusBadge";
 import Icon from "../components/Icon";
 import Doodle from "../components/Doodle";
@@ -66,6 +68,23 @@ export default function Deployments() {
 
   const [board] = createResource(org, (o) => getEnvironmentBoard(o));
   const groups = createMemo(() => groupBoard(board() ?? []));
+
+  // Each target's owners, as its source last reported them (ADR-0072). Best
+  // effort: a 403/404 (or any failure) just leaves the owners line off.
+  const [owners] = createResource(
+    () => {
+      const envs = groups().map((g) => g.environment);
+      return org() && envs.length > 0 ? { org: org()!, envs } : false;
+    },
+    async (k) => {
+      const lists = await Promise.all(
+        k.envs.map((e) => listDeploymentTargets(k.org, e).catch(() => null)),
+      );
+      return new Map(k.envs.map((e, i) => [e, targetOwners(lists[i] ?? [])]));
+    },
+  );
+  const ownersOf = (env: string, source: string, id: string) =>
+    owners()?.get(env)?.get(targetKey(source, id));
 
   /** The Environment whose Deployments are listed: `?env=`, else the first
    *  on the board, else the first registered one. */
@@ -162,7 +181,21 @@ export default function Deployments() {
                                   onClick={() => pickEnv(g.environment)}
                                   title={`Show ${g.environment}'s deployments`}
                                 >
-                                  <td class="mono dep-target">{targetLabel(row.target)}</td>
+                                  <td>
+                                    <span class="mono dep-target">{targetLabel(row.target)}</span>
+                                    <Show
+                                      when={ownersOf(g.environment, row.target.source, row.target.id)}
+                                    >
+                                      {(o) => (
+                                        <div
+                                          class="dep-owners mono"
+                                          title="The projects that own this target, as its source last reported"
+                                        >
+                                          owners: {o().join(", ")}
+                                        </div>
+                                      )}
+                                    </Show>
+                                  </td>
                                   <td>
                                     <Show
                                       when={row.live}

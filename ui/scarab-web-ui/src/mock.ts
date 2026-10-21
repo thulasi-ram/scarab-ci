@@ -22,6 +22,10 @@ type ServiceStatusDto = components["schemas"]["ServiceStatusDto"];
 type DeploymentDto = components["schemas"]["DeploymentDto"];
 type BoardRowDto = components["schemas"]["EnvironmentBoardRowDto"];
 type OrgEnvironmentDto = components["schemas"]["OrgEnvironmentDto"];
+type PluginCatalogEntryDto = components["schemas"]["PluginCatalogEntryDto"];
+type PluginInstallationDto = components["schemas"]["PluginInstallationDto"];
+type UnmappedGroupingDto = components["schemas"]["UnmappedGroupingDto"];
+type DeploymentSourceTargetDto = components["schemas"]["DeploymentSourceTargetDto"];
 
 const now = Date.now();
 const ago = (ms: number) => now - ms;
@@ -647,6 +651,131 @@ const orgEnvironments: OrgEnvironmentDto[] = [
   },
 ];
 
+// ── Plugins (ADR-0072) — Settings › Plugins, the Environment dialog's
+// installation picker, and the board's owners line. Consistent with the
+// org Environments above: `argocd` is running and feeds production + qa;
+// `argocd-us` (production's second source) is killed. `argocd` also reports
+// on two groupings no Environment lists. Writes echo a record and persist
+// nothing.
+const ARGOCD_REPO = "ghcr.io/thulasi-ram/scarab-plugin-argocd";
+const argocdManifest: PluginCatalogEntryDto["manifest"] = {
+  plugin: "argocd",
+  capabilities: ["report_deployments", "use_connection"],
+  connections: [
+    {
+      name: "argocd",
+      auth_schemes: ["bearer"],
+      read_rules: [
+        { method: "GET", path: "/api/version" },
+        { method: "GET", path: "/api/v1/applications" },
+        { method: "GET", path: "/api/v1/applications/*" },
+        { method: "GET", path: "/api/v1/applications/*/managed-resources" },
+        { method: "GET", path: "/api/v1/stream/applications" },
+      ],
+    },
+  ],
+  config_keys: ["ARGOCD_UI_URL", "OWNER_ANNOTATION"],
+};
+const pluginCatalog: PluginCatalogEntryDto[] = [
+  {
+    plugin: "argocd",
+    description:
+      "Reports Argo CD Application syncs into the Deployment record (first-party; ADR-0070 §11's reference reporter).",
+    image_repository: ARGOCD_REPO,
+    manifest: argocdManifest,
+    first_party: true,
+  },
+];
+const pluginInstallation = (
+  name: string,
+  digest: string,
+  o: Partial<PluginInstallationDto>,
+): PluginInstallationDto => ({
+  id: name === "argocd" ? "4f2a1c9e7b" : "9c0d33a1e5",
+  org: "acme",
+  name,
+  plugin: "argocd",
+  principal: `plugin:${name}`,
+  image: `${ARGOCD_REPO}@sha256:${digest.padEnd(64, "0")}`,
+  manifest_sha256: "b7e3".padEnd(64, "9"),
+  config: { ARGOCD_UI_URL: "https://argocd.acme.example" },
+  state: "enabled",
+  runtime_status: "running",
+  runtime_message: "",
+  probe_passed_at: ago(6 * 60 * min),
+  approved_by: "a.kim",
+  approved_at: ago(12 * 24 * 60 * min),
+  killed_at: null,
+  killed_by: null,
+  manifest: argocdManifest,
+  deployment_sources: [],
+  ...o,
+});
+const plugins: PluginInstallationDto[] = [
+  pluginInstallation("argocd", "4f2a1c9e7b3d", {
+    runtime_message: "watching 6 applications",
+    deployment_sources: [
+      { environment: "production", vendor_grouping: "production" },
+      { environment: "qa", vendor_grouping: "qa" },
+    ],
+  }),
+  pluginInstallation("argocd-us", "d81e6b02c4aa", {
+    state: "killed",
+    runtime_status: "stopped",
+    runtime_message: "scaled to zero by the kill switch",
+    killed_by: "j.lee",
+    killed_at: ago(90 * min),
+    approved_at: ago(5 * 24 * 60 * min),
+    deployment_sources: [{ environment: "production", vendor_grouping: "production" }],
+  }),
+];
+const unmappedGroupings: Record<string, UnmappedGroupingDto[]> = {
+  argocd: [
+    {
+      vendor_grouping: "staging",
+      reports: 14,
+      first_at: ago(3 * 24 * 60 * min),
+      last_at: ago(25 * min),
+      last_target_id: "orders-api",
+    },
+    {
+      vendor_grouping: "preview",
+      reports: 2,
+      first_at: ago(5 * 60 * min),
+      last_at: ago(4 * 60 * min),
+      last_target_id: "pr-218-web",
+    },
+  ],
+};
+const sourceTarget = (
+  environment: string,
+  target_id: string,
+  owner_projects: string[],
+  last_version: string,
+): DeploymentSourceTargetDto & { environment: string } => ({
+  environment,
+  source: "argocd",
+  principal: "plugin:argocd",
+  target_id,
+  vendor_grouping: environment,
+  version_scheme: "git-sha",
+  owner_projects,
+  owners_reported_at: owner_projects.length ? ago(6 * 60 * min) : null,
+  last_version,
+  last_status: "live",
+  last_label: "Healthy · Synced",
+  last_sequence: 42,
+  updated_at: ago(36 * min),
+});
+const deploymentTargets = [
+  sourceTarget("production", "orders-api", ["acme/orders-api"], "sha-4f2a1c9"),
+  sourceTarget("production", "edge-gateway", ["acme/edge-gateway", "acme/platform"], "sha-9c0ffee"),
+  sourceTarget("production", "inventory-svc", ["acme/inventory"], "sha-5d5d5d5"),
+  // messaging is absent: it is Unconfirmed on the board — its source has
+  // never reported on it — so there is no target row and no owners line.
+  sourceTarget("staging", "orders-api", ["acme/orders-api"], "sha-4f2a1c9"),
+];
+
 const secretNames = { names: ["GHCR_TOKEN", "DATABASE_URL", "SLACK_WEBHOOK_URL"] };
 // Org scope (no `repo=`) holds the org-wide base of the inheritance chain — the
 // Settings page's Org Secrets section (ADR-0060).
@@ -909,6 +1038,49 @@ function route(pathname: string, search: string, method: string): Response | nul
       );
     }
     return found ? json(found) : new Response("not found", { status: 404 });
+  }
+
+  // Plugins (ADR-0072): catalog, installations, kill/enable, uninstall,
+  // unmapped groupings, and an Environment's reported targets + owners.
+  if (/^\/v1\/orgs\/[^/]+\/plugin-catalog$/.test(p)) return json(pluginCatalog);
+  if (/^\/v1\/orgs\/[^/]+\/plugins$/.test(p)) {
+    if (method === "POST") {
+      // The body is not visible here; echo a fresh, still-pending install.
+      return json(
+        pluginInstallation("argocd-staging", "0a1b2c3d4e5f", {
+          id: "1d2e3f4a5b",
+          state: "enabled",
+          runtime_status: "pending",
+          runtime_message: "",
+          probe_passed_at: null,
+          approved_at: now,
+          deployment_sources: [],
+        }),
+        { status: 201 },
+      );
+    }
+    return json(plugins);
+  }
+  if ((m = p.match(/^\/v1\/orgs\/[^/]+\/plugins\/([^/]+)(?:\/(kill|enable|unmapped-groupings))?$/))) {
+    const found = plugins.find((x) => x.name === decodeURIComponent(m![1]!));
+    if (!found) return new Response("no such installation", { status: 404 });
+    if (m[2] === "unmapped-groupings") return json(unmappedGroupings[found.name] ?? []);
+    if (m[2] === "kill") {
+      return json({ ...found, state: "killed", runtime_status: "stopped", killed_by: "a.kim", killed_at: now });
+    }
+    if (m[2] === "enable") {
+      return json({ ...found, state: "enabled", runtime_status: "pending", killed_by: null, killed_at: null });
+    }
+    if (method === "DELETE") {
+      return json({ name: found.name, removed_deployment_sources: found.deployment_sources });
+    }
+    return json(found);
+  }
+  if ((m = p.match(/^\/v1\/orgs\/[^/]+\/environments\/([^/]+)\/deployment-targets$/))) {
+    const env = decodeURIComponent(m[1]!);
+    return json(
+      deploymentTargets.filter((t) => t.environment === env).map(({ environment: _, ...t }) => t),
+    );
   }
 
   // Deployment record (ADR-0070): the board, an env's list, one Deployment.

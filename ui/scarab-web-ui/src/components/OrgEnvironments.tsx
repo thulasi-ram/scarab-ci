@@ -13,11 +13,16 @@
 //
 // Saving is a FULL replace (`toPutBody` always sends every field), and the
 // server's 400/409 text is shown as-is: "already reports into environment
-// `prod`" is the whole answer to why a source will not save.
+// `prod`" is the whole answer to why a source will not save. A source's
+// installation is picked from the org's installed plugins (ADR-0072) — the
+// server refuses any other — falling back to free text if they cannot be
+// listed.
 import { createResource, createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { Portal } from "solid-js/web";
 import {
   deleteOrgEnvironment,
   listOrgEnvironments,
+  listPlugins,
   putOrgEnvironment,
   type OrgEnvironment,
 } from "../api/client";
@@ -29,13 +34,14 @@ import {
   toPutBody,
   type SourceRow,
 } from "../org-environments";
+import { installationChoices } from "../plugins";
 import { relTime, absTime } from "../fmt";
 import Icon from "./Icon";
 
-export default function OrgEnvironments(props: { org: string }) {
+export default function OrgEnvironments(props: { org: string; epoch?: number }) {
   const [epoch, setEpoch] = createSignal(0);
   const [environments] = createResource(
-    () => ({ org: props.org, epoch: epoch() }),
+    () => ({ org: props.org, epoch: epoch(), outer: props.epoch }),
     (k) => listOrgEnvironments(k.org),
   );
   /** `undefined` = closed; `null` = creating; an Environment = editing it. */
@@ -121,16 +127,20 @@ export default function OrgEnvironments(props: { org: string }) {
       </div>
 
       <Show when={editing() !== undefined}>
-        <EnvironmentDialog
-          org={props.org}
-          env={editing() ?? undefined}
-          taken={rows().map((e) => e.name)}
-          onClose={() => setEditing(undefined)}
-          onSaved={() => {
-            setEditing(undefined);
-            reload();
-          }}
-        />
+        {/* Portalled, as Plugins' install dialog: in-panel, it rendered under
+            the panels after this one (each is its own stacking context). */}
+        <Portal>
+          <EnvironmentDialog
+            org={props.org}
+            env={editing() ?? undefined}
+            taken={rows().map((e) => e.name)}
+            onClose={() => setEditing(undefined)}
+            onSaved={() => {
+              setEditing(undefined);
+              reload();
+            }}
+          />
+        </Portal>
       </Show>
     </div>
   );
@@ -202,6 +212,14 @@ function EnvironmentDialog(props: {
   );
   const [saving, setSaving] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
+  // The org's installations, so a source names one that exists (the server
+  // refuses any other with a 400). If they cannot be listed — plugins not
+  // configured, or the call failed — the field falls back to free text.
+  const [installed] = createResource(
+    () => props.org,
+    (o) => listPlugins(o).catch(() => null),
+  );
+  const picker = () => (installed.loading ? null : (installed() ?? null));
 
   onMount(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -312,12 +330,30 @@ function EnvironmentDialog(props: {
               <For each={sources()}>
                 {(row, i) => (
                   <div class="oenv-row">
-                    <input
-                      class="input mono"
-                      placeholder="installation (argocd-prod)"
-                      value={row.installation}
-                      onInput={(e) => setRow(i(), { installation: e.currentTarget.value })}
-                    />
+                    <Show
+                      when={picker()}
+                      fallback={
+                        <input
+                          class="input mono"
+                          placeholder="installation (argocd-prod)"
+                          value={row.installation}
+                          onInput={(e) => setRow(i(), { installation: e.currentTarget.value })}
+                        />
+                      }
+                    >
+                      {(list) => (
+                        <select
+                          class="input mono"
+                          value={row.installation}
+                          onChange={(e) => setRow(i(), { installation: e.currentTarget.value })}
+                        >
+                          <option value="">installation…</option>
+                          <For each={installationChoices(list(), row.installation)}>
+                            {(c) => <option value={c.value}>{c.label}</option>}
+                          </For>
+                        </select>
+                      )}
+                    </Show>
                     <input
                       class="input mono"
                       placeholder="vendor grouping (Argo project)"
@@ -346,9 +382,15 @@ function EnvironmentDialog(props: {
             <p class="fieldnote">
               Which plugin installation may report into this environment, and for which of
               its groupings (an Argo CD project, say) — matched exactly. A source reports
-              into one environment only. Reports from anything not listed here will be
-              dropped once source reporting arrives.
+              into one environment only. Reports from anything not listed here are
+              dropped; Settings › Plugins lists the groupings that were.
             </p>
+            <Show when={picker()?.length === 0}>
+              <p class="fieldnote">
+                No plugins are installed in {props.org} yet — install one under Plugins below
+                before routing it here.
+              </p>
+            </Show>
           </div>
         </div>
 
