@@ -430,6 +430,68 @@ async fn a_request_stalls_once_the_deadline_has_elapsed() {
     tdb.cleanup().await;
 }
 
+/// A source's report link reaches the API only as an `http(s)` URL: sources
+/// are untrusted plugins, and a `javascript:` link rendered as an href would
+/// run on Scarab's origin. Its own Org, so it shares no counter with `seed`.
+#[tokio::test]
+async fn only_http_report_links_are_passed_on() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
+    pg.migrate().await.unwrap();
+    let clock = Arc::new(FakeClock::new(CLOCK_START_MS));
+    for link in [
+        "HTTPS://argo.example/web/ops/1",
+        "JavaScript:alert(document.cookie)",
+        "data:text/html,<script>alert(1)</script>",
+        "argo.example/no-scheme",
+    ] {
+        clock.advance(SEED_STEP_MS);
+        pg.append(
+            "links",
+            &report(
+                "prod",
+                "web",
+                "v1",
+                SourceAssertedStatus::InProgress,
+                "sync",
+                Some(link),
+            ),
+            clock.now().await.0,
+        )
+        .await
+        .unwrap();
+    }
+    let db = Arc::new(InMemoryDb::new());
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        db.clone(),
+    ));
+    let app = router(AppState::new(db, clock, logs).with_deployments(pg));
+
+    let (status, d) = get_json(&app, "/v1/orgs/links/environments/prod/deployments/1").await;
+    assert_eq!(status, StatusCode::OK);
+    let links: Vec<Value> = d["reports"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["link"].clone())
+        .collect();
+    assert_eq!(
+        links,
+        vec![
+            json!("HTTPS://argo.example/web/ops/1"),
+            Value::Null,
+            Value::Null,
+            Value::Null
+        ]
+    );
+
+    tdb.cleanup().await;
+}
+
 /// The repo-scoped legacy route keeps serving approval history, untouched by
 /// (and not feeding) the Deployment record.
 #[tokio::test]

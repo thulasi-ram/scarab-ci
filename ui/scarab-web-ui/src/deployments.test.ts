@@ -8,6 +8,7 @@ import {
   groupBoard,
   madeLiveBy,
   pickOrg,
+  safeHref,
 } from "./deployments";
 
 const dep = (over: Partial<Deployment> = {}): Deployment => ({
@@ -70,6 +71,22 @@ describe("madeLiveBy", () => {
     expect(madeLiveBy(dep({ requesters: [r("early", false), r("late", true)] })).map((x) => x.run)).toEqual([
       "early",
     ]);
+  });
+});
+
+describe("safeHref", () => {
+  it("passes http and https URLs through", () => {
+    expect(safeHref("https://argo.example/app")).toBe("https://argo.example/app");
+    expect(safeHref("HTTP://argo.example/app")).toBe("HTTP://argo.example/app");
+  });
+
+  it("refuses script-bearing and unparseable links", () => {
+    expect(safeHref("javascript:alert(1)")).toBeNull();
+    expect(safeHref(" JavaScript:alert(1)")).toBeNull();
+    expect(safeHref("data:text/html,<script>alert(1)</script>")).toBeNull();
+    expect(safeHref("argo.example/no-scheme")).toBeNull();
+    expect(safeHref(null)).toBeNull();
+    expect(safeHref(undefined)).toBeNull();
   });
 });
 

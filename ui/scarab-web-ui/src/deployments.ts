@@ -68,6 +68,20 @@ export function madeLiveBy(d: Pick<Deployment, "requesters">): DeploymentRequest
   return d.requesters.filter((r) => !r.claim);
 }
 
+/** A source's report link, usable as an href only if it parses as an
+ *  `http:`/`https:` URL; anything else (`javascript:`, `data:`, garbage) is
+ *  `null`. The server already drops other schemes — this is the second lock,
+ *  since sources are untrusted plugins and Solid does not sanitize hrefs. */
+export function safeHref(link: string | null | undefined): string | null {
+  if (!link) return null;
+  try {
+    const { protocol } = new URL(link);
+    return protocol === "http:" || protocol === "https:" ? link : null;
+  } catch {
+    return null;
+  }
+}
+
 /** The run page a requester points at, or `null` when its Project is unknown —
  *  a run URL needs `/{org}/{project}`, and guessing the project would link to
  *  the wrong repo's run page. */

@@ -1868,6 +1868,10 @@ export interface components {
             at: number;
             /** @description Free-form; shown, never interpreted. */
             label: string;
+            /**
+             * @description Where the source shows this stage. Only an `http`/`https` URL is
+             *     passed on; any other scheme reads as absent.
+             */
             link?: string | null;
             /**
              * Format: int64
