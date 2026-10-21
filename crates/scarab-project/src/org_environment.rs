@@ -26,9 +26,6 @@ pub const MIN_ENVIRONMENT_DEPLOYMENT_DEADLINE_MS: i64 = 60_000;
 /// Past that, `stalled` stops meaning anything an operator would act on.
 pub const MAX_ENVIRONMENT_DEPLOYMENT_DEADLINE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
-/// The longest OrgEnvironment name, in characters.
-pub const MAX_ORG_ENVIRONMENT_NAME_CHARS: usize = 100;
-
 /// The longest OrgEnvironment description, in characters.
 pub const MAX_ORG_ENVIRONMENT_DESCRIPTION_CHARS: usize = 1000;
 
@@ -95,7 +92,11 @@ pub struct EnvironmentDeploymentSource {
 
 impl EnvironmentDeploymentSource {
     /// Shape-check one source: the installation is a DNS-1123 label, the
-    /// vendor grouping a non-empty string with no control characters.
+    /// vendor grouping a non-empty string with no control characters and no
+    /// leading or trailing whitespace. Inner whitespace is the vendor's
+    /// business; an edge space is refused rather than kept, because it is
+    /// invisible in every form and a form that trimmed it would silently
+    /// change the routing key.
     pub fn validate(&self) -> Result<(), OrgEnvironmentError> {
         let invalid = |m: String| Err(OrgEnvironmentError::Invalid(m));
         let installation = &self.installation;
@@ -121,6 +122,12 @@ impl EnvironmentDeploymentSource {
         if grouping.chars().any(char::is_control) {
             return invalid(format!(
                 "deployment source `{installation}`'s vendor grouping contains a control character"
+            ));
+        }
+        if grouping.trim() != grouping {
+            return invalid(format!(
+                "deployment source `{installation}`'s vendor grouping `{grouping}` starts or \
+                 ends with whitespace"
             ));
         }
         Ok(())
@@ -187,27 +194,25 @@ impl OrgEnvironment {
     }
 }
 
-/// The OrgEnvironment name rule: non-empty, at most
-/// [`MAX_ORG_ENVIRONMENT_NAME_CHARS`], and no `/`, whitespace or control
-/// characters. Deliberately permissive — every name a per-Project
-/// Environment can carry today must be registrable here, or the full
-/// migration (which merges them by name, ADR-0071 §10) would strand some.
+/// The OrgEnvironment name rule: non-empty, no control characters, and not
+/// `.` or `..`. Nothing else — no length cap, and `/` and whitespace are
+/// allowed — because a pipeline's `environment:` and a per-Project
+/// Environment's name only have to be non-empty today, and every such name
+/// must be registrable here or the full migration (which merges them by
+/// name, ADR-0071 §10) would strand it. The one exception is `.` / `..`:
+/// a client normalises those path segments away, so an Environment so named
+/// could be created but never addressed again.
 pub fn validate_org_environment_name(name: &str) -> Result<(), OrgEnvironmentError> {
     let invalid = |m: String| Err(OrgEnvironmentError::Invalid(m));
     if name.is_empty() {
         return invalid("environment name must not be empty".into());
     }
-    if name.chars().count() > MAX_ORG_ENVIRONMENT_NAME_CHARS {
-        return invalid(format!(
-            "environment name is longer than {MAX_ORG_ENVIRONMENT_NAME_CHARS} characters"
-        ));
+    if name == "." || name == ".." {
+        return invalid(format!("environment name must not be `{name}`"));
     }
-    if name
-        .chars()
-        .any(|c| c == '/' || c.is_whitespace() || c.is_control())
-    {
+    if name.chars().any(char::is_control) {
         return invalid(format!(
-            "environment name `{}` must not contain `/`, whitespace or control characters",
+            "environment name `{}` must not contain control characters",
             name.escape_debug()
         ));
     }
@@ -341,7 +346,8 @@ mod tests {
     }
 
     #[test]
-    fn name_rule_admits_every_plausible_per_project_name() {
+    fn name_rule_admits_every_name_a_pipeline_can_deploy_to() {
+        let long = "x".repeat(500);
         for name in [
             "prod",
             "Prod-EU",
@@ -349,25 +355,20 @@ mod tests {
             "prod.eu-west-1",
             "ünïcode",
             "a",
+            "Production EU",
+            "prod/eu",
+            " prod",
+            "...",
+            ".prod",
+            long.as_str(),
         ] {
             assert_eq!(env(name, vec![]).validate(), Ok(()), "{name}");
         }
-        let longest = "x".repeat(MAX_ORG_ENVIRONMENT_NAME_CHARS);
-        assert_eq!(env(&longest, vec![]).validate(), Ok(()));
     }
 
     #[test]
-    fn name_rule_refuses_empty_slash_whitespace_control_and_too_long() {
-        let too_long = "x".repeat(MAX_ORG_ENVIRONMENT_NAME_CHARS + 1);
-        for name in [
-            "",
-            "prod/eu",
-            "prod eu",
-            " prod",
-            "prod\t",
-            "prod\u{0}",
-            &too_long,
-        ] {
+    fn name_rule_refuses_empty_dot_segments_and_control_characters() {
+        for name in ["", ".", "..", "prod\t", "prod\n", "prod\u{0}", "prod\u{7f}"] {
             assert!(
                 matches!(
                     env(name, vec![]).validate(),
@@ -416,7 +417,16 @@ mod tests {
             assert_eq!(source("argocd", grouping).validate(), Ok(()), "{grouping}");
         }
         let too_long = "g".repeat(MAX_VENDOR_GROUPING_CHARS + 1);
-        for grouping in ["", "prod\n", too_long.as_str()] {
+        // An edge space is refused, not trimmed: it would be an invisible
+        // second routing key.
+        for grouping in [
+            "",
+            "prod\n",
+            " prod",
+            "prod ",
+            "\u{a0}prod",
+            too_long.as_str(),
+        ] {
             assert!(
                 matches!(
                     source("argocd", grouping).validate(),

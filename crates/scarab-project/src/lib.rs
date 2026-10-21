@@ -21,8 +21,8 @@ pub use org_environment::{
     validate_org_environment_name, EnvironmentDeploymentDeadline, EnvironmentDeploymentSource,
     OrgEnvironment, OrgEnvironmentError, OrgEnvironmentStore,
     MAX_ENVIRONMENT_DEPLOYMENT_DEADLINE_MS, MAX_INSTALLATION_NAME_CHARS,
-    MAX_ORG_ENVIRONMENT_DESCRIPTION_CHARS, MAX_ORG_ENVIRONMENT_NAME_CHARS,
-    MAX_VENDOR_GROUPING_CHARS, MIN_ENVIRONMENT_DEPLOYMENT_DEADLINE_MS,
+    MAX_ORG_ENVIRONMENT_DESCRIPTION_CHARS, MAX_VENDOR_GROUPING_CHARS,
+    MIN_ENVIRONMENT_DEPLOYMENT_DEADLINE_MS,
 };
 
 /// A top-level tenant. Owns Projects. The Scarab tenancy boundary — **not**

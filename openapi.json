@@ -4384,7 +4384,7 @@
           },
           "vendor_grouping": {
             "type": "string",
-            "description": "The vendor's grouping that maps into this Environment (an Argo CD\nproject, say). Opaque; matched exactly, no wildcards."
+            "description": "The vendor's grouping that maps into this Environment (an Argo CD\nproject, say). Opaque; matched exactly, no wildcards. No leading or\ntrailing whitespace (refused, never trimmed)."
           }
         },
         "additionalProperties": false

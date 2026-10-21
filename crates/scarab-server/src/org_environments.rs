@@ -35,7 +35,8 @@ pub struct EnvironmentDeploymentSourceDto {
     /// digits, `-`; at most 63). Not yet checked against real installations.
     pub installation: String,
     /// The vendor's grouping that maps into this Environment (an Argo CD
-    /// project, say). Opaque; matched exactly, no wildcards.
+    /// project, say). Opaque; matched exactly, no wildcards. No leading or
+    /// trailing whitespace (refused, never trimmed).
     pub vendor_grouping: String,
 }
 

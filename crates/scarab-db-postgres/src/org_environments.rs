@@ -1,9 +1,15 @@
 //! [`OrgEnvironmentStore`] on Postgres (ADR-0071, migration 0054): the
 //! minimal org-level Environment and its EnvironmentDeploymentSources.
 //!
-//! A write replaces an Environment's row **and its whole source list in one
-//! transaction**, so a reader never sees half of an edit, and a source is
-//! never briefly routed nowhere (or to two places) while an admin moves it.
+//! A **write** is atomic: it replaces an Environment's row **and its whole
+//! source list in one transaction**, so no edit is ever half-stored, and a
+//! source is never briefly routed nowhere (or to two places) while an admin
+//! moves it — the routing lookup is a single statement. **Reads are not**:
+//! `get` and `list` read the row and its sources in two statements, so one
+//! racing a replace can pair the old description and deadline with the new
+//! sources. Nothing acts on that pairing — the Deployment fold reads only the
+//! deadline — so the skew is accepted rather than paid for with a
+//! transaction per read.
 //! The `(org, installation, vendor_grouping)` primary key is what keeps a
 //! source in exactly one Environment; this module only turns a collision into
 //! [`OrgEnvironmentError::DeploymentSourceTaken`] naming the holder.

@@ -1991,7 +1991,8 @@ export interface components {
             installation: string;
             /**
              * @description The vendor's grouping that maps into this Environment (an Argo CD
-             *     project, say). Opaque; matched exactly, no wildcards.
+             *     project, say). Opaque; matched exactly, no wildcards. No leading or
+             *     trailing whitespace (refused, never trimmed).
              */
             vendor_grouping: string;
         };

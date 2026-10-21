@@ -51,13 +51,16 @@ export type OrgEnvironmentLike = {
 /** A PluginInstallation name: a DNS-1123 label, as the server checks it. */
 const INSTALLATION = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
 
-/** Why `name` cannot name an Environment, or `null` if it can. Permissive on
- *  purpose (the server's rule): every per-repo Environment name must be
- *  registrable. */
+/** Why `name` cannot name an Environment, or `null` if it can — the server's
+ *  rule, checked on the name exactly as typed (never trimmed: the name is the
+ *  key Deployments use, case and spaces included). Permissive on purpose: any
+ *  name a pipeline can deploy to must be registrable, so spaces, `/` and any
+ *  length are fine. Only empty, `.`/`..` (a URL cannot address them) and
+ *  control characters are refused. */
 export function nameError(name: string): string | null {
   if (name.length === 0) return "A name is required.";
-  if ([...name].length > 100) return "Names are at most 100 characters.";
-  if (/[\/\s\u0000-\u001f\u007f]/.test(name)) return "A name cannot contain `/`, spaces or control characters.";
+  if (name === "." || name === "..") return `"${name}" cannot name an environment.`;
+  if (/[\u0000-\u001f\u007f-\u009f]/.test(name)) return "A name cannot contain control characters.";
   return null;
 }
 
@@ -74,10 +77,14 @@ export function toForm(env?: OrgEnvironmentLike): OrgEnvironmentForm {
 /**
  * The PUT body for `form`, or the first reason it cannot be sent.
  *
- * Trims every text field. A row left entirely blank is an untouched "add
- * source" row and is dropped; a row with only one half filled is an error —
- * guessing the other half would route reports somewhere nobody chose. A
- * source listed twice is an error (the server refuses it too).
+ * Trims the description and the installation. The vendor grouping is sent
+ * exactly as typed: it is an opaque routing key, so an edge space is an
+ * error (the server refuses it too) rather than silently trimmed away — a
+ * trim would rewrite the key of an Environment set up through the API. A row
+ * left entirely blank is an untouched "add source" row and is dropped; a row
+ * with only one half filled is an error — guessing the other half would route
+ * reports somewhere nobody chose. A source listed twice is an error (the
+ * server refuses it too).
  */
 export function toPutBody(
   form: OrgEnvironmentForm,
@@ -93,10 +100,16 @@ export function toPutBody(
   const seen = new Set<string>();
   for (const row of form.sources) {
     const installation = row.installation.trim();
-    const vendor_grouping = row.vendor_grouping.trim();
-    if (!installation && !vendor_grouping) continue;
+    const vendor_grouping = row.vendor_grouping;
+    const grouping_blank = vendor_grouping.trim() === "";
+    if (!installation && grouping_blank) continue;
     if (!installation) return { error: `Source "${vendor_grouping}" needs an installation.` };
-    if (!vendor_grouping) return { error: `Source "${installation}" needs a vendor grouping.` };
+    if (grouping_blank) return { error: `Source "${installation}" needs a vendor grouping.` };
+    if (vendor_grouping.trim() !== vendor_grouping) {
+      return {
+        error: `${installation}'s vendor grouping "${vendor_grouping}" starts or ends with a space — remove it; groupings are matched exactly.`,
+      };
+    }
     if (!INSTALLATION.test(installation)) {
       return {
         error: `"${installation}" is not an installation name: lowercase letters, digits and "-", at most 63, starting and ending with a letter or digit.`,
