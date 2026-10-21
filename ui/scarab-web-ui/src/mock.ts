@@ -451,11 +451,12 @@ const deployments: Record<string, unknown[]> = {
 // rollout behind an older live; an Unconfirmed request on a brand-new target;
 // and superseded rows that were, and never were, live. staging has one live.
 const argo = (environment: string, id: string) => ({ environment, source: "argocd", id });
-const req = (run: string, project: string | null, at: number) => ({
+const req = (run: string, project: string | null, at: number, claim = false) => ({
   run,
   step: "deploy",
   effective_at: at,
   project,
+  claim,
 });
 const report = (
   status: "in_progress" | "live" | "failed",

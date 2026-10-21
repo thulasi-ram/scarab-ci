@@ -360,13 +360,68 @@ fn a_retried_deploy_step_joins_the_same_deployment() {
 #[test]
 fn a_report_before_its_request_is_explained_by_the_late_request() {
     // Argo can report the gitops commit live before the step that merged it
-    // has finished and recorded its DeploymentRequest.
+    // has finished and recorded its DeploymentRequest. The step *started*
+    // (-5) before the source first showed the change (0), so it can be what
+    // made it: it explains the Deployment.
     let mut l = DeploymentLedger::new();
     let reported = l.apply(report("api", "c1", Live, 0));
     assert!(l.get(reported).unwrap().is_unexplained());
-    let requested = l.apply(request("api", "c1", "r1", 3));
+    let requested = l.apply(request_started("api", "c1", "r1", -5, 3));
     assert_eq!(reported, requested);
-    assert!(!l.get(requested).unwrap().is_unexplained());
+    let d = l.get(requested).unwrap();
+    assert!(!d.is_unexplained());
+    assert!(!d.requesters[&requester("r1")].claim);
+}
+
+#[test]
+fn a_request_started_after_a_hand_applied_change_is_only_a_claim() {
+    // Someone ran `kubectl set image` and the source reported c1 live (0).
+    // A Deploy Run that only started afterwards (2) names the same version: it
+    // did not make the change, so it must not launder it. It joins as a claim
+    // — kept, so its gate still resolves (c1 was live: it passes) — and the
+    // Deployment stays Unexplained.
+    let mut l = DeploymentLedger::new();
+    let hotfix = l.apply(report("api", "c1", Live, 0));
+    let claimed = l.apply(request_started("api", "c1", "r9", 2, 4));
+    assert_eq!(claimed, hotfix);
+    let d = l.get(hotfix).unwrap();
+    assert!(d.is_unexplained());
+    assert!(d.requesters[&requester("r9")].claim);
+    assert_eq!(
+        d.gate_verdict(&requester("r9"), 4, DEADLINE),
+        Some(DeploymentGateVerdict::Passed { at: 2 })
+    );
+}
+
+#[test]
+fn an_explanation_is_sticky_across_a_rerun_and_a_later_claim() {
+    // r1's step started before the report: it explains the Deployment. Its
+    // step is then rerun (a new, later effective time) and another run r2
+    // names the same version after the fact. Neither takes the explanation
+    // back, and r1 is not demoted to a claim.
+    let mut l = DeploymentLedger::new();
+    let d = l.apply(report("api", "c1", Live, 10));
+    l.apply(request_started("api", "c1", "r1", 8, 12));
+    l.apply(request_started("api", "c1", "r1", 20, 25));
+    l.apply(request_started("api", "c1", "r2", 30, 31));
+    let d = l.get(d).unwrap();
+    assert!(!d.is_unexplained());
+    assert!(!d.requesters[&requester("r1")].claim);
+    assert_eq!(d.requesters[&requester("r1")].effective_at, 20);
+    assert!(d.requesters[&requester("r2")].claim);
+}
+
+#[test]
+fn a_request_created_deployment_has_no_claims() {
+    // Two concurrent requesters of the same version: the second started after
+    // the first created the Deployment, but a request-created Deployment is
+    // already explained and nobody's request is a claim on it.
+    let mut l = DeploymentLedger::new();
+    let d = l.apply(request("api", "c1", "r1", 0));
+    l.apply(request_started("api", "c1", "r2", 5, 6));
+    let d = l.get(d).unwrap();
+    assert!(!d.is_unexplained());
+    assert!(d.requesters.values().all(|m| !m.claim));
 }
 
 #[test]

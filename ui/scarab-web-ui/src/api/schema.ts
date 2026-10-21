@@ -1805,7 +1805,11 @@ export interface components {
             id: number;
             /** @description The stages, oldest first. */
             reports: components["schemas"]["DeploymentStatusReportDto"][];
-            /** @description In the order their requests arrived. Empty = Unexplained. */
+            /**
+             * @description In the order their requests arrived, claims included. Who made it
+             *     live is the requesters that are not claims; `unexplained` says
+             *     whether there is one.
+             */
             requesters: components["schemas"]["DeploymentRequesterDto"][];
             status: components["schemas"]["DeploymentStatusDto"];
             /**
@@ -1819,7 +1823,10 @@ export interface components {
              *     reported on.
              */
             unconfirmed: boolean;
-            /** @description Display term: no Deploy Run requested it — a change made outside Scarab. */
+            /**
+             * @description Display term: no Deploy Run's request explains it — a change made
+             *     outside Scarab. It may still carry claims.
+             */
             unexplained: boolean;
             /** @description Opaque, in the source's scheme; compared only for equality. */
             version: string;
@@ -1828,6 +1835,12 @@ export interface components {
         };
         /** @description A Deploy Run step that requested a Deployment. */
         DeploymentRequesterDto: {
+            /**
+             * @description Only a claim: the request joined a Deployment a source report created,
+             *     and its Step started after Scarab first saw that Deployment — so it
+             *     did not make it live and does not explain it (ADR-0070 §2).
+             */
+            claim: boolean;
             /**
              * Format: int64
              * @description Unix-ms the requesting Step started.

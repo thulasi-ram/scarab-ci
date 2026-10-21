@@ -18,11 +18,20 @@ import {
   listEnvironmentDeployments,
   listProjects,
   type Deployment,
+  type DeploymentRequester,
   type Project,
 } from "../api/client";
 import { me } from "../session";
 import { relTime, absTime } from "../fmt";
-import { deploymentTags, groupBoard, inFlight, pickOrg, requesterHref, targetLabel } from "../deployments";
+import {
+  deploymentTags,
+  groupBoard,
+  inFlight,
+  madeLiveBy,
+  pickOrg,
+  requesterHref,
+  targetLabel,
+} from "../deployments";
 import StatusBadge from "../components/StatusBadge";
 import Icon from "../components/Icon";
 import Doodle from "../components/Doodle";
@@ -128,7 +137,7 @@ export default function Deployments() {
                                       {(l) => (
                                         <span class="dep-cell">
                                           <span class="mono subtle">#{l().id}</span>
-                                          <Requesters org={o()} d={l()} />
+                                          <Requesters org={o()} requesters={madeLiveBy(l())} />
                                           <Tags d={l()} />
                                         </span>
                                       )}
@@ -238,7 +247,7 @@ function DeploymentTable(props: { org: string; rows: Deployment[] }) {
                   </span>
                 </td>
                 <td>
-                  <Requesters org={props.org} d={d} />
+                  <Requesters org={props.org} requesters={d.requesters} />
                 </td>
                 <td class="mono subtle" title={absTime(d.created_at)}>
                   {relTime(d.created_at)}
@@ -308,18 +317,19 @@ function Reports(props: { d: Deployment }) {
   );
 }
 
-/** The Deploy Run steps that asked for a Deployment, linked to their run when
- *  the run's Project is known. None = Unexplained (tagged separately). */
-function Requesters(props: { org: string; d: Deployment }) {
+/** Deploy Run steps that asked for a Deployment, linked to their run when the
+ *  run's Project is known; a claim is labelled as one. The caller picks which:
+ *  the board's "Made live by" passes only the non-claims. */
+function Requesters(props: { org: string; requesters: DeploymentRequester[] }) {
   const stop = (e: MouseEvent) => e.stopPropagation();
   return (
-    <Show when={props.d.requesters.length > 0} fallback={<span class="subtle">—</span>}>
+    <Show when={props.requesters.length > 0} fallback={<span class="subtle">—</span>}>
       <span class="dep-cell">
-        <For each={props.d.requesters}>
+        <For each={props.requesters}>
           {(r) => {
             const href = requesterHref(props.org, r);
             const text = `${r.run.slice(0, 8)} · ${r.step}`;
-            return href ? (
+            const run = href ? (
               <A class="dep-run mono" href={href} onClick={stop} title={`run ${r.run} in ${r.project}`}>
                 {text}
               </A>
@@ -327,6 +337,19 @@ function Requesters(props: { org: string; d: Deployment }) {
               <span class="dep-run mono" title={`run ${r.run} (project unknown)`}>
                 {text}
               </span>
+            );
+            return r.claim ? (
+              <span class="dep-cell">
+                {run}
+                <span
+                  class="dep-tag dep-tag-muted"
+                  title="Only a claim: this run named the version after its source had already shown it, so it did not make the change."
+                >
+                  claim
+                </span>
+              </span>
+            ) : (
+              run
             );
           }}
         </For>

@@ -4,8 +4,10 @@
 // The record's vocabulary (CONTEXT.md §4.6): a Deployment is a version made, or
 // asked to be made, live on a DeploymentTarget. Two display terms are computed
 // by the server and only *shown* here — never re-derived:
-//   - Unexplained — no Deploy Run requested it; something outside Scarab
-//                   changed what is live.
+//   - Unexplained — no Deploy Run's request explains it; something outside
+//                   Scarab changed what is live. It can still list requesters
+//                   that are only *claims*: runs that named the version after
+//                   the source had already shown it (ADR-0070 §2).
 //   - Unconfirmed — requested on a target its source has never reported on, so
 //                   nothing will ever move it past `requested` by itself.
 // A superseded Deployment additionally says whether it was ever live: "replaced
@@ -26,7 +28,8 @@ export function deploymentTags(
     tags.push({
       key: "unexplained",
       label: "unexplained",
-      title: "No Deploy Run requested this — it was changed outside Scarab.",
+      title:
+        "No Deploy Run's request explains this — it was changed outside Scarab. A run that named it afterwards is only a claim.",
       tone: "warn",
     });
   }
@@ -56,6 +59,13 @@ export function deploymentTags(
 /** A target as one short string: `source/id` (both opaque, source-supplied). */
 export function targetLabel(t: Pick<DeploymentTarget, "source" | "id">): string {
   return `${t.source}/${t.id}`;
+}
+
+/** Who made a Deployment live: its requesters minus the claims (a claim is a
+ *  run that named the version only after its source had already shown it, so
+ *  it did not make the change). The server decides which are claims. */
+export function madeLiveBy(d: Pick<Deployment, "requesters">): DeploymentRequester[] {
+  return d.requesters.filter((r) => !r.claim);
 }
 
 /** The run page a requester points at, or `null` when its Project is unknown —
