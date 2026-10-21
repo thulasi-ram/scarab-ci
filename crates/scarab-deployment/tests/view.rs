@@ -1,8 +1,8 @@
 //! The read model (`src/view.rs`): what the Deployments view and the
 //! Environment board show for a logged input sequence. The fold's rules are
 //! pinned by `tests/invariants.rs`; this pins only what the view adds on top —
-//! stable public ids, the Unexplained/Unconfirmed display terms, the board's
-//! live/newest split, ordering, and `now`-relative status.
+//! stable public ids, the Unexplained/Unconfirmed display terms and claims,
+//! the board's live/newest split, ordering, and `now`-relative status.
 
 use scarab_deployment::*;
 use SourceAssertedStatus::{InProgress, Live};
@@ -123,6 +123,56 @@ fn unexplained_and_unconfirmed() {
         "the source reported `web` (for v0), so it is not unconfirmed"
     );
     assert_eq!(v1.status, DeploymentStatus::Requested);
+}
+
+/// A request that names a hand-applied change only after the source showed it
+/// is a claim: listed among the requesters, flagged, and the Deployment stays
+/// Unexplained. One whose step started before the source showed it explains
+/// it, and the flag is per requester.
+#[test]
+fn a_late_claim_leaves_the_deployment_unexplained() {
+    let started_at = |seq: u64, t: &str, v: &str, run: &str, effective_at: Millis, at: Millis| {
+        let mut logged = request(seq, t, v, run, at);
+        if let DeploymentInput::Request {
+            effective_at: e, ..
+        } = &mut logged.input
+        {
+            *e = effective_at;
+        }
+        logged
+    };
+    let log = vec![
+        // Hand-applied: the source shows it first.
+        report(1, "web", "v9", Live, 10),
+        // A run that started afterwards names it.
+        started_at(2, "web", "v9", "r-late", 12, 13),
+        // api: the step started before the source showed it, and finished after.
+        report(3, "api", "a1", Live, 20),
+        started_at(4, "api", "a1", "r-early", 18, 22),
+    ];
+    let env = fold_environment(&log, 30, DEADLINE);
+
+    let hotfix = env.get(1).unwrap();
+    assert!(hotfix.unexplained, "a claim does not explain it");
+    assert_eq!(
+        hotfix
+            .requesters
+            .iter()
+            .map(|r| (r.requester.run.as_str(), r.claim))
+            .collect::<Vec<_>>(),
+        vec![("r-late", true)]
+    );
+    assert!(!hotfix.unconfirmed);
+
+    let api = env.get(3).unwrap();
+    assert!(!api.unexplained);
+    assert_eq!(
+        api.requesters
+            .iter()
+            .map(|r| (r.requester.run.as_str(), r.claim))
+            .collect::<Vec<_>>(),
+        vec![("r-early", false)]
+    );
 }
 
 /// The board: per target, the live Deployment plus the newest one only when

@@ -15,8 +15,23 @@
 //!   DeploymentTarget — a target belongs to exactly one Environment.)
 //! - **Join unless final.** A request or report attaches to the newest
 //!   Deployment with its key unless that one is `superseded`; otherwise it
-//!   creates a new Deployment. A report that creates one makes an
-//!   **Unexplained** Deployment (no requester).
+//!   creates a new Deployment.
+//! - **Explanation.** A Deployment a request created is explained by it. One
+//!   a *report* created is **Unexplained** — a change made outside Scarab —
+//!   until a request joins it whose effective time is at or before the
+//!   Deployment's creation: that step had already started when the source
+//!   first showed the change, so it can be what made it (the same test that
+//!   makes a late request history rather than a rollback). A request that
+//!   started *after* the change was first seen did not make it: it joins as
+//!   a **claim** — kept among the requesters, so its DeploymentGate still
+//!   resolves, but it never explains the Deployment. Being explained is
+//!   decided as inputs arrive and is sticky: a step that requests again with a
+//!   later effective time never un-explains it, and a requester that once
+//!   explained it is never demoted to a claim. Two known edges: a retried
+//!   Attempt whose new start is after the source's report reads as a claim
+//!   (its first Attempt made the change), and a long step spanning a
+//!   hand-applied change of the same version explains it — the record cannot
+//!   tell those apart.
 //! - **Effective time.** A request carries the time its Step *started* (when
 //!   the change was made) besides the time it was recorded (when the Step
 //!   succeeded). A request whose key's newest Deployment is final still
@@ -83,6 +98,10 @@
 //! - **INV-DEP-11** A request never creates a Deployment when its key's
 //!   newest Deployment was first seen at or after the request's effective
 //!   time — a late request joins, it is not a rollback.
+//! - **INV-DEP-12** A claim never explains a Deployment, and nothing
+//!   un-explains one: a report-created Deployment is explained only by a
+//!   request whose effective time is at or before its creation, and once
+//!   explained it stays explained.
 
 use std::collections::BTreeMap;
 
@@ -236,11 +255,19 @@ pub struct DeploymentInstant {
 }
 
 /// Where a requester's DeploymentRequest sits in the ledger's order: its
-/// effective time (when its step started) and when it arrived.
+/// effective time (when its step started) and when it arrived — and whether
+/// it is only a claim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeploymentRequestMark {
     pub effective_at: Millis,
     pub seq: u64,
+    /// The request joined a Deployment a report created, and its step started
+    /// after core first saw that Deployment — so it did not make the change
+    /// (see "Explanation" in the crate docs). Its DeploymentGate still
+    /// resolves; it just never explains the Deployment. Sticky in the other
+    /// direction: once a requester is not a claim, a later request from the
+    /// same step does not make it one.
+    pub claim: bool,
 }
 
 impl DeploymentRequestMark {
@@ -269,6 +296,12 @@ pub struct Deployment {
     pub stall_clock_from: Millis,
     pub superseded_at: Option<Millis>,
     superseded_seq: Option<u64>,
+    /// A source report created it, not a request.
+    created_by_report: bool,
+    /// Some request explains it — the one that created it, or one whose step
+    /// started at or before its creation. Set as inputs arrive, never cleared
+    /// (INV-DEP-12).
+    explained: bool,
 }
 
 /// How a DeploymentGate resolved.
@@ -318,9 +351,11 @@ impl Deployment {
         self.reports.last().map(|r| r.status)
     }
 
-    /// No Deploy Run requested it — a change made outside Scarab.
+    /// No Deploy Run's request explains it — a change made outside Scarab.
+    /// A Deployment can be Unexplained and still have requesters: claims
+    /// (see "Explanation" in the crate docs).
     pub fn is_unexplained(&self) -> bool {
-        self.requesters.is_empty()
+        !self.explained
     }
 
     /// Whether it was ever reported live — the fact that distinguishes
@@ -488,9 +523,15 @@ impl DeploymentLedger {
                 DeploymentInput::Report { .. } => d.is_open(),
             }
         });
+        let created_by_report = matches!(input, DeploymentInput::Report { .. });
         let idx = match joins {
             Some(idx) => idx,
-            None => self.create(input.target().clone(), input.version().clone(), now),
+            None => self.create(
+                input.target().clone(),
+                input.version().clone(),
+                now,
+                created_by_report,
+            ),
         };
         match input {
             DeploymentInput::Request {
@@ -499,11 +540,22 @@ impl DeploymentLedger {
                 ..
             } => {
                 let d = &mut self.deployments[idx];
+                // Its step had started by the time core first saw the
+                // Deployment, so it can be what made it. Always true for the
+                // request that created it (`created_at` is its own `at`).
+                let started_in_time = effective_at <= d.created_at;
+                let claim = d.created_by_report
+                    && !started_in_time
+                    && d.requesters.get(&requester).is_none_or(|m| m.claim);
+                if !claim {
+                    d.explained = true;
+                }
                 d.requesters.insert(
                     requester,
                     DeploymentRequestMark {
                         effective_at,
                         seq: now.seq,
+                        claim,
                     },
                 );
                 if d.is_open() {
@@ -546,12 +598,14 @@ impl DeploymentLedger {
     }
 
     /// A new Deployment becomes the newest on its target, superseding every
-    /// other one there that is not live.
+    /// other one there that is not live. A request creating it explains it; a
+    /// report creating it leaves it Unexplained.
     fn create(
         &mut self,
         target: DeploymentTarget,
         version: DeploymentVersion,
         now: DeploymentInstant,
+        created_by_report: bool,
     ) -> usize {
         for d in self.deployments.iter_mut() {
             if d.target == target
@@ -573,6 +627,8 @@ impl DeploymentLedger {
             stall_clock_from: now.at,
             superseded_at: None,
             superseded_seq: None,
+            created_by_report,
+            explained: false,
         });
         self.deployments.len() - 1
     }

@@ -1,6 +1,14 @@
 import { describe, it, expect } from "vitest";
 import type { BoardRow, Deployment } from "./api/client";
-import { deploymentTags, targetLabel, requesterHref, inFlight, groupBoard, pickOrg } from "./deployments";
+import {
+  deploymentTags,
+  targetLabel,
+  requesterHref,
+  inFlight,
+  groupBoard,
+  madeLiveBy,
+  pickOrg,
+} from "./deployments";
 
 const dep = (over: Partial<Deployment> = {}): Deployment => ({
   id: 1,
@@ -50,6 +58,18 @@ describe("deploymentTags", () => {
 describe("targetLabel", () => {
   it("joins the opaque source and id", () => {
     expect(targetLabel({ source: "argocd", id: "orders-api" })).toBe("argocd/orders-api");
+  });
+});
+
+describe("madeLiveBy", () => {
+  const r = (run: string, claim: boolean) => ({ run, step: "deploy", effective_at: 0, project: "web", claim });
+
+  it("leaves out claims, which did not make the change", () => {
+    // An Unexplained hotfix a later run named: nobody made it live.
+    expect(madeLiveBy(dep({ unexplained: true, requesters: [r("late", true)] }))).toEqual([]);
+    expect(madeLiveBy(dep({ requesters: [r("early", false), r("late", true)] })).map((x) => x.run)).toEqual([
+      "early",
+    ]);
   });
 });
 

@@ -7144,6 +7144,10 @@ pub struct DeploymentRequesterDto {
     /// The Project the run belongs to, when it is stamped and in this Org —
     /// what a link to the run (`/{org}/{project}/runs/{run}`) needs.
     pub project: Option<String>,
+    /// Only a claim: the request joined a Deployment a source report created,
+    /// and its Step started after Scarab first saw that Deployment — so it
+    /// did not make it live and does not explain it (ADR-0070 §2).
+    pub claim: bool,
 }
 
 /// One stage of a Deployment as its source reported it.
@@ -7170,7 +7174,9 @@ pub struct DeploymentDto {
     /// Opaque, in the source's scheme; compared only for equality.
     pub version: String,
     pub status: DeploymentStatusDto,
-    /// In the order their requests arrived. Empty = Unexplained.
+    /// In the order their requests arrived, claims included. Who made it
+    /// live is the requesters that are not claims; `unexplained` says
+    /// whether there is one.
     pub requesters: Vec<DeploymentRequesterDto>,
     /// The stages, oldest first.
     pub reports: Vec<DeploymentStatusReportDto>,
@@ -7180,7 +7186,8 @@ pub struct DeploymentDto {
     pub superseded_at: Option<i64>,
     /// Whether it was ever reported live.
     pub was_ever_live: bool,
-    /// Display term: no Deploy Run requested it — a change made outside Scarab.
+    /// Display term: no Deploy Run's request explains it — a change made
+    /// outside Scarab. It may still carry claims.
     pub unexplained: bool,
     /// Display term: requested on a DeploymentTarget its source has never
     /// reported on.
@@ -7280,6 +7287,7 @@ fn deployment_dto(
                 step: r.requester.step.clone(),
                 effective_at: r.effective_at,
                 project: projects.get(&r.requester.run).cloned().flatten(),
+                claim: r.claim,
             })
             .collect(),
         reports: view

@@ -28,6 +28,10 @@ pub struct DeploymentRequesterView {
     pub requester: DeploymentRequester,
     /// When the requesting Step started — no later than the change it made.
     pub effective_at: Millis,
+    /// Only a claim: it joined a Deployment a report created, and its Step
+    /// started after core first saw that Deployment, so it did not make it
+    /// live and does not explain it (see "Explanation" in the crate docs).
+    pub claim: bool,
 }
 
 /// One stage of a Deployment as reported: the report as the fold holds it
@@ -49,7 +53,8 @@ pub struct DeploymentView {
     pub version: DeploymentVersion,
     pub status: DeploymentStatus,
     /// In the order their requests arrived; a retried Step appears once, at
-    /// its latest request.
+    /// its latest request. Includes claims — "made live by" is the
+    /// non-claims only.
     pub requesters: Vec<DeploymentRequesterView>,
     /// The Deployment's stages, in the order they were received.
     pub reports: Vec<DeploymentStatusReportView>,
@@ -58,8 +63,8 @@ pub struct DeploymentView {
     /// Whether it was ever reported live — tells "replaced after going live"
     /// from "never went live" for a `superseded` one.
     pub was_ever_live: bool,
-    /// Display term (CONTEXT §4.6): no Deploy Run requested it — a change
-    /// made outside Scarab.
+    /// Display term (CONTEXT §4.6): no Deploy Run's request explains it — a
+    /// change made outside Scarab. It may still carry claims.
     pub unexplained: bool,
     /// Display term (CONTEXT §4.6): requested on a DeploymentTarget its
     /// source has never reported anything about, for any DeploymentVersion.
@@ -153,6 +158,7 @@ pub fn fold_environment(
                     .map(|(r, mark)| DeploymentRequesterView {
                         requester: r.clone(),
                         effective_at: mark.effective_at,
+                        claim: mark.claim,
                     })
                     .collect(),
                 reports: d

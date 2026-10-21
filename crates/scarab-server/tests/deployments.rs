@@ -50,6 +50,17 @@ fn target(environment: &str, id: &str) -> DeploymentTarget {
 }
 
 fn request(environment: &str, id: &str, version: &str, run: &str) -> DeploymentInput {
+    request_started(environment, id, version, run, 0)
+}
+
+/// A request from a step that started at `effective_at`.
+fn request_started(
+    environment: &str,
+    id: &str,
+    version: &str,
+    run: &str,
+    effective_at: i64,
+) -> DeploymentInput {
     DeploymentInput::Request {
         target: target(environment, id),
         version: DeploymentVersion(version.into()),
@@ -59,7 +70,7 @@ fn request(environment: &str, id: &str, version: &str, run: &str) -> DeploymentI
         },
         // The store stamps `at` and clamps `effective_at` to it; a step that
         // started at the epoch is simply "long before".
-        effective_at: 0,
+        effective_at,
         at: 0,
     }
 }
@@ -99,6 +110,8 @@ fn report(
 /// | 6   | prod    | web     | request v2 (run-2)             | #6 in flight |
 /// | 7   | staging | web     | request s1 (run-4)             | #7 live    |
 /// | 8   | staging | web     | live                           |            |
+/// | 9   | prod    | api     | request a0 (run-5), started    | claim on #4 |
+/// |     |         |         | after #4 was first seen        |            |
 async fn seed(store: &dyn DeploymentStore, db: &InMemoryDb, clock: &FakeClock) {
     use SourceAssertedStatus::{InProgress, Live};
     for input in [
@@ -117,6 +130,14 @@ async fn seed(store: &dyn DeploymentStore, db: &InMemoryDb, clock: &FakeClock) {
         request("prod", "web", "v2", "run-2"),
         request("staging", "web", "s1", "run-4"),
         report("staging", "web", "s1", Live, "healthy", None),
+        // Its step started after seq 4 was received: a claim, not the cause.
+        request_started(
+            "prod",
+            "api",
+            "a0",
+            "run-5",
+            CLOCK_START_MS + 8 * SEED_STEP_MS,
+        ),
     ] {
         clock.advance(SEED_STEP_MS);
         store
@@ -130,6 +151,7 @@ async fn seed(store: &dyn DeploymentStore, db: &InMemoryDb, clock: &FakeClock) {
         // A run stamped into another org: no link from acme's pages.
         ("run-3", "evil", "web"),
         ("run-4", "acme", "web"),
+        ("run-5", "acme", "web"),
     ] {
         db.set_run_tenant(&RunId(run.into()), org, project)
             .await
@@ -217,9 +239,20 @@ async fn the_board_shows_what_is_live_and_what_is_on_its_way() {
             ("staging".into(), "web".into(), Some(7), None),
         ]
     );
+    // A hand-applied change a later run named: still Unexplained, the run
+    // listed as a claim.
     let api = &board[0]["live"];
     assert_eq!(api["unexplained"], json!(true));
-    assert_eq!(api["requesters"], json!([]));
+    assert_eq!(
+        api["requesters"],
+        json!([{
+            "run": "run-5",
+            "step": "bump-gitops",
+            "effective_at": CLOCK_START_MS + 8 * SEED_STEP_MS,
+            "project": "web",
+            "claim": true
+        }])
+    );
     let web = &board[2];
     assert_eq!(web["live"]["status"], json!("live"));
     assert_eq!(web["live"]["version"], json!("v1"));
@@ -230,7 +263,8 @@ async fn the_board_shows_what_is_live_and_what_is_on_its_way() {
             "run": "run-2",
             "step": "bump-gitops",
             "effective_at": 0,
-            "project": "web"
+            "project": "web",
+            "claim": false
         }])
     );
 
@@ -361,8 +395,8 @@ async fn a_request_stalls_once_the_deadline_has_elapsed() {
     pg.migrate().await.unwrap();
     let h = harness(pg).await;
 
-    // #6 was stamped by this same clock at seq 6, and seeding left the clock
-    // at seq 8: the deadline elapses exactly `deadline - 2 steps` from now.
+    // #6 was stamped by this same clock at seq 6; seeding moved the clock on
+    // past it. Step to one millisecond short of its deadline, then onto it.
     let uri = "/v1/orgs/acme/environments/prod/deployments/6";
     let requested_at = get_json(&h.app, uri).await.1["created_at"]
         .as_i64()

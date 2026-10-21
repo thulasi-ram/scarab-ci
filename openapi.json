@@ -3924,7 +3924,7 @@
             "items": {
               "$ref": "#/components/schemas/DeploymentRequesterDto"
             },
-            "description": "In the order their requests arrived. Empty = Unexplained."
+            "description": "In the order their requests arrived, claims included. Who made it\nlive is the requesters that are not claims; `unexplained` says\nwhether there is one."
           },
           "status": {
             "$ref": "#/components/schemas/DeploymentStatusDto"
@@ -3946,7 +3946,7 @@
           },
           "unexplained": {
             "type": "boolean",
-            "description": "Display term: no Deploy Run requested it — a change made outside Scarab."
+            "description": "Display term: no Deploy Run's request explains it — a change made\noutside Scarab. It may still carry claims."
           },
           "version": {
             "type": "string",
@@ -3964,9 +3964,14 @@
         "required": [
           "run",
           "step",
-          "effective_at"
+          "effective_at",
+          "claim"
         ],
         "properties": {
+          "claim": {
+            "type": "boolean",
+            "description": "Only a claim: the request joined a Deployment a source report created,\nand its Step started after Scarab first saw that Deployment — so it\ndid not make it live and does not explain it (ADR-0070 §2)."
+          },
           "effective_at": {
             "type": "integer",
             "format": "int64",
