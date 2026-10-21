@@ -61,6 +61,7 @@ fn report(t: &str, v: &str, status: SourceAssertedStatus, at: Millis) -> Deploym
         report: DeploymentStatusReport {
             status,
             label: format!("{status:?}"),
+            link: None,
             at,
         },
     }
