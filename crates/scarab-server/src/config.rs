@@ -3178,7 +3178,7 @@ connections:
         let cfg = Config::resolve_from(
             &cli(Some("postgres://l/scarab")),
             dev_env(&[
-                ("SCARAB_DEV_PLUGIN_TOKENS", "0123456789=secret"),
+                ("SCARAB_DEV_PLUGIN_TOKENS", "0123456789=dev-tok-7f3c9a1e"),
                 ("SCARAB_DEV_PLUGIN_ALLOW_TAG", "1"),
             ]),
         )
@@ -3187,7 +3187,9 @@ connections:
         assert!(warnings.contains("DEV PLUGIN TOKENS"), "{warnings}");
         assert!(warnings.contains("PLUGIN TAG INSTALLS"), "{warnings}");
         assert!(
-            !format!("{cfg:?}").contains("secret"),
+            // A distinctive value: "secret" alone also matches field NAMES
+            // such as `github_webhook_secret` in the Debug output.
+            !format!("{cfg:?}").contains("dev-tok-7f3c9a1e"),
             "a dev token never reaches Debug output"
         );
     }
