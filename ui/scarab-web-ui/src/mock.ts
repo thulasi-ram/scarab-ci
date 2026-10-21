@@ -445,11 +445,15 @@ const deployments: Record<string, unknown[]> = {
 };
 
 // ── Deployment record (ADR-0070) — /deployments and the Environment board ──
-// Org-scoped ids (the org's input sequence). production covers every row shape
-// the page distinguishes: a requested rollout reported in stages up to live; an
-// Unexplained live (Argo selfHeal reverted it, no Deploy Run asked); a stalled
-// rollout behind an older live; an Unconfirmed request on a brand-new target;
-// and superseded rows that were, and never were, live. staging has one live.
+// Org-scoped ids (the org's input sequence) — so a higher id was created later,
+// exactly as the server's receipt-time stamps make it. production covers every
+// row shape the page distinguishes: a requested rollout reported in stages up
+// to live; an Unexplained live (Argo selfHeal reverted it, no Deploy Run asked)
+// that a later run named — a claim, not an explanation; a stalled rollout
+// behind an older live; an Unconfirmed request on a brand-new target; and
+// superseded rows that were, and never were, live. staging has one live. The
+// board sends `newest: null` when the newest is the live one, as the server
+// does.
 const argo = (environment: string, id: string) => ({ environment, source: "argocd", id });
 const req = (run: string, project: string | null, at: number, claim = false) => ({
   run,
@@ -466,8 +470,8 @@ const report = (
 ) => ({ status, label, at, source_at: at - 1500, link });
 const ARGO_UI = "https://argocd.acme.example/applications";
 
-const depOrders12: DeploymentDto = {
-  id: 12,
+const depOrders13: DeploymentDto = {
+  id: 13,
   target: argo("production", "orders-api"),
   version: "sha-4f2a1c9",
   status: "live",
@@ -490,7 +494,8 @@ const depOrders9: DeploymentDto = {
   requesters: [req("01984d00bb11", "orders-api", ago(26 * 60 * min))],
   reports: [report("live", "Healthy · Synced", ago(26 * 60 * min - 4 * min))],
   created_at: ago(26 * 60 * min),
-  superseded_at: ago(42 * min),
+  // Live until #13 was reported live, not when #13 was requested.
+  superseded_at: ago(36 * min),
   was_ever_live: true,
   unexplained: false,
   unconfirmed: false,
@@ -516,7 +521,9 @@ const depGateway14: DeploymentDto = {
   target: argo("production", "edge-gateway"),
   version: "sha-9c0ffee",
   status: "live",
-  requesters: [],
+  // A run that only started after Argo showed the revert named the same
+  // version: listed as a claim, and the Deployment stays Unexplained.
+  requesters: [req("01984f20ab99", "edge-gateway", ago(10 * min), true)],
   reports: [report("live", "selfHeal: reverted to git", ago(18 * min), `${ARGO_UI}/edge-gateway`)],
   created_at: ago(18 * min),
   was_ever_live: true,
@@ -536,8 +543,8 @@ const depGateway8: DeploymentDto = {
   unexplained: false,
   unconfirmed: false,
 };
-const depInventory13: DeploymentDto = {
-  id: 13,
+const depInventory12: DeploymentDto = {
+  id: 12,
   target: argo("production", "inventory-svc"),
   version: "sha-77ab001",
   status: "stalled",
@@ -591,8 +598,8 @@ const envDeployments: Record<string, DeploymentDto[]> = {
   production: [
     depMessaging15,
     depGateway14,
-    depInventory13,
-    depOrders12,
+    depOrders13,
+    depInventory12,
     depOrders10,
     depOrders9,
     depGateway8,
@@ -601,11 +608,11 @@ const envDeployments: Record<string, DeploymentDto[]> = {
   staging: [depStagingOrders11],
 };
 const board: BoardRowDto[] = [
-  { target: depOrders12.target, live: depOrders12, newest: depOrders12 },
-  { target: depGateway14.target, live: depGateway14, newest: depGateway14 },
-  { target: depInventory13.target, live: depInventory7, newest: depInventory13 },
+  { target: depOrders13.target, live: depOrders13, newest: null },
+  { target: depGateway14.target, live: depGateway14, newest: null },
+  { target: depInventory12.target, live: depInventory7, newest: depInventory12 },
   { target: depMessaging15.target, live: null, newest: depMessaging15 },
-  { target: depStagingOrders11.target, live: depStagingOrders11, newest: depStagingOrders11 },
+  { target: depStagingOrders11.target, live: depStagingOrders11, newest: null },
 ];
 
 const secretNames = { names: ["GHCR_TOKEN", "DATABASE_URL", "SLACK_WEBHOOK_URL"] };

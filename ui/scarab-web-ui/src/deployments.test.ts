@@ -106,7 +106,10 @@ describe("requesterHref", () => {
 
 describe("inFlight", () => {
   it("is null when the newest Deployment is the live one", () => {
+    // The server sends `newest: null` then; the id check only guards a
+    // response that repeats the live one.
     const live = dep({ id: 4 });
+    expect(inFlight({ live, newest: null })).toBeNull();
     expect(inFlight({ live, newest: live })).toBeNull();
   });
 
