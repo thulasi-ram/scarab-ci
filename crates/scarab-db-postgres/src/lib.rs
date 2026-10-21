@@ -2408,8 +2408,8 @@ const DEPLOYMENT_INPUT_COLUMNS: &str =
      requester_run, requester_step, effective_at,
      report_status, report_label, report_link, report_source_at";
 
-/// Append one DeploymentInput to `org`'s log on `conn`, returning it as
-/// logged — seq and stamped times included.
+/// Append one DeploymentInput to `org`'s log on `conn`, as received at
+/// `received_at`, returning it as logged — seq and stamped times included.
 ///
 /// One statement: the CTE bumps (or creates) the Org's counter row and the
 /// insert takes the seq and receipt time it returned. The counter row stays
@@ -2419,19 +2419,33 @@ const DEPLOYMENT_INPUT_COLUMNS: &str =
 /// recording a DeploymentRequest in the same commit as the Step success that
 /// produced it — and still share the one counter.
 ///
-/// **Core stamps time** (migration 0053): the stored `at` is the receipt time,
-/// GREATEST(the database clock, the Org's last `at`), never `input.at()`. It
-/// reads `clock_timestamp()`, not `now()`: `now()` is frozen at transaction
-/// start, so an append inside a long transaction would be stamped as of its
-/// beginning — still monotone through the GREATEST, but needlessly early. A
+/// **Isolation.** Run it under READ COMMITTED (Postgres's default). There a
+/// concurrent append to the same Org waits on the counter row and then
+/// re-reads it, so seqs stay gap-free. Under REPEATABLE READ or SERIALIZABLE
+/// the same upsert fails with a serialization error (40001) instead of
+/// waiting; a caller that needs those levels must retry the whole
+/// transaction.
+///
+/// **Core stamps time** (migration 0053): the stored `at` is
+/// GREATEST(`received_at`, the Org's last `at`), never `input.at()`.
+/// `received_at` is the control plane's clock (ADR-0070 §8) — the one a
+/// request's `effective_at` and a reader's `now` also come from — so read it
+/// right before this call, not at the start of a long transaction: an early
+/// reading is still monotone through the GREATEST, but needlessly early. It is
+/// refused when more than [`RECEIVED_AT_MAX_LEAD_MS`] ahead of the database's
+/// own clock: one replica with a runaway clock would otherwise ratchet the
+/// Org's `last_at` into the future and stamp every later input late. A
 /// report's own `at` is kept as `report_source_at`; a request's
 /// `effective_at` is clamped to no later than the stamp.
+///
+/// [`RECEIVED_AT_MAX_LEAD_MS`]: scarab_deployment::RECEIVED_AT_MAX_LEAD_MS
 pub async fn append_deployment_input(
     conn: &mut sqlx::PgConnection,
     org: &str,
     input: &scarab_deployment::DeploymentInput,
+    received_at: scarab_deployment::Millis,
 ) -> Result<scarab_deployment::LoggedDeploymentInput, DeploymentStoreError> {
-    use scarab_deployment::DeploymentInput;
+    use scarab_deployment::{DeploymentInput, RECEIVED_AT_MAX_LEAD_MS};
     let target = input.target();
     let (kind, requester, effective_at, report) = match input {
         DeploymentInput::Request {
@@ -2441,15 +2455,18 @@ pub async fn append_deployment_input(
         } => ("request", Some(requester), Some(*effective_at), None),
         DeploymentInput::Report { report, .. } => ("report", None, None, Some(report)),
     };
+    // The counter upsert's SELECT yields no row when `received_at` runs too
+    // far ahead, so nothing is bumped or inserted and the statement returns
+    // no row — the refusal below.
     let sql = format!(
         "WITH c AS (
              INSERT INTO deployment_input_counters (org, last_seq, last_at)
-             VALUES ($1, 1, (extract(epoch FROM clock_timestamp()) * 1000)::bigint)
+             SELECT $1, 1, $14::bigint
+             WHERE $14::bigint
+                 <= (extract(epoch FROM clock_timestamp()) * 1000)::bigint + $15::bigint
              ON CONFLICT (org) DO UPDATE
                  SET last_seq = deployment_input_counters.last_seq + 1,
-                     last_at = GREATEST(
-                         (extract(epoch FROM clock_timestamp()) * 1000)::bigint,
-                         deployment_input_counters.last_at)
+                     last_at = GREATEST(EXCLUDED.last_at, deployment_input_counters.last_at)
              RETURNING last_seq, last_at
          )
          INSERT INTO deployment_inputs
@@ -2477,9 +2494,31 @@ pub async fn append_deployment_input(
         .bind(report.map(|r| r.label.as_str()))
         .bind(report.and_then(|r| r.link.as_deref()))
         .bind(report.map(|r| r.at))
-        .fetch_one(&mut *conn)
+        .bind(received_at)
+        .bind(RECEIVED_AT_MAX_LEAD_MS)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(deployment_store_err)?;
+    let Some(row) = row else {
+        // Best effort, for the log line only: the refusal stands either way.
+        let store_now = sqlx::query_scalar::<_, i64>(
+            "SELECT (extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .ok();
+        tracing::warn!(
+            org,
+            received_at,
+            store_now,
+            max_lead_ms = RECEIVED_AT_MAX_LEAD_MS,
+            "deployment input refused: received_at runs ahead of the database clock"
+        );
+        return Err(DeploymentStoreError::ReceivedAtAhead {
+            received_at,
+            store_now,
+        });
+    };
     deployment_input_from_row(&row)
 }
 
@@ -2582,9 +2621,10 @@ impl DeploymentStore for PostgresDb {
         &self,
         org: &str,
         input: &scarab_deployment::DeploymentInput,
+        received_at: scarab_deployment::Millis,
     ) -> Result<scarab_deployment::LoggedDeploymentInput, DeploymentStoreError> {
         let mut conn = self.pool().acquire().await.map_err(deployment_store_err)?;
-        append_deployment_input(&mut conn, org, input).await
+        append_deployment_input(&mut conn, org, input, received_at).await
     }
 
     async fn inputs(

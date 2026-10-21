@@ -15,14 +15,18 @@
 -- within one Org commit strictly in seq order. Orgs never contend.
 --
 -- CORE STAMPS TIME. `at` is the time the input was RECEIVED, taken inside
--- that same upsert as GREATEST(the database clock, the Org's `last_at`) — so
--- it never goes backwards within an Org, and seq order and time order are one
--- order, which the fold requires (`DeploymentLedger::apply`). The `at` a
--- caller supplies is not stored as `at`: a source's clock (Argo's, a
--- plugin's) is not the control plane's, and the fold must never decide
--- "before"/"after" by clock skew. A report's own timestamp is kept as
--- `report_source_at`, display-only. A request's `effective_at` is from the
--- control plane's clock and is clamped to no later than the stamped `at`.
+-- that same upsert as GREATEST(the caller's `received_at`, the Org's
+-- `last_at`) — so it never goes backwards within an Org, and seq order and
+-- time order are one order, which the fold requires
+-- (`DeploymentLedger::apply`). `received_at` is the control plane's clock,
+-- the same one a request's `effective_at` and a reader's `now` come from
+-- (ADR-0070 §8); the upsert refuses one more than 60 s ahead of the database
+-- clock, which would otherwise ratchet `last_at` into the future for good.
+-- The `at` inside a caller's input is not stored as `at`: a source's clock
+-- (Argo's, a plugin's) is not the control plane's, and the fold must never
+-- decide "before"/"after" by clock skew. A report's own timestamp is kept as
+-- `report_source_at`, display-only. A request's `effective_at` is clamped to
+-- no later than the stamped `at`.
 --
 -- The legacy `deployments` table (0012, 0016) is untouched: it stays readable as
 -- approval history (ADR-0070 §1, ADR-0071 §9). Nothing here references it.

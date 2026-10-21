@@ -5,9 +5,10 @@
 //! The engine `Db` is the in-memory one: the only thing these endpoints ask
 //! of it is a requesting run's tenant (for the run link), which a test stamps
 //! directly. The input log is seeded through `DeploymentStore::append`, the
-//! same path the request writer and report ingest will use, so the stored
-//! times are core's receipt times — which is why the clock starts at the wall
-//! clock rather than at a small constant. Skips cleanly when
+//! same path the request writer and report ingest will use, with each
+//! `received_at` read from the server's own `FakeClock` — the one clock
+//! ADR-0070 §8 asks for — so stamped times, and therefore status and stall,
+//! are exact. Each test gets its own database (`fresh_db`). Skips cleanly when
 //! `SCARAB_TEST_DATABASE_URL` is unset (except the unwired-store test).
 
 mod common;
@@ -25,7 +26,7 @@ use scarab_deployment::{
     DeploymentInput, DeploymentRequester, DeploymentStatusReport, DeploymentStore,
     DeploymentTarget, DeploymentVersion, SourceAssertedStatus, DEFAULT_DEPLOYMENT_DEADLINE_MS,
 };
-use scarab_engine::{Db, RunId};
+use scarab_engine::{Clock, Db, RunId};
 use scarab_identity::{Binding, BindingOrigin, Principal, RbacStore, Role, Scope};
 use scarab_project::EnvironmentStore;
 use scarab_server::{router, AppState, LogService};
@@ -33,12 +34,12 @@ use scarab_testkit::{
     FakeAuthenticator, FakeClock, InMemoryDb, InMemoryObjectStore, InMemoryRbac, InMemorySessions,
 };
 
-fn wall_clock_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64
-}
+/// Where the server's FakeClock starts. Any time works as long as it is not
+/// ahead of the database's clock (the store refuses a runaway `received_at`).
+const CLOCK_START_MS: i64 = 1_000_000;
+
+/// How far the FakeClock moves between two seeded inputs.
+const SEED_STEP_MS: i64 = 1_000;
 
 fn target(environment: &str, id: &str) -> DeploymentTarget {
     DeploymentTarget {
@@ -84,7 +85,9 @@ fn report(
     }
 }
 
-/// Seed acme's log. Seqs (= Deployment ids where an input creates one):
+/// Seed acme's log, input `seq` received at `CLOCK_START_MS + seq *
+/// SEED_STEP_MS` on `clock`. Seqs (= Deployment ids where an input creates
+/// one):
 ///
 /// | seq | env     | target  | input                          | Deployment |
 /// |-----|---------|---------|--------------------------------|------------|
@@ -96,7 +99,7 @@ fn report(
 /// | 6   | prod    | web     | request v2 (run-2)             | #6 in flight |
 /// | 7   | staging | web     | request s1 (run-4)             | #7 live    |
 /// | 8   | staging | web     | live                           |            |
-async fn seed(store: &dyn DeploymentStore, db: &InMemoryDb) {
+async fn seed(store: &dyn DeploymentStore, db: &InMemoryDb, clock: &FakeClock) {
     use SourceAssertedStatus::{InProgress, Live};
     for input in [
         request("prod", "web", "v1", "run-1"),
@@ -115,7 +118,11 @@ async fn seed(store: &dyn DeploymentStore, db: &InMemoryDb) {
         request("staging", "web", "s1", "run-4"),
         report("staging", "web", "s1", Live, "healthy", None),
     ] {
-        store.append("acme", &input).await.unwrap();
+        clock.advance(SEED_STEP_MS);
+        store
+            .append("acme", &input, clock.now().await.0)
+            .await
+            .unwrap();
     }
     for (run, org, project) in [
         ("run-1", "acme", "web"),
@@ -137,9 +144,8 @@ struct Harness {
 
 async fn harness(pg: Arc<PostgresDb>) -> Harness {
     let db = Arc::new(InMemoryDb::new());
-    seed(pg.as_ref(), &db).await;
-    // After seeding, so every stored receipt time is at or before "now".
-    let clock = Arc::new(FakeClock::new(wall_clock_ms()));
+    let clock = Arc::new(FakeClock::new(CLOCK_START_MS));
+    seed(pg.as_ref(), &db, &clock).await;
     let logs = Arc::new(LogService::new(
         Arc::new(InMemoryObjectStore::new()),
         db.clone(),
@@ -355,11 +361,18 @@ async fn a_request_stalls_once_the_deadline_has_elapsed() {
     pg.migrate().await.unwrap();
     let h = harness(pg).await;
 
+    // #6 was stamped by this same clock at seq 6, and seeding left the clock
+    // at seq 8: the deadline elapses exactly `deadline - 2 steps` from now.
     let uri = "/v1/orgs/acme/environments/prod/deployments/6";
+    let requested_at = get_json(&h.app, uri).await.1["created_at"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(requested_at, CLOCK_START_MS + 6 * SEED_STEP_MS);
+    let now = h.clock.now().await.0;
+    h.clock
+        .advance(requested_at + DEFAULT_DEPLOYMENT_DEADLINE_MS - 1 - now);
     assert_eq!(get_json(&h.app, uri).await.1["status"], json!("requested"));
-    // A minute of margin over the deadline absorbs any skew between the
-    // database's clock (which stamped the input) and this process's.
-    h.clock.advance(DEFAULT_DEPLOYMENT_DEADLINE_MS + 60_000);
+    h.clock.advance(1);
     assert_eq!(get_json(&h.app, uri).await.1["status"], json!("stalled"));
     // A live one does not stall.
     let (_, live) = get_json(&h.app, "/v1/orgs/acme/environments/prod/deployments/1").await;
@@ -436,7 +449,8 @@ async fn reading_needs_read_on_the_org() {
     let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
     pg.migrate().await.unwrap();
     let db = Arc::new(InMemoryDb::new());
-    seed(pg.as_ref(), &db).await;
+    let clock = Arc::new(FakeClock::new(CLOCK_START_MS));
+    seed(pg.as_ref(), &db, &clock).await;
 
     let scoped = |subject: &str| Principal {
         subject: subject.into(),
@@ -477,7 +491,7 @@ async fn reading_needs_read_on_the_org() {
         db.clone(),
     ));
     let app = router(
-        AppState::new(db, Arc::new(FakeClock::new(wall_clock_ms())), logs)
+        AppState::new(db, clock, logs)
             .with_auth(auth, Arc::new(InMemorySessions::new()))
             .with_rbac(rbac)
             .with_deployments(pg),

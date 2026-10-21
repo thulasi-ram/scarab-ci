@@ -5,9 +5,13 @@
 //! show is the log itself: inputs round-trip exactly (both kinds, a report's
 //! link present or absent), seqs are per-Org and gap-free from 1 even under
 //! concurrent appends — the property a Deployment's public id rests on — the
+//! stamped time is the caller's `received_at` kept monotone per Org, a
+//! `received_at` running far ahead of the database clock is refused, the
 //! table refuses a row that is neither a well-formed request nor a well-formed
 //! report, and the legacy approval-history `deployments` table neither feeds
-//! nor is fed by it. Skips cleanly when `SCARAB_TEST_DATABASE_URL` is unset.
+//! nor is fed by it. Every test gets its own database (`fresh_db`), so Orgs
+//! never leak a counter between tests. Skips cleanly when
+//! `SCARAB_TEST_DATABASE_URL` is unset.
 
 mod common;
 
@@ -17,7 +21,8 @@ use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_deployment::{
     DeploymentInput, DeploymentRequester, DeploymentStatusReport, DeploymentStore,
-    DeploymentTarget, DeploymentVersion, SourceAssertedStatus,
+    DeploymentStoreError, DeploymentTarget, DeploymentVersion, SourceAssertedStatus,
+    RECEIVED_AT_MAX_LEAD_MS,
 };
 use scarab_project::EnvironmentStore;
 
@@ -107,15 +112,19 @@ async fn inputs_round_trip_and_seq_is_per_org_from_one() {
     );
 
     let mut appended = Vec::new();
-    for (org, input, seq) in [
-        ("acme", &asked, 1),
-        ("acme", &in_progress, 2),
+    // `received_at` is the control plane's clock, passed in: these are long in
+    // the past, so the database clock never refuses them.
+    for (org, input, received_at, seq) in [
+        ("acme", &asked, 1_000, 1),
+        ("acme", &in_progress, 1_010, 2),
         // Another Org's log starts its own count: ids are Org-scoped.
-        ("globex", &asked, 1),
-        ("acme", &live, 3),
-        ("acme", &failed, 4),
+        ("globex", &asked, 1_015, 1),
+        // Received "earlier" than the last input (another replica's clock
+        // running behind): stamped at the Org's last `at`, never before it.
+        ("acme", &live, 1_005, 3),
+        ("acme", &failed, 1_030, 4),
     ] {
-        let logged = db.append(org, input).await.unwrap();
+        let logged = db.append(org, input, received_at).await.unwrap();
         assert_eq!(logged.seq, seq);
         if org == "acme" {
             appended.push(logged);
@@ -130,11 +139,10 @@ async fn inputs_round_trip_and_seq_is_per_org_from_one() {
     );
     assert_eq!(prod, appended[..3], "append returns exactly what is logged");
 
-    // Core stamped the time: the caller's `at` (100, 110, …) is not what is
-    // stored — the database clock is — and it never goes backwards.
+    // Core stamped the time: `max(received_at, the Org's last at)` — not the
+    // caller's `at` (100, 110, …) — so it never goes backwards.
     let receipts: Vec<i64> = appended.iter().map(|l| l.input.at()).collect();
-    assert!(receipts.iter().all(|&at| at > 1_000_000_000_000));
-    assert!(receipts.windows(2).all(|w| w[0] <= w[1]), "{receipts:?}");
+    assert_eq!(receipts, vec![1_000, 1_010, 1_010, 1_030]);
 
     // Everything else round-trips; a report keeps its source's time aside.
     assert_eq!(prod[0].input, stamped(&asked, receipts[0]));
@@ -196,6 +204,7 @@ async fn a_request_effective_after_its_receipt_is_clamped() {
                 effective_at: far_future,
                 at: far_future,
             },
+            500,
         )
         .await
         .unwrap();
@@ -205,8 +214,59 @@ async fn a_request_effective_after_its_receipt_is_clamped() {
     else {
         panic!("a request comes back a request");
     };
-    assert!(at < far_future, "the caller's `at` is ignored");
-    assert_eq!(effective_at, at);
+    assert_eq!(at, 500, "the caller's `at` is ignored");
+    assert_eq!(effective_at, 500);
+
+    tdb.cleanup().await;
+}
+
+/// A `received_at` running more than a minute ahead of the database clock is
+/// refused, and refused *whole*: the Org's counter is untouched, so the next
+/// append gets the next seq and a stamp the runaway clock did not ratchet.
+/// Without the refusal one replica with a clock an hour fast would stamp every
+/// later input of the Org an hour late, for good.
+#[tokio::test]
+async fn a_received_at_far_ahead_of_the_database_clock_is_refused() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+
+    let first = db
+        .append("acme", &request("prod", "web", "v1", "run-1", 0), 1_000)
+        .await
+        .unwrap();
+    assert_eq!(first.seq, 1);
+
+    let db_now: i64 =
+        sqlx::query_scalar("SELECT (extract(epoch FROM clock_timestamp()) * 1000)::bigint")
+            .fetch_one(&tdb.pool)
+            .await
+            .unwrap();
+    // Ten lead-windows ahead: comfortably past the guard whatever the skew
+    // between this process and the database.
+    let runaway = db_now + 10 * RECEIVED_AT_MAX_LEAD_MS;
+    let refused = db
+        .append("acme", &request("prod", "web", "v2", "run-2", 0), runaway)
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(DeploymentStoreError::ReceivedAtAhead { received_at, store_now: Some(_) })
+                if received_at == runaway
+        ),
+        "{refused:?}"
+    );
+
+    let next = db
+        .append("acme", &request("prod", "web", "v3", "run-3", 0), 1_100)
+        .await
+        .unwrap();
+    assert_eq!(next.seq, 2, "the refused append consumed no seq");
+    assert_eq!(next.input.at(), 1_100, "nor ratcheted the Org's floor");
+    assert_eq!(db.inputs("acme", "prod").await.unwrap().len(), 2);
 
     tdb.cleanup().await;
 }
@@ -230,6 +290,9 @@ async fn concurrent_appends_get_exactly_one_through_n() {
                 db.append(
                     "acme",
                     &request("prod", &format!("svc-{i}"), "v1", "run-1", 100 + i),
+                    // Racing appends whose readings disagree with their
+                    // commit order: the stamp must still be monotone in seq.
+                    1_000 + (i * 7919) % 50,
                 )
                 .await
                 .unwrap()
@@ -358,7 +421,7 @@ async fn legacy_approval_history_is_untouched() {
     assert!(db.inputs("acme", "prod").await.unwrap().is_empty());
     assert!(db.environments("acme").await.unwrap().is_empty());
 
-    db.append("acme", &request("prod", "web", "v1", "run-1", 200))
+    db.append("acme", &request("prod", "web", "v1", "run-1", 200), 1_000)
         .await
         .unwrap();
     assert_eq!(
