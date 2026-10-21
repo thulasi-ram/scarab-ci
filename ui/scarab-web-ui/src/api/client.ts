@@ -587,18 +587,6 @@ export async function listEnvironmentDeployments(
   return data;
 }
 
-/** One Deployment and its reported stages. */
-export async function getDeployment(org: string, env: string, id: number): Promise<Deployment> {
-  const { data, error, response } = await api.GET(
-    "/v1/orgs/{org}/environments/{env}/deployments/{id}",
-    { params: { path: { org, env, id } } },
-  );
-  if (error || !data) {
-    throw new Error(errorText(error) || `could not load deployment #${id} (${response.status})`);
-  }
-  return data;
-}
-
 /** Fetch a run's status + steps (dogfoods `GET /v1/runs/{id}`). */
 export async function getRun(id: string): Promise<RunStatus> {
   const { data, error } = await api.GET("/v1/runs/{id}", {
