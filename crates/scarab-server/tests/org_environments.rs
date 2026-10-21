@@ -248,9 +248,19 @@ async fn invalid_writes_are_refused_and_store_nothing() {
                 { "installation": "argocd", "vendor_grouping": "prod" }
             ] }),
         ),
-        // Whitespace in the name.
+        // A vendor grouping with an edge space: refused, not kept or trimmed.
         (
-            "/v1/orgs/acme/environments/prod%20eu",
+            "/v1/orgs/acme/environments/prod",
+            json!({ "deployment_sources": [{ "installation": "argocd", "vendor_grouping": " prod" }] }),
+        ),
+        // A control character in the name.
+        (
+            "/v1/orgs/acme/environments/prod%09eu",
+            json!({ "deployment_sources": [] }),
+        ),
+        // A dot segment for a name: a client would normalise it away.
+        (
+            "/v1/orgs/acme/environments/%2E%2E",
             json!({ "deployment_sources": [] }),
         ),
     ] {
@@ -275,6 +285,46 @@ async fn invalid_writes_are_refused_and_store_nothing() {
     }
     let (_, list) = call(&app, "GET", "/v1/orgs/acme/environments", None, None).await;
     assert_eq!(list, json!([]));
+
+    tdb.cleanup().await;
+}
+
+/// A name a pipeline can deploy to — spaces, a `/` — is registrable and
+/// addressable: the router matches on the encoded path, so `%2F` stays inside
+/// the one `{env}` segment and arrives decoded.
+#[tokio::test]
+async fn names_with_spaces_and_slashes_round_trip() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
+    pg.migrate().await.unwrap();
+    let app = open_app(pg, Arc::new(FakeClock::new(CLOCK_START_MS)));
+
+    for (encoded, name) in [
+        ("Production%20EU", "Production EU"),
+        ("prod%2Feu", "prod/eu"),
+    ] {
+        let uri = format!("/v1/orgs/acme/environments/{encoded}");
+        let (status, put) = call(
+            &app,
+            "PUT",
+            &uri,
+            None,
+            Some(json!({ "deployment_deadline_ms": 5 * MINUTE_MS, "deployment_sources": [] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{name}: {put}");
+        assert_eq!(put["name"], json!(name));
+        let (status, got) = call(&app, "GET", &uri, None, None).await;
+        assert_eq!(status, StatusCode::OK, "{name}");
+        assert_eq!(got, put);
+        let (status, _) = call(&app, "DELETE", &uri, None, None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{name}");
+        let (status, _) = call(&app, "GET", &uri, None, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{name}");
+    }
 
     tdb.cleanup().await;
 }
@@ -562,9 +612,10 @@ async fn writes_need_org_administer_and_reads_need_org_read() {
     tdb.cleanup().await;
 }
 
-/// No store wired → the endpoints do not exist here (404), and the
-/// Deployment read fold keeps working on the default deadline. Needs no
-/// database.
+/// No store wired → the endpoints do not exist here (404). Needs no
+/// database. (That the fold then falls back to the default deadline is
+/// `deadline_from_org_environment`'s contract; this test does not exercise
+/// it — the Deployment record is unwired here too.)
 #[tokio::test]
 async fn unwired_store_is_404() {
     let app = router(app_state(

@@ -67,13 +67,13 @@ describe("toPutBody", () => {
     );
   });
 
-  it("refuses a source listed twice, even when only whitespace differs", () => {
+  it("refuses a source listed twice, even when the installation differs only by whitespace", () => {
     expect(
       toPutBody(
         form({
           sources: [
             { installation: "argocd", vendor_grouping: "prod" },
-            { installation: "argocd ", vendor_grouping: " prod" },
+            { installation: "argocd ", vendor_grouping: "prod" },
           ],
         }),
       ).error,
@@ -89,6 +89,19 @@ describe("toPutBody", () => {
         }),
       ).error,
     ).toBeUndefined();
+  });
+
+  it("sends a vendor grouping exactly as typed, refusing an edge space instead of trimming it", () => {
+    for (const vendor_grouping of [" prod", "prod ", "\tprod"]) {
+      expect(
+        toPutBody(form({ sources: [{ installation: "argocd", vendor_grouping }] })).error,
+        JSON.stringify(vendor_grouping),
+      ).toMatch(/space/);
+    }
+    expect(
+      toPutBody(form({ sources: [{ installation: "argocd", vendor_grouping: "Team A / Prod" }] })).body
+        ?.deployment_sources,
+    ).toEqual([{ installation: "argocd", vendor_grouping: "Team A / Prod" }]);
   });
 
   it("refuses an installation name that is not a DNS-1123 label", () => {
@@ -125,9 +138,11 @@ describe("toForm", () => {
 });
 
 describe("nameError", () => {
-  it("admits every plausible per-repo name and refuses slash, space and empty", () => {
-    for (const n of ["prod", "Prod-EU", "prod.eu-west-1", "staging_2"]) expect(nameError(n), n).toBeNull();
-    for (const n of ["", "prod/eu", "prod eu", "prod\t", "x".repeat(101)]) expect(nameError(n), n).toBeTruthy();
+  it("admits any name a pipeline can deploy to and refuses only empty, dot segments and control characters", () => {
+    for (const n of ["prod", "Prod-EU", "prod.eu-west-1", "staging_2", "Production EU", "prod/eu", " prod", "...", "x".repeat(500)]) {
+      expect(nameError(n), n).toBeNull();
+    }
+    for (const n of ["", ".", "..", "prod\t", "prod\n", "prod\u0000", "prod\u007f"]) expect(nameError(n), JSON.stringify(n)).toBeTruthy();
   });
 });
 

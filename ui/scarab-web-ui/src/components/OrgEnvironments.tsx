@@ -214,7 +214,7 @@ function EnvironmentDialog(props: {
   const creating = () => !props.env;
   const nameProblem = () => {
     if (!creating()) return null;
-    const n = name().trim();
+    const n = name();
     if (props.taken.includes(n)) return `${n} is already registered — edit it instead.`;
     return nameError(n);
   };
@@ -231,7 +231,7 @@ function EnvironmentDialog(props: {
     setSaving(true);
     setError(null);
     try {
-      await putOrgEnvironment(props.org, creating() ? name().trim() : props.env!.name, body);
+      await putOrgEnvironment(props.org, creating() ? name() : props.env!.name, body);
       props.onSaved();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not save the environment.");
@@ -281,6 +281,7 @@ function EnvironmentDialog(props: {
                 class="input tok-days"
                 type="number"
                 min="1"
+                step="any"
                 max={MAX_DEADLINE_MINUTES}
                 value={minutes()}
                 onInput={(e) => setMinutes(Number(e.currentTarget.value))}

@@ -610,9 +610,9 @@ export class OrgEnvironmentsForbiddenError extends Error {
 /**
  * The org's Environments, by name (`GET /v1/orgs/{org}/environments`).
  *
- * `null` when the server has no org-Environment store (a 404 before it
- * authorizes anything) — "this server has no org Environments", not "none
- * registered".
+ * `null` when the server has no org-Environment store (a 404, answered once
+ * the caller is authorized) — "this server has no org Environments", not
+ * "none registered".
  */
 export async function listOrgEnvironments(org: string): Promise<OrgEnvironment[] | null> {
   const { data, error, response } = await api.GET("/v1/orgs/{org}/environments", {
