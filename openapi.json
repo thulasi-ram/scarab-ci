@@ -864,6 +864,204 @@
         ]
       }
     },
+    "/v1/orgs/{org}/board": {
+      "get": {
+        "tags": [
+          "Deployments"
+        ],
+        "summary": "The Environment board: what is live on each DeploymentTarget (ADR-0070)",
+        "operationId": "get_environment_board",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment",
+            "in": "query",
+            "description": "Only this Environment's rows; omitted = every Environment with any\nDeployment.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/EnvironmentBoardRowDto"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "no Read on the org"
+          },
+          "404": {
+            "description": "deployments not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/environments/{env}/deployments": {
+      "get": {
+        "tags": [
+          "Deployments"
+        ],
+        "summary": "An Environment's Deployments, newest first (ADR-0070)",
+        "operationId": "list_environment_deployments",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "target_source",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "target_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/DeploymentDto"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "no Read on the org"
+          },
+          "404": {
+            "description": "deployments not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/environments/{env}/deployments/{id}": {
+      "get": {
+        "tags": [
+          "Deployments"
+        ],
+        "summary": "One Deployment and its stages (ADR-0070)",
+        "operationId": "get_deployment",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Deployment id",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeploymentDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "no Read on the org"
+          },
+          "404": {
+            "description": "no such Deployment in this Environment"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/orgs/{org}/principals": {
       "get": {
         "tags": [
@@ -1286,7 +1484,7 @@
         "tags": [
           "Environments"
         ],
-        "summary": "An environment's deployment history (ADR-0037)",
+        "summary": "Legacy approval history (ADR-0070 §1)",
         "operationId": "list_deployments",
         "responses": {
           "200": {
@@ -3687,6 +3885,177 @@
           }
         }
       },
+      "DeploymentDto": {
+        "type": "object",
+        "description": "One Deployment: a DeploymentVersion made (or asked to be made) live on a\nDeploymentTarget, and what was reported about it since (ADR-0070 §2).",
+        "required": [
+          "id",
+          "target",
+          "version",
+          "status",
+          "requesters",
+          "reports",
+          "created_at",
+          "was_ever_live",
+          "unexplained",
+          "unconfirmed"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix-ms."
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Org-scoped and stable: the sequence number of the input that created\nit.",
+            "minimum": 0
+          },
+          "reports": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DeploymentStatusReportDto"
+            },
+            "description": "The stages, oldest first."
+          },
+          "requesters": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DeploymentRequesterDto"
+            },
+            "description": "In the order their requests arrived. Empty = Unexplained."
+          },
+          "status": {
+            "$ref": "#/components/schemas/DeploymentStatusDto"
+          },
+          "superseded_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix-ms a newer Deployment took its place, if one has."
+          },
+          "target": {
+            "$ref": "#/components/schemas/DeploymentTargetDto"
+          },
+          "unconfirmed": {
+            "type": "boolean",
+            "description": "Display term: requested on a DeploymentTarget its source has never\nreported on."
+          },
+          "unexplained": {
+            "type": "boolean",
+            "description": "Display term: no Deploy Run requested it — a change made outside Scarab."
+          },
+          "version": {
+            "type": "string",
+            "description": "Opaque, in the source's scheme; compared only for equality."
+          },
+          "was_ever_live": {
+            "type": "boolean",
+            "description": "Whether it was ever reported live."
+          }
+        }
+      },
+      "DeploymentRequesterDto": {
+        "type": "object",
+        "description": "A Deploy Run step that requested a Deployment.",
+        "required": [
+          "run",
+          "step",
+          "effective_at"
+        ],
+        "properties": {
+          "effective_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix-ms the requesting Step started."
+          },
+          "project": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Project the run belongs to, when it is stamped and in this Org —\nwhat a link to the run (`/{org}/{project}/runs/{run}`) needs."
+          },
+          "run": {
+            "type": "string"
+          },
+          "step": {
+            "type": "string"
+          }
+        }
+      },
+      "DeploymentStatusDto": {
+        "type": "string",
+        "description": "A Deployment's fixed, vendor-neutral status (ADR-0070 §5).",
+        "enum": [
+          "requested",
+          "in_progress",
+          "live",
+          "failed",
+          "stalled",
+          "superseded"
+        ]
+      },
+      "DeploymentStatusReportDto": {
+        "type": "object",
+        "description": "One stage of a Deployment as its source reported it.",
+        "required": [
+          "status",
+          "label",
+          "at"
+        ],
+        "properties": {
+          "at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix-ms Scarab received the report — the time the record is ordered by."
+          },
+          "label": {
+            "type": "string",
+            "description": "Free-form; shown, never interpreted."
+          },
+          "link": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix-ms the source stamped on it, by its own clock. Display only."
+          },
+          "status": {
+            "$ref": "#/components/schemas/SourceAssertedStatusDto"
+          }
+        }
+      },
+      "DeploymentTargetDto": {
+        "type": "object",
+        "description": "The smallest unit a Deployment can independently succeed or fail on.\n`source` + `id` are opaque and source-supplied.",
+        "required": [
+          "environment",
+          "source",
+          "id"
+        ],
+        "properties": {
+          "environment": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          }
+        }
+      },
       "DispatchKind": {
         "type": "string",
         "description": "Which trigger a dispatch opts into: a human [`Manual`](DispatchKind::Manual)\ndispatch (the default) or its programmatic [`Api`](DispatchKind::Api) sibling\n(ADR-0043 §4). The named pipeline must declare the matching `on:` trigger to\nbe dispatchable.",
@@ -3725,6 +4094,40 @@
           "ref": {
             "type": "string",
             "description": "The ref to dispatch at (branch/tag/sha). Resolved to a concrete commit;\nthe run pins to that commit."
+          }
+        }
+      },
+      "EnvironmentBoardRowDto": {
+        "type": "object",
+        "description": "One DeploymentTarget's line on the Environment board.",
+        "required": [
+          "target"
+        ],
+        "properties": {
+          "live": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DeploymentDto",
+                "description": "What is live there now, if anything."
+              }
+            ]
+          },
+          "newest": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DeploymentDto",
+                "description": "The newest Deployment, only when it is not the live one — a change in\nflight, stalled or failed."
+              }
+            ]
+          },
+          "target": {
+            "$ref": "#/components/schemas/DeploymentTargetDto"
           }
         }
       },
@@ -4638,6 +5041,15 @@
           }
         }
       },
+      "SourceAssertedStatusDto": {
+        "type": "string",
+        "description": "The statuses a source may assert in a report (INV-DEP-6) — a subset of\n[`DeploymentStatusDto`], typed apart so the wire says so too.",
+        "enum": [
+          "in_progress",
+          "live",
+          "failed"
+        ]
+      },
       "StepDto": {
         "type": "object",
         "description": "One step (IR subset): the step contract is an OCI `image` + `command`.",
@@ -4924,7 +5336,11 @@
     },
     {
       "name": "Environments",
-      "description": "Environments and their protection rules, plus deployment history."
+      "description": "Environments and their protection rules, plus their legacy approval history."
+    },
+    {
+      "name": "Deployments",
+      "description": "The vendor-neutral Deployment record (ADR-0070): what is live on each DeploymentTarget, how it got there, and the Environment board."
     },
     {
       "name": "Secrets",

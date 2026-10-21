@@ -30,6 +30,54 @@ fn openapi_document_has_v1_paths_and_ir_schemas() {
     }
 }
 
+/// The Deployment record's read API (ADR-0070) is on the documented surface,
+/// with typed bodies the web UI generates its client from, and grouped apart
+/// from the repo-scoped legacy approval history that shares the word.
+#[test]
+fn openapi_document_has_the_deployment_record() {
+    let doc: serde_json::Value = serde_json::from_str(&scarab_server::openapi_json()).unwrap();
+
+    let paths = &doc["paths"];
+    for p in [
+        "/v1/orgs/{org}/board",
+        "/v1/orgs/{org}/environments/{env}/deployments",
+        "/v1/orgs/{org}/environments/{env}/deployments/{id}",
+    ] {
+        let op = &paths[p]["get"];
+        assert!(op.is_object(), "missing GET {p}");
+        assert_eq!(op["tags"], serde_json::json!(["Deployments"]), "{p}");
+    }
+    assert_eq!(
+        paths["/v1/repos/{org}/{repo}/environments/{name}/deployments"]["get"]["tags"],
+        serde_json::json!(["Environments"]),
+        "the legacy approval history stays with Environments"
+    );
+
+    let schemas = &doc["components"]["schemas"];
+    for s in [
+        "DeploymentDto",
+        "DeploymentStatusDto",
+        "SourceAssertedStatusDto",
+        "DeploymentTargetDto",
+        "DeploymentRequesterDto",
+        "DeploymentStatusReportDto",
+        "EnvironmentBoardRowDto",
+    ] {
+        assert!(schemas.get(s).is_some(), "missing schema {s}");
+    }
+    assert_eq!(
+        schemas["DeploymentStatusDto"]["enum"],
+        serde_json::json!([
+            "requested",
+            "in_progress",
+            "live",
+            "failed",
+            "stalled",
+            "superseded"
+        ])
+    );
+}
+
 #[test]
 fn cli_emits_openapi_json_file() {
     let dir = std::env::temp_dir().join(format!("scarab-openapi-{}", std::process::id()));

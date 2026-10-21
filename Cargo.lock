@@ -2863,6 +2863,7 @@ dependencies = [
  "rsa",
  "rustls",
  "scarab-db-postgres",
+ "scarab-deployment",
  "scarab-engine",
  "scarab-executor-k8s",
  "scarab-executor-local",
