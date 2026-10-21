@@ -321,6 +321,21 @@ async fn an_environments_deployments_newest_first_with_display_terms() {
     assert_eq!(v1["was_ever_live"], json!(true));
     assert_eq!(v1["requesters"][0]["project"], json!("web"));
 
+    // `limit` bounds the response, newest first; the statuses are still the
+    // whole log's fold.
+    let (_, top2) = get_json(
+        &h.app,
+        "/v1/orgs/acme/environments/prod/deployments?limit=2",
+    )
+    .await;
+    assert_eq!(ids(&top2), vec![6, 5]);
+    let (_, none) = get_json(
+        &h.app,
+        "/v1/orgs/acme/environments/prod/deployments?limit=0",
+    )
+    .await;
+    assert_eq!(none, json!([]));
+
     // Narrowed to one DeploymentTarget.
     let (_, web) = get_json(
         &h.app,

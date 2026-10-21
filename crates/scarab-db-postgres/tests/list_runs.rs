@@ -92,3 +92,42 @@ async fn run_number_is_allocated_per_repo_over_real_postgres() {
 
     tdb.cleanup().await;
 }
+
+/// `run_tenants` answers many runs in one query: stamped runs map to their
+/// `(org, project)`, and an unstamped or unknown run is simply absent.
+#[tokio::test]
+async fn run_tenants_maps_only_stamped_runs() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+
+    for id in ["r1", "r2", "unstamped"] {
+        db.create_run(&RunId(id.into()), 1, 1, Timestamp(1_000))
+            .await
+            .unwrap();
+    }
+    db.set_run_tenant(&RunId("r1".into()), "acme", "app")
+        .await
+        .unwrap();
+    db.set_run_tenant(&RunId("r2".into()), "globex", "web")
+        .await
+        .unwrap();
+
+    let ids = ["r1", "r2", "unstamped", "unknown"].map(|r| RunId(r.into()));
+    let tenants = db.run_tenants(&ids).await.unwrap();
+    assert_eq!(tenants.len(), 2);
+    assert_eq!(
+        tenants[&RunId("r1".into())],
+        ("acme".to_string(), "app".to_string())
+    );
+    assert_eq!(
+        tenants[&RunId("r2".into())],
+        ("globex".to_string(), "web".to_string())
+    );
+    assert!(db.run_tenants(&[]).await.unwrap().is_empty());
+
+    tdb.cleanup().await;
+}

@@ -963,6 +963,16 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "At most this many, newest first (default 200, capped at 1000). Bounds\nthe response only: the server still folds the Environment's whole log\nto derive each status.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
           }
         ],
         "responses": {
@@ -4034,7 +4044,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "Unix-ms the source stamped on it, by its own clock. Display only."
+            "description": "Unix-ms the source stamped on it, by its own clock. Display only.\nPresent on every recorded report."
           },
           "status": {
             "$ref": "#/components/schemas/SourceAssertedStatusDto"
