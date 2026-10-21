@@ -7156,6 +7156,8 @@ pub struct DeploymentStatusReportDto {
     pub status: SourceAssertedStatusDto,
     /// Free-form; shown, never interpreted.
     pub label: String,
+    /// Where the source shows this stage. Only an `http`/`https` URL is
+    /// passed on; any other scheme reads as absent.
     pub link: Option<String>,
     /// Unix-ms Scarab received the report — the time the record is ordered by.
     pub at: i64,
@@ -7278,6 +7280,19 @@ async fn requester_projects(
         .collect())
 }
 
+/// A source-supplied report link, passed on only if it is an `http(s)` URL.
+/// Sources are untrusted plugins (ADR-0072): a `javascript:` or `data:` link
+/// rendered as an href would run as script on Scarab's origin. Anything else
+/// is dropped rather than escaped — the record keeps it; the API does not
+/// hand it to a browser.
+fn safe_link(link: Option<&str>) -> Option<String> {
+    let link = link?.trim();
+    let scheme_len = link.find(':')?;
+    let scheme = &link[..scheme_len];
+    (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+        .then(|| link.to_string())
+}
+
 fn deployment_dto(
     view: &scarab_deployment::DeploymentView,
     projects: &std::collections::HashMap<String, String>,
@@ -7304,7 +7319,7 @@ fn deployment_dto(
             .map(|r| DeploymentStatusReportDto {
                 status: r.report.status.into(),
                 label: r.report.label.clone(),
-                link: r.report.link.clone(),
+                link: safe_link(r.report.link.as_deref()),
                 at: r.report.at,
                 source_at: r.source_at,
             })

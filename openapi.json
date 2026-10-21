@@ -4036,7 +4036,8 @@
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "Where the source shows this stage. Only an `http`/`https` URL is\npassed on; any other scheme reads as absent."
           },
           "source_at": {
             "type": [

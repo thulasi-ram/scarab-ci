@@ -30,6 +30,7 @@ import {
   madeLiveBy,
   pickOrg,
   requesterHref,
+  safeHref,
   targetLabel,
 } from "../deployments";
 import StatusBadge from "../components/StatusBadge";
@@ -286,7 +287,7 @@ function Reports(props: { d: Deployment }) {
           <div class="dep-report">
             <StatusBadge status={r.status} />
             <span class="dep-label">{r.label}</span>
-            <Show when={r.link}>
+            <Show when={safeHref(r.link)}>
               {(href) => (
                 <a class="dep-link mono" href={href()} target="_blank" rel="noopener noreferrer">
                   open ↗
