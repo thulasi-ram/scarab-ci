@@ -10,13 +10,13 @@
 // shared link and the back button all land where you were. The defaults (Runs
 // tab, no filter) are the absent params, which keeps the bare repo URL clean.
 import { createResource, createSignal, createEffect, onCleanup, For, Show } from "solid-js";
-import { useParams, useNavigate, useSearchParams } from "@solidjs/router";
+import { A, useParams, useNavigate, useSearchParams } from "@solidjs/router";
 import { recordVisit } from "../visited";
 import {
   listRepoRuns,
   repoForgeUrl,
   listEnvironments,
-  listDeployments,
+  listApprovalHistory,
   putEnvironment,
   type RunSummary,
   type RepoEnvironment,
@@ -556,10 +556,14 @@ function RepoEnvironments(props: { org: string; repo: string; epoch: number }) {
   );
 }
 
+// The history here is APPROVALS — what governance admitted into the
+// environment — not what went live. What is actually live, and how it got
+// there, is the Deployment record (ADR-0070) on /deployments, linked from the
+// panel header.
 function EnvPanel(props: { org: string; repo: string; env: RepoEnvironment }) {
   const key = () => ({ org: props.org, repo: props.repo, name: props.env.name });
   const [history] = createResource(key, ({ org, repo, name }) =>
-    listDeployments(org, repo, name).catch(() => []),
+    listApprovalHistory(org, repo, name).catch(() => []),
   );
   const rules = () => props.env.protection;
   const allowed = () => (rules().allowed_refs.length ? rules().allowed_refs.join(", ") : "any ref");
@@ -568,9 +572,14 @@ function EnvPanel(props: { org: string; repo: string; env: RepoEnvironment }) {
     <div class="panel env-panel">
       <div class="panel-h">
         <span>{props.env.name}</span>
-        <Show when={(history() ?? []).length > 0}>
-          <span class="subtle mono">current {history()![0]!.git_ref}</span>
-        </Show>
+        <span class="env-h-meta">
+          <Show when={(history() ?? []).length > 0}>
+            <span class="subtle mono">last approved {history()![0]!.git_ref}</span>
+          </Show>
+          <A class="env-deploy-link" href={`/deployments?env=${encodeURIComponent(props.env.name)}`}>
+            <Icon icon="rocket" size={12} /> deployments
+          </A>
+        </span>
       </div>
       <div class="env-body">
         <div class="env-rules mono">
@@ -583,9 +592,10 @@ function EnvPanel(props: { org: string; repo: string; env: RepoEnvironment }) {
           </Show>
         </div>
         <div class="env-history">
+          <div class="env-h-title mono">Approval history (legacy)</div>
           <For
             each={history() ?? []}
-            fallback={<div class="env-h-row mono subtle">no deployments yet</div>}
+            fallback={<div class="env-h-row mono subtle">no approvals recorded</div>}
           >
             {(h) => (
               <div class="env-h-row mono">

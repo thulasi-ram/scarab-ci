@@ -11,6 +11,7 @@ import RunDetail from "./routes/RunDetail";
 import RunPipeline from "./routes/RunPipeline";
 import Settings from "./routes/Settings";
 import Account from "./routes/Account";
+import Deployments from "./routes/Deployments";
 
 export default function App() {
   // The sign-in gate sits ABOVE the Router, not inside its root, and that
@@ -32,6 +33,9 @@ export default function App() {
       <Route path="/settings" component={Settings} />
       {/* Your sign-in accounts (ADR-0069) — everyone's, not admin-gated. */}
       <Route path="/account" component={Account} />
+      {/* What is live where (ADR-0070), org-scoped; `?env=` picks the
+          Environment. One segment, like /settings. */}
+      <Route path="/deployments" component={Deployments} />
       <Route path="/:org/:repo/run" component={RunPipeline} />
       <Route path="/:org/:repo/runs/:id" component={RunDetail} />
       <Route path="/:org/:repo" component={RepoView} />
