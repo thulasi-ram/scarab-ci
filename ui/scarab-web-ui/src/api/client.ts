@@ -587,6 +587,77 @@ export async function listEnvironmentDeployments(
   return data;
 }
 
+// --- Org-level Environments (ADR-0071, MMP step 1) — a name, its deployment
+// deadline and the sources allowed to report into it. Additive: per-repo
+// Environments (above) still govern Runs; the two share names, nothing else. ---
+
+/** An org-level Environment. */
+export type OrgEnvironment = components["schemas"]["OrgEnvironmentDto"];
+/** A (PluginInstallation, vendor grouping) allowed to report into one. */
+export type EnvironmentDeploymentSource = components["schemas"]["EnvironmentDeploymentSourceDto"];
+/** The PUT body: the whole Environment, replaced. */
+export type PutOrgEnvironmentRequest = components["schemas"]["PutOrgEnvironmentRequest"];
+
+/** The caller may not read this org's Environments (403): reading needs Read
+ *  on the Org, as for the Deployment record. */
+export class OrgEnvironmentsForbiddenError extends Error {
+  constructor(readonly org: string) {
+    super(`no read access to ${org}'s environments`);
+    this.name = "OrgEnvironmentsForbiddenError";
+  }
+}
+
+/**
+ * The org's Environments, by name (`GET /v1/orgs/{org}/environments`).
+ *
+ * `null` when the server has no org-Environment store (a 404 before it
+ * authorizes anything) — "this server has no org Environments", not "none
+ * registered".
+ */
+export async function listOrgEnvironments(org: string): Promise<OrgEnvironment[] | null> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/environments", {
+    params: { path: { org } },
+  });
+  if (response.status === 404) return null;
+  if (response.status === 403) throw new OrgEnvironmentsForbiddenError(org);
+  if (error || !data) {
+    throw new Error(errorText(error) || "failed to load the org's environments");
+  }
+  return data;
+}
+
+/**
+ * Create or replace an Environment (`PUT /v1/orgs/{org}/environments/{env}`),
+ * org admins only. A full replace: send every field. The server's 400 (which
+ * rule broke) and 409 (which Environment already lists a source) are passed
+ * through verbatim — they are the answer to "why will this not save".
+ */
+export async function putOrgEnvironment(
+  org: string,
+  env: string,
+  body: PutOrgEnvironmentRequest,
+): Promise<OrgEnvironment> {
+  const { data, error, response } = await api.PUT("/v1/orgs/{org}/environments/{env}", {
+    params: { path: { org, env } },
+    body,
+  });
+  if (error || !data) {
+    throw new Error(errorText(error) || `could not save ${env} (${response.status})`);
+  }
+  return data;
+}
+
+/** Delete an Environment (`DELETE /v1/orgs/{org}/environments/{env}`), org
+ *  admins only. Refused (409) once it has Deployments. */
+export async function deleteOrgEnvironment(org: string, env: string): Promise<void> {
+  const { error, response } = await api.DELETE("/v1/orgs/{org}/environments/{env}", {
+    params: { path: { org, env } },
+  });
+  if (error) {
+    throw new Error(errorText(error) || `could not delete ${env} (${response.status})`);
+  }
+}
+
 /** Fetch a run's status + steps (dogfoods `GET /v1/runs/{id}`). */
 export async function getRun(id: string): Promise<RunStatus> {
   const { data, error } = await api.GET("/v1/runs/{id}", {

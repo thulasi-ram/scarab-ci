@@ -21,6 +21,7 @@ type ArtifactDto = components["schemas"]["ArtifactDto"];
 type ServiceStatusDto = components["schemas"]["ServiceStatusDto"];
 type DeploymentDto = components["schemas"]["DeploymentDto"];
 type BoardRowDto = components["schemas"]["EnvironmentBoardRowDto"];
+type OrgEnvironmentDto = components["schemas"]["OrgEnvironmentDto"];
 
 const now = Date.now();
 const ago = (ms: number) => now - ms;
@@ -615,6 +616,37 @@ const board: BoardRowDto[] = [
   { target: depStagingOrders11.target, live: depStagingOrders11, newest: null },
 ];
 
+// ── Org-level Environments (ADR-0071) — Settings › Environments, and the
+// Deployments page's pills. production is registered with two sources; qa is
+// registered with nothing deployed yet (a pill with an empty list); staging
+// has Deployments but no org Environment, so its pill reads "unregistered ·
+// default deadline". Writes echo back and persist nothing.
+const orgEnvironments: OrgEnvironmentDto[] = [
+  {
+    org: "acme",
+    name: "production",
+    description: "customer-facing, eu-west-1 + us-east-1",
+    deployment_deadline_ms: 30 * min,
+    deployment_sources: [
+      { installation: "argocd", vendor_grouping: "production" },
+      { installation: "argocd-us", vendor_grouping: "production" },
+    ],
+    created_at: ago(40 * 24 * 60 * min),
+    updated_at: ago(3 * 24 * 60 * min),
+    updated_by: "a.kim",
+  },
+  {
+    org: "acme",
+    name: "qa",
+    description: "",
+    deployment_deadline_ms: 60 * min,
+    deployment_sources: [{ installation: "argocd", vendor_grouping: "qa" }],
+    created_at: ago(2 * 60 * min),
+    updated_at: ago(2 * 60 * min),
+    updated_by: "j.lee",
+  },
+];
+
 const secretNames = { names: ["GHCR_TOKEN", "DATABASE_URL", "SLACK_WEBHOOK_URL"] };
 // Org scope (no `repo=`) holds the org-wide base of the inheritance chain — the
 // Settings page's Org Secrets section (ADR-0060).
@@ -781,9 +813,9 @@ function json(body: unknown, init?: ResponseInit) {
   });
 }
 
-// `method` matters for exactly one surface so far — minting a token POSTs to
-// the same path the list GETs — so it is threaded through rather than having
-// the token route guess from the body.
+// `method` matters where one path serves several verbs — minting a token POSTs
+// to the path the list GETs; an org Environment is GET/PUT/DELETE on one path —
+// so it is threaded through rather than having a route guess from the body.
 function route(pathname: string, search: string, method: string): Response | null {
   const p = pathname;
   if (p === "/v1/me") return json(me);
@@ -854,6 +886,30 @@ function route(pathname: string, search: string, method: string): Response | nul
     return json(apiTokens);
   }
   if (/^\/v1\/orgs\/[^/]+\/tokens\/[^/]+$/.test(p)) return json({}, { status: 204 });
+
+  // Org-level Environments (ADR-0071): list, one, and echoing writes.
+  if (/^\/v1\/orgs\/[^/]+\/environments$/.test(p)) return json(orgEnvironments);
+  if ((m = p.match(/^\/v1\/orgs\/([^/]+)\/environments\/([^/]+)$/))) {
+    const name = decodeURIComponent(m[2]!);
+    const found = orgEnvironments.find((e) => e.name === name);
+    if (method === "DELETE") return new Response(null, { status: found ? 204 : 404 });
+    if (method === "PUT") {
+      // The body is not visible here; echo the stored record (or a fresh one).
+      return json(
+        found ?? {
+          org: decodeURIComponent(m[1]!),
+          name,
+          description: "",
+          deployment_deadline_ms: 60 * min,
+          deployment_sources: [],
+          created_at: now,
+          updated_at: now,
+          updated_by: "a.kim",
+        },
+      );
+    }
+    return found ? json(found) : new Response("not found", { status: 404 });
+  }
 
   // Deployment record (ADR-0070): the board, an env's list, one Deployment.
   if (/^\/v1\/orgs\/[^/]+\/board$/.test(p)) {
