@@ -33,6 +33,12 @@ pub const MAX_ORG_ENVIRONMENT_DESCRIPTION_CHARS: usize = 1000;
 /// installation the way Kubernetes names a label).
 pub const MAX_INSTALLATION_NAME_CHARS: usize = 63;
 
+/// The most EnvironmentDeploymentSources one Environment may list. Every
+/// source is a row the replace rewrites and a key the routing lookup holds;
+/// far more than any real CD layout needs, few enough that one PUT stays a
+/// bounded write.
+pub const MAX_ENVIRONMENT_DEPLOYMENT_SOURCES: usize = 256;
+
 /// The longest vendor grouping, in characters — a Kubernetes object name's
 /// limit, which an Argo CD project name (the motivating grouping) obeys.
 pub const MAX_VENDOR_GROUPING_CHARS: usize = 253;
@@ -178,6 +184,13 @@ impl OrgEnvironment {
         if self.description.chars().count() > MAX_ORG_ENVIRONMENT_DESCRIPTION_CHARS {
             return Err(OrgEnvironmentError::Invalid(format!(
                 "description is longer than {MAX_ORG_ENVIRONMENT_DESCRIPTION_CHARS} characters"
+            )));
+        }
+        if self.deployment_sources.len() > MAX_ENVIRONMENT_DEPLOYMENT_SOURCES {
+            return Err(OrgEnvironmentError::Invalid(format!(
+                "at most {MAX_ENVIRONMENT_DEPLOYMENT_SOURCES} deployment sources per \
+                 environment, got {}",
+                self.deployment_sources.len()
             )));
         }
         let mut seen = std::collections::BTreeSet::new();
@@ -465,6 +478,23 @@ mod tests {
                 vec![source("argocd", "prod"), source("Argo", "prod")]
             )
             .validate(),
+            Err(OrgEnvironmentError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn sources_per_environment_are_capped() {
+        let sources = |n: usize| {
+            (0..n)
+                .map(|i| source("argocd", &format!("g{i}")))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            env("prod", sources(MAX_ENVIRONMENT_DEPLOYMENT_SOURCES)).validate(),
+            Ok(())
+        );
+        assert!(matches!(
+            env("prod", sources(MAX_ENVIRONMENT_DEPLOYMENT_SOURCES + 1)).validate(),
             Err(OrgEnvironmentError::Invalid(_))
         ));
     }

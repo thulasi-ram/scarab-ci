@@ -1,0 +1,18 @@
+{
+  "plugin": "argocd",
+  "capabilities": ["report_deployments", "use_connection"],
+  "connections": [
+    {
+      "name": "argocd",
+      "auth_schemes": ["bearer"],
+      "read_rules": [
+        { "method": "GET", "path": "/api/version" },
+        { "method": "GET", "path": "/api/v1/applications" },
+        { "method": "GET", "path": "/api/v1/applications/*" },
+        { "method": "GET", "path": "/api/v1/applications/*/managed-resources" },
+        { "method": "GET", "path": "/api/v1/stream/applications" }
+      ]
+    }
+  ],
+  "config_keys": ["ARGOCD_UI_URL", "OWNER_ANNOTATION"]
+}
