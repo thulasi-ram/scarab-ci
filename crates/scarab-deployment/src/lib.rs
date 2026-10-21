@@ -17,6 +17,13 @@
 //!   Deployment with its key unless that one is `superseded`; otherwise it
 //!   creates a new Deployment. A report that creates one makes an
 //!   **Unexplained** Deployment (no requester).
+//! - **Effective time.** A request carries the time its Step *started* (when
+//!   the change was made) besides the time it was recorded (when the Step
+//!   succeeded). A request whose key's newest Deployment is final still
+//!   **joins it as history** if the source first saw that Deployment at or
+//!   after the request's effective time — the source simply got there
+//!   before the request was recorded. Only an older final Deployment makes
+//!   the request a genuine rollback, i.e. a new Deployment.
 //! - **Supersession.** Creating a Deployment supersedes every other
 //!   not-yet-live Deployment on its target at once. A `live` one stays live
 //!   until another Deployment on the target is reported `live` — and an
@@ -27,8 +34,18 @@
 //! - **Status.** `superseded` wins; otherwise the latest source report
 //!   decides (`in_progress` / `live` / `failed`); with no report it is
 //!   `requested`. `requested` and `in_progress` become `stalled` once the
-//!   EnvironmentDeploymentDeadline has elapsed since the Deployment was
-//!   created; a later `live` or `failed` report still recovers it.
+//!   EnvironmentDeploymentDeadline has elapsed on the Deployment's stall
+//!   clock — started at creation and **restarted by every request that
+//!   joins it**; a later `live` or `failed` report still recovers it.
+//! - **DeploymentGate.** A gate on a request looks **forward from the
+//!   request's effective time**: it passes if the Deployment was live at
+//!   that time or is reported live after it; it fails on a `failed` report
+//!   after it, on supersession, or once the deadline has elapsed since it.
+//!   Whatever happens first decides, and the verdict never changes.
+//! - **Order.** "Before" and "after" are judged on [`DeploymentInstant`] —
+//!   time, then the order inputs arrived in — never on time alone: two
+//!   inputs can share a millisecond. A deadline sorts before every input
+//!   stamped the same time.
 //!
 //! ## Invariants
 //!
@@ -37,7 +54,8 @@
 //!
 //! - **INV-DEP-1** At most one Deployment per DeploymentTarget is `live`.
 //! - **INV-DEP-2** `superseded` is absorbing: once a Deployment is
-//!   superseded, no later input changes its status, requesters or reports.
+//!   superseded, no later input changes its status or reports (a late
+//!   request may still add itself as a requester — history, not change).
 //! - **INV-DEP-3** The newest Deployment on a DeploymentTarget is never
 //!   `superseded`.
 //! - **INV-DEP-4** At most one non-superseded Deployment per
@@ -49,13 +67,21 @@
 //! - **INV-DEP-6** A source can only assert `in_progress`, `live` or
 //!   `failed`; `requested`, `stalled` and `superseded` are derived by core.
 //!   Enforced by the type system ([`SourceAssertedStatus`]), not a test.
-//! - **INV-DEP-7** `stalled` only when the deadline has elapsed since the
-//!   Deployment was created and its latest report is neither `live` nor
-//!   `failed`.
+//! - **INV-DEP-7** `stalled` only when the deadline has elapsed on the stall
+//!   clock and the latest report is neither `live` nor `failed`.
 //! - **INV-DEP-8** No input is lost: every request is a requester, and every
 //!   report is a report, on exactly one Deployment with the input's key.
+//! - **INV-DEP-9** A DeploymentGate looks forward: it fails on `failed` only
+//!   for a `failed` report at or after its request's effective time, passes
+//!   only if the Deployment was live then or is reported live after, and
+//!   fails on `stalled` only once the deadline has elapsed since then. A
+//!   failure that predates the request never fails it.
+//! - **INV-DEP-10** A DeploymentGate verdict, once reached, never changes.
+//! - **INV-DEP-11** A request never creates a Deployment when its key's
+//!   newest Deployment was first seen at or after the request's effective
+//!   time — a late request joins, it is not a rollback.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 /// Milliseconds since the epoch. Time is an input to the fold, never read.
 pub type Millis = i64;
@@ -116,12 +142,14 @@ pub struct DeploymentStatusReport {
 /// What the fold consumes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeploymentInput {
-    /// A Deploy Run step's DeploymentRequest, recorded when the step
-    /// succeeded.
+    /// A Deploy Run step's DeploymentRequest, recorded (`at`) when the step
+    /// succeeded; `effective_at` is when the step started, i.e. no later
+    /// than the change it made.
     Request {
         target: DeploymentTarget,
         version: DeploymentVersion,
         requester: DeploymentRequester,
+        effective_at: Millis,
         at: Millis,
     },
     /// A source's report about a *(target, version)*.
@@ -161,15 +189,75 @@ impl DeploymentInput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DeploymentId(pub u64);
 
+/// A point in the ledger's total order: time first, then the order inputs
+/// arrived in. Two inputs can carry the same millisecond, and "before the
+/// request" must still mean one thing — comparing times alone made a gate's
+/// verdict flip between equal timestamps (INV-DEP-10; found by proptest at
+/// 20 000 cases). Sequence 0 is reserved for instants known in advance (a
+/// deadline), which therefore precede every input stamped the same time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DeploymentInstant {
+    pub at: Millis,
+    pub seq: u64,
+}
+
+/// Where a requester's DeploymentRequest sits in the ledger's order: its
+/// effective time (when its step started) and when it arrived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeploymentRequestMark {
+    pub effective_at: Millis,
+    pub seq: u64,
+}
+
+impl DeploymentRequestMark {
+    fn instant(&self) -> DeploymentInstant {
+        DeploymentInstant {
+            at: self.effective_at,
+            seq: self.seq,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Deployment {
     pub id: DeploymentId,
     pub target: DeploymentTarget,
     pub version: DeploymentVersion,
-    pub requesters: BTreeSet<DeploymentRequester>,
+    /// Each requester's latest DeploymentRequest (a retried step replaces
+    /// its own mark).
+    pub requesters: BTreeMap<DeploymentRequester, DeploymentRequestMark>,
     pub reports: Vec<DeploymentStatusReport>,
+    /// Where each of `reports` arrived, index for index.
+    report_seqs: Vec<u64>,
     pub created_at: Millis,
+    /// When the `stalled` deadline is measured from: creation, restarted by
+    /// each request that joins.
+    pub stall_clock_from: Millis,
     pub superseded_at: Option<Millis>,
+    superseded_seq: Option<u64>,
+}
+
+/// How a DeploymentGate resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeploymentGateVerdict {
+    Passed {
+        at: Millis,
+    },
+    Failed {
+        reason: DeploymentGateFailure,
+        at: Millis,
+    },
+}
+
+/// Why a DeploymentGate failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeploymentGateFailure {
+    /// The source reported the Deployment failed after the request.
+    Failed,
+    /// The deadline elapsed after the request with nothing decisive.
+    Stalled,
+    /// A newer Deployment took its place before it was decided.
+    Superseded,
 }
 
 impl Deployment {
@@ -185,7 +273,7 @@ impl Deployment {
             Some(SourceAssertedStatus::InProgress) => DeploymentStatus::InProgress,
             None => DeploymentStatus::Requested,
         };
-        if now - self.created_at >= deadline {
+        if now - self.stall_clock_from >= deadline {
             DeploymentStatus::Stalled
         } else {
             unconverged
@@ -212,6 +300,87 @@ impl Deployment {
     fn is_open(&self) -> bool {
         self.superseded_at.is_none()
     }
+
+    fn reports_in_order(
+        &self,
+    ) -> impl Iterator<Item = (DeploymentInstant, &DeploymentStatusReport)> {
+        self.reports
+            .iter()
+            .zip(&self.report_seqs)
+            .map(|(r, &seq)| (DeploymentInstant { at: r.at, seq }, r))
+    }
+
+    fn superseded_instant(&self) -> Option<DeploymentInstant> {
+        Some(DeploymentInstant {
+            at: self.superseded_at?,
+            seq: self.superseded_seq?,
+        })
+    }
+
+    /// Was this Deployment live just before `p` in the ledger's order?
+    fn live_before(&self, p: DeploymentInstant) -> bool {
+        self.superseded_instant().is_none_or(|s| s > p)
+            && self
+                .reports_in_order()
+                .filter(|(i, _)| *i < p)
+                .last()
+                .is_some_and(|(_, r)| r.status == SourceAssertedStatus::Live)
+    }
+
+    /// The verdict, as of `now`, of a DeploymentGate on `requester`'s
+    /// DeploymentRequest — `None` while it is still waiting (or if that
+    /// requester never landed here). Looks only forward from the request
+    /// (INV-DEP-9): it passes if the Deployment was already live, otherwise
+    /// the earliest of a decisive report, supersession or the deadline
+    /// decides, so the verdict never changes once reached (INV-DEP-10).
+    pub fn gate_verdict(
+        &self,
+        requester: &DeploymentRequester,
+        now: Millis,
+        deadline: Millis,
+    ) -> Option<DeploymentGateVerdict> {
+        let start = self.requesters.get(requester)?.instant();
+        if self.live_before(start) {
+            return Some(DeploymentGateVerdict::Passed { at: start.at });
+        }
+        let report = self
+            .reports_in_order()
+            .find(|(i, r)| *i > start && r.status != SourceAssertedStatus::InProgress)
+            .map(|(i, r)| {
+                let verdict = match r.status {
+                    SourceAssertedStatus::Live => DeploymentGateVerdict::Passed { at: r.at },
+                    _ => DeploymentGateVerdict::Failed {
+                        reason: DeploymentGateFailure::Failed,
+                        at: r.at,
+                    },
+                };
+                (i, verdict)
+            });
+        let superseded = self.superseded_instant().map(|i| {
+            let verdict = DeploymentGateVerdict::Failed {
+                reason: DeploymentGateFailure::Superseded,
+                at: i.at.max(start.at),
+            };
+            (i, verdict)
+        });
+        let stall_at = start.at + deadline;
+        let stalled = Some((
+            DeploymentInstant {
+                at: stall_at,
+                seq: 0,
+            },
+            DeploymentGateVerdict::Failed {
+                reason: DeploymentGateFailure::Stalled,
+                at: stall_at,
+            },
+        ));
+        [report, superseded, stalled]
+            .into_iter()
+            .flatten()
+            .filter(|(i, _)| i.at <= now)
+            .min_by_key(|(i, _)| *i)
+            .map(|(_, verdict)| verdict)
+    }
 }
 
 /// Every Deployment, in creation order (so "newest" is the last one on a
@@ -219,6 +388,8 @@ impl Deployment {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DeploymentLedger {
     deployments: Vec<Deployment>,
+    /// The arrival sequence of the last input; inputs are numbered from 1.
+    seq: u64,
 }
 
 impl DeploymentLedger {
@@ -251,25 +422,54 @@ impl DeploymentLedger {
 
     /// Fold one input in, returning the Deployment it landed on.
     pub fn apply(&mut self, input: DeploymentInput) -> DeploymentId {
-        let at = input.at();
-        let idx = match self.open_with_key(input.target(), input.version()) {
+        self.seq += 1;
+        let now = DeploymentInstant {
+            at: input.at(),
+            seq: self.seq,
+        };
+        let newest = self.newest_with_key(input.target(), input.version());
+        let joins = newest.filter(|&idx| {
+            let d = &self.deployments[idx];
+            match &input {
+                DeploymentInput::Request { effective_at, .. } => {
+                    d.is_open() || d.created_at >= *effective_at
+                }
+                DeploymentInput::Report { .. } => d.is_open(),
+            }
+        });
+        let idx = match joins {
             Some(idx) => idx,
-            None => self.create(input.target().clone(), input.version().clone(), at),
+            None => self.create(input.target().clone(), input.version().clone(), now),
         };
         match input {
-            DeploymentInput::Request { requester, .. } => {
-                self.deployments[idx].requesters.insert(requester);
+            DeploymentInput::Request {
+                requester,
+                effective_at,
+                ..
+            } => {
+                let d = &mut self.deployments[idx];
+                d.requesters.insert(
+                    requester,
+                    DeploymentRequestMark {
+                        effective_at,
+                        seq: now.seq,
+                    },
+                );
+                if d.is_open() {
+                    d.stall_clock_from = d.stall_clock_from.max(effective_at);
+                }
             }
             DeploymentInput::Report { report, .. } => {
                 let goes_live = report.status == SourceAssertedStatus::Live;
                 self.deployments[idx].reports.push(report);
+                self.deployments[idx].report_seqs.push(now.seq);
                 if goes_live {
-                    self.supersede_other_live(idx, at);
+                    self.supersede_other_live(idx, now);
                 } else if !self.is_newest(idx) {
                     // An older Deployment is kept open only while it is the
                     // live one; it stopped being live, so the newer one has
                     // taken its place.
-                    self.deployments[idx].superseded_at = Some(at);
+                    supersede(&mut self.deployments[idx], now);
                 }
             }
         }
@@ -283,17 +483,15 @@ impl DeploymentLedger {
             .any(|d| &d.target == target)
     }
 
-    /// The newest Deployment with this key, if it is not final.
-    fn open_with_key(
+    /// The newest Deployment with this key, final or not.
+    fn newest_with_key(
         &self,
         target: &DeploymentTarget,
         version: &DeploymentVersion,
     ) -> Option<usize> {
-        let idx = self
-            .deployments
+        self.deployments
             .iter()
-            .rposition(|d| &d.target == target && &d.version == version)?;
-        self.deployments[idx].is_open().then_some(idx)
+            .rposition(|d| &d.target == target && &d.version == version)
     }
 
     /// A new Deployment becomes the newest on its target, superseding every
@@ -302,14 +500,14 @@ impl DeploymentLedger {
         &mut self,
         target: DeploymentTarget,
         version: DeploymentVersion,
-        at: Millis,
+        now: DeploymentInstant,
     ) -> usize {
         for d in self.deployments.iter_mut() {
             if d.target == target
                 && d.is_open()
                 && d.latest_report() != Some(SourceAssertedStatus::Live)
             {
-                d.superseded_at = Some(at);
+                supersede(d, now);
             }
         }
         let id = DeploymentId(self.deployments.len() as u64);
@@ -317,17 +515,20 @@ impl DeploymentLedger {
             id,
             target,
             version,
-            requesters: BTreeSet::new(),
+            requesters: BTreeMap::new(),
             reports: Vec::new(),
-            created_at: at,
+            report_seqs: Vec::new(),
+            created_at: now.at,
+            stall_clock_from: now.at,
             superseded_at: None,
+            superseded_seq: None,
         });
         self.deployments.len() - 1
     }
 
     /// `idx` was just reported live: whatever was live on its target before
     /// is now superseded.
-    fn supersede_other_live(&mut self, idx: usize, at: Millis) {
+    fn supersede_other_live(&mut self, idx: usize, now: DeploymentInstant) {
         let target = self.deployments[idx].target.clone();
         for (i, d) in self.deployments.iter_mut().enumerate() {
             if i != idx
@@ -335,8 +536,13 @@ impl DeploymentLedger {
                 && d.is_open()
                 && d.latest_report() == Some(SourceAssertedStatus::Live)
             {
-                d.superseded_at = Some(at);
+                supersede(d, now);
             }
         }
     }
+}
+
+fn supersede(d: &mut Deployment, now: DeploymentInstant) {
+    d.superseded_at = Some(now.at);
+    d.superseded_seq = Some(now.seq);
 }

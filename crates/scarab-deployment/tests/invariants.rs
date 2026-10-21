@@ -22,7 +22,14 @@ fn version(v: &str) -> DeploymentVersion {
     DeploymentVersion(v.into())
 }
 
-fn request(t: &str, v: &str, run: &str, at: Millis) -> DeploymentInput {
+/// A request whose step started at `effective_at` and succeeded at `at`.
+fn request_started(
+    t: &str,
+    v: &str,
+    run: &str,
+    effective_at: Millis,
+    at: Millis,
+) -> DeploymentInput {
     DeploymentInput::Request {
         target: target(t),
         version: version(v),
@@ -30,8 +37,21 @@ fn request(t: &str, v: &str, run: &str, at: Millis) -> DeploymentInput {
             run: run.into(),
             step: "bump".into(),
         },
+        effective_at,
         at,
     }
+}
+
+fn requester(run: &str) -> DeploymentRequester {
+    DeploymentRequester {
+        run: run.into(),
+        step: "bump".into(),
+    }
+}
+
+/// A request from a step that started and succeeded at the same instant.
+fn request(t: &str, v: &str, run: &str, at: Millis) -> DeploymentInput {
+    request_started(t, v, run, at, at)
 }
 
 fn report(t: &str, v: &str, status: SourceAssertedStatus, at: Millis) -> DeploymentInput {
@@ -57,8 +77,16 @@ fn input_at(at: Millis) -> impl Strategy<Value = DeploymentInput> {
         SourceAssertedStatus::Live,
         SourceAssertedStatus::Failed,
     ]);
+    // A step may have started up to 60ms before it succeeded, so requests
+    // arrive late relative to the change they made.
     prop_oneof![
-        (t.clone(), v.clone(), run).prop_map(move |(t, v, r)| request(t, v, r, at)),
+        (t.clone(), v.clone(), run, 0i64..60).prop_map(move |(t, v, r, lag)| request_started(
+            t,
+            v,
+            r,
+            at - lag,
+            at
+        )),
         (t, v, status).prop_map(move |(t, v, s)| report(t, v, s, at)),
     ]
 }
@@ -117,15 +145,16 @@ proptest! {
         });
     }
 
-    /// INV-DEP-2: superseded is absorbing — status, requesters and reports
-    /// never change again.
+    /// INV-DEP-2: superseded is absorbing — status and reports never change
+    /// again (a late request may still add itself as a requester).
     #[test]
     fn inv_dep_2_superseded_is_absorbing(inputs in inputs(), later in 0i64..1000) {
         let mut frozen: Vec<Deployment> = Vec::new();
         fold_checking(&inputs, |ledger, now| {
             for f in &frozen {
                 let d = ledger.get(f.id).expect("deployments are never removed");
-                assert_eq!(d, f, "a superseded deployment changed");
+                assert_eq!(d.reports, f.reports, "a superseded deployment changed");
+                assert_eq!(d.superseded_at, f.superseded_at);
                 assert_eq!(d.status(now + later, DEADLINE), DeploymentStatus::Superseded);
             }
             frozen = ledger
@@ -198,7 +227,7 @@ proptest! {
             let at = now + probe;
             for d in ledger.deployments() {
                 if d.status(at, DEADLINE) == DeploymentStatus::Stalled {
-                    assert!(at - d.created_at >= DEADLINE);
+                    assert!(at - d.stall_clock_from >= DEADLINE);
                     assert!(!matches!(
                         d.latest_report(),
                         Some(SourceAssertedStatus::Live | SourceAssertedStatus::Failed)
@@ -219,7 +248,7 @@ proptest! {
             assert_eq!(&d.target, input.target());
             assert_eq!(&d.version, input.version());
             match input {
-                DeploymentInput::Request { requester, .. } => assert!(d.requesters.contains(requester)),
+                DeploymentInput::Request { requester, .. } => assert!(d.requesters.contains_key(requester)),
                 DeploymentInput::Report { report, .. } => assert_eq!(d.reports.last(), Some(report)),
             }
         }
@@ -229,6 +258,88 @@ proptest! {
             .filter(|i| matches!(i, DeploymentInput::Report { .. }))
             .count();
         assert_eq!(reports, expected);
+    }
+
+    /// INV-DEP-9 and INV-DEP-10: every DeploymentGate looks only forward from
+    /// its request's effective time, and its verdict never changes once
+    /// reached.
+    #[test]
+    fn inv_dep_9_10_gates_look_forward_and_freeze(inputs in inputs(), probe in 0i64..300) {
+        let mut ledger = DeploymentLedger::new();
+        // (deployment, requester, effective_at, first verdict seen). A step
+        // that requests again is a new attempt with a new gate, so it replaces
+        // its own earlier entry.
+        type Gate = (DeploymentId, DeploymentRequester, Millis, Option<DeploymentGateVerdict>);
+        let mut gates: Vec<Gate> = Vec::new();
+        for input in &inputs {
+            let id = ledger.apply(input.clone());
+            if let DeploymentInput::Request { requester, effective_at, .. } = input {
+                gates.retain(|(_, r, _, _)| r != requester);
+                gates.push((id, requester.clone(), *effective_at, None));
+            }
+            let now = input.at();
+            for (id, requester, effective_at, seen) in gates.iter_mut() {
+                let d = ledger.get(*id).unwrap();
+                let Some(v) = d.gate_verdict(requester, now, DEADLINE) else {
+                    assert!(seen.is_none(), "a verdict was withdrawn");
+                    continue;
+                };
+                if let Some(first) = seen {
+                    assert_eq!(*first, v, "a gate verdict changed");
+                }
+                *seen = Some(v);
+                match v {
+                    DeploymentGateVerdict::Passed { at } => {
+                        assert!(at >= *effective_at);
+                        assert!(d.reports.iter().any(|r| r.status == SourceAssertedStatus::Live && r.at <= at));
+                    }
+                    DeploymentGateVerdict::Failed { reason: DeploymentGateFailure::Failed, at } => {
+                        assert!(d.reports.iter().any(|r| r.status == SourceAssertedStatus::Failed
+                            && r.at == at && r.at >= *effective_at));
+                    }
+                    DeploymentGateVerdict::Failed { reason: DeploymentGateFailure::Stalled, at } => {
+                        assert_eq!(at, *effective_at + DEADLINE);
+                        assert!(now >= at);
+                    }
+                    DeploymentGateVerdict::Failed { reason: DeploymentGateFailure::Superseded, .. } => {
+                        assert!(d.superseded_at.is_some());
+                    }
+                }
+            }
+        }
+        // Looking further into the future never withdraws or changes one.
+        let end = inputs.last().map_or(0, |i| i.at());
+        for (id, requester, _, seen) in &gates {
+            let later = ledger.get(*id).unwrap().gate_verdict(requester, end + probe, DEADLINE);
+            if let Some(first) = seen {
+                assert_eq!(later, Some(*first));
+            }
+        }
+    }
+
+    /// INV-DEP-11: a request never creates a Deployment when its key's newest
+    /// Deployment was first seen at or after the request's effective time.
+    #[test]
+    fn inv_dep_11_a_late_request_joins_rather_than_rolls_back(inputs in inputs()) {
+        let mut ledger = DeploymentLedger::new();
+        for input in &inputs {
+            let before = ledger.deployments().len();
+            let seen_after = match input {
+                DeploymentInput::Request { target, version, effective_at, .. } => ledger
+                    .deployments()
+                    .iter()
+                    .rev()
+                    .find(|d| &d.target == target && &d.version == version)
+                    .filter(|d| d.created_at >= *effective_at)
+                    .map(|d| d.id),
+                DeploymentInput::Report { .. } => None,
+            };
+            let id = ledger.apply(input.clone());
+            if let Some(existing) = seen_after {
+                assert_eq!(id, existing);
+                assert_eq!(ledger.deployments().len(), before);
+            }
+        }
     }
 }
 
@@ -331,61 +442,109 @@ fn stalled_recovers_when_the_source_reports_live() {
     );
 }
 
-// ---- audit findings these rules do NOT yet answer --------------------------
-//
-// Each test below pins what the rules as agreed actually do in a scenario the
-// 2026-10-22 design audit raised. They assert today's behaviour on purpose:
-// the behaviour is a pending design decision, and a change to these rules must
-// show up as a change to these tests.
+// ---- scenarios from the 2026-10-22 design audit ------------------------------
 
 #[test]
-fn audit_2_a_rerequest_after_failure_joins_the_failed_deployment() {
-    // Secret fixed, same commit redeployed by a new Run: the new request
-    // joins the already-failed Deployment, so a DeploymentGate resolving on
-    // "first decisive status" would fail the new Run at once. It also
-    // inherits the old Deployment's deadline clock.
+fn a_rerequest_after_failure_waits_for_fresh_reports() {
+    // Audit finding 2. Secret fixed, same version redeployed by a new Run: the
+    // request joins the failed Deployment, but its gate ignores the failure
+    // from before the request and waits for what happens next.
     let mut l = DeploymentLedger::new();
     let d = l.apply(request("api", "c1", "r1", 0));
     l.apply(report("api", "c1", Failed, 5));
     let again = l.apply(request("api", "c1", "r2", 200));
     assert_eq!(again, d);
+    let deployment = l.get(d).unwrap();
     assert_eq!(
-        l.get(d).unwrap().status(200, DEADLINE),
-        DeploymentStatus::Failed
+        deployment.gate_verdict(&requester("r2"), 200, DEADLINE),
+        None
+    );
+    // The stall clock restarted with the new request.
+    assert_eq!(deployment.stall_clock_from, 200);
+    // Nobody resyncs: it stalls a full deadline after the new request.
+    assert_eq!(
+        deployment.gate_verdict(&requester("r2"), 200 + DEADLINE, DEADLINE),
+        Some(DeploymentGateVerdict::Failed {
+            reason: DeploymentGateFailure::Stalled,
+            at: 200 + DEADLINE
+        })
+    );
+    // A resync takes it live before then: the gate passes.
+    l.apply(report("api", "c1", Live, 250));
+    assert_eq!(
+        l.get(d)
+            .unwrap()
+            .gate_verdict(&requester("r2"), 250, DEADLINE),
+        Some(DeploymentGateVerdict::Passed { at: 250 })
     );
 }
 
 #[test]
-fn audit_3_a_late_request_for_a_replaced_version_becomes_newest_and_stalls() {
-    // c1 went live, then an unrelated commit c2 was reported live, and only
-    // then was the Run's request for c1 recorded. c1's Deployment is final, so
-    // the late request makes a NEW one that is now the newest on the target —
-    // indistinguishable from a rollback — and it will stall.
+fn a_late_request_joins_the_deployment_the_source_already_saw() {
+    // Audit finding 3. The step started at -5 and merged; the source reported
+    // c1 live at 0 and an even newer c2 live at 10, and only then (12) was
+    // the request recorded. It joins c1's Deployment as history instead of
+    // creating a phantom rollback, and its gate passes: c1 did go live.
     let mut l = DeploymentLedger::new();
-    let first = l.apply(report("api", "c1", Live, 0));
+    let c1 = l.apply(report("api", "c1", Live, 0));
     let c2 = l.apply(report("api", "c2", Live, 10));
-    let late = l.apply(request("api", "c1", "r1", 12));
-    assert_ne!(late, first);
-    assert_eq!(l.newest_on(&target("api")).unwrap().id, late);
-    assert_eq!(l.live_on(&target("api")).unwrap().id, c2);
+    let late = l.apply(request_started("api", "c1", "r1", -5, 12));
+    assert_eq!(late, c1);
+    assert!(!l.get(c1).unwrap().is_unexplained());
+    assert_eq!(l.newest_on(&target("api")).unwrap().id, c2);
     assert_eq!(
-        l.get(late).unwrap().status(12 + DEADLINE, DEADLINE),
-        DeploymentStatus::Stalled
+        l.get(c1)
+            .unwrap()
+            .gate_verdict(&requester("r1"), 12, DEADLINE),
+        Some(DeploymentGateVerdict::Passed { at: 0 })
     );
 }
 
 #[test]
-fn audit_1_an_unrelated_gitops_commit_supersedes_the_requested_one() {
-    // Argo's synced revision moves to every new HEAD of the tracked branch. If
-    // another team's commit c2 lands before Argo syncs, Argo reports c2 live
-    // and never c1: the requested Deployment is superseded although its change
-    // IS live (c2 contains it).
+fn a_request_for_an_older_version_made_after_it_was_replaced_is_a_rollback() {
+    // The other side of the same rule: c1 was first seen before this step
+    // started, so asking for it again is a genuine rollback.
+    let mut l = DeploymentLedger::new();
+    let c1 = l.apply(report("api", "c1", Live, 0));
+    l.apply(report("api", "c2", Live, 10));
+    let rollback = l.apply(request_started("api", "c1", "r9", 15, 20));
+    assert_ne!(rollback, c1);
+    assert_eq!(l.newest_on(&target("api")).unwrap().id, rollback);
+}
+
+#[test]
+fn a_rerequest_of_what_is_already_live_passes_at_once() {
+    // Nothing will change, so no report will come: the gate passes because
+    // the requested version was already serving when the request was made.
+    let mut l = DeploymentLedger::new();
+    let d = l.apply(report("api", "c1", Live, 0));
+    l.apply(request("api", "c1", "r1", 30));
+    assert_eq!(
+        l.get(d)
+            .unwrap()
+            .gate_verdict(&requester("r1"), 30, DEADLINE),
+        Some(DeploymentGateVerdict::Passed { at: 30 })
+    );
+}
+
+#[test]
+fn with_a_gitops_commit_scheme_an_unrelated_commit_supersedes_the_request() {
+    // Audit finding 1, and why the DeploymentVersion scheme is declared by the
+    // source (decided 2026-10-22, provisional). Under a "gitops commit" scheme
+    // another team's commit c2 landing before Argo syncs makes Argo report c2
+    // and never c1, superseding the request although its change is live. An
+    // image-set scheme does not change on unrelated commits, so the report
+    // would carry the requested version instead.
     let mut l = DeploymentLedger::new();
     let requested = l.apply(request("api", "c1", "r1", 0));
     l.apply(report("api", "c2", Live, 30));
     assert_eq!(
-        l.get(requested).unwrap().status(30, DEADLINE),
-        DeploymentStatus::Superseded
+        l.get(requested)
+            .unwrap()
+            .gate_verdict(&requester("r1"), 30, DEADLINE),
+        Some(DeploymentGateVerdict::Failed {
+            reason: DeploymentGateFailure::Superseded,
+            at: 30
+        })
     );
-    assert!(l.newest_on(&target("api")).unwrap().is_unexplained());
 }
