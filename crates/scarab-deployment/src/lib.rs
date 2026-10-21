@@ -45,7 +45,10 @@
 //! - **Order.** "Before" and "after" are judged on [`DeploymentInstant`] —
 //!   time, then the order inputs arrived in — never on time alone: two
 //!   inputs can share a millisecond. A deadline sorts before every input
-//!   stamped the same time.
+//!   stamped the same time. Inputs arrive in time order — `at` is core's
+//!   receipt time, stamped by the store, never a source's clock — and one
+//!   that arrives backdated is clamped up, not trusted
+//!   ([`DeploymentLedger::apply`]).
 //!
 //! ## Invariants
 //!
@@ -88,8 +91,8 @@ pub mod view;
 
 pub use store::{DeploymentStore, DeploymentStoreError, LoggedDeploymentInput};
 pub use view::{
-    fold_environment, DeploymentRequesterView, DeploymentView, EnvironmentBoardRow,
-    EnvironmentDeployments,
+    fold_environment, DeploymentRequesterView, DeploymentStatusReportView, DeploymentView,
+    EnvironmentBoardRow, EnvironmentDeployments,
 };
 
 /// Milliseconds since the epoch. Time is an input to the fold, never read.
@@ -202,6 +205,15 @@ impl DeploymentInput {
             DeploymentInput::Request { at, .. } => *at,
             DeploymentInput::Report { report, .. } => report.at,
         }
+    }
+
+    /// The same input, its `at` raised to at least `floor`.
+    fn at_least(mut self, floor: Millis) -> Self {
+        match &mut self {
+            DeploymentInput::Request { at, .. } => *at = (*at).max(floor),
+            DeploymentInput::Report { report, .. } => report.at = report.at.max(floor),
+        }
+        self
     }
 }
 
@@ -410,6 +422,8 @@ pub struct DeploymentLedger {
     deployments: Vec<Deployment>,
     /// The arrival sequence of the last input; inputs are numbered from 1.
     seq: u64,
+    /// The `at` of the last input, after clamping (see [`Self::apply`]).
+    last_at: Option<Millis>,
 }
 
 impl DeploymentLedger {
@@ -441,7 +455,22 @@ impl DeploymentLedger {
     }
 
     /// Fold one input in, returning the Deployment it landed on.
+    ///
+    /// Requires inputs in non-decreasing `at`: the fold walks them in arrival
+    /// order and judges "before"/"after" on time first, so the two orders
+    /// must agree. The store guarantees it — `at` is the time core *received*
+    /// the input, stamped monotonically per Org, never a source's own clock
+    /// (ADR-0070; a plugin's clock and the control plane's disagree). An
+    /// input that arrives backdated anyway is clamped up to the last `at`
+    /// rather than trusted: otherwise a late arrival could land "before"
+    /// something the fold has already decided on, and a DeploymentGate
+    /// verdict could flip (INV-DEP-10).
     pub fn apply(&mut self, input: DeploymentInput) -> DeploymentId {
+        let input = match self.last_at {
+            Some(floor) => input.at_least(floor),
+            None => input,
+        };
+        self.last_at = Some(input.at());
         self.seq += 1;
         let now = DeploymentInstant {
             at: input.at(),

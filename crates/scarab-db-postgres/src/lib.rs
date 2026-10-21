@@ -2401,20 +2401,36 @@ impl EnvironmentStore for PostgresDb {
 // DeploymentStore (ADR-0070): the Deployment record's append-only input log.
 // ---------------------------------------------------------------------------
 
-/// Append one DeploymentInput to `org`'s log on `conn`, returning its seq.
+/// The `deployment_inputs` columns [`deployment_input_from_row`] reads — one
+/// list, so the append's `RETURNING` and the read's `SELECT` cannot drift.
+const DEPLOYMENT_INPUT_COLUMNS: &str =
+    "seq, environment, target_source, target_id, version, kind, at,
+     requester_run, requester_step, effective_at,
+     report_status, report_label, report_link, report_source_at";
+
+/// Append one DeploymentInput to `org`'s log on `conn`, returning it as
+/// logged — seq and stamped times included.
 ///
 /// One statement: the CTE bumps (or creates) the Org's counter row and the
-/// insert takes the number it returned. The counter row stays locked until
-/// `conn`'s transaction commits, which is what makes seq equal commit order
-/// within an Org (migration 0053). Takes a bare connection rather than the
-/// pool so a caller can append inside a transaction of its own — recording a
-/// DeploymentRequest in the same commit as the Step success that produced it
-/// — and still share the one counter.
+/// insert takes the seq and receipt time it returned. The counter row stays
+/// locked until `conn`'s transaction commits, which is what makes seq equal
+/// commit order within an Org (migration 0053). Takes a bare connection rather
+/// than the pool so a caller can append inside a transaction of its own —
+/// recording a DeploymentRequest in the same commit as the Step success that
+/// produced it — and still share the one counter.
+///
+/// **Core stamps time** (migration 0053): the stored `at` is the receipt time,
+/// GREATEST(the database clock, the Org's last `at`), never `input.at()`. It
+/// reads `clock_timestamp()`, not `now()`: `now()` is frozen at transaction
+/// start, so an append inside a long transaction would be stamped as of its
+/// beginning — still monotone through the GREATEST, but needlessly early. A
+/// report's own `at` is kept as `report_source_at`; a request's
+/// `effective_at` is clamped to no later than the stamp.
 pub async fn append_deployment_input(
     conn: &mut sqlx::PgConnection,
     org: &str,
     input: &scarab_deployment::DeploymentInput,
-) -> Result<u64, sqlx::Error> {
+) -> Result<scarab_deployment::LoggedDeploymentInput, DeploymentStoreError> {
     use scarab_deployment::DeploymentInput;
     let target = input.target();
     let (kind, requester, effective_at, report) = match input {
@@ -2425,36 +2441,46 @@ pub async fn append_deployment_input(
         } => ("request", Some(requester), Some(*effective_at), None),
         DeploymentInput::Report { report, .. } => ("report", None, None, Some(report)),
     };
-    let seq: i64 = sqlx::query_scalar(
+    let sql = format!(
         "WITH c AS (
-             INSERT INTO deployment_input_counters (org, last_seq) VALUES ($1, 1)
+             INSERT INTO deployment_input_counters (org, last_seq, last_at)
+             VALUES ($1, 1, (extract(epoch FROM clock_timestamp()) * 1000)::bigint)
              ON CONFLICT (org) DO UPDATE
-                 SET last_seq = deployment_input_counters.last_seq + 1
-             RETURNING last_seq
+                 SET last_seq = deployment_input_counters.last_seq + 1,
+                     last_at = GREATEST(
+                         (extract(epoch FROM clock_timestamp()) * 1000)::bigint,
+                         deployment_input_counters.last_at)
+             RETURNING last_seq, last_at
          )
          INSERT INTO deployment_inputs
              (org, seq, environment, target_source, target_id, version, kind, at,
               requester_run, requester_step, effective_at,
-              report_status, report_label, report_link)
-         SELECT $1, c.last_seq, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13 FROM c
-         RETURNING seq",
-    )
-    .bind(org)
-    .bind(&target.environment)
-    .bind(&target.source)
-    .bind(&target.id)
-    .bind(&input.version().0)
-    .bind(kind)
-    .bind(input.at())
-    .bind(requester.map(|r| r.run.as_str()))
-    .bind(requester.map(|r| r.step.as_str()))
-    .bind(effective_at)
-    .bind(report.map(|r| source_asserted_status_str(r.status)))
-    .bind(report.map(|r| r.label.as_str()))
-    .bind(report.and_then(|r| r.link.as_deref()))
-    .fetch_one(&mut *conn)
-    .await?;
-    Ok(seq as u64)
+              report_status, report_label, report_link, report_source_at)
+         SELECT $1, c.last_seq, $2, $3, $4, $5, $6, c.last_at, $7, $8,
+                -- LEAST ignores NULLs, so a report's NULL needs the CASE.
+                CASE WHEN $9::bigint IS NULL THEN NULL ELSE LEAST($9::bigint, c.last_at) END,
+                $10, $11, $12, $13
+         FROM c
+         RETURNING {DEPLOYMENT_INPUT_COLUMNS}"
+    );
+    let row = sqlx::query(&sql)
+        .bind(org)
+        .bind(&target.environment)
+        .bind(&target.source)
+        .bind(&target.id)
+        .bind(&input.version().0)
+        .bind(kind)
+        .bind(requester.map(|r| r.run.as_str()))
+        .bind(requester.map(|r| r.step.as_str()))
+        .bind(effective_at)
+        .bind(report.map(|r| source_asserted_status_str(r.status)))
+        .bind(report.map(|r| r.label.as_str()))
+        .bind(report.and_then(|r| r.link.as_deref()))
+        .bind(report.map(|r| r.at))
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(deployment_store_err)?;
+    deployment_input_from_row(&row)
 }
 
 fn source_asserted_status_str(s: scarab_deployment::SourceAssertedStatus) -> &'static str {
@@ -2542,6 +2568,7 @@ fn deployment_input_from_row(
     Ok(LoggedDeploymentInput {
         seq: seq as u64,
         input,
+        report_source_at: r.get::<Option<i64>, _>("report_source_at"),
     })
 }
 
@@ -2555,11 +2582,9 @@ impl DeploymentStore for PostgresDb {
         &self,
         org: &str,
         input: &scarab_deployment::DeploymentInput,
-    ) -> Result<u64, DeploymentStoreError> {
+    ) -> Result<scarab_deployment::LoggedDeploymentInput, DeploymentStoreError> {
         let mut conn = self.pool().acquire().await.map_err(deployment_store_err)?;
-        append_deployment_input(&mut conn, org, input)
-            .await
-            .map_err(deployment_store_err)
+        append_deployment_input(&mut conn, org, input).await
     }
 
     async fn inputs(
@@ -2567,19 +2592,17 @@ impl DeploymentStore for PostgresDb {
         org: &str,
         environment: &str,
     ) -> Result<Vec<scarab_deployment::LoggedDeploymentInput>, DeploymentStoreError> {
-        let rows = sqlx::query(
-            "SELECT seq, environment, target_source, target_id, version, kind, at,
-                    requester_run, requester_step, effective_at,
-                    report_status, report_label, report_link
-             FROM deployment_inputs
+        let sql = format!(
+            "SELECT {DEPLOYMENT_INPUT_COLUMNS} FROM deployment_inputs
              WHERE org = $1 AND environment = $2
-             ORDER BY seq",
-        )
-        .bind(org)
-        .bind(environment)
-        .fetch_all(self.pool())
-        .await
-        .map_err(deployment_store_err)?;
+             ORDER BY seq"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(org)
+            .bind(environment)
+            .fetch_all(self.pool())
+            .await
+            .map_err(deployment_store_err)?;
         rows.iter().map(deployment_input_from_row).collect()
     }
 

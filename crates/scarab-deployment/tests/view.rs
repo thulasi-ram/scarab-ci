@@ -31,6 +31,7 @@ fn request(seq: u64, t: &str, v: &str, run: &str, at: Millis) -> LoggedDeploymen
             effective_at: at,
             at,
         },
+        report_source_at: None,
     }
 }
 
@@ -53,6 +54,8 @@ fn report(
                 at,
             },
         },
+        // The source's clock runs a little behind core's.
+        report_source_at: Some(at - 1),
     }
 }
 
@@ -202,12 +205,20 @@ fn detail_carries_requesters_reports_and_history() {
         vec![("r1", 11), ("r2", 12)]
     );
     assert_eq!(
-        v1.reports.iter().map(|r| r.status).collect::<Vec<_>>(),
+        v1.reports
+            .iter()
+            .map(|r| r.report.status)
+            .collect::<Vec<_>>(),
         vec![InProgress, Live]
     );
     assert_eq!(
-        v1.reports[0].link.as_deref(),
+        v1.reports[0].report.link.as_deref(),
         Some("https://argo.example/web/4")
+    );
+    // Both times survive: core's receipt time, and the source's own beside it.
+    assert_eq!(
+        (v1.reports[0].report.at, v1.reports[0].source_at),
+        (13, Some(12))
     );
     assert_eq!(v1.status, DeploymentStatus::Superseded);
     assert_eq!(v1.superseded_at, Some(16));

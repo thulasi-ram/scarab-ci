@@ -30,6 +30,16 @@ pub struct DeploymentRequesterView {
     pub effective_at: Millis,
 }
 
+/// One stage of a Deployment as reported: the report as the fold holds it
+/// (`report.at` is when core received it) plus the time the source gave it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentStatusReportView {
+    pub report: DeploymentStatusReport,
+    /// The source's own timestamp — display-only, never compared (its clock
+    /// is not core's). `None` when the input carried none.
+    pub source_at: Option<Millis>,
+}
+
 /// One Deployment as a reader sees it at a given `now`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeploymentView {
@@ -41,8 +51,8 @@ pub struct DeploymentView {
     /// In the order their requests arrived; a retried Step appears once, at
     /// its latest request.
     pub requesters: Vec<DeploymentRequesterView>,
-    /// The Deployment's stages, in the order they were reported.
-    pub reports: Vec<DeploymentStatusReport>,
+    /// The Deployment's stages, in the order they were received.
+    pub reports: Vec<DeploymentStatusReportView>,
     pub created_at: Millis,
     pub superseded_at: Option<Millis>,
     /// Whether it was ever reported live — tells "replaced after going live"
@@ -107,23 +117,30 @@ pub fn fold_environment(
     // Deployment there. `apply` creates at most one Deployment per input, and
     // always at the end, so a grown ledger means "this input created it".
     let mut created_by: Vec<u64> = Vec::new();
+    // Indexed the same way: each report's source timestamp, in the order the
+    // reports landed — i.e. index for index with that Deployment's `reports`.
+    let mut report_source_ats: Vec<Vec<Option<Millis>>> = Vec::new();
     let mut reported_targets: BTreeSet<&DeploymentTarget> = BTreeSet::new();
     for logged in inputs {
         if let DeploymentInput::Report { target, .. } = &logged.input {
             reported_targets.insert(target);
         }
         let before = ledger.deployments().len();
-        ledger.apply(logged.input.clone());
+        let landed = ledger.apply(logged.input.clone());
         if ledger.deployments().len() > before {
             created_by.push(logged.seq);
+            report_source_ats.push(Vec::new());
+        }
+        if matches!(logged.input, DeploymentInput::Report { .. }) {
+            report_source_ats[landed.0 as usize].push(logged.report_source_at);
         }
     }
 
     let views: Vec<DeploymentView> = ledger
         .deployments()
         .iter()
-        .zip(&created_by)
-        .map(|(d, &id)| {
+        .zip(created_by.iter().zip(&report_source_ats))
+        .map(|(d, (&id, source_ats))| {
             let mut requesters: Vec<_> = d.requesters.iter().collect();
             requesters.sort_by_key(|(_, mark)| mark.seq);
             DeploymentView {
@@ -138,7 +155,15 @@ pub fn fold_environment(
                         effective_at: mark.effective_at,
                     })
                     .collect(),
-                reports: d.reports.clone(),
+                reports: d
+                    .reports
+                    .iter()
+                    .zip(source_ats)
+                    .map(|(report, &source_at)| DeploymentStatusReportView {
+                        report: report.clone(),
+                        source_at,
+                    })
+                    .collect(),
                 created_at: d.created_at,
                 superseded_at: d.superseded_at,
                 was_ever_live: d.was_ever_live(),
