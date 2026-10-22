@@ -73,6 +73,9 @@ pub mod org_environments;
 /// ADR-0072: PluginInstallations — the first-party catalog, install,
 /// uninstall, the kill switch — and the read views report ingest feeds.
 pub mod plugins;
+/// ADR-0072 §9: the plugin runtime's leased reconcile loop — namespace
+/// baseline, isolation probe, one workload per installation.
+pub mod plugin_runtime;
 pub mod retention;
 pub mod secret_executor;
 /// `--role workspace`: the ADR-0061 workspace service. Its own router, its own

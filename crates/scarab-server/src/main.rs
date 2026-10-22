@@ -724,7 +724,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let mut state = AppState::new(db, clock, logs)
+    let mut state = AppState::new(db.clone(), clock.clone(), logs)
         // How the outside world reaches this server (SCARAB_PUBLIC_URL).
         // UNCONDITIONAL, and it must stay that way: every webhook Scarab
         // registers posts to `{public_url}/webhooks/{forge}`, so gating this on
@@ -893,10 +893,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         state = state.with_ui_dir(&ui_dir);
         tracing::info!(dir = %ui_dir, "web UI embedded (same-origin, ADR-0054)");
     }
-    // Broker tokens (ADR-0072 §11). TokenReview is slice d2; until then only
-    // the dev stand-in exists, and the config gate admitted it only under
-    // SCARAB_DEV_INSECURE. With neither, every broker call is a 401 — the
-    // startup report says so.
+    // Broker tokens (ADR-0072 §11). Static dev tokens, when configured (the
+    // config gate admitted them only under SCARAB_DEV_INSECURE), stand in for
+    // TokenReview — the proc-mode path for a plugin run as a host process,
+    // which has no projected token. Otherwise TokenReview, below, once a
+    // cluster is reachable. With neither, every broker call is a 401.
     if !config.plugins.dev_tokens.is_empty() {
         state = state.with_plugin_tokens(Arc::new(scarab_server::broker::DevPluginTokens::new(
             config.plugins.namespace.clone(),
@@ -907,6 +908,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|(id, token)| (id.clone(), token.expose().to_string()))
                 .collect(),
         )));
+    }
+    // The plugin runtime (ADR-0072 §9): only with SCARAB_PLUGINS=on, in a
+    // role that serves the broker, and with a cluster to run Plugins in. The
+    // reconcile loop runs under the `plugin-runtime` lease, so with several
+    // api replicas exactly one of them manages the workloads.
+    if config.plugins.enabled && config.role.serves_broker() {
+        match scarab_plugin_k8s::default_client().await {
+            Ok(client) => {
+                if config.plugins.dev_tokens.is_empty() {
+                    state = state.with_plugin_tokens(Arc::new(
+                        scarab_plugin_k8s::TokenReviewVerifier::new(client.clone()),
+                    ));
+                    tracing::info!(
+                        "plugin broker tokens: TokenReview (audience {})",
+                        scarab_plugin::BROKER_TOKEN_AUDIENCE
+                    );
+                }
+                let broker_port = config
+                    .plugins
+                    .broker_addr
+                    .parse::<std::net::SocketAddr>()
+                    .map_err(|e| format!("SCARAB_BROKER_ADDR: {e}"))?
+                    .port();
+                // Validated at boot (config.rs); `None` = unset, and the
+                // runtime then refuses its baseline — loudly, every pass.
+                let broker_peer = config
+                    .plugins
+                    .broker_peer
+                    .as_deref()
+                    .map(scarab_plugin_k8s::BrokerPeer::parse)
+                    .transpose()
+                    .map_err(|e| format!("SCARAB_PLUGIN_BROKER_PEER: {e}"))?;
+                let runtime = scarab_plugin_k8s::K8sPluginRuntime::new(
+                    client,
+                    scarab_plugin_k8s::PluginRuntimeConfig {
+                        namespace: config.plugins.namespace.clone(),
+                        broker_url: config.plugins.broker_url.clone(),
+                        broker_peer,
+                        broker_port,
+                        probe_image: config.plugins.probe_image.clone().unwrap_or_else(|| {
+                            scarab_plugin_k8s::probe::DEFAULT_PROBE_IMAGE.to_string()
+                        }),
+                    },
+                );
+                scarab_server::plugin_runtime::PluginRuntimeLoop::new(
+                    db.clone(),
+                    pg.clone(),
+                    Arc::new(runtime),
+                    clock.clone(),
+                    replica_id.clone(),
+                )
+                .spawn();
+                tracing::info!(
+                    namespace = %config.plugins.namespace,
+                    "plugin runtime: reconcile loop started (lease {})",
+                    scarab_server::plugin_runtime::PLUGIN_RUNTIME_LEASE
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "plugin runtime OFF: no cluster reachable — installations stay pending and \
+                     broker tokens can only be dev tokens"
+                );
+            }
+        }
     }
     // The CredentialBroker (ADR-0072 §11): its OWN listener, so a plugin
     // Pod — whose network reaches only this port — never reaches the public

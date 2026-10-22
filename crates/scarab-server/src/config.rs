@@ -64,9 +64,9 @@
 //! | `SCARAB_PLUGINS` | env | `on`/`off` (default `off`): the plugin runtime (ADR-0072) — the CredentialBroker listener and plugin installs. The registry, the kill switch and the read views work either way; anything else refuses boot |
 //! | `SCARAB_BROKER_ADDR` | env | the CredentialBroker's own listener (ADR-0072 §11), separate from the API so plugins never reach the public surface; default `0.0.0.0:8090`. Only bound with `SCARAB_PLUGINS=on` |
 //! | `SCARAB_PLUGIN_NAMESPACE` | env | the one shared namespace Plugins run in (ADR-0072 §9); default `scarab-plugins`. A broker caller's ServiceAccount must be in it |
-//! | `SCARAB_PLUGIN_BROKER_URL` | env | the broker URL a Plugin Pod dials (slice d2 injects it); default `http://scarab-broker:8090` |
-//! | `SCARAB_PLUGIN_BROKER_PEER` | env | how the plugin NetworkPolicy names the broker (slice d2): `pods:<namespace>:<k=v,…>` or `cidr:<cidr>` |
-//! | `SCARAB_PLUGIN_PROBE_IMAGE` | env | the isolation-probe image (slice d2) |
+//! | `SCARAB_PLUGIN_BROKER_URL` | env | the broker URL the runtime injects into every Plugin Pod (`SCARAB_BROKER_URL`); default `http://scarab-broker:8090` |
+//! | `SCARAB_PLUGIN_BROKER_PEER` | env | how the `plugin-egress` NetworkPolicy names the broker: `pods:<namespace>:<k=v,…>` or `cidr:<ip>/<prefix>` (at most a /24). Unset = the runtime refuses its baseline and no Plugin runs |
+//! | `SCARAB_PLUGIN_PROBE_IMAGE` | env | the isolation-probe image (ADR-0072 §9); default `busybox:1.36` |
 //! | `SCARAB_PLUGIN_ARGOCD_REPO` | env | the repository the first-party Argo CD plugin installs from; default `ghcr.io/thulasi-ram/scarab-plugin-argocd`. An install must pin it by `@sha256:` digest |
 //! | `SCARAB_DEV_PLUGIN_TOKENS` | env | **dev only, needs `SCARAB_DEV_INSECURE`**: `<installation-id>=<token>,…` static broker tokens standing in for TokenReview (slice d2). Loud at boot |
 //! | `SCARAB_DEV_PLUGIN_ALLOW_TAG` | env | **dev only, needs `SCARAB_DEV_INSECURE`**: `1` lets a first-party install name a tag instead of a digest (kind/colima images have no repo digest). Loud at boot |
@@ -593,8 +593,10 @@ pub struct PluginsConfig {
     pub broker_addr: String,
     pub namespace: String,
     pub broker_url: String,
-    /// `pods:<ns>:<k=v,…>` or `cidr:<cidr>`; `None` = slice d2 derives it.
+    /// `pods:<ns>:<k=v,…>` or `cidr:<cidr>`, validated. `None` = unset: the
+    /// plugin runtime then refuses its namespace baseline and nothing runs.
     pub broker_peer: Option<String>,
+    /// `None` = the runtime's default probe image (busybox).
     pub probe_image: Option<String>,
     /// The repository the first-party Argo CD catalog entry installs from.
     pub argocd_repo: String,
@@ -648,11 +650,11 @@ impl PluginsConfig {
         }
         let broker_peer = set("SCARAB_PLUGIN_BROKER_PEER");
         if let Some(peer) = &broker_peer {
-            if !(peer.starts_with("pods:") || peer.starts_with("cidr:")) {
-                return Err(invalid(format!(
-                    "SCARAB_PLUGIN_BROKER_PEER must be `pods:<namespace>:<k=v,…>` or \
-                     `cidr:<cidr>`, got {peer:?}"
-                )));
+            // Parsed in full, not just by prefix: this is the one egress
+            // allowance a Plugin gets, so a selector that matches every Pod
+            // or a CIDR wider than a broker refuses boot (ADR-0072 §9).
+            if let Err(e) = scarab_plugin_k8s::BrokerPeer::parse(peer) {
+                return Err(invalid(format!("SCARAB_PLUGIN_BROKER_PEER: {e}")));
             }
         }
         let argocd_repo =
@@ -1713,9 +1715,13 @@ impl Config {
                     self.plugins.namespace,
                     self.plugins.argocd_repo,
                     if self.plugins.dev_tokens.is_empty() {
-                        "NONE yet (TokenReview arrives with the runtime) — every broker call \
-                         is refused"
-                            .to_string()
+                        format!(
+                            "TokenReview once a cluster is reachable (else every broker call \
+                             is refused); broker peer {}",
+                            self.plugins.broker_peer.as_deref().unwrap_or(
+                                "UNSET — the runtime refuses its namespace and no plugin runs"
+                            )
+                        )
                     } else {
                         format!(
                             "DEV static tokens for {} installation(s)",
@@ -3140,6 +3146,10 @@ connections:
             report.contains("every broker call is refused"),
             "no verifier is said out loud: {report}"
         );
+        assert!(
+            report.contains("broker peer UNSET"),
+            "a runtime that will refuse its namespace is said out loud: {report}"
+        );
     }
 
     #[test]
@@ -3163,6 +3173,10 @@ connections:
             ],
             &[("SCARAB_PLUGIN_NAMESPACE", "Scarab_Plugins")],
             &[("SCARAB_PLUGIN_BROKER_PEER", "10.0.0.1/32")],
+            // The one egress allowance must name the broker, not a network
+            // or every Pod of a namespace (ADR-0072 §9).
+            &[("SCARAB_PLUGIN_BROKER_PEER", "cidr:0.0.0.0/0")],
+            &[("SCARAB_PLUGIN_BROKER_PEER", "pods:scarab:")],
             &[("SCARAB_PLUGIN_ARGOCD_REPO", "ghcr.io/x/argocd:v1")],
             &[("SCARAB_PLUGIN_ARGOCD_REPO", "ghcr.io/x/argocd@sha256:abc")],
             &[("SCARAB_DEV_PLUGIN_TOKENS", "not-an-id=tok")],

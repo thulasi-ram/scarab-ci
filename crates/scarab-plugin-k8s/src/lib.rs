@@ -34,6 +34,13 @@ pub use probe::{ProbeReport, ProbeVerdict};
 pub use runtime::{K8sPluginRuntime, PluginRuntimeConfig, RuntimeError, WorkloadState};
 pub use token_review::{TokenReviewVerifier, VERDICT_CACHE_TTL};
 
+/// A client for the cluster this process is configured for: in-cluster
+/// config in a Pod, `KUBECONFIG` (the isolated kind kubeconfig) in proc mode.
+/// The composition root holds it without naming kube's types.
+pub async fn default_client() -> Result<kube::Client, String> {
+    kube::Client::try_default().await.map_err(|e| e.to_string())
+}
+
 /// The field manager every object this runtime applies is owned by.
 pub const FIELD_MANAGER: &str = "scarab-plugin-runtime";
 
