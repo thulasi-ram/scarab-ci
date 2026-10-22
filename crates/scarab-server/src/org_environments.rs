@@ -1,13 +1,15 @@
-//! Org-level Environments (ADR-0071, MMP step 1): the admin and read API for
-//! the minimal [`OrgEnvironment`] — a name, its EnvironmentDeploymentDeadline
-//! and its EnvironmentDeploymentSources — and the deadline the Deployment
-//! read fold uses.
+//! Org-level Environments (ADR-0071): the admin and read API for the
+//! [`OrgEnvironment`] — a name, its EnvironmentDeploymentDeadline and its
+//! EnvironmentDeploymentSources — its EnvironmentProjectEligibility, and the
+//! deadline the Deployment read fold uses.
 //!
-//! Strictly additive. Nothing here feeds Run admission: per-Project
-//! Environments (`/v1/repos/{org}/{repo}/environments/…`, ADR-0037) keep
-//! governing Runs until the full migration, and the two coexist by exact name.
-//! Nor does a Deployment need an OrgEnvironment: a name the Deployment record
-//! uses without one simply gets
+//! Since c-full c2 an OrgEnvironment is what admits Deploy Runs
+//! (`resolve_governance`), so the eligibility written here decides which
+//! Projects may deploy into it. The whole-Environment PUT never touches the
+//! baseline protection or the eligibility — each has its own write — so the
+//! c-min form cannot reset either by omission. (Baseline, overlay and grant
+//! endpoints are c3.) A Deployment still needs no OrgEnvironment: a name the
+//! Deployment record uses without one simply gets
 //! [`DEFAULT_DEPLOYMENT_DEADLINE_MS`](scarab_deployment::DEFAULT_DEPLOYMENT_DEADLINE_MS).
 //!
 //! Reads need Read on the Org and writes Administer on the Org: "org admins
@@ -20,7 +22,9 @@ use axum::Json;
 use scarab_engine::DbError;
 use scarab_identity::Action;
 use scarab_project::{
-    EnvironmentDeploymentDeadline, EnvironmentDeploymentSource, OrgEnvironment, OrgEnvironmentError,
+    DeployGovernance, EffectiveProtection, EnvironmentDeploymentDeadline,
+    EnvironmentDeploymentSource, EnvironmentProjectEligibility, EnvironmentProjectPrivilegeGrant,
+    EnvironmentProtectionRules, ImageGrant, OrgEnvironment, OrgEnvironmentError,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -102,8 +106,146 @@ pub struct PutOrgEnvironmentRequest {
     pub deployment_sources: Vec<EnvironmentDeploymentSourceDto>,
 }
 
+/// Protection rules as one layer holds them — an Environment's baseline or a
+/// Project's overlay (ADR-0071 §1, §3).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EnvironmentProtectionRulesDto {
+    /// Principal ids; every one must approve (AND).
+    pub approvers: Vec<String>,
+    /// Ref globs a deploy's symbolic ref must match; empty = any ref.
+    pub allowed_refs: Vec<String>,
+    /// Seconds. Carried and merged, not yet enforced (git-bug 2b94989).
+    pub wait_timer_s: u32,
+    /// A human dispatch must carry a reason (ADR-0057 §3).
+    pub require_reason: bool,
+    /// In-flight Deployments per DeploymentTarget; absent = no limit.
+    /// Enforced once deployment requests ship (ADR-0071 §9).
+    pub deployment_concurrency: Option<u32>,
+}
+
+impl From<&EnvironmentProtectionRules> for EnvironmentProtectionRulesDto {
+    fn from(r: &EnvironmentProtectionRules) -> Self {
+        Self {
+            approvers: r.approvers.clone(),
+            allowed_refs: r.allowed_refs.clone(),
+            wait_timer_s: r.wait_timer_s,
+            require_reason: r.require_reason,
+            deployment_concurrency: r.deployment_concurrency.map(|n| n.get()),
+        }
+    }
+}
+
+/// The rules admission enforces for one Project in one Environment: the
+/// baseline merged with the Project's overlay (ADR-0071 §3), computed by the
+/// server so no client re-implements the merge.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EffectiveProtectionDto {
+    /// Baseline approvers, then the overlay's not already listed — all required.
+    pub approvers: Vec<String>,
+    /// One list per layer (baseline first, then overlay): a ref must match
+    /// **every** non-empty layer. Never pre-intersected — `[main]` and
+    /// `[tags/*]` intersect to `[]`, which would read as "any ref".
+    pub allowed_ref_layers: Vec<Vec<String>>,
+    pub wait_timer_s: u32,
+    pub require_reason: bool,
+    pub deployment_concurrency: Option<u32>,
+    /// The deadline this Project's DeploymentGates use.
+    pub deployment_gate_deadline_ms: i64,
+}
+
+impl From<&EffectiveProtection> for EffectiveProtectionDto {
+    fn from(e: &EffectiveProtection) -> Self {
+        Self {
+            approvers: e.approvers.clone(),
+            allowed_ref_layers: e.allowed_refs.layers().to_vec(),
+            wait_timer_s: e.wait_timer_s,
+            require_reason: e.require_reason,
+            deployment_concurrency: e.deployment_concurrency.map(|n| n.get()),
+            deployment_gate_deadline_ms: e.deployment_gate_deadline.millis(),
+        }
+    }
+}
+
+/// One entry of a privilege whitelist (ADR-0039).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ImageGrantDto {
+    /// `sha256:…`.
+    pub image_digest: String,
+    pub privileged: bool,
+    pub capabilities: Vec<String>,
+}
+
+impl From<&ImageGrant> for ImageGrantDto {
+    fn from(g: &ImageGrant) -> Self {
+        Self {
+            image_digest: g.image_digest.clone(),
+            privileged: g.privileged,
+            capabilities: g.capabilities.clone(),
+        }
+    }
+}
+
+/// The privileges one Project holds within one Environment (ADR-0071 §8).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EnvironmentProjectPrivilegeGrantDto {
+    pub privileged_images: Vec<ImageGrantDto>,
+    pub permit_k8s_overlay: bool,
+}
+
+impl From<&EnvironmentProjectPrivilegeGrant> for EnvironmentProjectPrivilegeGrantDto {
+    fn from(g: &EnvironmentProjectPrivilegeGrant) -> Self {
+        Self {
+            privileged_images: g.privileged_images.iter().map(Into::into).collect(),
+            permit_k8s_overlay: g.permit_k8s_overlay,
+        }
+    }
+}
+
+/// An org-level Environment as one Project sees it (ADR-0071): the read
+/// model behind `GET /v1/repos/{org}/{repo}/environments`, which until
+/// ADR-0071 returned the repo's own per-repo environments.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProjectEnvironmentDto {
+    pub name: String,
+    /// Whether this Project may deploy here now (EnvironmentProjectEligibility).
+    /// `false` only for an Environment the Project still holds an overlay or
+    /// grant in after an admin made it ineligible.
+    pub eligible: bool,
+    /// The Environment's baseline, set by an org admin.
+    pub baseline: EnvironmentProtectionRulesDto,
+    /// The Environment's EnvironmentDeploymentDeadline.
+    pub deployment_deadline_ms: i64,
+    /// This Project's tighten-only overlay, if it has one.
+    pub overlay: Option<EnvironmentProtectionRulesDto>,
+    /// The overlay's tighter deadline for this Project's DeploymentGates.
+    pub overlay_deployment_gate_deadline_ms: Option<i64>,
+    /// What admission enforces: the baseline merged with the overlay.
+    pub effective: EffectiveProtectionDto,
+    /// This Project's privileges here, if an admin granted any.
+    pub privilege_grant: Option<EnvironmentProjectPrivilegeGrantDto>,
+}
+
+impl From<&DeployGovernance> for ProjectEnvironmentDto {
+    fn from(g: &DeployGovernance) -> Self {
+        Self {
+            name: g.environment.name.clone(),
+            eligible: g.eligible,
+            baseline: (&g.environment.protection).into(),
+            deployment_deadline_ms: g.environment.deployment_deadline.millis(),
+            overlay: g.overlay.as_ref().map(|o| (&o.rules).into()),
+            overlay_deployment_gate_deadline_ms: g
+                .overlay
+                .as_ref()
+                .and_then(|o| o.deployment_gate_deadline)
+                .map(|d| d.millis()),
+            effective: (&g.effective_protection()).into(),
+            privilege_grant: g.privilege_grant.as_ref().map(Into::into),
+        }
+    }
+}
+
 /// An [`OrgEnvironmentError`] as the API answers it.
-fn org_environment_api_error(e: OrgEnvironmentError) -> ApiError {
+pub(crate) fn org_environment_api_error(e: OrgEnvironmentError) -> ApiError {
     match e {
         OrgEnvironmentError::Invalid(m) => ApiError::BadRequest(m),
         taken @ OrgEnvironmentError::DeploymentSourceTaken { .. } => {
@@ -114,6 +256,9 @@ fn org_environment_api_error(e: OrgEnvironmentError) -> ApiError {
         missing @ OrgEnvironmentError::DeploymentSourceNotInstalled { .. } => {
             ApiError::BadRequest(missing.to_string())
         }
+        OrgEnvironmentError::NotFound { .. } => ApiError::NotFound,
+        // ADR-0071 §3, §8: a Project's overlay or grant pins the Environment.
+        in_use @ OrgEnvironmentError::InUse(_) => ApiError::Conflict(in_use.to_string()),
         OrgEnvironmentError::Store(m) => ApiError::Db(DbError::Other(m)),
     }
 }
@@ -225,6 +370,10 @@ pub(crate) async fn put_org_environment(
                 vendor_grouping: s.vendor_grouping,
             })
             .collect(),
+        // Ignored by the store (it keeps or defaults the stored ones): the
+        // baseline and the eligibility have their own writes, ADR-0071 §1-2.
+        protection: EnvironmentProtectionRules::default(),
+        eligibility: EnvironmentProjectEligibility::default(),
         // Used only on create; a replace keeps the stored one.
         created_at: now,
         updated_at: now,
@@ -242,9 +391,12 @@ pub(crate) async fn put_org_environment(
     Ok(Json((&stored).into()))
 }
 
-/// Delete an Environment and its sources. Administer on the Org.
+/// Delete an Environment, its sources and its eligibility. Administer on the
+/// Org.
 ///
-/// Refused (409) while the Deployment record holds anything for the name:
+/// Refused (409) while any Project holds an overlay or privilege grant in
+/// it (ADR-0071 §3, §8: those are never dropped as a side effect), and while
+/// the Deployment record holds anything for the name:
 /// the record is keyed by name, so deleting and re-creating the Environment
 /// would silently re-adopt that history under whatever the new one says.
 #[utoipa::path(
@@ -259,7 +411,7 @@ pub(crate) async fn put_org_environment(
         (status = 204, description = "deleted"),
         (status = 403, description = "not an org admin"),
         (status = 404, description = "no such Environment, or not configured"),
-        (status = 409, description = "the Environment has Deployments")
+        (status = 409, description = "the Environment has Deployments, or project overlays or grants")
     )
 )]
 pub(crate) async fn delete_org_environment(
@@ -292,6 +444,117 @@ pub(crate) async fn delete_org_environment(
     } else {
         Err(ApiError::NotFound)
     }
+}
+
+/// Which Projects may run Deploy Runs into an Environment (ADR-0071 §2):
+/// every Project in the org, or exactly those matching one of `projects`
+/// (project-name globs, `*` wildcards).
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EnvironmentEligibilityDto {
+    /// Every Project in the org. `projects` must then be empty.
+    pub all_projects: bool,
+    /// Project-name globs. An empty list with `all_projects: false` admits
+    /// **no** Project — eligibility starts closed.
+    #[serde(default)]
+    pub projects: Vec<String>,
+}
+
+impl From<&EnvironmentProjectEligibility> for EnvironmentEligibilityDto {
+    fn from(e: &EnvironmentProjectEligibility) -> Self {
+        match e {
+            EnvironmentProjectEligibility::AllProjects => Self {
+                all_projects: true,
+                projects: Vec::new(),
+            },
+            EnvironmentProjectEligibility::Projects(p) => Self {
+                all_projects: false,
+                projects: p.clone(),
+            },
+        }
+    }
+}
+
+/// An Environment's eligibility. Read on the Org.
+#[utoipa::path(
+    get,
+    path = "/v1/orgs/{org}/environments/{env}/eligibility",
+    params(
+        ("org" = String, Path, description = "org"),
+        ("env" = String, Path, description = "environment name")
+    ),
+    summary = "Which projects may deploy into an org Environment (ADR-0071 §2)",
+    responses(
+        (status = 200, body = EnvironmentEligibilityDto),
+        (status = 403, description = "no Read on the org"),
+        (status = 404, description = "no such Environment, or not configured")
+    )
+)]
+pub(crate) async fn get_environment_eligibility(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((org, env)): Path<(String, String)>,
+) -> Result<Json<EnvironmentEligibilityDto>, ApiError> {
+    let scope = rbac_scope(&org, None);
+    authorize_scoped(&st, &headers, Action::Read, Some(&scope)).await?;
+    let store = st.org_environments.as_ref().ok_or(ApiError::NotFound)?;
+    let environment = store
+        .get_org_environment(&org, &env)
+        .await
+        .map_err(org_environment_api_error)?
+        .ok_or(ApiError::NotFound)?;
+    Ok(Json((&environment.eligibility).into()))
+}
+
+/// Replace an Environment's eligibility. Administer on the Org: only an
+/// Environment's admin decides who deploys into it (ADR-0071 §2, §7).
+/// Takes effect for the next Run created, the next gate approval and the
+/// next secret launch — each re-checks it.
+#[utoipa::path(
+    put,
+    path = "/v1/orgs/{org}/environments/{env}/eligibility",
+    params(
+        ("org" = String, Path, description = "org"),
+        ("env" = String, Path, description = "environment name")
+    ),
+    request_body = EnvironmentEligibilityDto,
+    summary = "Replace which projects may deploy into an org Environment (ADR-0071 §2)",
+    responses(
+        (status = 200, body = EnvironmentEligibilityDto),
+        (status = 400, description = "an empty or duplicated pattern, or patterns with all_projects"),
+        (status = 403, description = "not an org admin"),
+        (status = 404, description = "no such Environment, or not configured")
+    )
+)]
+pub(crate) async fn put_environment_eligibility(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((org, env)): Path<(String, String)>,
+    Json(body): Json<EnvironmentEligibilityDto>,
+) -> Result<Json<EnvironmentEligibilityDto>, ApiError> {
+    let scope = rbac_scope(&org, None);
+    let principal = authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
+    let store = st
+        .environment_governance
+        .as_ref()
+        .ok_or(ApiError::NotFound)?;
+    let eligibility = match (body.all_projects, body.projects.is_empty()) {
+        (true, true) => EnvironmentProjectEligibility::AllProjects,
+        // Both would be read as "all", silently dropping the list the caller
+        // thought was the rule.
+        (true, false) => {
+            return Err(ApiError::BadRequest(
+                "`projects` must be empty when `all_projects` is true".into(),
+            ))
+        }
+        (false, _) => EnvironmentProjectEligibility::Projects(body.projects),
+    };
+    let now = st.clock.now().await.0;
+    let stored = store
+        .put_environment_eligibility(&org, &env, &eligibility, &principal.subject, now)
+        .await
+        .map_err(org_environment_api_error)?;
+    Ok(Json((&stored.eligibility).into()))
 }
 
 /// The EnvironmentDeploymentDeadline the Deployment read fold stalls by for

@@ -23,6 +23,11 @@ use scarab_engine::{
 };
 use scarab_storage::{ObjectStore, StorageError};
 
+/// An in-memory `EnvironmentGovernanceStore` (ADR-0071), and the seeding that
+/// mirrors the §10 migration of a legacy per-Project environment.
+mod environment_governance;
+pub use environment_governance::InMemoryEnvironmentGovernance;
+
 // ---------------------------------------------------------------------------
 // FakeClock — manually-advanced virtual time
 // ---------------------------------------------------------------------------
@@ -3472,9 +3477,9 @@ fn scope_key(scope: &SecretScope) -> String {
     match scope {
         SecretScope::Org { org } => format!("org:{org}"),
         SecretScope::Repo { org, repo } => format!("repo:{org}/{repo}"),
-        SecretScope::Environment {
+        SecretScope::EnvironmentProject {
             org,
-            repo,
+            project: repo,
             environment,
         } => format!("env:{org}/{repo}/{environment}"),
     }

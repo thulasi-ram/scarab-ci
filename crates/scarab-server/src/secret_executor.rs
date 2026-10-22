@@ -11,6 +11,13 @@
 //!
 //! A fork-PR run (its deploy context's `locked_out` flag) receives no secrets. A
 //! run without a deploy context (ordinary CI) resolves nothing here.
+//!
+//! With the Environment governance store wired, a deploy step that would carry
+//! one of its Environment's credentials (a secret or an OIDC token) is
+//! **re-admitted at launch**: the Environment must still exist and still admit
+//! the run's Project (ADR-0071 §2). Admission at Run creation is not enough on
+//! its own — a long Run outlives an admin withdrawing eligibility, and the
+//! point of use is where ADR-0037 places the check.
 
 use std::sync::Arc;
 
@@ -32,6 +39,9 @@ pub struct SecretInjectingExecutor {
     /// The OIDC issuer + token audience (ADR-0015). `None` = no token minted.
     oidc: Option<(Arc<dyn scarab_identity::OidcIssuer>, String)>,
     issuer_url: String,
+    /// Org Environment governance (ADR-0071). `None` = no launch-time
+    /// re-check (a hand-built executor; `main.rs` wires it).
+    governance: Option<Arc<dyn scarab_project::EnvironmentGovernanceStore>>,
 }
 
 /// Per-attempt OIDC token TTL (ADR-0015: short-lived by design — long enough
@@ -52,7 +62,54 @@ impl SecretInjectingExecutor {
             logs,
             oidc: None,
             issuer_url: String::new(),
+            governance: None,
         }
+    }
+
+    /// Re-check, at every launch that would carry an Environment credential,
+    /// that the run's Environment still exists and still admits its Project
+    /// (ADR-0071 §2).
+    pub fn with_environment_governance(
+        mut self,
+        governance: Arc<dyn scarab_project::EnvironmentGovernanceStore>,
+    ) -> Self {
+        self.governance = Some(governance);
+        self
+    }
+
+    /// Refuse the launch when the run is a deploy whose Environment is gone or
+    /// no longer admits its Project. A refusal is a launch failure, exactly as
+    /// an unresolvable secret is: the step fails, no credential is read.
+    async fn ensure_still_admitted(&self, step: &StepRun) -> Result<(), ExecError> {
+        let Some(governance) = &self.governance else {
+            return Ok(());
+        };
+        let Some(ctx) = self
+            .db
+            .run_deploy_context(&step.run)
+            .await
+            .map_err(|e| ExecError::Other(e.to_string()))?
+        else {
+            return Ok(());
+        };
+        let refusal = match governance
+            .deploy_governance(&ctx.org, &ctx.project, &ctx.environment)
+            .await
+            .map_err(|e| ExecError::Other(format!("environment governance store: {e}")))?
+        {
+            Some(g) if g.eligible => return Ok(()),
+            Some(_) => format!(
+                "project `{}` is no longer eligible to deploy to environment `{}` in org `{}`; \
+                 its credentials are not released (ADR-0071)",
+                ctx.project, ctx.environment, ctx.org
+            ),
+            None => format!(
+                "environment `{}` no longer exists in org `{}`; its credentials are not \
+                 released (ADR-0071)",
+                ctx.environment, ctx.org
+            ),
+        };
+        Err(ExecError::Launch(refusal))
     }
 
     /// Enable per-attempt OIDC token minting (ADR-0015): every launched step
@@ -134,6 +191,13 @@ impl Executor for SecretInjectingExecutor {
     }
 
     async fn launch(&self, step: &StepRun, spec: &StepSpec) -> Result<ExecHandle, ExecError> {
+        // ADR-0071 §2 at the point of use: before minting a token or resolving a
+        // secret on the Environment's behalf, the run must still be admitted. A
+        // launch carrying neither needs no Environment authority, so it is not
+        // re-checked (a plain step of a deploy run is not a credential use).
+        if self.oidc.is_some() || !spec.secrets.is_empty() {
+            self.ensure_still_admitted(step).await?;
+        }
         // Per-attempt OIDC token (ADR-0015): minted fresh on every launch,
         // in memory only — the k8s executor delivers it via a tmpfs file.
         let now_ms = std::time::SystemTime::now()
@@ -165,11 +229,11 @@ impl Executor for SecretInjectingExecutor {
         let Some(ctx) = ctx else {
             return self.inner.launch(step, spec).await;
         };
-        // The secret scope's `repo` is the Project's name (its repo's forge
-        // name, 1:1 in v1 — ADR-0046).
-        let scope = SecretScope::Environment {
+        // One Project within one Environment (ADR-0071 §6) — the Project's
+        // name is its repo's forge name (1:1 in v1, ADR-0046).
+        let scope = SecretScope::EnvironmentProject {
             org: ctx.org,
-            repo: ctx.project,
+            project: ctx.project,
             environment: ctx.environment,
         };
         // Resolve (with inheritance), register each value with the redactor, and

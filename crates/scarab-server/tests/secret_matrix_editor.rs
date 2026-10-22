@@ -22,9 +22,10 @@ use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
 use common::fresh_db;
+use common::governance::seed_migrated_environment;
 use scarab_db_postgres::PostgresDb;
 use scarab_engine::Db;
-use scarab_project::{Environment, EnvironmentStore, ProtectionRules, SecretCoverageStore};
+use scarab_project::{EnvironmentStore, ProtectionRules, SecretCoverageStore};
 use scarab_secrets::{SecretProvider, SecretScope};
 use scarab_server::{router, AppState, LogService};
 use scarab_testkit::{FakeClock, FakeSecrets, InMemoryObjectStore};
@@ -38,9 +39,9 @@ fn env_rules(environment: &str) -> ProtectionRules {
         wait_timer: 0,
         allowed_refs: Vec::new(),
         concurrency: 1,
-        secret_scope: SecretScope::Environment {
+        secret_scope: SecretScope::EnvironmentProject {
             org: ORG.into(),
-            repo: REPO.into(),
+            project: REPO.into(),
             environment: environment.into(),
         },
         oidc_subject: format!("scarab:{ORG}/{REPO}/{environment}"),
@@ -61,16 +62,10 @@ struct Harness {
 async fn harness(pg: Arc<PostgresDb>, environments: &[&str]) -> Harness {
     pg.migrate().await.unwrap();
     for name in environments {
-        pg.put_environment(
-            ORG,
-            REPO,
-            &Environment {
-                name: (*name).into(),
-                protection: env_rules(name),
-            },
-        )
-        .await
-        .unwrap();
+        // ADR-0071: the matrix's columns are the org Environments this
+        // Project may deploy into — seeded as the migration leaves a legacy
+        // per-repo environment.
+        seed_migrated_environment(&pg, ORG, REPO, name, env_rules(name)).await;
     }
     let secrets = Arc::new(FakeSecrets::new());
     let db: Arc<dyn Db> = pg.clone();
@@ -83,6 +78,7 @@ async fn harness(pg: Arc<PostgresDb>, environments: &[&str]) -> Harness {
     let app = router(
         AppState::new(db, Arc::new(FakeClock::new(1_000)), logs)
             .with_environments(envs)
+            .with_environment_governance(pg.clone())
             .with_secrets(secrets.clone())
             .with_secret_coverage(coverage),
     );
@@ -176,9 +172,9 @@ async fn an_environment_override_wins_while_the_others_inherit_the_repo_default(
     // model could be right while the write went to the wrong scope.
     let resolved = |environment: &str| {
         let secrets = h.secrets.clone();
-        let scope = SecretScope::Environment {
+        let scope = SecretScope::EnvironmentProject {
             org: ORG.into(),
-            repo: REPO.into(),
+            project: REPO.into(),
             environment: environment.into(),
         };
         async move {

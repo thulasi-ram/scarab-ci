@@ -170,8 +170,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Durable store — mandatory, already guaranteed by the config gate.
     let pg = PostgresDb::connect(&database_url).await?;
     pg.migrate().await?;
-    // Keep a typed handle so the same Postgres adapter can back both the `Db`
-    // port and the `EnvironmentStore` port (it implements both).
+    // Keep a typed handle so the same Postgres adapter can back the `Db` port
+    // and every store port it implements (environments, governance, …).
     let pg = Arc::new(pg);
     let db: Arc<dyn Db> = pg.clone();
 
@@ -666,7 +666,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Inject env-scoped secrets into deploy-run pods at launch
             // (ADR-0037).
             let mut secret_exec =
-                SecretInjectingExecutor::new(executor, db.clone(), secrets.clone(), logs.clone());
+                SecretInjectingExecutor::new(executor, db.clone(), secrets.clone(), logs.clone())
+                    // ADR-0071 §2: re-admit a deploy step at the point its
+                    // Environment's credentials would be used.
+                    .with_environment_governance(pg.clone());
             // Per-attempt OIDC federation tokens (ADR-0015), tmpfs-delivered.
             if let (Some(issuer), Some(oidc_cfg)) = (oidc_issuer.clone(), &config.oidc) {
                 secret_exec = secret_exec.with_oidc(
@@ -731,10 +734,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // any other feature (it used to ride on `with_oauth_login`) makes every
         // hook in a login-less deployment point at localhost and die silently.
         .with_public_url(config.public_url.clone())
-        // Environments + deployment history: the Postgres adapter is the store.
-        // Enables /v1/environments/* and admission enforcement for
-        // env-targeting runs (ADR-0024).
+        // The legacy approval history (ADR-0024, ADR-0070 §1), still written
+        // on every gate release.
         .with_environments(pg.clone())
+        // Org-level Environment governance (ADR-0071): what admits and governs
+        // every Deploy Run. ALWAYS wired here — an unwired store would admit
+        // deploys with no rules, which only a hand-built test state may do.
+        .with_environment_governance(pg.clone())
         // The Deployment record's input log (ADR-0070): the Environment board
         // and the Deployments view fold it on every read.
         .with_deployments(pg.clone())
