@@ -46,12 +46,35 @@ pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 /// deleted, not guarded.
 pub struct PostgresDb {
     pool: PgPool,
+    /// How long report ingest waits on any one lock before it gives up
+    /// ([`scarab_plugin::PluginStoreError::Busy`]): `SET LOCAL lock_timeout`
+    /// on its transaction. See [`PLUGIN_INGEST_LOCK_TIMEOUT`].
+    plugin_ingest_lock_timeout: std::time::Duration,
 }
+
+/// Report ingest's default lock wait (ADR-0072). An ingest holds its
+/// installation's row lock — the lock a kill takes — while it waits on the
+/// Org's Deployment counter; this bounds how long a kill can be held behind
+/// one blocked batch. The broker's per-installation semaphore keeps a second
+/// batch of the same plugin from queueing in one process; this timeout is the
+/// backstop ACROSS replicas, where that semaphore cannot see.
+pub const PLUGIN_INGEST_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl PostgresDb {
     /// Construct from an existing connection pool.
     pub fn with_pool(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            plugin_ingest_lock_timeout: PLUGIN_INGEST_LOCK_TIMEOUT,
+        }
+    }
+
+    /// Report ingest's lock wait, in place of [`PLUGIN_INGEST_LOCK_TIMEOUT`]
+    /// — for a test that has to watch it expire without waiting the
+    /// production five seconds. Whole milliseconds; at least 1.
+    pub fn with_plugin_ingest_lock_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.plugin_ingest_lock_timeout = timeout.max(std::time::Duration::from_millis(1));
+        self
     }
 
     /// Connect a pool to `url`.

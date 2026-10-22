@@ -6,13 +6,21 @@
 //! source list atomically and keeps `created_at`, a source routes to exactly
 //! one Environment per Org (a second claim is refused and changes nothing),
 //! deleting an Environment takes its sources with it, and two Orgs never see
-//! each other's names or sources. Every test gets its own database
+//! each other's names or sources, and a source must name a PluginInstallation
+//! in the Org — checked in the write's own transaction, so an uninstall racing
+//! the write can never leave one behind. Every test gets its own database
 //! (`fresh_db`). Skips cleanly when `SCARAB_TEST_DATABASE_URL` is unset.
 
 mod common;
 
+use std::sync::Arc;
+
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
+use scarab_plugin::{
+    InstallationState, PluginCapability, PluginInstallation, PluginManifest, PluginStore,
+    RuntimeStatus,
+};
 use scarab_project::{
     EnvironmentDeploymentDeadline, EnvironmentDeploymentSource, OrgEnvironment,
     OrgEnvironmentError, OrgEnvironmentStore,
@@ -47,6 +55,36 @@ fn org_environment(
     }
 }
 
+/// The installations these tests' sources name, in every Org they use: a
+/// source must name an installation in its Org (c-min F1).
+const INSTALLED: [&str; 4] = ["argocd", "argocd-eu", "argocd-prod", "flux"];
+
+fn installation(org: &str, name: &str, id: String) -> PluginInstallation {
+    PluginInstallation {
+        id,
+        org: org.into(),
+        name: name.into(),
+        plugin: "argocd".into(),
+        image: format!("ghcr.io/acme/argocd@sha256:{}", "a".repeat(64)),
+        manifest: PluginManifest {
+            plugin: "argocd".into(),
+            capabilities: vec![PluginCapability::ReportDeployments],
+            connections: vec![],
+            config_keys: vec![],
+        },
+        manifest_sha256: "0".repeat(64),
+        config: Default::default(),
+        state: InstallationState::Enabled,
+        runtime_status: RuntimeStatus::Pending,
+        runtime_message: String::new(),
+        probe_passed_at: None,
+        approved_by: "amy".into(),
+        approved_at: 1_000,
+        killed_by: None,
+        killed_at: None,
+    }
+}
+
 async fn migrated() -> Option<(common::TestDb, PostgresDb)> {
     let Some(tdb) = fresh_db().await else {
         eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
@@ -54,7 +92,40 @@ async fn migrated() -> Option<(common::TestDb, PostgresDb)> {
     };
     let db = PostgresDb::with_pool(tdb.pool.clone());
     db.migrate().await.unwrap();
+    let mut n = 0;
+    for org in ["acme", "globex", "initech"] {
+        for name in INSTALLED {
+            n += 1;
+            db.install(&installation(org, name, format!("{n:0>10}")))
+                .await
+                .unwrap();
+        }
+    }
     Some((tdb, db))
+}
+
+/// Wait until `n` backends of this database are blocked on a lock — how a
+/// test KNOWS a transaction reached its wait, rather than hoping a spawned
+/// task got scheduled there.
+async fn until_waiting_on_locks(pool: &sqlx::PgPool, n: i64) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if waiting >= n {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{n} lock waiter(s) never appeared"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 #[tokio::test]
@@ -391,5 +462,130 @@ async fn two_orgs_with_the_same_name_and_source_are_independent() {
         "deleting acme's prod leaves globex's alone"
     );
     assert_eq!(db.list_org_environments("acme").await.unwrap(), vec![]);
+    tdb.cleanup().await;
+}
+
+/// F1 (c-min audit): a source naming no installation in the Org is refused
+/// and nothing changes; one an Environment already lists from before the
+/// check existed says to remove it, so a deadline-only edit is not a riddle.
+#[tokio::test]
+async fn a_source_must_name_an_installation_in_the_org() {
+    let Some((tdb, db)) = migrated().await else {
+        return;
+    };
+    let err = db
+        .put_org_environment(&org_environment(
+            "acme",
+            "prod",
+            5,
+            vec![source("ghost", "prod")],
+            1_000,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        OrgEnvironmentError::DeploymentSourceNotInstalled {
+            installation: "ghost".into(),
+            org: "acme".into(),
+            already_listed: false,
+        }
+    );
+    assert!(err.to_string().contains("remove the source"), "{err}");
+    assert_eq!(
+        db.get_org_environment("acme", "prod").await.unwrap(),
+        None,
+        "the refused write left no Environment behind"
+    );
+
+    // A source written before installations were checked: plant it.
+    db.put_org_environment(&org_environment("acme", "prod", 5, vec![], 1_000))
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO environment_deployment_sources (org, environment, installation, vendor_grouping)
+         VALUES ('acme', 'prod', 'legacy', 'prod')",
+    )
+    .execute(&tdb.pool)
+    .await
+    .unwrap();
+    let err = db
+        .put_org_environment(&org_environment(
+            "acme",
+            "prod",
+            9,
+            vec![source("legacy", "prod")],
+            2_000,
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            OrgEnvironmentError::DeploymentSourceNotInstalled {
+                already_listed: true,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("remove the source"), "{err}");
+    // Removing it is the way out.
+    db.put_org_environment(&org_environment("acme", "prod", 9, vec![], 3_000))
+        .await
+        .unwrap();
+    tdb.cleanup().await;
+}
+
+/// Red-team F-10 / review #9, interleaving CONSTRUCTED: an uninstall holds
+/// the installation row (as its DELETE does) while a PUT naming it starts.
+/// The PUT waits on its FOR SHARE lock — before touching any source row — and
+/// once the uninstall commits it is refused. No deadlock, and no source left
+/// naming a retired name.
+#[tokio::test]
+async fn a_put_racing_an_uninstall_waits_for_it_and_is_refused() {
+    let Some((tdb, db)) = migrated().await else {
+        return;
+    };
+    let db = Arc::new(db);
+    let mut uninstall = tdb.pool.begin().await.unwrap();
+    sqlx::query("DELETE FROM plugin_installations WHERE org = 'acme' AND name = 'flux'")
+        .execute(&mut *uninstall)
+        .await
+        .unwrap();
+    let put = {
+        let db = db.clone();
+        tokio::spawn(async move {
+            db.put_org_environment(&org_environment(
+                "acme",
+                "prod",
+                5,
+                vec![source("flux", "clusters-prod")],
+                1_000,
+            ))
+            .await
+        })
+    };
+    until_waiting_on_locks(&tdb.pool, 1).await;
+    assert!(
+        !put.is_finished(),
+        "the PUT is held by the uninstall's lock"
+    );
+    uninstall.commit().await.unwrap();
+    let err = put.await.unwrap().unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            OrgEnvironmentError::DeploymentSourceNotInstalled { installation, .. }
+                if installation == "flux"
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        db.environment_for_deployment_source("acme", "flux", "clusters-prod")
+            .await
+            .unwrap(),
+        None
+    );
     tdb.cleanup().await;
 }

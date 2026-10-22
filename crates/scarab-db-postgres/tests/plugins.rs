@@ -8,8 +8,10 @@
 //! Environment sources as they are *now* (unmapped → mapped, a grouping moved
 //! to another Environment), ownership is kept without touching the record,
 //! concurrent batches on one target serialize, two Orgs never meet, a kill
-//! refuses ingest, and an uninstall takes its sources with it and retires its
-//! name for good. Every test gets its own database (`fresh_db`). Skips cleanly
+//! refuses ingest, an uninstall takes its sources with it and retires its
+//! name for good, a target routed somewhere its last status never reached is
+//! flagged for a re-send (and a moved one shows where it went), the
+//! per-installation caps block only new rows, and lists page by key. Every test gets its own database (`fresh_db`). Skips cleanly
 //! when `SCARAB_TEST_DATABASE_URL` is unset.
 
 mod common;
@@ -21,9 +23,11 @@ use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_deployment::{DeploymentInput, DeploymentStore, SourceAssertedStatus};
 use scarab_plugin::{
-    InstallationDeploymentSource, InstallationState, OwnershipReportItem, PluginCapability,
-    PluginInstallation, PluginManifest, PluginStore, PluginStoreError, ReportIngest, ReportItem,
-    ReportOutcome, ReportedStatus, RuntimeStatus, StatusReportItem,
+    EnvironmentTargetsPage, InstallationDeploymentSource, InstallationState, OwnershipReportItem,
+    PluginCapability, PluginInstallation, PluginManifest, PluginStore, PluginStoreError,
+    ReportIngest, ReportItem, ReportOutcome, ReportedStatus, RuntimeStatus, SourceTargetsPage,
+    StatusReportItem, TargetRouting, MAX_TARGETS_PER_INSTALLATION,
+    MAX_UNMAPPED_GROUPINGS_PER_INSTALLATION,
 };
 use scarab_project::{
     EnvironmentDeploymentDeadline, EnvironmentDeploymentSource, OrgEnvironment, OrgEnvironmentStore,
@@ -198,6 +202,26 @@ async fn a_repeat_is_a_duplicate_and_a_reused_key_with_other_content_rolls_back_
     assert_eq!(again[0].outcome, ReportOutcome::Duplicate);
     assert_eq!(again[0].input_seq, Some(seq));
 
+    // A repeat inside ONE batch sees the first copy, though receipts are
+    // written only after every item is decided.
+    let twice = db
+        .ingest_report(
+            "0000000001",
+            &[
+                ingest(status("k9", 9, "prod", "argocd/api", "a9")),
+                ingest(status("k9", 9, "prod", "argocd/api", "a9")),
+            ],
+            2_500,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (twice[0].outcome, twice[1].outcome),
+        (ReportOutcome::Accepted, ReportOutcome::Duplicate)
+    );
+    assert_eq!(twice[1].input_seq, twice[0].input_seq);
+    assert!(twice[0].input_seq.is_some());
+
     // k1 reused for different content, after a good item: the whole batch
     // is refused, so k2 is not recorded either.
     let err = db
@@ -214,8 +238,8 @@ async fn a_repeat_is_a_duplicate_and_a_reused_key_with_other_content_rolls_back_
     assert!(matches!(err, PluginStoreError::IdempotencyConflict { .. }));
     assert_eq!(
         db.inputs("acme", "prod").await.unwrap().len(),
-        1,
-        "only the first report is in the record"
+        2,
+        "only k1 and k9 are in the record"
     );
     assert_eq!(
         outcomes(
@@ -274,7 +298,7 @@ async fn a_sequence_not_newer_than_the_cursor_is_stale() {
         .collect();
     assert_eq!(versions, vec!["v5", "a1", "v6"]);
     let cursors: Vec<(String, u64)> = db
-        .source_targets("0000000001")
+        .source_targets("0000000001", &SourceTargetsPage::default())
         .await
         .unwrap()
         .into_iter()
@@ -309,7 +333,7 @@ async fn an_unmapped_grouping_is_counted_until_an_environment_lists_it() {
         vec![ReportOutcome::Unmapped, ReportOutcome::Unmapped]
     );
     assert!(db.environments("acme").await.unwrap().is_empty());
-    let unmapped = db.unmapped_groupings("0000000001").await.unwrap();
+    let unmapped = db.unmapped_groupings("0000000001", None, 0).await.unwrap();
     assert_eq!(unmapped.len(), 1);
     assert_eq!(
         (
@@ -335,7 +359,7 @@ async fn an_unmapped_grouping_is_counted_until_an_environment_lists_it() {
     // lands in the record.
     put_environment(&db, "acme", "prod", &[("argocd", "prod")]).await;
     assert!(db
-        .unmapped_groupings("0000000001")
+        .unmapped_groupings("0000000001", None, 0)
         .await
         .unwrap()
         .is_empty());
@@ -396,7 +420,10 @@ async fn ownership_is_kept_on_the_target_and_never_enters_the_record() {
         vec![ReportOutcome::Accepted]
     );
     assert!(db.inputs("acme", "prod").await.unwrap().is_empty());
-    let targets = db.environment_targets("acme", "prod").await.unwrap();
+    let targets = db
+        .environment_targets("acme", "prod", &EnvironmentTargetsPage::default())
+        .await
+        .unwrap();
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].owner_projects, vec!["acme/api", "acme/web"]);
     assert_eq!(targets[0].owners_reported_at, Some(1_000));
@@ -410,7 +437,10 @@ async fn ownership_is_kept_on_the_target_and_never_enters_the_record() {
         2_000,
     )
     .await;
-    let target = &db.environment_targets("acme", "prod").await.unwrap()[0];
+    let target = &db
+        .environment_targets("acme", "prod", &EnvironmentTargetsPage::default())
+        .await
+        .unwrap()[0];
     assert_eq!(target.owner_projects, vec!["acme/api", "acme/web"]);
     assert_eq!(
         target.version_scheme.as_deref(),
@@ -418,7 +448,10 @@ async fn ownership_is_kept_on_the_target_and_never_enters_the_record() {
     );
     assert_eq!(target.last_version.as_deref(), Some("v2"));
     outcomes(&db, "0000000001", vec![ownership("o3", 3, &[])], 3_000).await;
-    let target = &db.environment_targets("acme", "prod").await.unwrap()[0];
+    let target = &db
+        .environment_targets("acme", "prod", &EnvironmentTargetsPage::default())
+        .await
+        .unwrap()[0];
     assert!(target.owner_projects.is_empty());
     assert_eq!(target.last_version.as_deref(), Some("v2"), "kept");
     tdb.cleanup().await;
@@ -466,12 +499,15 @@ async fn a_grouping_moved_to_another_environment_re_homes_its_next_report() {
     assert_eq!(versions("staging").await, vec!["v1"], "history stays put");
     assert_eq!(versions("prod").await, vec!["v2"]);
     assert!(db
-        .environment_targets("acme", "staging")
+        .environment_targets("acme", "staging", &EnvironmentTargetsPage::default())
         .await
         .unwrap()
         .is_empty());
     assert_eq!(
-        db.environment_targets("acme", "prod").await.unwrap()[0].last_sequence,
+        db.environment_targets("acme", "prod", &EnvironmentTargetsPage::default())
+            .await
+            .unwrap()[0]
+            .last_sequence,
         2,
         "one cursor per target, wherever it routes"
     );
@@ -530,7 +566,10 @@ async fn concurrent_batches_on_one_target_accept_each_sequence_once() {
         .collect();
     assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
     assert_eq!(
-        db.source_targets("0000000001").await.unwrap()[0].last_sequence,
+        db.source_targets("0000000001", &SourceTargetsPage::default())
+            .await
+            .unwrap()[0]
+            .last_sequence,
         *seqs.last().unwrap()
     );
     tdb.cleanup().await;
@@ -574,7 +613,7 @@ async fn two_orgs_with_the_same_installation_name_never_meet() {
     assert!(db.environments("initech").await.unwrap().is_empty());
     assert_eq!(db.inputs("acme", "prod").await.unwrap().len(), 1);
     assert!(db
-        .environment_targets("initech", "prod")
+        .environment_targets("initech", "prod", &EnvironmentTargetsPage::default())
         .await
         .unwrap()
         .is_empty());
@@ -767,5 +806,360 @@ async fn receipts_older_than_the_cutoff_are_pruned() {
         .await,
         vec![ReportOutcome::Duplicate]
     );
+    tdb.cleanup().await;
+}
+
+fn resend_page() -> SourceTargetsPage {
+    SourceTargetsPage {
+        resend_only: true,
+        ..Default::default()
+    }
+}
+
+async fn resend_ids(db: &PostgresDb, id: &str) -> Vec<String> {
+    db.source_targets(id, &resend_page())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| t.target_id)
+        .collect()
+}
+
+/// P1 (judge-d1): a grouping reported on while unmapped, then mapped, would
+/// stay invisible — a reporter that sends transitions only has nothing new
+/// to say. `/targets` flags it for a re-send instead (core never fabricates
+/// a report); the re-sent status lands on the board and clears the flag.
+#[tokio::test]
+async fn a_newly_mapped_grouping_is_flagged_until_its_status_is_re_sent() {
+    let Some((tdb, db)) = migrated().await else {
+        return;
+    };
+    db.install(&installation("acme", "argocd", "0000000001"))
+        .await
+        .unwrap();
+    outcomes(
+        &db,
+        "0000000001",
+        vec![status("k1", 1, "staging", "argocd/web", "v1")],
+        1_000,
+    )
+    .await;
+    assert!(
+        resend_ids(&db, "0000000001").await.is_empty(),
+        "unmapped: nowhere to re-send to"
+    );
+
+    put_environment(&db, "acme", "staging", &[("argocd", "staging")]).await;
+    assert_eq!(resend_ids(&db, "0000000001").await, vec!["argocd/web"]);
+    let in_view = &db
+        .environment_targets("acme", "staging", &EnvironmentTargetsPage::default())
+        .await
+        .unwrap()[0];
+    assert!(in_view.resend);
+    assert_eq!(
+        in_view.last_status, None,
+        "the dropped status is not shown as staging's"
+    );
+    // The plugin's own seed state still has it.
+    assert_eq!(
+        db.source_targets("0000000001", &SourceTargetsPage::default())
+            .await
+            .unwrap()[0]
+            .last_status
+            .as_deref(),
+        Some("live")
+    );
+
+    // An ownership report does not clear it: it says nothing about status.
+    outcomes(
+        &db,
+        "0000000001",
+        vec![ReportItem::Ownership(OwnershipReportItem {
+            idempotency_key: "o2".into(),
+            sequence: 2,
+            vendor_grouping: "staging".into(),
+            target_id: "argocd/web".into(),
+            owners: vec!["acme/web".into()],
+        })],
+        1_500,
+    )
+    .await;
+    assert_eq!(resend_ids(&db, "0000000001").await, vec!["argocd/web"]);
+
+    // The re-send: current state, next sequence, new key.
+    assert_eq!(
+        outcomes(
+            &db,
+            "0000000001",
+            vec![status("k3-resend", 3, "staging", "argocd/web", "v1")],
+            2_000
+        )
+        .await,
+        vec![ReportOutcome::Accepted]
+    );
+    let logged = db.inputs("acme", "staging").await.unwrap();
+    assert_eq!(logged.len(), 1, "on the board now");
+    assert_eq!(logged[0].input.version().0, "v1");
+    assert!(resend_ids(&db, "0000000001").await.is_empty(), "cleared");
+    let in_view = &db
+        .environment_targets("acme", "staging", &EnvironmentTargetsPage::default())
+        .await
+        .unwrap()[0];
+    assert!(!in_view.resend);
+    assert_eq!(in_view.last_status.as_deref(), Some("live"));
+    tdb.cleanup().await;
+}
+
+async fn routing(db: &PostgresDb) -> Vec<TargetRouting> {
+    db.target_routings("acme", &[("argocd".into(), "argocd/web".into())])
+        .await
+        .unwrap()
+}
+
+/// P2 (judge-d1): an admin moves a grouping from staging to prod. Staging's
+/// record is untouched, but the target now routes to prod (the board shows
+/// it Moved); prod's view never shows staging's status as its own (F-3),
+/// and the target is flagged for a re-send there.
+#[tokio::test]
+async fn a_re_homed_target_shows_where_it_went_and_carries_no_stale_status() {
+    let Some((tdb, db)) = migrated().await else {
+        return;
+    };
+    db.install(&installation("acme", "argocd", "0000000001"))
+        .await
+        .unwrap();
+    put_environment(&db, "acme", "staging", &[("argocd", "apps")]).await;
+    outcomes(
+        &db,
+        "0000000001",
+        vec![status("k1", 1, "apps", "argocd/web", "v1")],
+        1_000,
+    )
+    .await;
+    assert_eq!(
+        routing(&db).await,
+        vec![TargetRouting {
+            installation: "argocd".into(),
+            target_id: "argocd/web".into(),
+            environment: Some("staging".into()),
+        }]
+    );
+
+    put_environment(&db, "acme", "staging", &[]).await;
+    put_environment(&db, "acme", "prod", &[("argocd", "apps")]).await;
+    assert_eq!(
+        routing(&db).await[0].environment.as_deref(),
+        Some("prod"),
+        "moved, with no report needed"
+    );
+    assert_eq!(
+        db.inputs("acme", "staging").await.unwrap().len(),
+        1,
+        "history stays"
+    );
+    let prod = &db
+        .environment_targets("acme", "prod", &EnvironmentTargetsPage::default())
+        .await
+        .unwrap()[0];
+    assert_eq!(prod.last_status, None, "staging's status is not prod's");
+    assert!(prod.resend);
+    assert!(db
+        .environment_targets("acme", "staging", &EnvironmentTargetsPage::default())
+        .await
+        .unwrap()
+        .is_empty());
+
+    // An ownership report routed to prod resets the cursor's stored status
+    // (red-team F-3): it was staging's fact.
+    outcomes(
+        &db,
+        "0000000001",
+        vec![ReportItem::Ownership(OwnershipReportItem {
+            idempotency_key: "o2".into(),
+            sequence: 2,
+            vendor_grouping: "apps".into(),
+            target_id: "argocd/web".into(),
+            owners: vec!["acme/web".into()],
+        })],
+        2_000,
+    )
+    .await;
+    let cursor = &db
+        .source_targets("0000000001", &SourceTargetsPage::default())
+        .await
+        .unwrap()[0];
+    assert_eq!(
+        (
+            cursor.last_status.as_deref(),
+            cursor.last_version.as_deref()
+        ),
+        (None, None)
+    );
+    assert!(cursor.resend, "only a status landing in prod clears it");
+
+    // Unmapped altogether: it routes nowhere, and is not flagged.
+    put_environment(&db, "acme", "prod", &[]).await;
+    assert_eq!(routing(&db).await[0].environment, None);
+    assert!(resend_ids(&db, "0000000001").await.is_empty());
+    tdb.cleanup().await;
+}
+
+/// P4 (judge-d1, red-team F-2): past a cap, a NEW target or unmapped
+/// grouping is rejected (`cap:`, no receipt); a known one keeps reporting.
+#[tokio::test]
+async fn the_caps_block_only_new_targets_and_new_unmapped_groupings() {
+    let Some((tdb, db)) = migrated().await else {
+        return;
+    };
+    db.install(&installation("acme", "argocd", "0000000001"))
+        .await
+        .unwrap();
+    put_environment(&db, "acme", "prod", &[("argocd", "prod")]).await;
+    // Fill to one below each cap directly: ingesting ten thousand reports
+    // would prove nothing more.
+    sqlx::query(
+        "INSERT INTO deployment_source_targets
+             (installation_id, target_id, org, vendor_grouping, environment, last_sequence,
+              updated_at)
+         SELECT '0000000001', 'filler/' || g, 'acme', 'prod', 'prod', 1, 1
+         FROM generate_series(1, $1) AS g",
+    )
+    .bind(MAX_TARGETS_PER_INSTALLATION as i64 - 1)
+    .execute(&tdb.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO deployment_source_unmapped
+             (installation_id, vendor_grouping, org, reports, first_at, last_at, last_target_id)
+         SELECT '0000000001', 'unmapped-' || g, 'acme', 1, 1, 1, 'filler/1'
+         FROM generate_series(1, $1) AS g",
+    )
+    .bind(MAX_UNMAPPED_GROUPINGS_PER_INSTALLATION as i64)
+    .execute(&tdb.pool)
+    .await
+    .unwrap();
+
+    let results = db
+        .ingest_report(
+            "0000000001",
+            &[
+                // The last free target slot…
+                ingest(status("k1", 1, "prod", "argocd/web", "v1")),
+                // …so the next new one is over.
+                ingest(status("k2", 1, "prod", "argocd/api", "a1")),
+                // A known target keeps reporting.
+                ingest(status("k3", 2, "prod", "filler/7", "f2")),
+                // A known target in a NEW unmapped grouping: over that cap.
+                ingest(status("k4", 3, "elsewhere", "filler/7", "f3")),
+                // A counted grouping keeps counting.
+                ingest(status("k5", 4, "unmapped-1", "filler/7", "f4")),
+            ],
+            1_000,
+        )
+        .await
+        .unwrap();
+    let got: Vec<ReportOutcome> = results.iter().map(|r| r.outcome).collect();
+    assert_eq!(
+        got,
+        vec![
+            ReportOutcome::Accepted,
+            ReportOutcome::Rejected,
+            ReportOutcome::Accepted,
+            ReportOutcome::Rejected,
+            ReportOutcome::Unmapped,
+        ]
+    );
+    for i in [1, 3] {
+        assert!(
+            results[i].reason.as_deref().unwrap().starts_with("cap:"),
+            "{:?}",
+            results[i].reason
+        );
+    }
+    let usage = db.installation_usage("0000000001").await.unwrap();
+    assert_eq!(usage.targets, MAX_TARGETS_PER_INSTALLATION);
+    assert_eq!(
+        usage.unmapped_groupings,
+        MAX_UNMAPPED_GROUPINGS_PER_INSTALLATION
+    );
+    // A rejected item left no receipt: its key is free once there is room.
+    sqlx::query("DELETE FROM deployment_source_targets WHERE target_id = 'filler/1'")
+        .execute(&tdb.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcomes(
+            &db,
+            "0000000001",
+            vec![status("k2", 1, "prod", "argocd/api", "a1")],
+            2_000
+        )
+        .await,
+        vec![ReportOutcome::Accepted]
+    );
+    tdb.cleanup().await;
+}
+
+/// Lists page by key: the next page starts after the last row seen.
+#[tokio::test]
+async fn targets_and_unmapped_groupings_page_by_key() {
+    let Some((tdb, db)) = migrated().await else {
+        return;
+    };
+    db.install(&installation("acme", "argocd", "0000000001"))
+        .await
+        .unwrap();
+    put_environment(&db, "acme", "prod", &[("argocd", "prod")]).await;
+    outcomes(
+        &db,
+        "0000000001",
+        vec![
+            status("k1", 1, "prod", "c", "v"),
+            status("k2", 1, "prod", "a", "v"),
+            status("k3", 1, "prod", "b", "v"),
+            status("k4", 1, "x", "d", "v"),
+            status("k5", 1, "y", "e", "v"),
+        ],
+        1_000,
+    )
+    .await;
+    let page = |after: Option<&str>| SourceTargetsPage {
+        after: after.map(String::from),
+        limit: 2,
+        resend_only: false,
+    };
+    let ids = |ts: Vec<scarab_plugin::DeploymentSourceTarget>| {
+        ts.into_iter().map(|t| t.target_id).collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ids(db.source_targets("0000000001", &page(None)).await.unwrap()),
+        vec!["a", "b"]
+    );
+    assert_eq!(
+        ids(db
+            .source_targets("0000000001", &page(Some("b")))
+            .await
+            .unwrap()),
+        vec!["c", "d"]
+    );
+    let env_page = EnvironmentTargetsPage {
+        after: Some(("argocd".into(), "a".into())),
+        limit: 1,
+    };
+    assert_eq!(
+        ids(db
+            .environment_targets("acme", "prod", &env_page)
+            .await
+            .unwrap()),
+        vec!["b"]
+    );
+    let groupings: Vec<String> = db
+        .unmapped_groupings("0000000001", Some("x"), 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|u| u.vendor_grouping)
+        .collect();
+    assert_eq!(groupings, vec!["y"]);
     tdb.cleanup().await;
 }

@@ -25,15 +25,20 @@ pub const MAX_IDEMPOTENCY_KEY_CHARS: usize = 128;
 pub const MAX_VERSION_SCHEME_CHARS: usize = 128;
 /// The most owner Projects one report may name for a target.
 pub const MAX_OWNER_PROJECTS: usize = 64;
+/// The longest `org` or `repo` half of an owner, in bytes (they are ASCII).
+pub const MAX_OWNER_SEGMENT_BYTES: usize = 255;
+/// The highest sequence a report may carry: 2^53 − 1, the largest integer a
+/// JSON number holds exactly in every reader (JavaScript's
+/// `Number.MAX_SAFE_INTEGER`). A larger one would round differently in a
+/// reporter written in another language, and two "different" sequences could
+/// compare equal. It does not stop a reporter from freezing its own target
+/// with a huge sequence (every later one is then stale); that waits for an
+/// admin cursor reset.
+pub const MAX_REPORT_SEQUENCE: u64 = (1 << 53) - 1;
 
-/// The body of `POST /_scarab/plugin/v1/reports`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReportBatch {
-    pub items: Vec<ReportItem>,
-}
-
-/// One report. Internally tagged by `type`.
+/// One report. Internally tagged by `type`. The body of `POST
+/// /_scarab/plugin/v1/reports` is `{"items": [ReportItem, …]}`; the broker
+/// parses each item on its own, so one it cannot read is `rejected` alone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ReportItem {
@@ -148,6 +153,22 @@ impl ReportItem {
         }
     }
 
+    /// The item with its owners sorted: the owner SET is the fact, so a
+    /// retry that lists the same owners in another order is the same report
+    /// and must hash the same — otherwise its idempotency key reads as reused
+    /// for other content (409) instead of a duplicate.
+    pub fn canonical(mut self) -> Self {
+        match &mut self {
+            ReportItem::Status(StatusReportItem {
+                owners: Some(owners),
+                ..
+            })
+            | ReportItem::Ownership(OwnershipReportItem { owners, .. }) => owners.sort(),
+            ReportItem::Status(_) => {}
+        }
+        self
+    }
+
     /// Check one item as `installation` (a name) in `org` would send it: the
     /// caps, a link that is `http(s)`, a grouping that is a valid
     /// EnvironmentDeploymentSource grouping, and owners that are Projects in
@@ -157,11 +178,11 @@ impl ReportItem {
     pub fn validate(&self, installation: &str, org: &str) -> Result<(), String> {
         let key = self.idempotency_key();
         bounded_text("idempotency_key", key, MAX_IDEMPOTENCY_KEY_CHARS, false)?;
-        // Postgres stores the sequence as BIGINT; 0 is "nothing accepted yet".
-        if self.sequence() == 0 || self.sequence() > i64::MAX as u64 {
+        // 0 is "nothing accepted yet"; the ceiling is JSON's exact-integer
+        // limit (and well inside Postgres's BIGINT).
+        if self.sequence() == 0 || self.sequence() > MAX_REPORT_SEQUENCE {
             return Err(format!(
-                "sequence must be between 1 and {}, got {}",
-                i64::MAX,
+                "sequence must be between 1 and {MAX_REPORT_SEQUENCE}, got {}",
                 self.sequence()
             ));
         }
@@ -171,6 +192,9 @@ impl ReportItem {
         }
         .validate()
         .map_err(|e| e.to_string())?;
+        // The grouping is matched exactly against what an admin typed; an
+        // invisible character would make a lookalike that never matches.
+        reject_invisible_format("vendor_grouping", self.vendor_grouping())?;
         bounded_text("target_id", self.target_id(), MAX_TARGET_ID_CHARS, false)?;
         if let Some(owners) = self.owners() {
             validate_owners(owners, org)?;
@@ -206,7 +230,37 @@ fn bounded_text(field: &str, value: &str, max: usize, may_be_empty: bool) -> Res
     if value.chars().any(char::is_control) {
         return Err(format!("{field} contains a control character"));
     }
-    Ok(())
+    reject_invisible_format(field, value)
+}
+
+/// The Unicode format characters that change how text reads without being
+/// seen: zero-width spaces and joiners, the bidirectional overrides and
+/// isolates that reverse a label on screen, the BOM, the soft hyphen and
+/// their kin. `char::is_control` is Cc only and lets every one through, so
+/// `argocd/w\u{200B}eb` would sit on the board beside `argocd/web` looking
+/// identical. Refused in every text field a report carries.
+fn is_invisible_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
+}
+
+fn reject_invisible_format(field: &str, value: &str) -> Result<(), String> {
+    match value.chars().find(|c| is_invisible_format(*c)) {
+        Some(c) => Err(format!(
+            "{field} contains the invisible format character U+{:04X}",
+            c as u32
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Only an absolute `http`/`https` URL: a `javascript:` or `data:` link
@@ -237,14 +291,20 @@ fn validate_owners(owners: &[String], org: &str) -> Result<(), String> {
         let Some((owner_org, project)) = owner.split_once('/') else {
             return Err(format!("owner `{owner}` must be `org/repo`"));
         };
+        // A forge's own name alphabet (GitHub and Forgejo agree): ASCII
+        // letters, digits, `-`, `_`, `.`. That leaves no room for a lookalike
+        // character, and keeps an owner's JSON the size of its bytes — the
+        // broker's body limit is computed from it.
         let well_formed = |s: &str| {
             !s.is_empty()
-                && s.len() <= 255
-                && !s.contains('/')
-                && !s.chars().any(|c| c.is_whitespace() || c.is_control())
+                && s.len() <= MAX_OWNER_SEGMENT_BYTES
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
         };
         if !well_formed(owner_org) || !well_formed(project) {
-            return Err(format!("owner `{owner}` must be `org/repo`"));
+            return Err(format!(
+                "owner `{owner}` must be `org/repo` (letters, digits, `-`, `_`, `.`)"
+            ));
         }
         if owner_org != org {
             return Err(format!(
@@ -283,7 +343,9 @@ pub enum ReportOutcome {
     /// No Environment lists its *(installation, grouping)*; dropped from the
     /// record and counted (ADR-0071 §5). Its sequence still advanced.
     Unmapped,
-    /// Failed validation; nothing was stored, not even a receipt.
+    /// Unreadable, failed validation, or would pass a per-installation cap
+    /// (its `reason` then starts `cap:`); nothing was stored, not even a
+    /// receipt, so the same key may be sent again once it is fixed.
     Rejected,
 }
 
@@ -453,6 +515,9 @@ mod tests {
             vec!["acme/web/x".into()],
             vec!["acme/".into()],
             vec!["acme/web".into(), "acme/web".into()],
+            vec!["acme/we b".into()],
+            vec!["acme/we\"b".into()],
+            vec![format!("acme/{}", "w".repeat(MAX_OWNER_SEGMENT_BYTES + 1))],
         ] {
             let mut s = status();
             s.owners = Some(owners.clone());
@@ -466,8 +531,11 @@ mod tests {
         s.sequence = 0;
         assert!(check(s).is_err(), "sequence 0");
         let mut s = status();
-        s.sequence = i64::MAX as u64 + 1;
-        assert!(check(s).is_err(), "sequence beyond BIGINT");
+        s.sequence = MAX_REPORT_SEQUENCE;
+        assert_eq!(check(s), Ok(()), "2^53 - 1 is the last exact JSON integer");
+        let mut s = status();
+        s.sequence = MAX_REPORT_SEQUENCE + 1;
+        assert!(check(s).is_err(), "sequence beyond 2^53 - 1");
         let mut s = status();
         s.vendor_grouping = " prod".into();
         assert!(check(s).is_err(), "edge space in the grouping");
@@ -480,6 +548,60 @@ mod tests {
         let mut s = status();
         s.source_at = -1;
         assert!(check(s).is_err(), "negative source_at");
+    }
+
+    /// Zero-width, bidi-override and other invisible format characters are
+    /// refused in every text field, so two targets cannot look identical on
+    /// the board and a label cannot render reversed (red-team F-4).
+    #[test]
+    fn invisible_format_characters_are_refused_in_every_text_field() {
+        type Set = Box<dyn Fn(&mut StatusReportItem, String)>;
+        let fields: [(&str, Set); 8] = [
+            ("target_id", Box::new(|s, v| s.target_id = v)),
+            ("vendor_grouping", Box::new(|s, v| s.vendor_grouping = v)),
+            ("idempotency_key", Box::new(|s, v| s.idempotency_key = v)),
+            ("version", Box::new(|s, v| s.version = v)),
+            ("version_scheme", Box::new(|s, v| s.version_scheme = v)),
+            ("label", Box::new(|s, v| s.label = v)),
+            (
+                "link",
+                Box::new(|s, v| s.link = Some(format!("https://argo.example/{v}"))),
+            ),
+            (
+                "owners",
+                Box::new(|s, v| s.owners = Some(vec![format!("acme/{v}")])),
+            ),
+        ];
+        for c in [
+            '\u{00AD}', '\u{061C}', '\u{180E}', '\u{200B}', '\u{200F}', '\u{202A}', '\u{202E}',
+            '\u{2060}', '\u{2064}', '\u{2066}', '\u{2069}', '\u{FEFF}',
+        ] {
+            for (field, set) in &fields {
+                let mut s = status();
+                set(&mut s, format!("w{c}eb"));
+                assert!(check(s).is_err(), "{field} with U+{:04X}", c as u32);
+            }
+        }
+        // Visible non-ASCII is fine where free text is allowed.
+        let mut s = status();
+        s.label = "déployé ✓".into();
+        assert_eq!(check(s), Ok(()));
+    }
+
+    #[test]
+    fn canonical_sorts_the_owner_set_and_nothing_else() {
+        let mut s = status();
+        s.owners = Some(vec!["acme/web".into(), "acme/api".into()]);
+        let mut sorted = s.clone();
+        sorted.owners = Some(vec!["acme/api".into(), "acme/web".into()]);
+        assert_eq!(
+            ReportItem::Status(s).canonical(),
+            ReportItem::Status(sorted.clone())
+        );
+        assert_eq!(
+            ReportItem::Status(sorted.clone()).canonical(),
+            ReportItem::Status(sorted)
+        );
     }
 
     #[test]

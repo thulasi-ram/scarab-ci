@@ -16,6 +16,22 @@ use crate::{InstallationState, PluginInstallation, ReportIngest, ReportItemOutco
 /// the receipt only makes the answer exact for a prompt retry.
 pub const REPORT_RECEIPT_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
+/// The most DeploymentTargets one installation may report on, and the most
+/// groupings no Environment lists it may have counted. Each is a row core
+/// keeps for good, created by whatever a plugin sends; without a cap a buggy
+/// or hostile plugin grows them without bound (red-team F-2). Far above any
+/// real Argo CD (thousands of Applications), and a cap blocks only NEW rows:
+/// a target already known keeps reporting. An item over a cap is
+/// `rejected` with a `cap:` reason.
+pub const MAX_TARGETS_PER_INSTALLATION: u64 = 10_000;
+pub const MAX_UNMAPPED_GROUPINGS_PER_INSTALLATION: u64 = 1_000;
+
+/// A list read's page size when none is asked for, and the most one page
+/// returns. Lists are keyset-paged: the next page starts after the last
+/// row's key, so a row added between pages is neither skipped nor repeated.
+pub const PAGE_DEFAULT_LIMIT: usize = 500;
+pub const PAGE_MAX_LIMIT: usize = 1000;
+
 /// An EnvironmentDeploymentSource that names an installation, seen from the
 /// installation: the Environment it routes a grouping into.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -25,8 +41,9 @@ pub struct InstallationDeploymentSource {
 }
 
 /// What core knows of one DeploymentTarget a source reports on: its cursor
-/// (the last accepted sequence), where it routes, its declared version
-/// scheme, its last reported status and its owners.
+/// (the last accepted sequence), where it routes now, where its last status
+/// was recorded, its declared version scheme, its last reported status and
+/// its owners.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeploymentSourceTarget {
     pub installation_id: String,
@@ -34,8 +51,21 @@ pub struct DeploymentSourceTarget {
     pub installation: String,
     pub target_id: String,
     pub vendor_grouping: String,
-    /// `None` while no Environment lists the grouping.
+    /// Where a report about it routes **now**: the Environment that lists
+    /// *(installation, grouping)* at the moment of the read. `None` while
+    /// none does. Moves the instant an admin edits the sources — no report
+    /// needed.
     pub environment: Option<String>,
+    /// The Environment its last status report was **appended to**; `None`
+    /// if its last status was dropped (unmapped) or none was ever reported.
+    pub status_environment: Option<String>,
+    /// The reporter must re-send this target's current status: it routes
+    /// somewhere ([`Self::environment`]) that its last status never reached
+    /// ([`Self::status_environment`]) — a grouping an admin just mapped, or
+    /// moved to another Environment. Derived on read, never stored, so an
+    /// Environment edit needs no write here and only a status report that
+    /// lands clears it (ADR-0070 §11).
+    pub resend: bool,
     pub last_sequence: u64,
     /// `None` until a status report has declared one.
     pub version_scheme: Option<String>,
@@ -47,6 +77,51 @@ pub struct DeploymentSourceTarget {
     pub owner_projects: Vec<String>,
     pub owners_reported_at: Option<i64>,
     pub updated_at: i64,
+}
+
+/// One page of an installation's targets ([`PluginStore::source_targets`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SourceTargetsPage {
+    /// Start after this target id (exclusive); `None` = from the first.
+    pub after: Option<String>,
+    /// At most this many; clamped to `1..=`[`PAGE_MAX_LIMIT`].
+    pub limit: usize,
+    /// Only the targets whose [`DeploymentSourceTarget::resend`] is set —
+    /// what a reporter polls for.
+    pub resend_only: bool,
+}
+
+/// One page of an Environment's targets
+/// ([`PluginStore::environment_targets`]), ordered by installation name then
+/// target id.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EnvironmentTargetsPage {
+    /// Start after this `(installation name, target id)` (exclusive).
+    pub after: Option<(String, String)>,
+    /// At most this many; clamped to `1..=`[`PAGE_MAX_LIMIT`].
+    pub limit: usize,
+}
+
+/// Where one DeploymentTarget a source has reported on routes now
+/// ([`PluginStore::target_routings`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetRouting {
+    /// The installation's name — `DeploymentTarget.source`.
+    pub installation: String,
+    pub target_id: String,
+    /// `None` = no Environment lists its grouping any more.
+    pub environment: Option<String>,
+}
+
+/// How much of its caps an installation uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InstallationUsage {
+    /// Out of [`MAX_TARGETS_PER_INSTALLATION`].
+    pub targets: u64,
+    /// Rows counted against [`MAX_UNMAPPED_GROUPINGS_PER_INSTALLATION`] —
+    /// including groupings an Environment has listed since, until their next
+    /// report clears them.
+    pub unmapped_groupings: u64,
 }
 
 /// A vendor grouping an installation reports on that no Environment lists:
@@ -94,6 +169,10 @@ pub enum PluginStoreError {
          nothing in this batch was recorded"
     )]
     IdempotencyConflict { idempotency_key: String },
+    /// The store is saturated: no connection was free in time, or a lock
+    /// wait passed its timeout. Nothing was recorded; retry later.
+    #[error("plugin store busy: {0}")]
+    Busy(String),
     /// The backing store failed, or held a row this binary cannot read.
     #[error("plugin store: {0}")]
     Store(String),
@@ -166,9 +245,13 @@ pub trait PluginStore: Send + Sync {
     /// installation's own record, never from a report. Per item: a repeat
     /// key is a duplicate; a sequence not newer than the target's cursor is
     /// stale; a grouping no Environment lists is unmapped (counted, sequence
-    /// still advanced); otherwise a status is appended to the Deployment
-    /// record. Refuses a killed installation and an idempotency key reused
-    /// with other content — then nothing in the batch is stored.
+    /// still advanced); a NEW target or unmapped grouping past its cap
+    /// ([`MAX_TARGETS_PER_INSTALLATION`],
+    /// [`MAX_UNMAPPED_GROUPINGS_PER_INSTALLATION`]) is rejected; otherwise a
+    /// status is appended to the Deployment record. Refuses a killed
+    /// installation, an idempotency key reused with other content, and a
+    /// saturated store ([`PluginStoreError::Busy`]) — then nothing in the
+    /// batch is stored.
     async fn ingest_report(
         &self,
         installation_id: &str,
@@ -176,27 +259,50 @@ pub trait PluginStore: Send + Sync {
         received_at: i64,
     ) -> Result<Vec<ReportItemOutcome>, PluginStoreError>;
 
-    /// The installation's targets — what a restarted plugin seeds its
-    /// cursors from — by target id.
+    /// A page of the installation's targets — what a restarted plugin seeds
+    /// its cursors from, and (with `resend_only`) what it must re-send — by
+    /// target id.
     async fn source_targets(
         &self,
         installation_id: &str,
+        page: &SourceTargetsPage,
     ) -> Result<Vec<DeploymentSourceTarget>, PluginStoreError>;
 
-    /// Every reported target routed into `environment` in `org`, by
-    /// installation then target id.
+    /// A page of the reported targets whose grouping `environment` lists
+    /// **now**, in `org`, by installation then target id. Their `last_*`
+    /// fields are set only when that last status was recorded in
+    /// `environment`: a status reported elsewhere is not this Environment's
+    /// fact.
     async fn environment_targets(
         &self,
         org: &str,
         environment: &str,
+        page: &EnvironmentTargetsPage,
     ) -> Result<Vec<DeploymentSourceTarget>, PluginStoreError>;
 
-    /// The installation's groupings no Environment lists right now, by
-    /// grouping.
+    /// Where each of `targets` — `(installation name, target id)` pairs in
+    /// `org` — routes now. A pair no installation of the Org has reported on
+    /// is absent.
+    async fn target_routings(
+        &self,
+        org: &str,
+        targets: &[(String, String)],
+    ) -> Result<Vec<TargetRouting>, PluginStoreError>;
+
+    /// A page of the installation's groupings no Environment lists right
+    /// now, by grouping, starting after `after`.
     async fn unmapped_groupings(
         &self,
         installation_id: &str,
+        after: Option<&str>,
+        limit: usize,
     ) -> Result<Vec<UnmappedGrouping>, PluginStoreError>;
+
+    /// How much of its caps the installation uses.
+    async fn installation_usage(
+        &self,
+        installation_id: &str,
+    ) -> Result<InstallationUsage, PluginStoreError>;
 
     /// Drop report receipts received before `received_before`. Returns how
     /// many went.

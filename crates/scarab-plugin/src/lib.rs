@@ -36,14 +36,16 @@ mod report;
 mod store;
 
 pub use report::{
-    OwnershipReportItem, ReportBatch, ReportIngest, ReportItem, ReportItemOutcome, ReportOutcome,
+    OwnershipReportItem, ReportIngest, ReportItem, ReportItemOutcome, ReportOutcome,
     ReportedStatus, StatusReportItem, MAX_IDEMPOTENCY_KEY_CHARS, MAX_OWNER_PROJECTS,
-    MAX_REPORT_ITEMS, MAX_REPORT_LABEL_CHARS, MAX_REPORT_LINK_CHARS, MAX_TARGET_ID_CHARS,
-    MAX_VERSION_CHARS, MAX_VERSION_SCHEME_CHARS,
+    MAX_OWNER_SEGMENT_BYTES, MAX_REPORT_ITEMS, MAX_REPORT_LABEL_CHARS, MAX_REPORT_LINK_CHARS,
+    MAX_REPORT_SEQUENCE, MAX_TARGET_ID_CHARS, MAX_VERSION_CHARS, MAX_VERSION_SCHEME_CHARS,
 };
 pub use store::{
-    DeploymentSourceTarget, InstallationDeploymentSource, PluginStore, PluginStoreError,
-    UnmappedGrouping, REPORT_RECEIPT_RETENTION_MS,
+    DeploymentSourceTarget, EnvironmentTargetsPage, InstallationDeploymentSource,
+    InstallationUsage, PluginStore, PluginStoreError, SourceTargetsPage, TargetRouting,
+    UnmappedGrouping, MAX_TARGETS_PER_INSTALLATION, MAX_UNMAPPED_GROUPINGS_PER_INSTALLATION,
+    PAGE_DEFAULT_LIMIT, PAGE_MAX_LIMIT, REPORT_RECEIPT_RETENTION_MS,
 };
 
 /// The longest installation or plugin name: a DNS-1123 label. Installation
