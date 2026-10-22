@@ -644,13 +644,19 @@ impl SecretProvider for PostgresSecrets {
 
 /// Encode a scope to its stored string. Distinct scopes never collide, so a
 /// lookup at the wrong scope simply misses (access is scoped, ADR-0032).
+///
+/// `EnvironmentProject` keeps the `env:` prefix of the scope it renamed
+/// (ADR-0071 §6): this string is the row's lookup key **and** its AEAD
+/// associated data, so changing it would orphan every stored environment
+/// secret (a miss) and fail the tag on any that were re-keyed (pinned by
+/// `environment_project_scope_key_and_aad_are_byte_identical_to_the_old_environment_scope`).
 fn scope_key(scope: &SecretScope) -> String {
     match scope {
         SecretScope::Org { org } => format!("org:{org}"),
         SecretScope::Repo { org, repo } => format!("repo:{org}/{repo}"),
-        SecretScope::Environment {
+        SecretScope::EnvironmentProject {
             org,
-            repo,
+            project: repo,
             environment,
         } => format!("env:{org}/{repo}/{environment}"),
     }
@@ -736,6 +742,32 @@ mod tests {
         let (legacy_ct, legacy_nonce) = encrypt(&key, b"old", b"").unwrap();
         assert_eq!(decrypt(&key, &legacy_nonce, &legacy_ct, b"").unwrap(), b"old");
         assert!(decrypt(&key, &legacy_nonce, &legacy_ct, &aad).is_err());
+    }
+
+    /// ADR-0071 §6 renamed `SecretScope::Environment { org, repo, environment }`
+    /// to `EnvironmentProject { org, project, environment }` **without moving
+    /// a byte**: the stored scope string and the AAD a row was sealed under
+    /// are exactly what the old variant produced, so every existing secret
+    /// still resolves at, and only at, the same scope.
+    #[test]
+    fn environment_project_scope_key_and_aad_are_byte_identical_to_the_old_environment_scope() {
+        let scope = SecretScope::EnvironmentProject {
+            org: "acme".into(),
+            project: "web".into(),
+            environment: "prod".into(),
+        };
+        assert_eq!(scope_key(&scope), "env:acme/web/prod");
+        assert_eq!(
+            row_aad(&scope_key(&scope), "TOKEN"),
+            b"env:acme/web/prod\0TOKEN".to_vec()
+        );
+        // A value sealed under the pre-rename encoding opens under the new one.
+        let key = [7u8; 32];
+        let (ct, nonce) = encrypt(&key, b"v", &row_aad("env:acme/web/prod", "TOKEN")).unwrap();
+        assert_eq!(
+            decrypt(&key, &nonce, &ct, &row_aad(&scope_key(&scope), "TOKEN")).unwrap(),
+            b"v"
+        );
     }
 
     /// The NUL separator keeps (scope, key) pairs from colliding.

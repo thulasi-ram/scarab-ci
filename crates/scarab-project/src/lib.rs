@@ -14,8 +14,9 @@ use scarab_forge::RepoRef;
 use scarab_secrets::SecretScope;
 use serde::{Deserialize, Serialize};
 
-/// The minimal org-level Environment (ADR-0071, MMP step 1). Coexists with the
-/// per-Project [`Environment`] below by exact name until the full migration.
+/// The org-level Environment (ADR-0071). Since the full migration (c-full c2)
+/// it alone governs Deploy Runs; the per-Project [`Environment`] below is the
+/// legacy shape the migration reads.
 mod org_environment;
 pub use org_environment::{
     validate_org_environment_name, EnvironmentDeploymentDeadline, EnvironmentDeploymentSource,
@@ -27,13 +28,13 @@ pub use org_environment::{
 
 /// The org-level Environment's governance model and its pure resolution
 /// (ADR-0071 §2, §3, §8, §10): baseline, tighten-only overlay, eligibility,
-/// per-Project privilege grant, and the migration from the per-Project
-/// [`Environment`]. Defined, not yet read by admission.
+/// per-Project privilege grant, the migration from the per-Project
+/// [`Environment`], and the store admission reads them through.
 mod environment_governance;
 pub use environment_governance::{
-    effective_protection, migrate_legacy_environment, AllowedRefConstraint, EffectiveProtection,
-    EnvironmentProjectEligibility, EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant,
-    EnvironmentProtectionRules,
+    effective_protection, migrate_legacy_environment, AllowedRefConstraint, DeployGovernance,
+    EffectiveProtection, EnvironmentGovernanceStore, EnvironmentProjectEligibility,
+    EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant, EnvironmentProtectionRules,
 };
 
 /// A top-level tenant. Owns Projects. The Scarab tenancy boundary — **not**
@@ -77,7 +78,13 @@ impl Project {
     }
 }
 
-/// A deployment environment with its protection rules.
+/// A deployment environment with its protection rules — the **legacy**
+/// per-Project ADR-0037 shape. Since ADR-0071's migration (c-full c2) nothing
+/// admits a Run by it: the migration turned each one into an
+/// [`EnvironmentProjectOverlay`] (and, where it carried privileges, an
+/// [`EnvironmentProjectPrivilegeGrant`]) via [`migrate_legacy_environment`].
+/// Kept to deserialise the frozen `legacy_project_environments` rows and as
+/// the oracle the migration's golden tests decide against.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Environment {
     pub name: String,
@@ -364,8 +371,14 @@ pub enum ProjectError {
     Store(String),
 }
 
-/// Durable store for environments (with their protection rules) and the
-/// deployment history recorded against them. Keyed by the owning
+/// Durable store for the **legacy** per-Project environments and the legacy
+/// approval history recorded against them (ADR-0070 §1). Since ADR-0071's
+/// migration the environment half reads and writes the frozen
+/// `legacy_project_environments` table, which nothing in the server writes
+/// any more (the per-repo write API answers 410) and admission never reads;
+/// it survives for the golden tests and the split report. The history half
+/// (`record_deployment` / `deployments`) is still written on every gate
+/// release. Keyed by the owning
 /// [`Project`]'s natural key `(org, project)` (ADR-0046) — the project name
 /// is its repo's forge name (1:1 in v1), the key a run knows from its
 /// trigger (ADR-0037).

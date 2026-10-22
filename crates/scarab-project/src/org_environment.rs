@@ -1,21 +1,23 @@
-//! The **minimal org-level Environment** (ADR-0071, MMP step 1): a name, its
-//! EnvironmentDeploymentDeadline, and its EnvironmentDeploymentSources —
-//! enough to key Deployments and, from slice (d) on, route source reports.
+//! The **org-level Environment** (ADR-0071): a name, its
+//! EnvironmentDeploymentDeadline, its EnvironmentDeploymentSources and — since
+//! the full migration (c-full sub-slice c2) — its baseline protection rules
+//! and EnvironmentProjectEligibility.
 //!
 //! This is CONTEXT §4.1's **Environment**. It is named [`OrgEnvironment`]
-//! only because the per-Project ADR-0037 struct already owns the name
-//! [`Environment`](crate::Environment); at the full migration (ADR-0071 §10)
-//! that struct becomes the EnvironmentProjectOverlay and this one becomes
-//! `Environment`.
+//! only because the per-Project ADR-0037 struct still owns the name
+//! [`Environment`](crate::Environment) as the legacy shape the migration
+//! reads; the mechanical rename to `Environment` is sub-slice c3.
 //!
-//! Until then the two **coexist by exact, case-sensitive name** and never
-//! reference each other: no foreign key either way, and an OrgEnvironment
-//! **never feeds admission** — per-Project Environments keep governing Runs
-//! (`resolve_governance` in the server is untouched). Nor does a Deployment
-//! need one: the Deployment record is keyed by name, and a name with no
+//! The two **no longer coexist** for admission: an OrgEnvironment **is** what
+//! governs a Deploy Run (`resolve_governance` in the server, through
+//! [`EnvironmentGovernanceStore`](crate::EnvironmentGovernanceStore)), and a
+//! name with no OrgEnvironment is refused (ADR-0071 §10). A Deployment still
+//! needs none: the Deployment record is keyed by name, and a name with no
 //! OrgEnvironment simply gets the default deadline.
 
 use async_trait::async_trait;
+
+use crate::{EnvironmentProjectEligibility, EnvironmentProtectionRules};
 
 /// The shortest EnvironmentDeploymentDeadline an admin may set: one minute.
 /// Anything shorter would read most real syncs as `stalled` before a source
@@ -150,10 +152,11 @@ fn is_dns1123_label(s: &str) -> bool {
         && s.ends_with(alnum)
 }
 
-/// An org-level Environment (ADR-0071 §1), in its minimal MMP shape: no
-/// protection rules, eligibility, overlays or grants yet — those arrive with
-/// the full migration. See the module docs for why it is not yet called
-/// `Environment`.
+/// An org-level Environment (ADR-0071 §1). Per-Project overlays and privilege
+/// grants are not part of it — they belong to one Project each and are read
+/// with it only through
+/// [`DeployGovernance`](crate::DeployGovernance). See the module docs for why
+/// it is not yet called `Environment`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrgEnvironment {
     pub org: String,
@@ -166,6 +169,16 @@ pub struct OrgEnvironment {
     /// The sources that may report into this Environment. A set: order is not
     /// kept (the store returns them sorted), and a duplicate is refused.
     pub deployment_sources: Vec<EnvironmentDeploymentSource>,
+    /// The baseline protection rules every eligible Project's Deploy Runs
+    /// obey (ADR-0071 §1), before any Project's overlay. Written only by
+    /// `EnvironmentGovernanceStore::put_environment_protection`:
+    /// [`OrgEnvironmentStore::put_org_environment`] ignores it, so the c-min
+    /// whole-Environment replace can never reset it by omission.
+    pub protection: EnvironmentProtectionRules,
+    /// Which Projects may deploy here (ADR-0071 §2). Written only by
+    /// `EnvironmentGovernanceStore::put_environment_eligibility`, for the
+    /// same reason; a new Environment starts with none (fail-closed).
+    pub eligibility: EnvironmentProjectEligibility,
     /// Unix-ms it was first created. Kept across replaces.
     pub created_at: i64,
     /// Unix-ms it was last written.
@@ -203,7 +216,7 @@ impl OrgEnvironment {
                 )));
             }
         }
-        Ok(())
+        self.eligibility.validate()
     }
 }
 
@@ -266,6 +279,15 @@ pub enum OrgEnvironmentError {
         /// has to say, or a deadline-only edit fails for no visible reason.
         already_listed: bool,
     },
+    /// No Environment by that name exists in the Org (ADR-0071): refused by
+    /// a governance write that names one. Nothing was stored.
+    #[error("org `{org}` has no environment `{environment}`")]
+    NotFound { org: String, environment: String },
+    /// The Environment is still referenced — Projects hold overlays or
+    /// privilege grants in it (ADR-0071 §3, §8) — so it cannot be deleted.
+    /// Nothing changed.
+    #[error("{0}")]
+    InUse(String),
     /// The backing store failed, or held a row this binary cannot read.
     #[error("org environment store: {0}")]
     Store(String),
@@ -293,6 +315,11 @@ pub trait OrgEnvironmentStore: Send + Sync {
     /// Create `env`, or replace the one with its `(org, name)` — its
     /// description, deadline and **whole** source list, atomically. On a
     /// replace the stored `created_at` is kept and `env.created_at` ignored.
+    /// `env.protection` and `env.eligibility` are **ignored** too: a new
+    /// Environment starts permissive and with no eligible Project, a replace
+    /// keeps what is stored, and the returned value carries the stored ones
+    /// (they have their own writes on
+    /// [`EnvironmentGovernanceStore`](crate::EnvironmentGovernanceStore)).
     /// Refuses an invalid `env` ([`OrgEnvironmentError::Invalid`]) and a
     /// source another Environment holds
     /// ([`OrgEnvironmentError::DeploymentSourceTaken`]); an adapter that
@@ -318,7 +345,9 @@ pub trait OrgEnvironmentStore: Send + Sync {
         org: &str,
     ) -> Result<Vec<OrgEnvironment>, OrgEnvironmentError>;
 
-    /// Remove an OrgEnvironment and its sources. `false` if there was none.
+    /// Remove an OrgEnvironment, its sources and its eligibility. `false` if
+    /// there was none. Refused with [`OrgEnvironmentError::InUse`] while any
+    /// Project holds an overlay or privilege grant in it.
     async fn delete_org_environment(
         &self,
         org: &str,
@@ -358,6 +387,8 @@ mod tests {
             )
             .unwrap(),
             deployment_sources: sources,
+            protection: EnvironmentProtectionRules::default(),
+            eligibility: EnvironmentProjectEligibility::default(),
             created_at: 0,
             updated_at: 0,
             updated_by: "amy".into(),

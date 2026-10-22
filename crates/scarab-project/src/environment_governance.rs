@@ -5,13 +5,14 @@
 //! function that folds a baseline and an overlay into the rules admission
 //! enforces ([`effective_protection`]).
 //!
-//! **Nothing reads this yet** (Deployments MMP slice c-full, sub-slice c1):
-//! admission still resolves the per-Project ADR-0037 [`Environment`] and its
-//! [`ProtectionRules`]. The types here are defined beside [`OrgEnvironment`]
-//! rather than inside it because `OrgEnvironment` is persisted and served
-//! whole by the c-min store and API, which have no columns for these yet —
-//! a field the store silently dropped on every write would read as governance
-//! that is not there. The full migration (c2) adds the columns and wires them.
+//! Since sub-slice c2 this is what **admission reads**: the server resolves a
+//! Deploy Run's [`DeployGovernance`] through an
+//! [`EnvironmentGovernanceStore`] (one consistent read), refuses an unknown
+//! Environment or an ineligible Project before the Run exists, and enforces
+//! [`EffectiveProtection`] and the Project's
+//! [`EnvironmentProjectPrivilegeGrant`]. The per-Project ADR-0037
+//! [`Environment`] and its [`ProtectionRules`] survive only as the **legacy**
+//! shape the migration reads (and the golden tests pin it against).
 //!
 //! [`OrgEnvironment`]: crate::OrgEnvironment
 
@@ -19,9 +20,11 @@ use std::num::NonZeroU32;
 
 #[cfg(doc)]
 use crate::ProtectionRules;
+use async_trait::async_trait;
+
 use crate::{
     admit_grants_against_whitelist, glob_match, AdmittedGrants, Environment,
-    EnvironmentDeploymentDeadline, GrantRequest, ImageGrant, OrgEnvironmentError,
+    EnvironmentDeploymentDeadline, GrantRequest, ImageGrant, OrgEnvironment, OrgEnvironmentError,
 };
 
 /// The protection rules an Environment's admin sets as its **baseline**, and
@@ -417,6 +420,142 @@ pub fn migrate_legacy_environment(
         }
     });
     (overlay, grant)
+}
+
+/// Everything admission needs to decide one Project's Deploy Run into one
+/// Environment (ADR-0071 §2, §3, §8), read **together** by
+/// [`EnvironmentGovernanceStore::deploy_governance`] so one decision never
+/// pairs, say, an old eligibility list with a new overlay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeployGovernance {
+    /// The Environment, with its baseline and eligibility.
+    pub environment: OrgEnvironment,
+    /// Whether the Environment's [`EnvironmentProjectEligibility`] admits the
+    /// Project this was read for. Computed by [`DeployGovernance::new`] from
+    /// `environment.eligibility`, so every store decides eligibility with the
+    /// one glob matcher rather than its own query.
+    pub eligible: bool,
+    /// The Project's tighten-only overlay, if it has one.
+    pub overlay: Option<EnvironmentProjectOverlay>,
+    /// The Project's privilege grant there, if it has one.
+    pub privilege_grant: Option<EnvironmentProjectPrivilegeGrant>,
+}
+
+impl DeployGovernance {
+    /// The governance of `project`'s Deploy Runs into `environment`.
+    pub fn new(
+        environment: OrgEnvironment,
+        project: &str,
+        overlay: Option<EnvironmentProjectOverlay>,
+        privilege_grant: Option<EnvironmentProjectPrivilegeGrant>,
+    ) -> Self {
+        let eligible = environment.eligibility.admits(project);
+        Self {
+            environment,
+            eligible,
+            overlay,
+            privilege_grant,
+        }
+    }
+
+    /// The rules admission enforces: the baseline merged with the overlay.
+    pub fn effective_protection(&self) -> EffectiveProtection {
+        effective_protection(
+            &self.environment.protection,
+            self.environment.deployment_deadline,
+            self.overlay.as_ref(),
+        )
+    }
+}
+
+/// Durable store for the governance half of org-level Environments (ADR-0071
+/// §2, §3, §8): baseline protection, eligibility, per-Project overlays and
+/// privilege grants. The Environment itself (name, description, deadline,
+/// sources) is the [`OrgEnvironmentStore`](crate::OrgEnvironmentStore)'s.
+///
+/// The baseline and the eligibility each have **their own write**, never a
+/// field of the whole-Environment replace: that replace is what the c-min
+/// admin form sends, and a form that knows nothing of governance must not
+/// reset it to permissive (or to "no eligible Project") by omission.
+///
+/// Every write naming an Environment that does not exist is refused with
+/// [`OrgEnvironmentError::NotFound`].
+#[async_trait]
+pub trait EnvironmentGovernanceStore: Send + Sync {
+    /// The governance of `project`'s Deploy Runs into `environment`, read in
+    /// **one consistent snapshot**; `None` when the Org has no Environment by
+    /// that name (exact, case-sensitive).
+    async fn deploy_governance(
+        &self,
+        org: &str,
+        project: &str,
+        environment: &str,
+    ) -> Result<Option<DeployGovernance>, OrgEnvironmentError>;
+
+    /// The governance of `project` in every Environment of `org` that it is
+    /// eligible for **or** holds an overlay or grant in (a Project made
+    /// ineligible keeps its overlay, and an admin must still see it), by
+    /// Environment name.
+    async fn project_environment_governance(
+        &self,
+        org: &str,
+        project: &str,
+    ) -> Result<Vec<DeployGovernance>, OrgEnvironmentError>;
+
+    /// Replace an Environment's baseline protection rules. Returns the
+    /// Environment as stored.
+    async fn put_environment_protection(
+        &self,
+        org: &str,
+        environment: &str,
+        protection: &EnvironmentProtectionRules,
+        updated_by: &str,
+        updated_at: i64,
+    ) -> Result<OrgEnvironment, OrgEnvironmentError>;
+
+    /// Replace an Environment's eligibility. Refuses an invalid list
+    /// ([`EnvironmentProjectEligibility::validate`]). Returns the Environment
+    /// as stored.
+    async fn put_environment_eligibility(
+        &self,
+        org: &str,
+        environment: &str,
+        eligibility: &EnvironmentProjectEligibility,
+        updated_by: &str,
+        updated_at: i64,
+    ) -> Result<OrgEnvironment, OrgEnvironmentError>;
+
+    /// Create or replace one Project's overlay.
+    async fn put_environment_project_overlay(
+        &self,
+        overlay: &EnvironmentProjectOverlay,
+        updated_by: &str,
+        updated_at: i64,
+    ) -> Result<(), OrgEnvironmentError>;
+
+    /// Remove one Project's overlay. `false` if there was none.
+    async fn delete_environment_project_overlay(
+        &self,
+        org: &str,
+        environment: &str,
+        project: &str,
+    ) -> Result<bool, OrgEnvironmentError>;
+
+    /// Create or replace one Project's privilege grant.
+    async fn put_environment_project_privilege_grant(
+        &self,
+        grant: &EnvironmentProjectPrivilegeGrant,
+        updated_by: &str,
+        updated_at: i64,
+    ) -> Result<(), OrgEnvironmentError>;
+
+    /// Remove one Project's privilege grant. `false` if there was none.
+    async fn delete_environment_project_privilege_grant(
+        &self,
+        org: &str,
+        environment: &str,
+        project: &str,
+    ) -> Result<bool, OrgEnvironmentError>;
 }
 
 #[cfg(test)]

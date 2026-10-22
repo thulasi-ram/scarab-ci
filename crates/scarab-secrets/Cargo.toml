@@ -11,3 +11,6 @@ async-trait = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+# The ADR-0071 §6 rename keeps the old `Environment` wire form readable; the
+# test that pins it decodes real JSON.
+serde_json = { workspace = true }
