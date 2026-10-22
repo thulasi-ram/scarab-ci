@@ -2823,6 +2823,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "scarab-plugin-k8s"
+version = "0.1.1"
+dependencies = [
+ "async-trait",
+ "base64",
+ "futures",
+ "k8s-openapi",
+ "kube",
+ "rustls",
+ "scarab-plugin",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "scarab-project"
 version = "0.1.1"
 dependencies = [
@@ -2887,6 +2906,7 @@ dependencies = [
  "scarab-identity",
  "scarab-pipeline",
  "scarab-plugin",
+ "scarab-plugin-k8s",
  "scarab-project",
  "scarab-secrets",
  "scarab-secrets-postgres",

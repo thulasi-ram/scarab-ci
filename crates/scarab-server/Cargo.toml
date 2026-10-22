@@ -62,6 +62,9 @@ scarab-deployment = { workspace = true }
 # ADR-0072: PluginInstallations, the report wire shape and its rules, and the
 # PluginStore / PluginTokenVerifier ports the broker and admin API speak.
 scarab-plugin = { workspace = true }
+# ADR-0072 §9/§11: the plugin runtime on Kubernetes (reconciled by
+# `plugin_runtime.rs`) and the TokenReview broker-token verifier.
+scarab-plugin-k8s = { workspace = true }
 scarab-db-postgres = { workspace = true }
 scarab-forge-github = { workspace = true }
 scarab-forge-forgejo = { workspace = true }

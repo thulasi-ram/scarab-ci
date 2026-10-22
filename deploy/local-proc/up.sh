@@ -346,6 +346,80 @@ if [ "${SCARAB_WSFETCH_SKIP_BUILD:-0}" != 1 ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Plugins (ADR-0072): the plugin namespace, and how a plugin Pod reaches the
+# CredentialBroker.
+#
+# The namespace is created every run (idempotent, cheap) with Pod Security
+# `restricted` — the plugin runtime only READS that label and refuses to run
+# anything without it, so this script (the operator, in proc mode) sets it.
+#
+# The broker is the server's second listener (SCARAB_BROKER_ADDR, :8090), so in
+# proc mode it is a HOST process exactly like the workspace service — same
+# routing problem, same answer. It is not probed directly: the server must know
+# the URL and the NetworkPolicy peer at BOOT, before its broker listens. The
+# host is the one a Pod was just proven to reach ($ws_host), taken AS A POD
+# RESOLVES IT ($broker_ip) for BOTH the peer (a NetworkPolicy ipBlock needs an
+# IP) and the URL: a plugin Pod has no DNS at all (its egress allows the broker
+# and nothing else — a resolver would be a tunnel out), and the server, a host
+# process, could not resolve the name the way a Pod does anyway (on darwin the
+# host's own idea of its address is the wrong one). Whether the broker then
+# actually answers a plugin is the isolation probe's job — it checks the
+# broker's healthz from a plugin-labelled Pod and fails closed.
+#
+# Only with SCARAB_PLUGINS=on (it costs one more throwaway Pod). A peer that
+# cannot be resolved is a warning, not fatal: the server then reports
+# "broker peer UNSET" at boot and the runtime refuses to start any plugin.
+plugins_ns="${SCARAB_PLUGIN_NAMESPACE:-scarab-plugins}"
+echo "==> ensuring plugin namespace '$plugins_ns' (Pod Security: restricted)"
+kubectl create namespace "$plugins_ns" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+kubectl label namespace "$plugins_ns" --overwrite \
+  pod-security.kubernetes.io/enforce=restricted \
+  pod-security.kubernetes.io/audit=restricted \
+  pod-security.kubernetes.io/warn=restricted >/dev/null
+export SCARAB_PLUGIN_NAMESPACE="$plugins_ns"
+broker_url=""
+broker_peer=""
+if [ "${SCARAB_PLUGINS:-off}" = on ]; then
+  broker_addr="${SCARAB_BROKER_ADDR:-0.0.0.0:8090}"
+  broker_port="${broker_addr##*:}"
+  case "$ws_host" in
+    *[!0-9.]*)
+      echo "==> resolving the broker host '$ws_host' as a Pod sees it"
+      # busybox nslookup prints the server's `Address:` BEFORE `Name:`; the
+      # answer's IPv4 `Address:` lines come after it.
+      resolve_script='nslookup "$H" 2>/dev/null | sed -n "/^Name:/,\$ s/^Address:[[:space:]]*\([0-9.]*\)\$/SCARAB_BROKER_IP=\1/p" | head -n 1'
+      resolve_pod="broker-resolve-$$"
+      kubectl delete pod "$resolve_pod" -n scarab --ignore-not-found --wait=false >/dev/null 2>&1 || true
+      kubectl run "$resolve_pod" -n scarab --image=busybox:1.36 --restart=Never \
+        --env="H=$ws_host" --command -- sh -c "$resolve_script" >/dev/null 2>&1 || true
+      for _ in $(seq 1 30); do
+        phase="$(kubectl get pod "$resolve_pod" -n scarab -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+        case "$phase" in Succeeded|Failed) break ;; esac
+        sleep 2
+      done
+      broker_ip="$(kubectl logs "$resolve_pod" -n scarab 2>/dev/null \
+                   | sed -n 's/^SCARAB_BROKER_IP=//p' | tr -d '\r' | head -n 1)"
+      kubectl delete pod "$resolve_pod" -n scarab --ignore-not-found --wait=false >/dev/null 2>&1 || true
+      ;;
+    *) broker_ip="$ws_host" ;;
+  esac
+  broker_url="${SCARAB_PLUGIN_BROKER_URL:-http://${broker_ip:-$ws_host}:$broker_port}"
+  if [ -n "${SCARAB_PLUGIN_BROKER_PEER:-}" ]; then
+    broker_peer="$SCARAB_PLUGIN_BROKER_PEER"
+  elif [ -n "${broker_ip:-}" ]; then
+    broker_peer="cidr:$broker_ip/32"
+  else
+    echo "    warning: could not resolve '$ws_host' from a Pod; SCARAB_PLUGIN_BROKER_PEER stays" >&2
+    echo "    unset and the plugin runtime will refuse to start any plugin." >&2
+  fi
+  export SCARAB_PLUGIN_BROKER_URL="$broker_url"
+  if [ -n "$broker_peer" ]; then
+    export SCARAB_PLUGIN_BROKER_PEER="$broker_peer"
+  fi
+  echo "    plugins reach the broker at $broker_url (NetworkPolicy peer: ${broker_peer:-UNSET})"
+fi
+
+# ---------------------------------------------------------------------------
 # What this run DISCOVERED, written down for other processes.
 #
 # Everything above is knowledge that exists only inside this shell: which port the
@@ -375,7 +449,16 @@ SCARAB_TEST_WSFETCH_IMAGE=$SCARAB_WSFETCH_IMAGE
 # is reused rather than guessed a second time.
 SCARAB_TEST_HOST_IP=$ws_host
 SCARAB_TEST_KUBE_NS=${SCARAB_NAMESPACE:-scarab}
+# Plugins (ADR-0072): the plugin namespace, and — with SCARAB_PLUGINS=on — how a
+# plugin Pod reaches the broker (both discovered above, not guessed).
+SCARAB_PLUGIN_NAMESPACE=$plugins_ns
 EOF
+if [ -n "$broker_url" ]; then
+  echo "SCARAB_PLUGIN_BROKER_URL=$broker_url" >> "$generated"
+fi
+if [ -n "$broker_peer" ]; then
+  echo "SCARAB_PLUGIN_BROKER_PEER=$broker_peer" >> "$generated"
+fi
 echo "    live-tier env written to deploy/local-proc/.env.generated ('just kube-tests' reads it)"
 
 echo "==> starting scarab-server (converged) in the background"
