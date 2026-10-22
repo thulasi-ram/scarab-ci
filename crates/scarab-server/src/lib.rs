@@ -173,6 +173,10 @@ pub struct AppState {
     /// connection, so a flood cannot queue behind the installation's row
     /// lock — the lock a kill needs.
     pub plugin_ingest_permits: Arc<broker::IngestPermits>,
+    /// How many entries the CredentialBroker's journal queue holds between
+    /// the read proxy and its writer (ADR-0072 §5). Full, the proxy refuses
+    /// to forward (503) rather than forward what it cannot journal.
+    pub broker_journal_queue: usize,
     /// Proves who calls the broker (ADR-0072 §11): TokenReview in production
     /// (slice d2), static dev tokens under `SCARAB_DEV_INSECURE`. `None` makes
     /// every authenticated broker call a 401 — nothing proven, nothing taken.
@@ -284,6 +288,7 @@ impl AppState {
             plugins: None,
             broker_plugins: None,
             plugin_ingest_permits: Arc::new(broker::IngestPermits::default()),
+            broker_journal_queue: broker_proxy::JOURNAL_QUEUE,
             plugin_tokens: None,
             plugin_policy: Arc::new(plugins::PluginPolicy::off()),
             secret_coverage: None,
@@ -395,6 +400,14 @@ impl AppState {
     /// small pool — instead of [`Self::with_plugins`]'s.
     pub fn with_broker_plugin_store(mut self, store: Arc<dyn scarab_plugin::PluginStore>) -> Self {
         self.broker_plugins = Some(store);
+        self
+    }
+
+    /// Size the CredentialBroker's journal queue (default
+    /// [`broker_proxy::JOURNAL_QUEUE`]). A test makes it small to reach
+    /// "journal full" without thousands of requests.
+    pub fn with_broker_journal_queue(mut self, entries: usize) -> Self {
+        self.broker_journal_queue = entries;
         self
     }
 

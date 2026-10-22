@@ -17,9 +17,9 @@ use std::collections::BTreeMap;
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_plugin::{
-    BrokerJournalEntry, ConnectionSlot, InstallationState, PluginCapability, PluginConnection,
-    PluginConnectionAuthScheme, PluginInstallation, PluginManifest, PluginStore, PluginStoreError,
-    RequestRule, RuntimeStatus,
+    BrokerJournalEntry, BrokerJournalPhase, ConnectionSlot, InstallationState, PluginCapability,
+    PluginConnection, PluginConnectionAuthScheme, PluginInstallation, PluginManifest, PluginStore,
+    PluginStoreError, RequestRule, RuntimeStatus,
 };
 
 async fn migrated() -> Option<(common::TestDb, PostgresDb)> {
@@ -51,6 +51,7 @@ fn installation(org: &str, name: &str, id: &str) -> PluginInstallation {
                 read_rules: vec![RequestRule {
                     method: "GET".into(),
                     path: "/api/v1/applications".into(),
+                    query: vec!["projects".into()],
                 }],
             }],
             config_keys: vec![],
@@ -83,10 +84,14 @@ fn binding(installation_id: &str, base_url: &str, credential_ref: &str) -> Plugi
 
 fn entry(installation_id: &str, path: &str, started_at: i64) -> BrokerJournalEntry {
     BrokerJournalEntry {
+        request_id: format!("req-{started_at}"),
+        phase: BrokerJournalPhase::End,
         installation_id: installation_id.into(),
         slot: "argocd".into(),
         method: "GET".into(),
         path: path.into(),
+        upstream_path: Some(path.into()),
+        query: Some("projects=prod".into()),
         rule: Some("GET /api/v1/applications".into()),
         status: Some(200),
         bytes: Some(42),
@@ -222,6 +227,9 @@ async fn the_journal_keeps_order_outlives_an_uninstall_and_is_pruned_by_age() {
         .await
         .unwrap();
     let refused = BrokerJournalEntry {
+        phase: BrokerJournalPhase::Refused,
+        upstream_path: None,
+        query: None,
         rule: None,
         status: Some(403),
         bytes: None,

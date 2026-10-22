@@ -31,7 +31,7 @@ use scarab_plugin::{
     admit_for_mmp, validate_installation_name, ConnectionSlot, DeploymentSourceTarget,
     EnvironmentTargetsPage, InstallationDeploymentSource, InstallationState, InstallationUsage,
     PluginCapability, PluginConnection, PluginConnectionAuthScheme, PluginInstallation,
-    PluginManifest, PluginStoreError, RuntimeStatus, UnmappedGrouping,
+    PluginManifest, PluginStoreError, RequestRule, RuntimeStatus, UnmappedGrouping,
     MAX_CONNECTION_BASE_URL_CHARS, MAX_CONNECTION_CA_PEM_BYTES, MAX_CONNECTION_CREDENTIAL_BYTES,
     MAX_TARGETS_PER_INSTALLATION, MAX_UNMAPPED_GROUPINGS_PER_INSTALLATION, PAGE_DEFAULT_LIMIT,
     PAGE_MAX_LIMIT,
@@ -218,11 +218,24 @@ impl From<PluginCapability> for PluginCapabilityDto {
 }
 
 /// An allowed read on a connection: method + path pattern (`*` = one
-/// segment).
+/// segment) + the query keys it may carry.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RequestRuleDto {
     pub method: String,
     pub path: String,
+    /// The query keys a request under this rule may carry, each at most
+    /// once; empty = no query. Anything else is refused by the broker.
+    pub query: Vec<String>,
+}
+
+impl From<&RequestRule> for RequestRuleDto {
+    fn from(r: &RequestRule) -> Self {
+        Self {
+            method: r.method.clone(),
+            path: r.path.clone(),
+            query: r.query.clone(),
+        }
+    }
 }
 
 /// A named external system the plugin reaches through the broker.
@@ -254,14 +267,7 @@ impl From<&PluginManifest> for PluginManifestDto {
                 .map(|s| ConnectionSlotDto {
                     name: s.name.clone(),
                     auth_schemes: s.auth_schemes.clone(),
-                    read_rules: s
-                        .read_rules
-                        .iter()
-                        .map(|r| RequestRuleDto {
-                            method: r.method.clone(),
-                            path: r.path.clone(),
-                        })
-                        .collect(),
+                    read_rules: s.read_rules.iter().map(RequestRuleDto::from).collect(),
                 })
                 .collect(),
             config_keys: m.config_keys.clone(),
@@ -569,14 +575,7 @@ fn connection_dto(
     PluginConnectionDto {
         slot: slot.name.clone(),
         auth_schemes: slot.auth_schemes.clone(),
-        read_rules: slot
-            .read_rules
-            .iter()
-            .map(|r| RequestRuleDto {
-                method: r.method.clone(),
-                path: r.path.clone(),
-            })
-            .collect(),
+        read_rules: slot.read_rules.iter().map(RequestRuleDto::from).collect(),
         configured: bound.is_some(),
         base_url: bound.map(|c| c.base_url.clone()),
         auth_scheme: bound.map(|c| c.auth_scheme.as_str().to_string()),

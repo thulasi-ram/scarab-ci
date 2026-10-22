@@ -27,19 +27,30 @@ CREATE TABLE plugin_connections (
     PRIMARY KEY (installation_id, slot)
 );
 
--- The broker's journal (ADR-0072 §5 step 4): one row per request a Plugin
--- sent a connection — proxied (`rule` set, `denied_reason` NULL, or `killed`
--- for a stream cut by the kill switch) or refused (`denied_reason` set).
--- Written asynchronously, off the request path. Deliberately NOT a foreign
--- key: the journal outlives an uninstall, for audit, until retention (14
--- days, owner default 9) prunes it.
+-- The broker's journal (ADR-0072 §5 step 4), append-only. A request the
+-- broker refused is one `refused` row (`denied_reason` set). A request it
+-- forwarded is two rows sharing `request_id`: `head` when the upstream's
+-- response head arrived — written through a queue slot reserved before
+-- forwarding, so nothing is forwarded unjournaled and a long watch stream is
+-- on record from its start — and `end` when the body ended (`bytes`;
+-- `denied_reason` NULL, or `cut: …` for a stream cut by the kill switch or a
+-- re-bind, or `upstream body error`). Written asynchronously, off the
+-- request path. Deliberately NOT a foreign key: the journal outlives an
+-- uninstall, for audit, until retention (14 days, owner default 9) prunes it.
 CREATE TABLE plugin_broker_journal (
     id              BIGSERIAL PRIMARY KEY,
+    request_id      TEXT   NOT NULL,
+    phase           TEXT   NOT NULL CHECK (phase IN ('refused', 'head', 'end')),
     installation_id TEXT   NOT NULL,
     slot            TEXT   NOT NULL,
     method          TEXT   NOT NULL,
-    -- The path after the slot, as sent (bounded); never the query.
+    -- The path after the slot, as sent (bounded).
     path            TEXT   NOT NULL,
+    -- What was forwarded: the matched path and the query, re-encoded
+    -- canonically (bounded). On a row refused for its query, `query` is the
+    -- query as sent.
+    upstream_path   TEXT,
+    query           TEXT,
     rule            TEXT,
     status          INT,
     bytes           BIGINT,
