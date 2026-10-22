@@ -115,9 +115,19 @@ source-supplied, *(source, id)*. Core compares it and never parses it. It comes 
 existence the first time it is named, by a request or a report. There is no prior
 registration. A rename at the source is a new DeploymentTarget. So is a **re-home**: when
 the source reports a known target under a grouping that maps to another Environment (an
-Argo Application moved to another Argo project), it is recorded as a new DeploymentTarget
-in the new Environment and the old one ends. Its history stays where it was; nothing is
-moved, and the move is not a standing conflict. Fan-out (one Environment
+Argo Application moved to another Argo project, or an admin moving the grouping between
+Environments), it is recorded as a new DeploymentTarget in the new Environment and the old
+one ends. Its history stays where it was; nothing is moved, and the move is not a standing
+conflict.
+
+"Ends" is a **display, not a status**: the old Environment's board shows the target as
+**Moved** — naming where its reports go now ("now: prod"), or that no Environment lists
+the grouping ("unmapped") — instead of claiming what was last live there; no input is
+appended and no seventh status exists. Moved is derived on read from the current
+EnvironmentDeploymentSources, so an admin's edit shows at once. A request for the target on
+the old Environment waits and, honestly, stalls: its reports now land elsewhere. The new
+Environment never shows the old one's last status as its own; the target appears there
+when its reporter re-sends its current state (§11). Fan-out (one Environment
 across regions or clusters) is several DeploymentTargets, not a grouping concept.
 
 ### 4. DeploymentVersion: an opaque label in a scheme the source declares (PROVISIONAL)
@@ -341,6 +351,28 @@ behaviour is the same across CD tools:
   back to `failed`.
 - Reports reach core by push under an identity core verifies, and core sets the report's
   source from that identity, never from the report (ADR-0072 §11).
+- Sequences are integers from 1 to **2^53 − 1**, the largest a JSON number holds exactly
+  in every reader. (A reporter that sends a huge one freezes its own target: every later
+  report is stale until an admin resets the cursor.)
+- **Re-send when asked.** Core never fabricates a report from what it last heard. When a
+  target routes to an Environment its last status never reached — a grouping an admin just
+  mapped, or moved — `GET /targets` flags it `resend`. Poll `GET /targets?resend=true` at
+  least once a minute and re-send each flagged target's **current** state as a new report
+  (next sequence, new idempotency key): the one exception to "transitions only". Skip a
+  target you have no status for. Only a status report that lands clears the flag; an
+  ownership report does not.
+- **Page `/targets`** (`after` = the previous page's `next_after`, `limit` ≤ 1000), at
+  start-up to seed cursors and on every resend poll.
+- **Read results per item.** A batch is answered item by item: `accepted`, `duplicate`,
+  `stale`, `unmapped`, or `rejected` with a reason — unreadable, breaking a rule, or past a
+  per-installation cap (`cap:`). A rejected item stored nothing, not even its key: fix it
+  or drop it, never retry it unchanged.
+- **A 409 names the key** reused for different content, and means the **whole batch was
+  rolled back**. That item is a reporter bug: log it, drop it, and resend the rest
+  unchanged.
+- **Back off on 429 and 503** by `Retry-After`. 429: a batch from this installation is
+  already in flight — send one at a time. 503: core is saturated; nothing was recorded, so
+  the same batch is safe to resend.
 
 The first-party Argo plugin is the contract's reference implementation.
 
