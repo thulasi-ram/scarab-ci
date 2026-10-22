@@ -740,6 +740,50 @@ export async function uninstallPlugin(org: string, name: string): Promise<Uninst
   return data;
 }
 
+/** One connection slot of an installation and what is bound to it — never
+ *  the credential (ADR-0072 §5). */
+export type PluginConnection = components["schemas"]["PluginConnectionDto"];
+
+/** An installation's connection slots, in manifest order
+ *  (`GET …/plugins/{name}/connections`). */
+export async function listPluginConnections(org: string, name: string): Promise<PluginConnection[]> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/plugins/{name}/connections", {
+    params: { path: { org, name } },
+  });
+  if (error || !data) {
+    throw new Error(errorText(error) || `failed to load ${name}'s connections (${response.status})`);
+  }
+  return data;
+}
+
+/** Bind a slot's destination and credential, replacing the previous binding
+ *  whole (`PUT …/connections/{slot}`). The credential is write-only. */
+export async function putPluginConnection(
+  org: string,
+  name: string,
+  slot: string,
+  body: components["schemas"]["PutPluginConnectionRequest"],
+): Promise<PluginConnection> {
+  const { data, error, response } = await api.PUT("/v1/orgs/{org}/plugins/{name}/connections/{slot}", {
+    params: { path: { org, name, slot } },
+    body,
+  });
+  if (error || !data) {
+    throw new Error(errorText(error) || `could not bind ${slot} (${response.status})`);
+  }
+  return data;
+}
+
+/** Unbind a slot and delete its credential (`DELETE …/connections/{slot}`). */
+export async function deletePluginConnection(org: string, name: string, slot: string): Promise<void> {
+  const { error, response } = await api.DELETE("/v1/orgs/{org}/plugins/{name}/connections/{slot}", {
+    params: { path: { org, name, slot } },
+  });
+  if (error || !response.ok) {
+    throw new Error(errorText(error) || `could not unbind ${slot} (${response.status})`);
+  }
+}
+
 /** A list endpoint's page size. The server pages by key (the next page
  *  starts after the last row), so a page shorter than this is the last. */
 const PAGE_LIMIT = 500;

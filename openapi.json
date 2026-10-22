@@ -1648,6 +1648,200 @@
         ]
       }
     },
+    "/v1/orgs/{org}/plugins/{name}/connections": {
+      "get": {
+        "tags": [
+          "Plugins"
+        ],
+        "summary": "A plugin's connection slots and their bindings (ADR-0072 §5)",
+        "operationId": "list_plugin_connections",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "installation name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PluginConnectionDto"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "no such installation, or plugins not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/plugins/{name}/connections/{slot}": {
+      "put": {
+        "tags": [
+          "Plugins"
+        ],
+        "summary": "Bind a plugin connection's destination and credential (ADR-0072 §5)",
+        "description": "The credential is written through to the secret store under a fresh\nserver-minted key and is never readable back; the previous binding's\ncredential is deleted once the new binding is stored. A response stream\nthe plugin has open on the old binding is cut within seconds.",
+        "operationId": "put_plugin_connection",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "installation name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "slot",
+            "in": "path",
+            "description": "the manifest's connection slot",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PutPluginConnectionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginConnectionDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "unknown slot, or a malformed base URL, credential or CA"
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "no such installation, or plugins or the secret store not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "Plugins"
+        ],
+        "summary": "Unbind a plugin connection and delete its credential (ADR-0072 §5)",
+        "operationId": "delete_plugin_connection",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "installation name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "slot",
+            "in": "path",
+            "description": "the manifest's connection slot",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "unbound"
+          },
+          "400": {
+            "description": "unknown slot"
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "no such installation or binding, or plugins not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/orgs/{org}/plugins/{name}/enable": {
       "post": {
         "tags": [
@@ -5526,6 +5720,84 @@
           }
         }
       },
+      "PluginConnectionDto": {
+        "type": "object",
+        "description": "One connection slot of an installation and what an admin bound to it\n(ADR-0072 §5). Never carries the credential, nor its secret key.",
+        "required": [
+          "slot",
+          "auth_schemes",
+          "read_rules",
+          "configured",
+          "credential_set",
+          "insecure_http"
+        ],
+        "properties": {
+          "auth_scheme": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "auth_schemes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The schemes the manifest allows; `bearer` is the only one today."
+          },
+          "base_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where every request on it goes — and nowhere else."
+          },
+          "ca_pem": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The CA certificates (PEM) that are the ONLY trust anchors for\n`base_url`; absent = the platform's roots. Certificates are public."
+          },
+          "configured": {
+            "type": "boolean",
+            "description": "Whether an admin has bound it. Unbound, the broker answers the\nplugin's requests on it with 409."
+          },
+          "credential_set": {
+            "type": "boolean",
+            "description": "Whether the credential is present in the secret store. Write-only:\nno endpoint returns it."
+          },
+          "insecure_http": {
+            "type": "boolean",
+            "description": "`base_url` is plain `http://`: the credential crosses the network in\nthe clear. Allowed (an in-cluster Service, say); the UI warns."
+          },
+          "read_rules": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RequestRuleDto"
+            },
+            "description": "What the plugin may send through it: reads only."
+          },
+          "slot": {
+            "type": "string",
+            "description": "The manifest's slot name."
+          },
+          "updated_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix-ms."
+          },
+          "updated_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
       "PluginInstallationDto": {
         "type": "object",
         "description": "A PluginInstallation (ADR-0072 §10).",
@@ -5817,6 +6089,32 @@
               "null"
             ],
             "description": "Free text; omitted = empty."
+          }
+        },
+        "additionalProperties": false
+      },
+      "PutPluginConnectionRequest": {
+        "type": "object",
+        "description": "`PUT /v1/orgs/{org}/plugins/{name}/connections/{slot}`: bind the slot's\ndestination and credential, replacing any previous binding whole.",
+        "required": [
+          "base_url",
+          "credential"
+        ],
+        "properties": {
+          "base_url": {
+            "type": "string",
+            "description": "`https://host[:port][/prefix]` (or `http://`, warned about). Every\nrequest the plugin sends on this slot goes here; it cannot pick\nanother host."
+          },
+          "ca_pem": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "PEM CA certificates to trust INSTEAD of the platform roots, for an\ninternal CA (https only). There is no skip-verify."
+          },
+          "credential": {
+            "type": "string",
+            "description": "The bearer token the broker adds upstream. Required on every bind —\na new destination never inherits a credential entered for another —\nand never readable back."
           }
         },
         "additionalProperties": false
@@ -6721,7 +7019,7 @@
     },
     {
       "name": "Plugins",
-      "description": "PluginInstallations (ADR-0072): the first-party catalog, install and uninstall, the kill switch, and the vendor groupings no Environment lists yet."
+      "description": "PluginInstallations (ADR-0072): the first-party catalog, install and uninstall, the kill switch, the vendor groupings no Environment lists yet, and the PluginConnections the CredentialBroker proxies to."
     },
     {
       "name": "Secrets",

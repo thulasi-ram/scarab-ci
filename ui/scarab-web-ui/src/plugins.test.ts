@@ -1,6 +1,11 @@
 import { describe, it, expect } from "vitest";
 import {
+  connectionBaseUrlError,
+  credentialBadge,
+  credentialError,
   imageError,
+  isInsecureHttp,
+  toConnectionBody,
   movedAwayNote,
   sourceAddedNotice,
   usageLine,
@@ -194,5 +199,52 @@ describe("usageLine", () => {
   it("warns from 90% of either cap", () => {
     expect(usageLine({ ...usage, targets: 9000 }).warn).toBe(true);
     expect(usageLine({ ...usage, unmapped_groupings: 900 }).warn).toBe(true);
+  });
+});
+
+describe("connection binding", () => {
+  const form = { base_url: "https://argocd.acme.example", credential: "tok", ca_pem: "" };
+
+  it("accepts an https destination and drops a blank CA", () => {
+    expect(toConnectionBody(form)).toEqual({
+      body: { base_url: "https://argocd.acme.example", credential: "tok" },
+    });
+  });
+
+  it("refuses what the server refuses", () => {
+    expect(connectionBaseUrlError("")).toBeNull();
+    expect(connectionBaseUrlError("argocd.acme.example")).toMatch(/absolute URL/);
+    expect(connectionBaseUrlError("ftp://argocd.acme.example")).toMatch(/http or https/);
+    expect(connectionBaseUrlError("https://u:p@argocd.acme.example")).toMatch(/user or password/);
+    expect(connectionBaseUrlError("https://argocd.acme.example/?x=1")).toMatch(/query/);
+    expect(connectionBaseUrlError("https://argocd.acme.example/#x")).toMatch(/query or fragment/);
+    expect(connectionBaseUrlError("https://argocd.acme.example/argo")).toBeNull();
+  });
+
+  it("always needs the credential, as a bearer token", () => {
+    expect(toConnectionBody({ ...form, credential: "" }).error).toMatch(/every save sends it again/);
+    expect(toConnectionBody({ ...form, credential: "two words" }).error).toMatch(/no spaces/);
+    expect(credentialError("a\nb")).toMatch(/no spaces/);
+  });
+
+  it("flags plain http and refuses a CA on it", () => {
+    expect(isInsecureHttp("http://argocd.svc:8080")).toBe(true);
+    expect(isInsecureHttp("https://argocd.svc")).toBe(false);
+    expect(toConnectionBody({ ...form, base_url: "http://argocd.svc" }).body).toBeDefined();
+    const pem = "-----BEGIN CERTIFICATE-----\nMII…\n-----END CERTIFICATE-----";
+    expect(toConnectionBody({ ...form, base_url: "http://argocd.svc", ca_pem: pem }).error).toMatch(
+      /https destination only/,
+    );
+    expect(toConnectionBody({ ...form, ca_pem: "not pem" }).error).toMatch(/PEM/);
+    expect(toConnectionBody({ ...form, ca_pem: pem }).body?.ca_pem).toBe(pem);
+  });
+
+  it("says set / not set / not bound — and never anything of the credential", () => {
+    expect(credentialBadge({ configured: false, credential_set: false }).label).toBe("not bound");
+    expect(credentialBadge({ configured: true, credential_set: true })).toMatchObject({
+      label: "credential set",
+      tone: "ok",
+    });
+    expect(credentialBadge({ configured: true, credential_set: false }).tone).toBe("danger");
   });
 });
