@@ -27,7 +27,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::FutureExt;
 use k8s_openapi::api::authentication::v1::{TokenRequest, TokenRequestSpec};
@@ -44,7 +44,7 @@ use kube::{Api, Client, Config};
 
 use scarab_plugin::{
     InstallationState, PluginCapability, PluginInstallation, PluginManifest, PluginTokenVerifier,
-    RuntimeStatus, VerifiedServiceAccount,
+    RuntimeStatus, TokenRejected, VerifiedServiceAccount,
 };
 use scarab_plugin_k8s::objects::{
     restricted_container_security_context, restricted_pod_security_context, DEFAULT_DENY_POLICY,
@@ -291,7 +291,9 @@ async fn wait_running(pods: &Api<Pod>, name: &str) {
 /// The isolation probe passes on a cluster that enforces NetworkPolicy
 /// (kind ≥ 0.24's kindnet does): the plugin-labelled Pod reaches the broker,
 /// and nothing else — no DNS answer either — while the control Pod reaches
-/// the canary and gets one.
+/// the canary and gets one. kindnet programs a new Pod's policy a few
+/// seconds after it starts; the probe's first passes see it open, and this
+/// is the case that proves the probe waits that out rather than failing.
 #[tokio::test]
 #[ignore]
 async fn the_isolation_probe_passes_on_this_cluster() {
@@ -568,8 +570,13 @@ async fn in_an_open_namespace_the_self_check_keeps_the_plugin_from_starting() {
             .expect("ensure");
         let selector = format!("{LABEL_INSTALLATION}={INSTALLATION_ID}");
         let mut state = WorkloadState::Absent;
-        // The check retries until its deadline, then the kubelet backs off.
-        for _ in 0..(SELF_CHECK_DEADLINE_SECONDS + 120) {
+        // The check retries until its deadline, then runs one last pass (up
+        // to ~35 s), and the runtime reports it from that first failed run;
+        // plus the Pod's own start, and margin. Wall-clock, not a count of
+        // polls: each poll is several API calls.
+        let wait = Duration::from_secs(u64::from(SELF_CHECK_DEADLINE_SECONDS) + 120);
+        let started = Instant::now();
+        while started.elapsed() < wait {
             state = runtime.workload_state(INSTALLATION_ID).await.unwrap();
             if matches!(&state, WorkloadState::Failing(why) if why.contains("self-check")) {
                 break;
@@ -577,9 +584,18 @@ async fn in_an_open_namespace_the_self_check_keeps_the_plugin_from_starting() {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
         let WorkloadState::Failing(why) = &state else {
-            panic!("the self-check never failed the workload in an open namespace: {state:?}");
+            panic!(
+                "the self-check never failed the workload in an open namespace within {}s: \
+                 {state:?}",
+                wait.as_secs()
+            );
         };
-        assert!(why.contains("isolation self-check"), "{why}");
+        assert!(why.contains("isolation self-check failed"), "{why}");
+        // The operator is told WHAT was open: the check's last pass.
+        assert!(
+            why.contains("SCARAB_PROBE") && why.contains("reached"),
+            "the self-check's verdict must be in the message: {why}"
+        );
         // The Plugin's own container never ran.
         let pods = f
             .pods()
@@ -693,6 +709,30 @@ async fn start_token_holder(f: &Fixture, name: &str, sa_name: &str) -> (String, 
     (tokens[0].clone(), tokens[1].clone())
 }
 
+/// How long revoking a token (deleting its Pod, or its ServiceAccount) may
+/// take to show at TokenReview: kube-apiserver caches a SUCCESSFUL token
+/// authentication itself (10 s by default) — the TokenReview API goes
+/// through that cache too — so a review right after the revocation can
+/// still say yes. Plus margin for its informers to see the deletion.
+const REVOCATION_VISIBLE_WITHIN: Duration = Duration::from_secs(30);
+
+/// TokenReview's verdict on `token`, asked until it is a rejection or
+/// [`REVOCATION_VISIBLE_WITHIN`] passes; the last verdict. A fresh verifier
+/// for every ask, so OUR verdict cache never answers for the API server.
+async fn verdict_once_revoked(
+    client: &Client,
+    token: &str,
+) -> Result<VerifiedServiceAccount, TokenRejected> {
+    let started = Instant::now();
+    loop {
+        let verdict = TokenReviewVerifier::new(client.clone()).verify(token).await;
+        if verdict.is_err() || started.elapsed() >= REVOCATION_VISIBLE_WITHIN {
+            return verdict;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
 /// TokenReview, for real: a projected `scarab-broker` token verifies as its
 /// ServiceAccount; a token for another audience does not; a TokenRequest
 /// with no bound Pod does not; once its Pod is gone, neither does the good
@@ -756,24 +796,27 @@ async fn token_review_accepts_only_a_live_pods_broker_token() {
         let err = verifier.verify(&unbound).await.unwrap_err();
         assert!(err.0.contains("not bound to a Pod"), "{err}");
 
-        // The bound object: with its Pod gone, the good token is nothing. A
-        // fresh verifier, so the 30 s cache cannot answer for the API server.
+        // The bound object: with its Pod gone — the object itself, not
+        // merely terminating — the good token is nothing (once the API
+        // server's own success cache has let go of it).
         let pods = f.pods();
         pods.delete("token-holder", &DeleteParams::default().grace_period(0))
             .await
             .unwrap();
+        let mut gone = false;
         for _ in 0..60 {
             if pods.get_opt("token-holder").await.unwrap().is_none() {
+                gone = true;
                 break;
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
+        assert!(gone, "the token holder's Pod was not deleted within 60s");
+        let verdict = verdict_once_revoked(&f.client, &broker_token).await;
         assert!(
-            TokenReviewVerifier::new(f.client.clone())
-                .verify(&broker_token)
-                .await
-                .is_err(),
-            "a token must die with its Pod"
+            verdict.is_err(),
+            "a token must die with its Pod (still accepted {}s after it was gone): {verdict:?}",
+            REVOCATION_VISIBLE_WITHIN.as_secs()
         );
 
         // The kill switch at the source: `stop` deletes the ServiceAccount,
@@ -791,13 +834,18 @@ async fn token_review_accepts_only_a_live_pods_broker_token() {
             pods.get_opt("token-survivor").await.unwrap().is_some(),
             "the Pod still exists, so only the ServiceAccount can be what revoked the token"
         );
-        let err = TokenReviewVerifier::new(f.client.clone())
-            .verify(&survivor_token)
+        // The review just above primed the API server's success cache, so
+        // it may take that long to say no.
+        let err = verdict_once_revoked(&f.client, &survivor_token)
             .await
-            .unwrap_err();
+            .expect_err("a token must die with its ServiceAccount");
         assert!(
             err.0.contains("not authenticated"),
             "a token must die with its ServiceAccount: {err}"
+        );
+        assert!(
+            pods.get_opt("token-survivor").await.unwrap().is_some(),
+            "the Pod outlived the revocation, so it was the ServiceAccount's deletion"
         );
     })
     .await;
