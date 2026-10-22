@@ -23,10 +23,12 @@ use scarab_engine::{
     StepSpec,
 };
 use scarab_forge::RepoRef;
-use scarab_project::{Deployment, Environment, EnvironmentStore, ProjectError, ProtectionRules};
+use scarab_project::{Environment, ProtectionRules};
 use scarab_secrets::SecretScope;
 use scarab_server::{dispatch_run, router, AppState, DispatchError, DispatchKind, LogService};
-use scarab_testkit::{FakeClock, FakeExecutor, InMemoryDb, InMemoryObjectStore};
+use scarab_testkit::{
+    FakeClock, FakeExecutor, InMemoryDb, InMemoryEnvironmentGovernance, InMemoryObjectStore,
+};
 
 fn repo() -> RepoRef {
     RepoRef {
@@ -49,86 +51,21 @@ steps:
     command: ["deploy", "${{ inputs.region }}", "n=${{ inputs.replicas }}"]
 "#;
 
-// --- an in-memory EnvironmentStore fake (governance without Postgres) ---------
+// --- governance without Postgres ----------------------------------------------
 
-#[derive(Default)]
-struct FakeEnvironments {
-    envs: Mutex<std::collections::HashMap<(String, String, String), Environment>>,
-    deployments: Mutex<Vec<Deployment>>,
-}
-
-#[async_trait]
-impl EnvironmentStore for FakeEnvironments {
-    async fn put_environment(
-        &self,
-        org: &str,
-        repo: &str,
-        env: &Environment,
-    ) -> Result<(), ProjectError> {
-        self.envs
-            .lock()
-            .unwrap()
-            .insert((org.into(), repo.into(), env.name.clone()), env.clone());
-        Ok(())
-    }
-    async fn get_environment(
-        &self,
-        org: &str,
-        repo: &str,
-        name: &str,
-    ) -> Result<Option<Environment>, ProjectError> {
-        Ok(self
-            .envs
-            .lock()
-            .unwrap()
-            .get(&(org.into(), repo.into(), name.into()))
-            .cloned())
-    }
-    async fn list_environments(
-        &self,
-        org: &str,
-        repo: &str,
-    ) -> Result<Vec<Environment>, ProjectError> {
-        Ok(self
-            .envs
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|((o, r, _), _)| o == org && r == repo)
-            .map(|(_, e)| e.clone())
-            .collect())
-    }
-    async fn delete_environment(
-        &self,
-        org: &str,
-        repo: &str,
-        name: &str,
-    ) -> Result<(), ProjectError> {
-        self.envs
-            .lock()
-            .unwrap()
-            .remove(&(org.into(), repo.into(), name.into()));
-        Ok(())
-    }
-    async fn record_deployment(&self, deployment: &Deployment) -> Result<(), ProjectError> {
-        self.deployments.lock().unwrap().push(deployment.clone());
-        Ok(())
-    }
-    async fn deployments(
-        &self,
-        org: &str,
-        repo: &str,
-        environment: &str,
-    ) -> Result<Vec<Deployment>, ProjectError> {
-        Ok(self
-            .deployments
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|d| d.org == org && d.project == repo && d.environment == environment)
-            .cloned()
-            .collect())
-    }
+/// The legacy `prod` environment as ADR-0071's migration hands it to
+/// admission: an org Environment `prod` (permissive baseline, `web`
+/// eligible) with `web`'s old rules as its overlay. The governance assertions
+/// below are the pre-ADR-0071 ones, unchanged.
+fn migrated(protection: ProtectionRules) -> InMemoryEnvironmentGovernance {
+    InMemoryEnvironmentGovernance::new().with_migrated_legacy_environment(
+        "acme",
+        "web",
+        &Environment {
+            name: "prod".into(),
+            protection,
+        },
+    )
 }
 
 fn prod_rules(approvers: &[&str], allowed_refs: &[&str]) -> ProtectionRules {
@@ -137,9 +74,9 @@ fn prod_rules(approvers: &[&str], allowed_refs: &[&str]) -> ProtectionRules {
         wait_timer: 0,
         allowed_refs: allowed_refs.iter().map(|s| s.to_string()).collect(),
         concurrency: 1,
-        secret_scope: SecretScope::Environment {
+        secret_scope: SecretScope::EnvironmentProject {
             org: "acme".into(),
-            repo: "web".into(),
+            project: "web".into(),
             environment: "prod".into(),
         },
         oidc_subject: "scarab:acme/web/prod".into(),
@@ -378,17 +315,7 @@ async fn dispatched_deploy_suspends_on_the_approval_gate() {
     let forge = scarab_testkit::FakeForge::new().with_file(".scarab/deploy.yaml", DEPLOY_YAML);
     let db = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
-    let envs = Arc::new(FakeEnvironments::default());
-    envs.put_environment(
-        "acme",
-        "web",
-        &Environment {
-            name: "prod".into(),
-            protection: prod_rules(&["alice"], &["refs/heads/main"]),
-        },
-    )
-    .await
-    .unwrap();
+    let envs = Arc::new(migrated(prod_rules(&["alice"], &["refs/heads/main"])));
 
     let run = dispatch_run(
         &forge,
@@ -443,18 +370,8 @@ async fn dispatch_ref_disallowed_by_environment_is_rejected_fail_closed() {
     let forge = scarab_testkit::FakeForge::new().with_file(".scarab/deploy.yaml", DEPLOY_YAML);
     let db = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
-    let envs = Arc::new(FakeEnvironments::default());
     // prod only admits refs/heads/main.
-    envs.put_environment(
-        "acme",
-        "web",
-        &Environment {
-            name: "prod".into(),
-            protection: prod_rules(&[], &["refs/heads/main"]),
-        },
-    )
-    .await
-    .unwrap();
+    let envs = Arc::new(migrated(prod_rules(&[], &["refs/heads/main"])));
 
     let err = dispatch_run(
         &forge,
@@ -482,21 +399,10 @@ async fn dispatch_ref_disallowed_by_environment_is_rejected_fail_closed() {
 
 // An Environment whose `require_reason` is set, admitting any ref (so the reason
 // check is what is exercised, not allowed_refs).
-async fn require_reason_env() -> Arc<FakeEnvironments> {
-    let envs = Arc::new(FakeEnvironments::default());
+async fn require_reason_env() -> Arc<InMemoryEnvironmentGovernance> {
     let mut protection = prod_rules(&[], &[]);
     protection.require_reason = true;
-    envs.put_environment(
-        "acme",
-        "web",
-        &Environment {
-            name: "prod".into(),
-            protection,
-        },
-    )
-    .await
-    .unwrap();
-    envs
+    Arc::new(migrated(protection))
 }
 
 /// A `require_reason` environment blocks a reasonless human dispatch at the
@@ -613,17 +519,7 @@ async fn dispatch_to_branch_scoped_env_admits_and_pins_the_resolved_sha() {
         .with_commit("main", "1234567890abcdef1234567890abcdef12345678");
     let db = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
-    let envs = Arc::new(FakeEnvironments::default());
-    envs.put_environment(
-        "acme",
-        "web",
-        &Environment {
-            name: "prod".into(),
-            protection: prod_rules(&[], &["refs/heads/main"]),
-        },
-    )
-    .await
-    .unwrap();
+    let envs = Arc::new(migrated(prod_rules(&[], &["refs/heads/main"])));
 
     // Bare branch name `main` → canonicalized to refs/heads/main → admitted.
     let run = dispatch_run(
@@ -970,17 +866,7 @@ async fn governed_deploy_serializes_without_cancelling_the_holder() {
         .with_commit("refs/heads/main", "sha-1");
     let db = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
-    let envs = Arc::new(FakeEnvironments::default());
-    envs.put_environment(
-        "acme",
-        "web",
-        &Environment {
-            name: "prod".into(),
-            protection: prod_rules(&[], &["refs/heads/main"]),
-        },
-    )
-    .await
-    .unwrap();
+    let envs = Arc::new(migrated(prod_rules(&[], &["refs/heads/main"])));
 
     let dispatch = || {
         let forge = &forge;

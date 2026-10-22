@@ -22,6 +22,7 @@ use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
 use common::fresh_db;
+use common::governance::seed_migrated_environment;
 use scarab_db_postgres::PostgresDb;
 use scarab_engine::ports::ExecState;
 use scarab_engine::{
@@ -38,9 +39,9 @@ fn rules(approvers: &[&str], allowed_refs: &[&str]) -> ProtectionRules {
         wait_timer: 0,
         allowed_refs: allowed_refs.iter().map(|s| s.to_string()).collect(),
         concurrency: 1,
-        secret_scope: SecretScope::Environment {
+        secret_scope: SecretScope::EnvironmentProject {
             org: "acme".into(),
-            repo: "web".into(),
+            project: "web".into(),
             environment: "prod".into(),
         },
         oidc_subject: "scarab:acme/web/prod".into(),
@@ -58,7 +59,11 @@ fn app(pg: Arc<PostgresDb>) -> axum::Router {
         Arc::new(InMemoryObjectStore::new()),
         pg.clone(),
     ));
-    router(AppState::new(db, clock, logs).with_environments(envs))
+    router(
+        AppState::new(db, clock, logs)
+            .with_environments(envs)
+            .with_environment_governance(pg),
+    )
 }
 
 fn json_req(method: &str, uri: &str, body: serde_json::Value) -> Request<Body> {
@@ -192,9 +197,9 @@ async fn put_environment_stamps_canonical_scope_and_subject_when_body_omits_them
         .expect("environment stored");
     assert_eq!(
         stored.protection.secret_scope,
-        SecretScope::Environment {
+        SecretScope::EnvironmentProject {
             org: "acme".into(),
-            repo: "web".into(),
+            project: "web".into(),
             environment: "prod".into(),
         }
     );
@@ -361,16 +366,15 @@ async fn deploy_gate_releases_and_records_history_only_when_admitted() {
     };
 
     // --- Case 1: approver requirement NOT met by the anonymous approver ---
-    pg.put_environment(
+    // (ADR-0071: `web`'s legacy rules, as the migration leaves them.)
+    seed_migrated_environment(
+        &pg,
         "acme",
         "web",
-        &scarab_project::Environment {
-            name: "prod".into(),
-            protection: rules(&["alice"], &["refs/heads/main"]), // requires alice, not anonymous
-        },
+        "prod",
+        rules(&["alice"], &["refs/heads/main"]), // requires alice, not anonymous
     )
-    .await
-    .unwrap();
+    .await;
     let run1 = RunId("deploy-blocked".into());
     drive_to_gate(&pg, &run1).await;
     pg.set_run_deploy_context(&run1, &ctx).await.unwrap();
@@ -393,16 +397,14 @@ async fn deploy_gate_releases_and_records_history_only_when_admitted() {
         .is_empty());
 
     // --- Case 2: approver requirement satisfied by the anonymous approver ---
-    pg.put_environment(
+    seed_migrated_environment(
+        &pg,
         "acme",
         "web",
-        &scarab_project::Environment {
-            name: "prod".into(),
-            protection: rules(&["anonymous"], &["refs/heads/main"]),
-        },
+        "prod",
+        rules(&["anonymous"], &["refs/heads/main"]),
     )
-    .await
-    .unwrap();
+    .await;
     let run2 = RunId("deploy-ok".into());
     drive_to_gate(&pg, &run2).await;
     pg.set_run_deploy_context(&run2, &ctx).await.unwrap();
@@ -444,16 +446,7 @@ async fn secret_matrix_reports_effective_status() {
     let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
     pg.migrate().await.unwrap();
     for name in ["prod", "staging"] {
-        pg.put_environment(
-            "acme",
-            "web",
-            &scarab_project::Environment {
-                name: name.into(),
-                protection: rules(&[], &[]),
-            },
-        )
-        .await
-        .unwrap();
+        seed_migrated_environment(&pg, "acme", "web", name, rules(&[], &[])).await;
     }
     // SHARED lives once at repo scope; PROD_ONLY only at prod's env scope.
     let secrets = FakeSecrets::new()
@@ -466,9 +459,9 @@ async fn secret_matrix_reports_effective_status() {
             b"x",
         )
         .with_secret(
-            &SecretScope::Environment {
+            &SecretScope::EnvironmentProject {
                 org: "acme".into(),
-                repo: "web".into(),
+                project: "web".into(),
                 environment: "prod".into(),
             },
             "PROD_ONLY",
@@ -485,6 +478,7 @@ async fn secret_matrix_reports_effective_status() {
     let app = router(
         AppState::new(db, clock, logs)
             .with_environments(envs)
+            .with_environment_governance(pg.clone())
             .with_secrets(secrets),
     );
 
