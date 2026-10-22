@@ -2029,15 +2029,21 @@ export interface components {
             step: string;
         };
         /**
-         * @description A DeploymentTarget a source reports into an Environment: who reports it,
-         *     its owners and declared version scheme, and its last reported status.
+         * @description A DeploymentTarget a source reports into an Environment — one whose
+         *     grouping the Environment lists NOW: who reports it, its owners and
+         *     declared version scheme, and its last status as reported HERE.
          */
         DeploymentSourceTargetDto: {
             last_label?: string | null;
             /** Format: int64 */
             last_sequence: number;
-            /** @description `in_progress` / `live` / `failed`, as last reported. */
+            /** @description `in_progress` / `live` / `failed`, as last reported here. */
             last_status?: string | null;
+            /**
+             * @description The last status reported into THIS Environment; absent when its last
+             *     status went elsewhere (or nowhere) — a status recorded in another
+             *     Environment is never shown as this one's.
+             */
             last_version?: string | null;
             /** @description Projects (`org/repo`) that own the target, as the source last said. */
             owner_projects: string[];
@@ -2048,6 +2054,12 @@ export interface components {
             owners_reported_at?: number | null;
             /** @description `plugin:<name>`. */
             principal: string;
+            /**
+             * @description Its source owes a re-send here: the grouping was mapped or moved into
+             *     this Environment after its last status. A running reporter re-sends
+             *     within about a minute (ADR-0070 §11), and it appears on the board.
+             */
+            resend: boolean;
             /** @description The reporting installation's name — the target's `source`. */
             source: string;
             target_id: string;
@@ -2143,6 +2155,7 @@ export interface components {
         /** @description One DeploymentTarget's line on the Environment board. */
         EnvironmentBoardRowDto: {
             live?: null | components["schemas"]["DeploymentDto"];
+            moved_away?: null | components["schemas"]["MovedAwayDto"];
             newest?: null | components["schemas"]["DeploymentDto"];
             target: components["schemas"]["DeploymentTargetDto"];
         };
@@ -2292,6 +2305,14 @@ export interface components {
              *     or by any later API call: a lost token is re-minted, never re-read.
              */
             token: string;
+        };
+        /** @description Where a moved DeploymentTarget's reports go now. */
+        MovedAwayDto: {
+            /**
+             * @description The Environment that lists its source's grouping now; absent = none
+             *     does (unmapped — its reports are dropped).
+             */
+            now?: string | null;
         };
         /** @description An org-level Environment in its minimal shape (ADR-0071, MMP step 1). */
         OrgEnvironmentDto: {
@@ -2464,6 +2485,7 @@ export interface components {
             runtime_message: string;
             runtime_status: components["schemas"]["RuntimeStatusDto"];
             state: components["schemas"]["InstallationStateDto"];
+            usage: components["schemas"]["PluginUsageDto"];
         };
         /**
          * @description What the plugin asks for — exactly what an admin approves with the
@@ -2474,6 +2496,28 @@ export interface components {
             config_keys: string[];
             connections: components["schemas"]["ConnectionSlotDto"][];
             plugin: string;
+        };
+        /**
+         * @description How much of its per-installation caps an installation uses: past one, a
+         *     report about a NEW target (or a new unmapped grouping) is rejected; known
+         *     targets keep reporting.
+         */
+        PluginUsageDto: {
+            /** Format: int64 */
+            max_targets: number;
+            /** Format: int64 */
+            max_unmapped_groupings: number;
+            /**
+             * Format: int64
+             * @description DeploymentTargets it has reported on.
+             */
+            targets: number;
+            /**
+             * Format: int64
+             * @description Groupings counted as reported on with no Environment listing them
+             *     (one an Environment lists since stays counted until its next report).
+             */
+            unmapped_groupings: number;
         };
         /** @description A Principal, as the grant/approver typeahead offers it (ADR-0069 §3). */
         PrincipalDto: {
@@ -4075,7 +4119,20 @@ export interface operations {
     };
     environment_deployment_targets: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description Start after this target — the last row of the previous page: its
+                 *     `source` …
+                 */
+                after_source?: string;
+                /** @description … and its `target_id`. Both or neither. */
+                after_target_id?: string;
+                /**
+                 * @description Page size: default 500, at most 1000. A page shorter than this is
+                 *     the last.
+                 */
+                limit?: number;
+            };
             header?: never;
             path: {
                 /** @description org */
@@ -4478,7 +4535,15 @@ export interface operations {
     };
     unmapped_groupings: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Start after this grouping — the last one of the previous page. */
+                after?: string;
+                /**
+                 * @description Page size: default 500, at most 1000. A page shorter than this is
+                 *     the last.
+                 */
+                limit?: number;
+            };
             header?: never;
             path: {
                 /** @description org */
