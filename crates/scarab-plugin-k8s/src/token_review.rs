@@ -11,9 +11,10 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use base64::Engine;
 use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec, TokenReviewStatus};
 use kube::api::PostParams;
 use kube::{Api, Client};
@@ -33,6 +34,21 @@ pub const VERDICT_CACHE_TTL: Duration = Duration::from_secs(30);
 /// never grow it; past this, expired entries go, and if that is not enough,
 /// everything does (the next calls just ask the API server again).
 const VERDICT_CACHE_MAX_ENTRIES: usize = 4096;
+
+/// At most this many TokenReviews in flight. The broker's port is reachable
+/// from any Pod in the cluster (step Pods running PR code included), and
+/// every novel token costs one POST to the API server: this is the bound on
+/// what a flood of junk can put on it. The local precheck
+/// ([`precheck_jwt`]) only filters obvious junk — a well-formed, unexpired
+/// `scarab-broker` JWT with a forged signature passes it — so this is the
+/// real bound.
+const MAX_CONCURRENT_TOKEN_REVIEWS: usize = 4;
+/// How long a call waits for a TokenReview slot before it is refused (and
+/// not cached — a busy API server says nothing about the token).
+const TOKEN_REVIEW_SLOT_WAIT: Duration = Duration::from_secs(5);
+/// A projected ServiceAccount token is ~1 KiB; nothing legitimate is near
+/// this.
+const MAX_TOKEN_BYTES: usize = 16 * 1024;
 
 /// The `extra` keys the API server sets on a token bound to a Pod.
 const POD_NAME_EXTRA: &str = "authentication.kubernetes.io/pod-name";
@@ -78,6 +94,7 @@ impl VerdictCache {
 pub struct TokenReviewVerifier {
     client: Client,
     cache: Mutex<VerdictCache>,
+    reviews: tokio::sync::Semaphore,
 }
 
 impl TokenReviewVerifier {
@@ -85,6 +102,7 @@ impl TokenReviewVerifier {
         Self {
             client,
             cache: Mutex::new(VerdictCache::default()),
+            reviews: tokio::sync::Semaphore::new(MAX_CONCURRENT_TOKEN_REVIEWS),
         }
     }
 
@@ -106,10 +124,18 @@ impl TokenReviewVerifier {
 #[async_trait]
 impl PluginTokenVerifier for TokenReviewVerifier {
     async fn verify(&self, token: &str) -> Result<VerifiedServiceAccount, TokenRejected> {
+        // Junk never reaches the cache or the API server. Not cached either:
+        // the check is cheaper than a lookup, and caching junk would only
+        // churn out real verdicts.
+        precheck_jwt(token, unix_now())?;
         let key: [u8; 32] = Sha256::digest(token.as_bytes()).into();
         if let Some(verdict) = self.cached(&key) {
             return verdict;
         }
+        let _slot = tokio::time::timeout(TOKEN_REVIEW_SLOT_WAIT, self.reviews.acquire())
+            .await
+            .map_err(|_| TokenRejected("TokenReview busy; try again".into()))?
+            .map_err(|_| TokenRejected("TokenReview unavailable".into()))?;
         let review = TokenReview {
             spec: TokenReviewSpec {
                 // Asked for explicitly: the API server answers for THIS
@@ -129,6 +155,65 @@ impl PluginTokenVerifier for TokenReviewVerifier {
         let verdict = verdict_from_status(reviewed.status.as_ref());
         self.remember(key, verdict.clone());
         verdict
+    }
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// A cheap, local look at the token before anyone asks the API server: a
+/// JWT (three base64url segments, JSON header and claims) for the broker
+/// audience that has not expired. It proves nothing — the signature is the
+/// API server's to check — it only turns away what TokenReview would
+/// certainly refuse, so junk costs the cluster nothing.
+fn precheck_jwt(token: &str, now: i64) -> Result<(), TokenRejected> {
+    let reject = |why: &str| Err(TokenRejected(format!("not a broker token: {why}")));
+    if token.len() > MAX_TOKEN_BYTES {
+        return reject("too long");
+    }
+    let mut segments = token.split('.');
+    let (Some(header), Some(claims), Some(signature), None) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return reject("not a JWT");
+    };
+    if signature.is_empty() {
+        return reject("unsigned");
+    }
+    let decode = |segment: &str| -> Option<serde_json::Value> {
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(segment)
+            .ok()?;
+        serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .filter(serde_json::Value::is_object)
+    };
+    let (Some(header), Some(claims)) = (decode(header), decode(claims)) else {
+        return reject("not a JWT");
+    };
+    if !header.get("alg").is_some_and(serde_json::Value::is_string) {
+        return reject("no algorithm");
+    }
+    let for_broker = match claims.get("aud") {
+        Some(serde_json::Value::String(aud)) => aud == BROKER_TOKEN_AUDIENCE,
+        Some(serde_json::Value::Array(auds)) => auds
+            .iter()
+            .any(|a| a.as_str() == Some(BROKER_TOKEN_AUDIENCE)),
+        _ => false,
+    };
+    if !for_broker {
+        return reject("not for the broker audience");
+    }
+    match claims.get("exp").and_then(serde_json::Value::as_i64) {
+        Some(exp) if exp > now => Ok(()),
+        Some(_) => reject("expired"),
+        None => reject("no expiry"),
     }
 }
 
@@ -263,6 +348,73 @@ mod tests {
             assert!(verdict_from_status(Some(&status)).is_err(), "{name}");
         }
         assert!(verdict_from_status(None).is_err());
+    }
+
+    fn jwt(header: &serde_json::Value, claims: &serde_json::Value) -> String {
+        let enc = |v: &serde_json::Value| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string())
+        };
+        format!("{}.{}.c2lnbmF0dXJl", enc(header), enc(claims))
+    }
+
+    #[test]
+    fn a_well_formed_unexpired_broker_jwt_passes_the_precheck() {
+        let header = serde_json::json!({"alg": "RS256", "kid": "k"});
+        let now = 1_000_000;
+        for aud in [
+            serde_json::json!("scarab-broker"),
+            serde_json::json!(["other", "scarab-broker"]),
+        ] {
+            let token = jwt(&header, &serde_json::json!({"aud": aud, "exp": now + 600}));
+            assert_eq!(precheck_jwt(&token, now), Ok(()));
+        }
+    }
+
+    /// Junk is turned away locally: it never costs a TokenReview.
+    #[test]
+    fn junk_never_reaches_the_api_server() {
+        let header = serde_json::json!({"alg": "RS256"});
+        let now = 1_000_000;
+        let good = serde_json::json!({"aud": ["scarab-broker"], "exp": now + 600});
+        let mut cases: Vec<(&str, String)> = vec![
+            ("empty", String::new()),
+            ("not a JWT", "hello".into()),
+            ("two segments", "a.b".into()),
+            ("four segments", format!("{}.x", jwt(&header, &good))),
+            ("not base64", "!!.!!.sig".into()),
+            ("too long", "a".repeat(MAX_TOKEN_BYTES + 1)),
+        ];
+        let unsigned = jwt(&header, &good);
+        cases.push((
+            "unsigned",
+            unsigned[..unsigned.rfind('.').unwrap() + 1].to_string(),
+        ));
+        cases.push(("no alg", jwt(&serde_json::json!({"typ": "JWT"}), &good)));
+        cases.push((
+            "another audience",
+            jwt(
+                &header,
+                &serde_json::json!({"aud": ["https://kubernetes.default.svc"], "exp": now + 600}),
+            ),
+        ));
+        cases.push((
+            "no audience",
+            jwt(&header, &serde_json::json!({"exp": now + 600})),
+        ));
+        cases.push((
+            "expired",
+            jwt(
+                &header,
+                &serde_json::json!({"aud": "scarab-broker", "exp": now}),
+            ),
+        ));
+        cases.push((
+            "no expiry",
+            jwt(&header, &serde_json::json!({"aud": "scarab-broker"})),
+        ));
+        for (name, token) in cases {
+            assert!(precheck_jwt(&token, now).is_err(), "{name}");
+        }
     }
 
     #[test]
