@@ -564,7 +564,8 @@ impl PluginStore for PostgresDb {
             let new_target = cursor.is_none();
             let new_unmapped = environment.is_none()
                 && sqlx::query_scalar::<_, i64>(
-                    "SELECT 1 FROM deployment_source_unmapped
+                    // `1::BIGINT`: a bare `1` is INT4 and will not decode as i64.
+                    "SELECT 1::BIGINT FROM deployment_source_unmapped
                      WHERE installation_id = $1 AND vendor_grouping = $2",
                 )
                 .bind(installation_id)
