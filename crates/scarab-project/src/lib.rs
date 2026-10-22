@@ -25,6 +25,17 @@ pub use org_environment::{
     MIN_ENVIRONMENT_DEPLOYMENT_DEADLINE_MS,
 };
 
+/// The org-level Environment's governance model and its pure resolution
+/// (ADR-0071 §2, §3, §8, §10): baseline, tighten-only overlay, eligibility,
+/// per-Project privilege grant, and the migration from the per-Project
+/// [`Environment`]. Defined, not yet read by admission.
+mod environment_governance;
+pub use environment_governance::{
+    effective_protection, migrate_legacy_environment, AllowedRefConstraint, EffectiveProtection,
+    EnvironmentProjectEligibility, EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant,
+    EnvironmentProtectionRules,
+};
+
 /// A top-level tenant. Owns Projects. The Scarab tenancy boundary — **not**
 /// the forge's `owner` namespace (one Org may span a GitHub org *and* a
 /// Forgejo instance).
@@ -252,58 +263,72 @@ impl ProtectionRules {
         image: &str,
         locked_out: bool,
     ) -> Result<AdmittedGrants, Vec<String>> {
-        let mut admitted = AdmittedGrants::default();
-        let mut violations = Vec::new();
+        admit_grants_against_whitelist(&self.privileged_images, req, image, locked_out)
+    }
+}
 
-        // run-as-root: self-service, sandbox-bound.
-        admitted.run_as_root = req.run_as_root;
+/// The ADR-0039 grant decision against one privilege whitelist — the body
+/// [`ProtectionRules::admit_grants`] and ADR-0071's
+/// [`EnvironmentProjectPrivilegeGrant::admit_grants`] share, so the per-Project
+/// grant that replaces the per-Project whitelist decides **identically** by
+/// construction (ADR-0071 §8, §10 step 5) rather than by a copy kept in step.
+/// See [`ProtectionRules::admit_grants`] for the rules.
+fn admit_grants_against_whitelist(
+    whitelist: &[ImageGrant],
+    req: &GrantRequest,
+    image: &str,
+    locked_out: bool,
+) -> Result<AdmittedGrants, Vec<String>> {
+    let mut admitted = AdmittedGrants::default();
+    let mut violations = Vec::new();
 
-        let wants_governed = req.privileged || !req.add_capabilities.is_empty();
-        if wants_governed {
-            if locked_out {
-                return Err(vec![
-                    "fork-PR run is locked out of governed grants (add-capabilities/privileged)"
-                        .to_string(),
-                ]);
-            }
-            let digest = image_digest(image);
-            let entry =
-                digest.and_then(|d| self.privileged_images.iter().find(|g| g.image_digest == d));
-            match (digest, entry) {
-                (None, _) => violations.push(format!(
-                    "image `{image}` requests a governed grant but is not pinned to a digest (repo@sha256:…)"
-                )),
-                (Some(d), None) => violations.push(format!(
-                    "image digest `{d}` is not whitelisted for governed grants in this environment"
-                )),
-                (Some(_), Some(entry)) => {
-                    if req.privileged {
-                        if entry.privileged {
-                            admitted.privileged = true;
-                        } else {
-                            violations.push(
-                                "`privileged` is not granted to this image digest".to_string(),
-                            );
-                        }
+    // run-as-root: self-service, sandbox-bound.
+    admitted.run_as_root = req.run_as_root;
+
+    let wants_governed = req.privileged || !req.add_capabilities.is_empty();
+    if wants_governed {
+        if locked_out {
+            return Err(vec![
+                "fork-PR run is locked out of governed grants (add-capabilities/privileged)"
+                    .to_string(),
+            ]);
+        }
+        let digest = image_digest(image);
+        let entry = digest.and_then(|d| whitelist.iter().find(|g| g.image_digest == d));
+        match (digest, entry) {
+            (None, _) => violations.push(format!(
+                "image `{image}` requests a governed grant but is not pinned to a digest (repo@sha256:…)"
+            )),
+            (Some(d), None) => violations.push(format!(
+                "image digest `{d}` is not whitelisted for governed grants in this environment"
+            )),
+            (Some(_), Some(entry)) => {
+                if req.privileged {
+                    if entry.privileged {
+                        admitted.privileged = true;
+                    } else {
+                        violations.push(
+                            "`privileged` is not granted to this image digest".to_string(),
+                        );
                     }
-                    for cap in &req.add_capabilities {
-                        if entry.capabilities.iter().any(|c| c == cap) {
-                            admitted.add_capabilities.push(cap.clone());
-                        } else {
-                            violations.push(format!(
-                                "capability `{cap}` is not granted to this image digest"
-                            ));
-                        }
+                }
+                for cap in &req.add_capabilities {
+                    if entry.capabilities.iter().any(|c| c == cap) {
+                        admitted.add_capabilities.push(cap.clone());
+                    } else {
+                        violations.push(format!(
+                            "capability `{cap}` is not granted to this image digest"
+                        ));
                     }
                 }
             }
         }
+    }
 
-        if violations.is_empty() {
-            Ok(admitted)
-        } else {
-            Err(violations)
-        }
+    if violations.is_empty() {
+        Ok(admitted)
+    } else {
+        Err(violations)
     }
 }
 
