@@ -109,6 +109,29 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- default .Release.Namespace .Values.scarab.namespace -}}
 {{- end -}}
 
+{{/* plugins.namespace must be a namespace of its own (ADR-0072 §9). The
+     runtime applies a default-deny NetworkPolicy selecting EVERY Pod there and
+     the chart grants Scarab Pod/Deployment create rights in it, so pointing it
+     at the release's namespace would cut the server off from Postgres/S3, at
+     the step namespace would put PR code beside plugins, and at `default` or a
+     `kube-*` namespace would hand Scarab's ServiceAccount create rights where
+     it has no business. Refused at render time, before any RBAC is granted. */}}
+{{- define "scarab.validatePlugins" -}}
+{{- if .Values.plugins.enabled -}}
+{{- $ns := .Values.plugins.namespace -}}
+{{- $reserved := dict
+      .Release.Namespace "the release namespace (scarab-server's own)"
+      (include "scarab.execNamespace" .) "scarab.namespace (where step Pods run)"
+      "default" "the `default` namespace" -}}
+{{- if hasKey $reserved $ns -}}
+{{- fail (printf "scarab: plugins.namespace `%s` is %s. Plugins need a namespace of their own: the runtime's default-deny NetworkPolicy selects every Pod in it (ADR-0072 §9)." $ns (get $reserved $ns)) -}}
+{{- end -}}
+{{- if hasPrefix "kube-" $ns -}}
+{{- fail (printf "scarab: plugins.namespace `%s` is a Kubernetes system namespace; plugins need a namespace of their own (ADR-0072 §9)." $ns) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
 {{/* Directory the file-mounted GitHub App PEM is projected into (enh 245a99c). */}}
 {{- define "scarab.githubAppPemDir" -}}
 /etc/scarab/forge

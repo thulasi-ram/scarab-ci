@@ -63,7 +63,7 @@
 //! | `SCARAB_CONNECTIONS_FILE` | env | path to a file holding the same `connections:` block (the GitOps shape: a ConfigMap mount). A bad path/parse/validation is a boot failure |
 //! | `SCARAB_PLUGINS` | env | `on`/`off` (default `off`): the plugin runtime (ADR-0072) — the CredentialBroker listener and plugin installs. The registry, the kill switch and the read views work either way; anything else refuses boot |
 //! | `SCARAB_BROKER_ADDR` | env | the CredentialBroker's own listener (ADR-0072 §11), separate from the API so plugins never reach the public surface; default `0.0.0.0:8090`. Only bound with `SCARAB_PLUGINS=on` |
-//! | `SCARAB_PLUGIN_NAMESPACE` | env | the one shared namespace Plugins run in (ADR-0072 §9); default `scarab-plugins`. A broker caller's ServiceAccount must be in it |
+//! | `SCARAB_PLUGIN_NAMESPACE` | env | the one shared namespace Plugins run in (ADR-0072 §9); default `scarab-plugins`. A broker caller's ServiceAccount must be in it. Never `SCARAB_NAMESPACE`, `default` or `kube-*` (refused at boot) |
 //! | `SCARAB_PLUGIN_BROKER_URL` | env | the broker URL the runtime injects into every Plugin Pod (`SCARAB_BROKER_URL`); default `http://scarab-broker:8090`. Plugins have no DNS, so a host NAME is resolved by the runtime every pass and injected as an IP |
 //! | `SCARAB_PLUGIN_BROKER_PEER` | env | how the `plugin-egress` NetworkPolicy names the broker: `pods:<namespace>:<k=v,…>` or `cidr:<ip>/<prefix>` (at most a /24). Unset = the runtime refuses its baseline and no Plugin runs |
 //! | `SCARAB_PLUGIN_PROBE_IMAGE` | env | the isolation-probe and per-Pod self-check image (ADR-0072 §9); default `busybox:1.36.1` pinned by digest. Pin an override by digest too |
@@ -608,11 +608,14 @@ pub struct PluginsConfig {
 }
 
 impl PluginsConfig {
-    /// Resolve the plugin knobs. `dev_insecure` gates the two dev knobs.
+    /// Resolve the plugin knobs. `dev_insecure` gates the two dev knobs;
+    /// `exec_namespace` is `SCARAB_NAMESPACE`, which the plugin namespace
+    /// must never be.
     fn resolve(
         env: &impl Fn(&str) -> Option<String>,
         dev_insecure: bool,
         api_addr: &str,
+        exec_namespace: &str,
     ) -> Result<Self, ConfigError> {
         let set = |k: &str| {
             env(k)
@@ -646,6 +649,24 @@ impl PluginsConfig {
         if scarab_plugin::validate_installation_name(&namespace).is_err() {
             return Err(invalid(format!(
                 "SCARAB_PLUGIN_NAMESPACE must be a DNS-1123 label, got {namespace:?}"
+            )));
+        }
+        // The runtime applies a default-deny NetworkPolicy selecting EVERY
+        // Pod of this namespace (ADR-0072 §9): shared with step Pods it would
+        // cut them off — and put PR code beside plugins — and `default` or a
+        // `kube-*` namespace is no place for Scarab to create workloads. Only
+        // with plugins on: off, nothing is ever created there, and an
+        // unrelated deployment should not refuse to boot over it.
+        if enabled && namespace == exec_namespace {
+            return Err(invalid(format!(
+                "SCARAB_PLUGIN_NAMESPACE ({namespace}) is SCARAB_NAMESPACE, where step Pods \
+                 run; plugins need a namespace of their own (ADR-0072 §9)"
+            )));
+        }
+        if enabled && (namespace == "default" || namespace.starts_with("kube-")) {
+            return Err(invalid(format!(
+                "SCARAB_PLUGIN_NAMESPACE ({namespace}) is a namespace Kubernetes owns; plugins \
+                 need a namespace of their own (ADR-0072 §9)"
             )));
         }
         let broker_url =
@@ -1480,7 +1501,7 @@ impl Config {
             None => 14,
         };
 
-        let plugins = PluginsConfig::resolve(&env, dev_insecure, &cli.addr)?;
+        let plugins = PluginsConfig::resolve(&env, dev_insecure, &cli.addr, &cli.namespace)?;
 
         Ok(Config {
             role: cli.role,
@@ -3123,7 +3144,7 @@ connections:
                 .find(|(key, _)| *key == k)
                 .map(|(_, v)| v.to_string())
         };
-        PluginsConfig::resolve(&env, dev_insecure, "0.0.0.0:8080")
+        PluginsConfig::resolve(&env, dev_insecure, "0.0.0.0:8080", "scarab")
     }
 
     #[test]
@@ -3178,6 +3199,20 @@ connections:
                 ("SCARAB_BROKER_ADDR", "[::]:8080"),
             ],
             &[("SCARAB_PLUGIN_NAMESPACE", "Scarab_Plugins")],
+            // A namespace of its own: never the step namespace
+            // (SCARAB_NAMESPACE, `scarab` here), never Kubernetes'.
+            &[
+                ("SCARAB_PLUGINS", "on"),
+                ("SCARAB_PLUGIN_NAMESPACE", "scarab"),
+            ],
+            &[
+                ("SCARAB_PLUGINS", "on"),
+                ("SCARAB_PLUGIN_NAMESPACE", "default"),
+            ],
+            &[
+                ("SCARAB_PLUGINS", "on"),
+                ("SCARAB_PLUGIN_NAMESPACE", "kube-system"),
+            ],
             &[("SCARAB_PLUGIN_BROKER_URL", "scarab-broker:8090")],
             &[("SCARAB_PLUGIN_BROKER_URL", "http://user:pw@broker:8090")],
             &[("SCARAB_PLUGIN_BROKER_PEER", "10.0.0.1/32")],
