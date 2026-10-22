@@ -349,18 +349,27 @@ impl K8sPluginRuntime {
         Ok(())
     }
 
-    /// The kill switch's runtime half: scale to zero and delete the
-    /// ServiceAccount — which invalidates every token bound to it at the API
-    /// server, so even a token still in a terminating Pod verifies as
-    /// nothing. (The broker refuses a killed installation on its own,
-    /// before any of this lands.) The Deployment stays, so an enable is a
+    /// The kill switch's runtime half: delete the ServiceAccount — which
+    /// invalidates every token bound to it at the API server, so even a
+    /// token still in a terminating Pod verifies as nothing — and scale to
+    /// zero. (The broker refuses a killed installation on its own, before
+    /// any of this lands.) The Deployment stays, so an enable is a
     /// scale-up, not a re-creation.
+    ///
+    /// Revocation first, and both always attempted: the token is the
+    /// security-relevant half, so a failed scale-down (or the reverse) must
+    /// never leave it valid. Errors are combined, and the next pass retries.
     pub async fn stop(&self, installation_id: &str) -> Result<(), RuntimeError> {
         let name = objects::workload_name(installation_id);
+        let revoked = gone_is_fine(
+            self.namespaced::<ServiceAccount>()
+                .delete(&name, &DeleteParams::default())
+                .await,
+        );
         // A merge patch, not an apply: an apply of `{replicas: 0}` alone
         // would remove every other field this manager owns.
         let scale = serde_json::json!({ "spec": { "replicas": 0 } });
-        gone_is_fine(
+        let scaled_down = gone_is_fine(
             self.namespaced::<Deployment>()
                 .patch(
                     &name,
@@ -371,12 +380,24 @@ impl K8sPluginRuntime {
                     &Patch::Merge(&scale),
                 )
                 .await,
-        )?;
-        gone_is_fine(
-            self.namespaced::<ServiceAccount>()
-                .delete(&name, &DeleteParams::default())
-                .await,
-        )
+        );
+        // `gone_is_fine` already says "kubernetes: …"; keep it said once.
+        let detail = |e: RuntimeError| match e {
+            RuntimeError::Kube(m) => m,
+            other => other.to_string(),
+        };
+        match (revoked.map_err(detail), scaled_down.map_err(detail)) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(e), Ok(())) => Err(RuntimeError::Kube(format!(
+                "deleting the ServiceAccount (its tokens stay valid until it is): {e}"
+            ))),
+            (Ok(()), Err(e)) => Err(RuntimeError::Kube(format!(
+                "scaling to zero (the ServiceAccount is deleted): {e}"
+            ))),
+            (Err(revoke), Err(scale)) => Err(RuntimeError::Kube(format!(
+                "deleting the ServiceAccount: {revoke}; scaling to zero: {scale}"
+            ))),
+        }
     }
 
     /// Uninstall: delete the Deployment (its Pods with it) and the
