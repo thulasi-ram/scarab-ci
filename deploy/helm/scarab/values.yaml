@@ -469,8 +469,10 @@ plugins:
   # The broker listener's port (SCARAB_BROKER_ADDR) and its Service port —
   # the same number, so the NetworkPolicy port and the URL agree.
   brokerPort: 8090
-  # The isolation probe's image (busybox: httpd, nc, wget). "" = the server
-  # default (busybox:1.36). Digest-pin in production.
+  # The isolation probe's (and every plugin Pod's self-check) image (busybox:
+  # httpd, nc, wget, nslookup, timeout). "" = the server default, busybox:1.36.1
+  # pinned by digest. An override should be digest-pinned too: the probe's
+  # verdict is only as good as the image printing it.
   probeImage: ""
   # The repository first-party Argo CD installs must pin by digest. "" = the
   # server default (ghcr.io/thulasi-ram/scarab-plugin-argocd).

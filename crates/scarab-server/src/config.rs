@@ -66,7 +66,7 @@
 //! | `SCARAB_PLUGIN_NAMESPACE` | env | the one shared namespace Plugins run in (ADR-0072 §9); default `scarab-plugins`. A broker caller's ServiceAccount must be in it |
 //! | `SCARAB_PLUGIN_BROKER_URL` | env | the broker URL the runtime injects into every Plugin Pod (`SCARAB_BROKER_URL`); default `http://scarab-broker:8090`. Plugins have no DNS, so a host NAME is resolved by the runtime every pass and injected as an IP |
 //! | `SCARAB_PLUGIN_BROKER_PEER` | env | how the `plugin-egress` NetworkPolicy names the broker: `pods:<namespace>:<k=v,…>` or `cidr:<ip>/<prefix>` (at most a /24). Unset = the runtime refuses its baseline and no Plugin runs |
-//! | `SCARAB_PLUGIN_PROBE_IMAGE` | env | the isolation-probe image (ADR-0072 §9); default `busybox:1.36` |
+//! | `SCARAB_PLUGIN_PROBE_IMAGE` | env | the isolation-probe and per-Pod self-check image (ADR-0072 §9); default `busybox:1.36.1` pinned by digest. Pin an override by digest too |
 //! | `SCARAB_PLUGIN_ARGOCD_REPO` | env | the repository the first-party Argo CD plugin installs from; default `ghcr.io/thulasi-ram/scarab-plugin-argocd`. An install must pin it by `@sha256:` digest |
 //! | `SCARAB_DEV_PLUGIN_TOKENS` | env | **dev only, needs `SCARAB_DEV_INSECURE`**: `<installation-id>=<token>,…` static broker tokens standing in for TokenReview (slice d2). Loud at boot |
 //! | `SCARAB_DEV_PLUGIN_ALLOW_TAG` | env | **dev only, needs `SCARAB_DEV_INSECURE`**: `1` lets a first-party install name a tag instead of a digest (kind/colima images have no repo digest). Loud at boot |
