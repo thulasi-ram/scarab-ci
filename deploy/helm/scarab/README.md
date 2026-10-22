@@ -378,7 +378,7 @@ DNS, which must be the usual `kube-system` Pods labelled `k8s-app=kube-dns`.
 | `scarab.workspaceUrl` | — | override the in-cluster workspace Service URL (split installs) |
 | `rbac.create` | `true` | Role/RoleBinding for Pod execution |
 | `plugins.enabled` | `false` | the ADR-0072 plugin runtime + CredentialBroker (above) |
-| `plugins.namespace` / `.createNamespace` | `scarab-plugins` / `true` | the shared plugin namespace; must enforce Pod Security `restricted` |
+| `plugins.namespace` / `.createNamespace` | `scarab-plugins` / `true` | the shared plugin namespace; must enforce Pod Security `restricted`. A namespace of its own: the render fails on the release namespace, `scarab.namespace`, `default` or `kube-*` |
 | `plugins.brokerPort` | `8090` | the broker listener and its ClusterIP Service port |
 | `plugins.probeImage` | `""` = `busybox:1.36.1@sha256:73aa…` | the isolation probe's and the per-Pod self-check's image; digest-pin an override |
 | `ingress.enabled` | `false` | expose the HTTP API |
