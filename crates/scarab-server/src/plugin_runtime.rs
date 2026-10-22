@@ -43,12 +43,15 @@ use scarab_plugin_k8s::{K8sPluginRuntime, RuntimeError, WorkloadState};
 
 /// The lease gating the loop to one replica at a time.
 pub const PLUGIN_RUNTIME_LEASE: &str = "plugin-runtime";
-/// Renewed at the start of every pass, so it must outlast the longest pass:
-/// one that runs a probe (the adapter bounds that at 5 minutes — canary
-/// readiness plus the checking Pods) and then applies every workload. Twice
-/// that, so a second replica never takes over mid-probe; a crashed leader
-/// is replaced within it.
-const PLUGIN_RUNTIME_LEASE_TTL_MS: i64 = 10 * 60 * 1000;
+/// Short, so a restarted or crashed leader is replaced within a minute (the
+/// lease is not released on shutdown). A pass can run far longer — a probe
+/// alone is bounded at 5 minutes — so while a pass runs the lease is renewed
+/// in the background every [`LEASE_RENEW_INTERVAL`], and re-checked before
+/// anything is held or stopped on the probe's strength.
+const PLUGIN_RUNTIME_LEASE_TTL_MS: i64 = 60 * 1000;
+/// A third of the TTL: two renewals can fail before the lease lapses.
+const LEASE_RENEW_INTERVAL: Duration =
+    Duration::from_millis((PLUGIN_RUNTIME_LEASE_TTL_MS / 3) as u64);
 pub const RECONCILE_INTERVAL: Duration = Duration::from_secs(15);
 /// A passed probe is trusted this long; a CNI can change under a running
 /// cluster.
@@ -207,6 +210,47 @@ fn capped(message: &str) -> String {
     }
 }
 
+/// Renews the lease in the background while a pass runs, so a pass longer
+/// than the TTL is never taken over midway — a second replica sweeping this
+/// one's probe Pods, or stopping what it just started. Dropping it stops the
+/// renewing, on every exit from the pass.
+struct LeaseRenewer(tokio::task::JoinHandle<()>);
+
+impl LeaseRenewer {
+    fn spawn(db: Arc<dyn Db>, owner: String) -> Self {
+        Self(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(LEASE_RENEW_INTERVAL).await;
+                match db
+                    .lease(PLUGIN_RUNTIME_LEASE, &owner, PLUGIN_RUNTIME_LEASE_TTL_MS)
+                    .await
+                {
+                    Ok(lease) if lease.owner == owner => {}
+                    Ok(lease) => {
+                        // The pass notices at its own ownership check, before
+                        // it holds or stops anything.
+                        tracing::warn!(
+                            holder = %lease.owner,
+                            "plugin runtime: lost the lease during a pass"
+                        );
+                        break;
+                    }
+                    // A database blip: keep trying while the lease lasts.
+                    Err(e) => {
+                        tracing::warn!(error = %e, "plugin runtime: could not renew the lease")
+                    }
+                }
+            }
+        }))
+    }
+}
+
+impl Drop for LeaseRenewer {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// The loop's state and handles.
 pub struct PluginRuntimeLoop {
     db: Arc<dyn Db>,
@@ -263,6 +307,33 @@ impl PluginRuntimeLoop {
             self.isolation = Isolation::default();
             return Ok(());
         }
+        let _renewer = LeaseRenewer::spawn(self.db.clone(), self.owner.clone());
+        self.pass().await
+    }
+
+    /// Whether this replica still holds the lease (renewing it if so). A
+    /// replica that lost it forgets its probe result, exactly as one that
+    /// never held it.
+    async fn still_holds_lease(&mut self) -> Result<bool, String> {
+        let lease = self
+            .db
+            .lease(
+                PLUGIN_RUNTIME_LEASE,
+                &self.owner,
+                PLUGIN_RUNTIME_LEASE_TTL_MS,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        if lease.owner != self.owner {
+            tracing::warn!(holder = %lease.owner, "plugin runtime: another replica holds the lease; abandoning this pass");
+            self.isolation = Isolation::default();
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// The pass proper, under the lease.
+    async fn pass(&mut self) -> Result<(), String> {
         let installations = self
             .store
             .all_installations()
@@ -291,6 +362,12 @@ impl PluginRuntimeLoop {
                     self.probe(&installations).await;
                 }
             }
+        }
+        // The probe can take minutes. Before anything is held or stopped on
+        // its strength, make sure no other replica took over meanwhile: two
+        // runtimes acting on one namespace would undo each other.
+        if !self.still_holds_lease().await? {
+            return Ok(());
         }
 
         for installation in &installations {
