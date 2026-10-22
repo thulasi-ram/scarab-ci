@@ -64,7 +64,7 @@
 //! | `SCARAB_PLUGINS` | env | `on`/`off` (default `off`): the plugin runtime (ADR-0072) — the CredentialBroker listener and plugin installs. The registry, the kill switch and the read views work either way; anything else refuses boot |
 //! | `SCARAB_BROKER_ADDR` | env | the CredentialBroker's own listener (ADR-0072 §11), separate from the API so plugins never reach the public surface; default `0.0.0.0:8090`. Only bound with `SCARAB_PLUGINS=on` |
 //! | `SCARAB_PLUGIN_NAMESPACE` | env | the one shared namespace Plugins run in (ADR-0072 §9); default `scarab-plugins`. A broker caller's ServiceAccount must be in it |
-//! | `SCARAB_PLUGIN_BROKER_URL` | env | the broker URL the runtime injects into every Plugin Pod (`SCARAB_BROKER_URL`); default `http://scarab-broker:8090` |
+//! | `SCARAB_PLUGIN_BROKER_URL` | env | the broker URL the runtime injects into every Plugin Pod (`SCARAB_BROKER_URL`); default `http://scarab-broker:8090`. Plugins have no DNS, so a host NAME is resolved by the runtime every pass and injected as an IP |
 //! | `SCARAB_PLUGIN_BROKER_PEER` | env | how the `plugin-egress` NetworkPolicy names the broker: `pods:<namespace>:<k=v,…>` or `cidr:<ip>/<prefix>` (at most a /24). Unset = the runtime refuses its baseline and no Plugin runs |
 //! | `SCARAB_PLUGIN_PROBE_IMAGE` | env | the isolation-probe image (ADR-0072 §9); default `busybox:1.36` |
 //! | `SCARAB_PLUGIN_ARGOCD_REPO` | env | the repository the first-party Argo CD plugin installs from; default `ghcr.io/thulasi-ram/scarab-plugin-argocd`. An install must pin it by `@sha256:` digest |
@@ -648,6 +648,13 @@ impl PluginsConfig {
                 "SCARAB_PLUGIN_NAMESPACE must be a DNS-1123 label, got {namespace:?}"
             )));
         }
+        let broker_url =
+            set("SCARAB_PLUGIN_BROKER_URL").unwrap_or_else(|| "http://scarab-broker:8090".into());
+        // The runtime takes it apart to hand Pods the broker by IP; a URL it
+        // cannot take apart would refuse every pass, so refuse boot instead.
+        if let Err(e) = scarab_plugin_k8s::BrokerUrl::parse(&broker_url) {
+            return Err(invalid(format!("SCARAB_PLUGIN_BROKER_URL: {e}")));
+        }
         let broker_peer = set("SCARAB_PLUGIN_BROKER_PEER");
         if let Some(peer) = &broker_peer {
             // Parsed in full, not just by prefix: this is the one egress
@@ -725,8 +732,7 @@ impl PluginsConfig {
             enabled,
             broker_addr,
             namespace,
-            broker_url: set("SCARAB_PLUGIN_BROKER_URL")
-                .unwrap_or_else(|| "http://scarab-broker:8090".into()),
+            broker_url,
             broker_peer,
             probe_image: set("SCARAB_PLUGIN_PROBE_IMAGE"),
             argocd_repo,
@@ -3172,6 +3178,8 @@ connections:
                 ("SCARAB_BROKER_ADDR", "[::]:8080"),
             ],
             &[("SCARAB_PLUGIN_NAMESPACE", "Scarab_Plugins")],
+            &[("SCARAB_PLUGIN_BROKER_URL", "scarab-broker:8090")],
+            &[("SCARAB_PLUGIN_BROKER_URL", "http://user:pw@broker:8090")],
             &[("SCARAB_PLUGIN_BROKER_PEER", "10.0.0.1/32")],
             // The one egress allowance must name the broker, not a network
             // or every Pod of a namespace (ADR-0072 §9).

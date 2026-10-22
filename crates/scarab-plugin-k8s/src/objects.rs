@@ -47,8 +47,10 @@ pub const PROBE_CANARY_PORT: u16 = 8080;
 
 /// Where the cluster's DNS lives. Every mainstream distribution (kind, k3s,
 /// EKS, GKE, AKS) runs CoreDNS/kube-dns in `kube-system` labelled
-/// `k8s-app=kube-dns`. A cluster that resolves elsewhere (node-local DNS)
-/// fails the probe's DNS check — loudly, which is the point.
+/// `k8s-app=kube-dns`. Only the probe's CONTROL Pod is allowed to it — its
+/// positive DNS check is what makes a Plugin's "no answer" mean something; a
+/// cluster that resolves elsewhere (node-local DNS) fails that check —
+/// loudly, which is the point. A Plugin gets no DNS at all.
 pub const DNS_NAMESPACE: &str = "kube-system";
 pub const DNS_POD_LABEL: (&str, &str) = ("k8s-app", "kube-dns");
 
@@ -60,6 +62,10 @@ pub const BROKER_TOKEN_FILE: &str = "token";
 
 /// The unprivileged uid/gid a Plugin runs as (distroless `nonroot`).
 pub const PLUGIN_UID: i64 = 65532;
+
+/// The CPU ceiling of every container in a Plugin Pod: a spinning (or
+/// compromised) Plugin gets half a core, never the node.
+pub const PLUGIN_CPU_LIMIT: &str = "500m";
 
 /// The name of an installation's ServiceAccount AND Deployment:
 /// `plugin-<id>`. Keyed by id (never the name), so a reinstall under a new id
@@ -125,8 +131,9 @@ pub fn default_deny_policy(namespace: &str) -> NetworkPolicy {
     }
 }
 
-/// The DNS egress rule: UDP and TCP 53 to the cluster DNS Pods only — not to
-/// any resolver, which would be a tunnel out.
+/// The DNS egress rule: UDP and TCP 53 to the cluster DNS Pods only. For the
+/// probe's control Pod alone — never a Plugin: the cluster resolver forwards
+/// any name upstream, so even "kube-dns only" is a tunnel out.
 fn dns_egress_rule() -> NetworkPolicyEgressRule {
     NetworkPolicyEgressRule {
         to: Some(vec![NetworkPolicyPeer {
@@ -145,9 +152,13 @@ fn dns_egress_rule() -> NetworkPolicyEgressRule {
     }
 }
 
-/// `plugin-egress`: what a Plugin workload may reach — DNS and the
-/// CredentialBroker's port, nothing else (ADR-0072 §9). Egress only: its
-/// ingress stays at `default-deny`'s nothing (owner default 4).
+/// `plugin-egress`: what a Plugin workload may reach — the CredentialBroker's
+/// port, nothing else (ADR-0072 §9). Not even DNS: CoreDNS's default
+/// `forward .` resolves `<data>.attacker.example` recursively, so a DNS
+/// allowance is a two-way channel out (data in the query names, commands in
+/// the answers). A Plugin needs none — its only peer is the broker, and it is
+/// handed the broker by IP. Egress only: its ingress stays at
+/// `default-deny`'s nothing (owner default 4).
 pub fn plugin_egress_policy(
     namespace: &str,
     broker: &BrokerPeer,
@@ -182,20 +193,17 @@ pub fn plugin_egress_policy(
             pod_selector: Some(selector(&[(LABEL_PLUGIN_WORKLOAD, "true")])),
             policy_types: Some(vec!["Egress".to_string()]),
             ingress: None,
-            egress: Some(vec![
-                dns_egress_rule(),
-                NetworkPolicyEgressRule {
-                    to: Some(vec![broker_peer]),
-                    ports: Some(vec![tcp(broker_port)]),
-                },
-            ]),
+            egress: Some(vec![NetworkPolicyEgressRule {
+                to: Some(vec![broker_peer]),
+                ports: Some(vec![tcp(broker_port)]),
+            }]),
         }),
     }
 }
 
-/// The probe's control Pod may reach the canary (and DNS). This is what
-/// makes a failed plugin-side connection mean "the policy held" rather than
-/// "the canary was never reachable".
+/// The probe's control Pod may reach the canary and the cluster DNS. This is
+/// what makes a failed plugin-side connection or lookup mean "the policy
+/// held" rather than "the canary / the resolver was never reachable".
 pub fn probe_control_egress_policy(namespace: &str) -> NetworkPolicy {
     NetworkPolicy {
         metadata: meta(PROBE_CONTROL_EGRESS_POLICY, namespace, managed_labels()),
@@ -333,10 +341,16 @@ fn plugin_env(installation: &PluginInstallation, broker_url: &str) -> Vec<EnvVar
 /// are per installation (ADR-0070 §11). Runs as `plugin-<id>` under the
 /// restricted profile with a read-only root, no service links (they would
 /// list every Service's address), and only the broker token mounted.
+///
+/// Before the Plugin starts, the isolation self-check initContainer
+/// ([`crate::probe::self_check_container`], `probe_image`) proves THIS Pod's
+/// network on THIS node: broker reachable, nothing else. `broker_url` is the
+/// broker as a Pod dials it — by IP, since a Plugin has no DNS.
 pub fn deployment(
     namespace: &str,
     installation: &PluginInstallation,
     broker_url: &str,
+    probe_image: &str,
 ) -> Deployment {
     let name = workload_name(&installation.id);
     let mut pod_labels = installation_labels(&installation.id);
@@ -387,6 +401,10 @@ pub fn deployment(
                     automount_service_account_token: Some(false),
                     enable_service_links: Some(false),
                     security_context: Some(restricted_pod_security_context()),
+                    init_containers: Some(vec![crate::probe::self_check_container(
+                        probe_image,
+                        broker_url,
+                    )]),
                     containers: vec![Container {
                         name: "plugin".to_string(),
                         image: Some(installation.image.clone()),
@@ -460,6 +478,9 @@ mod tests {
     use super::*;
     use scarab_plugin::{InstallationState, PluginCapability, PluginManifest, RuntimeStatus};
 
+    const BROKER_URL: &str = "http://10.96.0.20:8090";
+    const PROBE_IMAGE: &str = "busybox@sha256:0000";
+
     fn installation() -> PluginInstallation {
         PluginInstallation {
             id: "0123456789".into(),
@@ -516,7 +537,7 @@ mod tests {
 
     #[test]
     fn the_deployment_is_one_recreated_replica_as_its_own_service_account() {
-        let d = deployment("scarab-plugins", &installation(), "http://broker:8090");
+        let d = deployment("scarab-plugins", &installation(), BROKER_URL, PROBE_IMAGE);
         let spec = d.spec.as_ref().unwrap();
         assert_eq!(d.metadata.name.as_deref(), Some("plugin-0123456789"));
         assert_eq!(spec.replicas, Some(1));
@@ -549,7 +570,7 @@ mod tests {
 
     #[test]
     fn the_plugin_runs_under_the_restricted_profile_with_a_read_only_root() {
-        let d = deployment("scarab-plugins", &installation(), "http://broker:8090");
+        let d = deployment("scarab-plugins", &installation(), BROKER_URL, PROBE_IMAGE);
         let pod = pod_spec(&d);
         let psc = pod.security_context.as_ref().unwrap();
         assert_eq!(psc.run_as_non_root, Some(true));
@@ -570,7 +591,7 @@ mod tests {
 
     #[test]
     fn the_only_credential_is_a_short_lived_broker_audience_token() {
-        let d = deployment("scarab-plugins", &installation(), "http://broker:8090");
+        let d = deployment("scarab-plugins", &installation(), BROKER_URL, PROBE_IMAGE);
         let pod = pod_spec(&d);
         let volumes = pod.volumes.as_ref().unwrap();
         let projections: Vec<&ServiceAccountTokenProjection> = volumes
@@ -596,10 +617,10 @@ mod tests {
         // broker.
         inst.config
             .insert("SCARAB_BROKER_URL".into(), "http://evil:1".into());
-        let d = deployment("scarab-plugins", &inst, "http://broker:8090");
+        let d = deployment("scarab-plugins", &inst, BROKER_URL, PROBE_IMAGE);
         let env = env_of(&d);
         assert_eq!(env["ARGOCD_UI_URL"], "https://argo.example");
-        assert_eq!(env["SCARAB_BROKER_URL"], "http://broker:8090");
+        assert_eq!(env["SCARAB_BROKER_URL"], BROKER_URL);
         assert_eq!(
             env["SCARAB_BROKER_TOKEN_FILE"],
             "/var/run/secrets/scarab/broker/token"
@@ -630,8 +651,29 @@ mod tests {
         assert_eq!(spec.egress, None);
     }
 
+    /// The plugin's own Pod proves its isolation before the Plugin runs, as
+    /// the probe image, with the broker URL and nothing of the Plugin's.
     #[test]
-    fn plugin_egress_allows_dns_and_the_broker_port_only() {
+    fn the_plugin_starts_only_after_its_own_isolation_self_check() {
+        let d = deployment("scarab-plugins", &installation(), BROKER_URL, PROBE_IMAGE);
+        let pod = pod_spec(&d);
+        let init = pod.init_containers.as_ref().unwrap();
+        assert_eq!(init.len(), 1);
+        assert_eq!(init[0].name, crate::probe::SELF_CHECK_CONTAINER);
+        assert_eq!(init[0].image.as_deref(), Some(PROBE_IMAGE));
+        let env: Vec<_> = init[0]
+            .env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(env, ["BROKER_URL"], "no Plugin config, no token");
+        assert!(init[0].volume_mounts.is_none());
+    }
+
+    #[test]
+    fn plugin_egress_allows_the_broker_port_only_not_even_dns() {
         let peer = BrokerPeer::Pods {
             namespace: "scarab".into(),
             labels: BTreeMap::from([("app.kubernetes.io/name".into(), "scarab".into())]),
@@ -647,32 +689,13 @@ mod tests {
         assert_eq!(spec.policy_types, Some(vec!["Egress".to_string()]));
         assert_eq!(spec.ingress, None);
         let egress = spec.egress.unwrap();
-        assert_eq!(egress.len(), 2);
-        let dns = &egress[0];
-        let dns_to = &dns.to.as_ref().unwrap()[0];
-        assert_eq!(
-            dns_to.pod_selector.as_ref().unwrap().match_labels,
-            Some(BTreeMap::from([(
-                "k8s-app".to_string(),
-                "kube-dns".to_string()
-            )]))
-        );
-        assert!(dns_to.ip_block.is_none());
-        let dns_ports: Vec<_> = dns
-            .ports
-            .as_ref()
-            .unwrap()
+        // One rule: the broker. No DNS — a recursive resolver is a tunnel out.
+        assert_eq!(egress.len(), 1);
+        assert!(egress
             .iter()
-            .map(|p| (p.protocol.clone().unwrap(), p.port.clone().unwrap()))
-            .collect();
-        assert_eq!(
-            dns_ports,
-            vec![
-                ("UDP".to_string(), IntOrString::Int(53)),
-                ("TCP".to_string(), IntOrString::Int(53))
-            ]
-        );
-        let broker = &egress[1];
+            .flat_map(|r| r.ports.iter().flatten())
+            .all(|p| p.port != Some(IntOrString::Int(53))));
+        let broker = &egress[0];
         let broker_to = &broker.to.as_ref().unwrap()[0];
         assert_eq!(
             broker_to
@@ -703,7 +726,7 @@ mod tests {
         )
         .spec
         .unwrap();
-        let broker_to = &spec.egress.unwrap()[1].to.clone().unwrap()[0];
+        let broker_to = &spec.egress.unwrap()[0].to.clone().unwrap()[0];
         assert_eq!(
             broker_to.ip_block.as_ref().map(|b| b.cidr.as_str()),
             Some("192.168.5.2/32")

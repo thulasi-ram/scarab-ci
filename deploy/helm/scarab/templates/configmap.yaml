@@ -138,9 +138,12 @@ data:
   SCARAB_RESULTS_API_URL: {{ .Values.scarab.resultsApiUrl | default (printf "http://%s.%s.svc" (include "scarab.fullname" .) .Release.Namespace) | quote }}
   {{- if .Values.plugins.enabled }}
   {{- /* Plugins (ADR-0072). The broker is the server's second listener; the
-         URL plugins dial is its ClusterIP Service, and the NetworkPolicy
-         peer is this release's server Pods (their selector labels — the
-         workspace Pods carry a different name label, so they are not it).
+         URL names its ClusterIP Service, which the runtime resolves to the
+         ClusterIP every pass and hands plugins as an IP (they have no DNS).
+         The NetworkPolicy peer is this release's server Pods (their selector
+         labels — the workspace Pods carry a different name label, so they
+         are not it); it holds for the ClusterIP, being evaluated after the
+         Service's translation.
          The workspace StatefulSet reads this ConfigMap too and ignores
          these: only api/converged roles serve the broker. */}}
   SCARAB_PLUGINS: "on"

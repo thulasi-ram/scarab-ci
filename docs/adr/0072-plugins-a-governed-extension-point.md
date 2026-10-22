@@ -236,11 +236,20 @@ defend against `trusted_dom` code, which can change what is being confirmed.
   `restricted` Pod Security Admission level.
 - Each Plugin runs under a ServiceAccount with **no RBAC** and **no token automount**.
   It receives only a projected token for the broker (§11).
-- **NetworkPolicy is default-deny**, including Plugin to Plugin. Egress is allowed to DNS
-  and the CredentialBroker only. Ingress is allowed from the control plane only.
+- **NetworkPolicy is default-deny**, including Plugin to Plugin. Egress is allowed to the
+  CredentialBroker only — not to DNS: the cluster resolver forwards any name upstream, so
+  a DNS allowance is a two-way tunnel out. A Plugin is handed the broker by IP instead
+  (core resolves the broker's address itself). Ingress is allowed from the control plane
+  only.
 - **A fail-closed isolation probe.** At install and at every start, core runs a probe Pod
   in the namespace and checks that the policy is actually enforced. A cluster whose CNI
   ignores NetworkPolicy fails the probe, and the Plugin does not start.
+- **A self-check in every Plugin Pod.** The probe proves one node at one moment. So each
+  Plugin Pod runs the probe's plugin-side checks itself, as an initContainer, before the
+  Plugin starts: the broker must answer, and the API server, the internet, the cloud
+  metadata address and DNS must not. It retries until a deadline; a Pod whose network is
+  still open then never runs its Plugin. The namespace probe stays the negative control
+  the self-check lacks.
 - **Container isolation only.** No gVisor or other sandboxed runtime is required.
 
 ### 10. Installation, upgrade, publisher trust, operator ceiling, kill switch
