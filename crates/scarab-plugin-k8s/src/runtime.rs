@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use k8s_openapi::api::apps::v1::Deployment;
-use k8s_openapi::api::core::v1::{Namespace, Pod, ServiceAccount};
+use k8s_openapi::api::core::v1::{ContainerStatus, Namespace, Pod, ServiceAccount};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use kube::api::{DeleteParams, ListParams, LogParams, Patch, PatchParams, PostParams};
 use kube::{Api, Client};
@@ -24,6 +24,13 @@ use crate::{
 const CANARY_READY_TIMEOUT: Duration = Duration::from_secs(120);
 const PROBE_PODS_TIMEOUT: Duration = Duration::from_secs(180);
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+// The plugin-labelled probe Pod repeats its checks up to its enforcement
+// deadline, then runs one last pass (~35 s at most: a 5 s healthz, a 15 s DNS
+// timeout, four 3 s connects), after its own start; waiting less than that
+// would turn every slow-to-enforce cluster into "the probe could not run".
+const _: () =
+    assert!((probe::PROBE_ENFORCEMENT_DEADLINE_SECONDS as u64) + 60 < PROBE_PODS_TIMEOUT.as_secs());
 
 /// What the runtime needs to know, from `SCARAB_PLUGIN_*`.
 #[derive(Debug, Clone)]
@@ -483,30 +490,13 @@ impl K8sPluginRuntime {
             let status = pod.status.unwrap_or_default();
             // The isolation self-check first: while it fails, the Plugin's
             // own container never starts, so only here is the reason.
-            for init in status.init_container_statuses.unwrap_or_default() {
-                if init.name != probe::SELF_CHECK_CONTAINER {
-                    continue;
-                }
-                let crash_looping = init
-                    .state
-                    .as_ref()
-                    .and_then(|s| s.waiting.as_ref())
-                    .and_then(|w| w.reason.as_deref())
-                    == Some("CrashLoopBackOff");
-                if crash_looping {
-                    let verdict = init
-                        .last_state
-                        .and_then(|s| s.terminated)
-                        .and_then(|t| t.message)
-                        .map(|m| m.trim().replace('\n', "; "))
-                        .filter(|m| !m.is_empty())
-                        .unwrap_or_else(|| "no verdict recorded".to_string());
-                    return Ok(WorkloadState::Failing(format!(
-                        "the isolation self-check keeps failing — this Pod's network on its \
-                         node is not isolated as plugin-egress requires, so the Plugin does not \
-                         start: {verdict}"
-                    )));
-                }
+            if let Some(why) = status
+                .init_container_statuses
+                .iter()
+                .flatten()
+                .find_map(self_check_failure)
+            {
+                return Ok(WorkloadState::Failing(why));
             }
             for cs in status.container_statuses.unwrap_or_default() {
                 if let Some(waiting) = cs.state.and_then(|s| s.waiting) {
@@ -525,6 +515,47 @@ impl K8sPluginRuntime {
             status.available_replicas.unwrap_or(0)
         )))
     }
+}
+
+/// Why the Pod's isolation self-check has failed, if it has: from its FIRST
+/// failed run, not only once the kubelet backs off. The kubelet restarts a
+/// failed init container at once the first time, so for the whole of that
+/// second run (another full deadline) the state is `running` and only
+/// `lastState` says it failed — waiting for `CrashLoopBackOff` reported a
+/// Pod whose network was open for two minutes as merely "starting".
+///
+/// A run that has since passed (`terminated`, exit 0) clears it: the
+/// Plugin then starts, and the replica count speaks for it. The verdict is
+/// the check's last pass, which the kubelet keeps as the termination
+/// message (`FallbackToLogsOnError`).
+fn self_check_failure(init: &ContainerStatus) -> Option<String> {
+    if init.name != probe::SELF_CHECK_CONTAINER {
+        return None;
+    }
+    let state = init.state.as_ref();
+    let current = state.and_then(|s| s.terminated.as_ref());
+    if current.is_some_and(|t| t.exit_code == 0) {
+        return None;
+    }
+    let failed_run = current
+        .or_else(|| init.last_state.as_ref().and_then(|s| s.terminated.as_ref()))
+        .filter(|t| t.exit_code != 0);
+    let crash_looping = state
+        .and_then(|s| s.waiting.as_ref())
+        .and_then(|w| w.reason.as_deref())
+        == Some("CrashLoopBackOff");
+    if failed_run.is_none() && !crash_looping {
+        return None;
+    }
+    let verdict = failed_run
+        .and_then(|t| t.message.as_deref())
+        .map(|m| m.trim().replace('\n', "; "))
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| "no verdict recorded".to_string());
+    Some(format!(
+        "the isolation self-check failed — this Pod's network on its node is not isolated \
+         as plugin-egress requires, so the Plugin does not start: {verdict}"
+    ))
 }
 
 /// The probe Pods created more than [`probe::PROBE_POD_DEADLINE_SECONDS`]
@@ -611,7 +642,79 @@ async fn finished_log(pods: &Api<Pod>, name: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use k8s_openapi::api::core::v1::{
+        ContainerState, ContainerStateRunning, ContainerStateTerminated, ContainerStateWaiting,
+    };
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time};
+
+    fn terminated(exit_code: i32, message: &str) -> ContainerState {
+        ContainerState {
+            terminated: Some(ContainerStateTerminated {
+                exit_code,
+                message: Some(message.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn self_check(state: ContainerState, last: Option<ContainerState>) -> ContainerStatus {
+        ContainerStatus {
+            name: probe::SELF_CHECK_CONTAINER.to_string(),
+            state: Some(state),
+            last_state: last,
+            ..Default::default()
+        }
+    }
+
+    const OPEN: &str = "SCARAB_PROBE broker reached\nSCARAB_PROBE internet reached\n\
+                        isolation self-check FAILED\n";
+
+    /// The kind tier's bug: the first failed run is followed AT ONCE by a
+    /// second one (no backoff yet), so `CrashLoopBackOff` came only after
+    /// two deadlines and the workload read as "starting" all along. Every
+    /// state after a failed run is failing, with the verdict.
+    #[test]
+    fn a_self_check_is_failing_from_its_first_failed_run() {
+        let running = ContainerState {
+            running: Some(ContainerStateRunning::default()),
+            ..Default::default()
+        };
+        let backing_off = ContainerState {
+            waiting: Some(ContainerStateWaiting {
+                reason: Some("CrashLoopBackOff".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for status in [
+            self_check(terminated(1, OPEN), None),
+            self_check(running, Some(terminated(1, OPEN))),
+            self_check(backing_off, Some(terminated(1, OPEN))),
+        ] {
+            let why = self_check_failure(&status).expect("failing");
+            assert!(why.contains("isolation self-check failed"), "{why}");
+            assert!(why.contains("SCARAB_PROBE internet reached"), "{why}");
+        }
+    }
+
+    #[test]
+    fn a_self_check_still_running_or_passed_is_not_failing() {
+        let running = ContainerState {
+            running: Some(ContainerStateRunning::default()),
+            ..Default::default()
+        };
+        assert_eq!(self_check_failure(&self_check(running, None)), None);
+        // Passed on a retry: the earlier failure no longer holds the Plugin.
+        assert_eq!(
+            self_check_failure(&self_check(terminated(0, ""), Some(terminated(1, OPEN)))),
+            None
+        );
+        // Another init container's failure is not the self-check's verdict.
+        let mut other = self_check(terminated(1, OPEN), None);
+        other.name = "something-else".to_string();
+        assert_eq!(self_check_failure(&other), None);
+    }
 
     fn probe_pod_created_at(name: &str, created: Option<i64>) -> Pod {
         Pod {

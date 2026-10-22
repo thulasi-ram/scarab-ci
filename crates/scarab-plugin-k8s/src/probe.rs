@@ -24,12 +24,22 @@
 //! plugin-labelled Pod reach the canary, and fails here, loudly, rather than
 //! running Plugins unprotected.
 //!
-//! The probe proves one node at one moment. So every Plugin Pod also runs
-//! the plugin-side checks itself, as an initContainer ([`self_check_container`])
-//! before the Plugin starts — on its own node, at its own start — and
-//! retries them until they pass or a deadline ends it. Both run the SAME
-//! script ([`plugin_check_fns`]), so they cannot drift; the namespace probe
-//! remains the negative control the initContainer lacks (it has no canary).
+//! A CNI programs a NEW Pod's policy asynchronously (kindnet, seen: the
+//! plugin-labelled Pod reached DNS, the API server and the internet in its
+//! first second, and was blocked a few seconds later). So the plugin side
+//! does not judge one early pass: it repeats its checks until ONE pass has
+//! the broker reached and every forbidden destination unreached, or
+//! [`PROBE_ENFORCEMENT_DEADLINE_SECONDS`] pass — and then the last pass is
+//! the verdict. What it proves is "this cluster enforces the policy, within
+//! the deadline"; a CNI that never enforces still fails, at the deadline.
+//!
+//! The probe proves one node, once. So every Plugin Pod also runs the
+//! plugin-side checks itself, as an initContainer ([`self_check_container`])
+//! before the Plugin starts — on its own node, at its own start — so the
+//! window before enforcement lands is the self-check's, never the Plugin's.
+//! Both run the SAME loop ([`plugin_check_fns`]' `until_isolated`), so they
+//! cannot drift; the namespace probe remains the negative control the
+//! initContainer lacks (it has no canary).
 //!
 //! Each Pod prints `SCARAB_PROBE <check> <reached|unreached|unknown>` lines;
 //! the runtime reads their logs and [`assess`]es them. Pure: tested without a
@@ -82,10 +92,17 @@ pub const PROBE_POD_DEADLINE_SECONDS: i64 = 300;
 
 /// How long a Plugin Pod's self-check keeps retrying before it fails the
 /// Pod's start. Long enough for a CNI to program a new Pod; a Pod whose
-/// network stays open past it never runs its Plugin (the kubelet then
-/// restarts the check with backoff — CrashLoopBackOff, which the runtime
-/// reports as failing).
+/// network stays open past it never runs its Plugin. The runtime reports the
+/// workload failing from that first failed run (the kubelet then restarts
+/// the check, with backoff, and it may yet pass).
 pub const SELF_CHECK_DEADLINE_SECONDS: u32 = 120;
+
+/// How long the namespace probe's plugin-labelled Pod keeps repeating its
+/// checks for the CNI to enforce the policy on it. Shorter than the
+/// self-check's: the probe also runs the negative case (an open namespace)
+/// to this deadline, and both its Pods must finish within the runtime's
+/// wait for them (one more pass of up to ~35 s past the deadline included).
+pub const PROBE_ENFORCEMENT_DEADLINE_SECONDS: u32 = 60;
 
 /// The self-check initContainer's name, as `workload_state` looks for it.
 pub const SELF_CHECK_CONTAINER: &str = "isolation-self-check";
@@ -380,10 +397,18 @@ pub fn canary_pod(namespace: &str, nonce: &str, image: &str) -> Pod {
 ///   reached` / `Connection refused` / `unreachable` when nothing did.
 ///   Anything else is `unknown`, which never counts as a pass;
 /// - `broker_ok`: the broker's healthz says `ok` (`$BROKER_URL`);
-/// - `plugin_checks`: the plugin-side checks every Plugin Pod must pass —
-///   the broker reached; DNS, the API server, the internet and the metadata
-///   service not. An API server address the kubelet did not inject reports
-///   `unknown`: a check that could not run is a failure, not a pass.
+/// - `plugin_checks`: one pass of the plugin-side checks — the broker
+///   reached; DNS, the API server, the internet, the metadata service and,
+///   in the namespace probe (the only place `$CANARY_IP` is set), the
+///   canary not. An API server address the kubelet did not inject reports
+///   `unknown`: a check that could not run is a failure, not a pass;
+/// - `isolated <pass>`: was that pass as required — the broker `reached`,
+///   every forbidden check positively `unreached` (`unknown` is not);
+/// - `until_isolated <seconds>`: repeat `plugin_checks` until a pass is
+///   `isolated` (exit 0) or `<seconds>` are up (exit 1), and print the LAST
+///   pass — the verdict lines. Repeating, because a CNI programs a new
+///   Pod's policy some moments after the Pod starts; within one pass,
+///   because a pass is one consistent look at the Pod's network.
 pub fn plugin_check_fns() -> String {
     let (internet_host, internet_port) = PROBE_INTERNET_ADDR;
     let (metadata_host, metadata_port) = PROBE_METADATA_ADDR;
@@ -404,23 +429,45 @@ plugin_checks() {{
   if [ -z "$KUBERNETES_SERVICE_HOST" ]; then echo "SCARAB_PROBE apiserver unknown"; else reach apiserver "$KUBERNETES_SERVICE_HOST" "$KUBERNETES_SERVICE_PORT"; fi
   reach internet {internet_host} {internet_port}
   reach metadata {metadata_host} {metadata_port}
+  if [ -n "$CANARY_IP" ]; then reach canary "$CANARY_IP" {canary_port}; fi
+}}
+isolated() {{
+  case "$1" in *"SCARAB_PROBE broker reached"*) ;; *) return 1 ;; esac
+  for c in dns apiserver internet metadata ${{CANARY_IP:+canary}}; do
+    case "$1" in *"SCARAB_PROBE $c unreached"*) ;; *) return 1 ;; esac
+  done
+}}
+until_isolated() {{
+  until_deadline=$(( $(date +%s) + $1 ))
+  while :; do
+    out="$(plugin_checks)"
+    if isolated "$out"; then echo "$out"; return 0; fi
+    if [ "$(date +%s)" -ge "$until_deadline" ]; then echo "$out"; return 1; fi
+    sleep 3
+  done
 }}
 "#,
         dns_name = PROBE_DNS_NAME,
+        canary_port = PROBE_CANARY_PORT,
     )
 }
 
 /// The control Pod: retries the canary for a while — it may have only just
 /// become Ready, and a CNI may take a moment to program a new Pod — then
-/// checks that it gets a DNS answer (its policy allows DNS), proving the
-/// plugin side's "no answer" means something.
+/// retries until it gets a DNS answer (its policy allows DNS), proving the
+/// plugin side's "no answer" means something. Both are ALLOWED checks, so
+/// both retry until they succeed: a moment of a half-programmed Pod must not
+/// read as "the allowance does not work". (It has `CANARY_IP`, but never
+/// runs `plugin_checks`: its canary check is the ALLOWED one, above.)
 pub fn control_pod(namespace: &str, nonce: &str, image: &str, canary_ip: &str) -> Pod {
     let script = format!(
         r#"{fns}
 canary=unreached; i=0
 while [ $i -lt 15 ]; do if nc -z -w 3 "$CANARY_IP" {port} >/dev/null 2>&1; then canary=reached; break; fi; i=$((i+1)); sleep 2; done
 echo "SCARAB_PROBE canary $canary"
-resolves dns {dns_name}
+i=0
+while :; do dns="$(resolves dns {dns_name})"; if [ "$dns" = "SCARAB_PROBE dns reached" ] || [ $i -ge 4 ]; then break; fi; i=$((i+1)); sleep 2; done
+echo "$dns"
 "#,
         fns = plugin_check_fns(),
         port = PROBE_CANARY_PORT,
@@ -444,11 +491,13 @@ resolves dns {dns_name}
 /// `plugin-egress` selects it exactly as it selects a Plugin, but carrying
 /// no installation label (the reconcile loop never mistakes it for one).
 ///
-/// The broker check runs FIRST, with retries: it also absorbs the time a
-/// CNI takes to program a new Pod, so the forbidden checks after it run
-/// against the policy as enforced, not against a Pod the CNI has not caught
-/// up with. (If a CNI is still open then, the probe fails — the safe way.
-/// The unmeasured first moments of a REAL Plugin Pod are the self-check's.)
+/// It runs `until_isolated` — the self-check's own loop — with `$CANARY_IP`
+/// set, so the canary is one more forbidden check of every pass. A pass
+/// right after the Pod starts can run before the CNI has programmed it
+/// (everything reached); the loop waits that out, up to
+/// [`PROBE_ENFORCEMENT_DEADLINE_SECONDS`], and prints its last pass — which,
+/// on a CNI that never enforces, is the open one, and fails the probe.
+/// (The unmeasured first moments of a REAL Plugin Pod are the self-check's.)
 ///
 /// `broker_url` is the URL as a Pod dials it — the broker's IP, since a
 /// Plugin has no DNS.
@@ -461,15 +510,14 @@ pub fn plugin_probe_pod(
 ) -> Pod {
     let mut labels = probe_labels(nonce, PROBE_ROLE_PLUGIN);
     labels.insert(LABEL_PLUGIN_WORKLOAD.to_string(), "true".to_string());
+    // The exit status is not the verdict: the runtime [`assess`]es the
+    // printed pass, so a missing line fails closed as well.
     let script = format!(
         r#"{fns}
-i=0
-while [ $i -lt 15 ]; do if broker_ok; then break; fi; i=$((i+1)); sleep 2; done
-plugin_checks
-reach canary "$CANARY_IP" {canary_port}
+until_isolated {deadline}
 "#,
         fns = plugin_check_fns(),
-        canary_port = PROBE_CANARY_PORT,
+        deadline = PROBE_ENFORCEMENT_DEADLINE_SECONDS,
     );
     probe_pod(
         namespace,
@@ -488,30 +536,16 @@ reach canary "$CANARY_IP" {canary_port}
     )
 }
 
-/// The self-check script: [`plugin_check_fns`]' `plugin_checks`, repeated
-/// until every line is as required or [`SELF_CHECK_DEADLINE_SECONDS`] pass.
-/// Exit 0 lets the Plugin start; exit 1 keeps it from starting, with the
-/// last verdict lines as the termination message.
+/// The self-check script: [`plugin_check_fns`]' `until_isolated`, with
+/// [`SELF_CHECK_DEADLINE_SECONDS`]. Exit 0 lets the Plugin start; exit 1
+/// keeps it from starting, with the last pass's verdict lines as the
+/// termination message.
 pub fn self_check_script() -> String {
     format!(
         r#"{fns}
-passed() {{
-  case "$1" in *"SCARAB_PROBE broker reached"*) ;; *) return 1 ;; esac
-  for c in dns apiserver internet metadata; do
-    case "$1" in *"SCARAB_PROBE $c unreached"*) ;; *) return 1 ;; esac
-  done
-}}
-deadline=$(( $(date +%s) + {deadline} ))
-while :; do
-  out="$(plugin_checks)"
-  if passed "$out"; then echo "$out"; echo "isolation self-check passed"; exit 0; fi
-  if [ "$(date +%s)" -ge "$deadline" ]; then
-    echo "$out"
-    echo "isolation self-check FAILED: this Pod's network is not isolated as plugin-egress requires"
-    exit 1
-  fi
-  sleep 3
-done
+if until_isolated {deadline}; then echo "isolation self-check passed"; exit 0; fi
+echo "isolation self-check FAILED: this Pod's network is not isolated as plugin-egress requires"
+exit 1
 "#,
         fns = plugin_check_fns(),
         deadline = SELF_CHECK_DEADLINE_SECONDS,
@@ -519,9 +553,10 @@ done
 }
 
 /// The Plugin Pod's self-check initContainer (ADR-0072 §9): the namespace
-/// probe proves ONE node at ONE moment, after a settle delay; this proves
-/// the Plugin's own Pod, on its own node, before the Plugin runs. It gets
-/// the broker URL and nothing else — no config, no token.
+/// probe proves ONE node, once, for its own probe Pod; this proves the
+/// Plugin's own Pod, on its own node, before the Plugin runs. It gets the
+/// broker URL and nothing else — no config, no token (and no `CANARY_IP`,
+/// so it never checks a canary that is not there).
 pub fn self_check_container(image: &str, broker_url: &str) -> Container {
     let quantity = |q: &str| Quantity(q.to_string());
     Container {
@@ -690,9 +725,29 @@ mod tests {
             "reach internet 1.1.1.1 443",
             "reach metadata 169.254.169.254 80",
             "reach canary \"$CANARY_IP\" 8080",
+            // Every forbidden destination, the canary included where it is
+            // set, must be positively unreached in one pass.
+            "for c in dns apiserver internet metadata ${CANARY_IP:+canary}",
         ] {
             assert!(script.contains(needle), "{needle} missing from {script}");
         }
+        // The forbidden checks are repeated until enforced, not judged once:
+        // a CNI programs a new Pod's policy only after it starts.
+        assert!(
+            script.ends_with(&format!(
+                "\nuntil_isolated {PROBE_ENFORCEMENT_DEADLINE_SECONDS}\n"
+            )),
+            "{script}"
+        );
+        assert!(
+            plugin.spec.as_ref().unwrap().containers[0]
+                .env
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|e| e.name == "CANARY_IP"),
+            "the probe's plugin side checks the canary"
+        );
         // The control checks its allowed DNS with the very same function.
         let control = script_of(&control_pod("ns", "n1", "img", "10.0.0.9"));
         assert!(control.contains("resolves dns example.com."), "{control}");
@@ -713,13 +768,14 @@ mod tests {
         let script = init.command.clone().unwrap()[2].clone();
         assert!(probe.starts_with(&plugin_check_fns()));
         assert!(script.starts_with(&plugin_check_fns()));
-        assert!(script.contains("out=\"$(plugin_checks)\""));
-        assert!(script.contains(&format!("+ {SELF_CHECK_DEADLINE_SECONDS} ))")));
-        // Every forbidden destination must be positively unreached.
+        // The same loop, to the self-check's own deadline.
         assert!(
-            script.contains("for c in dns apiserver internet metadata"),
+            script.contains(&format!(
+                "if until_isolated {SELF_CHECK_DEADLINE_SECONDS}; then"
+            )),
             "{script}"
         );
+        assert!(script.trim_end().ends_with("exit 1"), "{script}");
         assert_eq!(init.name, SELF_CHECK_CONTAINER);
         assert_eq!(
             init.env.unwrap(),
