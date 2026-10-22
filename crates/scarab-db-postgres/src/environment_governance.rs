@@ -10,8 +10,10 @@ use sqlx::Row;
 
 use scarab_project::{
     DeployGovernance, EnvironmentDeploymentDeadline, EnvironmentGovernanceStore,
-    EnvironmentProjectEligibility, EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant,
-    EnvironmentProtectionRules, ImageGrant, OrgEnvironment, OrgEnvironmentError,
+    EnvironmentMigrationAcknowledgement, EnvironmentMigrationReport,
+    EnvironmentMigrationReportProject, EnvironmentProjectEligibility, EnvironmentProjectOverlay,
+    EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord, EnvironmentProtectionRules,
+    ImageGrant, OrgEnvironment, OrgEnvironmentError, ProtectionRules,
 };
 
 use crate::org_environments::{
@@ -145,6 +147,124 @@ async fn stored_environment(
     let sources = deployment_sources_of(&mut **tx, org, environment).await?;
     let patterns = eligible_project_patterns_of(&mut **tx, org, environment).await?;
     org_environment_from_row(row, sources, patterns)
+}
+
+/// The split report lines of `org` — all of them, or only `environment`'s —
+/// with each Project's legacy rules and current overlay, read inside `tx` so
+/// a line, the baseline and the overlays are one snapshot.
+async fn migration_report_lines(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    org: &str,
+    environment: Option<&str>,
+) -> Result<Vec<EnvironmentMigrationReport>, OrgEnvironmentError> {
+    let lines = sqlx::query(
+        "SELECT r.environment, r.merged_projects, r.referenced_only, r.referencing_projects,
+                r.created_at, r.acknowledged_at, r.acknowledged_by,
+                o.name IS NOT NULL AS environment_exists, o.approvers, o.allowed_refs,
+                o.wait_timer_s, o.require_reason, o.deployment_concurrency
+         FROM environment_migration_report r
+         LEFT JOIN org_environments o ON o.org = r.org AND o.name = r.environment
+         WHERE r.org = $1 AND ($2::text IS NULL OR r.environment = $2)
+         ORDER BY r.environment",
+    )
+    .bind(org)
+    .bind(environment)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(org_environment_store_err)?;
+    if lines.is_empty() {
+        return Ok(Vec::new());
+    }
+    // The org's legacy rows and overlays, once: a report has a handful of
+    // lines, and one query each beats a query per Project.
+    let mut legacy: std::collections::HashMap<(String, String), ProtectionRules> =
+        std::collections::HashMap::new();
+    for row in sqlx::query(
+        "SELECT name, project, protection FROM legacy_project_environments WHERE org = $1",
+    )
+    .bind(org)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(org_environment_store_err)?
+    {
+        let name: String = row.get("name");
+        let project: String = row.get("project");
+        // The rows were written through the typed ADR-0037 API, so every one
+        // deserialises (the golden corpus pins old shapes); one that does not
+        // is named rather than silently dropped from the comparison.
+        let rules: ProtectionRules =
+            serde_json::from_value(row.get::<serde_json::Value, _>("protection")).map_err(|e| {
+                OrgEnvironmentError::Store(format!(
+                    "legacy environment {org}/{project}/{name} is unreadable: {e}"
+                ))
+            })?;
+        legacy.insert((name, project), rules);
+    }
+    let mut overlays: std::collections::HashMap<(String, String), EnvironmentProjectOverlay> =
+        std::collections::HashMap::new();
+    for row in sqlx::query(&format!(
+        "SELECT {OVERLAY_COLUMNS} FROM environment_project_overlays WHERE org = $1"
+    ))
+    .bind(org)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(org_environment_store_err)?
+    {
+        let overlay = overlay_from_row(&row)?;
+        overlays.insert(
+            (overlay.environment.clone(), overlay.project.clone()),
+            overlay,
+        );
+    }
+
+    let mut report = Vec::with_capacity(lines.len());
+    for row in &lines {
+        let environment: String = row.get("environment");
+        let merged_projects: Vec<String> = row.get("merged_projects");
+        let referencing_projects: Vec<String> = row.get("referencing_projects");
+        let baseline = if row.get::<bool, _>("environment_exists") {
+            Some(protection_rules_from_row(row, &environment)?)
+        } else {
+            None
+        };
+        let acknowledged = match (
+            row.get::<Option<i64>, _>("acknowledged_at"),
+            row.get::<Option<String>, _>("acknowledged_by"),
+        ) {
+            (Some(at), Some(by)) => Some(EnvironmentMigrationAcknowledgement { at, by }),
+            _ => None,
+        };
+        let mut names: Vec<String> = merged_projects
+            .iter()
+            .chain(&referencing_projects)
+            .cloned()
+            .collect();
+        names.sort();
+        names.dedup();
+        let projects = names
+            .into_iter()
+            .map(|project| {
+                let key = (environment.clone(), project.clone());
+                EnvironmentMigrationReportProject {
+                    legacy: legacy.get(&key).cloned(),
+                    overlay: overlays.get(&key).cloned(),
+                    project,
+                }
+            })
+            .collect();
+        report.push(EnvironmentMigrationReport {
+            org: org.to_string(),
+            environment,
+            merged_projects,
+            referenced_only: row.get("referenced_only"),
+            referencing_projects,
+            created_at: row.get("created_at"),
+            acknowledged,
+            baseline,
+            projects,
+        });
+    }
+    Ok(report)
 }
 
 #[async_trait]
@@ -463,5 +583,99 @@ impl EnvironmentGovernanceStore for PostgresDb {
         .map_err(org_environment_store_err)?
         .rows_affected();
         Ok(deleted > 0)
+    }
+    async fn environment_projects(
+        &self,
+        org: &str,
+        environment: &str,
+    ) -> Result<Vec<EnvironmentProjectRecord>, OrgEnvironmentError> {
+        let mut tx = snapshot(self).await?;
+        let Some(row) = sqlx::query(&format!(
+            "SELECT {ORG_ENVIRONMENT_COLUMNS} FROM org_environments WHERE org = $1 AND name = $2"
+        ))
+        .bind(org)
+        .bind(environment)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(org_environment_store_err)?
+        else {
+            return Err(not_found(org, environment));
+        };
+        let env = stored_environment(&mut tx, &row, org, environment).await?;
+        let overlays = sqlx::query(&format!(
+            "SELECT {OVERLAY_COLUMNS} FROM environment_project_overlays
+             WHERE org = $1 AND environment = $2"
+        ))
+        .bind(org)
+        .bind(environment)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(org_environment_store_err)?
+        .iter()
+        .map(overlay_from_row)
+        .collect::<Result<Vec<_>, _>>()?;
+        let grants = sqlx::query(&format!(
+            "SELECT {GRANT_COLUMNS} FROM environment_project_privilege_grants
+             WHERE org = $1 AND environment = $2"
+        ))
+        .bind(org)
+        .bind(environment)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(org_environment_store_err)?
+        .iter()
+        .map(grant_from_row)
+        .collect::<Result<Vec<_>, _>>()?;
+        tx.commit().await.map_err(org_environment_store_err)?;
+        Ok(EnvironmentProjectRecord::collect(&env, overlays, grants))
+    }
+
+    async fn environment_migration_report(
+        &self,
+        org: &str,
+    ) -> Result<Vec<EnvironmentMigrationReport>, OrgEnvironmentError> {
+        let mut tx = snapshot(self).await?;
+        let report = migration_report_lines(&mut tx, org, None).await?;
+        tx.commit().await.map_err(org_environment_store_err)?;
+        Ok(report)
+    }
+
+    async fn acknowledge_environment_migration_report(
+        &self,
+        org: &str,
+        environment: &str,
+        acknowledged_by: &str,
+        acknowledged_at: i64,
+    ) -> Result<Option<EnvironmentMigrationReport>, OrgEnvironmentError> {
+        let mut tx = self
+            .pool()
+            .begin()
+            .await
+            .map_err(org_environment_store_err)?;
+        // COALESCE keeps the first acknowledgement: the record answers "who
+        // first looked at this", which a repeat click must not overwrite.
+        let updated = sqlx::query(
+            "UPDATE environment_migration_report SET
+                 acknowledged_at = COALESCE(acknowledged_at, $3),
+                 acknowledged_by = COALESCE(acknowledged_by, $4)
+             WHERE org = $1 AND environment = $2",
+        )
+        .bind(org)
+        .bind(environment)
+        .bind(acknowledged_at)
+        .bind(acknowledged_by)
+        .execute(&mut *tx)
+        .await
+        .map_err(org_environment_store_err)?
+        .rows_affected();
+        if updated == 0 {
+            return Ok(None);
+        }
+        let line = migration_report_lines(&mut tx, org, Some(environment))
+            .await?
+            .into_iter()
+            .next();
+        tx.commit().await.map_err(org_environment_store_err)?;
+        Ok(line)
     }
 }

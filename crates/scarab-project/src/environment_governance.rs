@@ -18,13 +18,12 @@
 
 use std::num::NonZeroU32;
 
-#[cfg(doc)]
-use crate::ProtectionRules;
 use async_trait::async_trait;
 
 use crate::{
     admit_grants_against_whitelist, glob_match, AdmittedGrants, Environment,
     EnvironmentDeploymentDeadline, GrantRequest, ImageGrant, OrgEnvironment, OrgEnvironmentError,
+    ProtectionRules,
 };
 
 /// The protection rules an Environment's admin sets as its **baseline**, and
@@ -468,6 +467,196 @@ impl DeployGovernance {
     }
 }
 
+/// One Project's standing within one Environment, as the Environment's admin
+/// reviews it: whether it is eligible, and the overlay and privilege grant
+/// it holds there, if any (ADR-0071 §2, §3, §8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvironmentProjectRecord {
+    pub project: String,
+    /// Whether the Environment's eligibility admits the Project now. A
+    /// Project made ineligible keeps its overlay and grant, so `false`
+    /// appears here.
+    pub eligible: bool,
+    pub overlay: Option<EnvironmentProjectOverlay>,
+    pub privilege_grant: Option<EnvironmentProjectPrivilegeGrant>,
+}
+
+impl EnvironmentProjectRecord {
+    /// One record per Project holding an overlay or a grant in
+    /// `environment`, by Project name, eligibility decided by the
+    /// Environment's own matcher — so every store answers the same way.
+    pub fn collect(
+        environment: &OrgEnvironment,
+        overlays: impl IntoIterator<Item = EnvironmentProjectOverlay>,
+        grants: impl IntoIterator<Item = EnvironmentProjectPrivilegeGrant>,
+    ) -> Vec<Self> {
+        let mut records: std::collections::BTreeMap<String, Self> =
+            std::collections::BTreeMap::new();
+        fn record<'a>(
+            records: &'a mut std::collections::BTreeMap<String, EnvironmentProjectRecord>,
+            environment: &OrgEnvironment,
+            project: &str,
+        ) -> &'a mut EnvironmentProjectRecord {
+            records
+                .entry(project.to_string())
+                .or_insert_with(|| EnvironmentProjectRecord {
+                    project: project.to_string(),
+                    eligible: environment.eligibility.admits(project),
+                    overlay: None,
+                    privilege_grant: None,
+                })
+        }
+        for overlay in overlays {
+            let project = overlay.project.clone();
+            record(&mut records, environment, &project).overlay = Some(overlay);
+        }
+        for grant in grants {
+            let project = grant.project.clone();
+            record(&mut records, environment, &project).privilege_grant = Some(grant);
+        }
+        records.into_values().collect()
+    }
+}
+
+/// Who acknowledged a migration report line, and when (unix-ms). The first
+/// acknowledgement stands: a second one changes nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvironmentMigrationAcknowledgement {
+    pub at: i64,
+    pub by: String,
+}
+
+/// One Project's part in a [`EnvironmentMigrationReport`] line: the legacy
+/// per-Project rules it had under ADR-0037 (`None` for a Project whose Runs
+/// only *named* the Environment) beside the overlay it holds **now** — which
+/// may have been tightened or removed since the migration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvironmentMigrationReportProject {
+    pub project: String,
+    pub legacy: Option<ProtectionRules>,
+    pub overlay: Option<EnvironmentProjectOverlay>,
+}
+
+/// A legacy rule the merged Projects did not agree on. Named after the
+/// ADR-0037 field, because that is what the admin is comparing.
+/// `concurrency` is absent on purpose: it was never carried (ADR-0071 §10
+/// step 3), so a difference in it changes nothing about the merge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LegacyRuleField {
+    Approvers,
+    AllowedRefs,
+    WaitTimer,
+    RequireReason,
+    PrivilegedImages,
+    PermitK8sOverlay,
+}
+
+impl LegacyRuleField {
+    /// The field's wire name, as the legacy rules were written.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Approvers => "approvers",
+            Self::AllowedRefs => "allowed_refs",
+            Self::WaitTimer => "wait_timer",
+            Self::RequireReason => "require_reason",
+            Self::PrivilegedImages => "privileged_images",
+            Self::PermitK8sOverlay => "permit_k8s_overlay",
+        }
+    }
+}
+
+/// One line of the ADR-0071 §10 step 8 **split report**: an Environment name
+/// the migration merged across several Projects, or created with eligibility
+/// *all projects* because no Project defined it. The one place the migration
+/// asks an admin to think — "is this `prod` really one place?" — so it carries
+/// what that question needs: each Project's old rules beside its overlay now,
+/// which rules disagreed, and the Environment's current baseline.
+///
+/// Splitting a name is a YAML change in the Projects that should deploy
+/// elsewhere (owner default 8): the report says so; it never renames anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvironmentMigrationReport {
+    pub org: String,
+    pub environment: String,
+    /// Projects whose per-Project environments of this name were merged.
+    pub merged_projects: Vec<String>,
+    /// No Project defined the name; it was migrated with eligibility *all
+    /// projects* (ADR-0071 §10 step 6).
+    pub referenced_only: bool,
+    /// Projects whose Runs named it without defining it.
+    pub referencing_projects: Vec<String>,
+    /// Unix-ms, when the migration wrote the line.
+    pub created_at: i64,
+    pub acknowledged: Option<EnvironmentMigrationAcknowledgement>,
+    /// The Environment's baseline **now**; `None` once the Environment was
+    /// deleted (the report outlives it).
+    pub baseline: Option<EnvironmentProtectionRules>,
+    /// Every merged and every referencing Project, by name.
+    pub projects: Vec<EnvironmentMigrationReportProject>,
+}
+
+impl EnvironmentMigrationReport {
+    /// The legacy rules the merged Projects disagreed on, in field order —
+    /// what made "one `prod`" possibly several places. Lists compare as
+    /// **sets** (`[main, tags/*]` and `[tags/*, main]` decided identically),
+    /// and so does the privilege whitelist. Empty when at most one Project
+    /// had legacy rules.
+    pub fn differing_legacy_rules(&self) -> Vec<LegacyRuleField> {
+        fn set(v: &[String]) -> std::collections::BTreeSet<&str> {
+            v.iter().map(String::as_str).collect()
+        }
+        fn whitelist(v: &[ImageGrant]) -> std::collections::BTreeSet<(&str, bool, Vec<&str>)> {
+            v.iter()
+                .map(|g| {
+                    let mut caps: Vec<&str> = g.capabilities.iter().map(String::as_str).collect();
+                    caps.sort_unstable();
+                    caps.dedup();
+                    (g.image_digest.as_str(), g.privileged, caps)
+                })
+                .collect()
+        }
+        let legacy: Vec<&ProtectionRules> = self
+            .projects
+            .iter()
+            .filter_map(|p| p.legacy.as_ref())
+            .collect();
+        let Some((first, rest)) = legacy.split_first() else {
+            return Vec::new();
+        };
+        let differs = |same: &dyn Fn(&ProtectionRules) -> bool| rest.iter().any(|r| !same(r));
+        let mut fields = Vec::new();
+        if differs(&|r| set(&r.approvers) == set(&first.approvers)) {
+            fields.push(LegacyRuleField::Approvers);
+        }
+        if differs(&|r| set(&r.allowed_refs) == set(&first.allowed_refs)) {
+            fields.push(LegacyRuleField::AllowedRefs);
+        }
+        if differs(&|r| r.wait_timer == first.wait_timer) {
+            fields.push(LegacyRuleField::WaitTimer);
+        }
+        if differs(&|r| r.require_reason == first.require_reason) {
+            fields.push(LegacyRuleField::RequireReason);
+        }
+        if differs(&|r| whitelist(&r.privileged_images) == whitelist(&first.privileged_images)) {
+            fields.push(LegacyRuleField::PrivilegedImages);
+        }
+        if differs(&|r| r.permit_k8s_overlay == first.permit_k8s_overlay) {
+            fields.push(LegacyRuleField::PermitK8sOverlay);
+        }
+        fields
+    }
+
+    /// The Environment still has the **permissive** baseline the migration
+    /// gave it (owner default 7): every Project's rules are its own overlay
+    /// alone, so nothing org-wide protects the place yet. `false` once the
+    /// Environment is gone.
+    pub fn permissive_baseline(&self) -> bool {
+        self.baseline
+            .as_ref()
+            .is_some_and(|b| *b == EnvironmentProtectionRules::default())
+    }
+}
+
 /// Durable store for the governance half of org-level Environments (ADR-0071
 /// §2, §3, §8): baseline protection, eligibility, per-Project overlays and
 /// privilege grants. The Environment itself (name, description, deadline,
@@ -556,6 +745,35 @@ pub trait EnvironmentGovernanceStore: Send + Sync {
         environment: &str,
         project: &str,
     ) -> Result<bool, OrgEnvironmentError>;
+
+    /// Every Project holding an overlay or a privilege grant in
+    /// `environment`, by Project name, with its eligibility now — what the
+    /// Environment's admin reviews (and why a delete is refused).
+    /// [`OrgEnvironmentError::NotFound`] if there is no such Environment.
+    async fn environment_projects(
+        &self,
+        org: &str,
+        environment: &str,
+    ) -> Result<Vec<EnvironmentProjectRecord>, OrgEnvironmentError>;
+
+    /// The org's split report (ADR-0071 §10 step 8), by Environment name,
+    /// acknowledged lines included. Empty for an org the migration had
+    /// nothing to report on.
+    async fn environment_migration_report(
+        &self,
+        org: &str,
+    ) -> Result<Vec<EnvironmentMigrationReport>, OrgEnvironmentError>;
+
+    /// Mark one report line reviewed. The first acknowledgement stands, so
+    /// a repeat is a no-op that still answers the line. `None` if the
+    /// migration wrote no line for that name.
+    async fn acknowledge_environment_migration_report(
+        &self,
+        org: &str,
+        environment: &str,
+        acknowledged_by: &str,
+        acknowledged_at: i64,
+    ) -> Result<Option<EnvironmentMigrationReport>, OrgEnvironmentError>;
 }
 
 #[cfg(test)]
@@ -1241,5 +1459,124 @@ mod tests {
             prop_assert!(!e.admits_protection_ref(Some(&r)));
             prop_assert!(e.admits(&r, &approvals).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod migration_report_tests {
+    use super::*;
+    use scarab_secrets::SecretScope;
+
+    fn legacy(approvers: &[&str], allowed_refs: &[&str]) -> ProtectionRules {
+        ProtectionRules {
+            approvers: approvers.iter().map(|s| s.to_string()).collect(),
+            wait_timer: 0,
+            allowed_refs: allowed_refs.iter().map(|s| s.to_string()).collect(),
+            concurrency: 1,
+            secret_scope: SecretScope::Org { org: "acme".into() },
+            oidc_subject: String::new(),
+            privileged_images: Vec::new(),
+            permit_k8s_overlay: false,
+            require_reason: false,
+        }
+    }
+
+    fn report(projects: Vec<(&str, Option<ProtectionRules>)>) -> EnvironmentMigrationReport {
+        EnvironmentMigrationReport {
+            org: "acme".into(),
+            environment: "prod".into(),
+            merged_projects: projects
+                .iter()
+                .filter(|(_, l)| l.is_some())
+                .map(|(p, _)| p.to_string())
+                .collect(),
+            referenced_only: false,
+            referencing_projects: Vec::new(),
+            created_at: 0,
+            acknowledged: None,
+            baseline: Some(EnvironmentProtectionRules::default()),
+            projects: projects
+                .into_iter()
+                .map(|(p, legacy)| EnvironmentMigrationReportProject {
+                    project: p.into(),
+                    legacy,
+                    overlay: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn identical_rules_in_another_order_do_not_differ() {
+        let r = report(vec![
+            (
+                "web",
+                Some(legacy(
+                    &["alice", "bob"],
+                    &["refs/heads/main", "refs/tags/*"],
+                )),
+            ),
+            (
+                "api",
+                Some(legacy(
+                    &["bob", "alice"],
+                    &["refs/tags/*", "refs/heads/main"],
+                )),
+            ),
+        ]);
+        assert!(r.differing_legacy_rules().is_empty());
+    }
+
+    #[test]
+    fn every_disagreeing_field_is_named_and_concurrency_never_is() {
+        let mut api = legacy(&["carol"], &["refs/heads/main"]);
+        api.wait_timer = 60;
+        api.require_reason = true;
+        api.concurrency = 7;
+        api.permit_k8s_overlay = true;
+        api.privileged_images = vec![ImageGrant {
+            image_digest: "sha256:aa".into(),
+            privileged: true,
+            capabilities: Vec::new(),
+        }];
+        let r = report(vec![
+            ("web", Some(legacy(&["alice"], &[]))),
+            ("api", Some(api)),
+            // A Project that only referenced the name has no rules to compare.
+            ("docs", None),
+        ]);
+        assert_eq!(
+            r.differing_legacy_rules(),
+            vec![
+                LegacyRuleField::Approvers,
+                LegacyRuleField::AllowedRefs,
+                LegacyRuleField::WaitTimer,
+                LegacyRuleField::RequireReason,
+                LegacyRuleField::PrivilegedImages,
+                LegacyRuleField::PermitK8sOverlay,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_referenced_only_name_has_nothing_to_compare() {
+        let r = report(vec![("web", None), ("api", None)]);
+        assert!(r.differing_legacy_rules().is_empty());
+    }
+
+    #[test]
+    fn permissive_baseline_is_the_default_rules_on_a_live_environment() {
+        let mut r = report(vec![]);
+        assert!(r.permissive_baseline());
+        r.baseline = Some(EnvironmentProtectionRules {
+            require_reason: true,
+            ..Default::default()
+        });
+        assert!(!r.permissive_baseline());
+        r.baseline = None;
+        assert!(
+            !r.permissive_baseline(),
+            "a deleted Environment has no baseline"
+        );
     }
 }

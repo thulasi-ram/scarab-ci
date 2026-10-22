@@ -16,19 +16,32 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use scarab_project::{
     migrate_legacy_environment, DeployGovernance, Environment, EnvironmentDeploymentDeadline,
-    EnvironmentGovernanceStore, EnvironmentProjectEligibility, EnvironmentProjectOverlay,
-    EnvironmentProjectPrivilegeGrant, EnvironmentProtectionRules, OrgEnvironment,
-    OrgEnvironmentError,
+    EnvironmentGovernanceStore, EnvironmentMigrationAcknowledgement, EnvironmentMigrationReport,
+    EnvironmentMigrationReportProject, EnvironmentProjectEligibility, EnvironmentProjectOverlay,
+    EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord, EnvironmentProtectionRules,
+    OrgEnvironment, OrgEnvironmentError, ProtectionRules,
 };
 
 type EnvironmentKey = (String, String);
 type ProjectKey = (String, String, String);
+
+/// A split report line as migration 0057 stores it: only what the
+/// migration knew. Everything else on [`EnvironmentMigrationReport`] is read
+/// live, as the Postgres store reads it.
+struct ReportLine {
+    referenced_only: bool,
+    referencing_projects: Vec<String>,
+    acknowledged: Option<EnvironmentMigrationAcknowledgement>,
+}
 
 #[derive(Default)]
 struct State {
     environments: BTreeMap<EnvironmentKey, OrgEnvironment>,
     overlays: BTreeMap<ProjectKey, EnvironmentProjectOverlay>,
     grants: BTreeMap<ProjectKey, EnvironmentProjectPrivilegeGrant>,
+    /// The frozen legacy rows, keyed (org, environment, project).
+    legacy: BTreeMap<ProjectKey, ProtectionRules>,
+    reports: BTreeMap<EnvironmentKey, ReportLine>,
 }
 
 /// An in-memory [`EnvironmentGovernanceStore`]. Reads are one lock, so
@@ -122,6 +135,7 @@ impl InMemoryEnvironmentGovernance {
             }
             let (overlay, grant) = migrate_legacy_environment(org, project, legacy);
             let key = (org.to_string(), legacy.name.clone(), project.to_string());
+            state.legacy.insert(key.clone(), legacy.protection.clone());
             state.overlays.insert(key.clone(), overlay);
             match grant {
                 Some(grant) => {
@@ -133,6 +147,74 @@ impl InMemoryEnvironmentGovernance {
             }
         }
         self
+    }
+
+    /// Seed the split report line migration 0057 writes for `name` (ADR-0071
+    /// §10 step 8). The merged Projects are the ones seeded through
+    /// [`with_migrated_legacy_environment`](Self::with_migrated_legacy_environment)
+    /// for `name`, as the migration derives them from the legacy rows.
+    pub fn with_migration_report(
+        self,
+        org: &str,
+        name: &str,
+        referenced_only: bool,
+        referencing_projects: &[&str],
+    ) -> Self {
+        self.state.lock().unwrap().reports.insert(
+            (org.to_string(), name.to_string()),
+            ReportLine {
+                referenced_only,
+                referencing_projects: referencing_projects.iter().map(|p| p.to_string()).collect(),
+                acknowledged: None,
+            },
+        );
+        self
+    }
+
+    fn report(
+        state: &State,
+        org: &str,
+        name: &str,
+        line: &ReportLine,
+    ) -> EnvironmentMigrationReport {
+        let merged_projects: Vec<String> = state
+            .legacy
+            .keys()
+            .filter(|(o, e, _)| o == org && e == name)
+            .map(|(_, _, p)| p.clone())
+            .collect();
+        let mut names: Vec<String> = merged_projects
+            .iter()
+            .chain(&line.referencing_projects)
+            .cloned()
+            .collect();
+        names.sort();
+        names.dedup();
+        let projects = names
+            .into_iter()
+            .map(|project| {
+                let key = (org.to_string(), name.to_string(), project.clone());
+                EnvironmentMigrationReportProject {
+                    legacy: state.legacy.get(&key).cloned(),
+                    overlay: state.overlays.get(&key).cloned(),
+                    project,
+                }
+            })
+            .collect();
+        EnvironmentMigrationReport {
+            org: org.to_string(),
+            environment: name.to_string(),
+            merged_projects,
+            referenced_only: line.referenced_only,
+            referencing_projects: line.referencing_projects.clone(),
+            created_at: 0,
+            acknowledged: line.acknowledged.clone(),
+            baseline: state
+                .environments
+                .get(&(org.to_string(), name.to_string()))
+                .map(|e| e.protection.clone()),
+            projects,
+        }
     }
 
     /// Remove an Environment outright (overlays and grants included) — the
@@ -320,5 +402,66 @@ impl EnvironmentGovernanceStore for InMemoryEnvironmentGovernance {
                 project.to_string(),
             ))
             .is_some())
+    }
+
+    async fn environment_projects(
+        &self,
+        org: &str,
+        environment: &str,
+    ) -> Result<Vec<EnvironmentProjectRecord>, OrgEnvironmentError> {
+        let state = self.state.lock().unwrap();
+        let env = state
+            .environments
+            .get(&(org.to_string(), environment.to_string()))
+            .ok_or_else(|| not_found(org, environment))?;
+        let in_env = |(o, e, _): &ProjectKey| o == org && e == environment;
+        Ok(EnvironmentProjectRecord::collect(
+            env,
+            state
+                .overlays
+                .iter()
+                .filter(|(k, _)| in_env(k))
+                .map(|(_, o)| o.clone()),
+            state
+                .grants
+                .iter()
+                .filter(|(k, _)| in_env(k))
+                .map(|(_, g)| g.clone()),
+        ))
+    }
+
+    async fn environment_migration_report(
+        &self,
+        org: &str,
+    ) -> Result<Vec<EnvironmentMigrationReport>, OrgEnvironmentError> {
+        let state = self.state.lock().unwrap();
+        Ok(state
+            .reports
+            .iter()
+            .filter(|((o, _), _)| o == org)
+            .map(|((o, name), line)| Self::report(&state, o, name, line))
+            .collect())
+    }
+
+    async fn acknowledge_environment_migration_report(
+        &self,
+        org: &str,
+        environment: &str,
+        acknowledged_by: &str,
+        acknowledged_at: i64,
+    ) -> Result<Option<EnvironmentMigrationReport>, OrgEnvironmentError> {
+        let mut state = self.state.lock().unwrap();
+        let key = (org.to_string(), environment.to_string());
+        let Some(line) = state.reports.get_mut(&key) else {
+            return Ok(None);
+        };
+        // The first acknowledgement stands, as in Postgres.
+        line.acknowledged
+            .get_or_insert_with(|| EnvironmentMigrationAcknowledgement {
+                at: acknowledged_at,
+                by: acknowledged_by.to_string(),
+            });
+        let line = &state.reports[&key];
+        Ok(Some(Self::report(&state, org, environment, line)))
     }
 }
