@@ -15,12 +15,11 @@
 #     crate simply cannot be named inside a pure crate's manifest.
 [workspace]
 resolver = "2"
+# `crates/scarab-plugin-argocd` (ADR-0072) is a member like any other, but it
+# names NO `scarab-*` crate outside `[dev-dependencies]`: it is the first-party
+# reporter and proves the third-party plugin contract is reachable over HTTP
+# alone.
 members = ["crates/*"]
-# ADR-0072: the first-party Argo CD plugin's manifest lands before its crate —
-# the server compiles the catalog entry in (`include_str!`) — so the directory
-# exists without a `Cargo.toml` and the `crates/*` glob would refuse to load it.
-# Drop this line when the reporter crate itself arrives.
-exclude = ["crates/scarab-plugin-argocd"]
 
 [workspace.package]
 edition = "2021"

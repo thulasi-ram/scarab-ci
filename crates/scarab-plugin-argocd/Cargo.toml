@@ -1,0 +1,65 @@
+[package]
+name = "scarab-plugin-argocd"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+# The first-party Argo CD reporter (ADR-0070 §4/§11, ADR-0072 §5/§11): a Plugin
+# that watches Argo CD through the CredentialBroker's read proxy and pushes
+# DeploymentStatusReports to the broker.
+#
+# It deliberately depends on NO `scarab-*` crate outside `[dev-dependencies]`.
+# Everything it knows about Scarab is the broker's HTTP contract, spelled out
+# again here in its own types — so it is the proof that a third-party reporter
+# can be written from the published contract alone, and a broker change that
+# breaks the contract breaks this crate's contract test, not a hidden shared
+# type.
+#
+# `manifest.json` is compiled into the server's first-party catalog
+# (`include_str!`); it is the authority on what this reporter may read.
+
+[lib]
+name = "scarab_plugin_argocd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "scarab-plugin-argocd"
+path = "src/main.rs"
+
+# A fake Argo CD API server for local verification (`just plugin-verify`) and
+# the `fake` image target. Never part of the reporter image.
+[[bin]]
+name = "fake-argocd"
+path = "src/bin/fake-argocd/main.rs"
+required-features = ["fake"]
+
+[features]
+fake = ["dep:axum", "dep:futures"]
+
+[dependencies]
+tokio = { workspace = true, features = ["signal"] }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+# The one backend beside the `tracing` facade: a binary has to install a
+# subscriber or its logs go nowhere. Kept to the fmt/env-filter/json layer the
+# server uses, so plugin and server logs read alike.
+tracing-subscriber = { workspace = true }
+# `fake` only.
+axum = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The contract test (tests/contract.rs) runs this reporter against the REAL
+# broker router over Postgres, with the fake Argo CD in process. Test-only:
+# none of these is linked into the reporter binary.
+scarab-server = { path = "../scarab-server" }
+scarab-db-postgres = { workspace = true }
+scarab-plugin = { workspace = true }
+scarab-testkit = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+futures = { workspace = true }
+sqlx = { workspace = true }
+tower = { workspace = true, features = ["util"] }
