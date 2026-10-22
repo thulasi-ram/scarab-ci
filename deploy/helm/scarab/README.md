@@ -380,7 +380,7 @@ DNS, which must be the usual `kube-system` Pods labelled `k8s-app=kube-dns`.
 | `plugins.enabled` | `false` | the ADR-0072 plugin runtime + CredentialBroker (above) |
 | `plugins.namespace` / `.createNamespace` | `scarab-plugins` / `true` | the shared plugin namespace; must enforce Pod Security `restricted` |
 | `plugins.brokerPort` | `8090` | the broker listener and its ClusterIP Service port |
-| `plugins.probeImage` | `""` = `busybox:1.36` | the isolation probe's image; digest-pin in production |
+| `plugins.probeImage` | `""` = `busybox:1.36.1@sha256:73aa…` | the isolation probe's and the per-Pod self-check's image; digest-pin an override |
 | `ingress.enabled` | `false` | expose the HTTP API |
 
 See `values.yaml` for the full surface. Every value maps to a `SCARAB_*` env var

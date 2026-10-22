@@ -53,9 +53,13 @@ use crate::{LABEL_MANAGED_BY, LABEL_PLUGIN_WORKLOAD, MANAGED_BY};
 
 /// The default probe image (`SCARAB_PLUGIN_PROBE_IMAGE` overrides it): its
 /// `httpd`, `nc -z`, `wget`, `nslookup` and `timeout` are all the probe and
-/// the self-check use. The same image the proc-mode stack already pulls for
-/// its own discovery Pod.
-pub const DEFAULT_PROBE_IMAGE: &str = "busybox:1.36";
+/// the self-check use. Pinned by digest — the multi-arch index of
+/// `busybox:1.36.1` — because the probe's verdict is only as good as the
+/// image printing it: a tag a privileged step on the same node could retag
+/// in containerd would let a forged image print "passed", and the
+/// self-check runs this image in every Plugin Pod.
+pub const DEFAULT_PROBE_IMAGE: &str =
+    "busybox:1.36.1@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662";
 
 /// The address the internet check dials.
 pub const PROBE_INTERNET_ADDR: (&str, u16) = ("1.1.1.1", 443);
