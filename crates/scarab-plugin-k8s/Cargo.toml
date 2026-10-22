@@ -23,6 +23,8 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # A per-probe nonce, so a probe's Pods never collide with a crashed one's.
 uuid = { workspace = true }
+# The local JWT precheck in front of TokenReview (shape, aud, exp).
+base64 = { workspace = true }
 
 [dev-dependencies]
 # The live tier (tests/cluster.rs) always cleans its namespaces up, even when
