@@ -3,39 +3,51 @@
 //!
 //! For each request a Plugin sends, the broker
 //!
-//! 1. checks it against the manifest's **read rules**
+//! 1. takes one of the installation's [`PROXY_CONCURRENCY_PER_INSTALLATION`]
+//!    permits — in authentication, before any store or secret read, so a
+//!    flood is turned away (429) without touching either;
+//! 2. checks it against the manifest's **read rules**
 //!    ([`scarab_plugin::match_read_request`]: decoded before matching, `*` =
-//!    one segment, traversal and encoded separators refused);
-//! 2. adds the credential — `Authorization: Bearer <secret>` — after
-//!    dropping the Plugin's own `Authorization` (its ServiceAccount token),
-//!    which therefore never leaves the cluster;
-//! 3. forwards it to the PluginConnection's admin-bound `base_url`; and
-//! 4. journals it, off the request path.
+//!    one segment, traversal and encoded separators refused, and only the
+//!    query keys the matched rule lists, each once);
+//! 3. reserves a slot in the journal queue — full, it refuses (503): it
+//!    never forwards what it cannot journal;
+//! 4. adds the credential — `Authorization: Bearer <secret>` — to an
+//!    **allowlist** of the Plugin's headers ([`REQUEST_HEADERS`]); the
+//!    Plugin's own `Authorization` (its ServiceAccount token) is not on it,
+//!    so it never leaves the cluster;
+//! 5. forwards the matched path and query, re-encoded canonically, to the
+//!    PluginConnection's admin-bound `base_url`; and
+//! 6. journals it, off the request path: a `head` row through the reserved
+//!    slot when the response head arrives, an `end` row when the body ends.
 //!
 //! **The destination is always the admin-bound `base_url`.** The upstream
-//! URL is built from the binding and the matched, re-encoded path only —
-//! never from the request's authority, its `Host` header or anything else a
-//! Plugin sends — so a Plugin cannot aim the credential at a host of its
-//! choosing. That is the core property of brokered mode (ADR-0072 §6).
+//! URL is built from the binding and the matched, re-encoded path and query
+//! only — never from the request's authority, its `Host` header or anything
+//! else a Plugin sends — so a Plugin cannot aim the credential at a host of
+//! its choosing. That is the core property of brokered mode (ADR-0072 §6).
 //!
 //! The rest follows from the Plugin being an untrusted caller:
 //!
+//! - **headers are allowlisted both ways**: a Plugin cannot steer the
+//!   upstream's method, path or identity with a header the upstream honours
+//!   (`X-HTTP-Method-Override`, `X-Original-URL`, grpc-gateway's
+//!   `Grpc-Metadata-Token`, Kubernetes' `Impersonate-User`), and gets back
+//!   only [`RESPONSE_HEADERS`] — never a session or anything carrying the
+//!   credential;
 //! - **no request body** (a read carries none) and **no redirects** — a 3xx
 //!   is handed back, never followed, so an upstream cannot bounce the
 //!   credential elsewhere;
-//! - **hop-by-hop headers** are dropped both ways, and so are credentials
-//!   the admin did not bind (`Cookie`, `Proxy-Authorization`);
 //! - a custom CA is the **only** trust anchor for its connection, and there
 //!   is no skip-verify;
 //! - responses **stream**, and every stream re-checks the kill switch (and
 //!   its binding) every [`KILL_RECHECK_INTERVAL`]: a kill, an uninstall, a
 //!   re-bind or an unbind cuts a stream already open within that interval,
-//!   not when it happens to end;
-//! - at most [`PROXY_CONCURRENCY_PER_INSTALLATION`] requests per
-//!   installation are in flight in this process (429 beyond), on top of the
-//!   broker's own small pool (judge-d1 P3).
+//!   not when it happens to end — and a cut stream always ends in an error,
+//!   never a clean end the Plugin could take for the whole response.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -50,8 +62,9 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 
 use scarab_plugin::{
-    match_read_request, rule_label, BrokerJournalEntry, InstallationState, PluginCapability,
-    PluginConnection, PluginStore, ReadRequestRefusal,
+    match_read_request, rule_label, BrokerJournalEntry, BrokerJournalPhase, ConnectionSlot,
+    InstallationState, PluginCapability, PluginConnection, PluginStore, ReadRequestMatch,
+    ReadRequestRefusal,
 };
 
 use super::AppState;
@@ -61,25 +74,61 @@ use crate::plugins::{plugin_connection_secret_scope, PLUGIN_CONNECTION_CREDENTIA
 /// How often an open response stream re-reads the kill switch and its
 /// binding. A kill reaches an open stream within this long.
 pub const KILL_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
+/// How long one re-check may take. A re-check that times out or fails to
+/// read counts as unreadable; [`KILL_RECHECK_UNREADABLE_TO_CUT`] in a row
+/// cut the stream. A read that *says* killed or re-bound cuts at once.
+pub const KILL_RECHECK_TIMEOUT: Duration = Duration::from_secs(2);
+pub const KILL_RECHECK_UNREADABLE_TO_CUT: u32 = 2;
 /// Proxied requests one installation may have in flight in this process. A
 /// reporter needs one long watch stream plus a few short reads.
 pub const PROXY_CONCURRENCY_PER_INSTALLATION: usize = 16;
+/// The journal queue between requests and the writer (the default of
+/// [`AppState::broker_journal_queue`]).
+pub const JOURNAL_QUEUE: usize = 4096;
 /// Upstream connect timeout, and how long the upstream has to send its
 /// response head. There is no total timeout: a watch stream is meant to stay
 /// open, and the kill re-check is what bounds it.
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const UPSTREAM_HEADERS_TIMEOUT: Duration = Duration::from_secs(30);
-/// The journal queue between requests and the writer, and how many entries
-/// the writer folds into one INSERT.
-const JOURNAL_QUEUE: usize = 4096;
+/// How many entries the writer folds into one INSERT.
 const JOURNAL_BATCH: usize = 256;
-/// How much of a request's path and slot the journal keeps.
+/// How much of a request's path, query and slot the journal keeps.
 const MAX_JOURNAL_PATH_CHARS: usize = 2048;
+const MAX_JOURNAL_QUERY_CHARS: usize = 2048;
 const MAX_JOURNAL_SLOT_CHARS: usize = 63;
 const RETRY_AFTER_TOO_MANY_SECS: u64 = 1;
 const RETRY_AFTER_BUSY_SECS: u64 = 5;
 /// Response chunks buffered between the upstream and the Plugin.
 const STREAM_BUFFER_CHUNKS: usize = 16;
+
+/// The Plugin's headers that may travel upstream — content negotiation,
+/// conditional reads and an identifying agent, nothing that could change
+/// what the upstream does or as whom. (No `Range` or `Cache-Control`: the
+/// Argo CD reporter needs neither.)
+pub const REQUEST_HEADERS: [&str; 6] = [
+    "accept",
+    "accept-encoding",
+    "accept-language",
+    "if-none-match",
+    "if-modified-since",
+    "user-agent",
+];
+
+/// The upstream's headers that may travel back: what describes the body and
+/// its caching, and `retry-after`. Not `set-cookie` or any other session, not
+/// `location` or `www-authenticate` (they can name the bound URL and realm).
+pub const RESPONSE_HEADERS: [&str; 10] = [
+    "content-type",
+    "content-length",
+    "content-encoding",
+    "etag",
+    "last-modified",
+    "cache-control",
+    "date",
+    "vary",
+    "retry-after",
+    "expires",
+];
 
 /// The route's path, as `broker::router` registers it.
 pub fn route_path() -> String {
@@ -92,23 +141,31 @@ pub fn route_path() -> String {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct UpstreamResponse;
 
+/// One of an installation's [`PROXY_CONCURRENCY_PER_INSTALLATION`] permits,
+/// taken in authentication and held until the response stream ends.
+#[derive(Clone)]
+pub(crate) struct ProxyPermit(#[allow(dead_code)] Arc<OwnedSemaphorePermit>);
+
 /// What the proxy route shares across requests: the registry on the
 /// broker's pool, the journal queue, the per-installation permits and the
 /// upstream clients (one per distinct CA).
 pub struct BrokerProxy {
     store: Arc<dyn PluginStore>,
     journal: Option<mpsc::Sender<BrokerJournalEntry>>,
+    /// Refusals not journaled because the queue was over half full.
+    refusals_unjournaled: AtomicU64,
     permits: Mutex<HashMap<String, Arc<Semaphore>>>,
     clients: Mutex<HashMap<String, reqwest::Client>>,
 }
 
 impl BrokerProxy {
-    /// A proxy over `store`, with its journal writer spawned on the current
-    /// Tokio runtime. Without a runtime there is no writer, and the proxy
-    /// refuses every request (503): it never forwards what it cannot journal.
-    pub fn spawn(store: Arc<dyn PluginStore>) -> Arc<Self> {
+    /// A proxy over `store`, with a `journal_queue`-entry journal queue and
+    /// its writer spawned on the current Tokio runtime. Without a runtime
+    /// there is no writer, and the proxy refuses every request (503): it
+    /// never forwards what it cannot journal.
+    pub fn spawn(store: Arc<dyn PluginStore>, journal_queue: usize) -> Arc<Self> {
         let journal = tokio::runtime::Handle::try_current().ok().map(|rt| {
-            let (tx, rx) = mpsc::channel(JOURNAL_QUEUE);
+            let (tx, rx) = mpsc::channel(journal_queue.max(2));
             rt.spawn(write_journal(store.clone(), rx));
             tx
         });
@@ -120,6 +177,7 @@ impl BrokerProxy {
         Arc::new(Self {
             store,
             journal,
+            refusals_unjournaled: AtomicU64::new(0),
             permits: Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
         })
@@ -138,20 +196,41 @@ impl BrokerProxy {
         semaphore.try_acquire_owned().ok()
     }
 
-    /// Whether the journal can take an entry right now.
-    fn journal_has_room(&self) -> bool {
-        self.journal.as_ref().is_some_and(|tx| tx.capacity() > 0)
+    /// A slot in the journal queue, held until the request's row is sent
+    /// through it — so that row cannot be dropped. `None` = full.
+    fn reserve_journal(&self) -> Option<mpsc::OwnedPermit<BrokerJournalEntry>> {
+        self.journal.clone()?.try_reserve_owned().ok()
     }
 
-    /// Queue an entry; never waits. A full queue drops it loudly — only a
-    /// refusal can hit that, because a request is not forwarded unless the
-    /// queue had room when it started.
-    fn journal(&self, entry: BrokerJournalEntry) {
+    /// Journal a refusal — while the queue is under half full. Past that,
+    /// refusals are counted and logged instead, so a flood of them can never
+    /// take the room a forwarded request needs to be journaled.
+    fn journal_refusal(&self, entry: BrokerJournalEntry) {
+        let Some(tx) = &self.journal else {
+            return;
+        };
+        if tx.capacity() > tx.max_capacity() / 2 && tx.try_send(entry).is_ok() {
+            return;
+        }
+        let unjournaled = self.refusals_unjournaled.fetch_add(1, Ordering::Relaxed) + 1;
+        // Logged at 1, 2, 4, 8, …: a flood is visible without flooding the log.
+        if unjournaled.is_power_of_two() {
+            tracing::warn!(
+                unjournaled,
+                "broker: journal queue over half full; refusals are counted, not journaled"
+            );
+        }
+    }
+
+    /// Journal a stream's `end` row; never waits. Its `head` row went
+    /// through a reserved slot, so a full queue costs only the byte count
+    /// and how it ended.
+    fn journal_end(&self, entry: BrokerJournalEntry) {
         let Some(tx) = &self.journal else {
             return;
         };
         if let Err(e) = tx.try_send(entry) {
-            tracing::error!(error = %e, "broker: journal queue full; an entry was dropped");
+            tracing::error!(error = %e, "broker: journal queue full; an end row was dropped");
         }
     }
 
@@ -179,26 +258,79 @@ impl BrokerProxy {
     }
 
     /// Is the stream still allowed to run: the installation enabled, and
-    /// the connection still bound to the credential it started with? `Err`
-    /// says why not. A read that fails cuts too — a kill switch that cannot
-    /// be read is not proof it is off.
+    /// the connection still bound to the credential it started with?
     async fn still_authorised(
         &self,
         installation_id: &str,
         slot: &str,
         credential_ref: &str,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), Recheck> {
         match self.store.installation_by_id(installation_id).await {
             Ok(Some(i)) if i.state == InstallationState::Enabled => {}
-            Ok(_) => return Err("cut: the installation was killed or uninstalled"),
-            Err(_) => return Err("cut: the kill switch could not be read"),
+            Ok(_) => {
+                return Err(Recheck::Decided(
+                    "cut: the installation was killed or uninstalled",
+                ))
+            }
+            Err(_) => {
+                return Err(Recheck::Unreadable(
+                    "cut: the kill switch could not be read",
+                ))
+            }
         }
         match self.store.connection(installation_id, slot).await {
             Ok(Some(c)) if c.credential_ref == credential_ref => Ok(()),
-            Ok(_) => Err("cut: the connection was re-bound or unbound"),
-            Err(_) => Err("cut: the connection could not be read"),
+            Ok(_) => Err(Recheck::Decided(
+                "cut: the connection was re-bound or unbound",
+            )),
+            Err(_) => Err(Recheck::Unreadable("cut: the connection could not be read")),
         }
     }
+}
+
+/// Why a stream's re-check did not pass.
+enum Recheck {
+    /// The store says stop: killed, uninstalled, re-bound or unbound.
+    Decided(&'static str),
+    /// The store could not say. Not proof the stream may go on, nor that it
+    /// must stop: [`KILL_RECHECK_UNREADABLE_TO_CUT`] in a row cut it.
+    Unreadable(&'static str),
+}
+
+/// Take one of the installation's proxy permits, before anything reads the
+/// store or a secret (`broker::authenticate`). Over the limit, the request
+/// (`method uri_path`) is refused (429) — journaled like any refusal.
+pub(crate) async fn take_permit(
+    st: &AppState,
+    proxy: &BrokerProxy,
+    installation_id: &str,
+    method: &str,
+    uri_path: &str,
+) -> Result<ProxyPermit, Response> {
+    if let Some(permit) = proxy.try_permit(installation_id) {
+        return Ok(ProxyPermit(Arc::new(permit)));
+    }
+    let started = Instant::now();
+    let (slot, path) = split_connection_path(uri_path).unwrap_or(("", String::new()));
+    let draft = Draft::new(
+        installation_id,
+        slot,
+        method,
+        &path,
+        st.clock.now().await.0,
+        started,
+    );
+    let refusal = Refusal::new(
+        StatusCode::TOO_MANY_REQUESTS,
+        "concurrency",
+        format!(
+            "at most {PROXY_CONCURRENCY_PER_INSTALLATION} broker requests per installation at \
+             once"
+        ),
+    )
+    .retry_after(RETRY_AFTER_TOO_MANY_SECS);
+    proxy.journal_refusal(draft.refused(refusal.status, refusal.reason));
+    Err(refusal.respond())
 }
 
 /// An upstream client for one connection: no redirects (a 3xx goes back to
@@ -251,29 +383,59 @@ async fn write_journal(store: Arc<dyn PluginStore>, mut rx: mpsc::Receiver<Broke
     }
 }
 
-/// One request's journal entry in the making.
+/// One request's journal rows in the making.
 struct Draft {
+    request_id: String,
     installation_id: String,
     slot: String,
     method: String,
     path: String,
+    upstream_path: Option<String>,
+    query: Option<String>,
     rule: Option<String>,
     started_at: i64,
     started: Instant,
 }
 
 impl Draft {
-    fn finish(
+    fn new(
+        installation_id: &str,
+        slot: &str,
+        method: &str,
+        raw_path: &str,
+        started_at: i64,
+        started: Instant,
+    ) -> Self {
+        Self {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            installation_id: installation_id.to_string(),
+            slot: bounded(slot, MAX_JOURNAL_SLOT_CHARS),
+            method: bounded(method, 16),
+            path: bounded(raw_path, MAX_JOURNAL_PATH_CHARS),
+            upstream_path: None,
+            query: None,
+            rule: None,
+            started_at,
+            started,
+        }
+    }
+
+    fn row(
         &self,
+        phase: BrokerJournalPhase,
         status: StatusCode,
         bytes: Option<u64>,
         denied_reason: Option<String>,
     ) -> BrokerJournalEntry {
         BrokerJournalEntry {
+            request_id: self.request_id.clone(),
+            phase,
             installation_id: self.installation_id.clone(),
             slot: self.slot.clone(),
             method: self.method.clone(),
             path: self.path.clone(),
+            upstream_path: self.upstream_path.clone(),
+            query: self.query.clone(),
             rule: self.rule.clone(),
             status: Some(status.as_u16()),
             bytes,
@@ -282,12 +444,67 @@ impl Draft {
             denied_reason,
         }
     }
+
+    fn refused(&self, status: StatusCode, reason: &str) -> BrokerJournalEntry {
+        self.row(
+            BrokerJournalPhase::Refused,
+            status,
+            None,
+            Some(reason.to_string()),
+        )
+    }
+
+    fn head(&self, status: StatusCode) -> BrokerJournalEntry {
+        self.row(BrokerJournalPhase::Head, status, None, None)
+    }
+
+    fn end(&self, status: StatusCode, bytes: u64, why: Option<&str>) -> BrokerJournalEntry {
+        self.row(
+            BrokerJournalPhase::End,
+            status,
+            Some(bytes),
+            why.map(str::to_string),
+        )
+    }
 }
 
 /// Bounded journal text: at most `max` characters, no NUL (Postgres TEXT
 /// refuses it).
 fn bounded(s: &str, max: usize) -> String {
     s.chars().filter(|c| *c != '\0').take(max).collect()
+}
+
+/// Why the broker refused a request: journaled (as `reason`), then answered.
+struct Refusal {
+    status: StatusCode,
+    reason: &'static str,
+    message: String,
+    retry_after: Option<u64>,
+}
+
+impl Refusal {
+    fn new(status: StatusCode, reason: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            reason,
+            message: message.into(),
+            retry_after: None,
+        }
+    }
+
+    fn retry_after(mut self, secs: u64) -> Self {
+        self.retry_after = Some(secs);
+        self
+    }
+
+    fn respond(self) -> Response {
+        let mut resp = (self.status, self.message).into_response();
+        if let Some(secs) = self.retry_after {
+            resp.headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from(secs));
+        }
+        resp
+    }
 }
 
 /// `…/connections/{slot}/{rest}` → (`slot`, `/{rest}`), both still exactly
@@ -299,21 +516,8 @@ fn split_connection_path(path: &str) -> Option<(&str, String)> {
     Some((slot, format!("/{tail}")))
 }
 
-/// Headers that describe one hop, never the message (RFC 9110 §7.6.1), plus
-/// the non-standard `Proxy-Connection`.
-const HOP_BY_HOP: [&str; 9] = [
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "proxy-connection",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-];
-
-/// The header names a `Connection` header marks hop-by-hop.
+/// The header names a `Connection` header marks hop-by-hop: dropped even if
+/// allowlisted, since they describe one hop, never the message.
 fn connection_listed(headers: &HeaderMap) -> Vec<String> {
     headers
         .get_all(header::CONNECTION)
@@ -325,51 +529,46 @@ fn connection_listed(headers: &HeaderMap) -> Vec<String> {
         .collect()
 }
 
-/// The Plugin's headers that may travel upstream. Dropped: hop-by-hop ones;
-/// `Host` (the upstream's is derived from the bound URL); `Authorization`
-/// (the Plugin's own ServiceAccount token — the bound credential replaces
-/// it) and `Cookie` (a credential nobody bound); the framing of a body a
-/// read does not have; and forwarding metadata a Plugin could forge.
+/// The Plugin's headers that travel upstream: [`REQUEST_HEADERS`] only.
+/// Everything else — its `Authorization` (the bound credential replaces
+/// it), `Cookie`, `Host`, forwarding metadata, and any header an upstream
+/// might honour to change the method, path or identity — stays behind.
 fn forwardable_request_headers(headers: &HeaderMap) -> HeaderMap {
     let listed = connection_listed(headers);
     let mut out = HeaderMap::new();
     for (name, value) in headers {
         let n = name.as_str();
-        let dropped = HOP_BY_HOP.contains(&n)
-            || listed.iter().any(|l| l == n)
-            || matches!(
-                n,
-                "host"
-                    | "authorization"
-                    | "cookie"
-                    | "content-length"
-                    | "content-type"
-                    | "expect"
-                    | "forwarded"
-                    | "x-real-ip"
-            )
-            || n.starts_with("x-forwarded-");
-        if !dropped {
+        if REQUEST_HEADERS.contains(&n) && !listed.iter().any(|l| l == n) {
             out.append(name.clone(), value.clone());
         }
     }
     out
 }
 
-/// The upstream's headers that may travel back: everything but hop-by-hop
-/// ones and `Set-Cookie` (a session the Plugin has no use for, and could
-/// not present — its `Cookie` is dropped).
-fn forwardable_response_headers(headers: &HeaderMap) -> HeaderMap {
+/// The upstream's headers that travel back: [`RESPONSE_HEADERS`] only, and
+/// none whose value holds the credential (an upstream that echoes it).
+fn forwardable_response_headers(headers: &HeaderMap, credential: &[u8]) -> HeaderMap {
     let listed = connection_listed(headers);
     let mut out = HeaderMap::new();
     for (name, value) in headers {
         let n = name.as_str();
-        if HOP_BY_HOP.contains(&n) || listed.iter().any(|l| l == n) || n == "set-cookie" {
+        if !RESPONSE_HEADERS.contains(&n) || listed.iter().any(|l| l == n) {
+            continue;
+        }
+        if contains(value.as_bytes(), credential) {
+            tracing::warn!(
+                header = n,
+                "broker: an upstream header echoed the credential; dropped"
+            );
             continue;
         }
         out.append(name.clone(), value.clone());
     }
     out
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// Does the request carry (or announce) a body?
@@ -380,10 +579,11 @@ fn has_body(headers: &HeaderMap) -> bool {
             .is_some_and(|v| v.to_str().map_or(true, |s| s.trim() != "0"))
 }
 
-/// The upstream URL: the bound base, the matched path re-encoded, the query
-/// as sent. Checked to still be the bound origin under the bound path — the
-/// matcher's canonical encoding already guarantees it; this makes the core
-/// property hold even if that ever regressed.
+/// The upstream URL: the bound base, then the matched path and query, both
+/// already re-encoded canonically by the matcher. Checked to still be the
+/// bound origin under the bound path — the matcher's canonical encoding
+/// already guarantees it; this makes the core property hold even if that
+/// ever regressed.
 fn upstream_url(
     connection: &PluginConnection,
     upstream_path: &str,
@@ -404,52 +604,46 @@ fn upstream_url(
     Ok(url)
 }
 
-fn text(status: StatusCode, message: String) -> Response {
-    (status, message).into_response()
-}
-
-fn with_retry_after(mut resp: Response, secs: u64) -> Response {
-    resp.headers_mut()
-        .insert(header::RETRY_AFTER, HeaderValue::from(secs));
-    resp
-}
-
-/// `GET|HEAD /_scarab/plugin/v1/connections/{slot}/{*path}` — authenticated
-/// and kill-switch-checked by `broker::authenticate_plugin` before it runs.
+/// `GET|HEAD /_scarab/plugin/v1/connections/{slot}/{*path}` — authenticated,
+/// kill-switch-checked and holding one of the installation's permits
+/// (`broker::authenticate`) before it runs.
 pub(crate) async fn proxy(
     State(st): State<AppState>,
     Extension(proxy): Extension<Arc<BrokerProxy>>,
     Extension(PluginCaller(installation)): Extension<PluginCaller>,
+    Extension(permit): Extension<ProxyPermit>,
     req: Request,
 ) -> Response {
     let started = Instant::now();
     let started_at = st.clock.now().await.0;
     let Some((slot_raw, raw_path)) = split_connection_path(req.uri().path()) else {
-        return text(StatusCode::NOT_FOUND, "no such broker route".into());
+        return (StatusCode::NOT_FOUND, "no such broker route").into_response();
     };
-    let mut draft = Draft {
-        installation_id: installation.id.clone(),
-        slot: bounded(slot_raw, MAX_JOURNAL_SLOT_CHARS),
-        method: bounded(req.method().as_str(), 16),
-        path: bounded(&raw_path, MAX_JOURNAL_PATH_CHARS),
-        rule: None,
+    let mut draft = Draft::new(
+        &installation.id,
+        slot_raw,
+        req.method().as_str(),
+        &raw_path,
         started_at,
         started,
-    };
-    // Every refusal is journaled with its reason, then answered.
-    let refuse = |draft: &Draft, status: StatusCode, reason: &str, message: String| {
-        proxy.journal(draft.finish(status, None, Some(reason.to_string())));
-        text(status, message)
+    );
+    // Until a journal slot is reserved, a refusal is journaled while the
+    // queue is under half full, and counted past that.
+    let refuse = |draft: &Draft, refusal: Refusal| {
+        proxy.journal_refusal(draft.refused(refusal.status, refusal.reason));
+        refusal.respond()
     };
 
     if !installation.manifest.has(PluginCapability::UseConnection) {
         return refuse(
             &draft,
-            StatusCode::FORBIDDEN,
-            "capability",
-            format!(
-                "plugin installation `{}` was not approved for use_connection",
-                installation.name
+            Refusal::new(
+                StatusCode::FORBIDDEN,
+                "capability",
+                format!(
+                    "plugin installation `{}` was not approved for use_connection",
+                    installation.name
+                ),
             ),
         );
     }
@@ -459,249 +653,312 @@ pub(crate) async fn proxy(
         .iter()
         .find(|s| s.name == slot_raw)
     else {
+        let message = format!(
+            "plugin installation `{}` declares no connection slot `{}`",
+            installation.name, draft.slot
+        );
         return refuse(
             &draft,
-            StatusCode::NOT_FOUND,
-            "unknown slot",
-            format!(
-                "plugin installation `{}` declares no connection slot `{}`",
-                installation.name, draft.slot
-            ),
+            Refusal::new(StatusCode::NOT_FOUND, "unknown slot", message),
         );
     };
     if has_body(req.headers()) {
         return refuse(
             &draft,
-            StatusCode::BAD_REQUEST,
-            "request body",
-            "a read carries no request body; the broker forwards none (ADR-0072 §5)".into(),
+            Refusal::new(
+                StatusCode::BAD_REQUEST,
+                "request body",
+                "a read carries no request body; the broker forwards none (ADR-0072 §5)",
+            ),
         );
     }
-    let matched = match match_read_request(slot, req.method().as_str(), &raw_path) {
-        Ok(m) => m,
-        Err(refusal @ ReadRequestRefusal::MethodNotAllowed(_)) => {
-            let mut resp = refuse(
-                &draft,
-                StatusCode::METHOD_NOT_ALLOWED,
-                "method",
-                format!("{refusal}; write rules are not available (ADR-0072 MMP)"),
-            );
-            resp.headers_mut()
-                .insert(header::ALLOW, HeaderValue::from_static("GET, HEAD"));
-            return resp;
-        }
-        Err(refusal) => {
-            return refuse(
-                &draft,
-                StatusCode::FORBIDDEN,
-                "no read rule",
-                refusal.to_string(),
-            )
-        }
-    };
-    draft.rule = Some(rule_label(matched.rule));
-
-    let connection = match proxy.store.connection(&installation.id, &slot.name).await {
-        Ok(Some(c)) => c,
-        Ok(None) => {
-            return refuse(
-                &draft,
-                StatusCode::CONFLICT,
-                "not bound",
-                format!(
-                    "connection `{}` is not bound: an org admin has not set its destination and \
-                     credential yet",
-                    slot.name
-                ),
-            )
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "broker: connection read failed");
-            return with_retry_after(
-                refuse(
+    let matched =
+        match match_read_request(slot, req.method().as_str(), &raw_path, req.uri().query()) {
+            Ok(m) => m,
+            Err(refusal @ ReadRequestRefusal::MethodNotAllowed(_)) => {
+                let mut resp = refuse(
                     &draft,
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "store busy",
-                    "the broker is busy; retry".into(),
-                ),
-                RETRY_AFTER_BUSY_SECS,
-            );
-        }
-    };
-    let Some(secrets) = st.secrets.as_deref() else {
-        // A misconfiguration, not the Plugin's business: scrubbed to a
-        // request id on the way out.
-        return refuse(
-            &draft,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "no secret store",
-            "broker: no secret store wired".into(),
-        );
-    };
-    let credential = match secrets
-        .get(
-            &plugin_connection_secret_scope(),
-            &connection.credential_ref,
-        )
-        .await
-    {
-        Ok(secret) => secret.value,
-        Err(scarab_secrets::SecretError::NotFound) => {
-            tracing::error!(
-                installation = %installation.id,
-                slot = %slot.name,
-                scope = PLUGIN_CONNECTION_CREDENTIALS_ORG,
-                "broker: a bound connection's credential is missing from the secret store"
-            );
-            return refuse(
-                &draft,
-                StatusCode::CONFLICT,
-                "credential missing",
-                format!(
-                    "connection `{}` has no credential: an org admin must bind it again",
-                    slot.name
-                ),
-            );
-        }
-        Err(e) => {
-            return refuse(
-                &draft,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "secret store",
-                format!("broker: secret store: {e}"),
-            )
-        }
-    };
-    // Validated as visible ASCII at bind time; refuse rather than send a
-    // malformed header if the store holds anything else.
-    let Some(bearer) = String::from_utf8(credential)
-        .ok()
-        .and_then(|t| HeaderValue::from_str(&format!("Bearer {t}")).ok())
-    else {
-        return refuse(
-            &draft,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "credential unusable",
-            "broker: a bound credential is not a valid header value".into(),
-        );
-    };
-    let mut bearer = bearer;
-    bearer.set_sensitive(true);
+                    Refusal::new(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method",
+                        format!("{refusal}; write rules are not available (ADR-0072 MMP)"),
+                    ),
+                );
+                resp.headers_mut()
+                    .insert(header::ALLOW, HeaderValue::from_static("GET, HEAD"));
+                return resp;
+            }
+            Err(refusal @ ReadRequestRefusal::QueryRefused(_)) => {
+                // The query as sent: what was refused is the audit's business.
+                draft.query = req
+                    .uri()
+                    .query()
+                    .map(|q| bounded(q, MAX_JOURNAL_QUERY_CHARS));
+                return refuse(
+                    &draft,
+                    Refusal::new(StatusCode::FORBIDDEN, "query", refusal.to_string()),
+                );
+            }
+            Err(refusal) => {
+                return refuse(
+                    &draft,
+                    Refusal::new(StatusCode::FORBIDDEN, "no read rule", refusal.to_string()),
+                )
+            }
+        };
+    draft.rule = Some(rule_label(matched.rule));
+    draft.upstream_path = Some(bounded(&matched.upstream_path, MAX_JOURNAL_PATH_CHARS));
+    draft.query = matched
+        .upstream_query
+        .as_deref()
+        .map(|q| bounded(q, MAX_JOURNAL_QUERY_CHARS));
 
-    let Some(permit) = proxy.try_permit(&installation.id) else {
-        return with_retry_after(
-            refuse(
-                &draft,
-                StatusCode::TOO_MANY_REQUESTS,
-                "concurrency",
-                format!(
-                    "at most {PROXY_CONCURRENCY_PER_INSTALLATION} broker requests per \
-                     installation at once"
-                ),
-            ),
-            RETRY_AFTER_TOO_MANY_SECS,
-        );
+    // Never forward what cannot be journaled: from here on, every outcome
+    // is journaled through this slot.
+    let Some(journal_slot) = proxy.reserve_journal() else {
+        tracing::error!(installation = %installation.id, slot = %slot.name,
+            "broker: journal queue full; refusing a read it could not journal");
+        return Refusal::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "journal full",
+            "the broker is busy; retry",
+        )
+        .retry_after(RETRY_AFTER_BUSY_SECS)
+        .respond();
     };
-    // Never forward what cannot be journaled.
-    if !proxy.journal_has_room() {
-        return with_retry_after(
-            text(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "the broker is busy; retry".into(),
-            ),
-            RETRY_AFTER_BUSY_SECS,
-        );
-    }
-    let url = match upstream_url(&connection, &matched.upstream_path, req.uri().query()) {
-        Ok(url) => url,
-        Err(e) => {
-            return refuse(
-                &draft,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "destination",
-                format!("broker: {e}"),
-            )
-        }
-    };
-    let client = match proxy.client(connection.ca_pem.as_deref()) {
-        Ok(c) => c,
-        Err(e) => {
-            return refuse(
-                &draft,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "client",
-                format!(
-                    "broker: upstream client for connection `{}`: {e}",
-                    slot.name
-                ),
-            )
-        }
-    };
-    let mut headers = forwardable_request_headers(req.headers());
-    headers.insert(header::AUTHORIZATION, bearer);
+    let headers = forwardable_request_headers(req.headers());
     let method = req.method().clone();
     // The request body (none, checked above) is dropped here, never read.
     drop(req);
 
-    let upstream = match tokio::time::timeout(
-        UPSTREAM_HEADERS_TIMEOUT,
-        client.request(method, url).headers(headers).send(),
+    let (connection, credential, upstream) = match send_upstream(
+        &st,
+        &proxy,
+        &installation.id,
+        slot,
+        &matched,
+        method,
+        headers,
     )
     .await
     {
-        Ok(Ok(resp)) => resp,
-        Ok(Err(e)) => {
-            // The error text names the bound URL: an operator's business,
-            // not the Plugin's.
-            tracing::warn!(installation = %installation.id, slot = %slot.name, error = %e,
-                "broker: upstream request failed");
-            return refuse(
-                &draft,
-                StatusCode::BAD_GATEWAY,
-                "upstream unreachable",
-                format!(
-                    "connection `{}`: the upstream could not be reached",
-                    slot.name
-                ),
-            );
-        }
-        Err(_) => {
-            return refuse(
-                &draft,
-                StatusCode::GATEWAY_TIMEOUT,
-                "upstream timeout",
-                format!(
-                    "connection `{}`: the upstream sent no response within {}s",
-                    slot.name,
-                    UPSTREAM_HEADERS_TIMEOUT.as_secs()
-                ),
-            )
+        Ok(sent) => sent,
+        Err(refusal) => {
+            journal_slot.send(draft.refused(refusal.status, refusal.reason));
+            return refusal.respond();
         }
     };
 
     let status = upstream.status();
-    let response_headers = forwardable_response_headers(upstream.headers());
+    let response_headers = forwardable_response_headers(upstream.headers(), credential.as_bytes());
+    drop(credential);
+    journal_slot.send(draft.head(status));
+
+    let cut = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(STREAM_BUFFER_CHUNKS);
     let pump = Pump {
         proxy: proxy.clone(),
         installation_id: installation.id.clone(),
         slot: slot.name.clone(),
         credential_ref: connection.credential_ref.clone(),
+        cut: cut.clone(),
+        unreadable: AtomicU32::new(0),
     };
     tokio::spawn(async move {
         let _permit = permit;
         let (bytes, end) = pump.run(upstream, tx).await;
-        pump.proxy
-            .journal(draft.finish(status, Some(bytes), end.map(str::to_string)));
+        pump.proxy.journal_end(draft.end(status, bytes, end));
     });
 
-    let mut resp = Response::new(Body::from_stream(
-        tokio_stream::wrappers::ReceiverStream::new(rx),
-    ));
+    let mut resp = Response::new(Body::from_stream(body_stream(rx, cut)));
     *resp.status_mut() = status;
     *resp.headers_mut() = response_headers;
     resp.extensions_mut().insert(UpstreamResponse);
     resp
+}
+
+/// What the Plugin reads: the pumped chunks, then — if the stream was cut
+/// or failed — an error, whatever the buffer held. The pump sets `cut`
+/// before it drops its sender, so the flag is set by the time the chunks
+/// run out: a Plugin that stopped reading and drains the buffer later still
+/// ends on an error, never on a clean end it could take for the whole body.
+fn body_stream(
+    rx: mpsc::Receiver<Result<Bytes, std::io::Error>>,
+    cut: Arc<AtomicBool>,
+) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> {
+    let tail = futures::stream::once(async move {
+        cut.load(Ordering::SeqCst).then(|| {
+            Err(std::io::Error::other(
+                "the broker cut this response short (ADR-0072 §10)",
+            ))
+        })
+    })
+    .filter_map(std::future::ready);
+    tokio_stream::wrappers::ReceiverStream::new(rx).chain(tail)
+}
+
+/// The bound connection, its credential, and the upstream's response head —
+/// or why not.
+async fn send_upstream(
+    st: &AppState,
+    proxy: &BrokerProxy,
+    installation_id: &str,
+    slot: &ConnectionSlot,
+    matched: &ReadRequestMatch<'_>,
+    method: axum::http::Method,
+    mut headers: HeaderMap,
+) -> Result<(PluginConnection, String, reqwest::Response), Refusal> {
+    let (connection, credential) = bound_credential(st, proxy, installation_id, slot).await?;
+    // Validated as visible ASCII at bind time; refuse rather than send a
+    // malformed header if the store holds anything else.
+    let credential = String::from_utf8(credential).map_err(|_| unusable_credential())?;
+    let mut bearer = HeaderValue::from_str(&format!("Bearer {credential}"))
+        .map_err(|_| unusable_credential())?;
+    bearer.set_sensitive(true);
+
+    let url = upstream_url(
+        &connection,
+        &matched.upstream_path,
+        matched.upstream_query.as_deref(),
+    )
+    .map_err(|e| {
+        Refusal::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "destination",
+            format!("broker: {e}"),
+        )
+    })?;
+    let client = proxy.client(connection.ca_pem.as_deref()).map_err(|e| {
+        Refusal::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "client",
+            format!(
+                "broker: upstream client for connection `{}`: {e}",
+                slot.name
+            ),
+        )
+    })?;
+    headers.insert(header::AUTHORIZATION, bearer);
+
+    match tokio::time::timeout(
+        UPSTREAM_HEADERS_TIMEOUT,
+        client.request(method, url).headers(headers).send(),
+    )
+    .await
+    {
+        Ok(Ok(resp)) => Ok((connection, credential, resp)),
+        Ok(Err(e)) => {
+            // The error text names the bound URL: an operator's business,
+            // not the Plugin's.
+            tracing::warn!(installation = %installation_id, slot = %slot.name, error = %e,
+                "broker: upstream request failed");
+            Err(Refusal::new(
+                StatusCode::BAD_GATEWAY,
+                "upstream unreachable",
+                format!(
+                    "connection `{}`: the upstream could not be reached",
+                    slot.name
+                ),
+            ))
+        }
+        Err(_) => Err(Refusal::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            "upstream timeout",
+            format!(
+                "connection `{}`: the upstream sent no response within {}s",
+                slot.name,
+                UPSTREAM_HEADERS_TIMEOUT.as_secs()
+            ),
+        )),
+    }
+}
+
+fn unusable_credential() -> Refusal {
+    Refusal::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "credential unusable",
+        "broker: a bound credential is not a valid header value",
+    )
+}
+
+/// The slot's binding and its credential's bytes. A re-bind between the
+/// two reads deletes the secret the first read names; the binding is then
+/// read once more, so a valid re-bind is not mistaken for a missing
+/// credential.
+async fn bound_credential(
+    st: &AppState,
+    proxy: &BrokerProxy,
+    installation_id: &str,
+    slot: &ConnectionSlot,
+) -> Result<(PluginConnection, Vec<u8>), Refusal> {
+    let mut reread = false;
+    loop {
+        let connection = match proxy.store.connection(installation_id, &slot.name).await {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                return Err(Refusal::new(
+                    StatusCode::CONFLICT,
+                    "not bound",
+                    format!(
+                        "connection `{}` is not bound: an org admin has not set its destination \
+                         and credential yet",
+                        slot.name
+                    ),
+                ))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "broker: connection read failed");
+                return Err(Refusal::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "store busy",
+                    "the broker is busy; retry",
+                )
+                .retry_after(RETRY_AFTER_BUSY_SECS));
+            }
+        };
+        let Some(secrets) = st.secrets.as_deref() else {
+            // A misconfiguration, not the Plugin's business: scrubbed to a
+            // request id on the way out.
+            return Err(Refusal::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "no secret store",
+                "broker: no secret store wired",
+            ));
+        };
+        match secrets
+            .get(
+                &plugin_connection_secret_scope(),
+                &connection.credential_ref,
+            )
+            .await
+        {
+            Ok(secret) => return Ok((connection, secret.value)),
+            Err(scarab_secrets::SecretError::NotFound) if !reread => reread = true,
+            Err(scarab_secrets::SecretError::NotFound) => {
+                tracing::error!(
+                    installation = %installation_id,
+                    slot = %slot.name,
+                    scope = PLUGIN_CONNECTION_CREDENTIALS_ORG,
+                    "broker: a bound connection's credential is missing from the secret store"
+                );
+                return Err(Refusal::new(
+                    StatusCode::CONFLICT,
+                    "credential missing",
+                    format!(
+                        "connection `{}` has no credential: an org admin must bind it again",
+                        slot.name
+                    ),
+                ));
+            }
+            Err(e) => {
+                return Err(Refusal::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "secret store",
+                    format!("broker: secret store: {e}"),
+                ))
+            }
+        }
+    }
 }
 
 /// Moves one upstream response body to the Plugin, re-checking the kill
@@ -711,11 +968,16 @@ struct Pump {
     installation_id: String,
     slot: String,
     credential_ref: String,
+    /// Set before the sender drops when the stream did not simply end: the
+    /// Plugin's body then ends in an error ([`body_stream`]).
+    cut: Arc<AtomicBool>,
+    /// Unreadable re-checks in a row.
+    unreadable: AtomicU32,
 }
 
 impl Pump {
     /// Returns the bytes delivered and, if the stream did not simply end,
-    /// why (`cut: …` for a kill-switch cut).
+    /// why (`cut: …` for a kill-switch or re-bind cut).
     async fn run(
         &self,
         upstream: reqwest::Response,
@@ -741,6 +1003,7 @@ impl Pump {
                     Some(Err(e)) => {
                         tracing::warn!(installation = %self.installation_id, slot = %self.slot,
                             error = %e, "broker: upstream body failed mid-stream");
+                        self.cut.store(true, Ordering::SeqCst);
                         send_error(&tx, "the upstream response failed").await;
                         break Some("upstream body error");
                     }
@@ -785,10 +1048,33 @@ impl Pump {
         }
     }
 
+    /// One re-check, bounded by [`KILL_RECHECK_TIMEOUT`]. `Err` = cut now:
+    /// the store said stop, or could not say [`KILL_RECHECK_UNREADABLE_TO_CUT`]
+    /// times in a row — a kill switch that cannot be read is not proof it is
+    /// off, but one slow read is not proof it is on.
     async fn check(&self) -> Result<(), &'static str> {
-        self.proxy
-            .still_authorised(&self.installation_id, &self.slot, &self.credential_ref)
-            .await
+        let unreadable = match tokio::time::timeout(
+            KILL_RECHECK_TIMEOUT,
+            self.proxy
+                .still_authorised(&self.installation_id, &self.slot, &self.credential_ref),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                self.unreadable.store(0, Ordering::Relaxed);
+                return Ok(());
+            }
+            Ok(Err(Recheck::Decided(why))) => return Err(why),
+            Ok(Err(Recheck::Unreadable(why))) => why,
+            Err(_) => "cut: the kill switch re-check timed out",
+        };
+        let in_a_row = self.unreadable.fetch_add(1, Ordering::Relaxed) + 1;
+        if in_a_row >= KILL_RECHECK_UNREADABLE_TO_CUT {
+            return Err(unreadable);
+        }
+        tracing::warn!(installation = %self.installation_id, slot = %self.slot, why = unreadable,
+            "broker: a stream re-check could not be read; cut if the next one cannot either");
+        Ok(())
     }
 
     /// End the Plugin's response with an error — an aborted body, never a
@@ -800,15 +1086,15 @@ impl Pump {
     ) -> &'static str {
         tracing::warn!(installation = %self.installation_id, slot = %self.slot, why,
             "broker: response stream cut (ADR-0072 §10)");
+        self.cut.store(true, Ordering::SeqCst);
         send_error(tx, why).await;
         why
     }
 }
 
-/// End the Plugin's body with an error. Waits briefly for room, so a Plugin
-/// that is reading sees the error rather than a clean end; one that stopped
-/// reading may instead drain what was buffered before the cut and then see
-/// the body end — never anything sent after it.
+/// Tell a Plugin that is reading why its body ends. Waits briefly for room;
+/// a Plugin that stopped reading may not get this message, but its body still
+/// ends in an error once it drains the buffer ([`body_stream`]).
 async fn send_error(tx: &mpsc::Sender<Result<Bytes, std::io::Error>>, why: &str) {
     let _ = tokio::time::timeout(
         Duration::from_secs(1),
@@ -841,12 +1127,12 @@ mod tests {
         let url = upstream_url(
             &bound("https://argo.acme.test/argo"),
             "/api/v1/applications",
-            Some("project=prod&x=%2F"),
+            Some("projects=prod&selector=a%3Db"),
         )
         .unwrap();
         assert_eq!(
             url.as_str(),
-            "https://argo.acme.test/argo/api/v1/applications?project=prod&x=%2F"
+            "https://argo.acme.test/argo/api/v1/applications?projects=prod&selector=a%3Db"
         );
         let url = upstream_url(&bound("http://127.0.0.1:9"), "/api/version", None).unwrap();
         assert_eq!(url.as_str(), "http://127.0.0.1:9/api/version");
@@ -864,47 +1150,76 @@ mod tests {
     }
 
     #[test]
-    fn the_plugin_s_token_and_hop_by_hop_headers_never_go_upstream() {
+    fn only_allowlisted_request_headers_go_upstream() {
         let mut h = HeaderMap::new();
-        h.insert(
-            header::AUTHORIZATION,
-            HeaderValue::from_static("Bearer sa-token"),
-        );
-        h.insert(header::HOST, HeaderValue::from_static("evil.test"));
-        h.insert(header::COOKIE, HeaderValue::from_static("session=1"));
-        h.insert(
-            header::CONNECTION,
-            HeaderValue::from_static("keep-alive, x-secret"),
-        );
-        h.insert("x-secret", HeaderValue::from_static("1"));
-        h.insert("proxy-authorization", HeaderValue::from_static("Basic x"));
-        h.insert("x-forwarded-host", HeaderValue::from_static("evil.test"));
-        h.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
-        h.insert(header::IF_NONE_MATCH, HeaderValue::from_static("\"v1\""));
+        for (name, value) in [
+            ("authorization", "Bearer sa-token"),
+            ("host", "evil.test"),
+            ("cookie", "session=1"),
+            ("connection", "keep-alive, accept-language"),
+            ("accept-language", "en"),
+            ("proxy-authorization", "Basic x"),
+            ("x-forwarded-host", "evil.test"),
+            // headers an upstream may honour to change what a GET does
+            ("x-http-method-override", "DELETE"),
+            ("x-http-method", "DELETE"),
+            ("x-method-override", "DELETE"),
+            ("x-original-url", "/api/v1/session"),
+            ("x-rewrite-url", "/api/v1/session"),
+            ("grpc-metadata-token", "another-identity"),
+            ("grpc-metadata-grpcgateway-cookie", "argocd.token=x"),
+            ("impersonate-user", "admin"),
+            ("impersonate-group", "system:masters"),
+            ("range", "bytes=0-1"),
+            ("cache-control", "no-cache"),
+            ("accept", "application/json"),
+            ("accept-encoding", "gzip"),
+            ("if-none-match", "\"v1\""),
+            ("if-modified-since", "Tue, 20 Oct 2026 00:00:00 GMT"),
+            ("user-agent", "scarab-plugin-argocd"),
+        ] {
+            h.append(
+                HeaderName::from_static(name),
+                HeaderValue::from_static(value),
+            );
+        }
         let out = forwardable_request_headers(&h);
         let names: Vec<&str> = out.keys().map(HeaderName::as_str).collect();
-        assert_eq!(names, vec!["accept", "if-none-match"]);
+        // `accept-language` is allowlisted, but this request's `Connection`
+        // marked it hop-by-hop.
+        assert_eq!(
+            names,
+            vec![
+                "accept",
+                "accept-encoding",
+                "if-none-match",
+                "if-modified-since",
+                "user-agent"
+            ]
+        );
     }
 
     #[test]
-    fn set_cookie_and_hop_by_hop_headers_never_come_back() {
+    fn only_allowlisted_response_headers_come_back_and_never_the_credential() {
         let mut h = HeaderMap::new();
-        h.insert(
-            header::SET_COOKIE,
-            HeaderValue::from_static("argocd.token=x"),
-        );
-        h.insert(
-            header::TRANSFER_ENCODING,
-            HeaderValue::from_static("chunked"),
-        );
-        h.insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        );
-        h.insert(header::LOCATION, HeaderValue::from_static("/elsewhere"));
-        let out = forwardable_response_headers(&h);
+        for (name, value) in [
+            ("set-cookie", "argocd.token=x"),
+            ("transfer-encoding", "chunked"),
+            ("content-type", "application/json"),
+            ("location", "https://argo.internal/elsewhere"),
+            ("www-authenticate", "Bearer realm=\"argo.internal\""),
+            ("x-session-token", "fresh-session"),
+            ("etag", "\"argo-api-token-s3cr3t\""),
+            ("retry-after", "3"),
+        ] {
+            h.append(
+                HeaderName::from_static(name),
+                HeaderValue::from_static(value),
+            );
+        }
+        let out = forwardable_response_headers(&h, b"argo-api-token-s3cr3t");
         let names: Vec<&str> = out.keys().map(HeaderName::as_str).collect();
-        assert_eq!(names, vec!["content-type", "location"]);
+        assert_eq!(names, vec!["content-type", "retry-after"]);
     }
 
     #[test]
@@ -941,5 +1256,30 @@ mod tests {
     fn a_ca_that_is_not_pem_is_refused() {
         assert!(upstream_client(Some("not a certificate")).is_err());
         assert!(upstream_client(None).is_ok());
+    }
+
+    /// The cut flag decides how the body ends, whatever was buffered: a
+    /// Plugin that drains the buffer after a cut still ends on an error.
+    #[tokio::test]
+    async fn a_cut_stream_ends_in_an_error_after_the_buffer_drains() {
+        for was_cut in [false, true] {
+            let (tx, rx) = mpsc::channel(STREAM_BUFFER_CHUNKS);
+            for _ in 0..STREAM_BUFFER_CHUNKS {
+                tx.try_send(Ok(Bytes::from_static(b"x"))).unwrap();
+            }
+            let cut = Arc::new(AtomicBool::new(false));
+            cut.store(was_cut, Ordering::SeqCst);
+            drop(tx);
+            let items: Vec<_> = body_stream(rx, cut).collect().await;
+            assert_eq!(
+                items.iter().filter(|i| i.is_ok()).count(),
+                STREAM_BUFFER_CHUNKS
+            );
+            assert_eq!(
+                items.last().is_some_and(Result::is_err),
+                was_cut,
+                "cut = {was_cut}"
+            );
+        }
     }
 }

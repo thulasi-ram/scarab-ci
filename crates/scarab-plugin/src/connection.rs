@@ -14,13 +14,20 @@
 //! - the path is **percent-decoded before matching**, segment by segment, so
 //!   a pattern cannot be dodged by spelling a literal in `%xx`;
 //! - a segment that decodes to a separator (`%2F`, `%5C`), to `.` / `..`,
-//!   or to anything still holding a `%` (double encoding), and any empty
-//!   segment, is refused outright — an upstream that normalises paths could
-//!   otherwise be walked out of the matched prefix;
+//!   to anything still holding a `%` (double encoding) or to anything not
+//!   ASCII (`．．` is `..` to an upstream that NFKC-normalises), and any
+//!   segment that is empty — also before a `;` parameter (`;x`, which a
+//!   server stripping matrix parameters reads as empty) — is refused
+//!   outright: an upstream that normalises paths could otherwise be walked
+//!   out of the matched prefix;
 //! - `*` in a pattern is **exactly one** non-empty segment;
-//! - what is forwarded is the matched segments **re-encoded canonically**,
-//!   never the raw text the Plugin sent, so the upstream sees exactly the
-//!   path the rule admitted.
+//! - the **query** may carry only the keys the matched rule lists, each at
+//!   most once — an allowlist, since a read path can still have a side
+//!   effect behind a query key (Argo CD's `?refresh=hard`), and refused
+//!   rather than dropped, since dropping a key can re-target the read;
+//! - what is forwarded is the matched segments and the query **re-encoded
+//!   canonically**, never the raw text the Plugin sent, so the upstream sees
+//!   exactly the request the rule admitted.
 
 use crate::{ConnectionSlot, RequestRule};
 
@@ -33,6 +40,9 @@ pub const BROKER_JOURNAL_RETENTION_MS: i64 = 14 * 24 * 60 * 60 * 1000;
 /// on what one request can make the matcher do.
 pub const MAX_PROXY_PATH_CHARS: usize = 4096;
 pub const MAX_PROXY_PATH_SEGMENTS: usize = 64;
+/// The longest raw query the broker will consider, and the most parameters.
+pub const MAX_PROXY_QUERY_CHARS: usize = 4096;
+pub const MAX_PROXY_QUERY_PARAMS: usize = 32;
 
 /// The longest connection base URL and CA bundle an admin may bind.
 pub const MAX_CONNECTION_BASE_URL_CHARS: usize = 2048;
@@ -91,28 +101,72 @@ pub struct PluginConnection {
     pub updated_at: i64,
 }
 
-/// One proxied (or refused) broker request, as journaled (ADR-0072 §5 step
-/// 4). Written asynchronously; read by audit and tests.
+/// Which of a request's journal rows an entry is. Rows are append-only: a
+/// forwarded request writes a [`Head`](Self::Head) row before its body
+/// streams — so a watch stream open for hours is on record from its first
+/// second — and an [`End`](Self::End) row when it ends; both carry the same
+/// `request_id`. A request that is never forwarded writes one
+/// [`Refused`](Self::Refused) row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BrokerJournalPhase {
+    Refused,
+    Head,
+    End,
+}
+
+impl BrokerJournalPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BrokerJournalPhase::Refused => "refused",
+            BrokerJournalPhase::Head => "head",
+            BrokerJournalPhase::End => "end",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "refused" => Some(BrokerJournalPhase::Refused),
+            "head" => Some(BrokerJournalPhase::Head),
+            "end" => Some(BrokerJournalPhase::End),
+            _ => None,
+        }
+    }
+}
+
+/// One row of the broker's journal of a request it proxied or refused
+/// (ADR-0072 §5 step 4). Written asynchronously; read by tests (an audit
+/// reader is MLP).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrokerJournalEntry {
+    /// Broker-minted, one per request: ties a `head` row to its `end` row.
+    pub request_id: String,
+    pub phase: BrokerJournalPhase,
     pub installation_id: String,
     /// The slot as the request named it (bounded; may name no real slot).
     pub slot: String,
     pub method: String,
-    /// The request path after the slot, as sent (bounded); never the query.
+    /// The request path after the slot, as sent (bounded).
     pub path: String,
+    /// The path forwarded upstream: the matched path re-encoded canonically.
+    /// `None` when it was refused before a rule matched.
+    pub upstream_path: Option<String>,
+    /// The query (bounded): as forwarded (canonical) once a rule matched it,
+    /// as sent on a row refused for its query; `None` when there was none.
+    pub query: Option<String>,
     /// The read rule that admitted it (`GET /api/v1/applications/*`); `None`
     /// when it was refused before a rule matched.
     pub rule: Option<String>,
     /// The status the Plugin got: the upstream's, or the broker's refusal.
     pub status: Option<u16>,
-    /// Response body bytes delivered to the Plugin.
+    /// Response body bytes delivered to the Plugin (`end` rows).
     pub bytes: Option<u64>,
     /// Unix-ms the request reached the broker.
     pub started_at: i64,
+    /// Until the refusal, the response head (`head`), or the end (`end`).
     pub duration_ms: Option<u64>,
-    /// Why the broker refused it, or cut it short (`killed`); `None` for a
-    /// request proxied to completion.
+    /// Why the broker refused it, or why its stream ended short (`cut: …`
+    /// for the kill switch or a re-bind, `upstream body error`); `None` for
+    /// a `head` row and a stream proxied to completion.
     pub denied_reason: Option<String>,
 }
 
@@ -124,6 +178,9 @@ pub struct ReadRequestMatch<'a> {
     /// The decoded path re-encoded canonically, `/`-joined, leading `/`:
     /// exactly what the rule admitted, and the only path forwarded.
     pub upstream_path: String,
+    /// The decoded query re-encoded canonically (`k=v&…`, in the order
+    /// sent): only keys the rule allows, each once. `None` = no query.
+    pub upstream_query: Option<String>,
 }
 
 /// Why the broker will not forward a request.
@@ -138,18 +195,25 @@ pub enum ReadRequestRefusal {
     /// Well-formed, but no read rule of the slot admits it.
     #[error("no read rule of connection `{0}` admits this request")]
     NoRuleMatches(String),
+    /// A rule admits the path, but not the query: a key it does not list, a
+    /// key twice, or a query that cannot be read one way only.
+    #[error("query refused: {0}")]
+    QueryRefused(String),
 }
 
-/// Does a read rule of `slot` admit `method raw_path`?
+/// Does a read rule of `slot` admit `method raw_path?raw_query`?
 ///
 /// `raw_path` is the request path **after** the slot, exactly as it arrived
-/// (still percent-encoded), with its leading `/` and without the query. A
-/// `HEAD` is admitted by a `GET` rule as well as a `HEAD` one: it is the
-/// same read without the body.
+/// (still percent-encoded), with its leading `/` and without the query;
+/// `raw_query` is the query as it arrived, without the `?`. A `HEAD` is
+/// admitted by a `GET` rule as well as a `HEAD` one: it is the same read
+/// without the body. The first rule whose method and path match decides;
+/// its query allowlist then has to admit the query.
 pub fn match_read_request<'a>(
     slot: &'a ConnectionSlot,
     method: &str,
     raw_path: &str,
+    raw_query: Option<&str>,
 ) -> Result<ReadRequestMatch<'a>, ReadRequestRefusal> {
     if !matches!(method, "GET" | "HEAD") {
         return Err(ReadRequestRefusal::MethodNotAllowed(method.to_string()));
@@ -163,6 +227,7 @@ pub fn match_read_request<'a>(
                 && pattern_matches(&rule.path, &segments)
         })
         .ok_or_else(|| ReadRequestRefusal::NoRuleMatches(slot.name.clone()))?;
+    let upstream_query = canonical_query(rule, raw_query)?;
     let mut upstream_path = String::with_capacity(raw_path.len());
     for segment in &segments {
         upstream_path.push('/');
@@ -171,7 +236,90 @@ pub fn match_read_request<'a>(
     Ok(ReadRequestMatch {
         rule,
         upstream_path,
+        upstream_query,
     })
+}
+
+/// The query re-encoded canonically, if `rule` admits every parameter of
+/// it. Parameters are read the way an upstream reads a form-encoded query
+/// (`&`-separated, `+` = space, then percent-decoded) — so the key compared
+/// is the key the upstream sees — and written back with every byte that is
+/// not unreserved percent-encoded, so a `;`, `&` or `=` inside a value stays
+/// inside it.
+fn canonical_query(
+    rule: &RequestRule,
+    raw_query: Option<&str>,
+) -> Result<Option<String>, ReadRequestRefusal> {
+    let refused = |m: String| Err(ReadRequestRefusal::QueryRefused(m));
+    let raw = match raw_query {
+        None | Some("") => return Ok(None),
+        Some(raw) => raw,
+    };
+    if raw.len() > MAX_PROXY_QUERY_CHARS {
+        return refused("longer than the broker considers".into());
+    }
+    let mut keys: Vec<String> = Vec::new();
+    let mut out = String::with_capacity(raw.len());
+    for pair in raw.split('&') {
+        if keys.len() == MAX_PROXY_QUERY_PARAMS {
+            return refused("too many parameters".into());
+        }
+        if pair.is_empty() {
+            return refused("an empty parameter (`&&`, or a trailing `&`)".into());
+        }
+        let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+        let (Some(key), Some(value)) = (form_decode(raw_key), form_decode(raw_value)) else {
+            return refused("an invalid percent-encoding, or one that is not UTF-8".into());
+        };
+        if key.is_empty() {
+            return refused("a parameter without a key".into());
+        }
+        if key.chars().chain(value.chars()).any(char::is_control) {
+            return refused("a control character".into());
+        }
+        if !rule.query.contains(&key) {
+            let shown: String = key.escape_debug().take(64).collect();
+            return refused(format!(
+                "query key `{shown}` is not one the rule `{}` allows ({})",
+                rule_label(rule),
+                if rule.query.is_empty() {
+                    "it allows no query".to_string()
+                } else {
+                    rule.query.join(", ")
+                }
+            ));
+        }
+        if keys.contains(&key) {
+            return refused(format!("query key `{key}` given more than once"));
+        }
+        if !out.is_empty() {
+            out.push('&');
+        }
+        out.push_str(&encode_query_component(&key));
+        out.push('=');
+        out.push_str(&encode_query_component(&value));
+        keys.push(key);
+    }
+    Ok(Some(out))
+}
+
+/// Decode one form-encoded query component: `+` is a space, then `%xx`.
+fn form_decode(raw: &str) -> Option<String> {
+    percent_decode_segment(&raw.replace('+', " "))
+}
+
+/// Encode one decoded query key or value: unreserved bytes stay literal,
+/// everything else — `&`, `=`, `;`, `+`, space, non-ASCII — is `%XX`.
+fn encode_query_component(component: &str) -> String {
+    let mut out = String::with_capacity(component.len());
+    for byte in component.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 /// `rule` as the journal names it: `GET /api/v1/applications/*`.
@@ -229,10 +377,18 @@ fn decode_path(raw_path: &str) -> Result<Vec<String>, ReadRequestRefusal> {
         if decoded.chars().any(char::is_control) {
             return malformed("a control character");
         }
-        // `.`/`..`, also behind a `;` parameter (`..;x`), which some servers
-        // strip before resolving the path.
-        let dots = decoded.split(';').next().unwrap_or_default();
-        if dots == "." || dots == ".." {
+        // Fullwidth `．．` is `..` to an upstream that NFKC-normalises; no
+        // vendor path a rule names needs anything but ASCII.
+        if !decoded.is_ascii() {
+            return malformed("a character that is not ASCII");
+        }
+        // What a server that strips a `;` parameter before resolving the
+        // path sees: `..;x` is `..`, and `;x` an empty segment it collapses.
+        let before_param = decoded.split(';').next().unwrap_or_default();
+        if before_param.is_empty() {
+            return malformed("an empty segment before a `;` parameter");
+        }
+        if before_param == "." || before_param == ".." {
             return malformed("a `.` or `..` segment");
         }
         segments.push(decoded);
@@ -304,6 +460,14 @@ mod tests {
         RequestRule {
             method: method.into(),
             path: path.into(),
+            query: vec![],
+        }
+    }
+
+    fn rule_q(method: &str, path: &str, query: &[&str]) -> RequestRule {
+        RequestRule {
+            query: query.iter().map(|k| k.to_string()).collect(),
+            ..rule(method, path)
         }
     }
 
@@ -314,8 +478,16 @@ mod tests {
             auth_schemes: vec!["bearer".into()],
             read_rules: vec![
                 rule("GET", "/api/version"),
-                rule("GET", "/api/v1/applications"),
-                rule("GET", "/api/v1/applications/*"),
+                rule_q(
+                    "GET",
+                    "/api/v1/applications",
+                    &["projects", "selector", "appNamespace"],
+                ),
+                rule_q(
+                    "GET",
+                    "/api/v1/applications/*",
+                    &["appNamespace", "project"],
+                ),
                 rule("GET", "/api/v1/applications/*/managed-resources"),
                 rule("HEAD", "/api/v1/stream/applications"),
             ],
@@ -324,7 +496,13 @@ mod tests {
 
     fn forwarded(method: &str, path: &str) -> Result<(String, String), ReadRequestRefusal> {
         let slot = argo();
-        match_read_request(&slot, method, path).map(|m| (rule_label(m.rule), m.upstream_path))
+        match_read_request(&slot, method, path, None).map(|m| (rule_label(m.rule), m.upstream_path))
+    }
+
+    /// The query forwarded for `GET path?query`.
+    fn query(path: &str, query: &str) -> Result<Option<String>, ReadRequestRefusal> {
+        let slot = argo();
+        match_read_request(&slot, "GET", path, Some(query)).map(|m| m.upstream_query)
     }
 
     #[test]
@@ -373,6 +551,11 @@ mod tests {
             "/api/v1/applications/.%2e",
             "/api/v1/applications/..;x",
             "/api/v1/applications/%2e%2e;x/managed-resources",
+            // nothing before a `;` parameter: empty once it is stripped
+            "/api/v1/applications/;x",
+            "/api/v1/applications/%3Bx/managed-resources",
+            // fullwidth dots: `..` after NFKC
+            "/api/v1/applications/%EF%BC%8E%EF%BC%8E",
             "/api/v1/../v1/applications",
             "/api/./v1/applications",
         ] {
@@ -453,10 +636,91 @@ mod tests {
             forwarded("GET", "/api/v1/applications/a%3Fb%23c%20d").map(|(_, p)| p),
             Ok("/api/v1/applications/a%3Fb%23c%20d".into())
         );
+        // A `;` parameter after a real name is data, and stays put.
         assert_eq!(
-            forwarded("GET", "/api/v1/applications/caf%C3%A9").map(|(_, p)| p),
-            Ok("/api/v1/applications/caf%C3%A9".into())
+            forwarded("GET", "/api/v1/applications/web;v=1").map(|(_, p)| p),
+            Ok("/api/v1/applications/web;v=1".into())
         );
+        // Anything not ASCII is refused, not re-encoded.
+        assert!(matches!(
+            forwarded("GET", "/api/v1/applications/caf%C3%A9"),
+            Err(ReadRequestRefusal::MalformedPath(_))
+        ));
+    }
+
+    #[test]
+    fn only_the_query_keys_a_rule_lists_are_forwarded_canonically() {
+        assert_eq!(query("/api/v1/applications", ""), Ok(None));
+        assert_eq!(
+            query("/api/v1/applications/web", "appNamespace=argo&project=prod"),
+            Ok(Some("appNamespace=argo&project=prod".into()))
+        );
+        // Decoded the way the upstream decodes, re-encoded canonically: a
+        // `+` is a space, and a `&`, `=` or `;` inside a value stays inside.
+        assert_eq!(
+            query(
+                "/api/v1/applications",
+                "selector=team%3Dweb+env%21%3Dprod&projects=a%3Bb%26refresh%3Dhard"
+            ),
+            Ok(Some(
+                "selector=team%3Dweb%20env%21%3Dprod&projects=a%3Bb%26refresh%3Dhard".into()
+            ))
+        );
+        assert_eq!(
+            query("/api/v1/applications", "%70rojects=a"),
+            Ok(Some("projects=a".into()))
+        );
+        // A key with no `=` is a key with an empty value.
+        assert_eq!(
+            query("/api/v1/applications", "projects"),
+            Ok(Some("projects=".into()))
+        );
+    }
+
+    #[test]
+    fn an_undeclared_repeated_or_malformed_query_is_refused() {
+        for (path, q) in [
+            // Argo's hard refresh: a side effect behind a read path
+            ("/api/v1/applications/web", "refresh=hard"),
+            ("/api/v1/applications/web", "project=prod&refresh=normal"),
+            ("/api/v1/applications/web", "%72efresh=hard"),
+            // a rule with no query list allows no query
+            ("/api/version", "x=1"),
+            (
+                "/api/v1/applications/web/managed-resources",
+                "appNamespace=argo",
+            ),
+            // case and spelling are exact
+            ("/api/v1/applications/web", "appnamespace=argo"),
+            ("/api/v1/applications/web", "app_namespace=argo"),
+            // once each: two would be read either way
+            ("/api/v1/applications/web", "project=a&project=b"),
+            ("/api/v1/applications/web", "project=a&%70roject=b"),
+            // malformed
+            ("/api/v1/applications/web", "project=a&"),
+            ("/api/v1/applications/web", "&project=a"),
+            ("/api/v1/applications/web", "project=a&&project=b"),
+            ("/api/v1/applications/web", "=a"),
+            ("/api/v1/applications/web", "project=%zz"),
+            ("/api/v1/applications/web", "project=%ff"),
+            ("/api/v1/applications/web", "project=a%00b"),
+        ] {
+            assert!(
+                matches!(query(path, q), Err(ReadRequestRefusal::QueryRefused(_))),
+                "{path}?{q}"
+            );
+        }
+        let long = format!("projects={}", "a".repeat(MAX_PROXY_QUERY_CHARS));
+        assert!(matches!(
+            query("/api/v1/applications", &long),
+            Err(ReadRequestRefusal::QueryRefused(_))
+        ));
+        // The path is still checked first: an unmatched path is not a
+        // query refusal.
+        assert!(matches!(
+            query("/api/v1/session", "refresh=hard"),
+            Err(ReadRequestRefusal::NoRuleMatches(_))
+        ));
     }
 
     #[test]
@@ -478,24 +742,45 @@ mod tests {
     }
 
     #[test]
-    fn segment_count_and_length_are_bounded() {
+    fn segment_and_parameter_counts_and_lengths_are_bounded() {
         let slot = ConnectionSlot {
             name: "wide".into(),
             auth_schemes: vec!["bearer".into()],
             read_rules: vec![rule("GET", &"/*".repeat(MAX_PROXY_PATH_SEGMENTS))],
         };
         let at_cap = "/a".repeat(MAX_PROXY_PATH_SEGMENTS);
-        assert!(match_read_request(&slot, "GET", &at_cap).is_ok());
+        assert!(match_read_request(&slot, "GET", &at_cap, None).is_ok());
         let over = "/a".repeat(MAX_PROXY_PATH_SEGMENTS + 1);
         assert!(matches!(
-            match_read_request(&slot, "GET", &over),
+            match_read_request(&slot, "GET", &over, None),
             Err(ReadRequestRefusal::MalformedPath(_))
         ));
         let long = format!("/{}", "a".repeat(MAX_PROXY_PATH_CHARS));
         assert!(matches!(
-            match_read_request(&slot, "GET", &long),
+            match_read_request(&slot, "GET", &long, None),
             Err(ReadRequestRefusal::MalformedPath(_))
         ));
+        let slot = ConnectionSlot {
+            read_rules: vec![rule_q("GET", "/a", &["k"])],
+            ..slot
+        };
+        let many = vec!["k=1"; MAX_PROXY_QUERY_PARAMS + 1].join("&");
+        assert!(matches!(
+            match_read_request(&slot, "GET", "/a", Some(&many)),
+            Err(ReadRequestRefusal::QueryRefused(_))
+        ));
+    }
+
+    #[test]
+    fn journal_phases_round_trip() {
+        for phase in [
+            BrokerJournalPhase::Refused,
+            BrokerJournalPhase::Head,
+            BrokerJournalPhase::End,
+        ] {
+            assert_eq!(BrokerJournalPhase::parse(phase.as_str()), Some(phase));
+        }
+        assert_eq!(BrokerJournalPhase::parse("killed"), None);
     }
 
     #[test]

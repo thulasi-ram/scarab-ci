@@ -46,7 +46,7 @@ use scarab_deployment::{
     DeploymentInput, DeploymentStatusReport, DeploymentTarget, DeploymentVersion,
 };
 use scarab_plugin::{
-    BrokerJournalEntry, DeploymentSourceTarget, EnvironmentTargetsPage,
+    BrokerJournalEntry, BrokerJournalPhase, DeploymentSourceTarget, EnvironmentTargetsPage,
     InstallationDeploymentSource, InstallationState, InstallationUsage, PluginConnection,
     PluginConnectionAuthScheme, PluginInstallation, PluginManifest, PluginStore, PluginStoreError,
     PluginUninstall, ReportIngest, ReportItem, ReportItemOutcome, ReportOutcome, RuntimeStatus,
@@ -1239,10 +1239,11 @@ impl PluginStore for PostgresDb {
         sqlx::query(
             "INSERT INTO plugin_broker_journal
                  (installation_id, slot, method, path, rule, status, bytes, started_at,
-                  duration_ms, denied_reason)
+                  duration_ms, denied_reason, request_id, phase, upstream_path, query)
              SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
                                   $6::int[], $7::bigint[], $8::bigint[], $9::bigint[],
-                                  $10::text[])",
+                                  $10::text[], $11::text[], $12::text[], $13::text[],
+                                  $14::text[])",
         )
         .bind(col(|e| e.installation_id.clone()))
         .bind(col(|e| e.slot.clone()))
@@ -1259,6 +1260,10 @@ impl PluginStore for PostgresDb {
         .bind(entries.iter().map(|e| e.started_at).collect::<Vec<_>>())
         .bind(num(|e| e.duration_ms.map(saturating_i64)))
         .bind(opt(|e| e.denied_reason.clone()))
+        .bind(col(|e| e.request_id.clone()))
+        .bind(col(|e| e.phase.as_str().to_string()))
+        .bind(opt(|e| e.upstream_path.clone()))
+        .bind(opt(|e| e.query.clone()))
         .execute(self.pool())
         .await
         .map_err(plugin_store_err)?;
@@ -1270,9 +1275,9 @@ impl PluginStore for PostgresDb {
         installation_id: &str,
         limit: usize,
     ) -> Result<Vec<BrokerJournalEntry>, PluginStoreError> {
-        Ok(sqlx::query(
+        sqlx::query(
             "SELECT installation_id, slot, method, path, rule, status, bytes, started_at,
-                    duration_ms, denied_reason
+                    duration_ms, denied_reason, request_id, phase, upstream_path, query
                FROM plugin_broker_journal
               WHERE installation_id = $1
               ORDER BY id DESC
@@ -1284,23 +1289,32 @@ impl PluginStore for PostgresDb {
         .await
         .map_err(plugin_store_err)?
         .iter()
-        .map(|r| BrokerJournalEntry {
-            installation_id: r.get("installation_id"),
-            slot: r.get("slot"),
-            method: r.get("method"),
-            path: r.get("path"),
-            rule: r.get("rule"),
-            status: r
-                .get::<Option<i32>, _>("status")
-                .and_then(|s| u16::try_from(s).ok()),
-            bytes: r.get::<Option<i64>, _>("bytes").map(|b| b.max(0) as u64),
-            started_at: r.get("started_at"),
-            duration_ms: r
-                .get::<Option<i64>, _>("duration_ms")
-                .map(|d| d.max(0) as u64),
-            denied_reason: r.get("denied_reason"),
+        .map(|r| {
+            let phase: String = r.get("phase");
+            Ok(BrokerJournalEntry {
+                request_id: r.get("request_id"),
+                phase: BrokerJournalPhase::parse(&phase).ok_or_else(|| {
+                    PluginStoreError::Store(format!("broker journal: unreadable phase {phase:?}"))
+                })?,
+                installation_id: r.get("installation_id"),
+                slot: r.get("slot"),
+                method: r.get("method"),
+                path: r.get("path"),
+                upstream_path: r.get("upstream_path"),
+                query: r.get("query"),
+                rule: r.get("rule"),
+                status: r
+                    .get::<Option<i32>, _>("status")
+                    .and_then(|s| u16::try_from(s).ok()),
+                bytes: r.get::<Option<i64>, _>("bytes").map(|b| b.max(0) as u64),
+                started_at: r.get("started_at"),
+                duration_ms: r
+                    .get::<Option<i64>, _>("duration_ms")
+                    .map(|d| d.max(0) as u64),
+                denied_reason: r.get("denied_reason"),
+            })
         })
-        .collect())
+        .collect()
     }
 
     async fn prune_broker_journal(&self, started_before: i64) -> Result<u64, PluginStoreError> {
