@@ -1170,6 +1170,34 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "after_source",
+            "in": "query",
+            "description": "Start after this target — the last row of the previous page: its\n`source` …",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "after_target_id",
+            "in": "query",
+            "description": "… and its `target_id`. Both or neither.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size: default 500, at most 1000. A page shorter than this is\nthe last.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
           }
         ],
         "responses": {
@@ -1754,6 +1782,25 @@
             "required": true,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "description": "Start after this grouping — the last one of the previous page.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size: default 500, at most 1000. A page shorter than this is\nthe last.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
             }
           }
         ],
@@ -4746,13 +4793,14 @@
       },
       "DeploymentSourceTargetDto": {
         "type": "object",
-        "description": "A DeploymentTarget a source reports into an Environment: who reports it,\nits owners and declared version scheme, and its last reported status.",
+        "description": "A DeploymentTarget a source reports into an Environment — one whose\ngrouping the Environment lists NOW: who reports it, its owners and\ndeclared version scheme, and its last status as reported HERE.",
         "required": [
           "source",
           "principal",
           "target_id",
           "vendor_grouping",
           "owner_projects",
+          "resend",
           "last_sequence",
           "updated_at"
         ],
@@ -4773,13 +4821,14 @@
               "string",
               "null"
             ],
-            "description": "`in_progress` / `live` / `failed`, as last reported."
+            "description": "`in_progress` / `live` / `failed`, as last reported here."
           },
           "last_version": {
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "The last status reported into THIS Environment; absent when its last\nstatus went elsewhere (or nowhere) — a status recorded in another\nEnvironment is never shown as this one's."
           },
           "owner_projects": {
             "type": "array",
@@ -4799,6 +4848,10 @@
           "principal": {
             "type": "string",
             "description": "`plugin:<name>`."
+          },
+          "resend": {
+            "type": "boolean",
+            "description": "Its source owes a re-send here: the grouping was mapped or moved into\nthis Environment after its last status. A running reporter re-sends\nwithin about a minute (ADR-0070 §11), and it appears on the board."
           },
           "source": {
             "type": "string",
@@ -4948,7 +5001,18 @@
               },
               {
                 "$ref": "#/components/schemas/DeploymentDto",
-                "description": "What is live there now, if anything."
+                "description": "What is live there now, if anything — as this Environment's record\nlast heard. When `moved_away` is set it is history: the last thing\nreported live HERE, not what this Environment runs now."
+              }
+            ]
+          },
+          "moved_away": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MovedAwayDto",
+                "description": "Display term **Moved** (ADR-0070 §3), not a status: the target's\nsource now routes it to another Environment, or to none. Its record\nhere is untouched; a request for it here waits, and stalls, because\nits reports now land elsewhere."
               }
             ]
           },
@@ -5228,6 +5292,19 @@
           }
         }
       },
+      "MovedAwayDto": {
+        "type": "object",
+        "description": "Where a moved DeploymentTarget's reports go now.",
+        "properties": {
+          "now": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Environment that lists its source's grouping now; absent = none\ndoes (unmapped — its reports are dropped)."
+          }
+        }
+      },
       "OrgEnvironmentDto": {
         "type": "object",
         "description": "An org-level Environment in its minimal shape (ADR-0071, MMP step 1).",
@@ -5467,7 +5544,8 @@
           "runtime_message",
           "approved_by",
           "approved_at",
-          "deployment_sources"
+          "deployment_sources",
+          "usage"
         ],
         "properties": {
           "approved_at": {
@@ -5552,6 +5630,9 @@
           },
           "state": {
             "$ref": "#/components/schemas/InstallationStateDto"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/PluginUsageDto"
           }
         }
       },
@@ -5585,6 +5666,40 @@
           },
           "plugin": {
             "type": "string"
+          }
+        }
+      },
+      "PluginUsageDto": {
+        "type": "object",
+        "description": "How much of its per-installation caps an installation uses: past one, a\nreport about a NEW target (or a new unmapped grouping) is rejected; known\ntargets keep reporting.",
+        "required": [
+          "targets",
+          "max_targets",
+          "unmapped_groupings",
+          "max_unmapped_groupings"
+        ],
+        "properties": {
+          "max_targets": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "max_unmapped_groupings": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "targets": {
+            "type": "integer",
+            "format": "int64",
+            "description": "DeploymentTargets it has reported on.",
+            "minimum": 0
+          },
+          "unmapped_groupings": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Groupings counted as reported on with no Environment listing them\n(one an Environment lists since stays counted until its next report).",
+            "minimum": 0
           }
         }
       },
