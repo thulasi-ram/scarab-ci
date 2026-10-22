@@ -910,10 +910,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // The CredentialBroker (ADR-0072 §11): its OWN listener, so a plugin
     // Pod — whose network reaches only this port — never reaches the public
-    // API or the UI. Only with SCARAB_PLUGINS=on.
+    // API or the UI. Only with SCARAB_PLUGINS=on, and only in a role that
+    // serves the API (api, converged): the chart's broker Service selects
+    // those Pods, and a scheduler or executor has no business accepting
+    // plugin traffic.
     let mut broker_handle: Option<tokio::task::JoinHandle<()>> = None;
-    if config.plugins.enabled {
-        let broker = scarab_server::broker::router(state.clone());
+    if config.plugins.enabled && config.role.serves_broker() {
+        // Its own small pool (red-team F-1): a plugin flood exhausts THIS
+        // one — answered 503 — never the pool the API, the engine and an
+        // admin's kill switch use.
+        let broker_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(scarab_server::broker::BROKER_POOL_MAX_CONNECTIONS)
+            .acquire_timeout(scarab_server::broker::BROKER_POOL_ACQUIRE_TIMEOUT)
+            .connect_lazy(&database_url)
+            .map_err(|e| format!("broker pool: {e}"))?;
+        let broker = scarab_server::broker::router(
+            state
+                .clone()
+                .with_broker_plugin_store(Arc::new(PostgresDb::with_pool(broker_pool))),
+        );
         let listener = tokio::net::TcpListener::bind(&config.plugins.broker_addr).await?;
         println!("broker listening on {}", config.plugins.broker_addr);
         broker_handle = Some(tokio::spawn(async move {

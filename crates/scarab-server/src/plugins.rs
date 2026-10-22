@@ -15,15 +15,17 @@
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use scarab_engine::DbError;
 use scarab_identity::Action;
 use scarab_plugin::{
-    admit_for_mmp, validate_installation_name, DeploymentSourceTarget,
-    InstallationDeploymentSource, InstallationState, PluginCapability, PluginInstallation,
-    PluginManifest, PluginStoreError, RuntimeStatus, UnmappedGrouping,
+    admit_for_mmp, validate_installation_name, DeploymentSourceTarget, EnvironmentTargetsPage,
+    InstallationDeploymentSource, InstallationState, InstallationUsage, PluginCapability,
+    PluginInstallation, PluginManifest, PluginStoreError, RuntimeStatus, UnmappedGrouping,
+    MAX_TARGETS_PER_INSTALLATION, MAX_UNMAPPED_GROUPINGS_PER_INSTALLATION, PAGE_DEFAULT_LIMIT,
+    PAGE_MAX_LIMIT,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -156,7 +158,10 @@ pub(crate) fn plugin_store_api_error(e: PluginStoreError) -> ApiError {
         PluginStoreError::NotFound => ApiError::NotFound,
         e @ PluginStoreError::Killed => ApiError::Denied(e.to_string()),
         e @ PluginStoreError::IdempotencyConflict { .. } => ApiError::Conflict(e.to_string()),
-        e @ (PluginStoreError::IdTaken | PluginStoreError::Store(_)) => {
+        // Busy reaches here only from the public API's own pool; the broker
+        // answers it 503 itself.
+        e
+        @ (PluginStoreError::IdTaken | PluginStoreError::Busy(_) | PluginStoreError::Store(_)) => {
             ApiError::Db(DbError::Other(e.to_string()))
         }
     }
@@ -315,6 +320,31 @@ impl From<&InstallationDeploymentSource> for InstallationDeploymentSourceDto {
     }
 }
 
+/// How much of its per-installation caps an installation uses: past one, a
+/// report about a NEW target (or a new unmapped grouping) is rejected; known
+/// targets keep reporting.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PluginUsageDto {
+    /// DeploymentTargets it has reported on.
+    pub targets: u64,
+    pub max_targets: u64,
+    /// Groupings counted as reported on with no Environment listing them
+    /// (one an Environment lists since stays counted until its next report).
+    pub unmapped_groupings: u64,
+    pub max_unmapped_groupings: u64,
+}
+
+impl From<InstallationUsage> for PluginUsageDto {
+    fn from(u: InstallationUsage) -> Self {
+        Self {
+            targets: u.targets,
+            max_targets: MAX_TARGETS_PER_INSTALLATION,
+            unmapped_groupings: u.unmapped_groupings,
+            max_unmapped_groupings: MAX_UNMAPPED_GROUPINGS_PER_INSTALLATION,
+        }
+    }
+}
+
 /// A PluginInstallation (ADR-0072 §10).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PluginInstallationDto {
@@ -346,11 +376,13 @@ pub struct PluginInstallationDto {
     /// The Environment sources that name this installation — at install,
     /// the ones written before it existed, which it now feeds.
     pub deployment_sources: Vec<InstallationDeploymentSourceDto>,
+    pub usage: PluginUsageDto,
 }
 
 fn installation_dto(
     i: &PluginInstallation,
     sources: &[InstallationDeploymentSource],
+    usage: InstallationUsage,
 ) -> PluginInstallationDto {
     PluginInstallationDto {
         id: i.id.clone(),
@@ -371,6 +403,7 @@ fn installation_dto(
         killed_by: i.killed_by.clone(),
         killed_at: i.killed_at,
         deployment_sources: sources.iter().map(Into::into).collect(),
+        usage: usage.into(),
     }
 }
 
@@ -423,8 +456,9 @@ impl From<&UnmappedGrouping> for UnmappedGroupingDto {
     }
 }
 
-/// A DeploymentTarget a source reports into an Environment: who reports it,
-/// its owners and declared version scheme, and its last reported status.
+/// A DeploymentTarget a source reports into an Environment — one whose
+/// grouping the Environment lists NOW: who reports it, its owners and
+/// declared version scheme, and its last status as reported HERE.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct DeploymentSourceTargetDto {
     /// The reporting installation's name — the target's `source`.
@@ -438,10 +472,17 @@ pub struct DeploymentSourceTargetDto {
     pub owner_projects: Vec<String>,
     /// Unix-ms the owners were last reported.
     pub owners_reported_at: Option<i64>,
+    /// The last status reported into THIS Environment; absent when its last
+    /// status went elsewhere (or nowhere) — a status recorded in another
+    /// Environment is never shown as this one's.
     pub last_version: Option<String>,
-    /// `in_progress` / `live` / `failed`, as last reported.
+    /// `in_progress` / `live` / `failed`, as last reported here.
     pub last_status: Option<String>,
     pub last_label: Option<String>,
+    /// Its source owes a re-send here: the grouping was mapped or moved into
+    /// this Environment after its last status. A running reporter re-sends
+    /// within about a minute (ADR-0070 §11), and it appears on the board.
+    pub resend: bool,
     pub last_sequence: u64,
     /// Unix-ms.
     pub updated_at: i64,
@@ -462,6 +503,7 @@ impl From<&DeploymentSourceTarget> for DeploymentSourceTargetDto {
             last_version: t.last_version.clone(),
             last_status: t.last_status.clone(),
             last_label: t.last_label.clone(),
+            resend: t.resend,
             last_sequence: t.last_sequence,
             updated_at: t.updated_at,
         }
@@ -489,11 +531,47 @@ async fn with_sources(
     st: &AppState,
     installation: &PluginInstallation,
 ) -> Result<PluginInstallationDto, ApiError> {
-    let sources = store(st)?
+    let store = store(st)?;
+    let sources = store
         .deployment_sources_naming(&installation.org, &installation.name)
         .await
         .map_err(plugin_store_api_error)?;
-    Ok(installation_dto(installation, &sources))
+    let usage = store
+        .installation_usage(&installation.id)
+        .await
+        .map_err(plugin_store_api_error)?;
+    Ok(installation_dto(installation, &sources, usage))
+}
+
+/// A page size from a query: default [`PAGE_DEFAULT_LIMIT`], at most
+/// [`PAGE_MAX_LIMIT`].
+fn page_size(limit: Option<usize>) -> usize {
+    limit.unwrap_or(PAGE_DEFAULT_LIMIT).clamp(1, PAGE_MAX_LIMIT)
+}
+
+/// `GET …/unmapped-groupings` paging: keyset on the grouping.
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct UnmappedGroupingsQuery {
+    /// Start after this grouping — the last one of the previous page.
+    pub after: Option<String>,
+    /// Page size: default 500, at most 1000. A page shorter than this is
+    /// the last.
+    pub limit: Option<usize>,
+}
+
+/// `GET …/deployment-targets` paging: keyset on (source, target id).
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct DeploymentTargetsQuery {
+    /// Start after this target — the last row of the previous page: its
+    /// `source` …
+    pub after_source: Option<String>,
+    /// … and its `target_id`. Both or neither.
+    pub after_target_id: Option<String>,
+    /// Page size: default 500, at most 1000. A page shorter than this is
+    /// the last.
+    pub limit: Option<usize>,
 }
 
 /// The plugins this Scarab can install. Administer on the Org.
@@ -782,13 +860,15 @@ pub(crate) async fn enable_plugin(
 }
 
 /// The groupings an installation reports on that no Environment lists —
-/// what is waiting to be mapped (ADR-0071 §5). Administer on the Org.
+/// what is waiting to be mapped (ADR-0071 §5) — a page at a time, by
+/// grouping. Administer on the Org.
 #[utoipa::path(
     get,
     path = "/v1/orgs/{org}/plugins/{name}/unmapped-groupings",
     params(
         ("org" = String, Path, description = "org"),
-        ("name" = String, Path, description = "installation name")
+        ("name" = String, Path, description = "installation name"),
+        UnmappedGroupingsQuery
     ),
     summary = "A plugin's vendor groupings no Environment lists (ADR-0071 §5)",
     responses(
@@ -801,6 +881,7 @@ pub(crate) async fn unmapped_groupings(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((org, name)): Path<(String, String)>,
+    Query(q): Query<UnmappedGroupingsQuery>,
 ) -> Result<Json<Vec<UnmappedGroupingDto>>, ApiError> {
     org_admin(&st, &headers, &org).await?;
     let store = store(&st)?;
@@ -810,20 +891,22 @@ pub(crate) async fn unmapped_groupings(
         .map_err(plugin_store_api_error)?
         .ok_or(ApiError::NotFound)?;
     let unmapped = store
-        .unmapped_groupings(&installation.id)
+        .unmapped_groupings(&installation.id, q.after.as_deref(), page_size(q.limit))
         .await
         .map_err(plugin_store_api_error)?;
     Ok(Json(unmapped.iter().map(Into::into).collect()))
 }
 
-/// The DeploymentTargets sources report into an Environment, with their
-/// owners, version scheme and last reported status. Read on the Org.
+/// The DeploymentTargets sources report into an Environment — those whose
+/// grouping it lists now — with their owners, version scheme and last status
+/// reported here, a page at a time by (source, target id). Read on the Org.
 #[utoipa::path(
     get,
     path = "/v1/orgs/{org}/environments/{env}/deployment-targets",
     params(
         ("org" = String, Path, description = "org"),
-        ("env" = String, Path, description = "environment name")
+        ("env" = String, Path, description = "environment name"),
+        DeploymentTargetsQuery
     ),
     summary = "An Environment's reported DeploymentTargets and their owners (ADR-0072)",
     responses(
@@ -836,49 +919,28 @@ pub(crate) async fn environment_deployment_targets(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((org, env)): Path<(String, String)>,
+    Query(q): Query<DeploymentTargetsQuery>,
 ) -> Result<Json<Vec<DeploymentSourceTargetDto>>, ApiError> {
     let scope = rbac_scope(&org, None);
     authorize_scoped(&st, &headers, Action::Read, Some(&scope)).await?;
+    let after = match (q.after_source, q.after_target_id) {
+        (Some(source), Some(target_id)) => Some((source, target_id)),
+        (None, None) => None,
+        _ => {
+            return Err(ApiError::BadRequest(
+                "`after_source` and `after_target_id` go together".into(),
+            ))
+        }
+    };
+    let page = EnvironmentTargetsPage {
+        after,
+        limit: page_size(q.limit),
+    };
     let targets = store(&st)?
-        .environment_targets(&org, &env)
+        .environment_targets(&org, &env, &page)
         .await
         .map_err(plugin_store_api_error)?;
     Ok(Json(targets.iter().map(Into::into).collect()))
-}
-
-/// F1 (c-min audit): every EnvironmentDeploymentSource must name an
-/// installation registered **in this org**, or the PUT is refused (400). A
-/// source naming nothing would sit dormant until someone installed a plugin
-/// by that name — which would then inherit the routing without its
-/// installer having consented to it.
-///
-/// No registry wired (a hand-built test state) means nothing to check
-/// against. The check and the write are not one transaction: an uninstall
-/// racing the PUT can leave a source naming the retired name, which routes
-/// nothing — names are never reused — so the race is harmless.
-pub(crate) async fn check_sources_are_installed<'a>(
-    st: &AppState,
-    org: &str,
-    installations: impl IntoIterator<Item = &'a str>,
-) -> Result<(), ApiError> {
-    let Some(store) = st.plugins.as_deref() else {
-        return Ok(());
-    };
-    let names: std::collections::BTreeSet<&str> = installations.into_iter().collect();
-    for name in names {
-        let installed = store
-            .installation(org, name)
-            .await
-            .map_err(plugin_store_api_error)?
-            .is_some();
-        if !installed {
-            return Err(ApiError::BadRequest(format!(
-                "deployment source `{name}` names no plugin installation in org `{org}`; \
-                 install it first (ADR-0072)"
-            )));
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

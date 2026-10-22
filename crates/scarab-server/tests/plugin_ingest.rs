@@ -180,6 +180,62 @@ fn status_item(key: &str, sequence: u64, version: &str) -> Value {
     })
 }
 
+/// Like [`call`], with the response headers.
+async fn call_with_headers(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    bearer: Option<&str>,
+    body: Option<Value>,
+) -> (StatusCode, axum::http::HeaderMap, String) {
+    let mut req = Request::builder().method(method).uri(uri);
+    if let Some(bearer) = bearer {
+        req = req.header("authorization", format!("Bearer {bearer}"));
+    }
+    let req = match body {
+        Some(b) => req
+            .header("content-type", "application/json")
+            .body(Body::from(b.to_string())),
+        None => req.body(Body::empty()),
+    }
+    .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        headers,
+        String::from_utf8_lossy(&bytes).into_owned(),
+    )
+}
+
+/// Wait until `n` backends of this database are blocked on a lock — how a
+/// test KNOWS a request reached its wait, rather than hoping a spawned task
+/// got scheduled there.
+async fn until_waiting_on_locks(pool: &sqlx::PgPool, n: i64) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if waiting >= n {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{n} lock waiter(s) never appeared"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 async fn report(apps: &Apps, token: &str, items: Vec<Value>) -> (StatusCode, Value) {
     call(
         &apps.broker,
@@ -610,5 +666,303 @@ async fn a_member_cannot_install_but_can_read_deployment_targets() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "a member kills");
+    tdb.cleanup().await;
+}
+
+fn outcomes_of(results: &Value) -> Vec<&str> {
+    results["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["outcome"].as_str().unwrap())
+        .collect()
+}
+
+/// Review #4: an item this release cannot read (a newer reporter's status
+/// variant, a missing field) is `rejected` on its own — it must not wedge
+/// every retry of the batch with a 400.
+#[tokio::test]
+async fn an_unreadable_item_is_rejected_alone_and_the_rest_land() {
+    let Some((tdb, pg)) = migrated().await else {
+        return;
+    };
+    let apps = apps(pg);
+    let token = install(&apps.public, "acme", "argocd").await;
+    list_source(&apps.public, "acme", "prod", "argocd", "prod").await;
+    let mut newer_status = status_item("k1", 1, "v1");
+    newer_status["status"] = json!("degraded");
+    let mut missing = status_item("k2", 2, "v2");
+    missing.as_object_mut().unwrap().remove("version");
+    let (status, results) = report(
+        &apps,
+        &token,
+        vec![newer_status, missing, json!(7), status_item("k3", 3, "v3")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{results}");
+    assert_eq!(
+        outcomes_of(&results),
+        vec!["rejected", "rejected", "rejected", "accepted"]
+    );
+    assert!(
+        results["results"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("unreadable item"),
+        "{results}"
+    );
+    tdb.cleanup().await;
+}
+
+/// Review #6: the owner SET is the fact — a retry listing the same owners in
+/// another order is a duplicate, not a key reused for other content (409).
+/// And red-team F-4: an invisible format character is rejected.
+#[tokio::test]
+async fn a_retry_with_reordered_owners_is_a_duplicate_and_bidi_is_rejected() {
+    let Some((tdb, pg)) = migrated().await else {
+        return;
+    };
+    let apps = apps(pg);
+    let token = install(&apps.public, "acme", "argocd").await;
+    list_source(&apps.public, "acme", "prod", "argocd", "prod").await;
+    let mut first = status_item("k1", 1, "v1");
+    first["owners"] = json!(["acme/web", "acme/api"]);
+    let mut retry = first.clone();
+    retry["owners"] = json!(["acme/api", "acme/web"]);
+    let (_, r) = report(&apps, &token, vec![first]).await;
+    assert_eq!(outcomes_of(&r), vec!["accepted"]);
+    let (status, r) = report(&apps, &token, vec![retry]).await;
+    assert_eq!(status, StatusCode::OK, "{r}");
+    assert_eq!(outcomes_of(&r), vec!["duplicate"]);
+
+    let mut lookalike = status_item("k2", 2, "v2");
+    lookalike["target_id"] = json!("argocd/w\u{200B}eb");
+    let mut reversed = status_item("k3", 3, "v3");
+    reversed["label"] = json!("\u{202E}yhtlaeh");
+    let (_, r) = report(&apps, &token, vec![lookalike, reversed]).await;
+    assert_eq!(outcomes_of(&r), vec!["rejected", "rejected"]);
+    tdb.cleanup().await;
+}
+
+/// Red-team F-5: a 500 tells the plugin only a request id; the database's
+/// own words go to the server log.
+#[tokio::test]
+async fn a_broker_500_carries_no_internal_detail() {
+    let Some((tdb, pg)) = migrated().await else {
+        return;
+    };
+    let apps = apps(pg);
+    let token = install(&apps.public, "acme", "argocd").await;
+    list_source(&apps.public, "acme", "prod", "argocd", "prod").await;
+    // Break the store for real: the receipt insert now fails.
+    sqlx::query("DROP TABLE plugin_report_receipts")
+        .execute(&tdb.pool)
+        .await
+        .unwrap();
+    let (status, headers, body) = call_with_headers(
+        &apps.broker,
+        "POST",
+        "/_scarab/plugin/v1/reports",
+        Some(&token),
+        Some(json!({ "items": [status_item("k1", 1, "v1")] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    let id = headers["x-request-id"].to_str().unwrap();
+    assert_eq!(body, format!("internal error; request id {id}"));
+    tdb.cleanup().await;
+}
+
+/// P3 (judge-d1, red-team F-1), interleaving CONSTRUCTED: a test
+/// transaction holds the Org's Deployment counter row, so ingest #1 blocks
+/// holding its installation's row lock — the lock a kill needs.
+/// - #2 from the same installation gets 429 + Retry-After at once, without
+///   queueing behind #1;
+/// - the kill waits on #1, and commits once #1's lock_timeout fires (#1 is
+///   told 503 + Retry-After; nothing of it is recorded);
+/// - the next ingest is refused by the kill (403); nothing was appended.
+#[tokio::test]
+async fn a_kill_lands_behind_a_blocked_ingest_without_queueing_a_flood() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    // Long enough that the kill is certainly queued behind #1 before #1
+    // gives up (both waits are observed below); short enough for a test.
+    let pg = Arc::new(
+        PostgresDb::with_pool(tdb.pool.clone())
+            .with_plugin_ingest_lock_timeout(std::time::Duration::from_secs(3)),
+    );
+    pg.migrate().await.unwrap();
+    let apps = apps(pg.clone());
+    let token = install(&apps.public, "acme", "argocd").await;
+    list_source(&apps.public, "acme", "prod", "argocd", "prod").await;
+    // The first append creates the Org's counter row.
+    let (_, r) = report(&apps, &token, vec![status_item("k1", 1, "v1")]).await;
+    assert_eq!(outcomes_of(&r), vec!["accepted"]);
+
+    let mut hold = tdb.pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM deployment_input_counters WHERE org = 'acme' FOR UPDATE")
+        .execute(&mut *hold)
+        .await
+        .unwrap();
+
+    let first = {
+        let broker = apps.broker.clone();
+        let token = token.clone();
+        tokio::spawn(async move {
+            call_with_headers(
+                &broker,
+                "POST",
+                "/_scarab/plugin/v1/reports",
+                Some(&token),
+                Some(json!({ "items": [status_item("k2", 2, "v2")] })),
+            )
+            .await
+        })
+    };
+    until_waiting_on_locks(&tdb.pool, 1).await;
+
+    let (status, headers, body) = call_with_headers(
+        &apps.broker,
+        "POST",
+        "/_scarab/plugin/v1/reports",
+        Some(&token),
+        Some(json!({ "items": [status_item("k3", 3, "v3")] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert!(headers.contains_key("retry-after"));
+
+    let kill = {
+        let public = apps.public.clone();
+        tokio::spawn(async move {
+            call(
+                &public,
+                "POST",
+                "/v1/orgs/acme/plugins/argocd/kill",
+                None,
+                None,
+            )
+            .await
+        })
+    };
+    until_waiting_on_locks(&tdb.pool, 2).await;
+    assert!(
+        !kill.is_finished(),
+        "the kill waits on #1's installation lock"
+    );
+
+    let (status, headers, body) = first.await.unwrap();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(headers.contains_key("retry-after"));
+    let (status, killed) = kill.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{killed}");
+    assert_eq!(killed["state"], json!("killed"));
+    hold.rollback().await.unwrap();
+
+    let (status, body) = report(&apps, &token, vec![status_item("k4", 4, "v4")]).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    use scarab_deployment::DeploymentStore;
+    let versions: Vec<String> = pg
+        .inputs("acme", "prod")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|l| l.input.version().0.clone())
+        .collect();
+    assert_eq!(versions, vec!["v1"], "nothing after k1 was recorded");
+    tdb.cleanup().await;
+}
+
+/// P1 + P2 (judge-d1) end to end: a grouping moved from staging to prod
+/// shows Moved on staging's board row (naming prod), prod's targets flag a
+/// re-send, `/targets?resend=true` lists it, and the re-sent status lands on
+/// prod's board and clears the flag.
+#[tokio::test]
+async fn a_moved_target_shows_on_the_old_board_and_is_re_sent_to_the_new() {
+    let Some((tdb, pg)) = migrated().await else {
+        return;
+    };
+    let apps = apps(pg);
+    let token = install(&apps.public, "acme", "argocd").await;
+    list_source(&apps.public, "acme", "staging", "argocd", "prod").await;
+    let (_, r) = report(&apps, &token, vec![status_item("k1", 1, "v1")]).await;
+    assert_eq!(outcomes_of(&r), vec!["accepted"]);
+
+    // Move the grouping `prod` from staging to prod.
+    let (status, body) = call(
+        &apps.public,
+        "PUT",
+        "/v1/orgs/acme/environments/staging",
+        None,
+        Some(json!({ "deployment_sources": [] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    list_source(&apps.public, "acme", "prod", "argocd", "prod").await;
+
+    let (_, board) = call(
+        &apps.public,
+        "GET",
+        "/v1/orgs/acme/board?environment=staging",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(board[0]["moved_away"], json!({ "now": "prod" }), "{board}");
+    assert_eq!(board[0]["live"]["version"], json!("v1"), "history stays");
+
+    let (_, owned) = call(
+        &apps.public,
+        "GET",
+        "/v1/orgs/acme/environments/prod/deployment-targets",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(owned[0]["resend"], json!(true), "{owned}");
+    assert_eq!(
+        owned[0]["last_status"],
+        Value::Null,
+        "staging's status is not prod's"
+    );
+    let (_, flagged) = call(
+        &apps.broker,
+        "GET",
+        "/_scarab/plugin/v1/targets?resend=true",
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        flagged["targets"][0]["target_id"],
+        json!("argocd/web"),
+        "{flagged}"
+    );
+    assert_eq!(flagged["targets"][0]["environment"], json!("prod"));
+
+    // The re-send: current state, next sequence, new key.
+    let (_, r) = report(&apps, &token, vec![status_item("k2-resend", 2, "v1")]).await;
+    assert_eq!(outcomes_of(&r), vec!["accepted"]);
+    let (_, board) = call(
+        &apps.public,
+        "GET",
+        "/v1/orgs/acme/board?environment=prod",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(board[0]["live"]["version"], json!("v1"), "{board}");
+    assert_eq!(board[0]["moved_away"], Value::Null);
+    let (_, flagged) = call(
+        &apps.broker,
+        "GET",
+        "/_scarab/plugin/v1/targets?resend=true",
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(flagged["targets"], json!([]), "cleared");
     tdb.cleanup().await;
 }

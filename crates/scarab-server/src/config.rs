@@ -107,6 +107,13 @@ pub enum Role {
 }
 
 impl Role {
+    /// Roles that serve the CredentialBroker's listener when plugins are on
+    /// (ADR-0072 §11): the ones that serve the API. The broker is part of
+    /// the control plane's front door, not of the scheduler or executor.
+    pub fn serves_broker(self) -> bool {
+        matches!(self, Role::Converged | Role::Api)
+    }
+
     /// Roles that drive the scheduler + executor background loop.
     pub fn runs_driver(self) -> bool {
         matches!(self, Role::Converged | Role::Scheduler | Role::Executor)
@@ -626,7 +633,7 @@ impl PluginsConfig {
                 "SCARAB_BROKER_ADDR must be an `ip:port` socket address, got {broker_addr:?}"
             )));
         }
-        if enabled && broker_addr == api_addr {
+        if enabled && listeners_clash(&broker_addr, api_addr) {
             return Err(invalid(format!(
                 "SCARAB_BROKER_ADDR ({broker_addr}) is the API's own address; the broker is a \
                  separate listener so plugins never reach the public API (ADR-0072 §11)"
@@ -739,6 +746,25 @@ impl PluginsConfig {
             dev_allow_tag: false,
             dev_tokens: Vec::new(),
         }
+    }
+}
+
+/// Whether the broker's address and the API's would bind the same socket.
+/// Compared as socket addresses, not strings: `127.0.0.1:8080` or
+/// `[::]:8080` against an API on `0.0.0.0:8080` is the same port on an
+/// overlapping address — a wildcard covers every address of its port. An
+/// API address that is not `ip:port` falls back to a string compare.
+fn listeners_clash(broker_addr: &str, api_addr: &str) -> bool {
+    use std::net::SocketAddr;
+    match (
+        broker_addr.parse::<SocketAddr>(),
+        api_addr.parse::<SocketAddr>(),
+    ) {
+        (Ok(b), Ok(a)) => {
+            b.port() == a.port()
+                && (b.ip() == a.ip() || b.ip().is_unspecified() || a.ip().is_unspecified())
+        }
+        _ => broker_addr == api_addr,
     }
 }
 
@@ -1677,9 +1703,13 @@ impl Config {
             },
             if self.plugins.enabled {
                 format!(
-                    "plugins: ON (ADR-0072) — broker on {}, namespace {}, argocd from {}; \
+                    "plugins: ON (ADR-0072) — broker {}, namespace {}, argocd from {}; \
                      token verification: {}; installs: {}",
-                    self.plugins.broker_addr,
+                    if self.role.serves_broker() {
+                        format!("on {}", self.plugins.broker_addr)
+                    } else {
+                        "not served by this role (api/converged only)".to_string()
+                    },
                     self.plugins.namespace,
                     self.plugins.argocd_repo,
                     if self.plugins.dev_tokens.is_empty() {
@@ -3121,6 +3151,16 @@ connections:
                 ("SCARAB_PLUGINS", "on"),
                 ("SCARAB_BROKER_ADDR", "0.0.0.0:8080"),
             ],
+            // The API's port on a narrower or IPv6 address is still its
+            // socket: a string compare let these through (red-team F-8).
+            &[
+                ("SCARAB_PLUGINS", "on"),
+                ("SCARAB_BROKER_ADDR", "127.0.0.1:8080"),
+            ],
+            &[
+                ("SCARAB_PLUGINS", "on"),
+                ("SCARAB_BROKER_ADDR", "[::]:8080"),
+            ],
             &[("SCARAB_PLUGIN_NAMESPACE", "Scarab_Plugins")],
             &[("SCARAB_PLUGIN_BROKER_PEER", "10.0.0.1/32")],
             &[("SCARAB_PLUGIN_ARGOCD_REPO", "ghcr.io/x/argocd:v1")],
@@ -3192,6 +3232,40 @@ connections:
             !format!("{cfg:?}").contains("dev-tok-7f3c9a1e"),
             "a dev token never reaches Debug output"
         );
+    }
+
+    #[test]
+    fn listeners_clash_by_socket_not_by_string() {
+        for (broker, api) in [
+            ("0.0.0.0:8080", "0.0.0.0:8080"),
+            ("127.0.0.1:8080", "0.0.0.0:8080"),
+            ("0.0.0.0:8080", "127.0.0.1:8080"),
+            ("[::]:8080", "0.0.0.0:8080"),
+            ("10.0.0.5:8080", "10.0.0.5:8080"),
+        ] {
+            assert!(listeners_clash(broker, api), "{broker} vs {api}");
+        }
+        for (broker, api) in [
+            ("0.0.0.0:8090", "0.0.0.0:8080"),
+            ("127.0.0.1:8080", "10.0.0.5:8080"),
+            ("[::1]:8080", "127.0.0.1:8080"),
+        ] {
+            assert!(!listeners_clash(broker, api), "{broker} vs {api}");
+        }
+    }
+
+    #[test]
+    fn only_the_api_roles_serve_the_broker() {
+        assert!(Role::Converged.serves_broker());
+        assert!(Role::Api.serves_broker());
+        for role in [
+            Role::Scheduler,
+            Role::Executor,
+            Role::Webhook,
+            Role::Workspace,
+        ] {
+            assert!(!role.serves_broker(), "{role:?}");
+        }
     }
 
     #[test]

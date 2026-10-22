@@ -154,9 +154,21 @@ pub struct AppState {
     pub org_environments: Option<Arc<dyn scarab_project::OrgEnvironmentStore>>,
     /// The PluginInstallation registry and report ingest (ADR-0072). `None`
     /// disables the plugin endpoints (404) and the broker's authenticated
-    /// routes, and leaves an org Environment's sources unchecked against
-    /// installations (F1 — a hand-built state has nothing to check against).
+    /// routes. (An org Environment's sources are checked against
+    /// installations by the Environment store itself, in its write's
+    /// transaction — c-min F1.)
     pub plugins: Option<Arc<dyn scarab_plugin::PluginStore>>,
+    /// The same registry on the broker's **own small connection pool**
+    /// (ADR-0072, red-team F-1): whatever plugins send, they can exhaust
+    /// only that pool — answered 503 — never the one the API, the engine
+    /// and an admin's kill switch use. `None` = the broker uses `plugins`
+    /// (a hand-built state).
+    pub broker_plugins: Option<Arc<dyn scarab_plugin::PluginStore>>,
+    /// At most one report batch in flight per installation in this process
+    /// (red-team F-1): a second is answered 429 before it takes a database
+    /// connection, so a flood cannot queue behind the installation's row
+    /// lock — the lock a kill needs.
+    pub plugin_ingest_permits: Arc<broker::IngestPermits>,
     /// Proves who calls the broker (ADR-0072 §11): TokenReview in production
     /// (slice d2), static dev tokens under `SCARAB_DEV_INSECURE`. `None` makes
     /// every authenticated broker call a 401 — nothing proven, nothing taken.
@@ -266,6 +278,8 @@ impl AppState {
             deployments: None,
             org_environments: None,
             plugins: None,
+            broker_plugins: None,
+            plugin_ingest_permits: Arc::new(broker::IngestPermits::default()),
             plugin_tokens: None,
             plugin_policy: Arc::new(plugins::PluginPolicy::off()),
             secret_coverage: None,
@@ -362,7 +376,7 @@ impl AppState {
     }
 
     /// Enable the plugin registry and its endpoints (ADR-0072) under
-    /// `policy`, and check every org Environment source against it.
+    /// `policy`.
     pub fn with_plugins(
         mut self,
         plugins: Arc<dyn scarab_plugin::PluginStore>,
@@ -370,6 +384,13 @@ impl AppState {
     ) -> Self {
         self.plugins = Some(plugins);
         self.plugin_policy = Arc::new(policy);
+        self
+    }
+
+    /// Serve the broker from `store` — the registry on the broker's own
+    /// small pool — instead of [`Self::with_plugins`]'s.
+    pub fn with_broker_plugin_store(mut self, store: Arc<dyn scarab_plugin::PluginStore>) -> Self {
+        self.broker_plugins = Some(store);
         self
     }
 
@@ -7268,11 +7289,26 @@ pub struct DeploymentDto {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct EnvironmentBoardRowDto {
     pub target: DeploymentTargetDto,
-    /// What is live there now, if anything.
+    /// What is live there now, if anything — as this Environment's record
+    /// last heard. When `moved_away` is set it is history: the last thing
+    /// reported live HERE, not what this Environment runs now.
     pub live: Option<DeploymentDto>,
     /// The newest Deployment, only when it is not the live one — a change in
     /// flight, stalled or failed.
     pub newest: Option<DeploymentDto>,
+    /// Display term **Moved** (ADR-0070 §3), not a status: the target's
+    /// source now routes it to another Environment, or to none. Its record
+    /// here is untouched; a request for it here waits, and stalls, because
+    /// its reports now land elsewhere.
+    pub moved_away: Option<MovedAwayDto>,
+}
+
+/// Where a moved DeploymentTarget's reports go now.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MovedAwayDto {
+    /// The Environment that lists its source's grouping now; absent = none
+    /// does (unmapped — its reports are dropped).
+    pub now: Option<String>,
 }
 
 /// `GET /v1/orgs/{org}/board` filter.
@@ -7439,6 +7475,7 @@ async fn get_environment_board(
         .flat_map(|row| row.live.iter().chain(row.newest.iter()))
         .collect();
     let projects = requester_projects(&st, &org, &shown).await?;
+    let routes = current_target_routes(&st, &org, &board).await?;
     Ok(Json(
         board
             .iter()
@@ -7446,9 +7483,39 @@ async fn get_environment_board(
                 target: (&row.target).into(),
                 live: row.live.as_ref().map(|d| deployment_dto(d, &projects)),
                 newest: row.newest.as_ref().map(|d| deployment_dto(d, &projects)),
+                moved_away: routes
+                    .get(&(row.target.source.clone(), row.target.id.clone()))
+                    .filter(|now| now.as_deref() != Some(row.target.environment.as_str()))
+                    .map(|now| MovedAwayDto { now: now.clone() }),
             })
             .collect(),
     ))
+}
+
+/// Where each board row's target routes now, for the targets a plugin
+/// installation of the Org has reported on (one query for the whole board).
+/// A target only a Deploy Run ever named, or whose source is not an
+/// installation, is absent: nothing routes it, so it cannot have moved.
+async fn current_target_routes(
+    st: &AppState,
+    org: &str,
+    board: &[scarab_deployment::EnvironmentBoardRow],
+) -> Result<std::collections::HashMap<(String, String), Option<String>>, ApiError> {
+    let Some(plugins) = st.plugins.as_deref() else {
+        return Ok(std::collections::HashMap::new());
+    };
+    let targets: std::collections::BTreeSet<(String, String)> = board
+        .iter()
+        .map(|row| (row.target.source.clone(), row.target.id.clone()))
+        .collect();
+    let targets: Vec<(String, String)> = targets.into_iter().collect();
+    Ok(plugins
+        .target_routings(org, &targets)
+        .await
+        .map_err(plugins::plugin_store_api_error)?
+        .into_iter()
+        .map(|r| ((r.installation, r.target_id), r.environment))
+        .collect())
 }
 
 /// An Environment's Deployments, newest first, optionally narrowed to one
@@ -9506,6 +9573,7 @@ impl utoipa::Modify for SecuritySchemes {
         DeploymentRequesterDto,
         DeploymentStatusReportDto,
         EnvironmentBoardRowDto,
+        MovedAwayDto,
         org_environments::OrgEnvironmentDto,
         org_environments::EnvironmentDeploymentSourceDto,
         org_environments::PutOrgEnvironmentRequest,
@@ -9518,6 +9586,7 @@ impl utoipa::Modify for SecuritySchemes {
         plugins::RuntimeStatusDto,
         plugins::InstallationDeploymentSourceDto,
         plugins::PluginInstallationDto,
+        plugins::PluginUsageDto,
         plugins::InstallPluginRequest,
         plugins::UninstalledPluginDto,
         plugins::UnmappedGroupingDto,
