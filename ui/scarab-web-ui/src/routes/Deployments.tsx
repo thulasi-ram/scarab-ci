@@ -45,7 +45,7 @@ import {
   targetLabel,
 } from "../deployments";
 import { envPills } from "../org-environments";
-import { targetKey, targetOwners } from "../plugins";
+import { movedAwayNote, targetKey, targetOwners } from "../plugins";
 import StatusBadge from "../components/StatusBadge";
 import Icon from "../components/Icon";
 import Doodle from "../components/Doodle";
@@ -197,15 +197,38 @@ export default function Deployments() {
                                     </Show>
                                   </td>
                                   <td>
+                                    {/* Moved (ADR-0070 §3): its source routes it elsewhere
+                                        now, so what was live here is history, not this
+                                        Environment's state — shown as the note, with the
+                                        last version here muted. */}
                                     <Show
-                                      when={row.live}
-                                      fallback={<span class="subtle">nothing live</span>}
+                                      when={row.moved_away}
+                                      fallback={
+                                        <Show
+                                          when={row.live}
+                                          fallback={<span class="subtle">nothing live</span>}
+                                        >
+                                          {(l) => <span class="mono dep-version">{l().version}</span>}
+                                        </Show>
+                                      }
                                     >
-                                      {(l) => <span class="mono dep-version">{l().version}</span>}
+                                      {(m) => (
+                                        <span class="dep-cell" title={movedAwayNote(m()).title}>
+                                          <span class="dep-tag dep-tag-muted">{movedAwayNote(m()).label}</span>
+                                          <Show when={row.live}>
+                                            {(l) => (
+                                              <span class="mono subtle">last here: {l().version}</span>
+                                            )}
+                                          </Show>
+                                        </span>
+                                      )}
                                     </Show>
                                   </td>
                                   <td>
-                                    <Show when={row.live} fallback={<span class="subtle">—</span>}>
+                                    <Show
+                                      when={!row.moved_away && row.live}
+                                      fallback={<span class="subtle">—</span>}
+                                    >
                                       {(l) => (
                                         <span class="dep-cell">
                                           <span class="mono subtle">#{l().id}</span>

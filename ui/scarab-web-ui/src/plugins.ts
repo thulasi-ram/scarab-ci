@@ -217,3 +217,47 @@ export function targetOwners(
   }
   return owners;
 }
+
+/**
+ * The note a board row carries when its target's source now routes it
+ * somewhere else — the display term **Moved** (ADR-0070 §3), not a status.
+ * The row's history stays; what was live here is no longer what this
+ * Environment runs.
+ */
+export function movedAwayNote(moved: { now?: string | null }): { label: string; title: string } {
+  return moved.now
+    ? {
+        label: `moved — now: ${moved.now}`,
+        title: `Its source now reports this target into ${moved.now}. Its history here stays; a request for it here will stall, because its reports land in ${moved.now}.`,
+      }
+    : {
+        label: "moved — unmapped",
+        title:
+          "No environment lists its source's grouping any more, so its reports are dropped. Its history here stays.",
+      };
+}
+
+/** What adding `installation / grouping` to `env` tells the admin: the
+ *  targets already reported under it are not on the board yet — the plugin
+ *  re-sends them when it next polls (within about a minute). */
+export function sourceAddedNotice(env: string, installation: string, grouping: string): string {
+  return `${env} now takes ${installation} / ${grouping}. Targets it already reports there appear on the board within ~60 s, as the plugin re-sends their current state.`;
+}
+
+/** An installation's use of its per-installation caps, as one line. `warn`
+ *  from 90%: past a cap, a NEW target (or unmapped grouping) is refused. */
+export function usageLine(u: {
+  targets: number;
+  max_targets: number;
+  unmapped_groupings: number;
+  max_unmapped_groupings: number;
+}): { label: string; warn: boolean; title: string } {
+  const n = (x: number) => x.toLocaleString("en-US");
+  const warn = u.targets >= 0.9 * u.max_targets || u.unmapped_groupings >= 0.9 * u.max_unmapped_groupings;
+  return {
+    label: `${n(u.targets)} / ${n(u.max_targets)} targets · ${n(u.unmapped_groupings)} / ${n(u.max_unmapped_groupings)} unmapped groupings`,
+    warn,
+    title:
+      "Per-installation caps: past one, a report about a NEW target (or a new unmapped grouping) is rejected; targets it already reports keep reporting.",
+  };
+}
