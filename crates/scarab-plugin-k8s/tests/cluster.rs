@@ -1,0 +1,643 @@
+//! Live tier for the plugin runtime (ADR-0072 §9, §11): what only a real
+//! cluster can show — that it ENFORCES the NetworkPolicy the unit tests only
+//! shape, that Pod Security admits the workload, and that TokenReview vouches
+//! for a projected broker token and for nothing else.
+//!
+//! `#[ignore]`d and gated on `SCARAB_TEST_KUBE`, so `cargo test` never runs it
+//! and never touches an ambient kubeconfig. Run it with `just kube-tests
+//! plugin` (or the whole tier with `just kube-tests`), which points
+//! `KUBECONFIG` at the isolated proc-mode kind cluster.
+//!
+//! Once `SCARAB_TEST_KUBE` is set, a misconfiguration is a **panic**, never a
+//! skip: a live case that silently does nothing reads as a green tier (the
+//! `cluster.rs` lesson in `scarab-executor-k8s`). In particular the cluster
+//! must come from an explicit `KUBECONFIG` whose current context is a kind
+//! cluster — production contexts sit beside the local one, and this suite
+//! creates and deletes namespaces.
+//!
+//! Everything runs in throwaway namespaces (`scarab-plugins-t-<nonce>` and a
+//! fake broker's `scarab-broker-t-<nonce>`), deleted afterwards even when an
+//! assertion fails. The fake broker is a busybox `httpd` serving
+//! `/_scarab/plugin/v1/healthz` → `ok` in-cluster, so the tier needs no host
+//! address and no Scarab server.
+
+use std::collections::BTreeMap;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
+use std::time::Duration;
+
+use futures::FutureExt;
+use k8s_openapi::api::authentication::v1::{TokenRequest, TokenRequestSpec};
+use k8s_openapi::api::core::v1::{
+    Container, Namespace, Pod, PodSpec, ProjectedVolumeSource, Service, ServiceAccount,
+    ServiceAccountTokenProjection, ServicePort, ServiceSpec, Volume, VolumeMount, VolumeProjection,
+};
+use k8s_openapi::api::networking::v1::{NetworkPolicy, NetworkPolicySpec};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
+use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+use kube::api::{DeleteParams, ListParams, LogParams, PostParams};
+use kube::config::{KubeConfigOptions, Kubeconfig};
+use kube::{Api, Client, Config};
+
+use scarab_plugin::{
+    InstallationState, PluginCapability, PluginInstallation, PluginManifest, PluginTokenVerifier,
+    RuntimeStatus, VerifiedServiceAccount,
+};
+use scarab_plugin_k8s::objects::{
+    restricted_container_security_context, restricted_pod_security_context, DEFAULT_DENY_POLICY,
+    PLUGIN_EGRESS_POLICY,
+};
+use scarab_plugin_k8s::probe::DEFAULT_PROBE_IMAGE;
+use scarab_plugin_k8s::{
+    BrokerPeer, K8sPluginRuntime, PluginRuntimeConfig, RuntimeError, TokenReviewVerifier,
+    WorkloadState, LABEL_INSTALLATION,
+};
+
+const BROKER_PORT: u16 = 8090;
+const INSTALLATION_ID: &str = "0123456789";
+
+fn opted_in() -> bool {
+    if std::env::var("SCARAB_TEST_KUBE").is_err() {
+        eprintln!("skipping: set SCARAB_TEST_KUBE=1 (use `just kube-tests plugin`)");
+        return false;
+    }
+    true
+}
+
+/// A client for the kind cluster the tier was pointed at — and only that.
+/// Panics (the tier is opted in) on anything else.
+async fn kind_client() -> Client {
+    let path = match std::env::var("KUBECONFIG") {
+        Ok(p) if !p.is_empty() => p,
+        _ => panic!(
+            "KUBECONFIG is not set, but SCARAB_TEST_KUBE is — this tier never uses an ambient \
+             kubeconfig. Run `just kube-tests plugin`, which points it at the isolated \
+             proc-mode kind cluster."
+        ),
+    };
+    let kubeconfig =
+        Kubeconfig::read_from(&path).unwrap_or_else(|e| panic!("reading KUBECONFIG {path}: {e}"));
+    let context = kubeconfig.current_context.clone().unwrap_or_default();
+    let allowed = std::env::var("SCARAB_TEST_KUBE_ALLOW_CONTEXT").unwrap_or_default();
+    assert!(
+        context.starts_with("kind-") || (!allowed.is_empty() && context == allowed),
+        "KUBECONFIG {path} has current context `{context}`, which is not a kind cluster. This \
+         suite creates and deletes namespaces; it runs only against kind, or against the one \
+         context named in SCARAB_TEST_KUBE_ALLOW_CONTEXT."
+    );
+    let config = Config::from_custom_kubeconfig(kubeconfig, &KubeConfigOptions::default())
+        .await
+        .unwrap_or_else(|e| panic!("loading context `{context}`: {e}"));
+    Client::try_from(config).expect("kube client")
+}
+
+fn probe_image() -> String {
+    std::env::var("SCARAB_TEST_PLUGIN_PROBE_IMAGE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_PROBE_IMAGE.to_string())
+}
+
+/// The throwaway namespaces one case runs in.
+struct Fixture {
+    client: Client,
+    plugins_ns: String,
+    broker_ns: String,
+}
+
+impl Fixture {
+    fn runtime(&self) -> K8sPluginRuntime {
+        K8sPluginRuntime::new(
+            self.client.clone(),
+            PluginRuntimeConfig {
+                namespace: self.plugins_ns.clone(),
+                broker_url: format!("http://fake-broker.{}.svc:{BROKER_PORT}", self.broker_ns),
+                broker_peer: Some(BrokerPeer::Pods {
+                    namespace: self.broker_ns.clone(),
+                    labels: BTreeMap::from([("app".to_string(), "fake-broker".to_string())]),
+                }),
+                broker_port: BROKER_PORT,
+                probe_image: probe_image(),
+            },
+        )
+    }
+
+    fn pods(&self) -> Api<Pod> {
+        Api::namespaced(self.client.clone(), &self.plugins_ns)
+    }
+}
+
+fn namespace(name: &str, psa_enforce: &str) -> Namespace {
+    Namespace {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            labels: Some(BTreeMap::from([
+                (
+                    "pod-security.kubernetes.io/enforce".to_string(),
+                    psa_enforce.to_string(),
+                ),
+                ("scarab.io/test".to_string(), "plugin-k8s".to_string()),
+            ])),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// Run `body` against fresh namespaces (the plugin one under
+/// `restricted`, plus the fake broker's), and delete them afterwards — on a
+/// panic too, which is then re-raised.
+async fn with_fixture<F, Fut>(body: F)
+where
+    F: FnOnce(Fixture) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let client = kind_client().await;
+    let nonce = &uuid::Uuid::new_v4().simple().to_string()[..8];
+    let plugins_ns = format!("scarab-plugins-t-{nonce}");
+    let broker_ns = format!("scarab-broker-t-{nonce}");
+    let namespaces: Api<Namespace> = Api::all(client.clone());
+    namespaces
+        .create(
+            &PostParams::default(),
+            &namespace(&plugins_ns, "restricted"),
+        )
+        .await
+        .expect("create the plugin namespace");
+    namespaces
+        .create(&PostParams::default(), &namespace(&broker_ns, "baseline"))
+        .await
+        .expect("create the fake broker's namespace");
+    let fixture = Fixture {
+        client: client.clone(),
+        plugins_ns: plugins_ns.clone(),
+        broker_ns: broker_ns.clone(),
+    };
+    let outcome = AssertUnwindSafe(async {
+        start_fake_broker(&fixture).await;
+        body(fixture).await;
+    })
+    .catch_unwind()
+    .await;
+    for ns in [&plugins_ns, &broker_ns] {
+        if let Err(e) = namespaces.delete(ns, &DeleteParams::background()).await {
+            eprintln!("cleanup: deleting namespace {ns}: {e}");
+        }
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// `fake-broker`: a busybox httpd answering `GET /_scarab/plugin/v1/healthz`
+/// with `ok`, behind a ClusterIP Service on the broker port.
+async fn start_fake_broker(f: &Fixture) {
+    let labels = BTreeMap::from([("app".to_string(), "fake-broker".to_string())]);
+    let script = format!(
+        "mkdir -p /tmp/w/_scarab/plugin/v1 && printf ok > /tmp/w/_scarab/plugin/v1/healthz && \
+         exec httpd -f -p {BROKER_PORT} -h /tmp/w"
+    );
+    let pod = Pod {
+        metadata: ObjectMeta {
+            name: Some("fake-broker".to_string()),
+            labels: Some(labels.clone()),
+            ..Default::default()
+        },
+        spec: Some(PodSpec {
+            automount_service_account_token: Some(false),
+            containers: vec![Container {
+                name: "httpd".to_string(),
+                image: Some(probe_image()),
+                command: Some(vec!["sh".to_string(), "-c".to_string(), script]),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let pods: Api<Pod> = Api::namespaced(f.client.clone(), &f.broker_ns);
+    pods.create(&PostParams::default(), &pod)
+        .await
+        .expect("create the fake broker");
+    let service = Service {
+        metadata: ObjectMeta {
+            name: Some("fake-broker".to_string()),
+            ..Default::default()
+        },
+        spec: Some(ServiceSpec {
+            selector: Some(labels),
+            ports: Some(vec![ServicePort {
+                port: i32::from(BROKER_PORT),
+                target_port: Some(IntOrString::Int(i32::from(BROKER_PORT))),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    Api::<Service>::namespaced(f.client.clone(), &f.broker_ns)
+        .create(&PostParams::default(), &service)
+        .await
+        .expect("create the fake broker's Service");
+    wait_running(&pods, "fake-broker").await;
+}
+
+async fn wait_running(pods: &Api<Pod>, name: &str) {
+    for _ in 0..120 {
+        let pod = pods.get(name).await.expect("read Pod");
+        if pod.status.and_then(|s| s.phase).as_deref() == Some("Running") {
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    panic!("Pod {name} was not Running within 120s");
+}
+
+/// The isolation probe passes on a cluster that enforces NetworkPolicy
+/// (kind ≥ 0.24's kindnet does): the plugin-labelled Pod reaches the broker
+/// and DNS, and nothing else.
+#[tokio::test]
+#[ignore]
+async fn the_isolation_probe_passes_on_this_cluster() {
+    if !opted_in() {
+        return;
+    }
+    with_fixture(|f| async move {
+        let runtime = f.runtime();
+        runtime.ensure_baseline().await.expect("baseline");
+        let report = runtime.probe_isolation().await;
+        assert!(report.passed(), "{}", report.message());
+        let leftovers = f
+            .pods()
+            .list(&ListParams::default().labels("scarab.io/isolation-probe"))
+            .await
+            .unwrap();
+        assert!(
+            leftovers
+                .items
+                .iter()
+                .all(|p| p.metadata.deletion_timestamp.is_some()),
+            "the probe deletes its Pods"
+        );
+    })
+    .await;
+}
+
+/// The probe's negative case, for real: with the egress policies gone a
+/// plugin-labelled Pod reaches the canary, and the probe FAILS — saying
+/// NetworkPolicy is not enforced, rather than passing an open namespace.
+#[tokio::test]
+#[ignore]
+async fn without_the_egress_policies_the_canary_is_reachable_and_the_probe_fails() {
+    if !opted_in() {
+        return;
+    }
+    with_fixture(|f| async move {
+        let runtime = f.runtime();
+        runtime.ensure_baseline().await.expect("baseline");
+        let policies: Api<NetworkPolicy> = Api::namespaced(f.client.clone(), &f.plugins_ns);
+        for name in [DEFAULT_DENY_POLICY, PLUGIN_EGRESS_POLICY] {
+            policies
+                .delete(name, &DeleteParams::default())
+                .await
+                .expect("delete a baseline policy");
+        }
+        let report = runtime.probe_isolation().await;
+        assert!(!report.passed(), "an open namespace must fail the probe");
+        assert!(
+            report.message().contains("NOT enforced"),
+            "the canary must be what failed it: {}",
+            report.message()
+        );
+        // The baseline puts them back.
+        runtime.ensure_baseline().await.expect("baseline restored");
+    })
+    .await;
+}
+
+/// Fail closed on the namespace itself: a level below `restricted`, or a
+/// NetworkPolicy the runtime did not write, refuses the baseline.
+#[tokio::test]
+#[ignore]
+async fn the_baseline_refuses_a_namespace_it_cannot_vouch_for() {
+    if !opted_in() {
+        return;
+    }
+    with_fixture(|f| async move {
+        // A stray allow-all egress policy in the plugin namespace.
+        let stray = NetworkPolicy {
+            metadata: ObjectMeta {
+                name: Some("allow-everything".to_string()),
+                ..Default::default()
+            },
+            spec: Some(NetworkPolicySpec {
+                pod_selector: Some(LabelSelector::default()),
+                policy_types: Some(vec!["Egress".to_string()]),
+                egress: Some(vec![Default::default()]),
+                ingress: None,
+            }),
+        };
+        let policies: Api<NetworkPolicy> = Api::namespaced(f.client.clone(), &f.plugins_ns);
+        policies
+            .create(&PostParams::default(), &stray)
+            .await
+            .unwrap();
+        let err = f.runtime().ensure_baseline().await.unwrap_err();
+        assert!(
+            matches!(&err, RuntimeError::BaselineRefused(m) if m.contains("allow-everything")),
+            "{err}"
+        );
+
+        // The fake broker's namespace is only `baseline`.
+        let mut config = f.runtime().config().clone();
+        config.namespace = f.broker_ns.clone();
+        let err = K8sPluginRuntime::new(f.client.clone(), config)
+            .ensure_baseline()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, RuntimeError::BaselineRefused(m) if m.contains("restricted")),
+            "{err}"
+        );
+    })
+    .await;
+}
+
+fn installation(image: &str) -> PluginInstallation {
+    PluginInstallation {
+        id: INSTALLATION_ID.into(),
+        org: "acme".into(),
+        name: "argocd-prod".into(),
+        plugin: "argocd".into(),
+        image: image.into(),
+        manifest: PluginManifest {
+            plugin: "argocd".into(),
+            capabilities: vec![PluginCapability::ReportDeployments],
+            connections: vec![],
+            config_keys: vec![],
+        },
+        manifest_sha256: "f".repeat(64),
+        config: BTreeMap::new(),
+        state: InstallationState::Enabled,
+        runtime_status: RuntimeStatus::Pending,
+        runtime_message: String::new(),
+        probe_passed_at: None,
+        approved_by: "amy".into(),
+        approved_at: 1,
+        killed_by: None,
+        killed_at: None,
+    }
+}
+
+/// The workload against a real API server: Pod Security `restricted` admits
+/// the Pod the Deployment makes; stop scales it to zero and deletes the
+/// ServiceAccount; uninstall removes the rest. (The image is the probe's
+/// busybox, which exits at once — admission is what is under test, not the
+/// Plugin.)
+#[tokio::test]
+#[ignore]
+async fn a_workload_is_admitted_stopped_and_uninstalled() {
+    if !opted_in() {
+        return;
+    }
+    with_fixture(|f| async move {
+        let runtime = f.runtime();
+        runtime.ensure_baseline().await.expect("baseline");
+        runtime
+            .ensure(&installation(&probe_image()))
+            .await
+            .expect("ensure");
+        // Applying twice changes nothing.
+        runtime
+            .ensure(&installation(&probe_image()))
+            .await
+            .expect("ensure again");
+        let selector = format!("{LABEL_INSTALLATION}={INSTALLATION_ID}");
+        let mut admitted = None;
+        for _ in 0..60 {
+            let pods = f
+                .pods()
+                .list(&ListParams::default().labels(&selector))
+                .await
+                .unwrap();
+            if let Some(pod) = pods.items.into_iter().next() {
+                admitted = Some(pod);
+                break;
+            }
+            if let WorkloadState::Failing(why) =
+                runtime.workload_state(INSTALLATION_ID).await.unwrap()
+            {
+                if why.contains("PodSecurity") {
+                    panic!("restricted Pod Security refused the plugin Pod: {why}");
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        let pod = admitted.expect("the Deployment made a Pod within 60s");
+        let spec = pod.spec.unwrap();
+        assert_eq!(spec.automount_service_account_token, Some(false));
+        assert_eq!(
+            spec.service_account_name.as_deref(),
+            Some("plugin-0123456789")
+        );
+        assert_eq!(
+            runtime
+                .workload_ids()
+                .await
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![INSTALLATION_ID.to_string()]
+        );
+
+        runtime.stop(INSTALLATION_ID).await.expect("stop");
+        assert_eq!(
+            runtime.workload_state(INSTALLATION_ID).await.unwrap(),
+            WorkloadState::Stopped
+        );
+        let sas: Api<ServiceAccount> = Api::namespaced(f.client.clone(), &f.plugins_ns);
+        assert!(sas.get_opt("plugin-0123456789").await.unwrap().is_none());
+        runtime
+            .stop(INSTALLATION_ID)
+            .await
+            .expect("stop is idempotent");
+
+        runtime.uninstall(INSTALLATION_ID).await.expect("uninstall");
+        assert_eq!(
+            runtime.workload_state(INSTALLATION_ID).await.unwrap(),
+            WorkloadState::Absent
+        );
+        runtime
+            .uninstall(INSTALLATION_ID)
+            .await
+            .expect("uninstall is idempotent");
+    })
+    .await;
+}
+
+fn projected_token(name: &str, audience: &str) -> Volume {
+    Volume {
+        name: name.to_string(),
+        projected: Some(ProjectedVolumeSource {
+            sources: Some(vec![VolumeProjection {
+                service_account_token: Some(ServiceAccountTokenProjection {
+                    audience: Some(audience.to_string()),
+                    expiration_seconds: Some(600),
+                    path: "token".to_string(),
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// TokenReview, for real: a projected `scarab-broker` token verifies as its
+/// ServiceAccount; a token for another audience does not; a TokenRequest
+/// with no bound Pod does not; and once its Pod is gone, neither does the
+/// good token.
+#[tokio::test]
+#[ignore]
+async fn token_review_accepts_only_a_live_pods_broker_token() {
+    if !opted_in() {
+        return;
+    }
+    with_fixture(|f| async move {
+        let sa_name = "plugin-0123456789";
+        let sas: Api<ServiceAccount> = Api::namespaced(f.client.clone(), &f.plugins_ns);
+        sas.create(
+            &PostParams::default(),
+            &ServiceAccount {
+                metadata: ObjectMeta {
+                    name: Some(sa_name.to_string()),
+                    ..Default::default()
+                },
+                automount_service_account_token: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let holder = Pod {
+            metadata: ObjectMeta {
+                name: Some("token-holder".to_string()),
+                ..Default::default()
+            },
+            spec: Some(PodSpec {
+                service_account_name: Some(sa_name.to_string()),
+                automount_service_account_token: Some(false),
+                termination_grace_period_seconds: Some(0),
+                security_context: Some(restricted_pod_security_context()),
+                containers: vec![Container {
+                    name: "holder".to_string(),
+                    image: Some(probe_image()),
+                    command: Some(vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        "cat /var/run/secrets/broker/token; echo; \
+                         cat /var/run/secrets/other/token; echo; sleep 600"
+                            .to_string(),
+                    ]),
+                    security_context: Some(restricted_container_security_context()),
+                    volume_mounts: Some(vec![
+                        VolumeMount {
+                            name: "broker".to_string(),
+                            mount_path: "/var/run/secrets/broker".to_string(),
+                            read_only: Some(true),
+                            ..Default::default()
+                        },
+                        VolumeMount {
+                            name: "other".to_string(),
+                            mount_path: "/var/run/secrets/other".to_string(),
+                            read_only: Some(true),
+                            ..Default::default()
+                        },
+                    ]),
+                    ..Default::default()
+                }],
+                volumes: Some(vec![
+                    projected_token("broker", "scarab-broker"),
+                    projected_token("other", "not-the-broker"),
+                ]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let pods = f.pods();
+        pods.create(&PostParams::default(), &holder).await.unwrap();
+        wait_running(&pods, "token-holder").await;
+        let mut tokens = Vec::new();
+        for _ in 0..30 {
+            let log = pods
+                .logs("token-holder", &LogParams::default())
+                .await
+                .unwrap_or_default();
+            tokens = log
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect();
+            if tokens.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        assert_eq!(tokens.len(), 2, "the holder printed both tokens");
+        let (broker_token, other_token) = (tokens[0].clone(), tokens[1].clone());
+
+        let verifier = TokenReviewVerifier::new(f.client.clone());
+        assert_eq!(
+            verifier.verify(&broker_token).await,
+            Ok(VerifiedServiceAccount {
+                namespace: f.plugins_ns.clone(),
+                service_account: sa_name.to_string(),
+            })
+        );
+        assert!(
+            verifier.verify(&other_token).await.is_err(),
+            "a token for another audience must not verify"
+        );
+        let unbound = sas
+            .create_token_request(
+                sa_name,
+                &PostParams::default(),
+                &TokenRequest {
+                    spec: Some(TokenRequestSpec {
+                        audiences: Some(vec!["scarab-broker".to_string()]),
+                        expiration_seconds: Some(600),
+                        bound_object_ref: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .status
+            .and_then(|status| status.token)
+            .expect("a minted token");
+        let err = verifier.verify(&unbound).await.unwrap_err();
+        assert!(err.0.contains("not bound to a Pod"), "{err}");
+
+        // The bound object: with its Pod gone, the good token is nothing. A
+        // fresh verifier, so the 30 s cache cannot answer for the API server.
+        pods.delete("token-holder", &DeleteParams::default().grace_period(0))
+            .await
+            .unwrap();
+        for _ in 0..60 {
+            if pods.get_opt("token-holder").await.unwrap().is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        assert!(
+            TokenReviewVerifier::new(f.client.clone())
+                .verify(&broker_token)
+                .await
+                .is_err(),
+            "a token must die with its Pod"
+        );
+    })
+    .await;
+}

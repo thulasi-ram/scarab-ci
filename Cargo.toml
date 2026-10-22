@@ -75,6 +75,9 @@ scarab-executor-local = { path = "crates/scarab-executor-local" }
 scarab-testkit = { path = "crates/scarab-testkit" }
 scarab-deployment = { path = "crates/scarab-deployment" }
 scarab-plugin = { path = "crates/scarab-plugin" }
+# ADR-0072 §9/§11: the plugin runtime's Kubernetes adapter (namespace
+# baseline, workloads, isolation probe, TokenReview).
+scarab-plugin-k8s = { path = "crates/scarab-plugin-k8s" }
 
 # --- test-only ---------------------------------------------------------------
 # Property testing for pure domain folds (invariant suites). Dev-dependency
