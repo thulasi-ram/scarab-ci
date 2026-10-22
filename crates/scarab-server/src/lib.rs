@@ -71,12 +71,12 @@ pub mod oidc;
 /// ADR-0071: the minimal org-level Environment — its admin/read API and the
 /// EnvironmentDeploymentDeadline the Deployment read fold uses.
 pub mod org_environments;
-/// ADR-0072 §9: the plugin runtime's leased reconcile loop — namespace
-/// baseline, isolation probe, one workload per installation.
-pub mod plugin_runtime;
 /// ADR-0072: PluginInstallations — the first-party catalog, install,
 /// uninstall, the kill switch — and the read views report ingest feeds.
 pub mod plugins;
+/// ADR-0072 §9: the plugin runtime's leased reconcile loop — namespace
+/// baseline, isolation probe, one workload per installation.
+pub mod plugin_runtime;
 pub mod retention;
 pub mod secret_executor;
 /// `--role workspace`: the ADR-0061 workspace service. Its own router, its own
@@ -1879,8 +1879,11 @@ async fn get_run(
         .run_snapshot_retention(&run)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let snapshot_retention =
-        snapshot_retention_dto(&retention, st.snapshot_retention_days, st.clock.now().await);
+    let snapshot_retention = snapshot_retention_dto(
+        &retention,
+        st.snapshot_retention_days,
+        st.clock.now().await,
+    );
     // Enrich each step with its sidecar services + shared-service opt-ins (ADR-
     // 0058) from the stored spec, so the FE can render sidecar nodes and `uses`
     // edges and address per-sidecar logs by index. A step with no stored spec
@@ -2647,8 +2650,13 @@ async fn pin_run_snapshots(
     let run = RunId(id);
     let scope = run_scope(&st, &run).await;
     let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
-    if !scarab_engine::pin_run_snapshots(&*st.db, &*st.clock, &run, Some(principal.subject.clone()))
-        .await?
+    if !scarab_engine::pin_run_snapshots(
+        &*st.db,
+        &*st.clock,
+        &run,
+        Some(principal.subject.clone()),
+    )
+    .await?
     {
         return Err(ApiError::NotFound);
     }
@@ -6107,9 +6115,7 @@ async fn mint_api_token(
 
     let name = req.name.trim();
     if name.is_empty() {
-        return Err(ApiError::BadRequest(
-            "token `name` must not be empty".into(),
-        ));
+        return Err(ApiError::BadRequest("token `name` must not be empty".into()));
     }
     if req.expires_in_days == 0 || req.expires_in_days > scarab_identity::MAX_API_TOKEN_DAYS {
         return Err(ApiError::BadRequest(format!(
@@ -7348,7 +7354,8 @@ async fn fold_environment_deployments(
         .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;
     // The Environment's own deadline, or the default for a name with no
     // OrgEnvironment (ADR-0071).
-    let deadline = org_environments::deadline_from_org_environment(st, org, environment).await?;
+    let deadline =
+        org_environments::deadline_from_org_environment(st, org, environment).await?;
     let now = st.clock.now().await.0;
     Ok(scarab_deployment::fold_environment(&inputs, now, deadline))
 }
@@ -8896,12 +8903,7 @@ async fn register_repo_webhook(
 ) -> Result<Json<BindRepoResultDto>, ApiError> {
     authorize_org_administer(&st, &headers).await?;
     let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
-    deny_if_config_owned(
-        connections,
-        &id,
-        "webhook registration for its repositories",
-    )
-    .await?;
+    deny_if_config_owned(connections, &id, "webhook registration for its repositories").await?;
     let conn = connections
         .get_connection(&id)
         .await
