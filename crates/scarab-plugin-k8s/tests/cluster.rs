@@ -620,10 +620,85 @@ fn projected_token(name: &str, audience: &str) -> Volume {
     }
 }
 
+/// A Pod running as `sa_name` that prints two projected tokens — one for
+/// `scarab-broker`, one for another audience — and then waits. Returns
+/// `(broker_token, other_token)`.
+async fn start_token_holder(f: &Fixture, name: &str, sa_name: &str) -> (String, String) {
+    let holder = Pod {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            ..Default::default()
+        },
+        spec: Some(PodSpec {
+            service_account_name: Some(sa_name.to_string()),
+            automount_service_account_token: Some(false),
+            termination_grace_period_seconds: Some(0),
+            security_context: Some(restricted_pod_security_context()),
+            containers: vec![Container {
+                name: "holder".to_string(),
+                image: Some(probe_image()),
+                command: Some(vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "cat /var/run/secrets/broker/token; echo; \
+                     cat /var/run/secrets/other/token; echo; sleep 600"
+                        .to_string(),
+                ]),
+                security_context: Some(restricted_container_security_context()),
+                volume_mounts: Some(vec![
+                    VolumeMount {
+                        name: "broker".to_string(),
+                        mount_path: "/var/run/secrets/broker".to_string(),
+                        read_only: Some(true),
+                        ..Default::default()
+                    },
+                    VolumeMount {
+                        name: "other".to_string(),
+                        mount_path: "/var/run/secrets/other".to_string(),
+                        read_only: Some(true),
+                        ..Default::default()
+                    },
+                ]),
+                ..Default::default()
+            }],
+            volumes: Some(vec![
+                projected_token("broker", "scarab-broker"),
+                projected_token("other", "not-the-broker"),
+            ]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let pods = f.pods();
+    pods.create(&PostParams::default(), &holder).await.unwrap();
+    wait_running(&pods, name).await;
+    let mut tokens = Vec::new();
+    for _ in 0..30 {
+        let log = pods
+            .logs(name, &LogParams::default())
+            .await
+            .unwrap_or_default();
+        tokens = log
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect();
+        if tokens.len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert_eq!(tokens.len(), 2, "{name} printed both tokens");
+    (tokens[0].clone(), tokens[1].clone())
+}
+
 /// TokenReview, for real: a projected `scarab-broker` token verifies as its
 /// ServiceAccount; a token for another audience does not; a TokenRequest
-/// with no bound Pod does not; and once its Pod is gone, neither does the
-/// good token.
+/// with no bound Pod does not; once its Pod is gone, neither does the good
+/// token; and — the kill switch at the source — once the runtime's `stop`
+/// has deleted the ServiceAccount, a token whose Pod is STILL RUNNING is
+/// rejected too.
 #[tokio::test]
 #[ignore]
 async fn token_review_accepts_only_a_live_pods_broker_token() {
@@ -631,6 +706,7 @@ async fn token_review_accepts_only_a_live_pods_broker_token() {
         return;
     }
     with_fixture(|f| async move {
+        // The installation's ServiceAccount, by the runtime's own naming.
         let sa_name = "plugin-0123456789";
         let sas: Api<ServiceAccount> = Api::namespaced(f.client.clone(), &f.plugins_ns);
         sas.create(
@@ -646,82 +722,15 @@ async fn token_review_accepts_only_a_live_pods_broker_token() {
         )
         .await
         .unwrap();
-        let holder = Pod {
-            metadata: ObjectMeta {
-                name: Some("token-holder".to_string()),
-                ..Default::default()
-            },
-            spec: Some(PodSpec {
-                service_account_name: Some(sa_name.to_string()),
-                automount_service_account_token: Some(false),
-                termination_grace_period_seconds: Some(0),
-                security_context: Some(restricted_pod_security_context()),
-                containers: vec![Container {
-                    name: "holder".to_string(),
-                    image: Some(probe_image()),
-                    command: Some(vec![
-                        "sh".to_string(),
-                        "-c".to_string(),
-                        "cat /var/run/secrets/broker/token; echo; \
-                         cat /var/run/secrets/other/token; echo; sleep 600"
-                            .to_string(),
-                    ]),
-                    security_context: Some(restricted_container_security_context()),
-                    volume_mounts: Some(vec![
-                        VolumeMount {
-                            name: "broker".to_string(),
-                            mount_path: "/var/run/secrets/broker".to_string(),
-                            read_only: Some(true),
-                            ..Default::default()
-                        },
-                        VolumeMount {
-                            name: "other".to_string(),
-                            mount_path: "/var/run/secrets/other".to_string(),
-                            read_only: Some(true),
-                            ..Default::default()
-                        },
-                    ]),
-                    ..Default::default()
-                }],
-                volumes: Some(vec![
-                    projected_token("broker", "scarab-broker"),
-                    projected_token("other", "not-the-broker"),
-                ]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let pods = f.pods();
-        pods.create(&PostParams::default(), &holder).await.unwrap();
-        wait_running(&pods, "token-holder").await;
-        let mut tokens = Vec::new();
-        for _ in 0..30 {
-            let log = pods
-                .logs("token-holder", &LogParams::default())
-                .await
-                .unwrap_or_default();
-            tokens = log
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(str::to_string)
-                .collect();
-            if tokens.len() >= 2 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-        assert_eq!(tokens.len(), 2, "the holder printed both tokens");
-        let (broker_token, other_token) = (tokens[0].clone(), tokens[1].clone());
+        let (broker_token, other_token) = start_token_holder(&f, "token-holder", sa_name).await;
+        let (survivor_token, _) = start_token_holder(&f, "token-survivor", sa_name).await;
 
         let verifier = TokenReviewVerifier::new(f.client.clone());
-        assert_eq!(
-            verifier.verify(&broker_token).await,
-            Ok(VerifiedServiceAccount {
-                namespace: f.plugins_ns.clone(),
-                service_account: sa_name.to_string(),
-            })
-        );
+        let as_the_installation = Ok(VerifiedServiceAccount {
+            namespace: f.plugins_ns.clone(),
+            service_account: sa_name.to_string(),
+        });
+        assert_eq!(verifier.verify(&broker_token).await, as_the_installation);
         assert!(
             verifier.verify(&other_token).await.is_err(),
             "a token for another audience must not verify"
@@ -749,6 +758,7 @@ async fn token_review_accepts_only_a_live_pods_broker_token() {
 
         // The bound object: with its Pod gone, the good token is nothing. A
         // fresh verifier, so the 30 s cache cannot answer for the API server.
+        let pods = f.pods();
         pods.delete("token-holder", &DeleteParams::default().grace_period(0))
             .await
             .unwrap();
@@ -764,6 +774,30 @@ async fn token_review_accepts_only_a_live_pods_broker_token() {
                 .await
                 .is_err(),
             "a token must die with its Pod"
+        );
+
+        // The kill switch at the source: `stop` deletes the ServiceAccount,
+        // and a token whose Pod is still running dies with it.
+        assert_eq!(
+            TokenReviewVerifier::new(f.client.clone())
+                .verify(&survivor_token)
+                .await,
+            as_the_installation,
+            "the survivor's token is good before the stop"
+        );
+        f.runtime().stop(INSTALLATION_ID).await.expect("stop");
+        assert!(sas.get_opt(sa_name).await.unwrap().is_none());
+        assert!(
+            pods.get_opt("token-survivor").await.unwrap().is_some(),
+            "the Pod still exists, so only the ServiceAccount can be what revoked the token"
+        );
+        let err = TokenReviewVerifier::new(f.client.clone())
+            .verify(&survivor_token)
+            .await
+            .unwrap_err();
+        assert!(
+            err.0.contains("not authenticated"),
+            "a token must die with its ServiceAccount: {err}"
         );
     })
     .await;
