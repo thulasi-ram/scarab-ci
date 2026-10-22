@@ -16,25 +16,42 @@
 // named like the grouping; otherwise the admin picks (a guess would route
 // reports somewhere nobody chose). The targets already reported under it
 // reach the board when the plugin re-sends them (within about a minute).
+//
+// "Connections" (d3, ADR-0072 §5) bind each manifest connection slot to the
+// ONE destination the CredentialBroker sends the plugin's reads to, and the
+// credential it adds. The credential is write-only — the panel only ever says
+// "set" / "not set" — and is typed again on every save, so a destination
+// never inherits a credential entered for another. Plain http is allowed but
+// always flagged.
 import { createResource, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { Portal } from "solid-js/web";
 import {
+  deletePluginConnection,
   enablePlugin,
   installPlugin,
   killPlugin,
   listOrgEnvironments,
   listPluginCatalog,
+  listPluginConnections,
   listPlugins,
   listUnmappedGroupings,
   putOrgEnvironment,
+  putPluginConnection,
   uninstallPlugin,
   type OrgEnvironment,
   type PluginCatalogEntry,
+  type PluginConnection,
   type PluginInstallation,
 } from "../api/client";
 import {
+  connectionBaseUrlError,
+  credentialBadge,
   imageError,
   imageRepository,
+  INSECURE_HTTP_WARNING,
+  isInsecureHttp,
+  toConnectionBody,
+  type ConnectionForm,
   installNameError,
   runtimeBadge,
   shortDigest,
@@ -42,6 +59,7 @@ import {
   stateBadge,
   suggestEnvironment,
   toInstallBody,
+  ruleLabel,
   usageLine,
   withSource,
   type BadgeTone,
@@ -238,6 +256,7 @@ function PluginRow(props: {
   const runtime = () => runtimeBadge(p().runtime_status);
   const usage = () => usageLine(p().usage);
   const [open, setOpen] = createSignal(false);
+  const [connectionsOpen, setConnectionsOpen] = createSignal(false);
 
   return (
     <li class="tok" classList={{ "tok-dead": killed() }}>
@@ -333,7 +352,16 @@ function PluginRow(props: {
         <button class="btn btn-ghost btn-sm plg-toggle" onClick={() => setOpen((o) => !o)}>
           <Icon icon={open() ? "chevron-down" : "chevron-right"} size={12} /> unmapped groupings
         </button>
+        <Show when={p().manifest.connections.length > 0}>
+          <button class="btn btn-ghost btn-sm plg-toggle" onClick={() => setConnectionsOpen((o) => !o)}>
+            <Icon icon={connectionsOpen() ? "chevron-down" : "chevron-right"} size={12} /> connections
+          </button>
+        </Show>
       </div>
+
+      <Show when={connectionsOpen()}>
+        <Connections org={props.org} installation={p().name} />
+      </Show>
 
       <Show when={open()}>
         <Unmapped
@@ -344,6 +372,216 @@ function PluginRow(props: {
         />
       </Show>
     </li>
+  );
+}
+
+/** An installation's connection slots: where the broker sends each one's
+ *  reads, and whether its credential is set (ADR-0072 §5). */
+function Connections(props: { org: string; installation: string }) {
+  const [epoch, setEpoch] = createSignal(0);
+  const [connections] = createResource(
+    () => ({ org: props.org, name: props.installation, epoch: epoch() }),
+    (k) => listPluginConnections(k.org, k.name),
+  );
+  const [error, setError] = createSignal<string | null>(null);
+  const [notice, setNotice] = createSignal<string | null>(null);
+  const changed = (msg: string) => {
+    setError(null);
+    setNotice(msg);
+    setEpoch((e) => e + 1);
+  };
+
+  return (
+    <div class="plg-unmapped">
+      <Show when={error()}>
+        <p class="error">{error()}</p>
+      </Show>
+      <Show when={notice()}>
+        <p class="notice-ok">{notice()}</p>
+      </Show>
+      <Show when={!connections.loading} fallback={<p class="empty">loading…</p>}>
+        <Show when={!connections.error} fallback={<p class="error">Could not load the connections.</p>}>
+          <For each={connections() ?? []} fallback={<p class="empty">This plugin declares no connections.</p>}>
+            {(c) => (
+              <ConnectionRow
+                org={props.org}
+                installation={props.installation}
+                connection={c}
+                onChanged={changed}
+                onError={(msg) => {
+                  setNotice(null);
+                  setError(msg);
+                }}
+              />
+            )}
+          </For>
+          <p class="subtle">
+            <small>
+              <Icon icon="shield-check" size={12} /> The plugin never holds the credential: the
+              broker adds it to the plugin's reads and sends them to this destination only — the
+              plugin cannot choose another host.
+            </small>
+          </p>
+        </Show>
+      </Show>
+    </div>
+  );
+}
+
+/** One connection slot: its binding, and the form that replaces it. */
+function ConnectionRow(props: {
+  org: string;
+  installation: string;
+  connection: PluginConnection;
+  onChanged: (msg: string) => void;
+  onError: (msg: string) => void;
+}) {
+  const c = () => props.connection;
+  const badge = () => credentialBadge(c());
+  const [editing, setEditing] = createSignal(false);
+  const [saving, setSaving] = createSignal(false);
+  // The credential is never prefilled: the server cannot give it back.
+  const blank = (): ConnectionForm => ({ base_url: c().base_url ?? "", credential: "", ca_pem: c().ca_pem ?? "" });
+  const [form, setForm] = createSignal<ConnectionForm>(blank());
+  const set = (k: keyof ConnectionForm, v: string) => setForm((f) => ({ ...f, [k]: v }));
+  const built = () => toConnectionBody(form());
+  const urlProblem = () => connectionBaseUrlError(form().base_url);
+
+  const save = async () => {
+    const body = built().body;
+    if (!body || saving()) return;
+    setSaving(true);
+    try {
+      const bound = await putPluginConnection(props.org, props.installation, c().slot, body);
+      setEditing(false);
+      props.onChanged(`${c().slot} now goes to ${bound.base_url}.`);
+    } catch (e) {
+      props.onError(e instanceof Error ? e.message : `Could not bind ${c().slot}.`);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const unbind = async () => {
+    if (
+      !window.confirm(
+        `Unbind ${c().slot}?\n\nIts credential is deleted, and the plugin's requests on it are refused from now on — a stream it has open is cut within seconds.`,
+      )
+    )
+      return;
+    try {
+      await deletePluginConnection(props.org, props.installation, c().slot);
+      props.onChanged(`${c().slot} is unbound; its credential is deleted.`);
+    } catch (e) {
+      props.onError(e instanceof Error ? e.message : `Could not unbind ${c().slot}.`);
+    }
+  };
+
+  return (
+    <div class="plg-unmapped-row">
+      <span class="mono plg-grouping">{c().slot}</span>
+      <span class="mono" title="Every request the plugin sends on this connection goes here, and nowhere else.">
+        {c().base_url ?? "no destination"}
+      </span>
+      <span class={BADGE[badge().tone]} title={badge().title}>
+        {badge().label}
+      </span>
+      <Show when={c().ca_pem}>
+        <span class="subtle" title="These CA certificates are the only trust anchors for this destination.">
+          <Icon icon="shield-check" size={12} /> custom CA
+        </span>
+      </Show>
+      <Show when={c().insecure_http}>
+        <span class="plg-killed" title={INSECURE_HTTP_WARNING}>
+          <Icon icon="alert-triangle" size={12} /> plain http
+        </span>
+      </Show>
+      <span class="oenv-actions">
+        <button
+          class="btn btn-ghost btn-sm"
+          onClick={() => {
+            setForm(blank());
+            setEditing((e) => !e);
+          }}
+        >
+          {c().configured ? "rebind" : "bind"}
+        </button>
+        <Show when={c().configured}>
+          <button class="btn btn-ghost btn-sm" onClick={() => void unbind()}>
+            unbind
+          </button>
+        </Show>
+      </span>
+      <span class="subtle">
+        <small>
+          reads only:{" "}
+          <span class="mono">{c().read_rules.map(ruleLabel).join(", ")}</span>
+        </small>
+      </span>
+
+      <Show when={editing()}>
+        <div class="token-form">
+          <div class="form-r">
+            <label>base URL</label>
+            <input
+              class="input mono"
+              placeholder="https://argocd.example.com"
+              value={form().base_url}
+              onInput={(e) => set("base_url", e.currentTarget.value)}
+            />
+            <Show when={urlProblem()}>
+              <p class="error">{urlProblem()}</p>
+            </Show>
+            <Show when={!urlProblem() && isInsecureHttp(form().base_url)}>
+              <p class="plg-killed">
+                <Icon icon="alert-triangle" size={12} /> {INSECURE_HTTP_WARNING}
+              </p>
+            </Show>
+          </div>
+          <div class="form-r">
+            <label>credential</label>
+            <input
+              class="input mono"
+              type="password"
+              autocomplete="new-password"
+              placeholder={c().credential_set ? "set — enter it again to save" : "bearer token"}
+              value={form().credential}
+              onInput={(e) => set("credential", e.currentTarget.value)}
+            />
+            <p class="fieldnote">
+              Sent upstream as <span class="mono">Authorization: Bearer …</span>. Write-only: it is
+              never shown again, and every save needs it — a new destination never keeps a
+              credential entered for another.
+            </p>
+          </div>
+          <div class="form-r">
+            <label>CA (optional)</label>
+            <textarea
+              class="input mono"
+              rows={3}
+              placeholder="-----BEGIN CERTIFICATE-----"
+              value={form().ca_pem}
+              onInput={(e) => set("ca_pem", e.currentTarget.value)}
+            />
+            <p class="fieldnote">
+              For an internal CA: these certificates replace the platform's roots for this
+              destination. https only; there is no way to skip verification.
+            </p>
+          </div>
+          <Show when={built().error && form().base_url.trim() !== ""}>
+            <p class="error">{built().error}</p>
+          </Show>
+          <div class="modal-actions">
+            <button class="btn btn-primary btn-sm" disabled={!built().body || saving()} onClick={() => void save()}>
+              {saving() ? "Saving…" : "Save"}
+            </button>
+            <button class="btn btn-ghost btn-sm" onClick={() => setEditing(false)}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      </Show>
+    </div>
   );
 }
 
@@ -598,7 +836,7 @@ function InstallDialog(props: {
                         connection <span class="mono">{slot.name}</span> ({slot.auth_schemes.join(", ")}) —
                         read only:{" "}
                         <span class="mono">
-                          {slot.read_rules.map((r) => `${r.method} ${r.path}`).join(", ")}
+                          {slot.read_rules.map(ruleLabel).join(", ")}
                         </span>
                       </p>
                     )}

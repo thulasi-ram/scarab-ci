@@ -26,6 +26,7 @@ type PluginCatalogEntryDto = components["schemas"]["PluginCatalogEntryDto"];
 type PluginInstallationDto = components["schemas"]["PluginInstallationDto"];
 type UnmappedGroupingDto = components["schemas"]["UnmappedGroupingDto"];
 type DeploymentSourceTargetDto = components["schemas"]["DeploymentSourceTargetDto"];
+type PluginConnectionDto = components["schemas"]["PluginConnectionDto"];
 
 const now = Date.now();
 const ago = (ms: number) => now - ms;
@@ -674,11 +675,15 @@ const argocdManifest: PluginCatalogEntryDto["manifest"] = {
       name: "argocd",
       auth_schemes: ["bearer"],
       read_rules: [
-        { method: "GET", path: "/api/version" },
-        { method: "GET", path: "/api/v1/applications" },
-        { method: "GET", path: "/api/v1/applications/*" },
-        { method: "GET", path: "/api/v1/applications/*/managed-resources" },
-        { method: "GET", path: "/api/v1/stream/applications" },
+        { method: "GET", path: "/api/version", query: [] },
+        { method: "GET", path: "/api/v1/applications", query: ["projects", "selector", "appNamespace"] },
+        { method: "GET", path: "/api/v1/applications/*", query: ["appNamespace", "project"] },
+        { method: "GET", path: "/api/v1/applications/*/managed-resources", query: ["appNamespace", "project"] },
+        {
+          method: "GET",
+          path: "/api/v1/stream/applications",
+          query: ["resourceVersion", "appNamespace", "projects", "name", "selector"],
+        },
       ],
     },
   ],
@@ -739,6 +744,36 @@ const plugins: PluginInstallationDto[] = [
     deployment_sources: [{ environment: "production", vendor_grouping: "production" }],
   }),
 ];
+// Connections (ADR-0072 §5): `argocd` is bound over https; `argocd-us` was
+// bound to an in-cluster Service over plain http (the flagged case). The
+// credential itself is never part of any response.
+const pluginConnection = (
+  slot: string,
+  o: Partial<PluginConnectionDto>,
+): PluginConnectionDto => ({
+  slot,
+  auth_schemes: ["bearer"],
+  read_rules: argocdManifest.connections[0]!.read_rules,
+  configured: true,
+  base_url: "https://argocd.acme.example",
+  auth_scheme: "bearer",
+  credential_set: true,
+  ca_pem: null,
+  insecure_http: false,
+  updated_by: "a.kim",
+  updated_at: ago(12 * 24 * 60 * min),
+  ...o,
+});
+const pluginConnections: Record<string, PluginConnectionDto[]> = {
+  argocd: [pluginConnection("argocd", {})],
+  "argocd-us": [
+    pluginConnection("argocd", {
+      base_url: "http://argocd-server.argocd.svc:80",
+      insecure_http: true,
+      updated_by: "j.lee",
+    }),
+  ],
+};
 const unmappedGroupings: Record<string, UnmappedGroupingDto[]> = {
   argocd: [
     {
@@ -1071,6 +1106,16 @@ function route(pathname: string, search: string, method: string): Response | nul
       );
     }
     return json(plugins);
+  }
+  if ((m = p.match(/^\/v1\/orgs\/[^/]+\/plugins\/([^/]+)\/connections(?:\/([^/]+))?$/))) {
+    const found = plugins.find((x) => x.name === decodeURIComponent(m![1]!));
+    if (!found) return new Response("no such installation", { status: 404 });
+    const list = pluginConnections[found.name] ?? [];
+    if (!m[2]) return json(list);
+    const slot = decodeURIComponent(m[2]);
+    if (method === "DELETE") return new Response(null, { status: 204 });
+    // The body is not visible here; echo the slot as bound.
+    return json(list.find((c) => c.slot === slot) ?? pluginConnection(slot, {}));
   }
   if ((m = p.match(/^\/v1\/orgs\/[^/]+\/plugins\/([^/]+)(?:\/(kill|enable|unmapped-groupings))?$/))) {
     const found = plugins.find((x) => x.name === decodeURIComponent(m![1]!));

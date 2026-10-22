@@ -146,8 +146,27 @@ retries and streaming. For each request the broker:
 4. journals it.
 
 A **PluginConnectionRequestRule** is an allowed request shape on a PluginConnection:
-method, path pattern and, optionally, a body schema.
+method, path pattern, an optional **query-key allowlist** and, optionally, a body schema.
 
+- **The query is allowlisted per rule.** A rule lists the query keys a request under it
+  may carry (none listed = no query). A key the rule does not list, or a key given twice,
+  is **refused**, not dropped: a read path can still have a side effect behind a query
+  key (on Argo, `GET /api/v1/applications/{name}?refresh=hard` asks for a hard refresh,
+  which regenerates manifests), and silently dropping a key such as `appNamespace` would re-target
+  the read. What is forwarded is the decoded query re-encoded canonically, and that is
+  what the journal records.
+- **Headers are allowlisted both ways.** Only content negotiation, conditional reads
+  and `User-Agent` go upstream (`Accept`, `Accept-Encoding`, `Accept-Language`,
+  `If-None-Match`, `If-Modified-Since`, `User-Agent`), so a Plugin cannot steer the
+  upstream's method, path or identity with a header it honours
+  (`X-HTTP-Method-Override`, `X-Original-URL`, grpc-gateway's `Grpc-Metadata-Token`,
+  Kubernetes' `Impersonate-User`). Only headers that describe the body and its caching
+  come back (`Content-Type`, `Content-Length`, `Content-Encoding`, `ETag`,
+  `Last-Modified`, `Cache-Control`, `Date`, `Vary`, `Retry-After`, `Expires`), and none
+  whose value holds the credential.
+- **Nothing is forwarded unjournaled.** The broker reserves a journal slot before it
+  forwards (full: it refuses, 503), writes a row when the response head arrives, and a
+  second when the stream ends, so a long watch stream is on record from its start.
 - **Read rules** apply at any time.
 - **Write rules** are declared **per PluginAction** and are open **only while that action
   is being invoked**. A write rule may bind `{target.id}` in the **path**, in a **query

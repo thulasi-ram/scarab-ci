@@ -29,6 +29,12 @@
 //!
 //! The org and the source written into the record come from the locked
 //! installation row, never from a report.
+//!
+//! **PluginConnections** (ADR-0072 §5, migration 0056) follow the same order:
+//! a bind takes the installation row `FOR UPDATE` before the connection row,
+//! and uninstall takes the installation row before deleting the connections
+//! (returning their credential keys, which live in the SecretProvider). The
+//! broker's journal is append-only and keyed by nothing it locks.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -40,9 +46,10 @@ use scarab_deployment::{
     DeploymentInput, DeploymentStatusReport, DeploymentTarget, DeploymentVersion,
 };
 use scarab_plugin::{
-    DeploymentSourceTarget, EnvironmentTargetsPage, InstallationDeploymentSource,
-    InstallationState, InstallationUsage, PluginInstallation, PluginManifest, PluginStore,
-    PluginStoreError, ReportIngest, ReportItem, ReportItemOutcome, ReportOutcome, RuntimeStatus,
+    BrokerJournalEntry, BrokerJournalPhase, DeploymentSourceTarget, EnvironmentTargetsPage,
+    InstallationDeploymentSource, InstallationState, InstallationUsage, PluginConnection,
+    PluginConnectionAuthScheme, PluginInstallation, PluginManifest, PluginStore, PluginStoreError,
+    PluginUninstall, ReportIngest, ReportItem, ReportItemOutcome, ReportOutcome, RuntimeStatus,
     SourceTargetsPage, TargetRouting, UnmappedGrouping, MAX_TARGETS_PER_INSTALLATION,
     MAX_UNMAPPED_GROUPINGS_PER_INSTALLATION, PAGE_DEFAULT_LIMIT, PAGE_MAX_LIMIT,
 };
@@ -162,6 +169,35 @@ fn target_from_row(r: &sqlx::postgres::PgRow) -> DeploymentSourceTarget {
         owners_reported_at: r.get("owners_reported_at"),
         updated_at: r.get("updated_at"),
     }
+}
+
+const CONNECTION_COLUMNS: &str = "installation_id, slot, base_url, auth_scheme, \
+     credential_ref, ca_pem, updated_by, updated_at";
+
+/// One `plugin_connections` row back into the domain. An auth scheme this
+/// binary does not know is reported, never defaulted: injecting a credential
+/// the wrong way is not a safe guess.
+fn connection_from_row(r: &sqlx::postgres::PgRow) -> Result<PluginConnection, PluginStoreError> {
+    let scheme: String = r.get("auth_scheme");
+    let auth_scheme = PluginConnectionAuthScheme::parse(&scheme).ok_or_else(|| {
+        PluginStoreError::Store(format!(
+            "plugin connection: unreadable auth scheme {scheme:?}"
+        ))
+    })?;
+    Ok(PluginConnection {
+        installation_id: r.get("installation_id"),
+        slot: r.get("slot"),
+        base_url: r.get("base_url"),
+        auth_scheme,
+        credential_ref: r.get("credential_ref"),
+        ca_pem: r.get("ca_pem"),
+        updated_by: r.get("updated_by"),
+        updated_at: r.get("updated_at"),
+    })
+}
+
+fn saturating_i64(n: u64) -> i64 {
+    i64::try_from(n).unwrap_or(i64::MAX)
 }
 
 /// Where an ingested item's `input_seq` comes from: known already (a
@@ -392,25 +428,42 @@ impl PluginStore for PostgresDb {
         name: &str,
         by: &str,
         at: i64,
-    ) -> Result<Option<Vec<InstallationDeploymentSource>>, PluginStoreError> {
+    ) -> Result<Option<PluginUninstall>, PluginStoreError> {
         let mut tx = self.pool().begin().await.map_err(plugin_store_err)?;
-        // Cursors, receipts and unmapped counts go with it (ON DELETE
-        // CASCADE). The DELETE takes the installation row's lock FIRST, so an
-        // ingest in flight finishes first and none starts after, and an
-        // Environment PUT naming it (which holds it FOR SHARE before touching
-        // any source row) either commits before this or waits for it — no
-        // two transactions ever wait on each other's source rows.
-        let deleted: Option<String> = sqlx::query_scalar(
-            "DELETE FROM plugin_installations WHERE org = $1 AND name = $2 RETURNING id",
+        // The installation row's lock FIRST, so an ingest in flight finishes
+        // first and none starts after, a connection bind (which takes it
+        // before any connection row) cannot slip a credential in between, and
+        // an Environment PUT naming it (which holds it FOR SHARE before
+        // touching any source row) either commits before this or waits for it
+        // — no two transactions ever wait on each other's dependent rows.
+        let id: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM plugin_installations WHERE org = $1 AND name = $2 FOR UPDATE",
         )
         .bind(org)
         .bind(name)
         .fetch_optional(&mut *tx)
         .await
         .map_err(plugin_store_err)?;
-        if deleted.is_none() {
+        let Some(id) = id else {
             return Ok(None);
-        }
+        };
+        // The connections' secret keys, read as the rows go: the secrets live
+        // in another store, so the caller deletes them (ADR-0072 §5).
+        let mut connection_credential_refs: Vec<String> = sqlx::query_scalar(
+            "DELETE FROM plugin_connections WHERE installation_id = $1 RETURNING credential_ref",
+        )
+        .bind(&id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(plugin_store_err)?;
+        connection_credential_refs.sort();
+        // Cursors, receipts and unmapped counts go with it (ON DELETE
+        // CASCADE).
+        sqlx::query("DELETE FROM plugin_installations WHERE id = $1")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await
+            .map_err(plugin_store_err)?;
         // Every source naming it goes too: a source naming a retired name
         // could never route again, and leaving it would read as if it might.
         let mut removed: Vec<InstallationDeploymentSource> = sqlx::query(
@@ -441,7 +494,10 @@ impl PluginStore for PostgresDb {
         .await
         .map_err(plugin_store_err)?;
         tx.commit().await.map_err(plugin_store_err)?;
-        Ok(Some(removed))
+        Ok(Some(PluginUninstall {
+            deployment_sources: removed,
+            connection_credential_refs,
+        }))
     }
 
     async fn deployment_sources_naming(
@@ -1035,6 +1091,236 @@ impl PluginStore for PostgresDb {
         Ok(
             sqlx::query("DELETE FROM plugin_report_receipts WHERE received_at < $1")
                 .bind(received_before)
+                .execute(self.pool())
+                .await
+                .map_err(plugin_store_err)?
+                .rows_affected(),
+        )
+    }
+
+    async fn put_connection(
+        &self,
+        connection: &PluginConnection,
+    ) -> Result<Option<String>, PluginStoreError> {
+        let c = connection;
+        if c.slot.is_empty()
+            || c.credential_ref.is_empty()
+            || !(c.base_url.starts_with("http://") || c.base_url.starts_with("https://"))
+        {
+            return Err(PluginStoreError::Invalid(
+                "a plugin connection needs a slot, an http(s) base URL and a credential".into(),
+            ));
+        }
+        let mut tx = self.pool().begin().await.map_err(plugin_store_err)?;
+        // The installation row first (the module's lock order): an uninstall
+        // that holds it wins and this finds nothing, and one that comes later
+        // sees — and deletes — the binding written here.
+        let installed: Option<String> =
+            sqlx::query_scalar("SELECT id FROM plugin_installations WHERE id = $1 FOR UPDATE")
+                .bind(&c.installation_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(plugin_store_err)?;
+        if installed.is_none() {
+            return Err(PluginStoreError::NotFound);
+        }
+        let previous: Option<String> = sqlx::query_scalar(
+            "SELECT credential_ref FROM plugin_connections
+              WHERE installation_id = $1 AND slot = $2 FOR UPDATE",
+        )
+        .bind(&c.installation_id)
+        .bind(&c.slot)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(plugin_store_err)?;
+        // Replaced whole: destination, credential handle and CA move together
+        // (ADR-0072 §5 — the destination is part of the authority).
+        sqlx::query(
+            "INSERT INTO plugin_connections
+                 (installation_id, slot, base_url, auth_scheme, credential_ref, ca_pem,
+                  updated_by, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (installation_id, slot) DO UPDATE SET
+                 base_url = EXCLUDED.base_url,
+                 auth_scheme = EXCLUDED.auth_scheme,
+                 credential_ref = EXCLUDED.credential_ref,
+                 ca_pem = EXCLUDED.ca_pem,
+                 updated_by = EXCLUDED.updated_by,
+                 updated_at = EXCLUDED.updated_at",
+        )
+        .bind(&c.installation_id)
+        .bind(&c.slot)
+        .bind(&c.base_url)
+        .bind(c.auth_scheme.as_str())
+        .bind(&c.credential_ref)
+        .bind(&c.ca_pem)
+        .bind(&c.updated_by)
+        .bind(c.updated_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(plugin_store_err)?;
+        tx.commit().await.map_err(plugin_store_err)?;
+        Ok(previous)
+    }
+
+    async fn connections(
+        &self,
+        installation_id: &str,
+    ) -> Result<Vec<PluginConnection>, PluginStoreError> {
+        let sql = format!(
+            "SELECT {CONNECTION_COLUMNS} FROM plugin_connections
+              WHERE installation_id = $1 ORDER BY slot"
+        );
+        sqlx::query(&sql)
+            .bind(installation_id)
+            .fetch_all(self.pool())
+            .await
+            .map_err(plugin_store_err)?
+            .iter()
+            .map(connection_from_row)
+            .collect()
+    }
+
+    async fn connection(
+        &self,
+        installation_id: &str,
+        slot: &str,
+    ) -> Result<Option<PluginConnection>, PluginStoreError> {
+        let sql = format!(
+            "SELECT {CONNECTION_COLUMNS} FROM plugin_connections
+              WHERE installation_id = $1 AND slot = $2"
+        );
+        sqlx::query(&sql)
+            .bind(installation_id)
+            .bind(slot)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(plugin_store_err)?
+            .as_ref()
+            .map(connection_from_row)
+            .transpose()
+    }
+
+    async fn delete_connection(
+        &self,
+        installation_id: &str,
+        slot: &str,
+    ) -> Result<Option<PluginConnection>, PluginStoreError> {
+        let sql = format!(
+            "DELETE FROM plugin_connections WHERE installation_id = $1 AND slot = $2
+             RETURNING {CONNECTION_COLUMNS}"
+        );
+        sqlx::query(&sql)
+            .bind(installation_id)
+            .bind(slot)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(plugin_store_err)?
+            .as_ref()
+            .map(connection_from_row)
+            .transpose()
+    }
+
+    async fn append_broker_journal(
+        &self,
+        entries: &[BrokerJournalEntry],
+    ) -> Result<(), PluginStoreError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        // One round trip per batch: the journal writer drains its queue in
+        // batches so a busy broker costs the pool a statement, not a row.
+        let col = |f: fn(&BrokerJournalEntry) -> String| entries.iter().map(f).collect::<Vec<_>>();
+        let opt = |f: fn(&BrokerJournalEntry) -> Option<String>| {
+            entries.iter().map(f).collect::<Vec<_>>()
+        };
+        let num =
+            |f: fn(&BrokerJournalEntry) -> Option<i64>| entries.iter().map(f).collect::<Vec<_>>();
+        sqlx::query(
+            "INSERT INTO plugin_broker_journal
+                 (installation_id, slot, method, path, rule, status, bytes, started_at,
+                  duration_ms, denied_reason, request_id, phase, upstream_path, query)
+             SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
+                                  $6::int[], $7::bigint[], $8::bigint[], $9::bigint[],
+                                  $10::text[], $11::text[], $12::text[], $13::text[],
+                                  $14::text[])",
+        )
+        .bind(col(|e| e.installation_id.clone()))
+        .bind(col(|e| e.slot.clone()))
+        .bind(col(|e| e.method.clone()))
+        .bind(col(|e| e.path.clone()))
+        .bind(opt(|e| e.rule.clone()))
+        .bind(
+            entries
+                .iter()
+                .map(|e| e.status.map(i32::from))
+                .collect::<Vec<_>>(),
+        )
+        .bind(num(|e| e.bytes.map(saturating_i64)))
+        .bind(entries.iter().map(|e| e.started_at).collect::<Vec<_>>())
+        .bind(num(|e| e.duration_ms.map(saturating_i64)))
+        .bind(opt(|e| e.denied_reason.clone()))
+        .bind(col(|e| e.request_id.clone()))
+        .bind(col(|e| e.phase.as_str().to_string()))
+        .bind(opt(|e| e.upstream_path.clone()))
+        .bind(opt(|e| e.query.clone()))
+        .execute(self.pool())
+        .await
+        .map_err(plugin_store_err)?;
+        Ok(())
+    }
+
+    async fn broker_journal(
+        &self,
+        installation_id: &str,
+        limit: usize,
+    ) -> Result<Vec<BrokerJournalEntry>, PluginStoreError> {
+        sqlx::query(
+            "SELECT installation_id, slot, method, path, rule, status, bytes, started_at,
+                    duration_ms, denied_reason, request_id, phase, upstream_path, query
+               FROM plugin_broker_journal
+              WHERE installation_id = $1
+              ORDER BY id DESC
+              LIMIT $2",
+        )
+        .bind(installation_id)
+        .bind(page_limit(limit))
+        .fetch_all(self.pool())
+        .await
+        .map_err(plugin_store_err)?
+        .iter()
+        .map(|r| {
+            let phase: String = r.get("phase");
+            Ok(BrokerJournalEntry {
+                request_id: r.get("request_id"),
+                phase: BrokerJournalPhase::parse(&phase).ok_or_else(|| {
+                    PluginStoreError::Store(format!("broker journal: unreadable phase {phase:?}"))
+                })?,
+                installation_id: r.get("installation_id"),
+                slot: r.get("slot"),
+                method: r.get("method"),
+                path: r.get("path"),
+                upstream_path: r.get("upstream_path"),
+                query: r.get("query"),
+                rule: r.get("rule"),
+                status: r
+                    .get::<Option<i32>, _>("status")
+                    .and_then(|s| u16::try_from(s).ok()),
+                bytes: r.get::<Option<i64>, _>("bytes").map(|b| b.max(0) as u64),
+                started_at: r.get("started_at"),
+                duration_ms: r
+                    .get::<Option<i64>, _>("duration_ms")
+                    .map(|d| d.max(0) as u64),
+                denied_reason: r.get("denied_reason"),
+            })
+        })
+        .collect()
+    }
+
+    async fn prune_broker_journal(&self, started_before: i64) -> Result<u64, PluginStoreError> {
+        Ok(
+            sqlx::query("DELETE FROM plugin_broker_journal WHERE started_at < $1")
+                .bind(started_before)
                 .execute(self.pool())
                 .await
                 .map_err(plugin_store_err)?

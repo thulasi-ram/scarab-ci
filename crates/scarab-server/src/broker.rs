@@ -4,8 +4,8 @@
 //! surface and the UI stay unreachable from a plugin Pod, and this router is
 //! not in the public OpenAPI document.
 //!
-//! Slice d1 serves identity and report ingest; the read proxy over
-//! PluginConnections is slice d3.
+//! Slice d1 serves identity and report ingest; slice d3 adds the read proxy
+//! over PluginConnections ([`crate::broker_proxy`]).
 //!
 //! Every route but `healthz` goes through [`authenticate_plugin`]: the
 //! token is verified ([`PluginTokenVerifier`]), its ServiceAccount mapped to
@@ -38,7 +38,7 @@ use axum::extract::{DefaultBodyLimit, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -53,6 +53,7 @@ use scarab_plugin::{
 };
 
 use super::{ApiError, AppState};
+use crate::broker_proxy;
 use crate::plugins::plugin_store_api_error;
 
 /// The reserved path prefix every broker route lives under.
@@ -120,12 +121,35 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             authenticate_plugin_for_ingest,
         ));
+    // The read proxy (slice d3). Every method reaches the handler — after
+    // authentication, the proxy permit and the kill switch — so a write is
+    // refused with a 405 that is journaled like any other refusal, not
+    // dropped by the router. The proxy is an outer layer, so authentication
+    // finds it to take the permit.
+    let proxy = state
+        .broker_plugins
+        .clone()
+        .or_else(|| state.plugins.clone())
+        .map(|store| {
+            Router::new()
+                .route(&broker_proxy::route_path(), any(broker_proxy::proxy))
+                .route_layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    authenticate_plugin_for_proxy,
+                ))
+                .layer(Extension(broker_proxy::BrokerProxy::spawn(
+                    store,
+                    state.broker_journal_queue,
+                )))
+        })
+        .unwrap_or_default();
     Router::new()
         // Unauthenticated: the reachability probe (proc-mode discovery and
         // the isolation probe, slice d2) must not need a token.
         .route(&format!("{BROKER_PREFIX}/healthz"), get(healthz))
         .merge(reads)
         .merge(ingest)
+        .merge(proxy)
         .layer(DefaultBodyLimit::max(BROKER_BODY_LIMIT_BYTES))
         .layer(axum::middleware::from_fn(super::request_id_middleware))
         // Outermost, so the response it rewrites already carries its
@@ -206,7 +230,7 @@ pub struct PluginCaller(pub PluginInstallation);
 /// (a reinstalled plugin's old token maps to nothing); a killed installation
 /// is a 403 naming the kill switch.
 async fn authenticate_plugin(State(st): State<AppState>, req: Request, next: Next) -> Response {
-    authenticate(st, req, next, false).await
+    authenticate(st, req, next, Gate::None).await
 }
 
 /// [`authenticate_plugin`], plus the per-installation batch permit — taken
@@ -218,15 +242,37 @@ async fn authenticate_plugin_for_ingest(
     req: Request,
     next: Next,
 ) -> Response {
-    authenticate(st, req, next, true).await
+    authenticate(st, req, next, Gate::Ingest).await
 }
 
-async fn authenticate(st: AppState, mut req: Request, next: Next, ingest: bool) -> Response {
+/// [`authenticate_plugin`], plus one of the installation's read-proxy
+/// permits — like ingest's, taken after the token is verified and before
+/// the installation (or anything else) is read, so a flood of proxied
+/// requests is turned away without touching the store or a secret. The
+/// permit rides in the request to the handler, which holds it until the
+/// response stream ends.
+async fn authenticate_plugin_for_proxy(
+    State(st): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    authenticate(st, req, next, Gate::Proxy).await
+}
+
+/// Which per-installation permit a route takes before the first read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    None,
+    Ingest,
+    Proxy,
+}
+
+async fn authenticate(st: AppState, mut req: Request, next: Next, gate: Gate) -> Response {
     let id = match verified_installation_id(&st, req.headers()).await {
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
-    let _permit = if ingest {
+    let _permit = if gate == Gate::Ingest {
         match st.plugin_ingest_permits.try_acquire(&id) {
             Some(permit) => Some(permit),
             None => return BrokerError::TooManyRequests.into_response(),
@@ -234,6 +280,24 @@ async fn authenticate(st: AppState, mut req: Request, next: Next, ingest: bool) 
     } else {
         None
     };
+    if gate == Gate::Proxy {
+        let Some(proxy) = req
+            .extensions()
+            .get::<Arc<broker_proxy::BrokerProxy>>()
+            .cloned()
+        else {
+            tracing::error!("broker: the read proxy route has no proxy layer");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
+        let method = req.method().as_str().to_string();
+        let path = req.uri().path().to_string();
+        match broker_proxy::take_permit(&st, &proxy, &id, &method, &path).await {
+            Ok(permit) => {
+                req.extensions_mut().insert(permit);
+            }
+            Err(refused) => return refused,
+        }
+    }
     match caller(&st, &id).await {
         Ok(caller) => {
             req.extensions_mut().insert(caller);
@@ -298,9 +362,17 @@ async fn caller(st: &AppState, id: &str) -> Result<PluginCaller, BrokerError> {
 /// Every 500 the broker would send becomes `internal error; request id <id>`
 /// — the detail (a database error's text, say) is logged under that id for
 /// an operator, never handed to an untrusted plugin (red-team F-5).
+///
+/// A proxied upstream's own 500 is not one of ours: its body is the
+/// vendor's, and it passes through untouched.
 async fn scrub_internal_errors(req: Request, next: Next) -> Response {
     let resp = next.run(req).await;
-    if resp.status() != StatusCode::INTERNAL_SERVER_ERROR {
+    if resp.status() != StatusCode::INTERNAL_SERVER_ERROR
+        || resp
+            .extensions()
+            .get::<broker_proxy::UpstreamResponse>()
+            .is_some()
+    {
         return resp;
     }
     let request_id = resp

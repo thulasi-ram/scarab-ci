@@ -49,6 +49,7 @@ use scarab_identity::{Action, Principal, Session};
 /// ADR-0072: the CredentialBroker's plugin-facing router — its own listener,
 /// not part of the public API.
 pub mod broker;
+pub mod broker_proxy;
 /// ADR-0062 part 3: the **change set** of a Workspace Export — the exact paths an
 /// Attempt wrote, read out of an `overlayfs` upper layer rather than inferred.
 /// The Export lifecycle it fed was deleted when ADR-0066 cancelled lazy delivery
@@ -172,6 +173,10 @@ pub struct AppState {
     /// connection, so a flood cannot queue behind the installation's row
     /// lock — the lock a kill needs.
     pub plugin_ingest_permits: Arc<broker::IngestPermits>,
+    /// How many entries the CredentialBroker's journal queue holds between
+    /// the read proxy and its writer (ADR-0072 §5). Full, the proxy refuses
+    /// to forward (503) rather than forward what it cannot journal.
+    pub broker_journal_queue: usize,
     /// Proves who calls the broker (ADR-0072 §11): TokenReview in production
     /// (slice d2), static dev tokens under `SCARAB_DEV_INSECURE`. `None` makes
     /// every authenticated broker call a 401 — nothing proven, nothing taken.
@@ -283,6 +288,7 @@ impl AppState {
             plugins: None,
             broker_plugins: None,
             plugin_ingest_permits: Arc::new(broker::IngestPermits::default()),
+            broker_journal_queue: broker_proxy::JOURNAL_QUEUE,
             plugin_tokens: None,
             plugin_policy: Arc::new(plugins::PluginPolicy::off()),
             secret_coverage: None,
@@ -394,6 +400,14 @@ impl AppState {
     /// small pool — instead of [`Self::with_plugins`]'s.
     pub fn with_broker_plugin_store(mut self, store: Arc<dyn scarab_plugin::PluginStore>) -> Self {
         self.broker_plugins = Some(store);
+        self
+    }
+
+    /// Size the CredentialBroker's journal queue (default
+    /// [`broker_proxy::JOURNAL_QUEUE`]). A test makes it small to reach
+    /// "journal full" without thousands of requests.
+    pub fn with_broker_journal_queue(mut self, entries: usize) -> Self {
+        self.broker_journal_queue = entries;
         self
     }
 
@@ -9215,8 +9229,8 @@ const TAG_GROUPS: &[(&str, &str)] = &[
     (
         "Plugins",
         "PluginInstallations (ADR-0072): the first-party catalog, install and \
-         uninstall, the kill switch, and the vendor groupings no Environment \
-         lists yet.",
+         uninstall, the kill switch, the vendor groupings no Environment \
+         lists yet, and the PluginConnections the CredentialBroker proxies to.",
     ),
     (
         "Secrets",
@@ -9465,6 +9479,9 @@ impl utoipa::Modify for SecuritySchemes {
         plugins::kill_plugin,
         plugins::enable_plugin,
         plugins::unmapped_groupings,
+        plugins::list_plugin_connections,
+        plugins::put_plugin_connection,
+        plugins::delete_plugin_connection,
         get_environment_board,
         list_environment_deployments,
         get_deployment,
@@ -9593,7 +9610,9 @@ impl utoipa::Modify for SecuritySchemes {
         plugins::InstallPluginRequest,
         plugins::UninstalledPluginDto,
         plugins::UnmappedGroupingDto,
-        plugins::DeploymentSourceTargetDto
+        plugins::DeploymentSourceTargetDto,
+        plugins::PluginConnectionDto,
+        plugins::PutPluginConnectionRequest
     ))
 )]
 pub struct ApiDoc;
@@ -9748,6 +9767,15 @@ fn router_inner(state: AppState) -> Router {
         .route(
             "/v1/orgs/{org}/plugins/{name}/unmapped-groupings",
             get(plugins::unmapped_groupings),
+        )
+        .route(
+            "/v1/orgs/{org}/plugins/{name}/connections",
+            get(plugins::list_plugin_connections),
+        )
+        .route(
+            "/v1/orgs/{org}/plugins/{name}/connections/{slot}",
+            axum::routing::put(plugins::put_plugin_connection)
+                .delete(plugins::delete_plugin_connection),
         )
         .route("/v1/orgs/{org}/board", get(get_environment_board))
         .route(

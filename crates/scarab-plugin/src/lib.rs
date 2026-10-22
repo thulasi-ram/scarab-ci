@@ -32,8 +32,16 @@ use std::fmt;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+mod connection;
 mod report;
 mod store;
+
+pub use connection::{
+    match_read_request, rule_label, BrokerJournalEntry, BrokerJournalPhase, PluginConnection,
+    PluginConnectionAuthScheme, ReadRequestMatch, ReadRequestRefusal, BROKER_JOURNAL_RETENTION_MS,
+    MAX_CONNECTION_BASE_URL_CHARS, MAX_CONNECTION_CA_PEM_BYTES, MAX_CONNECTION_CREDENTIAL_BYTES,
+    MAX_PROXY_PATH_CHARS, MAX_PROXY_PATH_SEGMENTS, MAX_PROXY_QUERY_CHARS, MAX_PROXY_QUERY_PARAMS,
+};
 
 pub use report::{
     OwnershipReportItem, ReportIngest, ReportItem, ReportItemOutcome, ReportOutcome,
@@ -43,9 +51,10 @@ pub use report::{
 };
 pub use store::{
     DeploymentSourceTarget, EnvironmentTargetsPage, InstallationDeploymentSource,
-    InstallationUsage, PluginStore, PluginStoreError, SourceTargetsPage, TargetRouting,
-    UnmappedGrouping, MAX_TARGETS_PER_INSTALLATION, MAX_UNMAPPED_GROUPINGS_PER_INSTALLATION,
-    PAGE_DEFAULT_LIMIT, PAGE_MAX_LIMIT, REPORT_RECEIPT_RETENTION_MS,
+    InstallationUsage, PluginStore, PluginStoreError, PluginUninstall, SourceTargetsPage,
+    TargetRouting, UnmappedGrouping, MAX_TARGETS_PER_INSTALLATION,
+    MAX_UNMAPPED_GROUPINGS_PER_INSTALLATION, PAGE_DEFAULT_LIMIT, PAGE_MAX_LIMIT,
+    REPORT_RECEIPT_RETENTION_MS,
 };
 
 /// The longest installation or plugin name: a DNS-1123 label. Installation
@@ -64,6 +73,9 @@ pub const MAX_READ_RULES_PER_SLOT: usize = 64;
 pub const MAX_CONFIG_KEYS: usize = 32;
 /// The longest read-rule path pattern and config value, in characters.
 pub const MAX_RULE_PATH_CHARS: usize = 512;
+/// The most query keys one read rule may allow, and the longest key.
+pub const MAX_RULE_QUERY_KEYS: usize = 16;
+pub const MAX_RULE_QUERY_KEY_CHARS: usize = 64;
 pub const MAX_CONFIG_VALUE_CHARS: usize = 2048;
 
 /// Config keys may not start with this: core sets the `SCARAB_*` variables a
@@ -146,9 +158,10 @@ pub const MMP_ADMITTED_CAPABILITIES: [PluginCapability; 2] = [
     PluginCapability::UseConnection,
 ];
 
-/// An allowed request shape on a PluginConnection (ADR-0072 §5): a method
-/// and a path pattern, `*` matching exactly one segment. The manifest
-/// declares **read** rules only; write rules belong to PluginActions (MLP).
+/// An allowed request shape on a PluginConnection (ADR-0072 §5): a method,
+/// a path pattern (`*` matching exactly one segment) and the query keys the
+/// request may carry. The manifest declares **read** rules only; write rules
+/// belong to PluginActions (MLP).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequestRule {
@@ -156,6 +169,13 @@ pub struct RequestRule {
     pub method: String,
     /// Absolute, `/`-separated; `*` is one whole segment.
     pub path: String,
+    /// The query keys a request under this rule may carry, each at most
+    /// once; empty (the default) = no query at all. An allowlist, because a
+    /// read path can still have a side effect behind a query key (Argo CD's
+    /// `?refresh=hard`), and dropping an undeclared key instead of refusing
+    /// could re-target the read (`appNamespace`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub query: Vec<String>,
 }
 
 /// A named external system the Plugin reaches through the broker (Argo CD's
@@ -377,8 +397,39 @@ impl RequestRule {
                 ));
             }
         }
+        if self.query.len() > MAX_RULE_QUERY_KEYS {
+            return invalid(format!(
+                "connection slot `{slot}`: rule `{path}` allows more than \
+                 {MAX_RULE_QUERY_KEYS} query keys"
+            ));
+        }
+        let mut keys = std::collections::BTreeSet::new();
+        for key in &self.query {
+            if !is_query_key(key) {
+                return invalid(format!(
+                    "connection slot `{slot}`: rule `{path}` query key `{}` must be 1-\
+                     {MAX_RULE_QUERY_KEY_CHARS} of `A-Z`, `a-z`, `0-9`, `_`, `.`, `-`",
+                    key.escape_debug()
+                ));
+            }
+            if !keys.insert(key.as_str()) {
+                return invalid(format!(
+                    "connection slot `{slot}`: rule `{path}` lists query key `{key}` twice"
+                ));
+            }
+        }
         Ok(())
     }
+}
+
+/// A query key a read rule may allow: plain ASCII, so what the broker
+/// compares is what the upstream reads.
+fn is_query_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= MAX_RULE_QUERY_KEY_CHARS
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
 }
 
 /// Can this release run a Plugin with `manifest`? Only the MMP's
@@ -662,6 +713,7 @@ mod tests {
         RequestRule {
             method: method.into(),
             path: path.into(),
+            query: vec![],
         }
     }
 
@@ -767,6 +819,42 @@ mod tests {
         let mut m = argo_like();
         m.connections[0].read_rules = vec![rule("HEAD", "/api/v1/*/x")];
         assert_eq!(m.validate(), Ok(()));
+    }
+
+    #[test]
+    fn a_rule_s_query_keys_are_plain_distinct_and_bounded() {
+        let with_query = |keys: Vec<String>| {
+            let mut m = argo_like();
+            m.connections[0].read_rules[0].query = keys;
+            m.validate()
+        };
+        assert_eq!(
+            with_query(vec!["appNamespace".into(), "project".into()]),
+            Ok(())
+        );
+        for keys in [
+            vec![String::new()],
+            vec!["app namespace".into()],
+            vec!["a=b".into()],
+            vec!["a&b".into()],
+            vec!["café".into()],
+            vec!["x".repeat(MAX_RULE_QUERY_KEY_CHARS + 1)],
+            vec!["project".into(), "project".into()],
+            (0..=MAX_RULE_QUERY_KEYS).map(|i| format!("k{i}")).collect(),
+        ] {
+            assert!(
+                matches!(
+                    with_query(keys.clone()),
+                    Err(PluginError::InvalidManifest(_))
+                ),
+                "{keys:?}"
+            );
+        }
+        // Absent in the JSON = no query; and an empty list is not written back.
+        let json = r#"{"method":"GET","path":"/api/version"}"#;
+        let rule: RequestRule = serde_json::from_str(json).unwrap();
+        assert!(rule.query.is_empty());
+        assert_eq!(serde_json::to_string(&rule).unwrap(), json);
     }
 
     #[test]

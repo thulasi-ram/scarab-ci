@@ -7,10 +7,26 @@
       "auth_schemes": ["bearer"],
       "read_rules": [
         { "method": "GET", "path": "/api/version" },
-        { "method": "GET", "path": "/api/v1/applications" },
-        { "method": "GET", "path": "/api/v1/applications/*" },
-        { "method": "GET", "path": "/api/v1/applications/*/managed-resources" },
-        { "method": "GET", "path": "/api/v1/stream/applications" }
+        {
+          "method": "GET",
+          "path": "/api/v1/applications",
+          "query": ["projects", "selector", "appNamespace"]
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/applications/*",
+          "query": ["appNamespace", "project"]
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/applications/*/managed-resources",
+          "query": ["appNamespace", "project"]
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/stream/applications",
+          "query": ["resourceVersion", "appNamespace", "projects", "name", "selector"]
+        }
       ]
     }
   ],

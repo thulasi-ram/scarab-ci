@@ -816,7 +816,8 @@ async fn uninstall_removes_its_sources_and_retires_its_name() {
         .await
         .unwrap()
         .expect("it existed");
-    assert_eq!(removed.len(), 2);
+    assert_eq!(removed.deployment_sources.len(), 2);
+    assert!(removed.connection_credential_refs.is_empty());
     assert!(db
         .deployment_sources_naming("acme", "argocd")
         .await
