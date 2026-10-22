@@ -1,0 +1,25 @@
+[package]
+name = "scarab-plugin"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+# Pure domain crate (CONTEXT §4.7, ADR-0072): what a Plugin is allowed to be —
+# its PluginManifest and closed PluginCapability vocabulary, a
+# PluginInstallation and its PluginPrincipal, the DeploymentReporterContract's
+# report items and their validation — plus the ports the server implements
+# (`PluginStore`, `PluginTokenVerifier`). No I/O: Kubernetes, TokenReview and
+# Postgres are adapters.
+[dependencies]
+# The manifest is a document an org admin approves byte-for-byte, and report
+# items are the broker's wire shape: serde is part of the domain here, not a
+# leaked format (ADR-0072 §2, §11).
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+# A report lands in the Deployment record as a DeploymentStatusReport.
+scarab-deployment = { workspace = true }
+# A report's (installation, vendor grouping) IS an EnvironmentDeploymentSource
+# (ADR-0071 §5): one shape rule, owned there.
+scarab-project = { workspace = true }

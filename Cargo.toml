@@ -16,6 +16,11 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+# ADR-0072: the first-party Argo CD plugin's manifest lands before its crate —
+# the server compiles the catalog entry in (`include_str!`) — so the directory
+# exists without a `Cargo.toml` and the `crates/*` glob would refuse to load it.
+# Drop this line when the reporter crate itself arrives.
+exclude = ["crates/scarab-plugin-argocd"]
 
 [workspace.package]
 edition = "2021"
@@ -69,6 +74,7 @@ scarab-executor-k8s = { path = "crates/scarab-executor-k8s" }
 scarab-executor-local = { path = "crates/scarab-executor-local" }
 scarab-testkit = { path = "crates/scarab-testkit" }
 scarab-deployment = { path = "crates/scarab-deployment" }
+scarab-plugin = { path = "crates/scarab-plugin" }
 
 # --- test-only ---------------------------------------------------------------
 # Property testing for pure domain folds (invariant suites). Dev-dependency

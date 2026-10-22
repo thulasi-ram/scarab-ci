@@ -33,6 +33,12 @@ pub const MAX_ORG_ENVIRONMENT_DESCRIPTION_CHARS: usize = 1000;
 /// installation the way Kubernetes names a label).
 pub const MAX_INSTALLATION_NAME_CHARS: usize = 63;
 
+/// The most EnvironmentDeploymentSources one Environment may list. Every
+/// source is a row the replace rewrites and a key the routing lookup holds;
+/// far more than any real CD layout needs, few enough that one PUT stays a
+/// bounded write.
+pub const MAX_ENVIRONMENT_DEPLOYMENT_SOURCES: usize = 256;
+
 /// The longest vendor grouping, in characters — a Kubernetes object name's
 /// limit, which an Argo CD project name (the motivating grouping) obeys.
 pub const MAX_VENDOR_GROUPING_CHARS: usize = 253;
@@ -180,6 +186,13 @@ impl OrgEnvironment {
                 "description is longer than {MAX_ORG_ENVIRONMENT_DESCRIPTION_CHARS} characters"
             )));
         }
+        if self.deployment_sources.len() > MAX_ENVIRONMENT_DEPLOYMENT_SOURCES {
+            return Err(OrgEnvironmentError::Invalid(format!(
+                "at most {MAX_ENVIRONMENT_DEPLOYMENT_SOURCES} deployment sources per \
+                 environment, got {}",
+                self.deployment_sources.len()
+            )));
+        }
         let mut seen = std::collections::BTreeSet::new();
         for source in &self.deployment_sources {
             source.validate()?;
@@ -239,9 +252,38 @@ pub enum OrgEnvironmentError {
         /// The Environment that holds it.
         environment: String,
     },
+    /// A source names no PluginInstallation in the Org (c-min audit F1): it
+    /// would sit dormant until someone installed a plugin under that name,
+    /// which would then inherit the routing without its installer having
+    /// consented to it. Nothing was stored.
+    #[error("{}", not_installed_text(.installation, .org, *.already_listed))]
+    DeploymentSourceNotInstalled {
+        installation: String,
+        org: String,
+        /// The Environment already listed it — a source written before
+        /// installations were checked. Every edit of the Environment is
+        /// refused until it is removed (or installed), which the message
+        /// has to say, or a deadline-only edit fails for no visible reason.
+        already_listed: bool,
+    },
     /// The backing store failed, or held a row this binary cannot read.
     #[error("org environment store: {0}")]
     Store(String),
+}
+
+fn not_installed_text(installation: &str, org: &str, already_listed: bool) -> String {
+    if already_listed {
+        format!(
+            "this environment still lists deployment source `{installation}`, which names no \
+             plugin installation in org `{org}` (it was written before installations were \
+             checked); remove the source, or install `{installation}` first (ADR-0072)"
+        )
+    } else {
+        format!(
+            "deployment source `{installation}` names no plugin installation in org `{org}`; \
+             install it first, or remove the source (ADR-0072)"
+        )
+    }
 }
 
 /// Durable store for OrgEnvironments and their EnvironmentDeploymentSources,
@@ -253,8 +295,11 @@ pub trait OrgEnvironmentStore: Send + Sync {
     /// replace the stored `created_at` is kept and `env.created_at` ignored.
     /// Refuses an invalid `env` ([`OrgEnvironmentError::Invalid`]) and a
     /// source another Environment holds
-    /// ([`OrgEnvironmentError::DeploymentSourceTaken`]); either way nothing
-    /// changes. Returns the OrgEnvironment as stored (sources sorted).
+    /// ([`OrgEnvironmentError::DeploymentSourceTaken`]); an adapter that
+    /// also keeps PluginInstallations refuses, **in the same transaction as
+    /// the write**, a source naming no installation in the Org
+    /// ([`OrgEnvironmentError::DeploymentSourceNotInstalled`]). Either way
+    /// nothing changes. Returns the OrgEnvironment as stored (sources sorted).
     async fn put_org_environment(
         &self,
         env: &OrgEnvironment,
@@ -465,6 +510,23 @@ mod tests {
                 vec![source("argocd", "prod"), source("Argo", "prod")]
             )
             .validate(),
+            Err(OrgEnvironmentError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn sources_per_environment_are_capped() {
+        let sources = |n: usize| {
+            (0..n)
+                .map(|i| source("argocd", &format!("g{i}")))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            env("prod", sources(MAX_ENVIRONMENT_DEPLOYMENT_SOURCES)).validate(),
+            Ok(())
+        );
+        assert!(matches!(
+            env("prod", sources(MAX_ENVIRONMENT_DEPLOYMENT_SOURCES + 1)).validate(),
             Err(OrgEnvironmentError::Invalid(_))
         ));
     }

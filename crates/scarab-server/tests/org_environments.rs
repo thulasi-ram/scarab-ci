@@ -43,6 +43,27 @@ fn app_state(db: Arc<InMemoryDb>, clock: Arc<FakeClock>) -> AppState {
     AppState::new(db, clock, logs)
 }
 
+/// The PluginInstallations these tests' sources name, in every Org they use:
+/// the Environment store refuses a source naming no installation in its Org
+/// (c-min F1). Written as rows — what an installation IS is not under test
+/// here.
+async fn install_named(pool: &sqlx::PgPool) {
+    for statement in [
+        "INSERT INTO plugin_installation_names (org, name, installation_id, installed_at)
+         SELECT o, n, substr(md5(o || '/' || n), 1, 10), 0
+         FROM unnest(ARRAY['acme', 'globex', 'initech']) AS o,
+              unnest(ARRAY['argocd', 'argocd-eu', 'argocd-prod']) AS n",
+        "INSERT INTO plugin_installations
+             (org, name, id, plugin, image, manifest, manifest_sha256, state, approved_by,
+              approved_at)
+         SELECT org, name, installation_id, 'argocd', 'test@sha256:0', '{}', '0', 'enabled',
+                'amy', 0
+         FROM plugin_installation_names",
+    ] {
+        sqlx::query(statement).execute(pool).await.unwrap();
+    }
+}
+
 /// A router with both stores wired and authz off (every caller an owner).
 fn open_app(pg: Arc<PostgresDb>, clock: Arc<FakeClock>) -> axum::Router {
     router(
@@ -105,6 +126,7 @@ async fn create_read_replace_and_delete_round_trip() {
     };
     let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
     pg.migrate().await.unwrap();
+    install_named(&tdb.pool).await;
     let clock = Arc::new(FakeClock::new(CLOCK_START_MS));
     let app = open_app(pg, clock.clone());
 
@@ -218,6 +240,7 @@ async fn invalid_writes_are_refused_and_store_nothing() {
     };
     let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
     pg.migrate().await.unwrap();
+    install_named(&tdb.pool).await;
     let app = open_app(pg, Arc::new(FakeClock::new(CLOCK_START_MS)));
 
     for (uri, body) in [
@@ -300,6 +323,7 @@ async fn names_with_spaces_and_slashes_round_trip() {
     };
     let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
     pg.migrate().await.unwrap();
+    install_named(&tdb.pool).await;
     let app = open_app(pg, Arc::new(FakeClock::new(CLOCK_START_MS)));
 
     for (encoded, name) in [
@@ -337,6 +361,7 @@ async fn a_source_another_environment_lists_is_a_409_naming_it() {
     };
     let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
     pg.migrate().await.unwrap();
+    install_named(&tdb.pool).await;
     let app = open_app(pg, Arc::new(FakeClock::new(CLOCK_START_MS)));
 
     let source = json!({ "installation": "argocd", "vendor_grouping": "prod" });
@@ -395,6 +420,7 @@ async fn an_environment_with_deployments_cannot_be_deleted() {
     };
     let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
     pg.migrate().await.unwrap();
+    install_named(&tdb.pool).await;
     let clock = Arc::new(FakeClock::new(CLOCK_START_MS));
     pg.append("acme", &request("prod", "web", "v1"), clock.now().await.0)
         .await
@@ -445,6 +471,7 @@ async fn a_request_stalls_after_its_environments_own_deadline() {
     };
     let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
     pg.migrate().await.unwrap();
+    install_named(&tdb.pool).await;
     let clock = Arc::new(FakeClock::new(CLOCK_START_MS));
     let app = open_app(pg.clone(), clock.clone());
     let (status, _) = call(
@@ -518,6 +545,7 @@ async fn writes_need_org_administer_and_reads_need_org_read() {
     };
     let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
     pg.migrate().await.unwrap();
+    install_named(&tdb.pool).await;
 
     let scoped = |subject: &str| Principal {
         subject: subject.into(),
@@ -634,5 +662,108 @@ async fn unwired_store_is_404() {
     ] {
         let (status, _) = call(&app, method, uri, None, body).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}");
+    }
+}
+
+/// The org Environment store is down while the Deployment record is not.
+struct OrgEnvironmentsDown;
+
+#[async_trait::async_trait]
+impl scarab_project::OrgEnvironmentStore for OrgEnvironmentsDown {
+    async fn put_org_environment(
+        &self,
+        _: &scarab_project::OrgEnvironment,
+    ) -> Result<scarab_project::OrgEnvironment, scarab_project::OrgEnvironmentError> {
+        Err(down())
+    }
+    async fn get_org_environment(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<Option<scarab_project::OrgEnvironment>, scarab_project::OrgEnvironmentError> {
+        Err(down())
+    }
+    async fn list_org_environments(
+        &self,
+        _: &str,
+    ) -> Result<Vec<scarab_project::OrgEnvironment>, scarab_project::OrgEnvironmentError> {
+        Err(down())
+    }
+    async fn delete_org_environment(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<bool, scarab_project::OrgEnvironmentError> {
+        Err(down())
+    }
+    async fn environment_for_deployment_source(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> Result<Option<String>, scarab_project::OrgEnvironmentError> {
+        Err(down())
+    }
+}
+
+fn down() -> scarab_project::OrgEnvironmentError {
+    scarab_project::OrgEnvironmentError::Store("connection refused".into())
+}
+
+/// A Deployment record with one (empty) Environment, `prod`.
+struct OneEmptyEnvironment;
+
+#[async_trait::async_trait]
+impl DeploymentStore for OneEmptyEnvironment {
+    async fn append(
+        &self,
+        _: &str,
+        _: &DeploymentInput,
+        _: scarab_deployment::Millis,
+    ) -> Result<scarab_deployment::LoggedDeploymentInput, scarab_deployment::DeploymentStoreError>
+    {
+        Err(scarab_deployment::DeploymentStoreError::Store(
+            "read-only fake".into(),
+        ))
+    }
+    async fn inputs(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<
+        Vec<scarab_deployment::LoggedDeploymentInput>,
+        scarab_deployment::DeploymentStoreError,
+    > {
+        Ok(vec![])
+    }
+    async fn environments(
+        &self,
+        _: &str,
+    ) -> Result<Vec<String>, scarab_deployment::DeploymentStoreError> {
+        Ok(vec!["prod".into()])
+    }
+}
+
+/// A failed deadline lookup is a 500, never a silent fallback to the default
+/// deadline: a status folded against the wrong deadline would read `stalled`
+/// (or not) for no reason anyone could see (c-min audit). Needs no database.
+#[tokio::test]
+async fn a_failed_deadline_lookup_is_a_500_not_the_default_deadline() {
+    let app = router(
+        app_state(Arc::new(InMemoryDb::new()), Arc::new(FakeClock::new(0)))
+            .with_deployments(Arc::new(OneEmptyEnvironment))
+            .with_org_environments(Arc::new(OrgEnvironmentsDown)),
+    );
+    for uri in [
+        "/v1/orgs/acme/board",
+        "/v1/orgs/acme/board?environment=prod",
+        "/v1/orgs/acme/environments/prod/deployments",
+    ] {
+        let (status, body) = call(&app, "GET", uri, None, None).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{uri}: {body}");
+        assert!(
+            body.as_str().unwrap().contains("connection refused"),
+            "{uri}: {body}"
+        );
     }
 }

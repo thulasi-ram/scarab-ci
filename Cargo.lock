@@ -2664,6 +2664,7 @@ dependencies = [
  "scarab-forge",
  "scarab-identity",
  "scarab-pipeline",
+ "scarab-plugin",
  "scarab-project",
  "scarab-storage",
  "scarab-storage-s3",
@@ -2810,6 +2811,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "scarab-plugin"
+version = "0.1.1"
+dependencies = [
+ "async-trait",
+ "scarab-deployment",
+ "scarab-project",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "scarab-project"
 version = "0.1.1"
 dependencies = [
@@ -2873,6 +2886,7 @@ dependencies = [
  "scarab-forge-github",
  "scarab-identity",
  "scarab-pipeline",
+ "scarab-plugin",
  "scarab-project",
  "scarab-secrets",
  "scarab-secrets-postgres",

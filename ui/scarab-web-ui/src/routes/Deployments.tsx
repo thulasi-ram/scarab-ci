@@ -24,6 +24,7 @@ import { A, useSearchParams } from "@solidjs/router";
 import {
   DeploymentsForbiddenError,
   getEnvironmentBoard,
+  listDeploymentTargets,
   listEnvironmentDeployments,
   listOrgEnvironments,
   listProjects,
@@ -44,6 +45,7 @@ import {
   targetLabel,
 } from "../deployments";
 import { envPills } from "../org-environments";
+import { movedAwayNote, targetKey, targetOwners } from "../plugins";
 import StatusBadge from "../components/StatusBadge";
 import Icon from "../components/Icon";
 import Doodle from "../components/Doodle";
@@ -66,6 +68,23 @@ export default function Deployments() {
 
   const [board] = createResource(org, (o) => getEnvironmentBoard(o));
   const groups = createMemo(() => groupBoard(board() ?? []));
+
+  // Each target's owners, as its source last reported them (ADR-0072). Best
+  // effort: a 403/404 (or any failure) just leaves the owners line off.
+  const [owners] = createResource(
+    () => {
+      const envs = groups().map((g) => g.environment);
+      return org() && envs.length > 0 ? { org: org()!, envs } : false;
+    },
+    async (k) => {
+      const lists = await Promise.all(
+        k.envs.map((e) => listDeploymentTargets(k.org, e).catch(() => null)),
+      );
+      return new Map(k.envs.map((e, i) => [e, targetOwners(lists[i] ?? [])]));
+    },
+  );
+  const ownersOf = (env: string, source: string, id: string) =>
+    owners()?.get(env)?.get(targetKey(source, id));
 
   /** The Environment whose Deployments are listed: `?env=`, else the first
    *  on the board, else the first registered one. */
@@ -162,17 +181,54 @@ export default function Deployments() {
                                   onClick={() => pickEnv(g.environment)}
                                   title={`Show ${g.environment}'s deployments`}
                                 >
-                                  <td class="mono dep-target">{targetLabel(row.target)}</td>
                                   <td>
+                                    <span class="mono dep-target">{targetLabel(row.target)}</span>
                                     <Show
-                                      when={row.live}
-                                      fallback={<span class="subtle">nothing live</span>}
+                                      when={ownersOf(g.environment, row.target.source, row.target.id)}
                                     >
-                                      {(l) => <span class="mono dep-version">{l().version}</span>}
+                                      {(o) => (
+                                        <div
+                                          class="dep-owners mono"
+                                          title="The projects that own this target, as its source last reported"
+                                        >
+                                          owners: {o().join(", ")}
+                                        </div>
+                                      )}
                                     </Show>
                                   </td>
                                   <td>
-                                    <Show when={row.live} fallback={<span class="subtle">—</span>}>
+                                    {/* Moved (ADR-0070 §3): its source routes it elsewhere
+                                        now, so what was live here is history, not this
+                                        Environment's state — shown as the note, with the
+                                        last version here muted. */}
+                                    <Show
+                                      when={row.moved_away}
+                                      fallback={
+                                        <Show
+                                          when={row.live}
+                                          fallback={<span class="subtle">nothing live</span>}
+                                        >
+                                          {(l) => <span class="mono dep-version">{l().version}</span>}
+                                        </Show>
+                                      }
+                                    >
+                                      {(m) => (
+                                        <span class="dep-cell" title={movedAwayNote(m()).title}>
+                                          <span class="dep-tag dep-tag-muted">{movedAwayNote(m()).label}</span>
+                                          <Show when={row.live}>
+                                            {(l) => (
+                                              <span class="mono subtle">last here: {l().version}</span>
+                                            )}
+                                          </Show>
+                                        </span>
+                                      )}
+                                    </Show>
+                                  </td>
+                                  <td>
+                                    <Show
+                                      when={!row.moved_away && row.live}
+                                      fallback={<span class="subtle">—</span>}
+                                    >
                                       {(l) => (
                                         <span class="dep-cell">
                                           <span class="mono subtle">#{l().id}</span>
