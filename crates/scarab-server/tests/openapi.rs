@@ -162,6 +162,9 @@ fn openapi_document_has_the_plugin_admin_api_but_not_the_broker() {
         ("/v1/orgs/{org}/plugins/{name}/kill", "post"),
         ("/v1/orgs/{org}/plugins/{name}/enable", "post"),
         ("/v1/orgs/{org}/plugins/{name}/unmapped-groupings", "get"),
+        ("/v1/orgs/{org}/plugins/{name}/connections", "get"),
+        ("/v1/orgs/{org}/plugins/{name}/connections/{slot}", "put"),
+        ("/v1/orgs/{org}/plugins/{name}/connections/{slot}", "delete"),
     ] {
         let op = &paths[p][method];
         assert!(op.is_object(), "missing {method} {p}");
@@ -190,8 +193,24 @@ fn openapi_document_has_the_plugin_admin_api_but_not_the_broker() {
         "UninstalledPluginDto",
         "UnmappedGroupingDto",
         "DeploymentSourceTargetDto",
+        "PluginConnectionDto",
+        "PutPluginConnectionRequest",
     ] {
         assert!(schemas.get(s).is_some(), "missing schema {s}");
+    }
+    // A connection's credential is write-only (ADR-0072 §5): the request
+    // carries it, no response shape can — nor its secret key.
+    let request = &schemas["PutPluginConnectionRequest"]["properties"];
+    assert!(request.get("credential").is_some());
+    let dto = schemas["PluginConnectionDto"]["properties"]
+        .as_object()
+        .unwrap();
+    assert!(dto.contains_key("credential_set"));
+    for secret in ["credential", "credential_ref", "token"] {
+        assert!(
+            !dto.contains_key(secret),
+            "PluginConnectionDto exposes `{secret}`"
+        );
     }
     assert_eq!(
         schemas["PluginCapabilityDto"]["enum"],
