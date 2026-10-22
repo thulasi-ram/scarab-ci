@@ -56,22 +56,41 @@ CREATE TABLE plugin_installations (
 );
 
 -- One row per (installation, DeploymentTarget) a source has reported on: the
--- cursor (last accepted sequence, ADR-0070 §11), where the target routes now,
--- its declared version scheme, its last status, and its owners — the current
+-- cursor (last accepted sequence, ADR-0070 §11), its grouping, where its last
+-- report routed and where its last status was recorded, its declared version
+-- scheme, its last status, and its owners — the current
 -- DeploymentTargetProjectOwnership snapshot (not in the fold).
 --
--- LOCK ORDER on ingest: installation row → cursor row → the Org's
--- `deployment_input_counters` row (taken by the append). Request appends take
--- only the counter, and every ingest of an installation holds its
--- installation row first, so cursor rows are never contended across
--- transactions and no cycle can form.
+-- Where a target routes NOW is never stored here: it is read through
+-- `environment_deployment_sources` on (org, installation name,
+-- vendor_grouping), so an admin's edit moves it at once with no write here.
+--
+-- LOCK ORDER on ingest (one transaction per batch): the installation row
+-- (FOR UPDATE, first) → this table's rows (each item's cursor) → LAST, after
+-- every item is decided, the Org's `deployment_input_counters` row (taken by
+-- the buffered appends, held to commit). Request appends take only the
+-- counter. Cursor rows are only ever written under their installation's row
+-- lock (ingest; uninstall's cascade after its own DELETE of that row), so no
+-- two transactions contend on one, and the counter — the one lock shared with
+-- every Deployment request in the Org — is taken last and held briefly.
 CREATE TABLE deployment_source_targets (
     installation_id    TEXT   NOT NULL REFERENCES plugin_installations (id) ON DELETE CASCADE,
     target_id          TEXT   NOT NULL,
     org                TEXT   NOT NULL,
     vendor_grouping    TEXT   NOT NULL,
-    -- NULL = no Environment lists the grouping (unmapped).
+    -- Where the LAST REPORT (status or ownership) routed when it arrived;
+    -- NULL = unmapped then. Not where it routes now (see above). Kept only
+    -- to see a routing change at ingest: when it differs from the new
+    -- report's routing, `last_*` are reset first — a status recorded in
+    -- one Environment is never shown as another's (red-team F-3).
     environment        TEXT,
+    -- The Environment the cursor's last status (`last_*`) was APPENDED to;
+    -- NULL = that status was dropped (unmapped), or none was reported.
+    -- Written only by a status report. A target whose current routing is
+    -- set and differs from it must be re-sent by its reporter: the
+    -- `resend` flag on `/targets` is derived from exactly that, never
+    -- stored (ADR-0070 §11).
+    status_environment TEXT,
     last_sequence      BIGINT NOT NULL CHECK (last_sequence > 0),
     -- NULL until a status report declares one (an ownership report has none).
     version_scheme     TEXT,
@@ -84,9 +103,10 @@ CREATE TABLE deployment_source_targets (
     PRIMARY KEY (installation_id, target_id)
 );
 
--- The Environment view: every reported target routed into one Environment.
-CREATE INDEX deployment_source_targets_env_idx
-    ON deployment_source_targets (org, environment);
+-- The Environment view and the routing join: an installation's targets by
+-- grouping.
+CREATE INDEX deployment_source_targets_grouping_idx
+    ON deployment_source_targets (installation_id, vendor_grouping);
 
 -- Idempotency receipts: a repeat key with the same content is a duplicate and
 -- answers with the first copy's outcome; with other content it is refused.

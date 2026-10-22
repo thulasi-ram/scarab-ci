@@ -13,6 +13,10 @@
 //! The `(org, installation, vendor_grouping)` primary key is what keeps a
 //! source in exactly one Environment; this module only turns a collision into
 //! [`OrgEnvironmentError::DeploymentSourceTaken`] naming the holder.
+//!
+//! A write also checks, **in its own transaction**, that every source names a
+//! PluginInstallation in the Org (c-min audit F1), holding those
+//! installations `FOR SHARE` until it commits — see `put_org_environment`.
 
 use async_trait::async_trait;
 use sqlx::Row;
@@ -97,6 +101,69 @@ impl OrgEnvironmentStore for PostgresDb {
         .fetch_one(&mut *tx)
         .await
         .map_err(org_environment_store_err)?;
+
+        // F1 (c-min audit): every source must name a PluginInstallation in
+        // this Org. Checked here, in the write's transaction, with the
+        // installations named by the stored sources AND the new ones locked
+        // FOR SHARE (sorted, before any source row is touched):
+        // - an uninstall locks its installation row and then deletes the
+        //   sources naming it, so it either finishes before this check reads
+        //   (and the name is refused) or waits for this write to commit —
+        //   never a source left naming a name an uninstall is retiring
+        //   (red-team F-10), and never each waiting on the other's source
+        //   rows (review #9: a 40P01 deadlock);
+        // - a kill or an ingest (FOR UPDATE on the same row) waits for this
+        //   write, which takes no lock either of them holds.
+        // The stored list is read under the Environment row lock taken just
+        // above, so a concurrent replace of this Environment cannot change it.
+        let stored_installations: std::collections::BTreeSet<String> = sqlx::query_scalar(
+            "SELECT DISTINCT installation FROM environment_deployment_sources
+             WHERE org = $1 AND environment = $2",
+        )
+        .bind(&env.org)
+        .bind(&env.name)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(org_environment_store_err)?
+        .into_iter()
+        .collect();
+        let mut named: std::collections::BTreeSet<&str> =
+            stored_installations.iter().map(String::as_str).collect();
+        named.extend(
+            env.deployment_sources
+                .iter()
+                .map(|s| s.installation.as_str()),
+        );
+        let named: Vec<&str> = named.into_iter().collect();
+        let installed: std::collections::BTreeSet<String> = sqlx::query_scalar(
+            "SELECT name FROM plugin_installations
+             WHERE org = $1 AND name = ANY($2::text[])
+             ORDER BY name
+             FOR SHARE",
+        )
+        .bind(&env.org)
+        .bind(&named)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(org_environment_store_err)?
+        .into_iter()
+        .collect();
+        let new_installations: std::collections::BTreeSet<&str> = env
+            .deployment_sources
+            .iter()
+            .map(|s| s.installation.as_str())
+            .collect();
+        if let Some(missing) = new_installations
+            .into_iter()
+            .find(|name| !installed.contains(*name))
+        {
+            // Dropping `tx` rolls the Environment upsert back too.
+            return Err(OrgEnvironmentError::DeploymentSourceNotInstalled {
+                installation: missing.to_string(),
+                org: env.org.clone(),
+                already_listed: stored_installations.contains(missing),
+            });
+        }
 
         sqlx::query(
             "DELETE FROM environment_deployment_sources WHERE org = $1 AND environment = $2",

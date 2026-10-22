@@ -252,9 +252,38 @@ pub enum OrgEnvironmentError {
         /// The Environment that holds it.
         environment: String,
     },
+    /// A source names no PluginInstallation in the Org (c-min audit F1): it
+    /// would sit dormant until someone installed a plugin under that name,
+    /// which would then inherit the routing without its installer having
+    /// consented to it. Nothing was stored.
+    #[error("{}", not_installed_text(.installation, .org, *.already_listed))]
+    DeploymentSourceNotInstalled {
+        installation: String,
+        org: String,
+        /// The Environment already listed it — a source written before
+        /// installations were checked. Every edit of the Environment is
+        /// refused until it is removed (or installed), which the message
+        /// has to say, or a deadline-only edit fails for no visible reason.
+        already_listed: bool,
+    },
     /// The backing store failed, or held a row this binary cannot read.
     #[error("org environment store: {0}")]
     Store(String),
+}
+
+fn not_installed_text(installation: &str, org: &str, already_listed: bool) -> String {
+    if already_listed {
+        format!(
+            "this environment still lists deployment source `{installation}`, which names no \
+             plugin installation in org `{org}` (it was written before installations were \
+             checked); remove the source, or install `{installation}` first (ADR-0072)"
+        )
+    } else {
+        format!(
+            "deployment source `{installation}` names no plugin installation in org `{org}`; \
+             install it first, or remove the source (ADR-0072)"
+        )
+    }
 }
 
 /// Durable store for OrgEnvironments and their EnvironmentDeploymentSources,
@@ -266,8 +295,11 @@ pub trait OrgEnvironmentStore: Send + Sync {
     /// replace the stored `created_at` is kept and `env.created_at` ignored.
     /// Refuses an invalid `env` ([`OrgEnvironmentError::Invalid`]) and a
     /// source another Environment holds
-    /// ([`OrgEnvironmentError::DeploymentSourceTaken`]); either way nothing
-    /// changes. Returns the OrgEnvironment as stored (sources sorted).
+    /// ([`OrgEnvironmentError::DeploymentSourceTaken`]); an adapter that
+    /// also keeps PluginInstallations refuses, **in the same transaction as
+    /// the write**, a source naming no installation in the Org
+    /// ([`OrgEnvironmentError::DeploymentSourceNotInstalled`]). Either way
+    /// nothing changes. Returns the OrgEnvironment as stored (sources sorted).
     async fn put_org_environment(
         &self,
         env: &OrgEnvironment,
