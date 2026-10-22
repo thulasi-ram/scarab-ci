@@ -59,6 +59,7 @@ import {
   stateBadge,
   suggestEnvironment,
   toInstallBody,
+  ruleLabel,
   usageLine,
   withSource,
   type BadgeTone,
@@ -514,7 +515,7 @@ function ConnectionRow(props: {
       <span class="subtle">
         <small>
           reads only:{" "}
-          <span class="mono">{c().read_rules.map((r) => `${r.method} ${r.path}`).join(", ")}</span>
+          <span class="mono">{c().read_rules.map(ruleLabel).join(", ")}</span>
         </small>
       </span>
 
@@ -835,7 +836,7 @@ function InstallDialog(props: {
                         connection <span class="mono">{slot.name}</span> ({slot.auth_schemes.join(", ")}) —
                         read only:{" "}
                         <span class="mono">
-                          {slot.read_rules.map((r) => `${r.method} ${r.path}`).join(", ")}
+                          {slot.read_rules.map(ruleLabel).join(", ")}
                         </span>
                       </p>
                     )}

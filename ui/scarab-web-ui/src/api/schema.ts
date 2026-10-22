@@ -2720,11 +2720,16 @@ export interface components {
         };
         /**
          * @description An allowed read on a connection: method + path pattern (`*` = one
-         *     segment).
+         *     segment) + the query keys it may carry.
          */
         RequestRuleDto: {
             method: string;
             path: string;
+            /**
+             * @description The query keys a request under this rule may carry, each at most
+             *     once; empty = no query. Anything else is refused by the broker.
+             */
+            query: string[];
         };
         /**
          * @description `GET …/steps/{step}/rerun-plan` body: what a rerun/retry of this step would

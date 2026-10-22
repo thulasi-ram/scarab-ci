@@ -4,6 +4,7 @@ import {
   credentialBadge,
   credentialError,
   imageError,
+  ruleLabel,
   isInsecureHttp,
   toConnectionBody,
   movedAwayNote,
@@ -237,6 +238,13 @@ describe("connection binding", () => {
     );
     expect(toConnectionBody({ ...form, ca_pem: "not pem" }).error).toMatch(/PEM/);
     expect(toConnectionBody({ ...form, ca_pem: pem }).body?.ca_pem).toBe(pem);
+  });
+
+  it("shows a read rule with the only query keys it allows", () => {
+    expect(ruleLabel({ method: "GET", path: "/api/version", query: [] })).toBe("GET /api/version");
+    expect(ruleLabel({ method: "GET", path: "/api/v1/applications/*", query: ["appNamespace", "project"] })).toBe(
+      "GET /api/v1/applications/* ?appNamespace&project",
+    );
   });
 
   it("says set / not set / not bound — and never anything of the credential", () => {

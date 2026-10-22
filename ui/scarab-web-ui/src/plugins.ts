@@ -340,6 +340,14 @@ export function toConnectionBody(
   };
 }
 
+/** A read rule as the approval screen shows it: `GET /api/v1/applications/*
+ *  ?appNamespace&project` — the method, the path pattern, and the only query
+ *  keys a request under it may carry (none listed = no query at all). */
+export function ruleLabel(r: { method: string; path: string; query: readonly string[] }): string {
+  const base = `${r.method} ${r.path}`;
+  return r.query.length > 0 ? `${base} ?${r.query.join("&")}` : base;
+}
+
 /** A connection slot's credential, as a badge: the only thing ever shown of
  *  it. A binding whose secret went missing reads "not set" too. */
 export function credentialBadge(c: { configured: boolean; credential_set: boolean }): Badge {
