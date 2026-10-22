@@ -498,6 +498,19 @@ plugin-kube-tests filter="":
         --run-ignored all --no-fail-fast
     fi
 
+# LIVE first-party Argo CD reporter (ADR-0072, ADR-0070 §11) on the proc-mode
+# kind cluster: builds the reporter image and kind-loads it, brings the stack up
+# with plugins on and the dev-only tag knob, runs a fake Argo CD on the host,
+# installs the plugin through the API, binds its connection, lists its project
+# in an Environment, and drives the fake through sync → hook failure → retries
+# exhausted → fix while polling the Environment's Deployments; then asserts the
+# isolation probe passed and that the kill switch makes the broker answer 403
+# and scales the workload to 0. Asserts the ISOLATED kubeconfig's context is
+# kind-scarab-dev before any cluster command. Leaves the stack up (`just down`).
+# Usage: `just plugin-verify` | `KEEP=1 just plugin-verify` (keep the fake Argo).
+plugin-verify:
+    bash deploy/local-proc/plugin-verify.sh
+
 # UI no-DOM suite (test-strategy Phase 3, base of the UI pyramid): vitest over
 # the run-detail derivations — event folding, Takes, attempts, logs, DAG layout.
 # No jsdom, no browser, no server; runs in under a second.
