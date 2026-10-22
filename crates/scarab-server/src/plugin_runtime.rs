@@ -39,9 +39,12 @@ use scarab_plugin_k8s::{K8sPluginRuntime, WorkloadState};
 
 /// The lease gating the loop to one replica at a time.
 pub const PLUGIN_RUNTIME_LEASE: &str = "plugin-runtime";
-/// Long enough to outlast a pass that runs a probe (a few minutes at worst
-/// on a cold node), so a second replica never probes concurrently.
-const PLUGIN_RUNTIME_LEASE_TTL_MS: i64 = 5 * 60 * 1000;
+/// Renewed at the start of every pass, so it must outlast the longest pass:
+/// one that runs a probe (the adapter bounds that at 5 minutes — canary
+/// readiness plus the checking Pods) and then applies every workload. Twice
+/// that, so a second replica never takes over mid-probe; a crashed leader
+/// is replaced within it.
+const PLUGIN_RUNTIME_LEASE_TTL_MS: i64 = 10 * 60 * 1000;
 pub const RECONCILE_INTERVAL: Duration = Duration::from_secs(15);
 /// A passed probe is trusted this long; a CNI can change under a running
 /// cluster.
@@ -275,9 +278,12 @@ impl PluginRuntimeLoop {
     }
 
     async fn probe(&mut self, installations: &[PluginInstallation]) {
-        // Shown while it runs, for what is waiting on it.
+        // Shown while it runs, for what is waiting on it — installs and
+        // enables, not workloads already running under an earlier probe.
         for i in installations.iter().filter(|i| {
-            i.state == InstallationState::Enabled && i.runtime_status == RuntimeStatus::Pending
+            i.state == InstallationState::Enabled
+                && i.runtime_status == RuntimeStatus::Pending
+                && i.probe_passed_at.is_none()
         }) {
             let _ = self
                 .store
