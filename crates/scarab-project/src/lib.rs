@@ -33,8 +33,10 @@ pub use org_environment::{
 mod environment_governance;
 pub use environment_governance::{
     effective_protection, migrate_legacy_environment, AllowedRefConstraint, DeployGovernance,
-    EffectiveProtection, EnvironmentGovernanceStore, EnvironmentProjectEligibility,
-    EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant, EnvironmentProtectionRules,
+    EffectiveProtection, EnvironmentGovernanceStore, EnvironmentMigrationAcknowledgement,
+    EnvironmentMigrationReport, EnvironmentMigrationReportProject, EnvironmentProjectEligibility,
+    EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord,
+    EnvironmentProtectionRules, LegacyRuleField,
 };
 
 /// A top-level tenant. Owns Projects. The Scarab tenancy boundary — **not**
