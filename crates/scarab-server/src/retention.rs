@@ -240,13 +240,12 @@ impl scarab_engine::WorkspaceSnapshots for CasSnapshots {
             Err(scarab_storage::StorageError::NotFound) => return Ok(None),
             Err(e) => return Err(e.to_string()),
         };
-        Ok(entries
-            .into_iter()
-            .find(|e| e.name == *leaf)
-            .and_then(|e| match e.target {
+        Ok(entries.into_iter().find(|e| e.name == *leaf).and_then(|e| {
+            match e.target {
                 scarab_storage::TreeTarget::Blob(b) => Some(b.0),
                 scarab_storage::TreeTarget::Tree(_) => None,
-            }))
+            }
+        }))
     }
 }
 
@@ -654,7 +653,10 @@ pub async fn sweep_cas(
     }
     // Gauge-like, SET per pass rather than accumulated, so a repaired cold
     // tier is visible as the value returning to zero.
-    crate::metrics::set_cas_gc_cold_residue(residue.len() as u64, suppressed_residue.len() as u64);
+    crate::metrics::set_cas_gc_cold_residue(
+        residue.len() as u64,
+        suppressed_residue.len() as u64,
+    );
 
     if swept > 0 {
         tracing::info!(swept, marked = marked.len(), "cas gc pass complete");
@@ -701,7 +703,8 @@ pub fn spawn_sweeper(
                     Err(e) => tracing::warn!(error = %e, "broker journal prune failed"),
                 }
             }
-            if let Err(e) = sweep_cas(&db, &cas, &store, &clock, &owner, gc, depot.as_deref()).await
+            if let Err(e) =
+                sweep_cas(&db, &cas, &store, &clock, &owner, gc, depot.as_deref()).await
             {
                 tracing::warn!(error = %e, "cas gc pass failed");
             }
