@@ -1,6 +1,9 @@
 import { describe, it, expect } from "vitest";
 import {
   imageError,
+  movedAwayNote,
+  sourceAddedNotice,
+  usageLine,
   installationChoices,
   installNameError,
   runtimeBadge,
@@ -163,5 +166,33 @@ describe("targetOwners", () => {
     ]);
     expect(owners.get("argocd/orders-api")).toEqual(["acme/orders-api"]);
     expect(owners.has("argocd/messaging")).toBe(false);
+  });
+});
+
+describe("movedAwayNote", () => {
+  it("names where the target went, or says it is unmapped", () => {
+    expect(movedAwayNote({ now: "prod" }).label).toBe("moved — now: prod");
+    expect(movedAwayNote({ now: null }).label).toBe("moved — unmapped");
+    expect(movedAwayNote({}).label).toBe("moved — unmapped");
+  });
+});
+
+describe("sourceAddedNotice", () => {
+  it("says the already-reported targets appear within about a minute", () => {
+    expect(sourceAddedNotice("staging", "argocd", "staging")).toMatch(
+      /^staging now takes argocd \/ staging\. .*within ~60 s/,
+    );
+  });
+});
+
+describe("usageLine", () => {
+  const usage = { targets: 12, max_targets: 10000, unmapped_groupings: 2, max_unmapped_groupings: 1000 };
+  it("shows both caps", () => {
+    expect(usageLine(usage).label).toBe("12 / 10,000 targets · 2 / 1,000 unmapped groupings");
+    expect(usageLine(usage).warn).toBe(false);
+  });
+  it("warns from 90% of either cap", () => {
+    expect(usageLine({ ...usage, targets: 9000 }).warn).toBe(true);
+    expect(usageLine({ ...usage, unmapped_groupings: 900 }).warn).toBe(true);
   });
 });

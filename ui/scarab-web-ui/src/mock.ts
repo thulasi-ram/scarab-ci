@@ -612,12 +612,20 @@ const envDeployments: Record<string, DeploymentDto[]> = {
   ],
   staging: [depStagingOrders11],
 };
+// staging's orders-api is Moved (ADR-0070 §3): no Environment lists argocd's
+// `staging` grouping any more (it is among argocd's unmapped groupings
+// below), so its reports are dropped — the row keeps its history and says so.
 const board: BoardRowDto[] = [
-  { target: depOrders13.target, live: depOrders13, newest: null },
-  { target: depGateway14.target, live: depGateway14, newest: null },
-  { target: depInventory12.target, live: depInventory7, newest: depInventory12 },
-  { target: depMessaging15.target, live: null, newest: depMessaging15 },
-  { target: depStagingOrders11.target, live: depStagingOrders11, newest: null },
+  { target: depOrders13.target, live: depOrders13, newest: null, moved_away: null },
+  { target: depGateway14.target, live: depGateway14, newest: null, moved_away: null },
+  { target: depInventory12.target, live: depInventory7, newest: depInventory12, moved_away: null },
+  { target: depMessaging15.target, live: null, newest: depMessaging15, moved_away: null },
+  {
+    target: depStagingOrders11.target,
+    live: depStagingOrders11,
+    newest: null,
+    moved_away: { now: null },
+  },
 ];
 
 // ── Org-level Environments (ADR-0071) — Settings › Environments, and the
@@ -709,11 +717,13 @@ const pluginInstallation = (
   killed_by: null,
   manifest: argocdManifest,
   deployment_sources: [],
+  usage: { targets: 0, max_targets: 10000, unmapped_groupings: 0, max_unmapped_groupings: 1000 },
   ...o,
 });
 const plugins: PluginInstallationDto[] = [
   pluginInstallation("argocd", "4f2a1c9e7b3d", {
     runtime_message: "watching 6 applications",
+    usage: { targets: 4, max_targets: 10000, unmapped_groupings: 2, max_unmapped_groupings: 1000 },
     deployment_sources: [
       { environment: "production", vendor_grouping: "production" },
       { environment: "qa", vendor_grouping: "qa" },
@@ -758,12 +768,13 @@ const sourceTarget = (
   principal: "plugin:argocd",
   target_id,
   vendor_grouping: environment,
-  version_scheme: "git-sha",
+  version_scheme: "argocd.target-images.v1",
   owner_projects,
   owners_reported_at: owner_projects.length ? ago(6 * 60 * min) : null,
   last_version,
   last_status: "live",
   last_label: "Healthy · Synced",
+  resend: false,
   last_sequence: 42,
   updated_at: ago(36 * min),
 });
@@ -773,7 +784,7 @@ const deploymentTargets = [
   sourceTarget("production", "inventory-svc", ["acme/inventory"], "sha-5d5d5d5"),
   // messaging is absent: it is Unconfirmed on the board — its source has
   // never reported on it — so there is no target row and no owners line.
-  sourceTarget("staging", "orders-api", ["acme/orders-api"], "sha-4f2a1c9"),
+  // staging has none: argocd's `staging` grouping is unmapped (Moved row).
 ];
 
 const secretNames = { names: ["GHCR_TOKEN", "DATABASE_URL", "SLACK_WEBHOOK_URL"] };
@@ -1065,11 +1076,13 @@ function route(pathname: string, search: string, method: string): Response | nul
     const found = plugins.find((x) => x.name === decodeURIComponent(m![1]!));
     if (!found) return new Response("no such installation", { status: 404 });
     if (m[2] === "unmapped-groupings") return json(unmappedGroupings[found.name] ?? []);
+    // Kill and enable flip `state` only, as the server does: the runtime
+    // (slice d2) reports what it observes, later.
     if (m[2] === "kill") {
-      return json({ ...found, state: "killed", runtime_status: "stopped", killed_by: "a.kim", killed_at: now });
+      return json({ ...found, state: "killed", killed_by: "a.kim", killed_at: now });
     }
     if (m[2] === "enable") {
-      return json({ ...found, state: "enabled", runtime_status: "pending", killed_by: null, killed_at: null });
+      return json({ ...found, state: "enabled", killed_by: null, killed_at: null });
     }
     if (method === "DELETE") {
       return json({ name: found.name, removed_deployment_sources: found.deployment_sources });

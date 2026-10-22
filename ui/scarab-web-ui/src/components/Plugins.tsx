@@ -12,8 +12,10 @@
 //
 // "Unmapped groupings" are groupings the plugin reports on that no
 // Environment lists: their reports are dropped. Each one offers to add itself
-// as a source on an org Environment — one click when an Environment is named
-// like the grouping.
+// as a source on an org Environment — preselected only when an Environment is
+// named like the grouping; otherwise the admin picks (a guess would route
+// reports somewhere nobody chose). The targets already reported under it
+// reach the board when the plugin re-sends them (within about a minute).
 import { createResource, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { Portal } from "solid-js/web";
 import {
@@ -36,9 +38,11 @@ import {
   installNameError,
   runtimeBadge,
   shortDigest,
+  sourceAddedNotice,
   stateBadge,
   suggestEnvironment,
   toInstallBody,
+  usageLine,
   withSource,
   type BadgeTone,
 } from "../plugins";
@@ -232,6 +236,7 @@ function PluginRow(props: {
   const killed = () => p().state === "killed";
   const state = () => stateBadge(p().state);
   const runtime = () => runtimeBadge(p().runtime_status);
+  const usage = () => usageLine(p().usage);
   const [open, setOpen] = createSignal(false);
 
   return (
@@ -301,6 +306,10 @@ function PluginRow(props: {
             </span>
           )}
         </Show>
+        <span class={usage().warn ? "plg-killed" : undefined} title={usage().title}>
+          <Icon icon="database" size={12} />
+          {usage().label}
+        </span>
       </div>
 
       <div class="tok-facts">
@@ -365,7 +374,7 @@ function Unmapped(props: {
       if (!built.body) throw new Error(built.error);
       await putOrgEnvironment(props.org, env.name, built.body);
       setEpoch((e) => e + 1);
-      props.onSourceAdded(`${env.name} now takes ${props.installation} / ${grouping}.`);
+      props.onSourceAdded(sourceAddedNotice(env.name, props.installation, grouping));
     } catch (e) {
       setError(e instanceof Error ? e.message : `Could not add the source to ${envName}.`);
     }
@@ -383,9 +392,9 @@ function Unmapped(props: {
             fallback={<p class="empty">Nothing dropped: every grouping it reports on is mapped.</p>}
           >
             {(g) => {
-              const [pick, setPick] = createSignal(
-                suggestEnvironment(g.vendor_grouping, envs()) ?? envs()[0]?.name ?? "",
-              );
+              // Preselected only on a name match; otherwise blank until the
+              // admin picks — never the first Environment by default.
+              const [pick, setPick] = createSignal(suggestEnvironment(g.vendor_grouping, envs()) ?? "");
               return (
                 <div class="plg-unmapped-row">
                   <span class="mono plg-grouping">{g.vendor_grouping}</span>
@@ -399,12 +408,26 @@ function Unmapped(props: {
                   >
                     <span class="plg-add">
                       <select class="input" value={pick()} onChange={(e) => setPick(e.currentTarget.value)}>
-                        <For each={envs()}>{(e) => <option value={e.name}>{e.name}</option>}</For>
+                        <option value="" disabled>
+                          route to…
+                        </option>
+                        <For each={envs()}>
+                          {(e) => (
+                            <option value={e.name} selected={e.name === pick()}>
+                              {e.name}
+                            </option>
+                          )}
+                        </For>
                       </select>
                       <button
                         class="btn btn-ghost btn-sm"
-                        title={`Add ${props.installation} / ${g.vendor_grouping} to ${pick()}'s deployment sources`}
-                        onClick={() => void add(g.vendor_grouping, pick())}
+                        disabled={!pick()}
+                        title={
+                          pick()
+                            ? `Add ${props.installation} / ${g.vendor_grouping} to ${pick()}'s deployment sources`
+                            : "Pick the environment its reports belong in"
+                        }
+                        onClick={() => pick() && void add(g.vendor_grouping, pick())}
                       >
                         <Icon icon="plus" size={12} /> add as source
                       </button>

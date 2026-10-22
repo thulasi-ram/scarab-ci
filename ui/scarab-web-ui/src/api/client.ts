@@ -740,32 +740,59 @@ export async function uninstallPlugin(org: string, name: string): Promise<Uninst
   return data;
 }
 
+/** A list endpoint's page size. The server pages by key (the next page
+ *  starts after the last row), so a page shorter than this is the last. */
+const PAGE_LIMIT = 500;
+/** A bound on how many pages one read follows — far past any real org (an
+ *  installation is capped at 10,000 targets), never an endless loop. */
+const MAX_PAGES = 50;
+
 /** The groupings `name` reports on that no Environment lists — reports for
- *  them are dropped (`GET …/plugins/{name}/unmapped-groupings`). */
+ *  them are dropped (`GET …/plugins/{name}/unmapped-groupings`, every page). */
 export async function listUnmappedGroupings(org: string, name: string): Promise<UnmappedGrouping[]> {
-  const { data, error, response } = await api.GET("/v1/orgs/{org}/plugins/{name}/unmapped-groupings", {
-    params: { path: { org, name } },
-  });
-  if (error || !data) {
-    throw new Error(errorText(error) || `failed to load ${name}'s unmapped groupings (${response.status})`);
+  const all: UnmappedGrouping[] = [];
+  let after: string | undefined;
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const { data, error, response } = await api.GET("/v1/orgs/{org}/plugins/{name}/unmapped-groupings", {
+      params: { path: { org, name }, query: { after, limit: PAGE_LIMIT } },
+    });
+    if (error || !data) {
+      throw new Error(errorText(error) || `failed to load ${name}'s unmapped groupings (${response.status})`);
+    }
+    all.push(...data);
+    if (data.length < PAGE_LIMIT) break;
+    after = data[data.length - 1]!.vendor_grouping;
   }
-  return data;
+  return all;
 }
 
-/** An Environment's reported DeploymentTargets and their owners. `null` when
- *  the caller cannot read them (403) or plugins are not configured (404) —
- *  the board then shows no owners rather than an error. */
+/** An Environment's reported DeploymentTargets and their owners, every page.
+ *  `null` when the caller cannot read them (403) or plugins are not
+ *  configured (404) — the board then shows no owners rather than an error. */
 export async function listDeploymentTargets(
   org: string,
   env: string,
 ): Promise<DeploymentSourceTarget[] | null> {
-  const { data, error, response } = await api.GET(
-    "/v1/orgs/{org}/environments/{env}/deployment-targets",
-    { params: { path: { org, env } } },
-  );
-  if (response.status === 403 || response.status === 404) return null;
-  if (error || !data) throw new Error(errorText(error) || `failed to load ${env}'s targets`);
-  return data;
+  const all: DeploymentSourceTarget[] = [];
+  let after: { source: string; id: string } | undefined;
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const { data, error, response } = await api.GET(
+      "/v1/orgs/{org}/environments/{env}/deployment-targets",
+      {
+        params: {
+          path: { org, env },
+          query: { after_source: after?.source, after_target_id: after?.id, limit: PAGE_LIMIT },
+        },
+      },
+    );
+    if (response.status === 403 || response.status === 404) return null;
+    if (error || !data) throw new Error(errorText(error) || `failed to load ${env}'s targets`);
+    all.push(...data);
+    if (data.length < PAGE_LIMIT) break;
+    const last = data[data.length - 1]!;
+    after = { source: last.source, id: last.target_id };
+  }
+  return all;
 }
 
 /** Fetch a run's status + steps (dogfoods `GET /v1/runs/{id}`). */
