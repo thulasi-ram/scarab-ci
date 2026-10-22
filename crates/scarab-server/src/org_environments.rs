@@ -109,6 +109,11 @@ fn org_environment_api_error(e: OrgEnvironmentError) -> ApiError {
         taken @ OrgEnvironmentError::DeploymentSourceTaken { .. } => {
             ApiError::Conflict(taken.to_string())
         }
+        // F1 (c-min audit). The text says what to do, including for a
+        // source written before installations were checked.
+        missing @ OrgEnvironmentError::DeploymentSourceNotInstalled { .. } => {
+            ApiError::BadRequest(missing.to_string())
+        }
         OrgEnvironmentError::Store(m) => ApiError::Db(DbError::Other(m)),
     }
 }
@@ -226,16 +231,10 @@ pub(crate) async fn put_org_environment(
         updated_by: principal.subject,
     };
     environment.validate().map_err(org_environment_api_error)?;
-    // F1 (c-min audit): a source must name an installation in this org.
-    crate::plugins::check_sources_are_installed(
-        &st,
-        &environment.org,
-        environment
-            .deployment_sources
-            .iter()
-            .map(|s| s.installation.as_str()),
-    )
-    .await?;
+    // F1 (c-min audit): the store refuses a source naming no installation in
+    // this org, checked inside its write's transaction with the named
+    // installations locked — a check here, before it, would race an
+    // uninstall (red-team F-10).
     let stored = store
         .put_org_environment(&environment)
         .await
