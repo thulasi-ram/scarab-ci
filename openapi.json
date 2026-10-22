@@ -6197,10 +6197,11 @@
       },
       "RequestRuleDto": {
         "type": "object",
-        "description": "An allowed read on a connection: method + path pattern (`*` = one\nsegment).",
+        "description": "An allowed read on a connection: method + path pattern (`*` = one\nsegment) + the query keys it may carry.",
         "required": [
           "method",
-          "path"
+          "path",
+          "query"
         ],
         "properties": {
           "method": {
@@ -6208,6 +6209,13 @@
           },
           "path": {
             "type": "string"
+          },
+          "query": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The query keys a request under this rule may carry, each at most\nonce; empty = no query. Anything else is refused by the broker."
           }
         }
       },
