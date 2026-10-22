@@ -8,7 +8,11 @@
 //! 1. **Baseline.** The plugin namespace must enforce `restricted` Pod
 //!    Security and hold only the runtime's own NetworkPolicies (applied
 //!    here). Refused → every workload is stopped and every enabled
-//!    installation shows `error` with the reason. Fail closed.
+//!    installation shows `error` with the reason. Fail closed. A Kubernetes
+//!    error while checking (a timeout, a 5xx, an admission-webhook blip) is
+//!    NOT a refusal: it proves nothing either way, so the pass is skipped —
+//!    running workloads stay up, the probe result is kept — and only Killed
+//!    installations are still stopped.
 //! 2. **Isolation probe**, when due: at manager boot (the first pass after
 //!    this replica takes the lease), every [`PROBE_MAX_AGE_MS`], whenever an
 //!    enabled installation has not been probed for (a fresh install, or an
@@ -35,7 +39,7 @@ use std::time::Duration;
 
 use scarab_engine::{Clock, Db};
 use scarab_plugin::{InstallationState, PluginInstallation, PluginStore, RuntimeStatus};
-use scarab_plugin_k8s::{K8sPluginRuntime, WorkloadState};
+use scarab_plugin_k8s::{K8sPluginRuntime, RuntimeError, WorkloadState};
 
 /// The lease gating the loop to one replica at a time.
 pub const PLUGIN_RUNTIME_LEASE: &str = "plugin-runtime";
@@ -95,6 +99,33 @@ pub fn probe_due(now: i64, isolation: &Isolation, installations: &[PluginInstall
     isolation.failure.is_some() && age >= PROBE_FAILED_RETRY_MS
 }
 
+/// What this pass learned about the plugin namespace's baseline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Baseline {
+    /// Fit to run Plugins in; the runtime's policies are applied.
+    Ready,
+    /// The namespace is not one Plugins may run in (not `restricted`, a
+    /// stray policy, no broker peer). Fail closed: hold every workload.
+    Refused(String),
+    /// The cluster could not be asked — a transient Kubernetes error. It
+    /// proves nothing about the namespace, so it must not stop the fleet:
+    /// this pass leaves everything but Killed installations as it is.
+    Unavailable(String),
+}
+
+impl Baseline {
+    /// Only a refusal holds workloads; any other error is "could not ask".
+    pub fn from_result(result: Result<(), RuntimeError>) -> Self {
+        match result {
+            Ok(()) => Baseline::Ready,
+            Err(e @ RuntimeError::BaselineRefused(_)) => Baseline::Refused(e.to_string()),
+            Err(e @ (RuntimeError::Kube(_) | RuntimeError::Invalid(_))) => {
+                Baseline::Unavailable(e.to_string())
+            }
+        }
+    }
+}
+
 /// What a pass does with one installation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -107,27 +138,36 @@ pub enum Decision {
     },
     /// Apply its workload; `probe_passed_at` is the probe that allowed it.
     Run { probe_passed_at: i64 },
-    /// No probe result yet (none was due — nothing enabled at the time):
-    /// leave it as it is.
+    /// Leave it as it is, and write nothing: the cluster could not be asked
+    /// this pass ([`Baseline::Unavailable`]), or there is no probe result
+    /// yet. (The second is defensive: [`probe_due`] forces a probe whenever
+    /// something is enabled and none ran since this replica took the lease,
+    /// so the loop never reaches it.)
     Wait,
 }
 
 /// Decide one installation from the namespace baseline and the isolation
-/// result. Killed always stops; nothing enabled runs without both a
-/// baseline and a passed probe.
+/// result. Killed always stops — even when the cluster is flaky, since a
+/// stop is the safe direction; nothing enabled runs without both a baseline
+/// and a passed probe; and a baseline that could not be checked changes
+/// nothing.
 pub fn decide(
     installation: &PluginInstallation,
-    baseline: &Result<(), String>,
+    baseline: &Baseline,
     isolation: &Isolation,
 ) -> Decision {
     if installation.state == InstallationState::Killed {
         return Decision::Stop;
     }
-    if let Err(why) = baseline {
-        return Decision::Hold {
-            status: RuntimeStatus::Error,
-            message: why.clone(),
-        };
+    match baseline {
+        Baseline::Ready => {}
+        Baseline::Refused(why) => {
+            return Decision::Hold {
+                status: RuntimeStatus::Error,
+                message: why.clone(),
+            }
+        }
+        Baseline::Unavailable(_) => return Decision::Wait,
     }
     match (&isolation.failure, isolation.probed_at) {
         (Some(why), _) => Decision::Hold {
@@ -229,19 +269,27 @@ impl PluginRuntimeLoop {
             .await
             .map_err(|e| e.to_string())?;
 
-        let baseline = self
-            .runtime
-            .ensure_baseline()
-            .await
-            .map_err(|e| e.to_string());
-        if let Err(why) = &baseline {
-            tracing::error!(reason = %why, "plugin runtime: namespace baseline refused; no plugin runs");
-            // Nothing proven about the namespace any more.
-            self.isolation = Isolation::default();
-        } else {
-            let now = self.clock.now().await.0;
-            if probe_due(now, &self.isolation, &installations) {
-                self.probe(&installations).await;
+        let baseline = Baseline::from_result(self.runtime.ensure_baseline().await);
+        match &baseline {
+            Baseline::Refused(why) => {
+                tracing::error!(reason = %why, "plugin runtime: namespace baseline refused; no plugin runs");
+                // Nothing proven about the namespace any more.
+                self.isolation = Isolation::default();
+            }
+            Baseline::Unavailable(why) => {
+                // Not a verdict on the namespace: keep the isolation result,
+                // leave running workloads up, and try again next pass.
+                tracing::warn!(
+                    error = %why,
+                    "plugin runtime: could not check the namespace baseline; skipping this pass \
+                     (killed installations are still stopped)"
+                );
+            }
+            Baseline::Ready => {
+                let now = self.clock.now().await.0;
+                if probe_due(now, &self.isolation, &installations) {
+                    self.probe(&installations).await;
+                }
             }
         }
 
@@ -257,6 +305,11 @@ impl PluginRuntimeLoop {
             }
         }
 
+        // A flaky cluster this pass: no orphan sweep either — its listing
+        // would come from the same API that just failed.
+        if matches!(baseline, Baseline::Unavailable(_)) {
+            return Ok(());
+        }
         // Only after a successful registry read: an id missing from a FAILED
         // read is not an uninstall.
         let known: BTreeSet<&str> = installations.iter().map(|i| i.id.as_str()).collect();
@@ -315,7 +368,7 @@ impl PluginRuntimeLoop {
     async fn reconcile_installation(
         &self,
         installation: &PluginInstallation,
-        baseline: &Result<(), String>,
+        baseline: &Baseline,
     ) -> Result<(), String> {
         let (status, message, probe_passed_at) =
             match decide(installation, baseline, &self.isolation) {
@@ -341,13 +394,15 @@ impl PluginRuntimeLoop {
                 Decision::Run { probe_passed_at } => {
                     let applied = self.runtime.ensure(installation).await;
                     let (status, message) = match applied {
-                        Ok(()) => running_status(
-                            &self
-                                .runtime
-                                .workload_state(&installation.id)
-                                .await
-                                .map_err(|e| e.to_string())?,
-                        ),
+                        // A failed read-back is not a failed workload: the
+                        // apply landed. Record `pending` with why, and —
+                        // crucially — the probe that allowed it, so the next
+                        // pass does not take it for a fresh install and
+                        // re-probe.
+                        Ok(()) => match self.runtime.workload_state(&installation.id).await {
+                            Ok(state) => running_status(&state),
+                            Err(e) => (RuntimeStatus::Pending, format!("state unknown: {e}")),
+                        },
                         Err(e) => (RuntimeStatus::Error, e.to_string()),
                     };
                     (status, message, Some(probe_passed_at))
@@ -491,45 +546,74 @@ mod tests {
             assert_eq!(
                 decide(
                     &installation(InstallationState::Killed),
-                    &Ok(()),
+                    &Baseline::Ready,
                     &isolation
                 ),
                 Decision::Stop
             );
         }
-        assert_eq!(
-            decide(
-                &installation(InstallationState::Killed),
-                &Err("refused".into()),
-                &passed(1)
-            ),
-            Decision::Stop
-        );
+        for baseline in [
+            Baseline::Refused("refused".into()),
+            Baseline::Unavailable("kubernetes: timeout".into()),
+        ] {
+            assert_eq!(
+                decide(
+                    &installation(InstallationState::Killed),
+                    &baseline,
+                    &passed(1)
+                ),
+                Decision::Stop
+            );
+        }
+    }
+
+    /// A Kubernetes error while checking the baseline proves nothing about
+    /// the namespace: it must not stop running workloads (and revoke their
+    /// tokens) the way a refusal does.
+    #[test]
+    fn a_transient_kubernetes_error_leaves_running_plugins_alone() {
+        let baseline = Baseline::from_result(Err(RuntimeError::Kube("503".into())));
+        assert!(matches!(baseline, Baseline::Unavailable(_)));
+        assert_eq!(decide(&running(1), &baseline, &passed(1)), Decision::Wait);
+        // Only a refusal holds.
+        let refused =
+            Baseline::from_result(Err(RuntimeError::BaselineRefused("not restricted".into())));
+        assert!(matches!(
+            decide(&running(1), &refused, &passed(1)),
+            Decision::Hold {
+                status: RuntimeStatus::Error,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn nothing_runs_without_a_baseline_and_a_passed_probe() {
         let enabled = installation(InstallationState::Enabled);
         assert_eq!(
-            decide(&enabled, &Err("not restricted".into()), &passed(1)),
+            decide(
+                &enabled,
+                &Baseline::Refused("not restricted".into()),
+                &passed(1)
+            ),
             Decision::Hold {
                 status: RuntimeStatus::Error,
                 message: "not restricted".into()
             }
         );
         assert!(matches!(
-            decide(&enabled, &Ok(()), &failed(1)),
+            decide(&enabled, &Baseline::Ready, &failed(1)),
             Decision::Hold {
                 status: RuntimeStatus::ProbeFailed,
                 ..
             }
         ));
         assert_eq!(
-            decide(&enabled, &Ok(()), &Isolation::default()),
+            decide(&enabled, &Baseline::Ready, &Isolation::default()),
             Decision::Wait
         );
         assert_eq!(
-            decide(&enabled, &Ok(()), &passed(7)),
+            decide(&enabled, &Baseline::Ready, &passed(7)),
             Decision::Run { probe_passed_at: 7 }
         );
     }
