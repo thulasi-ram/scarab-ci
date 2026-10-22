@@ -474,6 +474,37 @@ fail_with_log() {
   exit 1
 }
 
+# ADR-0071 (c-full c2): a Deploy Run is admitted only into an org Environment
+# that exists AND lists its Project as eligible — a pipeline naming any other
+# `environment:` is refused (the webhook skips it; a dispatch answers 403).
+# The dogfood pipeline (.scarab/dogfood.yaml) deploys to `production`, so seed
+# that Environment, eligible for every Project, in the dogfood org. Only when
+# it is MISSING: the Environment PUT is a whole replace and the eligibility
+# PUT a replace too, so re-running `just up` must not undo what someone
+# configured since. Override the org with SCARAB_DEV_ORG.
+seed_environments() {
+  local org="${SCARAB_DEV_ORG:-thulasi-ram}" env_name="production" code
+  code="$(curl -s -o /dev/null -w '%{http_code}' "$base/v1/orgs/$org/environments/$env_name")"
+  case "$code" in
+    200)
+      echo "==> org Environment $org/$env_name exists; leaving it as configured"
+      return 0
+      ;;
+    404) ;;
+    *)
+      echo "warning: could not read org Environment $org/$env_name (HTTP $code); not seeding it" >&2
+      return 0
+      ;;
+  esac
+  curl -sf -X PUT "$base/v1/orgs/$org/environments/$env_name" -H 'content-type: application/json' \
+    -d '{"description":"seeded by just up (local-proc) for the dogfood pipeline","deployment_sources":[]}' \
+    >/dev/null || fail_with_log "seeding org Environment $org/$env_name failed"
+  curl -sf -X PUT "$base/v1/orgs/$org/environments/$env_name/eligibility" \
+    -H 'content-type: application/json' -d '{"all_projects":true}' >/dev/null \
+    || fail_with_log "making every project eligible for $org/$env_name failed"
+  echo "==> seeded org Environment $org/$env_name (eligible: all projects; permissive baseline)"
+}
+
 echo "==> waiting for the API (/healthz) from pid $server_pid"
 # The port was proven free above and this child is proven alive below, so a
 # /healthz that answers can only be answered by the server WE started. Both
@@ -485,6 +516,7 @@ for _ in $(seq 1 30); do
     fail_with_log "scarab-server (pid $server_pid) exited during startup; it never served $base"
   fi
   if curl -sf "$base/healthz" >/dev/null 2>&1; then
+    seed_environments
     echo "==> scarab-server is up on $base (pid $server_pid, logs: deploy/local-proc/server.log)"
     echo "    workspace service: $SCARAB_WORKSPACE_URL from a Pod, http://127.0.0.1:$ws_port from the host"
     echo "    run 'just demo' to submit a pipeline and watch it complete."

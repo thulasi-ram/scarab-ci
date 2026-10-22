@@ -81,9 +81,12 @@ interface:
 # --- environment (ADR-0024/0032): pipeline-level ----------------------------
 # An `environment:` makes the whole pipeline a *deploy* — its runs are enforced
 # against the environment's protection rules and opt out of newest-wins cancel.
-# An environment that is REFERENCED but not defined resolves to
-# `Governed { protection: None }` — still a deploy, permissive on rules — so
-# this runs locally without seeding a `production` Environment first.
+# Since ADR-0071 the name must be an org-level Environment that lists this
+# project as eligible: an unknown or ineligible one is REFUSED at Run creation
+# (the webhook skips this pipeline; a dispatch answers 403). `just up` seeds
+# `production` in the dogfood org, eligible for every project; anywhere else,
+# an org admin creates it (PUT /v1/orgs/{org}/environments/production) and
+# makes this project eligible (…/production/eligibility).
 environment: production
 
 # --- concurrency (ADR-0011/0032) + budget (ADR-0047) ------------------------

@@ -56,6 +56,11 @@ from: *all projects*, or an explicit list in which project-name globs are allowe
 - It is **owned by the Environment, never the Project.**
 - A new Environment starts with **no** eligible Projects. It is fail-closed.
 - It is checked **at Run creation**, before any Pod is created or any secret resolved.
+  It is checked **again** wherever the Environment's authority is used later in the Run:
+  a manual gate does not release (409) for a Project no longer eligible, or for an
+  Environment that no longer exists, and a step is not handed the Environment's secrets
+  or OIDC token at launch. An admin withdrawing eligibility therefore stops a long Run at
+  its next use of the Environment, not only its next Run.
 - Reading and watching an Environment's DeploymentTargets needs only eligibility.
 
 ### 3. EnvironmentProjectOverlay: per-project, tighten-only
@@ -204,7 +209,10 @@ governed exactly as before:
    had it" would start rejecting those Runs. The migration finds referenced-only names in
    Run history. A name referenced only by a Pipeline that has never run is invisible to
    it; that Pipeline's first Run is rejected until an admin creates the Environment. This
-   is the one behaviour change.
+   is the one behaviour change. An org Environment that already existed (created through
+   the minimal org-level API before the migration) and that no Project defined is treated
+   like a referenced-only name — a pipeline naming it deployed with no rules from any
+   Project — and also gets eligibility **all projects**.
 7. Old `deployments` rows stay readable as **legacy approval history** (ADR-0070 §1).
    They are not converted into Deployments, because they carry no target or version.
 8. A **split report** lists every name that merged across Projects, so an admin can
