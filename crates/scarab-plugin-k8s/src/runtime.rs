@@ -197,16 +197,11 @@ impl K8sPluginRuntime {
     /// Run the isolation probe (see [`crate::probe`]). Never an `Err`: a
     /// probe that cannot finish is a FAILED probe, and the Plugin does not
     /// start. Its Pods are deleted afterwards, pass or fail, and so are any a
-    /// crashed earlier probe left behind.
+    /// crashed earlier probe left behind — but only ones past their deadline,
+    /// never another manager's probe still in flight.
     pub async fn probe_isolation(&self) -> ProbeReport {
         let pods: Api<Pod> = self.namespaced();
-        let leftovers = ListParams::default().labels(LABEL_PROBE);
-        if let Err(e) = pods
-            .delete_collection(&DeleteParams::background().grace_period(0), &leftovers)
-            .await
-        {
-            tracing::warn!(error = %e, "isolation probe: could not clear leftover probe Pods");
-        }
+        self.clear_stale_probe_pods(&pods).await;
         let nonce = uuid::Uuid::new_v4().simple().to_string()[..10].to_string();
         let report = match self.run_probe(&pods, &nonce).await {
             Ok(report) => report,
@@ -220,6 +215,30 @@ impl K8sPluginRuntime {
             tracing::warn!(error = %e, %nonce, "isolation probe: could not delete its Pods");
         }
         report
+    }
+
+    /// Delete probe Pods older than [`probe::PROBE_POD_DEADLINE_SECONDS`]:
+    /// by then their `activeDeadlineSeconds` has ended them, so they belong
+    /// to no live probe. A younger one may be another replica's, mid-probe
+    /// after a lease handover — deleting it would fail that probe, and a
+    /// failed probe stops every Plugin.
+    async fn clear_stale_probe_pods(&self, pods: &Api<Pod>) {
+        let listed = match pods.list(&ListParams::default().labels(LABEL_PROBE)).await {
+            Ok(listed) => listed.items,
+            Err(e) => {
+                tracing::warn!(error = %e, "isolation probe: could not list leftover probe Pods");
+                return;
+            }
+        };
+        let now = k8s_openapi::jiff::Timestamp::now().as_second();
+        for name in stale_probe_pods(&listed, now) {
+            if let Err(e) = gone_is_fine(
+                pods.delete(&name, &DeleteParams::background().grace_period(0))
+                    .await,
+            ) {
+                tracing::warn!(error = %e, pod = %name, "isolation probe: could not delete a leftover probe Pod");
+            }
+        }
     }
 
     async fn run_probe(&self, pods: &Api<Pod>, nonce: &str) -> Result<ProbeReport, String> {
@@ -415,6 +434,23 @@ impl K8sPluginRuntime {
     }
 }
 
+/// The probe Pods created more than [`probe::PROBE_POD_DEADLINE_SECONDS`]
+/// before `now` (Unix seconds). One with no creation time is left alone: it
+/// cannot be shown to be dead.
+fn stale_probe_pods(pods: &[Pod], now: i64) -> Vec<String> {
+    pods.iter()
+        .filter(|pod| {
+            pod.metadata
+                .creation_timestamp
+                .as_ref()
+                .is_some_and(|created| {
+                    now - created.0.as_second() > probe::PROBE_POD_DEADLINE_SECONDS
+                })
+        })
+        .filter_map(|pod| pod.metadata.name.clone())
+        .collect()
+}
+
 fn id_of(name: Option<&str>) -> Option<String> {
     name.and_then(installation_id_of_service_account)
         .map(str::to_string)
@@ -476,5 +512,43 @@ async fn finished_log(pods: &Api<Pod>, name: &str) -> Result<String, String> {
             ));
         }
         tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time};
+
+    fn probe_pod_created_at(name: &str, created: Option<i64>) -> Pod {
+        Pod {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                creation_timestamp: created
+                    .map(|secs| Time(k8s_openapi::jiff::Timestamp::from_second(secs).unwrap())),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// The leftover sweep must not kill another replica's probe in flight
+    /// (a lease handover mid-probe): only Pods past the probe deadline go.
+    #[test]
+    fn only_probe_pods_past_their_deadline_are_swept() {
+        let now = 1_000_000;
+        let pods = [
+            probe_pod_created_at("in-flight", Some(now - 30)),
+            probe_pod_created_at(
+                "at-the-deadline",
+                Some(now - probe::PROBE_POD_DEADLINE_SECONDS),
+            ),
+            probe_pod_created_at(
+                "abandoned",
+                Some(now - probe::PROBE_POD_DEADLINE_SECONDS - 1),
+            ),
+            probe_pod_created_at("no-creation-time", None),
+        ];
+        assert_eq!(stale_probe_pods(&pods, now), vec!["abandoned".to_string()]);
     }
 }
