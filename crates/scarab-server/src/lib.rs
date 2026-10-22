@@ -7331,8 +7331,11 @@ fn per_repo_environment_writes_gone(org: &str, repo: &str, name: &str) -> ApiErr
          `{name}` is now the org Environment `/v1/orgs/{org}/environments/{name}`, \
          administered by an org admin (who also decides, via \
          `/v1/orgs/{org}/environments/{name}/eligibility`, whether `{repo}` may deploy there). \
-         `{repo}`'s own stricter rules are its project overlay; read them at \
-         `GET /v1/repos/{org}/{repo}/environments/{name}`"
+         `{repo}`'s own stricter rules are its project overlay, written at \
+         `PUT /v1/orgs/{org}/environments/{name}/projects/{repo}/overlay`; its \
+         privileges are an org admin's grant at \
+         `/v1/orgs/{org}/environments/{name}/projects/{repo}/privilege-grant`. \
+         Read all of it at `GET /v1/repos/{org}/{repo}/environments/{name}`"
     ))
 }
 
@@ -9569,7 +9572,7 @@ fn tag_for_path(path: &str) -> Option<&'static str> {
         // path segment with the repo-scoped legacy approval history, which
         // stays under Environments.
         "Deployments"
-    } else if path.contains("/environments") {
+    } else if path.contains("/environments") || path.contains("/environment-migration-report") {
         "Environments"
     } else if path.contains("/secrets") {
         "Secrets"
@@ -9750,6 +9753,17 @@ impl utoipa::Modify for SecuritySchemes {
         org_environments::delete_org_environment,
         org_environments::get_environment_eligibility,
         org_environments::put_environment_eligibility,
+        org_environments::get_environment_protection,
+        org_environments::put_environment_protection,
+        org_environments::list_environment_projects,
+        org_environments::get_environment_project_overlay,
+        org_environments::put_environment_project_overlay,
+        org_environments::delete_environment_project_overlay,
+        org_environments::get_environment_project_privilege_grant,
+        org_environments::put_environment_project_privilege_grant,
+        org_environments::delete_environment_project_privilege_grant,
+        org_environments::get_environment_migration_report,
+        org_environments::acknowledge_environment_migration_report,
         plugins::environment_deployment_targets,
         plugins::plugin_catalog,
         plugins::list_plugins,
@@ -9883,6 +9897,14 @@ impl utoipa::Modify for SecuritySchemes {
         org_environments::EffectiveProtectionDto,
         org_environments::EnvironmentProjectPrivilegeGrantDto,
         org_environments::ImageGrantDto,
+        org_environments::PutEnvironmentProtectionRequest,
+        org_environments::PutEnvironmentProjectOverlayRequest,
+        org_environments::EnvironmentProjectOverlayDto,
+        org_environments::PutEnvironmentProjectPrivilegeGrantRequest,
+        org_environments::EnvironmentProjectDto,
+        org_environments::LegacyProtectionRulesDto,
+        org_environments::EnvironmentMigrationReportProjectDto,
+        org_environments::EnvironmentMigrationReportDto,
         plugins::PluginCapabilityDto,
         plugins::RequestRuleDto,
         plugins::ConnectionSlotDto,
@@ -10030,6 +10052,35 @@ fn router_inner(state: AppState) -> Router {
             "/v1/orgs/{org}/environments/{env}/eligibility",
             axum::routing::put(org_environments::put_environment_eligibility)
                 .get(org_environments::get_environment_eligibility),
+        )
+        .route(
+            "/v1/orgs/{org}/environments/{env}/protection",
+            axum::routing::put(org_environments::put_environment_protection)
+                .get(org_environments::get_environment_protection),
+        )
+        .route(
+            "/v1/orgs/{org}/environments/{env}/projects",
+            get(org_environments::list_environment_projects),
+        )
+        .route(
+            "/v1/orgs/{org}/environments/{env}/projects/{project}/overlay",
+            axum::routing::put(org_environments::put_environment_project_overlay)
+                .get(org_environments::get_environment_project_overlay)
+                .delete(org_environments::delete_environment_project_overlay),
+        )
+        .route(
+            "/v1/orgs/{org}/environments/{env}/projects/{project}/privilege-grant",
+            axum::routing::put(org_environments::put_environment_project_privilege_grant)
+                .get(org_environments::get_environment_project_privilege_grant)
+                .delete(org_environments::delete_environment_project_privilege_grant),
+        )
+        .route(
+            "/v1/orgs/{org}/environment-migration-report",
+            get(org_environments::get_environment_migration_report),
+        )
+        .route(
+            "/v1/orgs/{org}/environment-migration-report/{env}/acknowledge",
+            post(org_environments::acknowledge_environment_migration_report),
         )
         .route(
             "/v1/orgs/{org}/environments/{env}/deployment-targets",
