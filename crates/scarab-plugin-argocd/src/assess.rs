@@ -10,7 +10,9 @@
 //!   `Failed`/`Error` operation on the current revision is `failed`, and
 //!   everything before it is `in_progress` with the reason as the label.
 //!   Health adds one more give-up: a workload past its progress deadline
-//!   (owner default 6) — Kubernetes itself has stopped waiting.
+//!   (owner default 6) — Kubernetes itself has stopped waiting — and any
+//!   Degraded Argo Rollout, which the Rollouts controller only reports once
+//!   it has stopped (aborted, timed out, or an invalid spec).
 //! - **`live` only when the target version is serving**: synced (live
 //!   matches the target the version was computed from) and healthy, with no
 //!   operation running.
@@ -118,8 +120,8 @@ pub fn assess(app: &Application) -> Assessment {
             Status::InProgress,
             with_message("missing", message.as_deref()),
         ),
-        "Degraded" => match progress_deadline_message(app) {
-            Some(m) => assessment(Status::Failed, with_message("degraded", Some(&m))),
+        "Degraded" => match given_up_health(app) {
+            Some(m) => assessment(Status::Failed, m),
             None => assessment(
                 Status::InProgress,
                 with_message("degraded", message.as_deref()),
@@ -227,10 +229,57 @@ fn health_message(app: &Application) -> Option<String> {
         .and_then(|h| h.message.clone())
 }
 
+/// The label for a Degraded Application whose rollout has been given up,
+/// if it has: a degraded `argoproj.io/Rollout`, else a progress-deadline
+/// message on the Application or a degraded resource. Any other Degraded
+/// (a crash-looping Pod, a failing probe) may still recover: `in_progress`.
+fn given_up_health(app: &Application) -> Option<String> {
+    if let Some((name, message)) = degraded_rollout(app) {
+        return Some(match message {
+            Some(m) => with_message("degraded", Some(&m)),
+            None => format!("degraded: rollout {name} gave up"),
+        });
+    }
+    progress_deadline_message(app).map(|m| with_message("degraded", Some(&m)))
+}
+
+/// The first degraded Argo Rollout among the Application's resources, and
+/// its health message.
+///
+/// A Rollout is Degraded only once its controller has stopped: Argo CD's
+/// health check for `argoproj.io/Rollout` maps exactly three conditions to
+/// Degraded — `InvalidSpec`, `RolloutAborted` (a canary whose analysis
+/// failed, or a manual abort) and `ProgressDeadlineExceeded` — each with the
+/// condition's own message; newer Rollouts give the phase as
+/// `"<Reason>: <message>"` and Argo CD copies it. None of them recovers
+/// without a new rollout or a human, so the kind alone decides, not the
+/// message's wording. Verified 2026-10-22 against
+/// https://github.com/argoproj/argo-cd/blob/v2.13.0/resource_customizations/argoproj.io/Rollout/health.lua
+/// and argo-rollouts v1.7.2 `utils/rollout/rolloututil.go`
+/// (`CalculateRolloutPhase`).
+fn degraded_rollout(app: &Application) -> Option<(String, Option<String>)> {
+    app.status
+        .resources
+        .iter()
+        .filter(|r| r.group == "argoproj.io" && r.kind == "Rollout")
+        .find_map(|r| {
+            let h = r.health.as_ref().filter(|h| h.status == "Degraded")?;
+            let message = h.message.clone().filter(|m| !m.trim().is_empty());
+            Some((r.name.clone(), message))
+        })
+}
+
 /// A message saying a workload exceeded its progress deadline, if any —
-/// Kubernetes' own give-up for a rollout (`ProgressDeadlineExceeded`).
+/// Kubernetes' own give-up for a rollout (`ProgressDeadlineExceeded`):
+/// a Deployment's `exceeded its progress deadline`, or a Rollout's
+/// `ReplicaSet "x" has timed out progressing.` (argo-rollouts
+/// `ReplicaSetTimeOutMessage`/`RolloutTimeOutMessage`) where Argo CD put it
+/// on the Application rather than on the resource.
 fn progress_deadline_message(app: &Application) -> Option<String> {
-    let says_deadline = |m: &str| m.to_ascii_lowercase().contains("progress deadline");
+    let says_deadline = |m: &str| {
+        let m = m.to_ascii_lowercase();
+        m.contains("progress deadline") || m.contains("timed out progress")
+    };
     if let Some(m) = app
         .status
         .health

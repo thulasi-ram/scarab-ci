@@ -13,10 +13,23 @@
 //! its managed resources (target AND live states as JSON strings, hooks
 //! flagged). Every control write is a reconcile: `reconciledAt` and the
 //! `resourceVersion` move, and a `MODIFIED` (or `ADDED`) event is streamed.
+//!
+//! The watch stream behaves as Argo CD's `ApplicationService.Watch` does
+//! (argo-cd v2.13.0 `server/application/application.go`, read 2026-10-22):
+//! an `ADDED` snapshot of every Application, sorted by namespace/name, only
+//! when `resourceVersion` is empty; then live events, dropping any whose
+//! Application is older than a given `resourceVersion`. There is **no
+//! backlog**: a client that watches from a list's `resourceVersion` gets
+//! nothing that changed between its list and its watch. Argo also takes its
+//! snapshot BEFORE subscribing, so a change in between is in neither; the
+//! fake closes that gap (one lock) unless a test opens it on purpose
+//! ([`FakeArgo::change_after_next_snapshot`]). One known difference: Argo
+//! (grpc-gateway) sends no response headers before its first event; the
+//! fake sends them at once.
 
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 
@@ -163,13 +176,20 @@ struct Stored {
     managed: Value,
 }
 
+/// A change a test schedules for a precise moment: `(namespace, name, spec)`.
+type Change = (String, String, FakeAppSpec);
+
 struct Inner {
     apps: BTreeMap<(String, String), Stored>,
     resource_version: u64,
-    /// Every event ever streamed, by resourceVersion: a watch that starts
-    /// at a list's version replays what came after it, as Argo's does.
-    history: Vec<(u64, String)>,
     requests: Vec<SeenRequest>,
+    /// Applications whose managed resources answer 500 (an Argo controller
+    /// that cannot render them).
+    failing_managed: BTreeSet<(String, String)>,
+    /// Applied right after the next list is answered.
+    after_next_list: Option<Change>,
+    /// Applied between the next watch's snapshot and its subscription.
+    after_next_snapshot: Option<Change>,
 }
 
 /// The fake. Cheap to clone; clones share state.
@@ -188,8 +208,10 @@ impl FakeArgo {
             inner: Arc::new(Mutex::new(Inner {
                 apps: BTreeMap::new(),
                 resource_version: 1000,
-                history: Vec::new(),
                 requests: Vec::new(),
+                failing_managed: BTreeSet::new(),
+                after_next_list: None,
+                after_next_snapshot: None,
             })),
             events,
             token,
@@ -223,7 +245,6 @@ impl FakeArgo {
                 managed,
             },
         );
-        inner.history.push((rv, line.clone()));
         let _ = self.events.send((rv, line));
     }
 
@@ -238,7 +259,6 @@ impl FakeArgo {
         inner.resource_version += 1;
         let rv = inner.resource_version;
         let line = event_line("DELETED", &stored.application);
-        inner.history.push((rv, line.clone()));
         let _ = self.events.send((rv, line));
         true
     }
@@ -252,6 +272,30 @@ impl FakeArgo {
 
     pub fn requests(&self) -> Vec<SeenRequest> {
         self.lock().requests.clone()
+    }
+
+    /// Make an Application's managed resources answer 500 (`true`), or
+    /// serve them again (`false`). Not a reconcile: no event.
+    pub fn fail_managed_resources(&self, namespace: &str, name: &str, fail: bool) {
+        let key = (namespace.to_string(), name.to_string());
+        let mut inner = self.lock();
+        if fail {
+            inner.failing_managed.insert(key);
+        } else {
+            inner.failing_managed.remove(&key);
+        }
+    }
+
+    /// Apply `spec` the moment the next list has been answered — a change
+    /// that lands between a client's list and its watch.
+    pub fn change_after_next_list(&self, namespace: &str, name: &str, spec: FakeAppSpec) {
+        self.lock().after_next_list = Some((namespace.into(), name.into(), spec));
+    }
+
+    /// Apply `spec` between the next watch's snapshot and its subscription:
+    /// Argo's own gap, in neither the snapshot nor that watch's events.
+    pub fn change_after_next_snapshot(&self, namespace: &str, name: &str, spec: FakeAppSpec) {
+        self.lock().after_next_snapshot = Some((namespace.into(), name.into(), spec));
     }
 }
 
@@ -553,13 +597,20 @@ async fn version() -> Json<Value> {
 }
 
 async fn list_applications(State(fake): State<FakeArgo>) -> Json<Value> {
-    let inner = fake.lock();
-    let items: Vec<Value> = inner.apps.values().map(|s| s.application.clone()).collect();
-    Json(json!({
-        "metadata": { "resourceVersion": inner.resource_version.to_string() },
-        // Argo serves `null`, not `[]`, for none.
-        "items": if items.is_empty() { Value::Null } else { Value::Array(items) }
-    }))
+    let (body, change) = {
+        let mut inner = fake.lock();
+        let items: Vec<Value> = inner.apps.values().map(|s| s.application.clone()).collect();
+        let body = json!({
+            "metadata": { "resourceVersion": inner.resource_version.to_string() },
+            // Argo serves `null`, not `[]`, for none.
+            "items": if items.is_empty() { Value::Null } else { Value::Array(items) }
+        });
+        (body, inner.after_next_list.take())
+    };
+    if let Some((namespace, name, spec)) = change {
+        fake.put_app(&namespace, &name, spec);
+    }
+    Json(body)
 }
 
 #[derive(Debug, Deserialize)]
@@ -598,6 +649,17 @@ async fn managed_resources(
     Path(name): Path<String>,
     Query(q): Query<AppQuery>,
 ) -> Response {
+    let ns = q
+        .app_namespace
+        .clone()
+        .unwrap_or_else(|| DEFAULT_APP_NAMESPACE.to_string());
+    if fake.lock().failing_managed.contains(&(ns, name.clone())) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "error getting cached app managed resources", "code": 13, "message": "error getting cached app managed resources" })),
+        )
+            .into_response();
+    }
     match lookup(&fake, &name, &q) {
         Some((_, managed)) => Json(managed).into_response(),
         None => not_found(&format!("application {name}")),
@@ -614,35 +676,43 @@ async fn stream_applications(
     State(fake): State<FakeArgo>,
     Query(q): Query<StreamQuery>,
 ) -> Response {
-    let from: u64 = q
-        .resource_version
-        .as_deref()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    // Subscribe and take the backlog under one lock, so no event falls
-    // between them.
-    let (backlog, rx) = {
-        let inner = fake.lock();
-        let rx = fake.events.subscribe();
-        let backlog: Vec<(u64, String)> = inner
-            .history
-            .iter()
-            .filter(|(rv, _)| *rv > from)
-            .cloned()
-            .collect();
-        (backlog, rx)
+    let requested = q.resource_version.as_deref().unwrap_or("");
+    // Argo: a non-numeric version filters nothing (`strconv.Atoi` fails).
+    let min_version: u64 = requested.parse().unwrap_or(0);
+    let snapshot_wanted = requested.is_empty();
+    let (snapshot, rx) = {
+        let mut inner = fake.lock();
+        let snapshot: Vec<String> = if snapshot_wanted {
+            inner
+                .apps
+                .values()
+                .map(|s| event_line("ADDED", &s.application))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let change = inner.after_next_snapshot.take();
+        match change {
+            // Argo's gap, on purpose: the change lands after the snapshot
+            // was taken and before this watch subscribes.
+            Some((namespace, name, spec)) => {
+                drop(inner);
+                fake.put_app(&namespace, &name, spec);
+                (snapshot, fake.events.subscribe())
+            }
+            None => (snapshot, fake.events.subscribe()),
+        }
     };
-    let last = backlog.last().map(|(rv, _)| *rv).unwrap_or(from);
-    let backlog = futures::stream::iter(
-        backlog
+    let snapshot = futures::stream::iter(
+        snapshot
             .into_iter()
-            .map(|(_, line)| Ok::<Bytes, Infallible>(Bytes::from(line))),
+            .map(|line| Ok::<Bytes, Infallible>(Bytes::from(line))),
     );
-    let live = futures::stream::unfold((rx, last), |(mut rx, last)| async move {
+    let live = futures::stream::unfold(rx, move |mut rx| async move {
         loop {
             match rx.recv().await {
-                Ok((rv, line)) if rv > last => {
-                    return Some((Ok::<Bytes, Infallible>(Bytes::from(line)), (rx, rv)))
+                Ok((rv, line)) if rv >= min_version => {
+                    return Some((Ok::<Bytes, Infallible>(Bytes::from(line)), rx))
                 }
                 Ok(_) => continue,
                 // Lagged or closed: end the stream; the client re-lists.
@@ -653,7 +723,7 @@ async fn stream_applications(
     use futures::StreamExt;
     (
         [("content-type", "application/json")],
-        Body::from_stream(backlog.chain(live)),
+        Body::from_stream(snapshot.chain(live)),
     )
         .into_response()
 }

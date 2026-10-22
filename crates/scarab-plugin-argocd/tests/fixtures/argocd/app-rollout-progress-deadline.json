@@ -1,0 +1,170 @@
+{
+  "apiVersion": "argoproj.io/v1alpha1",
+  "kind": "Application",
+  "metadata": {
+    "name": "web",
+    "namespace": "argocd",
+    "uid": "6f1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+    "resourceVersion": "48212901",
+    "generation": 1442,
+    "creationTimestamp": "2025-03-02T11:20:00Z",
+    "annotations": {
+      "scarab.io/owner-projects": "acme/web, acme/web-worker"
+    },
+    "labels": {
+      "team": "storefront"
+    }
+  },
+  "spec": {
+    "project": "prod",
+    "source": {
+      "repoURL": "https://git.example/acme/gitops.git",
+      "path": "apps/web/overlays/prod",
+      "targetRevision": "main"
+    },
+    "destination": {
+      "server": "https://kubernetes.default.svc",
+      "namespace": "web"
+    },
+    "syncPolicy": {
+      "retry": {
+        "limit": 3,
+        "backoff": {
+          "duration": "5s",
+          "factor": 2,
+          "maxDuration": "3m0s"
+        }
+      },
+      "automated": {
+        "prune": true,
+        "selfHeal": true
+      }
+    }
+  },
+  "status": {
+    "sync": {
+      "status": "Synced",
+      "revision": "8d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e",
+      "comparedTo": {
+        "source": {
+          "repoURL": "https://git.example/acme/gitops.git",
+          "path": "apps/web/overlays/prod",
+          "targetRevision": "main"
+        },
+        "destination": {
+          "server": "https://kubernetes.default.svc",
+          "namespace": "web"
+        }
+      }
+    },
+    "health": {
+      "status": "Degraded",
+      "lastTransitionTime": "2026-10-21T09:13:58Z"
+    },
+    "reconciledAt": "2026-10-21T09:14:07Z",
+    "observedAt": "2026-10-21T09:14:07Z",
+    "sourceType": "Kustomize",
+    "summary": {
+      "images": [
+        "ghcr.io/acme/web:1.41.0",
+        "ghcr.io/acme/web:1.42.0",
+        "docker.io/istio/proxyv2:1.22.3"
+      ],
+      "externalURLs": [
+        "https://web.acme.example"
+      ]
+    },
+    "resources": [
+      {
+        "group": "",
+        "version": "v1",
+        "kind": "Service",
+        "namespace": "web",
+        "name": "web",
+        "status": "Synced",
+        "health": {
+          "status": "Healthy"
+        }
+      },
+      {
+        "group": "argoproj.io",
+        "version": "v1alpha1",
+        "kind": "Rollout",
+        "namespace": "web",
+        "name": "web",
+        "status": "Synced",
+        "health": {
+          "status": "Degraded",
+          "message": "ProgressDeadlineExceeded: ReplicaSet \"web-6d8f7c9b5\" has timed out progressing."
+        }
+      },
+      {
+        "group": "",
+        "version": "v1",
+        "kind": "ConfigMap",
+        "namespace": "web",
+        "name": "web-config",
+        "status": "Synced"
+      }
+    ],
+    "history": [
+      {
+        "revision": "2f0c1b7e9a4d3c5b6a7e8f9012345678abcdef01",
+        "deployedAt": "2026-10-20T16:02:11Z",
+        "id": 311,
+        "source": {
+          "repoURL": "https://git.example/acme/gitops.git",
+          "path": "apps/web/overlays/prod",
+          "targetRevision": "main"
+        },
+        "deployStartedAt": "2026-10-20T16:01:40Z"
+      }
+    ],
+    "operationState": {
+      "operation": {
+        "sync": {
+          "revision": "8d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e",
+          "syncStrategy": {
+            "hook": {}
+          }
+        },
+        "initiatedBy": {
+          "automated": true
+        },
+        "retry": {
+          "limit": 3,
+          "backoff": {
+            "duration": "5s",
+            "factor": 2,
+            "maxDuration": "3m0s"
+          }
+        }
+      },
+      "phase": "Succeeded",
+      "startedAt": "2026-10-21T09:12:40Z",
+      "syncResult": {
+        "revision": "8d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e",
+        "resources": [
+          {
+            "group": "argoproj.io",
+            "version": "v1alpha1",
+            "kind": "Rollout",
+            "namespace": "web",
+            "name": "web",
+            "status": "Synced",
+            "message": "rollout.argoproj.io/web configured",
+            "syncPhase": "Sync",
+            "syncWave": 0
+          }
+        ],
+        "source": {
+          "repoURL": "https://git.example/acme/gitops.git",
+          "path": "apps/web/overlays/prod",
+          "targetRevision": "main"
+        }
+      },
+      "message": "successfully synced (all tasks run)",
+      "finishedAt": "2026-10-21T09:14:01Z"
+    }
+  }
+}
