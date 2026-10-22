@@ -640,6 +640,47 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/orgs/{org}/plugins/{name}/connections": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** A plugin's connection slots and their bindings (ADR-0072 §5) */
+        get: operations["list_plugin_connections"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/plugins/{name}/connections/{slot}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Bind a plugin connection's destination and credential (ADR-0072 §5)
+         * @description The credential is written through to the secret store under a fresh
+         *     server-minted key and is never readable back; the previous binding's
+         *     credential is deleted once the new binding is stored. A response stream
+         *     the plugin has open on the old binding is cut within seconds.
+         */
+        put: operations["put_plugin_connection"];
+        post?: never;
+        /** Unbind a plugin connection and delete its credential (ADR-0072 §5) */
+        delete: operations["delete_plugin_connection"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/orgs/{org}/plugins/{name}/enable": {
         parameters: {
             query?: never;
@@ -2440,6 +2481,47 @@ export interface components {
             /** @description The catalog key `POST …/plugins` names as `plugin`. */
             plugin: string;
         };
+        /**
+         * @description One connection slot of an installation and what an admin bound to it
+         *     (ADR-0072 §5). Never carries the credential, nor its secret key.
+         */
+        PluginConnectionDto: {
+            auth_scheme?: string | null;
+            /** @description The schemes the manifest allows; `bearer` is the only one today. */
+            auth_schemes: string[];
+            /** @description Where every request on it goes — and nowhere else. */
+            base_url?: string | null;
+            /**
+             * @description The CA certificates (PEM) that are the ONLY trust anchors for
+             *     `base_url`; absent = the platform's roots. Certificates are public.
+             */
+            ca_pem?: string | null;
+            /**
+             * @description Whether an admin has bound it. Unbound, the broker answers the
+             *     plugin's requests on it with 409.
+             */
+            configured: boolean;
+            /**
+             * @description Whether the credential is present in the secret store. Write-only:
+             *     no endpoint returns it.
+             */
+            credential_set: boolean;
+            /**
+             * @description `base_url` is plain `http://`: the credential crosses the network in
+             *     the clear. Allowed (an in-cluster Service, say); the UI warns.
+             */
+            insecure_http: boolean;
+            /** @description What the plugin may send through it: reads only. */
+            read_rules: components["schemas"]["RequestRuleDto"][];
+            /** @description The manifest's slot name. */
+            slot: string;
+            /**
+             * Format: int64
+             * @description Unix-ms.
+             */
+            updated_at?: number | null;
+            updated_by?: string | null;
+        };
         /** @description A PluginInstallation (ADR-0072 §10). */
         PluginInstallationDto: {
             /**
@@ -2573,6 +2655,29 @@ export interface components {
             deployment_sources: components["schemas"]["EnvironmentDeploymentSourceDto"][];
             /** @description Free text; omitted = empty. */
             description?: string | null;
+        };
+        /**
+         * @description `PUT /v1/orgs/{org}/plugins/{name}/connections/{slot}`: bind the slot's
+         *     destination and credential, replacing any previous binding whole.
+         */
+        PutPluginConnectionRequest: {
+            /**
+             * @description `https://host[:port][/prefix]` (or `http://`, warned about). Every
+             *     request the plugin sends on this slot goes here; it cannot pick
+             *     another host.
+             */
+            base_url: string;
+            /**
+             * @description PEM CA certificates to trust INSTEAD of the platform roots, for an
+             *     internal CA (https only). There is no skip-verify.
+             */
+            ca_pem?: string | null;
+            /**
+             * @description The bearer token the broker adds upstream. Required on every bind —
+             *     a new destination never inherits a credential entered for another —
+             *     and never readable back.
+             */
+            credential: string;
         };
         /**
          * @description `POST /v1/secrets` body: define (or overwrite) a secret at a scope. The
@@ -4449,6 +4554,141 @@ export interface operations {
                 content?: never;
             };
             /** @description no such installation, or plugins not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_plugin_connections: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description installation name */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PluginConnectionDto"][];
+                };
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such installation, or plugins not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    put_plugin_connection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description installation name */
+                name: string;
+                /** @description the manifest's connection slot */
+                slot: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PutPluginConnectionRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PluginConnectionDto"];
+                };
+            };
+            /** @description unknown slot, or a malformed base URL, credential or CA */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such installation, or plugins or the secret store not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_plugin_connection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description installation name */
+                name: string;
+                /** @description the manifest's connection slot */
+                slot: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description unbound */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description unknown slot */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such installation or binding, or plugins not configured */
             404: {
                 headers: {
                     [name: string]: unknown;

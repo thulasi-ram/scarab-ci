@@ -261,3 +261,100 @@ export function usageLine(u: {
       "Per-installation caps: past one, a report about a NEW target (or a new unmapped grouping) is rejected; targets it already reports keep reporting.",
   };
 }
+
+// --- PluginConnections (ADR-0072 §5, Deployments MMP d3) -------------------
+// An admin binds each manifest connection slot to the ONE destination the
+// broker may send the plugin's requests to, and the credential it adds. The
+// credential is write-only: the server never returns it, so the form only
+// ever says "set" / "not set", and every save sends it again — a new
+// destination never inherits a credential entered for another.
+
+/** The bind form as the panel holds it. */
+export type ConnectionForm = {
+  base_url: string;
+  /** Always typed afresh; never prefilled (the server cannot give it back). */
+  credential: string;
+  /** PEM certificates trusted INSTEAD of the platform roots; blank = none. */
+  ca_pem: string;
+};
+
+/** What `PUT …/plugins/{name}/connections/{slot}` carries — structurally the
+ *  generated `PutPluginConnectionRequest`. */
+export type ConnectionBody = { base_url: string; credential: string; ca_pem?: string };
+
+/** Why `url` cannot be a connection's destination, or `null` if it can (or
+ *  is still empty). Mirrors the server: an absolute http(s) URL with a host,
+ *  no user/password, query or fragment. */
+export function connectionBaseUrlError(url: string): string | null {
+  const raw = url.trim();
+  if (raw === "") return null;
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    return "Not an absolute URL — it is https://host[:port][/prefix].";
+  }
+  if (u.protocol !== "https:" && u.protocol !== "http:") return "The destination must be http or https.";
+  if (!u.hostname) return "The destination needs a host.";
+  if (u.username || u.password) return "No user or password in the URL — the credential goes in its own field.";
+  if (u.search || u.hash || raw.includes("?") || raw.includes("#")) {
+    return "No query or fragment: the plugin's own request supplies those.";
+  }
+  return null;
+}
+
+/** Plain http: the credential would cross the network in the clear. Allowed
+ *  (an in-cluster Service, say), never silently. */
+export function isInsecureHttp(url: string): boolean {
+  return url.trim().toLowerCase().startsWith("http://");
+}
+
+export const INSECURE_HTTP_WARNING =
+  "Plain http: the broker sends the credential unencrypted to this destination. Use it only for a destination inside a network you trust.";
+
+/** Why `credential` cannot be sent as a bearer token, or `null`. */
+export function credentialError(credential: string): string | null {
+  const t = credential.trim();
+  if (t === "") return "Enter the credential — every save sends it again, so a destination never keeps one entered for another.";
+  if (!/^[\x21-\x7e]+$/.test(t)) return "A bearer token is visible ASCII with no spaces.";
+  return null;
+}
+
+/** The body for `form`, or the first reason it cannot be sent. */
+export function toConnectionBody(
+  form: ConnectionForm,
+): { body: ConnectionBody; error?: undefined } | { body?: undefined; error: string } {
+  const base_url = form.base_url.trim();
+  if (!base_url) return { error: "Enter the destination's base URL." };
+  const urlProblem = connectionBaseUrlError(base_url);
+  if (urlProblem) return { error: urlProblem };
+  const credProblem = credentialError(form.credential);
+  if (credProblem) return { error: credProblem };
+  const ca = form.ca_pem.trim();
+  if (ca && isInsecureHttp(base_url)) return { error: "A CA applies to an https destination only." };
+  if (ca && !ca.includes("-----BEGIN CERTIFICATE-----")) {
+    return { error: "The CA must be PEM certificates (-----BEGIN CERTIFICATE-----…)." };
+  }
+  return {
+    body: { base_url, credential: form.credential.trim(), ...(ca ? { ca_pem: ca } : {}) },
+  };
+}
+
+/** A connection slot's credential, as a badge: the only thing ever shown of
+ *  it. A binding whose secret went missing reads "not set" too. */
+export function credentialBadge(c: { configured: boolean; credential_set: boolean }): Badge {
+  if (!c.configured) {
+    return {
+      label: "not bound",
+      tone: "muted",
+      title: "No destination or credential yet: the broker refuses the plugin's requests on this connection.",
+    };
+  }
+  return c.credential_set
+    ? { label: "credential set", tone: "ok", title: "Stored in the secret store. It is never shown again." }
+    : {
+        label: "credential not set",
+        tone: "danger",
+        title: "The binding's credential is missing from the secret store: bind it again.",
+      };
+}
