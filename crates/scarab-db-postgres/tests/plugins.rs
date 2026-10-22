@@ -88,6 +88,8 @@ async fn put_environment(db: &PostgresDb, org: &str, name: &str, sources: &[(&st
                 vendor_grouping: (*grouping).into(),
             })
             .collect(),
+        protection: Default::default(),
+        eligibility: Default::default(),
         created_at: 1_000,
         updated_at: 1_000,
         updated_by: "amy".into(),

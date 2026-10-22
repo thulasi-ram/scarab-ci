@@ -49,6 +49,10 @@ fn org_environment(
         deployment_deadline: EnvironmentDeploymentDeadline::new(deadline_minutes * MINUTE_MS)
             .unwrap(),
         deployment_sources: sources,
+        // The governance half has its own writes (ADR-0071); a new
+        // Environment stores the permissive, fail-closed defaults.
+        protection: Default::default(),
+        eligibility: Default::default(),
         created_at: at,
         updated_at: at,
         updated_by: "amy".into(),
