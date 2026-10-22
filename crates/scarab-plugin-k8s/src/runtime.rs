@@ -14,7 +14,9 @@ use scarab_plugin::{installation_id_of_service_account, PluginInstallation};
 
 use crate::objects::{self, LABEL_PROBE};
 use crate::probe::{self, ProbeReport};
-use crate::{BrokerPeer, FIELD_MANAGER, LABEL_INSTALLATION, PSA_ENFORCE_LABEL, PSA_RESTRICTED};
+use crate::{
+    BrokerPeer, BrokerUrl, FIELD_MANAGER, LABEL_INSTALLATION, PSA_ENFORCE_LABEL, PSA_RESTRICTED,
+};
 
 /// How long the canary may take to accept connections (an image pull on a
 /// cold node included), and how long the two checking Pods may take to
@@ -28,7 +30,8 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 pub struct PluginRuntimeConfig {
     /// The one shared plugin namespace (`SCARAB_PLUGIN_NAMESPACE`).
     pub namespace: String,
-    /// What a Plugin Pod dials (`SCARAB_PLUGIN_BROKER_URL`).
+    /// The broker URL (`SCARAB_PLUGIN_BROKER_URL`). A Plugin Pod dials it
+    /// by IP: see [`K8sPluginRuntime::pod_broker_url`].
     pub broker_url: String,
     /// How `plugin-egress` names the broker (`SCARAB_PLUGIN_BROKER_PEER`).
     /// `None` = not configured: the baseline refuses, and nothing starts.
@@ -52,6 +55,9 @@ pub enum RuntimeError {
     Invalid(String),
     #[error("kubernetes: {0}")]
     Kube(String),
+    /// The broker URL's host did not resolve (this pass).
+    #[error("resolving the broker: {0}")]
+    BrokerUnresolved(String),
 }
 
 fn kube_err(e: kube::Error) -> RuntimeError {
@@ -194,16 +200,47 @@ impl K8sPluginRuntime {
         Ok(())
     }
 
+    /// The broker URL as a Plugin Pod dials it: by IP, because a Plugin has
+    /// no DNS (see `plugin-egress`). A URL that names an IP is used as is
+    /// (proc mode: `up.sh` resolves the host as a Pod sees it). A name — the
+    /// chart's broker Service — is resolved HERE, by the control plane, on
+    /// every call, so a re-created Service's new ClusterIP is picked up
+    /// within a pass; the NetworkPolicy peer is unaffected, since it is
+    /// evaluated on the Pod behind the Service, after translation.
+    pub async fn pod_broker_url(&self) -> Result<String, RuntimeError> {
+        let url = BrokerUrl::parse(&self.config.broker_url).map_err(RuntimeError::Invalid)?;
+        if let Some(ip) = url.ip() {
+            return Ok(url.with_ip(ip));
+        }
+        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((url.host(), url.port()))
+            .await
+            .map_err(|e| RuntimeError::BrokerUnresolved(format!("`{}`: {e}", url.host())))?
+            .collect();
+        // IPv4 first: a single-stack cluster's Service is IPv4, and a
+        // dual-stack one serves both.
+        let ip = addrs
+            .iter()
+            .find(|a| a.is_ipv4())
+            .or_else(|| addrs.first())
+            .map(|a| a.ip())
+            .ok_or_else(|| {
+                RuntimeError::BrokerUnresolved(format!("`{}` has no address", url.host()))
+            })?;
+        Ok(url.with_ip(ip))
+    }
+
     /// Run the isolation probe (see [`crate::probe`]). Never an `Err`: a
     /// probe that cannot finish is a FAILED probe, and the Plugin does not
     /// start. Its Pods are deleted afterwards, pass or fail, and so are any a
     /// crashed earlier probe left behind — but only ones past their deadline,
     /// never another manager's probe still in flight.
-    pub async fn probe_isolation(&self) -> ProbeReport {
+    ///
+    /// `pod_broker_url` is [`Self::pod_broker_url`]'s answer this pass.
+    pub async fn probe_isolation(&self, pod_broker_url: &str) -> ProbeReport {
         let pods: Api<Pod> = self.namespaced();
         self.clear_stale_probe_pods(&pods).await;
         let nonce = uuid::Uuid::new_v4().simple().to_string()[..10].to_string();
-        let report = match self.run_probe(&pods, &nonce).await {
+        let report = match self.run_probe(&pods, &nonce, pod_broker_url).await {
             Ok(report) => report,
             Err(why) => ProbeReport::could_not_run(why),
         };
@@ -241,7 +278,12 @@ impl K8sPluginRuntime {
         }
     }
 
-    async fn run_probe(&self, pods: &Api<Pod>, nonce: &str) -> Result<ProbeReport, String> {
+    async fn run_probe(
+        &self,
+        pods: &Api<Pod>,
+        nonce: &str,
+        pod_broker_url: &str,
+    ) -> Result<ProbeReport, String> {
         let ns = &self.config.namespace;
         let image = &self.config.probe_image;
         let create = |pod: Pod| async move {
@@ -258,7 +300,7 @@ impl K8sPluginRuntime {
             nonce,
             image,
             &canary_ip,
-            &self.config.broker_url,
+            pod_broker_url,
         ))
         .await?;
         let control_name = control.metadata.name.unwrap_or_default();
@@ -279,7 +321,12 @@ impl K8sPluginRuntime {
     }
 
     /// Apply installation's ServiceAccount and Deployment (one replica).
-    pub async fn ensure(&self, installation: &PluginInstallation) -> Result<(), RuntimeError> {
+    /// `pod_broker_url` is [`Self::pod_broker_url`]'s answer this pass.
+    pub async fn ensure(
+        &self,
+        installation: &PluginInstallation,
+        pod_broker_url: &str,
+    ) -> Result<(), RuntimeError> {
         installation
             .validate()
             .map_err(|e| RuntimeError::Invalid(e.to_string()))?;
@@ -292,7 +339,8 @@ impl K8sPluginRuntime {
         let deployment = objects::deployment(
             &self.config.namespace,
             installation,
-            &self.config.broker_url,
+            pod_broker_url,
+            &self.config.probe_image,
         );
         self.namespaced::<Deployment>()
             .patch(&name, &Self::apply_params(), &Patch::Apply(&deployment))
@@ -411,11 +459,35 @@ impl K8sPluginRuntime {
             .await
             .map_err(kube_err)?;
         for pod in pods.items {
-            for cs in pod
-                .status
-                .and_then(|s| s.container_statuses)
-                .unwrap_or_default()
-            {
+            let status = pod.status.unwrap_or_default();
+            // The isolation self-check first: while it fails, the Plugin's
+            // own container never starts, so only here is the reason.
+            for init in status.init_container_statuses.unwrap_or_default() {
+                if init.name != probe::SELF_CHECK_CONTAINER {
+                    continue;
+                }
+                let crash_looping = init
+                    .state
+                    .as_ref()
+                    .and_then(|s| s.waiting.as_ref())
+                    .and_then(|w| w.reason.as_deref())
+                    == Some("CrashLoopBackOff");
+                if crash_looping {
+                    let verdict = init
+                        .last_state
+                        .and_then(|s| s.terminated)
+                        .and_then(|t| t.message)
+                        .map(|m| m.trim().replace('\n', "; "))
+                        .filter(|m| !m.is_empty())
+                        .unwrap_or_else(|| "no verdict recorded".to_string());
+                    return Ok(WorkloadState::Failing(format!(
+                        "the isolation self-check keeps failing — this Pod's network on its \
+                         node is not isolated as plugin-egress requires, so the Plugin does not \
+                         start: {verdict}"
+                    )));
+                }
+            }
+            for cs in status.container_statuses.unwrap_or_default() {
                 if let Some(waiting) = cs.state.and_then(|s| s.waiting) {
                     let reason = waiting.reason.unwrap_or_default();
                     if STUCK_REASONS.contains(&reason.as_str()) {

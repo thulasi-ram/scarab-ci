@@ -357,11 +357,14 @@ fi
 # proc mode it is a HOST process exactly like the workspace service — same
 # routing problem, same answer. It is not probed directly: the server must know
 # the URL and the NetworkPolicy peer at BOOT, before its broker listens. The
-# host is the one a Pod was just proven to reach ($ws_host); the peer is that
-# host's address AS A POD RESOLVES IT (a NetworkPolicy ipBlock needs an IP, and
-# on darwin the host's own idea of its address is the wrong one). Whether the
-# broker then actually answers a plugin is the isolation probe's job — it checks
-# the broker's healthz from a plugin-labelled Pod and fails closed.
+# host is the one a Pod was just proven to reach ($ws_host), taken AS A POD
+# RESOLVES IT ($broker_ip) for BOTH the peer (a NetworkPolicy ipBlock needs an
+# IP) and the URL: a plugin Pod has no DNS at all (its egress allows the broker
+# and nothing else — a resolver would be a tunnel out), and the server, a host
+# process, could not resolve the name the way a Pod does anyway (on darwin the
+# host's own idea of its address is the wrong one). Whether the broker then
+# actually answers a plugin is the isolation probe's job — it checks the
+# broker's healthz from a plugin-labelled Pod and fails closed.
 #
 # Only with SCARAB_PLUGINS=on (it costs one more throwaway Pod). A peer that
 # cannot be resolved is a warning, not fatal: the server then reports
@@ -400,7 +403,7 @@ if [ "${SCARAB_PLUGINS:-off}" = on ]; then
       ;;
     *) broker_ip="$ws_host" ;;
   esac
-  broker_url="${SCARAB_PLUGIN_BROKER_URL:-http://$ws_host:$broker_port}"
+  broker_url="${SCARAB_PLUGIN_BROKER_URL:-http://${broker_ip:-$ws_host}:$broker_port}"
   if [ -n "${SCARAB_PLUGIN_BROKER_PEER:-}" ]; then
     broker_peer="$SCARAB_PLUGIN_BROKER_PEER"
   elif [ -n "${broker_ip:-}" ]; then

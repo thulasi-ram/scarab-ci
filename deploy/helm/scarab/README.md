@@ -339,11 +339,18 @@ there, `get` on that one namespace, and a binding to `system:auth-delegator`
 (TokenReview, which is how the broker verifies a plugin's projected token).
 
 **The cluster must enforce NetworkPolicy.** The runtime writes a default-deny
-policy plus one egress allowance (cluster DNS and the broker), and before any
-plugin starts — and every 6 h — runs an isolation probe in the namespace. On a
-cluster whose CNI ignores NetworkPolicy the probe fails and the plugin stays
-down, its installation showing `probe_failed` and why. Cluster DNS must be the
-usual `kube-system` Pods labelled `k8s-app=kube-dns`.
+policy plus one egress allowance — the broker, nothing else. Not even DNS: the
+cluster resolver forwards any name upstream, so a DNS allowance would be a
+tunnel out. Plugins are handed the broker by IP instead (the runtime resolves
+the broker Service to its ClusterIP every pass). Before any plugin starts — and
+every 6 h — the runtime runs an isolation probe in the namespace. On a cluster
+whose CNI ignores NetworkPolicy the probe fails and the plugin stays down, its
+installation showing `probe_failed` and why. Each plugin Pod then re-checks its
+own network in an `isolation-self-check` initContainer (the probe image) before
+the plugin starts, on whichever node it landed: the broker reachable; the API
+server, the internet, `169.254.169.254` and DNS not. Until that passes the
+plugin does not run. The probe's control Pod (never a plugin) uses the cluster
+DNS, which must be the usual `kube-system` Pods labelled `k8s-app=kube-dns`.
 
 ## Key values
 

@@ -105,8 +105,10 @@ pub fn probe_due(now: i64, isolation: &Isolation, installations: &[PluginInstall
 /// What this pass learned about the plugin namespace's baseline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Baseline {
-    /// Fit to run Plugins in; the runtime's policies are applied.
-    Ready,
+    /// Fit to run Plugins in; the runtime's policies are applied, and a
+    /// Plugin Pod reaches the broker at `pod_broker_url` (by IP: a Plugin
+    /// has no DNS).
+    Ready { pod_broker_url: String },
     /// The namespace is not one Plugins may run in (not `restricted`, a
     /// stray policy, no broker peer). Fail closed: hold every workload.
     Refused(String),
@@ -117,14 +119,19 @@ pub enum Baseline {
 }
 
 impl Baseline {
-    /// Only a refusal holds workloads; any other error is "could not ask".
-    pub fn from_result(result: Result<(), RuntimeError>) -> Self {
-        match result {
-            Ok(()) => Baseline::Ready,
+    /// Classify one pass's baseline check — followed, when it passed, by
+    /// the broker's address as a Pod dials it. Only a refusal holds
+    /// workloads; any other error — a Kubernetes error, a broker name that
+    /// did not resolve this pass — is "could not ask".
+    pub fn classify(checked: Result<String, RuntimeError>) -> Self {
+        match checked {
+            Ok(pod_broker_url) => Baseline::Ready { pod_broker_url },
             Err(e @ RuntimeError::BaselineRefused(_)) => Baseline::Refused(e.to_string()),
-            Err(e @ (RuntimeError::Kube(_) | RuntimeError::Invalid(_))) => {
-                Baseline::Unavailable(e.to_string())
-            }
+            Err(
+                e @ (RuntimeError::Kube(_)
+                | RuntimeError::Invalid(_)
+                | RuntimeError::BrokerUnresolved(_)),
+            ) => Baseline::Unavailable(e.to_string()),
         }
     }
 }
@@ -139,8 +146,12 @@ pub enum Decision {
         status: RuntimeStatus,
         message: String,
     },
-    /// Apply its workload; `probe_passed_at` is the probe that allowed it.
-    Run { probe_passed_at: i64 },
+    /// Apply its workload, dialing the broker at `pod_broker_url`;
+    /// `probe_passed_at` is the probe that allowed it.
+    Run {
+        probe_passed_at: i64,
+        pod_broker_url: String,
+    },
     /// Leave it as it is, and write nothing: the cluster could not be asked
     /// this pass ([`Baseline::Unavailable`]), or there is no probe result
     /// yet. (The second is defensive: [`probe_due`] forces a probe whenever
@@ -162,8 +173,8 @@ pub fn decide(
     if installation.state == InstallationState::Killed {
         return Decision::Stop;
     }
-    match baseline {
-        Baseline::Ready => {}
+    let pod_broker_url = match baseline {
+        Baseline::Ready { pod_broker_url } => pod_broker_url,
         Baseline::Refused(why) => {
             return Decision::Hold {
                 status: RuntimeStatus::Error,
@@ -171,7 +182,7 @@ pub fn decide(
             }
         }
         Baseline::Unavailable(_) => return Decision::Wait,
-    }
+    };
     match (&isolation.failure, isolation.probed_at) {
         (Some(why), _) => Decision::Hold {
             status: RuntimeStatus::ProbeFailed,
@@ -179,6 +190,7 @@ pub fn decide(
         },
         (None, Some(at)) => Decision::Run {
             probe_passed_at: at,
+            pod_broker_url: pod_broker_url.clone(),
         },
         (None, None) => Decision::Wait,
     }
@@ -340,7 +352,11 @@ impl PluginRuntimeLoop {
             .await
             .map_err(|e| e.to_string())?;
 
-        let baseline = Baseline::from_result(self.runtime.ensure_baseline().await);
+        let checked = match self.runtime.ensure_baseline().await {
+            Ok(()) => self.runtime.pod_broker_url().await,
+            Err(e) => Err(e),
+        };
+        let baseline = Baseline::classify(checked);
         match &baseline {
             Baseline::Refused(why) => {
                 tracing::error!(reason = %why, "plugin runtime: namespace baseline refused; no plugin runs");
@@ -356,10 +372,10 @@ impl PluginRuntimeLoop {
                      (killed installations are still stopped)"
                 );
             }
-            Baseline::Ready => {
+            Baseline::Ready { pod_broker_url } => {
                 let now = self.clock.now().await.0;
                 if probe_due(now, &self.isolation, &installations) {
-                    self.probe(&installations).await;
+                    self.probe(&installations, pod_broker_url).await;
                 }
             }
         }
@@ -407,7 +423,7 @@ impl PluginRuntimeLoop {
         Ok(())
     }
 
-    async fn probe(&mut self, installations: &[PluginInstallation]) {
+    async fn probe(&mut self, installations: &[PluginInstallation], pod_broker_url: &str) {
         // Shown while it runs, for what is waiting on it — installs and
         // enables, not workloads already running under an earlier probe.
         for i in installations.iter().filter(|i| {
@@ -426,7 +442,7 @@ impl PluginRuntimeLoop {
                 )
                 .await;
         }
-        let report = self.runtime.probe_isolation().await;
+        let report = self.runtime.probe_isolation(pod_broker_url).await;
         let finished = self.clock.now().await.0;
         if report.passed() {
             tracing::info!("plugin runtime: isolation probe passed");
@@ -468,8 +484,11 @@ impl PluginRuntimeLoop {
                         .map_err(|e| e.to_string())?;
                     (status, message, None)
                 }
-                Decision::Run { probe_passed_at } => {
-                    let applied = self.runtime.ensure(installation).await;
+                Decision::Run {
+                    probe_passed_at,
+                    pod_broker_url,
+                } => {
+                    let applied = self.runtime.ensure(installation, &pod_broker_url).await;
                     let (status, message) = match applied {
                         // A failed read-back is not a failed workload: the
                         // apply landed. Record `pending` with why, and —
@@ -548,6 +567,12 @@ mod tests {
         }
     }
 
+    fn ready() -> Baseline {
+        Baseline::Ready {
+            pod_broker_url: "http://10.96.0.20:8090".into(),
+        }
+    }
+
     fn passed(at: i64) -> Isolation {
         Isolation {
             probed_at: Some(at),
@@ -623,7 +648,7 @@ mod tests {
             assert_eq!(
                 decide(
                     &installation(InstallationState::Killed),
-                    &Baseline::Ready,
+                    &ready(),
                     &isolation
                 ),
                 Decision::Stop
@@ -649,12 +674,12 @@ mod tests {
     /// tokens) the way a refusal does.
     #[test]
     fn a_transient_kubernetes_error_leaves_running_plugins_alone() {
-        let baseline = Baseline::from_result(Err(RuntimeError::Kube("503".into())));
+        let baseline = Baseline::classify(Err(RuntimeError::Kube("503".into())));
         assert!(matches!(baseline, Baseline::Unavailable(_)));
         assert_eq!(decide(&running(1), &baseline, &passed(1)), Decision::Wait);
         // Only a refusal holds.
         let refused =
-            Baseline::from_result(Err(RuntimeError::BaselineRefused("not restricted".into())));
+            Baseline::classify(Err(RuntimeError::BaselineRefused("not restricted".into())));
         assert!(matches!(
             decide(&running(1), &refused, &passed(1)),
             Decision::Hold {
@@ -662,6 +687,13 @@ mod tests {
                 ..
             }
         ));
+        // A broker name that did not resolve this pass is "could not ask"
+        // too: plugins already running keep the address they were given.
+        let unresolved = Baseline::classify(Err(RuntimeError::BrokerUnresolved(
+            "`scarab-broker`: timeout".into(),
+        )));
+        assert!(matches!(unresolved, Baseline::Unavailable(_)));
+        assert_eq!(decide(&running(1), &unresolved, &passed(1)), Decision::Wait);
     }
 
     #[test]
@@ -679,19 +711,22 @@ mod tests {
             }
         );
         assert!(matches!(
-            decide(&enabled, &Baseline::Ready, &failed(1)),
+            decide(&enabled, &ready(), &failed(1)),
             Decision::Hold {
                 status: RuntimeStatus::ProbeFailed,
                 ..
             }
         ));
         assert_eq!(
-            decide(&enabled, &Baseline::Ready, &Isolation::default()),
+            decide(&enabled, &ready(), &Isolation::default()),
             Decision::Wait
         );
         assert_eq!(
-            decide(&enabled, &Baseline::Ready, &passed(7)),
-            Decision::Run { probe_passed_at: 7 }
+            decide(&enabled, &ready(), &passed(7)),
+            Decision::Run {
+                probe_passed_at: 7,
+                pod_broker_url: "http://10.96.0.20:8090".into()
+            }
         );
     }
 

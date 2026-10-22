@@ -19,7 +19,10 @@
 //! fake broker's `scarab-broker-t-<nonce>`), deleted afterwards even when an
 //! assertion fails. The fake broker is a busybox `httpd` serving
 //! `/_scarab/plugin/v1/healthz` → `ok` in-cluster, so the tier needs no host
-//! address and no Scarab server.
+//! address and no Scarab server. Plugins have no DNS, so the runtime is
+//! configured with the fake broker Service's ClusterIP (what the runtime
+//! would resolve a name to in-cluster — the test process, on the host,
+//! cannot resolve `*.svc`).
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -47,7 +50,9 @@ use scarab_plugin_k8s::objects::{
     restricted_container_security_context, restricted_pod_security_context, DEFAULT_DENY_POLICY,
     PLUGIN_EGRESS_POLICY,
 };
-use scarab_plugin_k8s::probe::DEFAULT_PROBE_IMAGE;
+use scarab_plugin_k8s::probe::{
+    DEFAULT_PROBE_IMAGE, SELF_CHECK_CONTAINER, SELF_CHECK_DEADLINE_SECONDS,
+};
 use scarab_plugin_k8s::{
     BrokerPeer, K8sPluginRuntime, PluginRuntimeConfig, RuntimeError, TokenReviewVerifier,
     WorkloadState, LABEL_INSTALLATION,
@@ -115,6 +120,8 @@ struct Fixture {
     client: Client,
     plugins_ns: String,
     broker_ns: String,
+    /// `http://<fake-broker ClusterIP>:<port>`.
+    broker_url: String,
 }
 
 impl Fixture {
@@ -123,7 +130,7 @@ impl Fixture {
             self.client.clone(),
             PluginRuntimeConfig {
                 namespace: self.plugins_ns.clone(),
-                broker_url: format!("http://fake-broker.{}.svc:{BROKER_PORT}", self.broker_ns),
+                broker_url: self.broker_url.clone(),
                 broker_peer: Some(BrokerPeer::Pods {
                     namespace: self.broker_ns.clone(),
                     labels: BTreeMap::from([("app".to_string(), "fake-broker".to_string())]),
@@ -136,6 +143,15 @@ impl Fixture {
 
     fn pods(&self) -> Api<Pod> {
         Api::namespaced(self.client.clone(), &self.plugins_ns)
+    }
+
+    /// The baseline, applied, and the broker URL as Pods dial it — what one
+    /// reconcile pass starts with.
+    async fn ready_runtime(&self) -> (K8sPluginRuntime, String) {
+        let runtime = self.runtime();
+        runtime.ensure_baseline().await.expect("baseline");
+        let pod_broker_url = runtime.pod_broker_url().await.expect("broker URL");
+        (runtime, pod_broker_url)
     }
 }
 
@@ -180,14 +196,15 @@ where
         .create(&PostParams::default(), &namespace(&broker_ns, "baseline"))
         .await
         .expect("create the fake broker's namespace");
-    let fixture = Fixture {
-        client: client.clone(),
-        plugins_ns: plugins_ns.clone(),
-        broker_ns: broker_ns.clone(),
-    };
     let outcome = AssertUnwindSafe(async {
-        start_fake_broker(&fixture).await;
-        body(fixture).await;
+        let broker_ip = start_fake_broker(&client, &broker_ns).await;
+        body(Fixture {
+            client: client.clone(),
+            plugins_ns: plugins_ns.clone(),
+            broker_ns: broker_ns.clone(),
+            broker_url: format!("http://{broker_ip}:{BROKER_PORT}"),
+        })
+        .await;
     })
     .catch_unwind()
     .await;
@@ -202,8 +219,9 @@ where
 }
 
 /// `fake-broker`: a busybox httpd answering `GET /_scarab/plugin/v1/healthz`
-/// with `ok`, behind a ClusterIP Service on the broker port.
-async fn start_fake_broker(f: &Fixture) {
+/// with `ok`, behind a ClusterIP Service on the broker port. Returns the
+/// Service's ClusterIP.
+async fn start_fake_broker(client: &Client, broker_ns: &str) -> String {
     let labels = BTreeMap::from([("app".to_string(), "fake-broker".to_string())]);
     let script = format!(
         "mkdir -p /tmp/w/_scarab/plugin/v1 && printf ok > /tmp/w/_scarab/plugin/v1/healthz && \
@@ -227,7 +245,7 @@ async fn start_fake_broker(f: &Fixture) {
         }),
         ..Default::default()
     };
-    let pods: Api<Pod> = Api::namespaced(f.client.clone(), &f.broker_ns);
+    let pods: Api<Pod> = Api::namespaced(client.clone(), broker_ns);
     pods.create(&PostParams::default(), &pod)
         .await
         .expect("create the fake broker");
@@ -247,11 +265,16 @@ async fn start_fake_broker(f: &Fixture) {
         }),
         ..Default::default()
     };
-    Api::<Service>::namespaced(f.client.clone(), &f.broker_ns)
+    let created = Api::<Service>::namespaced(client.clone(), broker_ns)
         .create(&PostParams::default(), &service)
         .await
         .expect("create the fake broker's Service");
     wait_running(&pods, "fake-broker").await;
+    created
+        .spec
+        .and_then(|s| s.cluster_ip)
+        .filter(|ip| !ip.is_empty() && ip != "None")
+        .expect("the fake broker's Service has a ClusterIP")
 }
 
 async fn wait_running(pods: &Api<Pod>, name: &str) {
@@ -266,8 +289,9 @@ async fn wait_running(pods: &Api<Pod>, name: &str) {
 }
 
 /// The isolation probe passes on a cluster that enforces NetworkPolicy
-/// (kind ≥ 0.24's kindnet does): the plugin-labelled Pod reaches the broker
-/// and DNS, and nothing else.
+/// (kind ≥ 0.24's kindnet does): the plugin-labelled Pod reaches the broker,
+/// and nothing else — no DNS answer either — while the control Pod reaches
+/// the canary and gets one.
 #[tokio::test]
 #[ignore]
 async fn the_isolation_probe_passes_on_this_cluster() {
@@ -275,9 +299,8 @@ async fn the_isolation_probe_passes_on_this_cluster() {
         return;
     }
     with_fixture(|f| async move {
-        let runtime = f.runtime();
-        runtime.ensure_baseline().await.expect("baseline");
-        let report = runtime.probe_isolation().await;
+        let (runtime, pod_broker_url) = f.ready_runtime().await;
+        let report = runtime.probe_isolation(&pod_broker_url).await;
         assert!(report.passed(), "{}", report.message());
         let leftovers = f
             .pods()
@@ -305,16 +328,9 @@ async fn without_the_egress_policies_the_canary_is_reachable_and_the_probe_fails
         return;
     }
     with_fixture(|f| async move {
-        let runtime = f.runtime();
-        runtime.ensure_baseline().await.expect("baseline");
-        let policies: Api<NetworkPolicy> = Api::namespaced(f.client.clone(), &f.plugins_ns);
-        for name in [DEFAULT_DENY_POLICY, PLUGIN_EGRESS_POLICY] {
-            policies
-                .delete(name, &DeleteParams::default())
-                .await
-                .expect("delete a baseline policy");
-        }
-        let report = runtime.probe_isolation().await;
+        let (runtime, pod_broker_url) = f.ready_runtime().await;
+        remove_plugin_policies(&f).await;
+        let report = runtime.probe_isolation(&pod_broker_url).await;
         assert!(!report.passed(), "an open namespace must fail the probe");
         assert!(
             report.message().contains("NOT enforced"),
@@ -375,6 +391,18 @@ async fn the_baseline_refuses_a_namespace_it_cannot_vouch_for() {
     .await;
 }
 
+/// Open the namespace: delete `default-deny` and `plugin-egress`, so a
+/// plugin-labelled Pod reaches everything.
+async fn remove_plugin_policies(f: &Fixture) {
+    let policies: Api<NetworkPolicy> = Api::namespaced(f.client.clone(), &f.plugins_ns);
+    for name in [DEFAULT_DENY_POLICY, PLUGIN_EGRESS_POLICY] {
+        policies
+            .delete(name, &DeleteParams::default())
+            .await
+            .expect("delete a baseline policy");
+    }
+}
+
 fn installation(image: &str) -> PluginInstallation {
     PluginInstallation {
         id: INSTALLATION_ID.into(),
@@ -402,10 +430,12 @@ fn installation(image: &str) -> PluginInstallation {
 }
 
 /// The workload against a real API server: Pod Security `restricted` admits
-/// the Pod the Deployment makes; stop scales it to zero and deletes the
-/// ServiceAccount; uninstall removes the rest. (The image is the probe's
-/// busybox, which exits at once — admission is what is under test, not the
-/// Plugin.)
+/// the Pod the Deployment makes, isolation self-check initContainer and all;
+/// on this enforcing cluster the self-check PASSES (broker by IP reached,
+/// nothing else); stop scales it to zero and deletes the ServiceAccount;
+/// uninstall removes the rest. (The Plugin image is the probe's busybox,
+/// which exits at once — admission and the self-check are under test, not
+/// the Plugin.)
 #[tokio::test]
 #[ignore]
 async fn a_workload_is_admitted_stopped_and_uninstalled() {
@@ -413,15 +443,14 @@ async fn a_workload_is_admitted_stopped_and_uninstalled() {
         return;
     }
     with_fixture(|f| async move {
-        let runtime = f.runtime();
-        runtime.ensure_baseline().await.expect("baseline");
+        let (runtime, pod_broker_url) = f.ready_runtime().await;
         runtime
-            .ensure(&installation(&probe_image()))
+            .ensure(&installation(&probe_image()), &pod_broker_url)
             .await
             .expect("ensure");
         // Applying twice changes nothing.
         runtime
-            .ensure(&installation(&probe_image()))
+            .ensure(&installation(&probe_image()), &pod_broker_url)
             .await
             .expect("ensure again");
         let selector = format!("{LABEL_INSTALLATION}={INSTALLATION_ID}");
@@ -446,6 +475,13 @@ async fn a_workload_is_admitted_stopped_and_uninstalled() {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
         let pod = admitted.expect("the Deployment made a Pod within 60s");
+        let pod_name = pod.metadata.name.clone().unwrap();
+        let self_check_exit = wait_self_check_exit(&f.pods(), &pod_name).await;
+        assert_eq!(
+            self_check_exit,
+            Some(0),
+            "on an enforcing cluster the isolation self-check passes"
+        );
         let spec = pod.spec.unwrap();
         assert_eq!(spec.automount_service_account_token, Some(false));
         assert_eq!(
@@ -483,6 +519,85 @@ async fn a_workload_is_admitted_stopped_and_uninstalled() {
             .uninstall(INSTALLATION_ID)
             .await
             .expect("uninstall is idempotent");
+    })
+    .await;
+}
+
+/// The first exit code of `pod_name`'s isolation self-check, waiting up to
+/// its deadline plus slack; `None` if it never finished.
+async fn wait_self_check_exit(pods: &Api<Pod>, pod_name: &str) -> Option<i32> {
+    let wait = SELF_CHECK_DEADLINE_SECONDS + 60;
+    for _ in 0..wait {
+        let pod = pods.get(pod_name).await.expect("read the plugin Pod");
+        let statuses = pod
+            .status
+            .and_then(|s| s.init_container_statuses)
+            .unwrap_or_default();
+        for st in statuses
+            .into_iter()
+            .filter(|s| s.name == SELF_CHECK_CONTAINER)
+        {
+            let terminated = st
+                .state
+                .and_then(|s| s.terminated)
+                .or_else(|| st.last_state.and_then(|s| s.terminated));
+            if let Some(t) = terminated {
+                return Some(t.exit_code);
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    None
+}
+
+/// The self-check is what proves the Plugin's OWN Pod: in a namespace whose
+/// policies are gone, it must keep the Plugin from starting — and the
+/// runtime must say why — rather than run it unprotected.
+#[tokio::test]
+#[ignore]
+async fn in_an_open_namespace_the_self_check_keeps_the_plugin_from_starting() {
+    if !opted_in() {
+        return;
+    }
+    with_fixture(|f| async move {
+        let (runtime, pod_broker_url) = f.ready_runtime().await;
+        remove_plugin_policies(&f).await;
+        runtime
+            .ensure(&installation(&probe_image()), &pod_broker_url)
+            .await
+            .expect("ensure");
+        let selector = format!("{LABEL_INSTALLATION}={INSTALLATION_ID}");
+        let mut state = WorkloadState::Absent;
+        // The check retries until its deadline, then the kubelet backs off.
+        for _ in 0..(SELF_CHECK_DEADLINE_SECONDS + 120) {
+            state = runtime.workload_state(INSTALLATION_ID).await.unwrap();
+            if matches!(&state, WorkloadState::Failing(why) if why.contains("self-check")) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        let WorkloadState::Failing(why) = &state else {
+            panic!("the self-check never failed the workload in an open namespace: {state:?}");
+        };
+        assert!(why.contains("isolation self-check"), "{why}");
+        // The Plugin's own container never ran.
+        let pods = f
+            .pods()
+            .list(&ListParams::default().labels(&selector))
+            .await
+            .unwrap();
+        for pod in pods.items {
+            let started = pod
+                .status
+                .and_then(|s| s.container_statuses)
+                .unwrap_or_default()
+                .iter()
+                .any(|c| c.state.as_ref().is_some_and(|s| s.waiting.is_none()));
+            assert!(
+                !started,
+                "the Plugin container started past a failing self-check"
+            );
+        }
     })
     .await;
 }

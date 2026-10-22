@@ -6,9 +6,10 @@
 //! - [`K8sPluginRuntime`] keeps the one shared plugin namespace's **baseline**
 //!   — it refuses to run anything unless the namespace enforces the
 //!   `restricted` Pod Security level, and server-side-applies a default-deny
-//!   NetworkPolicy plus the one egress allowance a Plugin gets (DNS and the
-//!   CredentialBroker) — and runs one ServiceAccount + Deployment per
-//!   PluginInstallation.
+//!   NetworkPolicy plus the one egress allowance a Plugin gets (the
+//!   CredentialBroker, by IP — no DNS) — and runs one ServiceAccount +
+//!   Deployment per PluginInstallation, each Pod gated by an isolation
+//!   self-check initContainer.
 //! - The **isolation probe** ([`K8sPluginRuntime::probe_isolation`]) checks
 //!   that the cluster actually enforces that policy before any Plugin starts:
 //!   a cluster whose CNI ignores NetworkPolicy fails it, and the Plugin does
@@ -151,6 +152,98 @@ impl BrokerPeer {
     }
 }
 
+/// `SCARAB_PLUGIN_BROKER_URL`, taken apart: what a Plugin Pod dials to reach
+/// the broker. A Plugin has no DNS (its egress allows the broker and nothing
+/// else), so a URL naming a HOST is resolved by the runtime — which can — and
+/// handed to Pods by IP ([`BrokerUrl::with_ip`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrokerUrl {
+    scheme: String,
+    host: String,
+    port: u16,
+    /// `""` or `/…`, with no trailing `/`.
+    path: String,
+}
+
+impl BrokerUrl {
+    /// `http(s)://<host>[:<port>][/<path>]`, no credentials, no query.
+    pub fn parse(url: &str) -> Result<Self, String> {
+        let (scheme, rest) = url
+            .split_once("://")
+            .ok_or_else(|| format!("`{url}`: want `http://<host>:<port>`"))?;
+        let default_port = match scheme {
+            "http" => 80,
+            "https" => 443,
+            _ => return Err(format!("`{url}`: the scheme must be http or https")),
+        };
+        if rest.contains(['@', '?', '#']) {
+            return Err(format!(
+                "`{url}`: no credentials, query or fragment in a broker URL"
+            ));
+        }
+        let (authority, path) = match rest.find('/') {
+            Some(at) => rest.split_at(at),
+            None => (rest, ""),
+        };
+        let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+            let (host, after) = bracketed
+                .split_once(']')
+                .ok_or_else(|| format!("`{url}`: unclosed `[`"))?;
+            if host.parse::<std::net::Ipv6Addr>().is_err() {
+                return Err(format!("`{url}`: `[{host}]` is not an IPv6 address"));
+            }
+            (host, after.strip_prefix(':'))
+        } else {
+            match authority.rsplit_once(':') {
+                Some((host, port)) => (host, Some(port)),
+                None => (authority, None),
+            }
+        };
+        if host.is_empty() {
+            return Err(format!("`{url}`: no host"));
+        }
+        let port = match port {
+            None => default_port,
+            Some(p) => p
+                .parse::<u16>()
+                .ok()
+                .filter(|p| *p != 0)
+                .ok_or_else(|| format!("`{url}`: `{p}` is not a port"))?,
+        };
+        Ok(BrokerUrl {
+            scheme: scheme.to_string(),
+            host: host.to_string(),
+            port,
+            path: path.trim_end_matches('/').to_string(),
+        })
+    }
+
+    /// The host, as written (a name or an IP literal, unbracketed).
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// The host when it is already an IP: then there is nothing to resolve.
+    pub fn ip(&self) -> Option<IpAddr> {
+        self.host.parse().ok()
+    }
+
+    /// The same URL with the host replaced by `ip`. (An `https` URL by IP
+    /// cannot verify a certificate issued to a name — the broker hop is
+    /// plain HTTP inside the cluster today; revisit if it ever is not.)
+    pub fn with_ip(&self, ip: IpAddr) -> String {
+        let host = match ip {
+            IpAddr::V4(v4) => v4.to_string(),
+            IpAddr::V6(v6) => format!("[{v6}]"),
+        };
+        format!("{}://{host}:{}{}", self.scheme, self.port, self.path)
+    }
+}
+
 /// Characters a label key or value may hold (the key may carry a
 /// `prefix/`). Shape only; the API server has the last word.
 fn is_label_text(s: &str) -> bool {
@@ -186,6 +279,53 @@ mod tests {
             Ok(BrokerPeer::Cidr("192.168.5.2/32".into()))
         );
         assert!(BrokerPeer::parse("cidr:fd00::1/128").is_ok());
+    }
+
+    #[test]
+    fn a_broker_url_by_name_is_rewritten_to_the_ip_a_pod_dials() {
+        let url = BrokerUrl::parse("http://scarab-broker.scarab.svc:8090/").unwrap();
+        assert_eq!(url.host(), "scarab-broker.scarab.svc");
+        assert_eq!(url.port(), 8090);
+        assert_eq!(url.ip(), None);
+        assert_eq!(
+            url.with_ip("10.96.0.20".parse().unwrap()),
+            "http://10.96.0.20:8090"
+        );
+        assert_eq!(
+            url.with_ip("fd00::20".parse().unwrap()),
+            "http://[fd00::20]:8090"
+        );
+        // Already an IP: nothing to resolve.
+        let by_ip = BrokerUrl::parse("http://192.168.5.2:8090").unwrap();
+        assert_eq!(by_ip.ip(), Some("192.168.5.2".parse().unwrap()));
+        assert_eq!(
+            BrokerUrl::parse("http://[fd00::1]:8090").unwrap().ip(),
+            Some("fd00::1".parse().unwrap())
+        );
+        // Default port, and a path kept.
+        assert_eq!(
+            BrokerUrl::parse("http://broker/base/")
+                .unwrap()
+                .with_ip("10.0.0.1".parse().unwrap()),
+            "http://10.0.0.1:80/base"
+        );
+    }
+
+    #[test]
+    fn a_broker_url_that_is_not_one_is_refused() {
+        for bad in [
+            "scarab-broker:8090",
+            "ftp://broker:8090",
+            "http://:8090",
+            "http://broker:0",
+            "http://broker:http",
+            "http://user:pw@broker:8090",
+            "http://broker:8090/?x=1",
+            "http://[fd00::1:8090",
+            "http://[not-v6]:8090",
+        ] {
+            assert!(BrokerUrl::parse(bad).is_err(), "{bad} must be refused");
+        }
     }
 
     #[test]
