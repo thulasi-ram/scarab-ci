@@ -8,7 +8,9 @@
 
 use async_trait::async_trait;
 
-use crate::{InstallationState, PluginInstallation, ReportIngest, ReportItemOutcome};
+use crate::{
+    InstallationState, PluginInstallation, ReportIngest, ReportItemOutcome, RuntimeStatus,
+};
 
 /// How long a report receipt (idempotency key → outcome) is kept. A repeat
 /// older than this is no longer recognised as a duplicate, but its sequence
@@ -207,7 +209,15 @@ pub trait PluginStore: Send + Sync {
     /// Every installation in `org`, by name.
     async fn installations(&self, org: &str) -> Result<Vec<PluginInstallation>, PluginStoreError>;
 
+    /// Every installation in every Org, by id — what the plugin runtime
+    /// reconciles workloads against. Only the runtime reads it: an id absent
+    /// here is an uninstalled installation whose workload must go.
+    async fn all_installations(&self) -> Result<Vec<PluginInstallation>, PluginStoreError>;
+
     /// Kill or re-enable. Killing records who and when; enabling clears it.
+    /// Re-enabling a killed installation also resets its runtime record to
+    /// `pending` with no `probe_passed_at`, so the runtime probes isolation
+    /// again before it starts the workload (ADR-0072 §9: "at every start").
     /// `None` if there is no such installation.
     async fn set_installation_state(
         &self,
@@ -217,6 +227,21 @@ pub trait PluginStore: Send + Sync {
         by: &str,
         at: i64,
     ) -> Result<Option<PluginInstallation>, PluginStoreError>;
+
+    /// Record what the plugin runtime observed of installation `id`'s
+    /// workload — written **only if the installation is still in
+    /// `decided_in`**, the state the runtime read before acting. A kill or
+    /// enable that lands while the runtime was probing or applying is then
+    /// never overwritten by a status decided for the old state; the next pass
+    /// decides again. Returns whether a row was written.
+    async fn set_runtime_status(
+        &self,
+        id: &str,
+        decided_in: InstallationState,
+        status: RuntimeStatus,
+        message: &str,
+        probe_passed_at: Option<i64>,
+    ) -> Result<bool, PluginStoreError>;
 
     /// Uninstall: remove the installation, its cursors, receipts and unmapped
     /// counts, **and every EnvironmentDeploymentSource naming it**, and retire
