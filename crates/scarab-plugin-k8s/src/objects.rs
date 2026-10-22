@@ -416,10 +416,12 @@ pub fn deployment(
                                 ("cpu".to_string(), quantity("50m")),
                                 ("memory".to_string(), quantity("64Mi")),
                             ])),
-                            limits: Some(BTreeMap::from([(
-                                "memory".to_string(),
-                                quantity("256Mi"),
-                            )])),
+                            // CPU too: a spinning Plugin gets half a core,
+                            // never the node.
+                            limits: Some(BTreeMap::from([
+                                ("cpu".to_string(), quantity(PLUGIN_CPU_LIMIT)),
+                                ("memory".to_string(), quantity("256Mi")),
+                            ])),
                             ..Default::default()
                         }),
                         volume_mounts: Some(vec![
@@ -587,6 +589,31 @@ mod tests {
         let caps = csc.capabilities.as_ref().unwrap();
         assert_eq!(caps.drop.as_deref(), Some(&["ALL".to_string()][..]));
         assert_eq!(caps.add, None);
+    }
+
+    /// Every container of a Plugin Pod is bounded in CPU and memory — the
+    /// Plugin and its self-check alike.
+    #[test]
+    fn every_container_of_a_plugin_pod_has_a_cpu_and_memory_limit() {
+        let d = deployment("scarab-plugins", &installation(), BROKER_URL, PROBE_IMAGE);
+        let pod = pod_spec(&d);
+        let containers = pod
+            .containers
+            .iter()
+            .chain(pod.init_containers.iter().flatten());
+        let mut seen = 0;
+        for c in containers {
+            let limits = c.resources.as_ref().unwrap().limits.as_ref().unwrap();
+            assert_eq!(
+                limits["cpu"],
+                Quantity(PLUGIN_CPU_LIMIT.to_string()),
+                "{}",
+                c.name
+            );
+            assert!(limits.contains_key("memory"), "{}", c.name);
+            seen += 1;
+        }
+        assert_eq!(seen, 2);
     }
 
     #[test]
