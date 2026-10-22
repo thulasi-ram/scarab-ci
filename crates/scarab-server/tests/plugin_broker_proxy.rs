@@ -28,10 +28,11 @@ use tower::ServiceExt;
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_plugin::{
-    BrokerJournalEntry, PluginStore, PluginTokenVerifier, TokenRejected, VerifiedServiceAccount,
+    BrokerJournalEntry, BrokerJournalPhase, PluginStore, PluginTokenVerifier, TokenRejected,
+    VerifiedServiceAccount,
 };
 use scarab_secrets::{SecretProvider, SecretScope};
-use scarab_server::broker_proxy::KILL_RECHECK_INTERVAL;
+use scarab_server::broker_proxy::{KILL_RECHECK_INTERVAL, PROXY_CONCURRENCY_PER_INSTALLATION};
 use scarab_server::plugins::{PluginPolicy, PLUGIN_CONNECTION_CREDENTIALS_ORG};
 use scarab_server::{broker, router, AppState, LogService};
 use scarab_testkit::{FakeClock, FakeSecrets, InMemoryDb, InMemoryObjectStore};
@@ -163,6 +164,11 @@ struct Harness {
 }
 
 async fn harness() -> Option<Harness> {
+    harness_with(|st| st).await
+}
+
+/// [`harness`], with the state adjusted before the routers are built.
+async fn harness_with(adjust: impl FnOnce(AppState) -> AppState) -> Option<Harness> {
     let Some(tdb) = fresh_db().await else {
         eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
         return None;
@@ -189,6 +195,7 @@ async fn harness() -> Option<Harness> {
         )
         .with_plugin_tokens(Arc::new(FakeTokenReview))
         .with_secrets(secrets.clone());
+    let st = adjust(st);
     Some(Harness {
         tdb,
         pg,
@@ -281,19 +288,70 @@ fn plugin_get(token: &str, path: &str) -> Request<Body> {
 
 /// The journal is written off the request path: wait for `n` entries.
 async fn journal(pg: &PostgresDb, installation_id: &str, n: usize) -> Vec<BrokerJournalEntry> {
+    journal_until(pg, installation_id, |e| e.len() >= n).await
+}
+
+/// Wait until the installation's journal (newest first) satisfies `done`.
+async fn journal_until(
+    pg: &PostgresDb,
+    installation_id: &str,
+    done: impl Fn(&[BrokerJournalEntry]) -> bool,
+) -> Vec<BrokerJournalEntry> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let entries = pg.broker_journal(installation_id, 100).await.unwrap();
-        if entries.len() >= n {
+        let entries = pg.broker_journal(installation_id, 200).await.unwrap();
+        if done(&entries) {
             return entries;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "{n} journal entries never appeared (have {})",
-            entries.len()
+            "the journal never got there: {entries:#?}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// The `phase` row of each request, newest first.
+fn rows(entries: &[BrokerJournalEntry], phase: BrokerJournalPhase) -> Vec<&BrokerJournalEntry> {
+    entries.iter().filter(|e| e.phase == phase).collect()
+}
+
+/// Read a response body until it ends; `true` if it ended in an error.
+/// Panics if it is still open at `deadline`.
+async fn ends_in_error(
+    body: &mut (impl futures::Stream<Item = Result<axum::body::Bytes, axum::Error>> + Unpin),
+    deadline: tokio::time::Instant,
+) -> bool {
+    loop {
+        match tokio::time::timeout_at(deadline, body.next()).await {
+            Err(_) => panic!("the stream was still open at the deadline"),
+            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Err(_))) => return true,
+            Ok(None) => return false,
+        }
+    }
+}
+
+/// Open the watch stream and read its first chunk.
+async fn open_stream(
+    h: &Harness,
+    token: &str,
+) -> impl futures::Stream<Item = Result<axum::body::Bytes, axum::Error>> + Unpin {
+    let resp = h
+        .broker
+        .clone()
+        .oneshot(plugin_get(token, "/api/v1/stream/applications"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mut body = resp.into_body().into_data_stream();
+    let first = tokio::time::timeout(Duration::from_secs(5), body.next())
+        .await
+        .expect("the stream delivers")
+        .expect("a chunk")
+        .expect("not an error");
+    assert!(first.starts_with(b"{\"type\""));
+    body
 }
 
 fn plugin_scope() -> SecretScope {
@@ -317,10 +375,19 @@ async fn the_bound_credential_is_injected_and_the_plugins_own_token_never_leaves
 
     let req = Request::builder()
         .method("GET")
-        .uri("/_scarab/plugin/v1/connections/argocd/api/v1/applications?projects=prod&fields=items")
+        .uri(
+            "/_scarab/plugin/v1/connections/argocd/api/v1/applications\
+             ?projects=prod&selector=team%3Dweb+tier%3Dfront",
+        )
         .header("authorization", format!("Bearer {token}"))
         .header("cookie", "argocd.token=from-the-plugin")
         .header("x-forwarded-host", "evil.example")
+        // Headers an upstream may honour to change the method, the path or
+        // the identity a read runs as: none may arrive.
+        .header("x-http-method-override", "DELETE")
+        .header("x-original-url", "/api/v1/session")
+        .header("grpc-metadata-token", "another-identity")
+        .header("impersonate-user", "admin")
         .header("accept", "application/json")
         .body(Body::empty())
         .unwrap();
@@ -335,9 +402,10 @@ async fn the_bound_credential_is_injected_and_the_plugins_own_token_never_leaves
     let seen = up.seen();
     assert_eq!(seen.len(), 1);
     let s = &seen[0];
+    // The query, re-encoded canonically.
     assert_eq!(
         s.path_and_query,
-        "/api/v1/applications?projects=prod&fields=items"
+        "/api/v1/applications?projects=prod&selector=team%3Dweb%20tier%3Dfront"
     );
     assert_eq!(
         s.headers.get("authorization").unwrap(),
@@ -353,15 +421,97 @@ async fn the_bound_credential_is_injected_and_the_plugins_own_token_never_leaves
             "the plugin's ServiceAccount token reached the upstream in `{name}`"
         );
     }
-    assert!(s.headers.get("cookie").is_none());
-    assert!(s.headers.get("x-forwarded-host").is_none());
+    let names: Vec<&str> = s.headers.keys().map(|n| n.as_str()).collect();
+    for name in [
+        "cookie",
+        "x-forwarded-host",
+        "x-http-method-override",
+        "x-original-url",
+        "grpc-metadata-token",
+        "impersonate-user",
+    ] {
+        assert!(!names.contains(&name), "`{name}` reached the upstream");
+    }
 
-    let entries = journal(&h.pg, &id, 1).await;
-    assert_eq!(entries[0].status, Some(200));
-    assert_eq!(entries[0].rule.as_deref(), Some("GET /api/v1/applications"));
-    assert_eq!(entries[0].path, "/api/v1/applications");
-    assert_eq!(entries[0].denied_reason, None);
-    assert_eq!(entries[0].bytes, Some(body.len() as u64));
+    // Two rows: the head when the response started, the end when it ended.
+    let entries = journal(&h.pg, &id, 2).await;
+    let (head, end) = (
+        rows(&entries, BrokerJournalPhase::Head),
+        rows(&entries, BrokerJournalPhase::End),
+    );
+    assert_eq!((head.len(), end.len()), (1, 1), "{entries:#?}");
+    assert_eq!(head[0].request_id, end[0].request_id);
+    for row in [head[0], end[0]] {
+        assert_eq!(row.status, Some(200));
+        assert_eq!(row.rule.as_deref(), Some("GET /api/v1/applications"));
+        assert_eq!(row.path, "/api/v1/applications");
+        assert_eq!(row.upstream_path.as_deref(), Some("/api/v1/applications"));
+        assert_eq!(
+            row.query.as_deref(),
+            Some("projects=prod&selector=team%3Dweb%20tier%3Dfront"),
+            "the journal holds the query that was forwarded"
+        );
+        assert_eq!(row.denied_reason, None);
+    }
+    assert_eq!(head[0].bytes, None);
+    assert_eq!(end[0].bytes, Some(body.len() as u64));
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn a_query_key_the_rule_does_not_list_is_refused_journaled_and_never_sent() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    let (up, base) = spawn_upstream().await;
+    let (id, token) = install(&h).await;
+    bind(&h, &base).await;
+
+    let refused = [
+        // Argo CD's hard refresh: a side effect behind a read path.
+        "/api/v1/applications/web?refresh=hard",
+        "/api/v1/applications/web?project=prod&refresh=normal",
+        "/api/v1/applications/web?%72efresh=hard",
+        // A rule without a query list allows no query.
+        "/api/version?x=1",
+        // Twice would be read either way.
+        "/api/v1/applications/web?project=a&project=b",
+    ];
+    for path in refused {
+        let (status, _, body) = send(&h.broker, plugin_get(&token, path)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
+    }
+    assert!(
+        up.seen().is_empty(),
+        "a refused request reached the upstream"
+    );
+    // What the rule lists goes through.
+    let (status, _, _) = send(
+        &h.broker,
+        plugin_get(
+            &token,
+            "/api/v1/applications/web?appNamespace=argo&project=prod",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        up.seen()[0].path_and_query,
+        "/api/v1/applications/web?appNamespace=argo&project=prod"
+    );
+
+    let entries = journal_until(&h.pg, &id, |e| {
+        rows(e, BrokerJournalPhase::Refused).len() == refused.len()
+    })
+    .await;
+    let refusals = rows(&entries, BrokerJournalPhase::Refused);
+    assert!(refusals
+        .iter()
+        .all(|e| e.status == Some(403) && e.denied_reason.as_deref() == Some("query")));
+    // The refused query is on record as sent.
+    assert!(refusals
+        .iter()
+        .any(|e| e.query.as_deref() == Some("refresh=hard")));
     h.finish().await;
 }
 
@@ -515,10 +665,9 @@ async fn a_redirect_is_handed_back_never_followed() {
     )
     .await;
     assert_eq!(status, StatusCode::FOUND);
-    assert_eq!(
-        headers.get("location").unwrap(),
-        "/api/v1/applications/landing"
-    );
+    // Handed back, not followed — and without its `Location`, which can
+    // name the bound upstream (response headers are allowlisted).
+    assert!(headers.get("location").is_none());
     let paths: Vec<String> = up.seen().into_iter().map(|s| s.path_and_query).collect();
     assert_eq!(paths, vec!["/api/v1/applications/redirector"]);
     h.finish().await;
@@ -533,38 +682,16 @@ async fn an_open_stream_is_cut_within_the_recheck_interval_of_a_kill() {
     let (id, token) = install(&h).await;
     bind(&h, &base).await;
 
-    let resp = h
-        .broker
-        .clone()
-        .oneshot(plugin_get(&token, "/api/v1/stream/applications"))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let mut body = resp.into_body().into_data_stream();
-    let first = tokio::time::timeout(Duration::from_secs(5), body.next())
-        .await
-        .expect("the stream delivers")
-        .expect("a chunk")
-        .expect("not an error");
-    assert!(first.starts_with(b"{\"type\""));
+    let mut body = open_stream(&h, &token).await;
+    // The stream is on record from its start, not only when it ends.
+    let entries = journal(&h.pg, &id, 1).await;
+    assert_eq!(entries[0].phase, BrokerJournalPhase::Head);
 
     let (status, _) = admin(&h.public, "POST", "/v1/orgs/acme/plugins/argo/kill", None).await;
     assert_eq!(status, StatusCode::OK);
-    let killed_at = tokio::time::Instant::now();
-    let deadline = killed_at + KILL_RECHECK_INTERVAL + Duration::from_secs(3);
-    let ended_with_error = loop {
-        match tokio::time::timeout_at(deadline, body.next()).await {
-            Err(_) => panic!(
-                "the stream was still open {:?} after the kill",
-                deadline - killed_at
-            ),
-            Ok(Some(Ok(_))) => continue,
-            Ok(Some(Err(_))) => break true,
-            Ok(None) => break false,
-        }
-    };
+    let deadline = tokio::time::Instant::now() + KILL_RECHECK_INTERVAL + Duration::from_secs(3);
     assert!(
-        ended_with_error,
+        ends_in_error(&mut body, deadline).await,
         "a cut stream must end in an error, not a clean end"
     );
 
@@ -577,21 +704,182 @@ async fn an_open_stream_is_cut_within_the_recheck_interval_of_a_kill() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let entries = journal(&h.pg, &id, 1).await;
-    assert_eq!(entries[0].status, Some(200));
+    let entries = journal_until(&h.pg, &id, |e| !rows(e, BrokerJournalPhase::End).is_empty()).await;
+    let end = rows(&entries, BrokerJournalPhase::End)[0];
+    assert_eq!(end.status, Some(200));
     assert!(
-        entries[0]
-            .denied_reason
+        end.denied_reason
             .as_deref()
-            .is_some_and(|r| r.starts_with("cut:")),
-        "{:?}",
-        entries[0]
+            .is_some_and(|r| r.starts_with("cut: the installation")),
+        "{end:?}"
     );
-    assert!(entries[0].bytes.unwrap_or(0) > 0);
+    assert!(end.bytes.unwrap_or(0) > 0);
 
     // And the next request is refused at the door.
     let (status, _, _) = send(&h.broker, plugin_get(&token, "/api/version")).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+    h.finish().await;
+}
+
+/// The plugin stops reading, its buffer fills, the kill cuts the stream
+/// while the broker cannot hand it even the error — and when it reads
+/// again, what it buffered still ends in an error, never a clean end.
+#[tokio::test]
+async fn a_cut_stream_ends_in_an_error_even_for_a_plugin_that_stopped_reading() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    let (up, base) = spawn_upstream().await;
+    let (_, token) = install(&h).await;
+    bind(&h, &base).await;
+
+    let mut body = open_stream(&h, &token).await;
+    let (status, _) = admin(&h.public, "POST", "/v1/orgs/acme/plugins/argo/kill", None).await;
+    assert_eq!(status, StatusCode::OK);
+    // Not reading: the upstream ticks every 100 ms, so the buffer is full
+    // long before the re-check cuts, and the cut's error finds no room.
+    let deadline = tokio::time::Instant::now() + KILL_RECHECK_INTERVAL + Duration::from_secs(3);
+    while !up.stream_dropped.load(Ordering::SeqCst) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the stream was not cut while the plugin was not reading"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        ends_in_error(
+            &mut body,
+            tokio::time::Instant::now() + Duration::from_secs(5)
+        )
+        .await,
+        "a plugin that drains its buffer after a cut must still see an error"
+    );
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn a_rebind_or_an_unbind_cuts_an_open_stream() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    let (_, base) = spawn_upstream().await;
+    let (id, token) = install(&h).await;
+    bind(&h, &base).await;
+
+    let mut body = open_stream(&h, &token).await;
+    assert_eq!(bind(&h, &base).await.0, StatusCode::OK);
+    let deadline = tokio::time::Instant::now() + KILL_RECHECK_INTERVAL + Duration::from_secs(3);
+    assert!(ends_in_error(&mut body, deadline).await, "re-bind");
+
+    // On the new binding, a stream runs — until the slot is unbound.
+    let mut body = open_stream(&h, &token).await;
+    let (status, _) = admin(
+        &h.public,
+        "DELETE",
+        "/v1/orgs/acme/plugins/argo/connections/argocd",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let deadline = tokio::time::Instant::now() + KILL_RECHECK_INTERVAL + Duration::from_secs(3);
+    assert!(ends_in_error(&mut body, deadline).await, "unbind");
+
+    let entries = journal_until(&h.pg, &id, |e| rows(e, BrokerJournalPhase::End).len() == 2).await;
+    for end in rows(&entries, BrokerJournalPhase::End) {
+        assert_eq!(
+            end.denied_reason.as_deref(),
+            Some("cut: the connection was re-bound or unbound"),
+            "{end:?}"
+        );
+    }
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn requests_past_the_installation_s_limit_are_429_before_any_read() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    let (up, base) = spawn_upstream().await;
+    let (id, token) = install(&h).await;
+    bind(&h, &base).await;
+
+    let mut open = Vec::new();
+    for _ in 0..PROXY_CONCURRENCY_PER_INSTALLATION {
+        open.push(open_stream(&h, &token).await);
+    }
+    let (status, headers, _) = send(&h.broker, plugin_get(&token, "/api/version")).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(headers.get("retry-after").unwrap(), "1");
+    assert_eq!(up.seen().len(), PROXY_CONCURRENCY_PER_INSTALLATION);
+    let entries = journal_until(&h.pg, &id, |e| {
+        !rows(e, BrokerJournalPhase::Refused).is_empty()
+    })
+    .await;
+    let refused = rows(&entries, BrokerJournalPhase::Refused);
+    assert_eq!(refused[0].status, Some(429));
+    assert_eq!(refused[0].denied_reason.as_deref(), Some("concurrency"));
+    assert_eq!(refused[0].path, "/api/version");
+
+    // A permit comes back when its stream ends.
+    drop(open.pop());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let (status, _, _) = send(&h.broker, plugin_get(&token, "/api/version")).await;
+        if status == StatusCode::OK {
+            break;
+        }
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the permit never came back"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    drop(open);
+    h.finish().await;
+}
+
+/// With the journal writer stuck (its table locked) the queue fills, and
+/// the broker refuses to forward rather than forward what it cannot journal
+/// — and every request it did forward is on record once the writer moves.
+#[tokio::test]
+async fn a_full_journal_refuses_to_forward_and_nothing_forwarded_goes_unjournaled() {
+    let Some(h) = harness_with(|st| st.with_broker_journal_queue(4)).await else {
+        return;
+    };
+    let (up, base) = spawn_upstream().await;
+    let (id, token) = install(&h).await;
+    bind(&h, &base).await;
+
+    let mut lock = h.tdb.pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE plugin_broker_journal IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    let mut forwarded = 0;
+    let mut refused = false;
+    for _ in 0..32 {
+        let before = up.seen().len();
+        let (status, headers, _) = send(&h.broker, plugin_get(&token, "/api/version")).await;
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            assert!(headers.get("retry-after").is_some());
+            assert_eq!(up.seen().len(), before, "a 503 reached the upstream");
+            refused = true;
+            break;
+        }
+        assert_eq!(status, StatusCode::OK);
+        forwarded += 1;
+    }
+    assert!(refused, "the journal queue never filled");
+    assert_eq!(up.seen().len(), forwarded);
+    lock.rollback().await.unwrap();
+
+    let entries = journal_until(&h.pg, &id, |e| {
+        rows(e, BrokerJournalPhase::Head).len() == forwarded
+    })
+    .await;
+    assert_eq!(rows(&entries, BrokerJournalPhase::Head).len(), forwarded);
     h.finish().await;
 }
 
