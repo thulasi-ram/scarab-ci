@@ -2830,6 +2830,7 @@ dependencies = [
  "futures",
  "k8s-openapi",
  "kube",
+ "rustls",
  "scarab-plugin",
  "serde_json",
  "sha2",

@@ -37,6 +37,14 @@ pub use token_review::{TokenReviewVerifier, VERDICT_CACHE_TTL};
 /// A client for the cluster this process is configured for: in-cluster
 /// config in a Pod, `KUBECONFIG` (the isolated kind kubeconfig) in proc mode.
 /// The composition root holds it without naming kube's types.
+///
+/// The client speaks rustls, and the binaries that link this crate link more
+/// than one rustls CryptoProvider, so none is auto-selected: the caller must
+/// have installed one before the first request. The only non-test caller,
+/// `scarab-server`'s `main`, installs `ring` before anything else runs
+/// (`main.rs`, ahead of `Cli::parse`); the live tier does the same in
+/// `tests/cluster.rs`. A new caller must too, or its first TLS handshake
+/// panics.
 pub async fn default_client() -> Result<kube::Client, String> {
     kube::Client::try_default().await.map_err(|e| e.to_string())
 }
