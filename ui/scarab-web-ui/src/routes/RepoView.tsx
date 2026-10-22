@@ -17,10 +17,20 @@ import {
   repoForgeUrl,
   listEnvironments,
   listApprovalHistory,
-  putEnvironment,
+  putEnvironmentOverlay,
+  deleteEnvironmentOverlay,
   type RunSummary,
-  type RepoEnvironment,
+  type ProjectEnvironment,
 } from "../api/client";
+import {
+  concurrencyLabel,
+  isPermissive,
+  overlayToForm,
+  refLayersLabel,
+  rulesSummary,
+  tightenable,
+  toOverlayBody,
+} from "../environment-overlays";
 import { relTime, absTime, duration } from "../fmt";
 import { forgeCommitUrl, forgePrUrl } from "../forge";
 import TriggerCell from "../components/TriggerCell";
@@ -149,7 +159,9 @@ export default function RepoView() {
   const setPipelineFilter = filterSetter("pipeline");
   const envFilter = () => one(search.env);
   const setEnvFilter = filterSetter("env");
-  const [showEnvDialog, setShowEnvDialog] = createSignal(false);
+  /** `undefined` = closed; `""` = open with no Environment picked; a name =
+   *  open on that Environment (its overlay prefilled). */
+  const [envDialog, setEnvDialog] = createSignal<string | undefined>(undefined);
   const [envEpoch, setEnvEpoch] = createSignal(0); // bump to refetch the env list after a create
   const [secretFocus, setSecretFocus] = createSignal(0);
   // The two secret panels read the same store through separate fetches; each
@@ -218,7 +230,11 @@ export default function RepoView() {
           onClick: () => nav(`/${org()}/${repo()}/run`),
         };
       case "environments":
-        return { label: "New environment", icon: "plus", onClick: () => setShowEnvDialog(true) };
+        return {
+          label: "Tighten for this project",
+          icon: "shield-check",
+          onClick: () => setEnvDialog(""),
+        };
       case "secrets":
         return { label: "New secret", icon: "plus", onClick: () => setSecretFocus((n) => n + 1) };
       default:
@@ -492,7 +508,13 @@ export default function RepoView() {
 
       {/* ---- Environments ---- */}
       <Show when={tab() === "environments"}>
-        <RepoEnvironments org={org()} repo={repo()} epoch={envEpoch()} />
+        <RepoEnvironments
+          org={org()}
+          repo={repo()}
+          epoch={envEpoch()}
+          onTighten={(name) => setEnvDialog(name)}
+          onChanged={() => setEnvEpoch((n) => n + 1)}
+        />
       </Show>
 
       {/* ---- Secrets ---- */}
@@ -525,31 +547,60 @@ export default function RepoView() {
         </div>
       </Show>
 
-      <Show when={showEnvDialog()}>
+      <Show when={envDialog() !== undefined}>
         <EnvDialog
           org={org()}
           repo={repo()}
-          onClose={() => setShowEnvDialog(false)}
-          onCreated={() => setEnvEpoch((n) => n + 1)}
+          initial={envDialog() || undefined}
+          onClose={() => setEnvDialog(undefined)}
+          onSaved={() => setEnvEpoch((n) => n + 1)}
         />
       </Show>
     </section>
   );
 }
 
-// ---- environments (real API: `GET …/environments` + per-env deployments) --
 
-function RepoEnvironments(props: { org: string; repo: string; epoch: number }) {
-  // `epoch` is in the key so a create in EnvDialog re-fetches the list.
+// ---- environments (ADR-0071: org Environments as this project sees them) --
+// Each panel shows the org's BASELINE, this project's OVERLAY and the
+// EFFECTIVE rules — the last computed by the server, never merged here. The
+// project can only tighten (its overlay); the baseline, who may deploy and
+// any privileges are an org admin's, under Settings › Environments.
+
+function RepoEnvironments(props: {
+  org: string;
+  repo: string;
+  epoch: number;
+  onTighten: (env: string) => void;
+  onChanged: () => void;
+}) {
+  // `epoch` is in the key so a save in EnvDialog re-fetches the list.
   const key = () => ({ org: props.org, repo: props.repo, epoch: props.epoch });
   const [envs] = createResource(key, ({ org, repo }) => listEnvironments(org, repo));
 
   return (
     <Show when={!envs.loading} fallback={<p class="empty">loading…</p>}>
       <Show when={!envs.error} fallback={<p class="error">Could not load environments.</p>}>
-        <Show when={(envs()?.length ?? 0) > 0} fallback={<p class="empty">No environments.</p>}>
+        <Show
+          when={(envs()?.length ?? 0) > 0}
+          fallback={
+            <p class="empty">
+              This project may not deploy into any environment yet. Environments are
+              org-level: an org admin creates one and makes {props.repo} eligible for it
+              under Settings › Environments.
+            </p>
+          }
+        >
           <For each={envs()}>
-            {(env) => <EnvPanel org={props.org} repo={props.repo} env={env} />}
+            {(env) => (
+              <EnvPanel
+                org={props.org}
+                repo={props.repo}
+                env={env}
+                onTighten={() => props.onTighten(env.name)}
+                onChanged={props.onChanged}
+              />
+            )}
           </For>
         </Show>
       </Show>
@@ -561,19 +612,46 @@ function RepoEnvironments(props: { org: string; repo: string; epoch: number }) {
 // environment — not what went live. What is actually live, and how it got
 // there, is the Deployment record (ADR-0070) on /deployments, linked from the
 // panel header.
-function EnvPanel(props: { org: string; repo: string; env: RepoEnvironment }) {
+function EnvPanel(props: {
+  org: string;
+  repo: string;
+  env: ProjectEnvironment;
+  onTighten: () => void;
+  onChanged: () => void;
+}) {
   const key = () => ({ org: props.org, repo: props.repo, name: props.env.name });
   const [history] = createResource(key, ({ org, repo, name }) =>
     listApprovalHistory(org, repo, name).catch(() => []),
   );
-  const rules = () => props.env.protection;
-  const allowed = () => (rules().allowed_refs.length ? rules().allowed_refs.join(", ") : "any ref");
+  const [error, setError] = createSignal<string | null>(null);
+  const effective = () => props.env.effective;
+
+  const removeOverlay = async () => {
+    if (
+      !window.confirm(
+        `Remove ${props.repo}'s overlay on ${props.env.name}?\n\nIts deploys fall back to the org baseline.`,
+      )
+    )
+      return;
+    setError(null);
+    try {
+      await deleteEnvironmentOverlay(props.org, props.env.name, props.repo);
+      props.onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not remove the overlay.");
+    }
+  };
 
   return (
     <div class="panel env-panel">
       <div class="panel-h">
         <span>{props.env.name}</span>
         <span class="env-h-meta">
+          <Show when={!props.env.eligible}>
+            <span class="tok-role" title="An org admin withdrew this project's eligibility">
+              not eligible
+            </span>
+          </Show>
           <Show when={(history() ?? []).length > 0}>
             <span class="subtle mono">last approved {history()![0]!.git_ref}</span>
           </Show>
@@ -583,15 +661,76 @@ function EnvPanel(props: { org: string; repo: string; env: RepoEnvironment }) {
         </span>
       </div>
       <div class="env-body">
-        <div class="env-rules mono">
-          <Icon icon="shield-check" size={13} /> {rules().approvers.length} approver
-          {rules().approvers.length === 1 ? "" : "s"}
-          <span class="dotsep">·</span> {rules().wait_timer}s wait
-          <span class="dotsep">·</span> {allowed()}
-          <Show when={rules().require_reason}>
+        <div class="env-rules mono" title="What admission enforces for this project">
+          <Icon icon="shield-check" size={13} /> {effective().approvers.length} approver
+          {effective().approvers.length === 1 ? "" : "s"}
+          <Show when={effective().approvers.length > 0}>
+            {" "}({effective().approvers.join(", ")})
+          </Show>
+          <span class="dotsep">·</span> {refLayersLabel(effective().allowed_ref_layers)}
+          <Show when={effective().wait_timer_s > 0}>
+            <span class="dotsep">·</span>{" "}
+            <span title="Carried, not yet enforced">{effective().wait_timer_s}s wait</span>
+          </Show>
+          <Show when={effective().require_reason}>
             <span class="dotsep">·</span> reason required
           </Show>
+          <Show when={effective().deployment_concurrency != null}>
+            <span class="dotsep">·</span>{" "}
+            <span title="Enforced once deployment requests ship">
+              {concurrencyLabel(effective().deployment_concurrency)}
+            </span>
+          </Show>
         </div>
+        <div class="env-layers">
+          <div class="env-h-row mono">
+            <span class="subtle">org baseline</span>{" "}
+            <Show
+              when={!isPermissive(props.env.baseline)}
+              fallback={<span class="subtle">permissive — no org-wide rule yet</span>}
+            >
+              {rulesSummary(props.env.baseline)}
+            </Show>
+          </div>
+          <div class="env-h-row mono">
+            <span class="subtle">{props.repo} overlay</span>{" "}
+            <Show when={props.env.overlay} fallback={<span class="subtle">none</span>}>
+              {(o) => (
+                <>
+                  {rulesSummary(o())}
+                  <Show when={props.env.overlay_deployment_gate_deadline_ms != null}>
+                    {" "}· gates stall after{" "}
+                    {Math.round(props.env.overlay_deployment_gate_deadline_ms! / 60_000)} min
+                  </Show>
+                </>
+              )}
+            </Show>
+            <span class="oenv-actions">
+              <Show when={props.env.eligible || props.env.overlay}>
+                <button class="btn btn-ghost btn-sm" onClick={props.onTighten}>
+                  {props.env.overlay ? "edit" : "tighten"}
+                </button>
+              </Show>
+              <Show when={props.env.overlay}>
+                <button class="btn btn-ghost btn-sm" onClick={removeOverlay}>
+                  remove
+                </button>
+              </Show>
+            </span>
+          </div>
+          <Show when={props.env.privilege_grant}>
+            {(g) => (
+              <div class="env-h-row mono">
+                <span class="subtle">privileges</span> {g().privileged_images.length} image
+                {g().privileged_images.length === 1 ? "" : "s"}
+                <Show when={g().permit_k8s_overlay}> · raw k8s_overlay allowed</Show>
+              </div>
+            )}
+          </Show>
+        </div>
+        <Show when={error()}>
+          <p class="error">{error()}</p>
+        </Show>
         <div class="env-history">
           <div class="env-h-title mono">Approval history (legacy)</div>
           <For
@@ -613,48 +752,76 @@ function EnvPanel(props: { org: string; repo: string; env: RepoEnvironment }) {
   );
 }
 
-// ---- new-environment dialog ----------------------------------------------
-// Wired to `PUT …/environments/{name}` (ADR-0037). Fields map 1:1 onto
-// ProtectionRules: comma lists → string[], numbers → wait_timer/concurrency.
-
-const splitList = (s: string): string[] =>
-  s.split(",").map((x) => x.trim()).filter((x) => x.length > 0);
+// ---- "Tighten for this project" ---------------------------------------------
+// Writes this project's overlay (`PUT /v1/orgs/{org}/environments/{env}/
+// projects/{repo}/overlay`, ADR-0071 §3). Offers only the Environments the
+// project may deploy into (or already has an overlay in): an Environment is
+// created, and made available, by an org admin. Every field can only make
+// this project's deploys stricter than the org baseline.
 
 function EnvDialog(props: {
   org: string;
   repo: string;
+  /** Open on this Environment, its overlay prefilled. */
+  initial?: string;
   onClose: () => void;
-  onCreated: () => void;
+  onSaved: () => void;
 }) {
-  const [name, setName] = createSignal("");
-  const [approvers, setApprovers] = createSignal("");
-  const [waitTimer, setWaitTimer] = createSignal("0");
-  const [allowedRefs, setAllowedRefs] = createSignal("main");
-  const [concurrency, setConcurrency] = createSignal("1");
-  const [requireReason, setRequireReason] = createSignal(false);
+  const [envs] = createResource(
+    () => ({ org: props.org, repo: props.repo }),
+    ({ org, repo }) => listEnvironments(org, repo),
+  );
+  const choices = () => tightenable(envs() ?? []);
+  const [picked, setPicked] = createSignal(props.initial ?? "");
+  const blank = overlayToForm(null);
+  const [approvers, setApprovers] = createSignal(blank.approvers);
+  const [allowedRefs, setAllowedRefs] = createSignal(blank.allowedRefs);
+  const [waitTimer, setWaitTimer] = createSignal(blank.waitTimerS);
+  const [concurrency, setConcurrency] = createSignal(blank.concurrency);
+  const [requireReason, setRequireReason] = createSignal(blank.requireReason);
+  const [gateDeadline, setGateDeadline] = createSignal(blank.gateDeadlineMinutes);
   const [saving, setSaving] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
 
+  // Prefill from the picked Environment's overlay once the list is in (and
+  // again on every pick): editing starts from what is stored, never blank.
+  createEffect(() => {
+    const env = (envs() ?? []).find((e) => e.name === picked());
+    const form = overlayToForm(
+      env?.overlay
+        ? { ...env.overlay, deployment_gate_deadline_ms: env.overlay_deployment_gate_deadline_ms }
+        : null,
+    );
+    setApprovers(form.approvers);
+    setAllowedRefs(form.allowedRefs);
+    setWaitTimer(form.waitTimerS);
+    setConcurrency(form.concurrency);
+    setRequireReason(form.requireReason);
+    setGateDeadline(form.gateDeadlineMinutes);
+  });
+
+  const built = () =>
+    toOverlayBody({
+      approvers: approvers(),
+      allowedRefs: allowedRefs(),
+      waitTimerS: waitTimer(),
+      requireReason: requireReason(),
+      concurrency: concurrency(),
+      gateDeadlineMinutes: gateDeadline(),
+    });
+  const problem = () => (picked() ? (built().error ?? null) : "Pick an environment.");
+
   const save = async () => {
-    const n = name().trim();
-    if (!n) {
-      setError("Name is required.");
-      return;
-    }
+    const body = built().body;
+    if (!body || problem() || saving()) return;
     setSaving(true);
     setError(null);
     try {
-      await putEnvironment(props.org, props.repo, n, {
-        approvers: splitList(approvers()),
-        wait_timer: Number(waitTimer()) || 0,
-        allowed_refs: splitList(allowedRefs()),
-        concurrency: Number(concurrency()) || 1,
-        require_reason: requireReason(),
-      });
-      props.onCreated();
+      await putEnvironmentOverlay(props.org, picked(), props.repo, body);
+      props.onSaved();
       props.onClose();
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not save environment.");
+      setError(e instanceof Error ? e.message : "Could not save the overlay.");
     } finally {
       setSaving(false);
     }
@@ -663,19 +830,41 @@ function EnvDialog(props: {
   return (
     <div class="modal-scrim" onClick={props.onClose}>
       <div class="modal" onClick={(e) => e.stopPropagation()}>
-        <div class="panel-h"><span>New environment</span></div>
+        <div class="panel-h">
+          <span>Tighten for {props.repo}</span>
+        </div>
         <div class="modal-body">
           <div class="form-r">
-            <label>name</label>
-            <input
-              class="input"
-              placeholder="e.g. production"
-              value={name()}
-              onInput={(e) => setName(e.currentTarget.value)}
-            />
+            <label>environment</label>
+            <Show
+              when={choices().length > 0}
+              fallback={
+                <p class="fieldnote">
+                  {envs.loading
+                    ? "loading…"
+                    : `${props.repo} may not deploy into any environment yet — an org admin makes it eligible under Settings › Environments.`}
+                </p>
+              }
+            >
+              <select
+                class="input mono"
+                value={picked()}
+                onChange={(e) => setPicked(e.currentTarget.value)}
+              >
+                <option value="">environment…</option>
+                <For each={choices()}>
+                  {(env) => (
+                    <option value={env.name}>
+                      {env.name}
+                      {env.overlay ? " (has overlay)" : ""}
+                    </option>
+                  )}
+                </For>
+              </select>
+            </Show>
           </div>
           <div class="form-r">
-            <label>approvers</label>
+            <label>extra approvers</label>
             <input
               class="input"
               placeholder="comma-separated user ids (blank = none)"
@@ -690,6 +879,20 @@ function EnvDialog(props: {
               placeholder="add an approver — find a user"
               onPick={(id) => setApprovers(addToList(approvers(), id))}
             />
+            <p class="fieldnote">Required in addition to the org baseline's approvers.</p>
+          </div>
+          <div class="form-r">
+            <label>allowed refs</label>
+            <input
+              class="input"
+              placeholder="comma-separated globs, e.g. refs/heads/main (blank = any)"
+              value={allowedRefs()}
+              onInput={(e) => setAllowedRefs(e.currentTarget.value)}
+            />
+            <p class="fieldnote">
+              A ref must match these <b>and</b> the baseline's. Use full refs —{" "}
+              <span class="mono">refs/heads/main</span>, not <span class="mono">main</span>.
+            </p>
           </div>
           <div class="form-r">
             <label>wait timer (s)</label>
@@ -700,15 +903,7 @@ function EnvDialog(props: {
               value={waitTimer()}
               onInput={(e) => setWaitTimer(e.currentTarget.value)}
             />
-          </div>
-          <div class="form-r">
-            <label>allowed refs</label>
-            <input
-              class="input"
-              placeholder="comma-separated (blank = any ref)"
-              value={allowedRefs()}
-              onInput={(e) => setAllowedRefs(e.currentTarget.value)}
-            />
+            <p class="fieldnote">Recorded, not yet enforced.</p>
           </div>
           <div class="form-r">
             <label>concurrency</label>
@@ -716,9 +911,30 @@ function EnvDialog(props: {
               class="input"
               type="number"
               min="1"
+              placeholder="no limit"
               value={concurrency()}
               onInput={(e) => setConcurrency(e.currentTarget.value)}
             />
+            <p class="fieldnote">
+              In-flight deployments per target; blank = no limit. Enforced once deployment
+              requests ship.
+            </p>
+          </div>
+          <div class="form-r">
+            <label>gate deadline (min)</label>
+            <input
+              class="input"
+              type="number"
+              min="1"
+              step="any"
+              placeholder="the environment's"
+              value={gateDeadline()}
+              onInput={(e) => setGateDeadline(e.currentTarget.value)}
+            />
+            <p class="fieldnote">
+              Only this project's deployment gates, and only if shorter than the
+              environment's deadline.
+            </p>
           </div>
           <div class="form-r">
             <label>require reason</label>
@@ -731,18 +947,21 @@ function EnvDialog(props: {
               <span class="subtle">manual/api dispatches must supply a reason</span>
             </label>
           </div>
+          <Show when={problem() && picked()}>
+            <p class="error">{problem()}</p>
+          </Show>
           <Show when={error()}>
             <p class="error">{error()}</p>
           </Show>
           <div class="modal-actions">
-            <button class="btn btn-primary" disabled={saving()} onClick={save}>
-              <Icon icon="plus" size={14} /> {saving() ? "Creating…" : "Create"}
+            <button class="btn btn-primary" disabled={!!problem() || saving()} onClick={save}>
+              <Icon icon="shield-check" size={14} /> {saving() ? "Saving…" : "Save overlay"}
             </button>
             <button class="btn btn-ghost" onClick={props.onClose}>Cancel</button>
           </div>
           <p class="subtle modal-note">
-            Defines a deploy gate (approvers, wait timer, allowed refs). Requires the
-            Administer capability on this repo (ADR-0037).
+            An overlay can only make {props.repo}'s deploys stricter than the org baseline.
+            Requires the Administer capability on this repo (ADR-0071).
           </p>
         </div>
       </div>

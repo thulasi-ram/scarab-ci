@@ -442,49 +442,62 @@ export function workspaceFileUrl(
   return attempt ? `${base}&attempt=${encodeURIComponent(attempt)}` : base;
 }
 
-// --- Environments (ADR-0024/0037). The generated schema types these responses
-// opaquely (no body declared), so they're plain-fetched — same pattern as the
-// secret parity matrix below — and hand-typed against the server's serialized
-// `scarab_project::Environment` / `Deployment` shapes. ---
+// --- A repository's Environments (ADR-0071). Since the migration an
+// Environment is org-level; a repository sees the ones its Project may deploy
+// into (or holds an overlay or grant in), each with the org's BASELINE, the
+// Project's own tighten-only OVERLAY, and the EFFECTIVE rules admission
+// enforces — merged by the server, never here. The old per-repo
+// `PUT/DELETE …/environments/{name}` answer 410. ---
 
-/** An environment's protection rules, as serialized by the server. */
-export type ProtectionRules = {
-  approvers: string[];
-  wait_timer: number;
-  allowed_refs: string[];
-  concurrency: number;
-  /** Require a reason for human dispatches (manual/api) into this environment
-   *  (ADR-0057 §3). Optional/omittable — the server defaults it off (fail-open).
-   *  Administer-only to set, like the rest of the rules. */
-  require_reason?: boolean;
-};
-export type RepoEnvironment = { name: string; protection: ProtectionRules };
+/** One Environment as this Project sees it. */
+export type ProjectEnvironment = components["schemas"]["ProjectEnvironmentDto"];
+/** One rules layer (a baseline or an overlay's rules). */
+export type EnvironmentRules = components["schemas"]["EnvironmentProtectionRulesDto"];
+/** The merged rules admission enforces. */
+export type EffectiveRules = components["schemas"]["EffectiveProtectionDto"];
+/** A Project's overlay as stored. */
+export type EnvironmentOverlay = components["schemas"]["EnvironmentProjectOverlayDto"];
+/** The overlay PUT body. */
+export type PutOverlayRequest = components["schemas"]["PutEnvironmentProjectOverlayRequest"];
 
-/** List a repo's environments (`GET …/environments`). */
-export async function listEnvironments(org: string, repo: string): Promise<RepoEnvironment[]> {
+/** The Environments this repository's Project sees (`GET …/environments`). */
+export async function listEnvironments(org: string, repo: string): Promise<ProjectEnvironment[]> {
+  // Plain fetch: the spec declares this route's response but not its path
+  // parameters, so the typed client cannot address it.
   const res = await fetch(
     `/v1/repos/${encodeURIComponent(org)}/${encodeURIComponent(repo)}/environments`,
   );
-  if (!res.ok) throw new Error("failed to list environments");
-  return (await res.json()) as RepoEnvironment[];
+  if (res.status === 401) setUnauthenticated(true);
+  if (!res.ok) throw new Error(`failed to list environments (${res.status})`);
+  return (await res.json()) as ProjectEnvironment[];
 }
 
-/** Create or replace an environment's protection rules
- *  (`PUT …/environments/{name}`, ADR-0037; requires Administer). */
-export async function putEnvironment(
+const envPath = (org: string, env: string) =>
+  `/v1/orgs/${encodeURIComponent(org)}/environments/${encodeURIComponent(env)}`;
+const projectPath = (org: string, env: string, project: string) =>
+  `${envPath(org, env)}/projects/${encodeURIComponent(project)}`;
+
+/** Tighten an Environment for one Project — create or replace its overlay
+ *  (Administer on the Project or Org). Through `send`: the server's 400
+ *  (an approver who is not a Scarab user) and 409 (not eligible) are the
+ *  answer to "why will this not save", shown verbatim. */
+export async function putEnvironmentOverlay(
   org: string,
-  repo: string,
-  name: string,
-  protection: ProtectionRules,
+  env: string,
+  project: string,
+  body: PutOverlayRequest,
+): Promise<EnvironmentOverlay> {
+  const res = await send(`${projectPath(org, env, project)}/overlay`, "PUT", body);
+  return (await res.json()) as EnvironmentOverlay;
+}
+
+/** Remove a Project's overlay: its deploys fall back to the baseline. */
+export async function deleteEnvironmentOverlay(
+  org: string,
+  env: string,
+  project: string,
 ): Promise<void> {
-  // Through `send`: Administer-gated, so a cookie session needs the CSRF
-  // token (this raw `fetch` used to omit it and 403 under real login), and an
-  // unknown approver comes back with the server's explanation (ADR-0069 §3).
-  await send(
-    `/v1/repos/${encodeURIComponent(org)}/${encodeURIComponent(repo)}/environments/${encodeURIComponent(name)}`,
-    "PUT",
-    protection,
-  );
+  await send(`${projectPath(org, env, project)}/overlay`, "DELETE");
 }
 
 /** One approval recorded when a run into an environment was admitted (`at` is
@@ -587,9 +600,10 @@ export async function listEnvironmentDeployments(
   return data;
 }
 
-// --- Org-level Environments (ADR-0071, MMP step 1) — a name, its deployment
-// deadline and the sources allowed to report into it. Additive: per-repo
-// Environments (above) still govern Runs; the two share names, nothing else. ---
+// --- Org-level Environments (ADR-0071) — the place deployments land in: its
+// deadline and reporting sources (the whole-Environment PUT), and — each with
+// its own write, so that PUT can never reset them — its baseline protection,
+// its eligibility, and each Project's privilege grant. Org admins only. ---
 
 /** An org-level Environment. */
 export type OrgEnvironment = components["schemas"]["OrgEnvironmentDto"];
@@ -656,6 +670,93 @@ export async function deleteOrgEnvironment(org: string, env: string): Promise<vo
   if (error) {
     throw new Error(errorText(error) || `could not delete ${env} (${response.status})`);
   }
+}
+
+/** The baseline PUT body. */
+export type PutProtectionRequest = components["schemas"]["PutEnvironmentProtectionRequest"];
+/** Which Projects may deploy into an Environment. */
+export type EnvironmentEligibility = components["schemas"]["EnvironmentEligibilityDto"];
+/** A Project's standing in one Environment: eligible, overlay, grant. */
+export type EnvironmentProject = components["schemas"]["EnvironmentProjectDto"];
+/** A Project's privileges in one Environment. */
+export type PrivilegeGrant = components["schemas"]["EnvironmentProjectPrivilegeGrantDto"];
+export type PutPrivilegeGrantRequest =
+  components["schemas"]["PutEnvironmentProjectPrivilegeGrantRequest"];
+/** One line of the migration's split report. */
+export type MigrationReportLine = components["schemas"]["EnvironmentMigrationReportDto"];
+
+/** Replace an Environment's baseline. Returns the Environment as stored. */
+export async function putEnvironmentProtection(
+  org: string,
+  env: string,
+  body: PutProtectionRequest,
+): Promise<OrgEnvironment> {
+  const res = await send(`${envPath(org, env)}/protection`, "PUT", body);
+  return (await res.json()) as OrgEnvironment;
+}
+
+/** Replace an Environment's eligibility. */
+export async function putEnvironmentEligibility(
+  org: string,
+  env: string,
+  body: EnvironmentEligibility,
+): Promise<EnvironmentEligibility> {
+  const res = await send(`${envPath(org, env)}/eligibility`, "PUT", body);
+  return (await res.json()) as EnvironmentEligibility;
+}
+
+/** Every Project holding an overlay or grant in an Environment. */
+export async function listEnvironmentProjects(
+  org: string,
+  env: string,
+): Promise<EnvironmentProject[]> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/environments/{env}/projects", {
+    params: { path: { org, env } },
+  });
+  if (error || !data) {
+    throw new Error(errorText(error) || `failed to list ${env}'s projects (${response.status})`);
+  }
+  return data;
+}
+
+/** Grant a Project privileges in an Environment (replaces any grant). */
+export async function putPrivilegeGrant(
+  org: string,
+  env: string,
+  project: string,
+  body: PutPrivilegeGrantRequest,
+): Promise<PrivilegeGrant> {
+  const res = await send(`${projectPath(org, env, project)}/privilege-grant`, "PUT", body);
+  return (await res.json()) as PrivilegeGrant;
+}
+
+/** Withdraw a Project's privilege grant. */
+export async function deletePrivilegeGrant(org: string, env: string, project: string): Promise<void> {
+  await send(`${projectPath(org, env, project)}/privilege-grant`, "DELETE");
+}
+
+/** The migration's split report. `null` when the caller may not read it
+ *  (403 — it needs Administer on the org) or the server has no governance
+ *  store (404): the panel then simply does not show. */
+export async function getMigrationReport(org: string): Promise<MigrationReportLine[] | null> {
+  const { data, response } = await api.GET("/v1/orgs/{org}/environment-migration-report", {
+    params: { path: { org } },
+  });
+  if (response.status === 403 || response.status === 404) return null;
+  if (!data) throw new Error(`failed to load the migration report (${response.status})`);
+  return data;
+}
+
+/** Mark one split-report line reviewed (the first acknowledgement stands). */
+export async function acknowledgeMigrationReport(
+  org: string,
+  env: string,
+): Promise<MigrationReportLine> {
+  const res = await send(
+    `/v1/orgs/${encodeURIComponent(org)}/environment-migration-report/${encodeURIComponent(env)}/acknowledge`,
+    "POST",
+  );
+  return (await res.json()) as MigrationReportLine;
 }
 
 // --- Plugins (ADR-0072, Deployments MMP d1) — an org's PluginInstallations:

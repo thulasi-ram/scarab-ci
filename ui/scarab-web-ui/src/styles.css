@@ -1670,6 +1670,9 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .env-panel .env-body { padding: 14px 16px; }
 .env-rules { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--sage); margin-bottom: 12px; }
 .env-history { display: flex; flex-direction: column; gap: 6px; }
+/* ADR-0071: baseline / overlay / privileges, one line each, above the history. */
+.env-layers { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
+.env-layers .env-h-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .env-h-row { font-size: 12px; color: var(--sage); }
 .ok-mark { color: var(--ok); margin: 0 4px; }
 /* The legacy approval list is labelled as such, and the panel header links to
@@ -3220,6 +3223,11 @@ h1, .crumb-head, .run-title {
    token has no equivalent for is here: two actions, a description, a source
    list, and the editable source rows in the dialog. */
 .oenv-actions { margin-left: auto; display: inline-flex; gap: 6px; }
+/* ADR-0071 §10 step 8: the split report above the Environment list. */
+.oenv-report { border: 1px dashed var(--line, currentColor); border-radius: 8px; padding: 10px 12px; margin-bottom: 12px; }
+.oenv-report-h { display: flex; align-items: center; gap: 8px; font-size: 12.5px; }
+.oenv-report-h .btn { margin-left: auto; }
+.oenv-report-projects { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
 .oenv-desc { font-size: 12.5px; color: var(--sage); }
 .oenv-sources { display: inline-flex; gap: 10px; flex-wrap: wrap; }
 .oenv-rows { display: grid; gap: 6px; }
