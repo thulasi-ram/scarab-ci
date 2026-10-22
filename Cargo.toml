@@ -101,7 +101,9 @@ clap = { version = "4", features = ["derive", "env"] }
 # that actually writes, installed only by the composition root.
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring", "migrate", "macros", "json"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+# `stream`: the CredentialBroker streams an upstream response body to the
+# Plugin as it arrives (ADR-0072 §5 — Argo CD's watch API never ends).
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
 # Pin the rustls default CryptoProvider (ring) at the composition root; see the
 # note in scarab-server/src/main.rs. `ring` matches sqlx's `tls-rustls-ring`.
 rustls = { version = "0.23", features = ["ring"] }

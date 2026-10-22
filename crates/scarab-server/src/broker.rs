@@ -4,8 +4,8 @@
 //! surface and the UI stay unreachable from a plugin Pod, and this router is
 //! not in the public OpenAPI document.
 //!
-//! Slice d1 serves identity and report ingest; the read proxy over
-//! PluginConnections is slice d3.
+//! Slice d1 serves identity and report ingest; slice d3 adds the read proxy
+//! over PluginConnections ([`crate::broker_proxy`]).
 //!
 //! Every route but `healthz` goes through [`authenticate_plugin`]: the
 //! token is verified ([`PluginTokenVerifier`]), its ServiceAccount mapped to
@@ -38,7 +38,7 @@ use axum::extract::{DefaultBodyLimit, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -53,6 +53,7 @@ use scarab_plugin::{
 };
 
 use super::{ApiError, AppState};
+use crate::broker_proxy;
 use crate::plugins::plugin_store_api_error;
 
 /// The reserved path prefix every broker route lives under.
@@ -120,12 +121,30 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             authenticate_plugin_for_ingest,
         ));
+    // The read proxy (slice d3). Every method reaches the handler — after
+    // authentication and the kill switch — so a write is refused with a 405
+    // that is journaled like any other refusal, not dropped by the router.
+    let proxy = state
+        .broker_plugins
+        .clone()
+        .or_else(|| state.plugins.clone())
+        .map(|store| {
+            Router::new()
+                .route(&broker_proxy::route_path(), any(broker_proxy::proxy))
+                .route_layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    authenticate_plugin,
+                ))
+                .layer(Extension(broker_proxy::BrokerProxy::spawn(store)))
+        })
+        .unwrap_or_default();
     Router::new()
         // Unauthenticated: the reachability probe (proc-mode discovery and
         // the isolation probe, slice d2) must not need a token.
         .route(&format!("{BROKER_PREFIX}/healthz"), get(healthz))
         .merge(reads)
         .merge(ingest)
+        .merge(proxy)
         .layer(DefaultBodyLimit::max(BROKER_BODY_LIMIT_BYTES))
         .layer(axum::middleware::from_fn(super::request_id_middleware))
         // Outermost, so the response it rewrites already carries its
@@ -298,9 +317,17 @@ async fn caller(st: &AppState, id: &str) -> Result<PluginCaller, BrokerError> {
 /// Every 500 the broker would send becomes `internal error; request id <id>`
 /// — the detail (a database error's text, say) is logged under that id for
 /// an operator, never handed to an untrusted plugin (red-team F-5).
+///
+/// A proxied upstream's own 500 is not one of ours: its body is the
+/// vendor's, and it passes through untouched.
 async fn scrub_internal_errors(req: Request, next: Next) -> Response {
     let resp = next.run(req).await;
-    if resp.status() != StatusCode::INTERNAL_SERVER_ERROR {
+    if resp.status() != StatusCode::INTERNAL_SERVER_ERROR
+        || resp
+            .extensions()
+            .get::<broker_proxy::UpstreamResponse>()
+            .is_some()
+    {
         return resp;
     }
     let request_id = resp

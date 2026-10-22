@@ -32,8 +32,16 @@ use std::fmt;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+mod connection;
 mod report;
 mod store;
+
+pub use connection::{
+    match_read_request, rule_label, BrokerJournalEntry, PluginConnection,
+    PluginConnectionAuthScheme, ReadRequestMatch, ReadRequestRefusal, BROKER_JOURNAL_RETENTION_MS,
+    MAX_CONNECTION_BASE_URL_CHARS, MAX_CONNECTION_CA_PEM_BYTES, MAX_CONNECTION_CREDENTIAL_BYTES,
+    MAX_PROXY_PATH_CHARS, MAX_PROXY_PATH_SEGMENTS,
+};
 
 pub use report::{
     OwnershipReportItem, ReportIngest, ReportItem, ReportItemOutcome, ReportOutcome,
@@ -43,9 +51,10 @@ pub use report::{
 };
 pub use store::{
     DeploymentSourceTarget, EnvironmentTargetsPage, InstallationDeploymentSource,
-    InstallationUsage, PluginStore, PluginStoreError, SourceTargetsPage, TargetRouting,
-    UnmappedGrouping, MAX_TARGETS_PER_INSTALLATION, MAX_UNMAPPED_GROUPINGS_PER_INSTALLATION,
-    PAGE_DEFAULT_LIMIT, PAGE_MAX_LIMIT, REPORT_RECEIPT_RETENTION_MS,
+    InstallationUsage, PluginStore, PluginStoreError, PluginUninstall, SourceTargetsPage,
+    TargetRouting, UnmappedGrouping, MAX_TARGETS_PER_INSTALLATION,
+    MAX_UNMAPPED_GROUPINGS_PER_INSTALLATION, PAGE_DEFAULT_LIMIT, PAGE_MAX_LIMIT,
+    REPORT_RECEIPT_RETENTION_MS,
 };
 
 /// The longest installation or plugin name: a DNS-1123 label. Installation
