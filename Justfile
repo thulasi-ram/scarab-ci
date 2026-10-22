@@ -455,11 +455,40 @@ kube-tests filter="":
     export SCARAB_TEST_KUBE=1
     echo "==> running the live tier (ns=$ns, workspace=$SCARAB_TEST_WORKSPACE_URL,"
     echo "    pod-facing=$SCARAB_TEST_WORKSPACE_POD_URL, fetcher=$SCARAB_TEST_WSFETCH_IMAGE)"
+    # Both live suites: the executor's and the plugin runtime's (ADR-0072 §9 —
+    # its isolation probe, Pod Security admission, TokenReview).
     if [ -n "{{filter}}" ]; then
-      cargo nextest run -p scarab-executor-k8s --test cluster \
+      cargo nextest run -p scarab-executor-k8s -p scarab-plugin-k8s --test cluster \
         --run-ignored all --no-fail-fast -E 'test(~{{filter}})'
     else
-      cargo nextest run -p scarab-executor-k8s --test cluster \
+      cargo nextest run -p scarab-executor-k8s -p scarab-plugin-k8s --test cluster \
+        --run-ignored all --no-fail-fast
+    fi
+
+# LIVE plugin-runtime tier alone (`crates/scarab-plugin-k8s/tests/cluster.rs`,
+# ADR-0072 §9/§11): the isolation probe passes on kind and FAILS once the egress
+# policies are gone; the namespace baseline refuses a non-`restricted` namespace
+# and a stray policy; Pod Security admits the plugin workload; TokenReview accepts
+# a live Pod's broker token and nothing else. Self-contained — throwaway
+# namespaces and an in-cluster fake broker — so it needs only the proc-mode kind
+# cluster, through its ISOLATED kubeconfig (the suite also refuses any context
+# that is not `kind-*`). Usage: `just plugin-kube-tests` | `just plugin-kube-tests token_review`.
+plugin-kube-tests filter="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    bash deploy/local-proc/up.sh
+    export KUBECONFIG="$PWD/deploy/local-proc/.kubeconfig"
+    ctx="$(kubectl config current-context)"
+    case "$ctx" in
+      kind-*) ;;
+      *) echo "error: refusing to run against context '$ctx' (expected kind-*)" >&2; exit 1 ;;
+    esac
+    export SCARAB_TEST_KUBE=1
+    if [ -n "{{filter}}" ]; then
+      cargo nextest run -p scarab-plugin-k8s --test cluster \
+        --run-ignored all --no-fail-fast -E 'test(~{{filter}})'
+    else
+      cargo nextest run -p scarab-plugin-k8s --test cluster \
         --run-ignored all --no-fail-fast
     fi
 
