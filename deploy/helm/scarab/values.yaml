@@ -438,6 +438,44 @@ workspace:
   nodeSelector: {}
   tolerations: []
 
+# Plugins (ADR-0072): long-lived vendor workloads (e.g. the first-party Argo CD
+# reporter) that Scarab runs in ONE shared namespace and talks to only through
+# the CredentialBroker — a second listener of scarab-server, exposed by a
+# ClusterIP Service and NEVER through the ingress.
+#
+# OFF by default. Turning it on renders:
+#   - the plugin namespace, labelled Pod Security `restricted` (enforce). The
+#     runtime REFUSES to run anything in a namespace without that label;
+#   - a Role there (ServiceAccounts, Deployments, Pods, Pod logs,
+#     NetworkPolicies — the runtime writes a default-deny + one egress
+#     allowance itself), `get` on that one namespace, and a ClusterRoleBinding
+#     to `system:auth-delegator` so the broker can verify plugin tokens with
+#     TokenReview;
+#   - the broker Service and port, and SCARAB_PLUGINS=on with the broker's
+#     address and NetworkPolicy peer derived from this release.
+#
+# The cluster MUST enforce NetworkPolicy: before any plugin starts (and every
+# 6 h) the server runs an isolation probe in the namespace, and a CNI that
+# ignores NetworkPolicy fails it — the plugin then stays down, with the reason
+# on its installation (runtime_status probe_failed).
+plugins:
+  enabled: false
+  # The one shared plugin namespace (SCARAB_PLUGIN_NAMESPACE).
+  namespace: scarab-plugins
+  # Render the namespace (with its Pod Security labels). Set false if you
+  # create it yourself — it must carry
+  # pod-security.kubernetes.io/enforce=restricted.
+  createNamespace: true
+  # The broker listener's port (SCARAB_BROKER_ADDR) and its Service port —
+  # the same number, so the NetworkPolicy port and the URL agree.
+  brokerPort: 8090
+  # The isolation probe's image (busybox: httpd, nc, wget). "" = the server
+  # default (busybox:1.36). Digest-pin in production.
+  probeImage: ""
+  # The repository first-party Argo CD installs must pin by digest. "" = the
+  # server default (ghcr.io/thulasi-ram/scarab-plugin-argocd).
+  argocdRepo: ""
+
 # RBAC the k8s executor needs to run one Pod per step in scarab.namespace.
 # NOTE: the workspace StatefulSet gets its own ServiceAccount with NO
 # RoleBinding — see templates/serviceaccount-workspace.yaml for why that is

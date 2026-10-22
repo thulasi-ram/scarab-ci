@@ -77,6 +77,13 @@ spec:
             - name: http
               containerPort: 8080
               protocol: TCP
+            {{- if .Values.plugins.enabled }}
+            # The CredentialBroker's own listener (ADR-0072 §11) — reached
+            # only through the ClusterIP broker Service, never the ingress.
+            - name: broker
+              containerPort: {{ .Values.plugins.brokerPort }}
+              protocol: TCP
+            {{- end }}
           {{- with .Values.livenessProbe }}
           livenessProbe:
             {{- toYaml . | nindent 12 }}

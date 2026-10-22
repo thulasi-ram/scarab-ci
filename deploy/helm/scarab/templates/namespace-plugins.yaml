@@ -1,0 +1,24 @@
+{{- if and .Values.plugins.enabled .Values.plugins.createNamespace -}}
+{{- /*
+  The one shared plugin namespace (ADR-0072 §9), under Pod Security
+  `restricted`. The runtime only READS these labels — it refuses to run any
+  plugin in a namespace that does not enforce `restricted` — so this is where
+  the level is set, by the operator's release, not by the runtime.
+
+  `helm.sh/resource-policy: keep`: uninstalling the release does not delete
+  the namespace, so `helm uninstall` cannot take running plugin state with it
+  by surprise; delete it yourself once the plugins are uninstalled.
+*/ -}}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.plugins.namespace }}
+  labels:
+    {{- include "scarab.labels" . | nindent 4 }}
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+  annotations:
+    helm.sh/resource-policy: keep
+{{- end }}
