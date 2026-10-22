@@ -1,0 +1,25 @@
+{{- if .Values.plugins.enabled -}}
+{{- /*
+  The CredentialBroker (ADR-0072 §11): scarab-server's SECOND listener, the
+  only address a plugin's network reaches. ClusterIP only, and deliberately
+  not referenced by templates/ingress.yaml: the broker must never be reachable
+  from outside the cluster. Port == targetPort, so the URL plugins dial and
+  the NetworkPolicy port (evaluated on the Pod port) are the same number.
+*/ -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "scarab.fullname" . }}-broker
+  labels:
+    {{- include "scarab.labels" . | nindent 4 }}
+    app.kubernetes.io/component: broker
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "scarab.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: broker
+      port: {{ .Values.plugins.brokerPort }}
+      targetPort: broker
+      protocol: TCP
+{{- end }}

@@ -325,6 +325,26 @@ which is exactly the cost the warm tier exists to remove.
 > zone placement, and reachability from a step Pod. `workspace.replicaCount > 1`
 > has not been exercised.
 
+## Plugins (`plugins`, ADR-0072)
+
+Off by default. `plugins.enabled=true` runs the plugin runtime: Scarab manages
+one Deployment per installed plugin (e.g. the first-party Argo CD reporter) in
+the shared `plugins.namespace`, and plugins talk to Scarab only through the
+**CredentialBroker** — a second listener on `plugins.brokerPort`, exposed by
+the ClusterIP Service `<fullname>-broker` and never through the ingress.
+
+It renders the namespace (labelled Pod Security `restricted`; set
+`plugins.createNamespace=false` to bring your own, with that label), a Role
+there, `get` on that one namespace, and a binding to `system:auth-delegator`
+(TokenReview, which is how the broker verifies a plugin's projected token).
+
+**The cluster must enforce NetworkPolicy.** The runtime writes a default-deny
+policy plus one egress allowance (cluster DNS and the broker), and before any
+plugin starts — and every 6 h — runs an isolation probe in the namespace. On a
+cluster whose CNI ignores NetworkPolicy the probe fails and the plugin stays
+down, its installation showing `probe_failed` and why. Cluster DNS must be the
+usual `kube-system` Pods labelled `k8s-app=kube-dns`.
+
 ## Key values
 
 | Key | Default | Notes |
@@ -350,6 +370,10 @@ which is exactly the cost the warm tier exists to remove.
 | `secrets.workspaceTokenSecret` | — | HMAC secret for the workspace token; MUST differ from `resultsTokenSecret` (above) |
 | `scarab.workspaceUrl` | — | override the in-cluster workspace Service URL (split installs) |
 | `rbac.create` | `true` | Role/RoleBinding for Pod execution |
+| `plugins.enabled` | `false` | the ADR-0072 plugin runtime + CredentialBroker (above) |
+| `plugins.namespace` / `.createNamespace` | `scarab-plugins` / `true` | the shared plugin namespace; must enforce Pod Security `restricted` |
+| `plugins.brokerPort` | `8090` | the broker listener and its ClusterIP Service port |
+| `plugins.probeImage` | `""` = `busybox:1.36` | the isolation probe's image; digest-pin in production |
 | `ingress.enabled` | `false` | expose the HTTP API |
 
 See `values.yaml` for the full surface. Every value maps to a `SCARAB_*` env var
@@ -368,3 +392,4 @@ or supply them as keys of your own `secrets.existingSecret`.
 - [ADR-0049 — Identity & access: forge-agnostic OAuth/OIDC login](../../../docs/adr/0049-identity-and-access.md)
 - [ADR-0061 — Workspace data path: workspace service + node driver, lazy materialisation](../../../docs/adr/0061-workspace-data-path.md)
 - [ADR-0062 — Workspace Export: laziness without a node driver (the Farm and Export rungs)](../../../docs/adr/0062-workspace-export-lazy-without-node-driver.md)
+- [ADR-0072 — Plugins: a governed extension point](../../../docs/adr/0072-plugins-a-governed-extension-point.md)

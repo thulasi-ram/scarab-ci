@@ -136,6 +136,25 @@ data:
          so sidecars pulled an unpinned image and posted results nowhere. */}}
   SCARAB_SIDECAR_IMAGE: {{ .Values.scarab.sidecarImage | quote }}
   SCARAB_RESULTS_API_URL: {{ .Values.scarab.resultsApiUrl | default (printf "http://%s.%s.svc" (include "scarab.fullname" .) .Release.Namespace) | quote }}
+  {{- if .Values.plugins.enabled }}
+  {{- /* Plugins (ADR-0072). The broker is the server's second listener; the
+         URL plugins dial is its ClusterIP Service, and the NetworkPolicy
+         peer is this release's server Pods (their selector labels — the
+         workspace Pods carry a different name label, so they are not it).
+         The workspace StatefulSet reads this ConfigMap too and ignores
+         these: only api/converged roles serve the broker. */}}
+  SCARAB_PLUGINS: "on"
+  SCARAB_BROKER_ADDR: {{ printf "0.0.0.0:%d" (int .Values.plugins.brokerPort) | quote }}
+  SCARAB_PLUGIN_NAMESPACE: {{ .Values.plugins.namespace | quote }}
+  SCARAB_PLUGIN_BROKER_URL: {{ printf "http://%s-broker.%s.svc:%d" (include "scarab.fullname" .) .Release.Namespace (int .Values.plugins.brokerPort) | quote }}
+  SCARAB_PLUGIN_BROKER_PEER: {{ printf "pods:%s:app.kubernetes.io/name=%s,app.kubernetes.io/instance=%s" .Release.Namespace (include "scarab.name" .) .Release.Name | quote }}
+  {{- with .Values.plugins.probeImage }}
+  SCARAB_PLUGIN_PROBE_IMAGE: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.plugins.argocdRepo }}
+  SCARAB_PLUGIN_ARGOCD_REPO: {{ . | quote }}
+  {{- end }}
+  {{- end }}
   {{- range $k, $v := .Values.scarab.extraEnv }}
   {{ $k }}: {{ $v | quote }}
   {{- end }}
