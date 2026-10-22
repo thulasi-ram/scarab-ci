@@ -741,9 +741,7 @@ impl Pump {
                     Some(Err(e)) => {
                         tracing::warn!(installation = %self.installation_id, slot = %self.slot,
                             error = %e, "broker: upstream body failed mid-stream");
-                        let _ = tx
-                            .send(Err(std::io::Error::other("the upstream response failed")))
-                            .await;
+                        send_error(&tx, "the upstream response failed").await;
                         break Some("upstream body error");
                     }
                     Some(Ok(chunk)) => {
@@ -802,11 +800,21 @@ impl Pump {
     ) -> &'static str {
         tracing::warn!(installation = %self.installation_id, slot = %self.slot, why,
             "broker: response stream cut (ADR-0072 §10)");
-        // `try_send`: a Plugin that stopped reading gets its stream dropped
-        // either way when the sender goes.
-        let _ = tx.try_send(Err(std::io::Error::other(why)));
+        send_error(tx, why).await;
         why
     }
+}
+
+/// End the Plugin's body with an error. Waits briefly for room, so a Plugin
+/// that is reading sees the error rather than a clean end; one that stopped
+/// reading may instead drain what was buffered before the cut and then see
+/// the body end — never anything sent after it.
+async fn send_error(tx: &mpsc::Sender<Result<Bytes, std::io::Error>>, why: &str) {
+    let _ = tokio::time::timeout(
+        Duration::from_secs(1),
+        tx.send(Err(std::io::Error::other(why.to_string()))),
+    )
+    .await;
 }
 
 #[cfg(test)]
