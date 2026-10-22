@@ -6,6 +6,13 @@
 //! What a plugin itself calls lives on the CredentialBroker's own listener
 //! ([`crate::broker`]), never here: this module is the public API.
 //!
+//! Slice d3 adds **PluginConnections** (ADR-0072 §5): per manifest connection
+//! slot, an admin binds the one destination (`base_url`) and credential the
+//! broker may use for it. The credential is write-only — written through to
+//! the SecretProvider under a server-minted key, never readable back by any
+//! endpoint — and every bind replaces destination and credential together,
+//! so a destination is never re-aimed with a credential entered for another.
+//!
 //! **Third-party installs are off** (ADR-0072 consequences) until
 //! StepUpConfirmation and publisher signatures exist: only a catalog entry
 //! compiled into this binary can be installed, and only by **digest** of its
@@ -21,9 +28,11 @@ use axum::Json;
 use scarab_engine::DbError;
 use scarab_identity::Action;
 use scarab_plugin::{
-    admit_for_mmp, validate_installation_name, DeploymentSourceTarget, EnvironmentTargetsPage,
-    InstallationDeploymentSource, InstallationState, InstallationUsage, PluginCapability,
-    PluginInstallation, PluginManifest, PluginStoreError, RuntimeStatus, UnmappedGrouping,
+    admit_for_mmp, validate_installation_name, ConnectionSlot, DeploymentSourceTarget,
+    EnvironmentTargetsPage, InstallationDeploymentSource, InstallationState, InstallationUsage,
+    PluginCapability, PluginConnection, PluginConnectionAuthScheme, PluginInstallation,
+    PluginManifest, PluginStoreError, RuntimeStatus, UnmappedGrouping,
+    MAX_CONNECTION_BASE_URL_CHARS, MAX_CONNECTION_CA_PEM_BYTES, MAX_CONNECTION_CREDENTIAL_BYTES,
     MAX_TARGETS_PER_INSTALLATION, MAX_UNMAPPED_GROUPINGS_PER_INSTALLATION, PAGE_DEFAULT_LIMIT,
     PAGE_MAX_LIMIT,
 };
@@ -36,6 +45,18 @@ use super::{authorize_scoped, rbac_scope, ApiError, AppState};
 /// The first-party Argo CD plugin's manifest, compiled in: what an admin
 /// approves for it is exactly this document plus a digest (ADR-0072 §1-2).
 const ARGOCD_MANIFEST_JSON: &str = include_str!("../../scarab-plugin-argocd/manifest.json");
+
+/// The reserved secret-scope org PluginConnection credentials live under
+/// (ADR-0072 §5), beside forge credentials' `_forge`: a connection row holds
+/// only its key there (`pc-<uuid>`), and the broker reads the bytes at use.
+pub const PLUGIN_CONNECTION_CREDENTIALS_ORG: &str = "_plugin_connections";
+
+/// [`PLUGIN_CONNECTION_CREDENTIALS_ORG`] as a secret scope.
+pub(crate) fn plugin_connection_secret_scope() -> scarab_secrets::SecretScope {
+    scarab_secrets::SecretScope::Org {
+        org: PLUGIN_CONNECTION_CREDENTIALS_ORG.to_string(),
+    }
+}
 
 /// The plugin runtime's policy as the API enforces it (from
 /// [`crate::config::PluginsConfig`]).
@@ -510,6 +531,164 @@ impl From<&DeploymentSourceTarget> for DeploymentSourceTargetDto {
     }
 }
 
+/// One connection slot of an installation and what an admin bound to it
+/// (ADR-0072 §5). Never carries the credential, nor its secret key.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PluginConnectionDto {
+    /// The manifest's slot name.
+    pub slot: String,
+    /// The schemes the manifest allows; `bearer` is the only one today.
+    pub auth_schemes: Vec<String>,
+    /// What the plugin may send through it: reads only.
+    pub read_rules: Vec<RequestRuleDto>,
+    /// Whether an admin has bound it. Unbound, the broker answers the
+    /// plugin's requests on it with 409.
+    pub configured: bool,
+    /// Where every request on it goes — and nowhere else.
+    pub base_url: Option<String>,
+    pub auth_scheme: Option<String>,
+    /// Whether the credential is present in the secret store. Write-only:
+    /// no endpoint returns it.
+    pub credential_set: bool,
+    /// The CA certificates (PEM) that are the ONLY trust anchors for
+    /// `base_url`; absent = the platform's roots. Certificates are public.
+    pub ca_pem: Option<String>,
+    /// `base_url` is plain `http://`: the credential crosses the network in
+    /// the clear. Allowed (an in-cluster Service, say); the UI warns.
+    pub insecure_http: bool,
+    pub updated_by: Option<String>,
+    /// Unix-ms.
+    pub updated_at: Option<i64>,
+}
+
+fn connection_dto(
+    slot: &ConnectionSlot,
+    bound: Option<&PluginConnection>,
+    credential_keys: &std::collections::BTreeSet<String>,
+) -> PluginConnectionDto {
+    PluginConnectionDto {
+        slot: slot.name.clone(),
+        auth_schemes: slot.auth_schemes.clone(),
+        read_rules: slot
+            .read_rules
+            .iter()
+            .map(|r| RequestRuleDto {
+                method: r.method.clone(),
+                path: r.path.clone(),
+            })
+            .collect(),
+        configured: bound.is_some(),
+        base_url: bound.map(|c| c.base_url.clone()),
+        auth_scheme: bound.map(|c| c.auth_scheme.as_str().to_string()),
+        credential_set: bound.is_some_and(|c| credential_keys.contains(&c.credential_ref)),
+        ca_pem: bound.and_then(|c| c.ca_pem.clone()),
+        insecure_http: bound.is_some_and(|c| c.base_url.starts_with("http://")),
+        updated_by: bound.map(|c| c.updated_by.clone()),
+        updated_at: bound.map(|c| c.updated_at),
+    }
+}
+
+/// `PUT /v1/orgs/{org}/plugins/{name}/connections/{slot}`: bind the slot's
+/// destination and credential, replacing any previous binding whole.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PutPluginConnectionRequest {
+    /// `https://host[:port][/prefix]` (or `http://`, warned about). Every
+    /// request the plugin sends on this slot goes here; it cannot pick
+    /// another host.
+    pub base_url: String,
+    /// The bearer token the broker adds upstream. Required on every bind —
+    /// a new destination never inherits a credential entered for another —
+    /// and never readable back.
+    pub credential: String,
+    /// PEM CA certificates to trust INSTEAD of the platform roots, for an
+    /// internal CA (https only). There is no skip-verify.
+    #[serde(default)]
+    pub ca_pem: Option<String>,
+}
+
+/// The bound form of an admin's base URL: an absolute `http(s)` URL with a
+/// host and no userinfo, query or fragment, without a trailing `/` — the
+/// broker appends the matched path to it.
+fn normalize_connection_base_url(raw: &str) -> Result<String, ApiError> {
+    let raw = raw.trim();
+    let bad = |why: &str| {
+        Err(ApiError::BadRequest(format!(
+            "base_url {why}; it is `https://host[:port][/prefix]`"
+        )))
+    };
+    if raw.chars().count() > MAX_CONNECTION_BASE_URL_CHARS {
+        return bad(&format!(
+            "is longer than {MAX_CONNECTION_BASE_URL_CHARS} characters"
+        ));
+    }
+    let Ok(url) = reqwest::Url::parse(raw) else {
+        return bad("is not an absolute URL");
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return bad("must be http or https");
+    }
+    if url.host_str().is_none_or(str::is_empty) {
+        return bad("needs a host");
+    }
+    // Userinfo would be a second credential beside the bound one; a query or
+    // fragment would be glued onto every request in ways nobody reads.
+    if !url.username().is_empty() || url.password().is_some() {
+        return bad("must not carry a user or password");
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return bad("must not carry a query or fragment");
+    }
+    Ok(url.as_str().trim_end_matches('/').to_string())
+}
+
+/// The credential as the broker will send it: a bearer token, so visible
+/// ASCII with no spaces — which also keeps it from ever splitting a header.
+fn check_connection_credential(raw: &str) -> Result<String, ApiError> {
+    let token = raw.trim();
+    if token.is_empty() {
+        return Err(ApiError::BadRequest("credential is required".into()));
+    }
+    if token.len() > MAX_CONNECTION_CREDENTIAL_BYTES {
+        return Err(ApiError::BadRequest(format!(
+            "credential is longer than {MAX_CONNECTION_CREDENTIAL_BYTES} bytes"
+        )));
+    }
+    if !token.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(ApiError::BadRequest(
+            "a bearer credential is visible ASCII with no spaces".into(),
+        ));
+    }
+    Ok(token.to_string())
+}
+
+/// A CA bundle an upstream client can actually be built with, for an
+/// `https` destination only (a CA means nothing over plain http).
+fn check_connection_ca(raw: Option<&str>, base_url: &str) -> Result<Option<String>, ApiError> {
+    let Some(pem) = raw.map(str::trim).filter(|p| !p.is_empty()) else {
+        return Ok(None);
+    };
+    if !base_url.starts_with("https://") {
+        return Err(ApiError::BadRequest(
+            "ca_pem applies to an https base_url only".into(),
+        ));
+    }
+    if pem.len() > MAX_CONNECTION_CA_PEM_BYTES {
+        return Err(ApiError::BadRequest(format!(
+            "ca_pem is larger than {MAX_CONNECTION_CA_PEM_BYTES} bytes"
+        )));
+    }
+    crate::broker_proxy::upstream_client(Some(pem))
+        .map_err(|e| ApiError::BadRequest(format!("ca_pem: {e}")))?;
+    Ok(Some(format!("{pem}\n")))
+}
+
+/// A fresh credential key: `pc-<uuid>`. Server-minted, so an admin can never
+/// point a connection at another connection's secret.
+fn mint_connection_credential_ref() -> String {
+    format!("pc-{}", uuid::Uuid::new_v4().simple())
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -752,9 +931,9 @@ pub(crate) async fn get_plugin(
     Ok(Json(with_sources(&st, &installation).await?))
 }
 
-/// Uninstall. Removes every Environment source naming it and retires the
-/// name in this org for good; its Deployment history stays. Administer on
-/// the Org.
+/// Uninstall. Removes every Environment source naming it and its
+/// connections (and their credentials), and retires the name in this org for
+/// good; its Deployment history stays. Administer on the Org.
 #[utoipa::path(
     delete,
     path = "/v1/orgs/{org}/plugins/{name}",
@@ -781,9 +960,13 @@ pub(crate) async fn uninstall_plugin(
         .await
         .map_err(plugin_store_api_error)?
         .ok_or(ApiError::NotFound)?;
+    // Its connections went with it; their credentials live in another store.
+    for credential_ref in &removed.connection_credential_refs {
+        delete_connection_credential(&st, credential_ref).await;
+    }
     Ok(Json(UninstalledPluginDto {
         name,
-        removed_deployment_sources: removed.iter().map(Into::into).collect(),
+        removed_deployment_sources: removed.deployment_sources.iter().map(Into::into).collect(),
     }))
 }
 
@@ -941,6 +1124,242 @@ pub(crate) async fn environment_deployment_targets(
         .await
         .map_err(plugin_store_api_error)?;
     Ok(Json(targets.iter().map(Into::into).collect()))
+}
+
+/// An installation in `org` and the manifest slot `slot` of it, or 404.
+async fn installation_and_slot(
+    st: &AppState,
+    org: &str,
+    name: &str,
+    slot: &str,
+) -> Result<(PluginInstallation, ConnectionSlot), ApiError> {
+    let installation = store(st)?
+        .installation(org, name)
+        .await
+        .map_err(plugin_store_api_error)?
+        .ok_or(ApiError::NotFound)?;
+    let slot = installation
+        .manifest
+        .connections
+        .iter()
+        .find(|s| s.name == slot)
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "plugin installation `{name}` declares no connection slot `{slot}`"
+            ))
+        })?;
+    Ok((installation, slot))
+}
+
+/// The keys present in the connection-credential scope — names only, never
+/// a value — so a binding whose secret went missing reads "not set".
+async fn credential_keys(st: &AppState) -> Result<std::collections::BTreeSet<String>, ApiError> {
+    match st.secrets.as_deref() {
+        Some(secrets) => Ok(secrets
+            .list_scoped(&plugin_connection_secret_scope())
+            .await
+            .map_err(super::secret_err)?
+            .into_iter()
+            .collect()),
+        None => Ok(Default::default()),
+    }
+}
+
+/// Delete a credential no binding references any more. Best effort: a
+/// failure leaves an unreachable secret (logged), never a broken binding.
+async fn delete_connection_credential(st: &AppState, credential_ref: &str) {
+    if let Some(secrets) = st.secrets.as_deref() {
+        if let Err(e) = secrets
+            .delete(&plugin_connection_secret_scope(), credential_ref)
+            .await
+        {
+            tracing::warn!(credential_ref, error = %e,
+                "plugin connection: an unreferenced credential could not be deleted");
+        }
+    }
+}
+
+/// An installation's connection slots and what is bound to each, in
+/// manifest order — never a credential. Administer on the Org.
+#[utoipa::path(
+    get,
+    path = "/v1/orgs/{org}/plugins/{name}/connections",
+    params(
+        ("org" = String, Path, description = "org"),
+        ("name" = String, Path, description = "installation name")
+    ),
+    summary = "A plugin's connection slots and their bindings (ADR-0072 §5)",
+    responses(
+        (status = 200, body = [PluginConnectionDto]),
+        (status = 403, description = "not an org admin"),
+        (status = 404, description = "no such installation, or plugins not configured")
+    )
+)]
+pub(crate) async fn list_plugin_connections(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((org, name)): Path<(String, String)>,
+) -> Result<Json<Vec<PluginConnectionDto>>, ApiError> {
+    org_admin(&st, &headers, &org).await?;
+    let store = store(&st)?;
+    let installation = store
+        .installation(&org, &name)
+        .await
+        .map_err(plugin_store_api_error)?
+        .ok_or(ApiError::NotFound)?;
+    let bound = store
+        .connections(&installation.id)
+        .await
+        .map_err(plugin_store_api_error)?;
+    let keys = credential_keys(&st).await?;
+    Ok(Json(
+        installation
+            .manifest
+            .connections
+            .iter()
+            .map(|slot| connection_dto(slot, bound.iter().find(|c| c.slot == slot.name), &keys))
+            .collect(),
+    ))
+}
+
+/// Bind a connection slot to its destination and credential (ADR-0072 §5),
+/// replacing any previous binding whole. Administer on the Org.
+///
+/// The credential is written through to the secret store under a fresh
+/// server-minted key and is never readable back; the previous binding's
+/// credential is deleted once the new binding is stored. A response stream
+/// the plugin has open on the old binding is cut within seconds.
+#[utoipa::path(
+    put,
+    path = "/v1/orgs/{org}/plugins/{name}/connections/{slot}",
+    params(
+        ("org" = String, Path, description = "org"),
+        ("name" = String, Path, description = "installation name"),
+        ("slot" = String, Path, description = "the manifest's connection slot")
+    ),
+    request_body = PutPluginConnectionRequest,
+    summary = "Bind a plugin connection's destination and credential (ADR-0072 §5)",
+    responses(
+        (status = 200, body = PluginConnectionDto),
+        (status = 400, description = "unknown slot, or a malformed base URL, credential or CA"),
+        (status = 403, description = "not an org admin"),
+        (status = 404, description = "no such installation, or plugins or the secret store not configured")
+    )
+)]
+pub(crate) async fn put_plugin_connection(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((org, name, slot)): Path<(String, String, String)>,
+    Json(body): Json<PutPluginConnectionRequest>,
+) -> Result<Json<PluginConnectionDto>, ApiError> {
+    let by = org_admin(&st, &headers, &org).await?;
+    let store = store(&st)?;
+    // No secret store, no write-through target: refusing is the only honest
+    // answer, as for forge connections (ADR-0060 part D).
+    let secrets = st.secrets.as_deref().ok_or(ApiError::NotFound)?;
+    let (installation, slot) = installation_and_slot(&st, &org, &name, &slot).await?;
+    if !slot
+        .auth_schemes
+        .iter()
+        .any(|s| s == PluginConnectionAuthScheme::Bearer.as_str())
+    {
+        return Err(ApiError::BadRequest(format!(
+            "connection slot `{}` allows no scheme the broker can inject",
+            slot.name
+        )));
+    }
+    let base_url = normalize_connection_base_url(&body.base_url)?;
+    let credential = check_connection_credential(&body.credential)?;
+    let ca_pem = check_connection_ca(body.ca_pem.as_deref(), &base_url)?;
+
+    // Secret first, row second: a failure in between leaves an orphan
+    // secret (deleted below), never a binding whose credential never landed.
+    let credential_ref = mint_connection_credential_ref();
+    secrets
+        .put(
+            &plugin_connection_secret_scope(),
+            scarab_secrets::Secret {
+                key: credential_ref.clone(),
+                value: credential.into_bytes(),
+            },
+        )
+        .await
+        .map_err(super::secret_err)?;
+    let connection = PluginConnection {
+        installation_id: installation.id.clone(),
+        slot: slot.name.clone(),
+        base_url,
+        auth_scheme: PluginConnectionAuthScheme::Bearer,
+        credential_ref: credential_ref.clone(),
+        ca_pem,
+        updated_by: by.clone(),
+        updated_at: st.clock.now().await.0,
+    };
+    let previous = match store.put_connection(&connection).await {
+        Ok(previous) => previous,
+        Err(e) => {
+            delete_connection_credential(&st, &credential_ref).await;
+            return Err(plugin_store_api_error(e));
+        }
+    };
+    if let Some(previous) = previous {
+        delete_connection_credential(&st, &previous).await;
+    }
+    // The destination is part of the authority: who aimed it where is the
+    // audit line worth keeping.
+    tracing::warn!(
+        org,
+        installation = %installation.name,
+        slot = %slot.name,
+        base_url = %connection.base_url,
+        by,
+        "plugin connection bound (ADR-0072 §5)"
+    );
+    let keys = credential_keys(&st).await?;
+    Ok(Json(connection_dto(&slot, Some(&connection), &keys)))
+}
+
+/// Unbind a connection slot and delete its credential. The broker answers
+/// the plugin's requests on it with 409 from then on, and cuts a response
+/// stream already open within seconds. Administer on the Org.
+#[utoipa::path(
+    delete,
+    path = "/v1/orgs/{org}/plugins/{name}/connections/{slot}",
+    params(
+        ("org" = String, Path, description = "org"),
+        ("name" = String, Path, description = "installation name"),
+        ("slot" = String, Path, description = "the manifest's connection slot")
+    ),
+    summary = "Unbind a plugin connection and delete its credential (ADR-0072 §5)",
+    responses(
+        (status = 204, description = "unbound"),
+        (status = 400, description = "unknown slot"),
+        (status = 403, description = "not an org admin"),
+        (status = 404, description = "no such installation or binding, or plugins not configured")
+    )
+)]
+pub(crate) async fn delete_plugin_connection(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((org, name, slot)): Path<(String, String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let by = org_admin(&st, &headers, &org).await?;
+    let (installation, slot) = installation_and_slot(&st, &org, &name, &slot).await?;
+    let removed = store(&st)?
+        .delete_connection(&installation.id, &slot.name)
+        .await
+        .map_err(plugin_store_api_error)?
+        .ok_or(ApiError::NotFound)?;
+    delete_connection_credential(&st, &removed.credential_ref).await;
+    tracing::warn!(
+        org,
+        installation = %installation.name,
+        slot = %slot.name,
+        by,
+        "plugin connection unbound (ADR-0072 §5)"
+    );
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]

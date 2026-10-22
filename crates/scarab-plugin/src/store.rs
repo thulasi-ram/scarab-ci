@@ -9,7 +9,8 @@
 use async_trait::async_trait;
 
 use crate::{
-    InstallationState, PluginInstallation, ReportIngest, ReportItemOutcome, RuntimeStatus,
+    BrokerJournalEntry, InstallationState, PluginConnection, PluginInstallation, ReportIngest,
+    ReportItemOutcome, RuntimeStatus,
 };
 
 /// How long a report receipt (idempotency key → outcome) is kept. A repeat
@@ -138,6 +139,17 @@ pub struct UnmappedGrouping {
     pub last_target_id: String,
 }
 
+/// What an uninstall removed with the installation.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PluginUninstall {
+    /// The Environment sources that named it, sorted.
+    pub deployment_sources: Vec<InstallationDeploymentSource>,
+    /// The SecretProvider keys of its PluginConnections' credentials. The
+    /// rows went with the installation; the caller deletes the secrets, which
+    /// live in another store (ADR-0072 §5).
+    pub connection_credential_refs: Vec<String>,
+}
+
 /// A [`PluginStore`] failure.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PluginStoreError {
@@ -243,17 +255,17 @@ pub trait PluginStore: Send + Sync {
         probe_passed_at: Option<i64>,
     ) -> Result<bool, PluginStoreError>;
 
-    /// Uninstall: remove the installation, its cursors, receipts and unmapped
-    /// counts, **and every EnvironmentDeploymentSource naming it**, and retire
-    /// its name in the Org for good — atomically. Returns the sources it
-    /// removed; `None` if there was no such installation.
+    /// Uninstall: remove the installation, its cursors, receipts, unmapped
+    /// counts and PluginConnections, **and every EnvironmentDeploymentSource
+    /// naming it**, and retire its name in the Org for good — atomically.
+    /// Returns what it removed; `None` if there was no such installation.
     async fn uninstall(
         &self,
         org: &str,
         name: &str,
         by: &str,
         at: i64,
-    ) -> Result<Option<Vec<InstallationDeploymentSource>>, PluginStoreError>;
+    ) -> Result<Option<PluginUninstall>, PluginStoreError>;
 
     /// The EnvironmentDeploymentSources in `org` that name the installation
     /// `name` (whether or not it exists — a source written before
@@ -332,4 +344,54 @@ pub trait PluginStore: Send + Sync {
     /// Drop report receipts received before `received_before`. Returns how
     /// many went.
     async fn prune_report_receipts(&self, received_before: i64) -> Result<u64, PluginStoreError>;
+
+    /// Bind (or re-bind) a PluginConnection, replacing the slot's previous
+    /// binding whole. Returns the previous binding's `credential_ref`, whose
+    /// secret the caller now deletes. [`PluginStoreError::NotFound`] if the
+    /// installation is gone (an uninstall won the race); nothing is stored
+    /// then. Whether the slot exists in the manifest is the caller's check.
+    async fn put_connection(
+        &self,
+        connection: &PluginConnection,
+    ) -> Result<Option<String>, PluginStoreError>;
+
+    /// The installation's PluginConnections, by slot.
+    async fn connections(
+        &self,
+        installation_id: &str,
+    ) -> Result<Vec<PluginConnection>, PluginStoreError>;
+
+    /// One binding — what the broker reads on every proxied request, and
+    /// re-reads while a response streams, so a re-bind or unbind reaches a
+    /// stream already open.
+    async fn connection(
+        &self,
+        installation_id: &str,
+        slot: &str,
+    ) -> Result<Option<PluginConnection>, PluginStoreError>;
+
+    /// Unbind a slot. Returns the removed binding (its secret is the
+    /// caller's to delete); `None` if it was not bound.
+    async fn delete_connection(
+        &self,
+        installation_id: &str,
+        slot: &str,
+    ) -> Result<Option<PluginConnection>, PluginStoreError>;
+
+    /// Append broker journal entries (ADR-0072 §5), in order.
+    async fn append_broker_journal(
+        &self,
+        entries: &[BrokerJournalEntry],
+    ) -> Result<(), PluginStoreError>;
+
+    /// The installation's newest journal entries, newest first.
+    async fn broker_journal(
+        &self,
+        installation_id: &str,
+        limit: usize,
+    ) -> Result<Vec<BrokerJournalEntry>, PluginStoreError>;
+
+    /// Drop journal entries started before `started_before`. Returns how many
+    /// went.
+    async fn prune_broker_journal(&self, started_before: i64) -> Result<u64, PluginStoreError>;
 }

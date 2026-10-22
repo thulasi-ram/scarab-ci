@@ -108,6 +108,30 @@ pub async fn sweep_plugin_receipts(
         .map_err(|e| e.to_string())
 }
 
+/// Prune CredentialBroker journal entries older than
+/// [`BROKER_JOURNAL_RETENTION_MS`](scarab_plugin::BROKER_JOURNAL_RETENTION_MS)
+/// (ADR-0072 §5; owner default 9: 14 days), under the same leader lease as
+/// the log sweep.
+pub async fn sweep_plugin_broker_journal(
+    db: &Arc<dyn Db>,
+    plugins: &dyn scarab_plugin::PluginStore,
+    clock: &Arc<dyn Clock>,
+    owner: &str,
+) -> Result<u64, String> {
+    let lease = db
+        .lease(RETENTION_LEASE, owner, RETENTION_LEASE_TTL_MS)
+        .await
+        .map_err(|e| e.to_string())?;
+    if lease.owner != owner {
+        return Ok(0);
+    }
+    let cutoff = clock.now().await.0 - scarab_plugin::BROKER_JOURNAL_RETENTION_MS;
+    plugins
+        .prune_broker_journal(cutoff)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Delete one run's log blobs, then its index. Body deletion is best-effort
 /// per key (a missing blob is already gone); the index drop only happens
 /// after the pass over the bodies, so a partial failure re-sweeps.
@@ -216,12 +240,13 @@ impl scarab_engine::WorkspaceSnapshots for CasSnapshots {
             Err(scarab_storage::StorageError::NotFound) => return Ok(None),
             Err(e) => return Err(e.to_string()),
         };
-        Ok(entries.into_iter().find(|e| e.name == *leaf).and_then(|e| {
-            match e.target {
+        Ok(entries
+            .into_iter()
+            .find(|e| e.name == *leaf)
+            .and_then(|e| match e.target {
                 scarab_storage::TreeTarget::Blob(b) => Some(b.0),
                 scarab_storage::TreeTarget::Tree(_) => None,
-            }
-        }))
+            }))
     }
 }
 
@@ -629,10 +654,7 @@ pub async fn sweep_cas(
     }
     // Gauge-like, SET per pass rather than accumulated, so a repaired cold
     // tier is visible as the value returning to zero.
-    crate::metrics::set_cas_gc_cold_residue(
-        residue.len() as u64,
-        suppressed_residue.len() as u64,
-    );
+    crate::metrics::set_cas_gc_cold_residue(residue.len() as u64, suppressed_residue.len() as u64);
 
     if swept > 0 {
         tracing::info!(swept, marked = marked.len(), "cas gc pass complete");
@@ -673,9 +695,13 @@ pub fn spawn_sweeper(
                     }
                     Err(e) => tracing::warn!(error = %e, "plugin receipt prune failed"),
                 }
+                match sweep_plugin_broker_journal(&db, plugins.as_ref(), &clock, &owner).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(entries = n, "retention: pruned broker journal"),
+                    Err(e) => tracing::warn!(error = %e, "broker journal prune failed"),
+                }
             }
-            if let Err(e) =
-                sweep_cas(&db, &cas, &store, &clock, &owner, gc, depot.as_deref()).await
+            if let Err(e) = sweep_cas(&db, &cas, &store, &clock, &owner, gc, depot.as_deref()).await
             {
                 tracing::warn!(error = %e, "cas gc pass failed");
             }
