@@ -4,8 +4,8 @@
 //! for a projected broker token and for nothing else.
 //!
 //! `#[ignore]`d and gated on `SCARAB_TEST_KUBE`, so `cargo test` never runs it
-//! and never touches an ambient kubeconfig. Run it with `just kube-tests
-//! plugin` (or the whole tier with `just kube-tests`), which points
+//! and never touches an ambient kubeconfig. Run it with `just
+//! plugin-kube-tests` (or the whole tier with `just kube-tests`), which points
 //! `KUBECONFIG` at the isolated proc-mode kind cluster.
 //!
 //! Once `SCARAB_TEST_KUBE` is set, a misconfiguration is a **panic**, never a
@@ -58,20 +58,32 @@ const INSTALLATION_ID: &str = "0123456789";
 
 fn opted_in() -> bool {
     if std::env::var("SCARAB_TEST_KUBE").is_err() {
-        eprintln!("skipping: set SCARAB_TEST_KUBE=1 (use `just kube-tests plugin`)");
+        eprintln!("skipping: set SCARAB_TEST_KUBE=1 (use `just plugin-kube-tests`)");
         return false;
     }
     true
 }
 
+/// Install `ring` as the process-level rustls CryptoProvider. This crate's
+/// graph links more than one provider (`ring` and `aws-lc-rs`), so rustls
+/// 0.23 refuses to auto-select and panics at the first TLS handshake — the
+/// kube client dialing the API server. Same call as `scarab-server`'s
+/// `main.rs`; the `Err` (a provider is already installed, by an earlier test
+/// in this process) is ignored.
+fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 /// A client for the kind cluster the tier was pointed at — and only that.
-/// Panics (the tier is opted in) on anything else.
+/// Panics (the tier is opted in) on anything else. Every case builds its
+/// client here, so this is where the CryptoProvider goes in.
 async fn kind_client() -> Client {
+    install_crypto_provider();
     let path = match std::env::var("KUBECONFIG") {
         Ok(p) if !p.is_empty() => p,
         _ => panic!(
             "KUBECONFIG is not set, but SCARAB_TEST_KUBE is — this tier never uses an ambient \
-             kubeconfig. Run `just kube-tests plugin`, which points it at the isolated \
+             kubeconfig. Run `just plugin-kube-tests`, which points it at the isolated \
              proc-mode kind cluster."
         ),
     };

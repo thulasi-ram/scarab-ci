@@ -29,3 +29,8 @@ uuid = { workspace = true }
 # an assertion fails: `catch_unwind` around the body, then cleanup, then
 # re-raise.
 futures = { workspace = true }
+# The live tier builds a kube client (rustls) in a crate graph that links more
+# than one rustls CryptoProvider, so rustls cannot pick one and panics on the
+# first TLS handshake. tests/cluster.rs installs `ring` first, exactly as the
+# server's composition root does.
+rustls = { workspace = true }
