@@ -182,12 +182,18 @@ demo-oracle ref="edge":
 
 # Run scarab-server in the FOREGROUND against the dev stack (Ctrl-C to stop).
 # Useful when iterating; `just up` runs it in the background instead. Needs the
-# stack up first (`just up`). Env comes from the one dev env file, not inline.
+# stack up first (`just up`). Env comes from the one dev env file, not inline,
+# plus what `just up` DISCOVERED (`.env.generated`, when present): the plugin
+# namespace and how a plugin Pod reaches the broker. Without it, with
+# SCARAB_PLUGINS=on, the broker peer is unset and no plugin ever runs.
 serve:
     #!/usr/bin/env bash
     set -euo pipefail
     [ -f deploy/local-proc/.env ] || { echo "==> creating deploy/local-proc/.env from .env.example"; cp deploy/local-proc/.env.example deploy/local-proc/.env; }
     set -a && source deploy/local-proc/.env && set +a
+    if [ -f deploy/local-proc/.env.generated ]; then
+      set -a && source deploy/local-proc/.env.generated && set +a
+    fi
     export KUBECONFIG=deploy/local-proc/.kubeconfig
     cargo run -p scarab-server -- --role converged --serve
 
