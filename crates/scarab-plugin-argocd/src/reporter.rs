@@ -2,23 +2,29 @@
 //! the DeploymentReporterContract (ADR-0070 §11).
 //!
 //! One **session** is: who am I (`/whoami`) → seed every cursor
-//! (`/targets`, all pages) → list Applications → watch them (NDJSON, from
-//! the list's `resourceVersion`). Anything that breaks a session — a cut
-//! stream, a 401/403, the broker unreachable — ends it, and the next one
-//! starts after a backoff with a fresh seed and list, so nothing missed
-//! while disconnected is lost and nothing already reported is repeated.
+//! (`/targets`, all pages) → open the watch (NDJSON, no `resourceVersion`)
+//! → list Applications → process what the watch buffered meanwhile → once
+//! more, a catch-up list. Anything that breaks a session — a cut stream, a
+//! 401/403, the broker unreachable — ends it, and the next one starts after
+//! a backoff with a fresh seed and list, so nothing missed while
+//! disconnected is lost and nothing already reported is repeated. One
+//! Application whose managed resources cannot be read does not: it stays
+//! unreported, and is read again on its next change and every resend tick.
 //!
 //! Per Application, changes are coalesced for [`Config::debounce`]; then,
 //! only if its target revision or last reconcile moved, its managed
 //! resources are re-read for the version (ADR-0070 §4), and it is assessed.
 //! A report goes out only when *(version, status, label)* differs from the
-//! last one — transitions only, never per reconcile.
+//! last one — transitions only, never per reconcile. A change older than
+//! what was already observed (by `resourceVersion`) is dropped, so a
+//! buffered snapshot can never undo a newer list.
 //!
 //! Reports leave in one queue, in order, one batch at a time (a second
 //! batch in flight is a 429). Each carries the target's next sequence and a
 //! fresh idempotency key; a batch that got no answer is resent unchanged,
 //! so a retry is a `duplicate`, never a second fact.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::hash::{BuildHasher, Hasher};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -42,6 +48,9 @@ const REPORT_DEPLOYMENTS: &str = "report_deployments";
 const STREAM_CHANNEL: usize = 256;
 /// The longest NDJSON line accepted (one Application object).
 const MAX_STREAM_LINE_BYTES: usize = 32 * 1024 * 1024;
+/// The broker's `rejected` reasons for its caps (targets per installation,
+/// unmapped groupings): the only rejections worth trying again.
+const CAP_REJECTION: &str = "cap:";
 /// `Retry-After` when a 429/503 has none: the broker's own defaults.
 const DEFAULT_RETRY_AFTER_429: Duration = Duration::from_secs(1);
 const DEFAULT_RETRY_AFTER_503: Duration = Duration::from_secs(5);
@@ -107,7 +116,19 @@ struct AppView {
 
 /// One line from the watch-stream reader.
 enum StreamMsg {
-    Line(StreamLine),
+    Line(Box<StreamLine>),
+    /// The watch could not be opened.
+    OpenFailed(BrokerError),
+}
+
+/// What reading an Application's managed resources gave.
+enum ImageRead {
+    Read(BTreeSet<String>),
+    /// Argo has none (404: the Application went away meanwhile).
+    Gone,
+    /// This one read failed (an Argo 5xx, a timeout, an unreadable or
+    /// oversized body): this Application only, read again later.
+    Failed,
 }
 
 struct Reporter {
@@ -126,6 +147,12 @@ struct Reporter {
     /// A `stale` answer means this process's cursors are behind the
     /// broker's: re-seed before the next report.
     reseed_needed: bool,
+    /// Targets whose managed resources could not be read: read again on the
+    /// resend tick (and on their next change).
+    needs_read: BTreeSet<String>,
+    /// Targets whose last report the broker rejected over a cap: decided
+    /// again on the resend tick, in case there is room now.
+    capped: BTreeSet<String>,
 }
 
 impl Reporter {
@@ -140,6 +167,8 @@ impl Reporter {
             apps: HashMap::new(),
             outbox: VecDeque::new(),
             reseed_needed: false,
+            needs_read: BTreeSet::new(),
+            capped: BTreeSet::new(),
         })
     }
 
@@ -163,38 +192,63 @@ impl Reporter {
 
         // Seed, then list: whatever the list shows is compared with what was
         // last ACCEPTED, so a restart reports only what changed meanwhile.
-        self.reseed().await?;
+        // Seed only — the previous session's views may be long out of date
+        // (or gone); they are decided again once the list below refreshes
+        // them.
+        self.reseed(false).await?;
         // Pending reports from a previous session go first, in order.
         self.flush(stop).await?;
-        let list: ApplicationList = self.broker.argocd_get("/api/v1/applications", &[]).await?;
-        let listed: BTreeSet<String> = list.items.iter().map(Application::target_id).collect();
-        self.apps.retain(|target, _| listed.contains(target));
-        for app in list.items {
-            self.observe(app).await?;
-        }
-        self.flush(stop).await?;
 
-        let resource_version = list.metadata.resource_version;
-        let query: Vec<(&str, &str)> = if resource_version.is_empty() {
-            vec![]
-        } else {
-            vec![("resourceVersion", resource_version.as_str())]
-        };
-        let resp = self
-            .broker
-            .argocd_stream("/api/v1/stream/applications", &query)
-            .await?;
+        // The watch opens BEFORE the list, without a `resourceVersion`, and
+        // buffers in the channel while the list is processed: Argo's Watch
+        // replays no backlog from a list's version (it only drops events
+        // older than it), so a change between a list and a watch opened
+        // from it would be lost until the next reconcile. Opened first, the
+        // change is in the stream; whatever both carry is a duplicate, and
+        // duplicates are harmless — older-or-equal versions are skipped, the
+        // fingerprint cache prevents re-reads, and only transitions report.
+        //
+        // Verified 2026-10-22 against argo-cd v2.13.0
+        // `server/application/application.go` (`Server.Watch`):
+        // `minVersion` from `resourceVersion` only filters; the ADDED
+        // snapshot is sent only when it is empty; the snapshot is taken
+        // BEFORE `appBroadcaster.Subscribe`, and no header is flushed before
+        // the first event. So (a) the open runs inside the reader task —
+        // with nothing to send, Argo answers no headers, and awaiting them
+        // here would hold the session; and (b) Argo's own snapshot→subscribe
+        // gap is closed by one catch-up list after the snapshot has drained.
         let (tx, mut rx) = mpsc::channel(STREAM_CHANNEL);
-        let reader = AbortOnDrop(tokio::spawn(read_ndjson(
-            resp,
+        let reader = AbortOnDrop(tokio::spawn(watch_applications(
+            self.broker.clone(),
             tx,
             self.cfg.stream_idle_reconnect,
         )));
+        let listed = self.list_applications().await?;
+        let names: BTreeSet<String> = listed.iter().map(Application::target_id).collect();
+        self.apps.retain(|target, _| names.contains(target));
+        self.needs_read.retain(|target| names.contains(target));
+        self.capped.retain(|target| names.contains(target));
+        for app in listed {
+            // Every listed app is decided (the reseed above decided none),
+            // but on the newer of the list's state and the one already held:
+            // argocd-server replicas each list from their own cache, which
+            // can lag the one an earlier session watched.
+            let app = match self.apps.get(&app.target_id()) {
+                Some(seen) if version_order(&app, &seen.app) == Some(Ordering::Less) => {
+                    seen.app.clone()
+                }
+                _ => app,
+            };
+            self.observe(app).await?;
+        }
+        self.flush(stop).await?;
         tracing::info!(apps = self.apps.len(), "argocd: watching Applications");
 
         let mut pending: HashMap<String, (Application, Instant)> = HashMap::new();
         let mut resend_tick = tokio::time::interval(self.cfg.resend_poll);
         resend_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The catch-up list: one resend period in, the snapshot has drained.
+        let mut catch_up_at = Some(Instant::now() + self.cfg.resend_poll);
         loop {
             let next_due = pending.values().map(|(_, at)| *at).min();
             tokio::select! {
@@ -204,7 +258,9 @@ impl Reporter {
                         drop(reader);
                         return Err(SessionEnd::Reconnect("the watch stream ended".into()));
                     }
+                    Some(StreamMsg::OpenFailed(e)) => return Err(e.into()),
                     Some(StreamMsg::Line(line)) => {
+                        let line = *line;
                         if let Some(err) = line.error {
                             return Err(SessionEnd::Reconnect(format!(
                                 "the watch stream reported an error: {}", err.message
@@ -214,18 +270,24 @@ impl Reporter {
                         let target = event.application.target_id();
                         match event.kind.as_str() {
                             "DELETED" => {
+                                let known = self
+                                    .apps
+                                    .get(&target)
+                                    .map(|v| &v.app)
+                                    .or_else(|| pending.get(&target).map(|(a, _)| a));
+                                if known.is_some_and(|a| {
+                                    version_order(&event.application, a) == Some(Ordering::Less)
+                                }) {
+                                    continue;
+                                }
                                 // No status means "gone" (ADR-0070 §5); the
                                 // board keeps what it last heard.
                                 pending.remove(&target);
                                 self.apps.remove(&target);
+                                self.needs_read.remove(&target);
+                                self.capped.remove(&target);
                             }
-                            _ => {
-                                let deadline = Instant::now() + self.cfg.debounce;
-                                pending
-                                    .entry(target)
-                                    .and_modify(|(app, _)| *app = event.application.clone())
-                                    .or_insert((event.application, deadline));
-                            }
+                            _ => self.queue(&mut pending, event.application),
                         }
                     }
                 },
@@ -246,11 +308,51 @@ impl Reporter {
                 }
                 _ = resend_tick.tick() => {
                     if self.reseed_needed {
-                        self.reseed().await?;
+                        self.reseed(true).await?;
                     }
                     self.resend_flagged().await?;
+                    self.retry_reads(&pending).await?;
+                    self.retry_capped();
+                    if catch_up_at.is_some_and(|at| Instant::now() >= at) {
+                        catch_up_at = None;
+                        for app in self.list_applications().await? {
+                            self.queue(&mut pending, app);
+                        }
+                    }
                     self.flush(stop).await?;
                 }
+            }
+        }
+    }
+
+    /// Every Application Argo lists for this token.
+    async fn list_applications(&self) -> Result<Vec<Application>, SessionEnd> {
+        let list: ApplicationList = self.broker.argocd_get("/api/v1/applications", &[]).await?;
+        Ok(list.items)
+    }
+
+    /// Take a changed Application into the debounce, unless what is already
+    /// observed or queued for it is newer: the watch's snapshot and the
+    /// catch-up list can both carry states older than the list before them,
+    /// and processing one would report a step backwards.
+    fn queue(&self, pending: &mut HashMap<String, (Application, Instant)>, app: Application) {
+        let target = app.target_id();
+        if self.apps.get(&target).is_some_and(|seen| {
+            matches!(
+                version_order(&app, &seen.app),
+                Some(Ordering::Less | Ordering::Equal)
+            )
+        }) {
+            return;
+        }
+        match pending.get_mut(&target) {
+            Some((queued, _)) => {
+                if version_order(&app, queued) != Some(Ordering::Less) {
+                    *queued = app;
+                }
+            }
+            None => {
+                pending.insert(target, (app, Instant::now() + self.cfg.debounce));
             }
         }
     }
@@ -258,8 +360,9 @@ impl Reporter {
     /// Seed cursors from `/targets` (all pages): the last accepted sequence
     /// and state per target. A target with a report still queued here keeps
     /// what this process last decided, so the queued report is not decided
-    /// again. Then re-assess every known Application against the result.
-    async fn reseed(&mut self) -> Result<(), SessionEnd> {
+    /// again. Then, with `decide_known`, re-assess every known Application
+    /// against the result (mid-session, where the views are current).
+    async fn reseed(&mut self, decide_known: bool) -> Result<(), SessionEnd> {
         let targets = self.broker.targets(false).await?;
         let queued: BTreeSet<String> = self
             .outbox
@@ -286,11 +389,45 @@ impl Reporter {
             cursor.owners = Some(t.owners);
         }
         self.reseed_needed = false;
-        let known: Vec<String> = self.apps.keys().cloned().collect();
-        for target in known {
-            self.decide(&target, false);
+        if decide_known {
+            let known: Vec<String> = self.apps.keys().cloned().collect();
+            for target in known {
+                self.decide(&target, false);
+            }
         }
         Ok(())
+    }
+
+    /// Read again every Application whose managed resources could not be
+    /// read, unless a newer change of it is already queued (that change
+    /// reads them anyway).
+    async fn retry_reads(
+        &mut self,
+        pending: &HashMap<String, (Application, Instant)>,
+    ) -> Result<(), SessionEnd> {
+        self.needs_read.retain(|t| self.apps.contains_key(t));
+        let due: Vec<Application> = self
+            .needs_read
+            .iter()
+            .filter(|t| !pending.contains_key(*t))
+            .filter_map(|t| self.apps.get(t).map(|v| v.app.clone()))
+            .collect();
+        for app in due {
+            tracing::info!(target_id = %app.target_id(), "argocd: reading managed resources again");
+            self.observe(app).await?;
+        }
+        Ok(())
+    }
+
+    /// Decide again every target whose last report hit a broker cap. One
+    /// with a report queued is skipped: that report's own answer decides.
+    fn retry_capped(&mut self) {
+        for target in std::mem::take(&mut self.capped) {
+            if self.outbox.iter().any(|i| i.target_id() == target) {
+                continue;
+            }
+            self.decide(&target, false);
+        }
     }
 
     /// Re-send every flagged target's current state (ADR-0070 §11) — the one
@@ -323,9 +460,27 @@ impl Reporter {
             .get(&target)
             .filter(|v| v.fingerprint == fingerprint)
             .and_then(|v| v.images.clone());
-        let images = match cached {
-            Some(images) => Some(images),
+        // Images are only ever reused under the fingerprint they were read
+        // with: a failed read leaves `None`, never the previous revision's
+        // images paired with the new one's state.
+        let read = match cached {
+            Some(images) => ImageRead::Read(images),
             None => self.read_images(&app).await?,
+        };
+        let images = match read {
+            ImageRead::Read(images) => {
+                self.needs_read.remove(&target);
+                Some(images)
+            }
+            // Retried on its next change only: a DELETED event follows.
+            ImageRead::Gone => {
+                self.needs_read.remove(&target);
+                None
+            }
+            ImageRead::Failed => {
+                self.needs_read.insert(target.clone());
+                None
+            }
         };
         self.apps.insert(
             target.clone(),
@@ -340,9 +495,11 @@ impl Reporter {
     }
 
     /// The Application's target pod-template images, from its managed
-    /// resources. `None` when Argo has none to give (the Application went
-    /// away meanwhile): it is tried again on its next change.
-    async fn read_images(&self, app: &Application) -> Result<Option<BTreeSet<String>>, SessionEnd> {
+    /// resources. Only a refusal of this installation itself ends the
+    /// session; any other failure is this Application's alone, so one app
+    /// Argo cannot render (a 5xx), or one too large to read in time, never
+    /// stops the others from being listed and watched.
+    async fn read_images(&self, app: &Application) -> Result<ImageRead, SessionEnd> {
         let path = format!(
             "/api/v1/applications/{}/managed-resources",
             encode_component(&app.metadata.name)
@@ -355,12 +512,30 @@ impl Reporter {
             )
             .await
         {
-            Ok(resources) => Ok(Some(target_images(&resources))),
+            Ok(resources) => Ok(ImageRead::Read(target_images(&resources))),
             Err(e @ BrokerError::Status { status: 404, .. }) => {
                 tracing::info!(target_id = %app.target_id(), error = %e, "argocd: no managed resources");
-                Ok(None)
+                Ok(ImageRead::Gone)
             }
-            Err(e) => Err(e.into()),
+            // The broker's own refusals (a revoked or killed installation,
+            // an expired token) are plain 401/403s, indistinguishable from
+            // Argo's — so every 401/403 ends the session. An Argo RBAC 403
+            // cannot single out one listed app: list and managed-resources
+            // need the same `applications, get`.
+            Err(
+                e @ (BrokerError::Token(_)
+                | BrokerError::Status {
+                    status: 401 | 403, ..
+                }),
+            ) => Err(e.into()),
+            Err(e) => {
+                tracing::warn!(
+                    target_id = %app.target_id(),
+                    error = %e,
+                    "argocd: managed resources unreadable; unreported until a read succeeds"
+                );
+                Ok(ImageRead::Failed)
+            }
         }
     }
 
@@ -523,9 +698,29 @@ impl Reporter {
                 self.reseed_needed = true;
             }
             "rejected" => {
-                // Nothing stored, not even the key. Never resent unchanged:
-                // the state stays marked as reported until it changes.
-                tracing::error!(%target_id, sequence, reason = reason.unwrap_or(""), "argocd: report rejected");
+                let reason = reason.unwrap_or("");
+                if reason.starts_with(CAP_REJECTION) {
+                    // Over a broker cap: nothing stored, no `/targets` row,
+                    // so core can never flag it for a resend — yet room may
+                    // come (a target retired, a grouping mapped). Un-mark it
+                    // (if this was its newest report) and decide it again on
+                    // the resend tick: one attempt per tick, never a loop.
+                    tracing::warn!(%target_id, sequence, %reason, "argocd: report over a broker cap; retrying on the resend tick");
+                    if let Some(c) = self.cursors.get_mut(target_id) {
+                        if c.last_sequence == sequence {
+                            match item {
+                                ReportItem::Status(_) => c.reported = None,
+                                ReportItem::Ownership(_) => c.owners = None,
+                            }
+                        }
+                    }
+                    self.capped.insert(target_id.to_string());
+                } else {
+                    // Nothing stored, not even the key. Never resent
+                    // unchanged: the state stays marked as reported until it
+                    // changes.
+                    tracing::error!(%target_id, sequence, %reason, "argocd: report rejected");
+                }
             }
             other => {
                 tracing::warn!(%target_id, sequence, outcome = other, "argocd: unknown report outcome");
@@ -546,6 +741,27 @@ impl Reporter {
                 "argocd: exiting with reports undelivered; the next start re-derives them"
             ),
         }
+    }
+}
+
+/// Open the watch — no `resourceVersion`, so Argo sends its ADDED snapshot
+/// first — and read it into `tx`. Bounded by `idle` while opening too:
+/// Argo sends no headers until its first event.
+async fn watch_applications(broker: Broker, tx: mpsc::Sender<StreamMsg>, idle: Duration) {
+    let opened = tokio::time::timeout(
+        idle,
+        broker.argocd_stream("/api/v1/stream/applications", &[]),
+    )
+    .await;
+    match opened {
+        Err(_) => tracing::info!(
+            ?idle,
+            "argocd: watch stream silent since opening; re-opening"
+        ),
+        Ok(Err(e)) => {
+            let _ = tx.send(StreamMsg::OpenFailed(e)).await;
+        }
+        Ok(Ok(resp)) => read_ndjson(resp, tx, idle).await,
     }
 }
 
@@ -575,7 +791,7 @@ async fn read_ndjson(mut resp: reqwest::Response, tx: mpsc::Sender<StreamMsg>, i
             }
             match serde_json::from_slice::<StreamLine>(line) {
                 Ok(parsed) => {
-                    if tx.send(StreamMsg::Line(parsed)).await.is_err() {
+                    if tx.send(StreamMsg::Line(Box::new(parsed))).await.is_err() {
                         return;
                     }
                 }
@@ -595,6 +811,15 @@ impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+/// How `a` compares with `b` by `resourceVersion`. Kubernetes calls it
+/// opaque, but Argo's own Watch compares it as an integer (`strconv.Atoi`);
+/// when either is not a number there is no order (`None`), and nothing is
+/// skipped for being old.
+fn version_order(a: &Application, b: &Application) -> Option<Ordering> {
+    let rv = |app: &Application| app.metadata.resource_version.parse::<u64>().ok();
+    Some(rv(a)?.cmp(&rv(b)?))
 }
 
 fn stopped(stop: &watch::Receiver<bool>) -> bool {
@@ -667,6 +892,79 @@ impl Backoff {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reporter holding one readable Application, `argocd/web` (no
+    /// network: nothing here sends).
+    fn reporter_with_web() -> Reporter {
+        let mut r = Reporter::new(Config::new("http://127.0.0.1:9", "/nonexistent")).unwrap();
+        r.org = "acme".into();
+        let app: Application = serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "web", "namespace": "argocd", "resourceVersion": "7" },
+            "spec": { "project": "prod" },
+            "status": { "sync": { "status": "Synced", "revision": "r1" }, "health": { "status": "Healthy" } }
+        }))
+        .unwrap();
+        r.apps.insert(
+            "argocd/web".into(),
+            AppView {
+                fingerprint: app.manifests_fingerprint(),
+                app,
+                images: Some(BTreeSet::from(["ghcr.io/acme/web:1".to_string()])),
+            },
+        );
+        r
+    }
+
+    /// Queue `web`'s state, and answer it with `outcome`/`reason` as a
+    /// flush would (the batch then leaves the queue).
+    fn send_and_answer(r: &mut Reporter, outcome: &str, reason: Option<&str>) {
+        r.decide("argocd/web", false);
+        let item = r.outbox.pop_front().expect("a report was queued");
+        assert!(r.outbox.is_empty());
+        r.read_result(&item, outcome, reason);
+    }
+
+    #[test]
+    fn a_cap_rejection_is_decided_again_on_the_tick_and_no_other_rejection_is() {
+        let mut r = reporter_with_web();
+        send_and_answer(
+            &mut r,
+            "rejected",
+            Some("cap: installation `argo` already reports 10000 targets"),
+        );
+        // No row was written, so core will never flag it: the reporter
+        // itself tries again on the resend tick, at the next sequence.
+        r.retry_capped();
+        assert_eq!(r.outbox.len(), 1, "re-decided after a cap rejection");
+        assert_eq!(r.outbox[0].sequence(), 2);
+        let item = r.outbox.pop_front().unwrap();
+        r.read_result(&item, "accepted", None);
+        r.retry_capped();
+        assert!(r.outbox.is_empty(), "accepted: nothing more to send");
+
+        // Any other rejection would be refused again unchanged: never retried.
+        let mut r = reporter_with_web();
+        send_and_answer(&mut r, "rejected", Some("label: over 512 characters"));
+        r.retry_capped();
+        r.decide("argocd/web", false);
+        assert!(
+            r.outbox.is_empty(),
+            "the rejected state stays marked as reported"
+        );
+    }
+
+    #[test]
+    fn versions_order_numerically_and_unknown_ones_never_order() {
+        let at = |rv: &str| {
+            let mut a = Application::default();
+            a.metadata.resource_version = rv.into();
+            a
+        };
+        assert_eq!(version_order(&at("9"), &at("10")), Some(Ordering::Less));
+        assert_eq!(version_order(&at("10"), &at("10")), Some(Ordering::Equal));
+        assert_eq!(version_order(&at(""), &at("10")), None);
+        assert_eq!(version_order(&at("abc"), &at("10")), None);
+    }
 
     #[test]
     fn backoff_doubles_to_its_cap_and_resets() {

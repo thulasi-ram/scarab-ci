@@ -618,3 +618,102 @@ async fn an_unmapped_grouping_is_resent_once_an_environment_lists_it() {
     assert_eq!(labels(&ds[0]), ["synced, healthy"]);
     w.finish().await;
 }
+
+fn live(ds: &[Value]) -> bool {
+    ds.first().is_some_and(|d| d["status"] == json!("live"))
+}
+
+#[tokio::test]
+async fn an_application_argo_cannot_render_stays_unreported_while_the_others_go_live() {
+    let Some(mut w) = world().await else { return };
+    // `bad` lists before `web`. Argo answers 500 for its managed resources
+    // (a controller that cannot render it): that is `bad`'s problem alone,
+    // never a reason to end the session and wedge every re-list.
+    w.fake.fail_managed_resources("argocd", "bad", true);
+    w.argo(
+        "bad",
+        FakeAppSpec {
+            project: "prod".into(),
+            images: vec!["ghcr.io/acme/bad:1".into()],
+            ..Default::default()
+        },
+    );
+    w.argo("web", web("r1", "ghcr.io/acme/web:1"));
+    w.start_reporter();
+    w.until("prod", "argocd/web", "web live", live).await;
+    // The watch is open and carrying changes, past `bad`.
+    w.settle(1).await;
+    assert!(
+        w.deployments("prod", "argocd/bad").await.is_empty(),
+        "no images, no version: nothing is reported for it"
+    );
+
+    // Argo recovers. Nothing about `bad` changes, so no event comes: the
+    // resend tick reads it again.
+    w.fake.fail_managed_resources("argocd", "bad", false);
+    let ds = w
+        .until("prod", "argocd/bad", "bad live once readable", live)
+        .await;
+    assert_eq!(ds[0]["version"], json!("ghcr.io/acme/bad:1"));
+    assert_eq!(labels(&ds[0]), ["synced, healthy"]);
+    w.finish().await;
+}
+
+#[tokio::test]
+async fn a_change_racing_the_session_start_is_reported_and_never_undone() {
+    let Some(mut w) = world().await else { return };
+    // r1 noticed, awaiting auto-sync. The sync completes the moment the
+    // reporter's list has been answered — between its list and its watch.
+    // Argo's Watch replays no backlog, so a watch opened from the list's
+    // `resourceVersion` would never hear of it.
+    w.argo(
+        "web",
+        FakeAppSpec {
+            sync: "OutOfSync".into(),
+            ..web("r1", "ghcr.io/acme/web:1")
+        },
+    );
+    w.clock.advance(1_000);
+    w.fake
+        .change_after_next_list("argocd", "web", web("r1", "ghcr.io/acme/web:1"));
+    w.start_reporter();
+    let ds = w.until("prod", "argocd/web", "v1 live", live).await;
+    assert_eq!(
+        labels(&ds[0]).last().map(String::as_str),
+        Some("synced, healthy")
+    );
+
+    // Restart. This time r2 goes live in Argo's OWN gap — after the watch's
+    // ADDED snapshot (which still shows r2 awaiting sync) and before it
+    // subscribes. The snapshot is older than the list the reporter may
+    // already have processed: it must never report a step backwards.
+    w.stop_reporter().await;
+    w.argo(
+        "web",
+        FakeAppSpec {
+            sync: "OutOfSync".into(),
+            ..web("r2", "ghcr.io/acme/web:2")
+        },
+    );
+    w.clock.advance(1_000);
+    w.fake
+        .change_after_next_snapshot("argocd", "web", web("r2", "ghcr.io/acme/web:2"));
+    w.start_reporter();
+    let v2 = version("ghcr.io/acme/web:2");
+    w.until("prod", "argocd/web", "v2 live", |ds| {
+        live(ds) && ds[0]["version"] == json!(v2)
+    })
+    .await;
+    // Whatever was buffered has been processed by the time a later change
+    // has reported.
+    w.settle(1).await;
+    let ds = w.deployments("prod", "argocd/web").await;
+    let l = labels(&ds[0]);
+    let first_live = l.iter().position(|x| x == "synced, healthy").unwrap();
+    assert!(
+        l[first_live..].iter().all(|x| x == "synced, healthy"),
+        "an older state was reported after a newer one: {l:?}"
+    );
+    assert_eq!(ds[0]["status"], json!("live"));
+    w.finish().await;
+}

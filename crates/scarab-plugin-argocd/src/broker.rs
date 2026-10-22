@@ -23,6 +23,17 @@ pub const BROKER_PREFIX: &str = "/_scarab/plugin/v1";
 pub const ARGOCD_SLOT: &str = "argocd";
 /// `/targets` page size: the contract's maximum.
 const TARGETS_PAGE_LIMIT: usize = 1000;
+/// The largest body read from the broker's own routes (`/whoami`, a
+/// `/targets` page of 1000 cursors, a report batch's results).
+const MAX_BROKER_BODY_BYTES: usize = 16 * 1024 * 1024;
+/// The largest Argo CD response read through the proxy. Managed resources
+/// carry every resource's target AND live state as JSON strings, so a big
+/// Application is legitimately tens of MiB; past this one it is refused
+/// (that Application stays unreported, the rest carry on) rather than let
+/// one response grow the reporter without bound under its memory limit.
+const MAX_ARGOCD_BODY_BYTES: usize = 64 * 1024 * 1024;
+/// How much of an error body is kept: it is only logged.
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
 pub enum BrokerError {
@@ -231,7 +242,11 @@ impl Broker {
         }
         let status = resp.status().as_u16();
         let retry_after = retry_after(resp.headers());
-        let body = resp.text().await.unwrap_or_default();
+        // Only logged: a bounded prefix, never the whole of a hostile body.
+        let body = match read_capped(resp, MAX_ERROR_BODY_BYTES, true).await {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(_) => String::new(),
+        };
         Err(BrokerError::Status {
             status,
             retry_after,
@@ -248,10 +263,7 @@ impl Broker {
                 Some(self.request_timeout),
             )
             .await?;
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| BrokerError::Transport(e.to_string()))?;
+        let bytes = read_capped(resp, MAX_BROKER_BODY_BYTES, false).await?;
         serde_json::from_slice(&bytes).map_err(|e| BrokerError::Decode(e.to_string()))
     }
 
@@ -296,10 +308,7 @@ impl Broker {
                 Some(self.request_timeout),
             )
             .await?;
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| BrokerError::Transport(e.to_string()))?;
+        let bytes = read_capped(resp, MAX_BROKER_BODY_BYTES, false).await?;
         let results: ReportResults =
             serde_json::from_slice(&bytes).map_err(|e| BrokerError::Decode(e.to_string()))?;
         if results.results.len() != items.len() {
@@ -334,10 +343,7 @@ impl Broker {
                 Some(self.request_timeout),
             )
             .await?;
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| BrokerError::Transport(e.to_string()))?;
+        let bytes = read_capped(resp, MAX_ARGOCD_BODY_BYTES, false).await?;
         serde_json::from_slice(&bytes).map_err(|e| BrokerError::Decode(e.to_string()))
     }
 
@@ -353,6 +359,37 @@ impl Broker {
     }
 }
 
+/// Read a body of at most `limit` bytes. A declared `Content-Length` over
+/// the limit is refused before reading; a chunked body is cut as soon as it
+/// passes it. `truncate` keeps the first `limit` bytes instead of failing
+/// (for error bodies, which are only logged).
+async fn read_capped(
+    mut resp: reqwest::Response,
+    limit: usize,
+    truncate: bool,
+) -> Result<Vec<u8>, BrokerError> {
+    let too_large = || BrokerError::Decode(format!("response body over {limit} bytes"));
+    if !truncate && resp.content_length().is_some_and(|n| n > limit as u64) {
+        return Err(too_large());
+    }
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| BrokerError::Transport(e.to_string()))?
+    {
+        if body.len() + chunk.len() > limit {
+            if truncate {
+                body.extend_from_slice(&chunk[..limit - body.len()]);
+                return Ok(body);
+            }
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,5 +401,48 @@ mod tests {
             "?after=argocd%2Fweb%20app&limit=1000"
         );
         assert_eq!(query_string(&[]), "");
+    }
+
+    /// One raw HTTP/1.1 response on a loopback socket: `length` = declare a
+    /// `Content-Length`, else close-delimited (no length known up front).
+    async fn serve_once(body: Vec<u8>, length: bool) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 4096];
+            let _ = sock.read(&mut req).await;
+            let head = if length {
+                format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", body.len())
+            } else {
+                "HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n".to_string()
+            };
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(&body).await;
+            let _ = sock.shutdown().await;
+        });
+        format!("http://{addr}/")
+    }
+
+    #[tokio::test]
+    async fn a_body_over_its_cap_is_refused_or_truncated_never_read_whole() {
+        for length in [true, false] {
+            let url = serve_once(vec![b'x'; 2048], length).await;
+            let resp = reqwest::get(&url).await.unwrap();
+            assert!(
+                matches!(
+                    read_capped(resp, 1024, false).await,
+                    Err(BrokerError::Decode(_))
+                ),
+                "length declared: {length}"
+            );
+            let url = serve_once(vec![b'x'; 2048], length).await;
+            let resp = reqwest::get(&url).await.unwrap();
+            assert_eq!(read_capped(resp, 1024, true).await.unwrap().len(), 1024);
+            let url = serve_once(vec![b'x'; 1024], length).await;
+            let resp = reqwest::get(&url).await.unwrap();
+            assert_eq!(read_capped(resp, 1024, false).await.unwrap().len(), 1024);
+        }
     }
 }

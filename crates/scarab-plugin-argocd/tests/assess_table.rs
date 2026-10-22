@@ -139,6 +139,19 @@ fn assess_maps_argo_states_to_statuses() {
             InProgress,
             "degraded: Readiness probe failed",
         ),
+        // A degraded Argo Rollout has given up, whatever its message says:
+        // the Rollouts controller is Degraded only when aborted, timed out
+        // or invalid (Argo CD's Rollout health check).
+        (
+            "app-rollout-aborted.json",
+            Failed,
+            "degraded: RolloutAborted: Rollout aborted update to revision 7",
+        ),
+        (
+            "app-rollout-progress-deadline.json",
+            Failed,
+            "has timed out progressing",
+        ),
         ("app-suspended.json", InProgress, "paused: Rollout is paused"),
         ("app-missing.json", InProgress, "missing"),
     ];
@@ -155,6 +168,27 @@ fn assess_maps_argo_states_to_statuses() {
             "{name}: labels are one line"
         );
     }
+}
+
+#[test]
+fn a_rollouts_timed_out_message_is_a_give_up_wherever_argo_puts_it() {
+    // Argo Rollouts says "timed out progressing", not "progress deadline";
+    // an Argo CD that copies it onto the Application (and lists no Rollout
+    // resource with it) must still read it as a give-up.
+    let mut a = app("app-degraded-crashloop.json");
+    assert_eq!(assess(&a).status, Status::InProgress);
+    a.status.health.message =
+        Some("ReplicaSet \"web-6d8f7c9b5\" has timed out progressing.".into());
+    assert_eq!(assess(&a).status, Status::Failed);
+    // A Rollout that is merely progressing or paused is not a give-up.
+    let mut r = app("app-rollout-aborted.json");
+    for res in r.status.resources.iter_mut() {
+        if let Some(h) = res.health.as_mut() {
+            h.status = "Progressing".into();
+        }
+    }
+    r.status.health.status = "Progressing".into();
+    assert_eq!(assess(&r).status, Status::InProgress);
 }
 
 #[test]
