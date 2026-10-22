@@ -670,6 +670,108 @@ async fn a_killed_installation_ingests_nothing_until_re_enabled() {
     tdb.cleanup().await;
 }
 
+/// The plugin runtime's record (slice d2): a status decided for one state is
+/// never written over a kill or enable that landed meanwhile, and re-enabling
+/// a killed installation forgets its last probe so it is probed again before
+/// it starts (ADR-0072 §9).
+#[tokio::test]
+async fn runtime_status_is_written_only_in_the_state_it_was_decided_in() {
+    let Some((tdb, db)) = migrated().await else {
+        return;
+    };
+    db.install(&installation("acme", "argocd", "0000000001"))
+        .await
+        .unwrap();
+    db.install(&installation("globex", "argocd", "0000000002"))
+        .await
+        .unwrap();
+    let ids: Vec<String> = db
+        .all_installations()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|i| i.id)
+        .collect();
+    assert_eq!(ids, ["0000000001", "0000000002"], "every Org, by id");
+
+    assert!(db
+        .set_runtime_status(
+            "0000000001",
+            InstallationState::Enabled,
+            RuntimeStatus::Running,
+            "",
+            Some(2_000)
+        )
+        .await
+        .unwrap());
+    db.set_installation_state("acme", "argocd", InstallationState::Killed, "amy", 3_000)
+        .await
+        .unwrap();
+    // A pass that read `enabled` before the kill must not write `running`
+    // over it.
+    assert!(!db
+        .set_runtime_status(
+            "0000000001",
+            InstallationState::Enabled,
+            RuntimeStatus::Running,
+            "",
+            Some(2_000)
+        )
+        .await
+        .unwrap());
+    let killed = db.installation_by_id("0000000001").await.unwrap().unwrap();
+    assert_eq!(
+        (killed.runtime_status, killed.probe_passed_at),
+        (RuntimeStatus::Running, Some(2_000)),
+        "a kill alone leaves the runtime record to the runtime"
+    );
+    assert!(db
+        .set_runtime_status(
+            "0000000001",
+            InstallationState::Killed,
+            RuntimeStatus::Stopped,
+            "",
+            Some(2_000)
+        )
+        .await
+        .unwrap());
+
+    let enabled = db
+        .set_installation_state("acme", "argocd", InstallationState::Enabled, "bob", 4_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            enabled.runtime_status,
+            enabled.runtime_message.as_str(),
+            enabled.probe_passed_at
+        ),
+        (RuntimeStatus::Pending, "", None),
+        "a re-enabled installation is probed again before it starts"
+    );
+    // Enabling one already enabled resets nothing.
+    db.set_runtime_status(
+        "0000000002",
+        InstallationState::Enabled,
+        RuntimeStatus::Running,
+        "",
+        Some(5_000),
+    )
+    .await
+    .unwrap();
+    let again = db
+        .set_installation_state("globex", "argocd", InstallationState::Enabled, "bob", 6_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (again.runtime_status, again.probe_passed_at),
+        (RuntimeStatus::Running, Some(5_000))
+    );
+    tdb.cleanup().await;
+}
+
 /// F1 (c-min audit): an uninstall takes every source naming it and retires
 /// the name, so a later installation can never inherit its routing or its
 /// Deployment history.

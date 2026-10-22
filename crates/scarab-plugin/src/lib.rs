@@ -66,6 +66,25 @@ pub const MAX_CONFIG_KEYS: usize = 32;
 pub const MAX_RULE_PATH_CHARS: usize = 512;
 pub const MAX_CONFIG_VALUE_CHARS: usize = 2048;
 
+/// Config keys may not start with this: core sets the `SCARAB_*` variables a
+/// Plugin's container gets ([`PLUGIN_ENV_BROKER_URL`],
+/// [`PLUGIN_ENV_BROKER_TOKEN_FILE`]), and an approved config value must never
+/// be able to point a Plugin's token at another broker.
+pub const RESERVED_CONFIG_KEY_PREFIX: &str = "SCARAB_";
+
+/// The audience of a Plugin's projected ServiceAccount token (ADR-0072 §11).
+/// The runtime projects tokens for it and the broker's verifier accepts no
+/// other, so a token minted for the API server — or for any other consumer —
+/// is useless against the broker, and a broker token is useless elsewhere.
+pub const BROKER_TOKEN_AUDIENCE: &str = "scarab-broker";
+
+/// The Plugin contract's environment, as the runtime sets it: where the
+/// broker is, and the file the projected broker token is kept current in.
+/// The kubelet rotates the token in place before it expires, so a Plugin
+/// re-reads the file for every request rather than caching it.
+pub const PLUGIN_ENV_BROKER_URL: &str = "SCARAB_BROKER_URL";
+pub const PLUGIN_ENV_BROKER_TOKEN_FILE: &str = "SCARAB_BROKER_TOKEN_FILE";
+
 /// One entry of the **closed** PluginCapability vocabulary (ADR-0072 §2).
 /// Every variant exists so a manifest naming it parses and can be refused by
 /// name; which ones this release runs is [`admit_for_mmp`]'s call.
@@ -237,6 +256,12 @@ impl PluginManifest {
                 return invalid(format!(
                     "config key `{key}` must be 1-64 of `A-Z`, `0-9`, `_`, not starting \
                      with a digit"
+                ));
+            }
+            if key.starts_with(RESERVED_CONFIG_KEY_PREFIX) {
+                return invalid(format!(
+                    "config key `{key}` starts with `{RESERVED_CONFIG_KEY_PREFIX}`, which is \
+                     reserved for the variables core sets"
                 ));
             }
             if !keys.insert(key.as_str()) {
@@ -767,6 +792,9 @@ mod tests {
             Box::new(|m| m.config_keys.push("argocd_url".into())),
             Box::new(|m| m.config_keys.push("1URL".into())),
             Box::new(|m| m.config_keys.push("ARGOCD_UI_URL".into())),
+            // Core's own variables: a config value must never re-aim the
+            // Plugin's broker or its token file.
+            Box::new(|m| m.config_keys.push("SCARAB_BROKER_URL".into())),
         ];
         for (i, mutate) in cases.iter().enumerate() {
             let mut m = argo_like();

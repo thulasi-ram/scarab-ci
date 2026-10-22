@@ -305,6 +305,44 @@ impl PluginStore for PostgresDb {
             .collect()
     }
 
+    async fn all_installations(&self) -> Result<Vec<PluginInstallation>, PluginStoreError> {
+        let sql = format!("SELECT {INSTALLATION_COLUMNS} FROM plugin_installations ORDER BY id");
+        sqlx::query(&sql)
+            .fetch_all(self.pool())
+            .await
+            .map_err(plugin_store_err)?
+            .iter()
+            .map(installation_from_row)
+            .collect()
+    }
+
+    async fn set_runtime_status(
+        &self,
+        id: &str,
+        decided_in: InstallationState,
+        status: RuntimeStatus,
+        message: &str,
+        probe_passed_at: Option<i64>,
+    ) -> Result<bool, PluginStoreError> {
+        // Guarded by the state the runtime decided in: a kill or enable that
+        // committed meanwhile wins, and the runtime decides again next pass.
+        let written = sqlx::query(
+            "UPDATE plugin_installations
+                SET runtime_status = $3, runtime_message = $4, probe_passed_at = $5
+              WHERE id = $1 AND state = $2",
+        )
+        .bind(id)
+        .bind(decided_in.as_str())
+        .bind(status.as_str())
+        .bind(message)
+        .bind(probe_passed_at)
+        .execute(self.pool())
+        .await
+        .map_err(plugin_store_err)?
+        .rows_affected();
+        Ok(written == 1)
+    }
+
     async fn set_installation_state(
         &self,
         org: &str,
@@ -315,11 +353,22 @@ impl PluginStore for PostgresDb {
     ) -> Result<Option<PluginInstallation>, PluginStoreError> {
         // A repeat kill keeps the first `killed_by`/`killed_at`: who stopped
         // it is the fact worth keeping. Enabling clears both.
+        //
+        // Enabling a KILLED installation also forgets its last probe: the
+        // runtime must prove isolation again before the workload starts
+        // (ADR-0072 §9, "at every start"). An enable of one already enabled
+        // changes nothing. (Every SET expression reads the row as it was.)
         let sql = format!(
             "UPDATE plugin_installations SET
                  state = $3,
                  killed_by = CASE WHEN $3 = 'killed' THEN COALESCE(killed_by, $4) END,
-                 killed_at = CASE WHEN $3 = 'killed' THEN COALESCE(killed_at, $5) END
+                 killed_at = CASE WHEN $3 = 'killed' THEN COALESCE(killed_at, $5) END,
+                 runtime_status = CASE WHEN $3 = 'enabled' AND state = 'killed'
+                                       THEN 'pending' ELSE runtime_status END,
+                 runtime_message = CASE WHEN $3 = 'enabled' AND state = 'killed'
+                                        THEN '' ELSE runtime_message END,
+                 probe_passed_at = CASE WHEN $3 = 'enabled' AND state = 'killed'
+                                        THEN NULL ELSE probe_passed_at END
              WHERE org = $1 AND name = $2
              RETURNING {INSTALLATION_COLUMNS}"
         );
