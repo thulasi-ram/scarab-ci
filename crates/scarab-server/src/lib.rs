@@ -1211,7 +1211,9 @@ pub struct AttemptDto {
     pub failed: bool,
     /// Coarse failure kind when `failed`: `infra` | `step` | `timeout` | `lost`
     /// | `config` | `missing-inputs` (an input snapshot gone from every tier —
-    /// Rerun/Retry regenerates it; ticket e140121).
+    /// Rerun/Retry regenerates it; ticket e140121) | `gate` (a gate's wait
+    /// resolved failed — e.g. not released within `gate_expires_after`; the
+    /// reason is in `failure_detail`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure: Option<String>,
     /// The executor's human-readable cause for a failed attempt (ticket
@@ -1238,6 +1240,7 @@ fn attempt_dto(a: &scarab_engine::Attempt) -> AttemptDto {
             scarab_engine::FailureKind::Lost => "lost",
             scarab_engine::FailureKind::Config => "config",
             scarab_engine::FailureKind::MissingInputs => "missing-inputs",
+            scarab_engine::FailureKind::Gate => "gate",
         }
         .to_string()
     });
@@ -6895,18 +6898,12 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
         .next()
 }
 
-/// The distinct principals who have approved a `manual` gate `step`, in approval
-/// order — the accumulated `GateApproved` events (ADR-0037).
+/// The distinct principals who have approved a `manual` gate `step` in its
+/// CURRENT wait, in approval order (ADR-0037) — approvals given before the
+/// gate's latest re-arm (an expired wait that was retried) do not count. One
+/// definition, shared with the engine's dedup: [`scarab_engine::gate_approvers`].
 fn gate_approvers(events: &[EventKind], step: &StepId) -> Vec<String> {
-    let mut seen: Vec<String> = Vec::new();
-    for e in events {
-        if let EventPayload::GateApproved { step: s, by } = &e.kind {
-            if s == step && !seen.contains(by) {
-                seen.push(by.clone());
-            }
-        }
-    }
-    seen
+    scarab_engine::gate_approvers(events, step)
 }
 
 /// Approve a `manual` gate (ADR-0008, 0037). The authenticated principal's

@@ -5338,7 +5338,7 @@
               "string",
               "null"
             ],
-            "description": "Coarse failure kind when `failed`: `infra` | `step` | `timeout` | `lost`\n| `config` | `missing-inputs` (an input snapshot gone from every tier —\nRerun/Retry regenerates it; ticket e140121)."
+            "description": "Coarse failure kind when `failed`: `infra` | `step` | `timeout` | `lost`\n| `config` | `missing-inputs` (an input snapshot gone from every tier —\nRerun/Retry regenerates it; ticket e140121) | `gate` (a gate's wait\nresolved failed — e.g. not released within `gate_expires_after`; the\nreason is in `failure_detail`)."
           },
           "failure_detail": {
             "type": [
