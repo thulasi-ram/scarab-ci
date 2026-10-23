@@ -59,10 +59,12 @@ export function describeEvent(e: RunEvent): string {
 }
 
 /** The human line for a GateResolved payload, step omitted: the journalled
- * verdict of one gate wait — passed or failed, with its reason. */
+ * verdict of one gate wait — passed or failed, with its reason, and who
+ * rejected it when a human (or an external gate's token) did. */
 function gateResolvedSummary(v: Record<string, unknown>): string {
   const reason = v.reason ? ` — ${String(v.reason)}` : "";
-  return v.passed ? `gate passed${reason}` : `gate failed${reason}`;
+  if (v.passed) return `gate passed${reason}`;
+  return `gate ${v.by ? `rejected by ${String(v.by)}` : "failed"}${reason}`;
 }
 
 /** The human line for a WorkspaceInputCollisions payload, step omitted:

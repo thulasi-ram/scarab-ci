@@ -1355,6 +1355,22 @@ export async function approveGate(id: string, step: string): Promise<GateApprova
   return data as unknown as GateApproval;
 }
 
+/** Reject a waiting gate — fail it with a reason (`POST …/gates/{step}/reject`,
+ * ADR-0070 §9). Any gate kind (`manual`/`timer`/`external`/`deployment`) that is
+ * pending and reached. The gate's Attempt fails with the reason and who
+ * rejected it, its dependents are skipped, and the run ends `failed`. The
+ * server's own words come back on failure: 400 for a missing/over-long reason,
+ * 409 for a gate that is not rejectable, not pending, or not reached yet. */
+export async function rejectGate(id: string, step: string, reason: string): Promise<void> {
+  const { error, response } = await api.POST("/v1/runs/{id}/gates/{step}/reject", {
+    params: { path: { id, step } },
+    body: { reason },
+  });
+  if (error !== undefined || !response.ok) {
+    throw new Error(errorText(error) || `could not reject gate ${step} (${response.status})`);
+  }
+}
+
 /** Whether a run status is terminal (no further updates will stream). */
 export function isTerminal(status: string): boolean {
   return status === "succeeded" || status === "failed" || status === "cancelled";

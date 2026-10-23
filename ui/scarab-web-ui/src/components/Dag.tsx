@@ -10,7 +10,7 @@
 // graph answers "what shape, and where does each step stand", not "which try".
 // Clicking a node selects it.
 import { createSignal, onMount, onCleanup, createEffect, createMemo, For, Show } from "solid-js";
-import { isGateOpen } from "../gates";
+import { isGateOpen, type GateStatus } from "../gates";
 import { layerSteps } from "../dag-layout";
 import Icon from "./Icon";
 
@@ -24,6 +24,10 @@ export type DagStep = {
   reused?: boolean;
   needs: string[];
   gate?: string | null;
+  /** A gate's verdict, a waiting DeploymentGate's target + Deployment, or a
+   * deploy step's concurrency hold — the line `gateStatus` (gates.ts) derives.
+   * Shown as the node's meta line in place of the generic one. */
+  note?: GateStatus | null;
   /** When the current (running) attempt started, epoch-ms — drives live elapsed. */
   runningSince?: number | null;
   /** Wall-clock a finished step took (ms), derived from the event log. */
@@ -350,7 +354,9 @@ export default function Dag(props: {
   // resize the node). Zoom/pan need no re-measure: edges are stored in unscaled
   // graph coords, so the transform scales them onto the nodes for free.
   createEffect(() => {
-    props.steps.map((s) => `${s.id}:${s.status}:${s.attempts}:${s.gate ?? ""}`).join(",");
+    props.steps
+      .map((s) => `${s.id}:${s.status}:${s.attempts}:${s.gate ?? ""}:${s.note?.text ?? ""}`)
+      .join(",");
     (props.services ?? []).map((s) => `${s.name}:${s.status}`).join(",");
     requestAnimationFrame(() => requestAnimationFrame(measure));
   });
@@ -360,6 +366,9 @@ export default function Dag(props: {
     if (s.status === "running") {
       return s.runningSince ? `running · ${elapsed(s.runningSince, now())}` : "running";
     }
+    // A gate's verdict / wait, or a concurrency hold, says more than the
+    // status: "waiting on argocd/web (in progress)", "failed: <reason>".
+    if (s.note) return s.note.text;
     if (isGateOpen(s)) {
       return `gate · ${s.gate}`;
     }
@@ -499,7 +508,12 @@ export default function Dag(props: {
                       </span>
                       <span class="dnode-main" title={s.id}>
                         <span class="dnode-id">{s.id}</span>
-                        <span class="dnode-meta">{meta(s)}</span>
+                        <span
+                          class={`dnode-meta ${s.note ? `gnote ${s.note.tone}` : ""}`}
+                          title={s.note?.text}
+                        >
+                          {meta(s)}
+                        </span>
                       </span>
                       <Show when={s.attempts > 1}>
                         <span class="dnode-count" title={`${s.attempts} tries`}>

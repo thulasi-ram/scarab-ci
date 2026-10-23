@@ -22,7 +22,8 @@
  * `DagStep` and the API's `StepStatus` satisfy it. */
 export type GateLike = {
   status: string;
-  /** `manual` / `timer` / `external` when this step is a gate, else absent. */
+  /** `manual` / `timer` / `external` / `deployment` when this step is a gate,
+   * else absent. */
   gate?: string | null;
   needs?: string[];
 };
@@ -59,4 +60,147 @@ export function gateBlockers(s: GateLike, statusOf: (step: string) => string | u
  * run-level "approve" affordance would be ambiguous about which one it meant. */
 export function approvableGates<T extends GateLike>(steps: readonly T[]): T[] {
   return steps.filter(isApprovable);
+}
+
+// --- Verdicts, waits and holds (slice b, criterion 5) ----------------------
+// The server says, per step, how a gate's latest wait resolved
+// (`gate_resolution`, the journal's GateResolved), what a waiting
+// DeploymentGate waits on (`deployment_gate`, display only), and why a deploy
+// step is held by per-DeploymentTarget concurrency (`held`). These turn those
+// facts into the one line the DAG node and the step pane both show.
+
+/** The kinds a human can REJECT (fail with a reason): every gate kind. A
+ * DeploymentGate cannot be approved — core passes it from the Deployment
+ * record — but rejecting one is how a human gives up before its deadline. */
+const REJECTABLE_KINDS: ReadonlySet<string> = new Set(["manual", "timer", "external", "deployment"]);
+
+/** A gate verdict as the server journals it (`GateResolutionDto`). */
+export type GateResolutionLike = {
+  passed: boolean;
+  reason?: string | null;
+  /** The gate Attempt the verdict closed. */
+  attempt: string;
+  /** Who rejected it, for a rejection by request. */
+  by?: string | null;
+};
+
+/** A waiting DeploymentGate's target and Deployment (`DeploymentGateDto`). */
+export type DeploymentGateLike = {
+  target_source: string;
+  target_id: string;
+  deployment_status?: string | null;
+  latest_label?: string | null;
+};
+
+export type GateStatusLike = GateLike & {
+  attempt_list?: { id: string }[];
+  gate_resolution?: GateResolutionLike | null;
+  deployment_gate?: DeploymentGateLike | null;
+  held?: string | null;
+};
+
+/** The tone a status line renders with, and its text. */
+export type GateStatus = { tone: "waiting" | "passed" | "failed" | "held"; text: string };
+
+/** The verdict that speaks for the gate as it is NOW, or null.
+ *
+ * The server sends the LATEST `GateResolved`, which outlives a re-arm: a retry
+ * or rerun puts the gate back to `pending` (and later mints a new Attempt), and
+ * showing the old "passed" then would lie. So a verdict counts only while the
+ * gate is settled (`succeeded`/`failed`) AND it closed the gate's latest
+ * Attempt. */
+export function currentResolution(s: GateStatusLike): GateResolutionLike | null {
+  const r = s.gate_resolution;
+  if (!r || !s.gate) return null;
+  if (s.status !== "succeeded" && s.status !== "failed") return null;
+  const last = s.attempt_list?.[s.attempt_list.length - 1];
+  if (last && last.id !== r.attempt) return null;
+  return r;
+}
+
+/** `in_progress` → `in progress`. */
+const pretty = (status: string): string => status.replace(/_/g, " ");
+
+/** A concurrency hold's reason as the server words it starts with `held:`;
+ * the line adds that prefix itself, so it is not doubled. */
+const holdReason = (held: string): string => held.replace(/^held:\s*/i, "").trim();
+
+/** The one status line for a step's gate or hold, or null when there is
+ * nothing to say beyond its status:
+ *
+ *   held: <reason>                       a deploy step held by concurrency
+ *   passed: <reason>                     a settled gate's verdict
+ *   failed: <reason> (rejected by <who>) a settled gate's verdict
+ *   waiting on <source/id> (<status>, "<label>")   a waiting DeploymentGate
+ */
+export function gateStatus(s: GateStatusLike): GateStatus | null {
+  if (s.held) return { tone: "held", text: `held: ${holdReason(s.held)}` };
+  if (!s.gate) return null;
+  const r = currentResolution(s);
+  if (r) {
+    const reason = r.reason?.trim();
+    if (r.passed) return { tone: "passed", text: reason ? `passed: ${reason}` : "passed" };
+    const by = r.by ? ` (rejected by ${r.by})` : "";
+    return { tone: "failed", text: `failed: ${reason || "no reason given"}${by}` };
+  }
+  const d = s.deployment_gate;
+  if (d && isGateOpen(s)) {
+    const detail = d.deployment_status
+      ? [pretty(d.deployment_status), d.latest_label ? `"${d.latest_label}"` : null]
+          .filter(Boolean)
+          .join(", ")
+      : "no Deployment recorded yet";
+    return { tone: "waiting", text: `waiting on ${d.target_source}/${d.target_id} (${detail})` };
+  }
+  return null;
+}
+
+/** {@link gateStatus}'s text alone. */
+export function gateStatusText(s: GateStatusLike): string | null {
+  return gateStatus(s)?.text ?? null;
+}
+
+/** Can a human reject this gate right now? Any gate kind, while it waits on a
+ * verdict: open, and REACHED — every need succeeded. The server 409s a gate
+ * whose needs are unmet ("not reached yet"), so offering Reject there would
+ * always fail. */
+export function isRejectable(s: GateLike, statusOf: (step: string) => string | undefined): boolean {
+  return isGateOpen(s) && REJECTABLE_KINDS.has(s.gate ?? "") && gateBlockers(s, statusOf).length === 0;
+}
+
+/** The gates the run page's gate bar lists, in step order: every open gate a
+ * human can act on — approve (manual) or reject (any kind). A blocked one is
+ * listed too, with its actions disabled, so "not your turn yet" is visible. */
+export function actionableGates<T extends GateLike>(steps: readonly T[]): T[] {
+  return steps.filter((s) => isGateOpen(s) && REJECTABLE_KINDS.has(s.gate ?? ""));
+}
+
+/** The server's bound on a reject reason, in UTF-8 bytes. */
+export const REJECT_REASON_MAX_BYTES = 1024;
+
+/** Why a reject reason would be refused (400), or null when it is fine. The
+ * server trims it, then requires 1..=1024 bytes. */
+export function rejectReasonError(reason: string): string | null {
+  const t = reason.trim();
+  if (!t) return "a reason is required";
+  if (new TextEncoder().encode(t).length > REJECT_REASON_MAX_BYTES) {
+    return `at most ${REJECT_REASON_MAX_BYTES} bytes`;
+  }
+  return null;
+}
+
+/** The gate bar's hint for an open gate: what it is waiting for. */
+export function gateWaitHint(s: GateStatusLike, statusOf: (step: string) => string | undefined): string {
+  const blockers = gateBlockers(s, statusOf);
+  if (blockers.length > 0) return `waiting on ${blockers.join(", ")}`;
+  switch (s.gate) {
+    case "deployment":
+      return gateStatusText(s) ?? "waiting on its Deployment";
+    case "timer":
+      return "waiting for its timer";
+    case "external":
+      return "waiting for an external release";
+    default:
+      return "waiting for a decision";
+  }
 }

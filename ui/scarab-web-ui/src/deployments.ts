@@ -90,6 +90,23 @@ export function requesterHref(org: string, r: Pick<DeploymentRequester, "run" | 
   return `/${encodeURIComponent(org)}/${encodeURIComponent(r.project)}/runs/${encodeURIComponent(r.run)}`;
 }
 
+/** What one requester row of the Deployments page shows: the link to its run
+ *  (null when the Project is unknown — shown, not linked), its text, and the
+ *  hover title. The run is named by its short id: `DeploymentRequesterDto`
+ *  carries no run number (`#N`), and looking one up per requester would cost
+ *  a query each. */
+export function requesterRow(
+  org: string,
+  r: Pick<DeploymentRequester, "run" | "step" | "project">,
+): { href: string | null; text: string; title: string } {
+  const href = requesterHref(org, r);
+  return {
+    href,
+    text: `${r.run.slice(0, 8)} · ${r.step}`,
+    title: href ? `run ${r.run} in ${r.project}` : `run ${r.run} (project unknown)`,
+  };
+}
+
 /** The board's "in flight" cell: the newest Deployment when it is not the one
  *  that is live (a rollout under way, or one that failed or stalled). */
 export function inFlight(row: Pick<BoardRow, "live" | "newest">): Deployment | null {

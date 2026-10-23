@@ -27,6 +27,7 @@ import {
   ofRecordIndexOf,
 } from "../attempts";
 import { levelOf } from "../logs";
+import type { GateStatus } from "../gates";
 import Icon from "./Icon";
 import AttemptsDropdown, { type FilmstripTry } from "./AttemptsDropdown";
 
@@ -83,6 +84,10 @@ export default function StepPane(props: {
    * — set when the user clicked this step's docked sidecar chip in the DAG.
    * `null`/absent = the step's main container. */
   focusSidecar?: number | null;
+  /** The step's gate verdict, DeploymentGate wait, or concurrency hold (gates.ts
+   * `gateStatus`) — shown under the stamp. `null` = nothing to say (or viewing
+   * an older version, which this line does not describe). */
+  gateStatus?: GateStatus | null;
 }) {
   const [tab, setTab] = createSignal<Tab>("logs");
   const [wsPath, setWsPath] = createSignal("");
@@ -388,6 +393,13 @@ export default function StepPane(props: {
                 <span class="cs-ver">{props.versionLabel}</span>
               </Show>
             </div>
+            <Show when={props.gateStatus}>
+              {(g) => (
+                <div class={`gate-status ${g().tone}`} role="status">
+                  {g().text}
+                </div>
+              )}
+            </Show>
             <div class="pane-tabbar">
               <div class="tabs">
                 <TabBtn id="logs" label="Logs" />

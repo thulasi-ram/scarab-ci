@@ -43,6 +43,12 @@ const RUN_ID = "0190f8a2000071fb8c0011223344aabb";
 // RunRerunRequested boundary with superseded/shadowed attempts), a shared
 // service + a docked sidecar (ADR-0058), a pending manual gate, an artifact.
 const RICH_RUN_ID = "0190f8a2000071fb8c0099887766ccdd";
+// The DEPLOY run (slice b, criterion 5): one Deploy Run showing every
+// DeploymentGate state — waiting (on Deployment #16, linked from the
+// Deployments page), passed, failed — and a deploy step HELD by
+// per-DeploymentTarget concurrency. Reached from /deployments (edge-gateway's
+// in-flight row) at /acme/edge-gateway/runs/<id>.
+const DEPLOY_RUN_ID = "0190f8a2000071fb8c00d3e9107a1616";
 
 // ── /v1/me ────────────────────────────────────────────────────────────────
 // An Owner of the one implicit org (ADR-0060), so the Settings gear renders.
@@ -427,6 +433,139 @@ const deployments: Record<string, unknown[]> = {
   preview: [],
 };
 
+// ── the DEPLOY run (slice b, criterion 5) ───────────────────────────────────
+//   bump        ✓ → live        DeploymentGate WAITING on #16 (in progress)
+//   bump-canary ✓ → live-canary DeploymentGate PASSED (Healthy · Synced)
+//   bump-eu     ✓ → live-eu     DeploymentGate FAILED (the source's label)
+//   bump-docs   HELD — `argocd`/`docs` is at its concurrency limit
+//   smoke       needs live (not reached)
+const deployGate = (id: string, needs: string, status: string, a1: number, outcome: string) => ({
+  id,
+  status,
+  attempts: 1,
+  needs: [needs],
+  gate: "deployment",
+  attempt_list: [
+    {
+      id: "a1",
+      started_at: ago(a1),
+      failed: outcome === "failed",
+      ...(outcome === "failed"
+        ? { failure: "gate", failure_detail: "ImagePullBackOff: sha-a1b2c3d not found in registry" }
+        : {}),
+      outcome,
+    },
+  ],
+});
+const deployBump = (id: string, at: number) => ({
+  id,
+  status: "succeeded",
+  attempts: 1,
+  needs: [],
+  attempt_list: [{ id: "a1", started_at: ago(at), failed: false, outcome: "succeeded" }],
+});
+const deployRunStatus: RunStatusDto = {
+  id: DEPLOY_RUN_ID,
+  status: "suspended",
+  run_number: 58,
+  pipeline: "deploy",
+  trigger_title: "Deploy sha-a1b2c3d to production",
+  origin_pr_base: null,
+  params: {},
+  snapshot_retention: { retention_days: 14, expired: false, pinned: false },
+  steps: [
+    deployBump("bump", 5 * min),
+    {
+      ...deployGate("live", "bump", "pending", 4 * min, "running"),
+      deployment_gate: {
+        environment: "production",
+        target_source: "argocd",
+        target_id: "edge-gateway",
+        deployment_id: 16,
+        deployment_status: "in_progress",
+        version: "sha-a1b2c3d",
+        latest_label: "sync wave 3: rollout",
+      },
+    },
+    deployBump("bump-canary", 5 * min),
+    {
+      ...deployGate("live-canary", "bump-canary", "succeeded", 4 * min, "succeeded"),
+      gate_resolution: {
+        passed: true,
+        reason: "sha-a1b2c3d live on `argocd`/`edge-canary`: Healthy · Synced",
+        at: ago(3 * min),
+        attempt: "a1",
+        deployment_id: 17,
+      },
+    },
+    deployBump("bump-eu", 5 * min),
+    {
+      ...deployGate("live-eu", "bump-eu", "failed", 4 * min, "failed"),
+      gate_resolution: {
+        passed: false,
+        reason: "ImagePullBackOff: sha-a1b2c3d not found in registry",
+        at: ago(2 * min),
+        attempt: "a1",
+        deployment_id: 18,
+      },
+    },
+    {
+      id: "bump-docs",
+      status: "pending",
+      attempts: 0,
+      needs: [],
+      attempt_list: [],
+      held: "held: waiting for deployment concurrency on `argocd`/`docs` (1/1 in flight)",
+    },
+    { id: "smoke", status: "pending", attempts: 0, needs: ["live"], attempt_list: [] },
+  ],
+};
+const dev = sse(DEPLOY_RUN_ID);
+const deployEventsBody = [
+  dev(ago(5 * min + 5000), {
+    Raw: {
+      trigger: {
+        event: {
+          kind: "manual",
+          actor: "a.kim",
+          branch: "main",
+          ref: "refs/heads/main",
+          sha: "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+          repo: { owner: "acme", name: "edge-gateway" },
+        },
+      },
+    },
+  }),
+  ...["bump", "bump-canary", "bump-eu"].flatMap((s) => [
+    dev(ago(5 * min), { AttemptStarted: { step: s, attempt: "a1" } }),
+    dev(ago(4 * min + 10000), { AttemptFinished: { step: s, attempt: "a1" } }),
+    dev(ago(4 * min + 9000), { StepTransitioned: { step: s, from: "running", to: "succeeded" } }),
+  ]),
+  ...["live", "live-canary", "live-eu"].map((s) =>
+    dev(ago(4 * min), { AttemptStarted: { step: s, attempt: "a1" } }),
+  ),
+  dev(ago(3 * min), { AttemptFinished: { step: "live-canary", attempt: "a1" } }),
+  dev(ago(3 * min), {
+    GateResolved: {
+      step: "live-canary",
+      attempt: "a1",
+      passed: true,
+      reason: "sha-a1b2c3d live on `argocd`/`edge-canary`: Healthy · Synced",
+      deployment: 17,
+    },
+  }),
+  dev(ago(2 * min), { AttemptFinished: { step: "live-eu", attempt: "a1", failure: "gate" } }),
+  dev(ago(2 * min), {
+    GateResolved: {
+      step: "live-eu",
+      attempt: "a1",
+      passed: false,
+      reason: "ImagePullBackOff: sha-a1b2c3d not found in registry",
+      deployment: 18,
+    },
+  }),
+].join("");
+
 // ── Deployment record (ADR-0070) — /deployments and the Environment board ──
 // Org-scoped ids (the org's input sequence) — so a higher id was created later,
 // exactly as the server's receipt-time stamps make it. production covers every
@@ -564,6 +703,23 @@ const depMessaging15: DeploymentDto = {
   unexplained: false,
   unconfirmed: true,
 };
+// A rollout in flight, requested by the DEPLOY run's `bump` — its `live`
+// DeploymentGate waits on it.
+const depGateway16: DeploymentDto = {
+  id: 16,
+  target: argo("production", "edge-gateway"),
+  version: "sha-a1b2c3d",
+  status: "in_progress",
+  requesters: [{ ...req(DEPLOY_RUN_ID, "edge-gateway", ago(4 * min)), step: "bump" }],
+  reports: [
+    report("in_progress", "sync wave 1: config", ago(3 * min), `${ARGO_UI}/edge-gateway`),
+    report("in_progress", "sync wave 3: rollout", ago(2 * min), `${ARGO_UI}/edge-gateway`),
+  ],
+  created_at: ago(4 * min),
+  was_ever_live: false,
+  unexplained: false,
+  unconfirmed: false,
+};
 const depStagingOrders11: DeploymentDto = {
   id: 11,
   target: argo("staging", "orders-api"),
@@ -580,6 +736,7 @@ const depStagingOrders11: DeploymentDto = {
 /** Each Environment's Deployments, newest first (the list endpoint's order). */
 const envDeployments: Record<string, DeploymentDto[]> = {
   production: [
+    depGateway16,
     depMessaging15,
     depGateway14,
     depOrders13,
@@ -596,7 +753,7 @@ const envDeployments: Record<string, DeploymentDto[]> = {
 // below), so its reports are dropped — the row keeps its history and says so.
 const board: BoardRowDto[] = [
   { target: depOrders13.target, live: depOrders13, newest: null, moved_away: null },
-  { target: depGateway14.target, live: depGateway14, newest: null, moved_away: null },
+  { target: depGateway14.target, live: depGateway14, newest: depGateway16, moved_away: null },
   { target: depInventory12.target, live: depInventory7, newest: depInventory12, moved_away: null },
   { target: depMessaging15.target, live: null, newest: depMessaging15, moved_away: null },
   {
@@ -1393,6 +1550,20 @@ function route(pathname: string, search: string, method: string): Response | nul
     });
   if (p === `/v1/runs/${RUN_ID}/artifacts`) return json([]);
   if (p === `/v1/runs/${RUN_ID}/services`) return json([]);
+
+  // the DEPLOY run (DeploymentGates + a concurrency hold)
+  if (p === `/v1/runs/${DEPLOY_RUN_ID}`) return json(deployRunStatus);
+  if (p === `/v1/runs/${DEPLOY_RUN_ID}/events`)
+    return new Response(deployEventsBody, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  if (p === `/v1/runs/${DEPLOY_RUN_ID}/artifacts`) return json([]);
+  if (p === `/v1/runs/${DEPLOY_RUN_ID}/services`) return json([]);
+  // Reject a gate (ADR-0070 §9): the fixture is static, so it only answers.
+  if (method === "POST" && /^\/v1\/runs\/[^/]+\/gates\/[^/]+\/reject$/.test(p)) {
+    return json({ rejected: true }, { status: 202 });
+  }
 
   // the RICH run (Playwright walkthrough fixture)
   if (p === `/v1/runs/${RICH_RUN_ID}`) return json(richRunStatus);

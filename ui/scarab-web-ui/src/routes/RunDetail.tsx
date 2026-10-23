@@ -17,6 +17,7 @@ import {
   retryStep,
   cancelRun,
   approveGate,
+  rejectGate,
   isTerminal,
   runParams,
   listArtifacts,
@@ -46,7 +47,15 @@ import {
   type TakeView,
 } from "../takes";
 import { stripTries as stripTriesOf } from "../attempts";
-import { approvableGates, gateBlockers } from "../gates";
+import {
+  actionableGates,
+  gateBlockers,
+  gateStatus,
+  gateWaitHint,
+  isApprovable,
+  isRejectable,
+  rejectReasonError,
+} from "../gates";
 import {
   isWidened,
   pinLabel,
@@ -93,6 +102,13 @@ export default function RunDetail() {
   const [sel, setSel] = createSignal<string | null>(null);
   const [approving, setApproving] = createSignal<string | null>(null);
   const [gateNotes, setGateNotes] = createSignal<Record<string, string>>({});
+  // Reject (ADR-0070 §9): the gate whose in-page reason form is open, its
+  // draft reason, and the gate a reject is in flight for. Confirmation is the
+  // form itself — a required reason and an explicit second click — never a
+  // browser `confirm()` (the artifact/embedded viewers refuse dialogs).
+  const [rejectFor, setRejectFor] = createSignal<string | null>(null);
+  const [rejectReason, setRejectReason] = createSignal("");
+  const [rejecting, setRejecting] = createSignal<string | null>(null);
   const [selAttempt, setSelAttempt] = createSignal<string | null>(null);
   // A step's docked sidecar the user clicked (ADR-0058): its `services:` index,
   // or null. Focuses that container in the StepPane Logs tab. Cleared whenever
@@ -273,6 +289,10 @@ export default function RunDetail() {
         reused,
         needs: s.needs ?? [],
         gate: s.gate,
+        // The gate verdict / DeploymentGate wait / concurrency hold line. It
+        // describes the run NOW, so it is dropped while viewing an older
+        // version (the statuses there are a replay; this is not).
+        note: tv ? null : gateStatus(s),
         runningSince:
           !tv && s.status === "running"
             ? s.attempt_list?.[s.attempt_list.length - 1]?.started_at ?? null
@@ -544,7 +564,11 @@ export default function RunDetail() {
   // anything else. A run can suspend on SEVERAL gates, so this is a list and
   // every gate carries its own action; there is deliberately no run-level
   // "approve" button, which would be ambiguous about what it approved.
-  const pendingGates = () => approvableGates(run()?.steps ?? []);
+  //
+  // Reject is offered for every gate kind (a DeploymentGate can only be
+  // rejected — core passes it), beside Approve on manual gates; a gate whose
+  // needs are unmet lists with both disabled (the server 409s it).
+  const pendingGates = () => actionableGates(run()?.steps ?? []);
 
   const statusOf = (step: string) => (run()?.steps ?? []).find((s) => s.id === step)?.status;
 
@@ -570,6 +594,36 @@ export default function RunDetail() {
       setGateNotes({ ...gateNotes(), [step]: e instanceof Error ? e.message : "approve failed" });
     } finally {
       setApproving(null);
+    }
+  }
+
+  function openReject(step: string) {
+    setRejectFor(step);
+    setRejectReason("");
+  }
+
+  async function onReject(step: string) {
+    const reason = rejectReason();
+    const invalid = rejectReasonError(reason);
+    if (invalid) {
+      setGateNotes({ ...gateNotes(), [step]: invalid });
+      return;
+    }
+    setRejecting(step);
+    try {
+      await rejectGate(id(), step, reason.trim());
+      setGateNotes({ ...gateNotes(), [step]: "rejected" });
+      setRejectFor(null);
+      setRejectReason("");
+      setLive(true);
+      await refresh();
+      if (!poll && live()) poll = setInterval(() => void refresh(), POLL_MS);
+    } catch (e) {
+      // The server's own words (400 bad reason / 409 not rejectable, not
+      // pending, not reached) — the reason form stays open to fix and retry.
+      setGateNotes({ ...gateNotes(), [step]: e instanceof Error ? e.message : "reject failed" });
+    } finally {
+      setRejecting(null);
     }
   }
 
@@ -672,26 +726,84 @@ export default function RunDetail() {
                     <div class="gate-row" classList={{ blocked: blockersOf(g).length > 0 }}>
                       <Icon icon="shield-check" size={13} />
                       <span class="gate-step mono">{g.id}</span>
-                      <span class="gate-hint">
-                        {blockersOf(g).length === 0
-                          ? "waiting for a decision"
-                          : `waiting on ${blockersOf(g).join(", ")}`}
+                      <span class="gate-kind mono">{g.gate}</span>
+                      <span class="gate-hint" title={gateWaitHint(g, statusOf)}>
+                        {gateWaitHint(g, statusOf)}
                       </span>
                       <Show when={gateNotes()[g.id]}>
                         {(note) => <span class="gate-note">{note()}</span>}
                       </Show>
-                      <button
-                        class="btn btn-sm btn-primary"
-                        onClick={() => void onApprove(g.id)}
-                        disabled={approving() !== null || blockersOf(g).length > 0}
-                        title={
-                          blockersOf(g).length > 0
-                            ? `blocked — ${blockersOf(g).join(", ")} has not succeeded`
-                            : `approve ${g.id}`
+                      <Show
+                        when={rejectFor() === g.id}
+                        fallback={
+                          <span class="gate-actions">
+                            <button
+                              class="btn btn-sm btn-ghost"
+                              onClick={() => openReject(g.id)}
+                              disabled={rejecting() !== null || !isRejectable(g, statusOf)}
+                              title={
+                                blockersOf(g).length > 0
+                                  ? `blocked — ${blockersOf(g).join(", ")} has not succeeded`
+                                  : `reject ${g.id} — fail it with a reason; the run fails`
+                              }
+                            >
+                              Reject
+                            </button>
+                            <Show when={isApprovable(g)}>
+                              <button
+                                class="btn btn-sm btn-primary"
+                                onClick={() => void onApprove(g.id)}
+                                disabled={approving() !== null || blockersOf(g).length > 0}
+                                title={
+                                  blockersOf(g).length > 0
+                                    ? `blocked — ${blockersOf(g).join(", ")} has not succeeded`
+                                    : `approve ${g.id}`
+                                }
+                              >
+                                {approving() === g.id ? "approving…" : "Approve"}
+                              </button>
+                            </Show>
+                          </span>
                         }
                       >
-                        {approving() === g.id ? "approving…" : "Approve"}
-                      </button>
+                        {/* The in-page confirm: a required reason, then an
+                            explicit "Reject gate". The reason is journalled on
+                            the verdict and the gate's Attempt. */}
+                        <form
+                          class="gate-reject"
+                          onSubmit={(e) => {
+                            e.preventDefault();
+                            void onReject(g.id);
+                          }}
+                        >
+                          <input
+                            class="input input-sm"
+                            type="text"
+                            required
+                            maxlength={1024}
+                            placeholder="why reject? (required)"
+                            aria-label={`reason for rejecting ${g.id}`}
+                            value={rejectReason()}
+                            onInput={(e) => setRejectReason(e.currentTarget.value)}
+                            ref={(el) => queueMicrotask(() => el.focus())}
+                          />
+                          <button
+                            type="submit"
+                            class="btn btn-sm btn-danger"
+                            disabled={rejecting() !== null || rejectReasonError(rejectReason()) !== null}
+                          >
+                            {rejecting() === g.id ? "rejecting…" : "Reject gate"}
+                          </button>
+                          <button
+                            type="button"
+                            class="btn btn-sm btn-ghost"
+                            onClick={() => setRejectFor(null)}
+                            disabled={rejecting() !== null}
+                          >
+                            Cancel
+                          </button>
+                        </form>
+                      </Show>
                     </div>
                   )}
                 </For>
@@ -1103,6 +1215,9 @@ export default function RunDetail() {
                       canDebug={canShell()}
                       onDebugPod={() => setShellOpen(true)}
                       focusSidecar={focusSidecar()}
+                      gateStatus={
+                        !timeTraveling() && selectedStep() ? gateStatus(selectedStep()!) : null
+                      }
                     />
                   }
                 >

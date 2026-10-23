@@ -2227,6 +2227,26 @@ export interface components {
             /** @description Whether it was ever reported live. */
             was_ever_live: boolean;
         };
+        /**
+         * @description A waiting DeploymentGate: the DeploymentTarget it waits on and, once its
+         *     requester's DeploymentRequest is in the record, where that Deployment
+         *     stands (as the Deployments view folds it).
+         */
+        DeploymentGateDto: {
+            /**
+             * Format: int64
+             * @description The Deployment the requester's current request landed on.
+             */
+            deployment_id?: number | null;
+            deployment_status?: null | components["schemas"]["DeploymentStatusDto"];
+            environment: string;
+            /** @description The latest source report's label, when it has one. */
+            latest_label?: string | null;
+            target_id: string;
+            target_source: string;
+            /** @description The DeploymentVersion asked for. */
+            version?: string | null;
+        };
         /** @description A Deploy Run step that requested a Deployment. */
         DeploymentRequesterDto: {
             /**
@@ -2554,6 +2574,34 @@ export interface components {
             /**
              * @description Why the gate failed — required (1 to 1024 bytes, trimmed) with
              *     `passed: false`; ignored on a release.
+             */
+            reason?: string | null;
+        };
+        /** @description How a gate's wait resolved: its `GateResolved` journal entry. */
+        GateResolutionDto: {
+            /**
+             * Format: int64
+             * @description Unix-ms the verdict was journalled.
+             */
+            at: number;
+            /** @description The gate Attempt the verdict closed (`a1`, `a2`, …). */
+            attempt: string;
+            /**
+             * @description Who rejected it, for a rejection by request (`external:{step}` for an
+             *     external gate's token). Absent for a verdict the engine reached.
+             */
+            by?: string | null;
+            /**
+             * Format: int64
+             * @description The Deployment a DeploymentGate's verdict was read from (its
+             *     Org-scoped id, as the Deployments view shows it).
+             */
+            deployment_id?: number | null;
+            /** @description `true`: the gate passed and its dependents may run. */
+            passed: boolean;
+            /**
+             * @description Why — a timer elapsing, a DeploymentGate's "v1 live on …", the
+             *     source's failure label, a rejection's reason.
              */
             reason?: string | null;
         };
@@ -3621,11 +3669,21 @@ export interface components {
              */
             attempt_list?: components["schemas"]["AttemptDto"][];
             attempts: number;
+            deployment_gate?: null | components["schemas"]["DeploymentGateDto"];
             /**
-             * @description `manual`/`timer`/`external` if this step is a gate (ADR-0008), else absent.
-             *     Gates launch no pod and suspend the run until released.
+             * @description `manual`/`timer`/`external`/`deployment` if this step is a gate
+             *     (ADR-0008, ADR-0070 §8), else absent. Gates launch no pod; a waiting
+             *     gate holds only the steps that need it.
              */
             gate?: string | null;
+            gate_resolution?: null | components["schemas"]["GateResolutionDto"];
+            /**
+             * @description Why this deploy Step is held `pending` by per-DeploymentTarget
+             *     concurrency (ADR-0071 §9), e.g. "held: waiting for deployment
+             *     concurrency on `argocd`/`web` (1/1 in flight)". Derived each read
+             *     (nothing is journalled per scheduler pass). Absent when not held.
+             */
+            held?: string | null;
             id: string;
             /**
              * @description Upstream step ids this step depends on — the DAG in-edges (ADR-0006). The
