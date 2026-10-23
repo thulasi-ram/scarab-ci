@@ -57,10 +57,13 @@ from: *all projects*, or an explicit list in which project-name globs are allowe
 - A new Environment starts with **no** eligible Projects. It is fail-closed.
 - It is checked **at Run creation**, before any Pod is created or any secret resolved.
   It is checked **again** wherever the Environment's authority is used later in the Run:
-  a manual gate does not release (409) for a Project no longer eligible, or for an
-  Environment that no longer exists, and a step is not handed the Environment's secrets
-  or OIDC token at launch. An admin withdrawing eligibility therefore stops a long Run at
-  its next use of the Environment, not only its next Run.
+  a manual or external gate does not release (409) for a Project no longer eligible, or
+  for an Environment that no longer exists, and **every** step of a Deploy Run is
+  re-checked at launch — whether or not it carries secrets, an OIDC token, governed
+  grants or a raw overlay — and fails cleanly (a configuration failure with the reason)
+  when the Project is no longer eligible. Timer gates are covered by that launch check.
+  An admin withdrawing eligibility therefore stops a long Run at its next step, not only
+  its next Run.
 - Reading and watching an Environment's DeploymentTargets needs only eligibility.
 
 ### 3. EnvironmentProjectOverlay: per-project, tighten-only
