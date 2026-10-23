@@ -3143,6 +3143,9 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "the caller may not dispatch, or the pipeline's Environment does not exist in the org or does not admit this project (ADR-0071); the body says what an org admin must do. No run is created"
           }
         },
         "security": [
@@ -3162,6 +3165,26 @@
         ],
         "summary": "The environments this project may deploy into, with baseline/overlay/effective rules (ADR-0071)",
         "operationId": "list_environments",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "repo owner",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "repo name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "",
@@ -3194,6 +3217,35 @@
         ],
         "summary": "One environment as this project sees it: baseline, overlay, effective (ADR-0071)",
         "operationId": "get_environment",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "repo owner",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "repo name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "",
@@ -3224,6 +3276,35 @@
         ],
         "summary": "Retired: per-repo environments are org-level Environments now (ADR-0071)",
         "operationId": "put_environment",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "repo owner",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "repo name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "410": {
             "description": "gone; the body says where it went"
@@ -3244,6 +3325,35 @@
         ],
         "summary": "Retired: per-repo environments are org-level Environments now (ADR-0071)",
         "operationId": "delete_environment",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "repo owner",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "repo name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "410": {
             "description": "gone; the body says where it went"
@@ -3266,6 +3376,35 @@
         ],
         "summary": "Legacy approval history (ADR-0070 §1)",
         "operationId": "list_deployments",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "repo owner",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "repo name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "most recent first"
@@ -3992,7 +4131,7 @@
         "tags": [
           "Runs"
         ],
-        "summary": "Release an **external** gate by presenting its token (ADR-0034) — the path an\noutside system (a deploy webhook, a change-management tool) uses instead of an\ninteractive approval. The token is `HMAC-SHA256(secret, \"{run}:{step}\")`\n(`sha256=<hex>`), verified in constant time; no per-gate storage. The endpoint\nis 404 when no token secret is configured, and only releases gates of kind\n`external` (manual gates stay approval-only).",
+        "summary": "Release an **external** gate by presenting its token (ADR-0034) — the path an\noutside system (a deploy webhook, a change-management tool) uses instead of an\ninteractive approval. The token is `HMAC-SHA256(secret, \"{run}:{step}\")`\n(`sha256=<hex>`), verified in constant time; no per-gate storage. The endpoint\nis 404 when no token secret is configured, and only releases gates of kind\n`external` (manual gates stay approval-only). In a Deploy Run, the gate is\nheld (409) when the run's Environment no longer exists or no longer admits\nits Project (ADR-0071 §2) — the same check `approve_gate` makes. The token\nproves who is releasing, not that the deploy is still allowed.",
         "operationId": "release_gate_external",
         "parameters": [
           {
@@ -4023,6 +4162,9 @@
           },
           "404": {
             "description": "no such external gate, or token release disabled"
+          },
+          "409": {
+            "description": "the gate is not pending, or the run's Environment no longer exists or no longer admits its project"
           }
         },
         "security": [

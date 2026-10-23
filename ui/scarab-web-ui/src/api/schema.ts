@@ -1342,7 +1342,10 @@ export interface paths {
          *     interactive approval. The token is `HMAC-SHA256(secret, "{run}:{step}")`
          *     (`sha256=<hex>`), verified in constant time; no per-gate storage. The endpoint
          *     is 404 when no token secret is configured, and only releases gates of kind
-         *     `external` (manual gates stay approval-only).
+         *     `external` (manual gates stay approval-only). In a Deploy Run, the gate is
+         *     held (409) when the run's Environment no longer exists or no longer admits
+         *     its Project (ADR-0071 §2) — the same check `approve_gate` makes. The token
+         *     proves who is releasing, not that the deploy is still allowed.
          */
         post: operations["release_gate_external"];
         delete?: never;
@@ -6010,13 +6013,25 @@ export interface operations {
                     "application/json": components["schemas"]["CreateRunResponse"];
                 };
             };
+            /** @description the caller may not dispatch, or the pipeline's Environment does not exist in the org or does not admit this project (ADR-0071); the body says what an org admin must do. No run is created */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     list_environments: {
         parameters: {
             query?: never;
             header?: never;
-            path?: never;
+            path: {
+                /** @description repo owner */
+                org: string;
+                /** @description repo name */
+                repo: string;
+            };
             cookie?: never;
         };
         requestBody?: never;
@@ -6035,7 +6050,14 @@ export interface operations {
         parameters: {
             query?: never;
             header?: never;
-            path?: never;
+            path: {
+                /** @description repo owner */
+                org: string;
+                /** @description repo name */
+                repo: string;
+                /** @description Environment name */
+                name: string;
+            };
             cookie?: never;
         };
         requestBody?: never;
@@ -6061,7 +6083,14 @@ export interface operations {
         parameters: {
             query?: never;
             header?: never;
-            path?: never;
+            path: {
+                /** @description repo owner */
+                org: string;
+                /** @description repo name */
+                repo: string;
+                /** @description Environment name */
+                name: string;
+            };
             cookie?: never;
         };
         requestBody?: never;
@@ -6079,7 +6108,14 @@ export interface operations {
         parameters: {
             query?: never;
             header?: never;
-            path?: never;
+            path: {
+                /** @description repo owner */
+                org: string;
+                /** @description repo name */
+                repo: string;
+                /** @description Environment name */
+                name: string;
+            };
             cookie?: never;
         };
         requestBody?: never;
@@ -6097,7 +6133,14 @@ export interface operations {
         parameters: {
             query?: never;
             header?: never;
-            path?: never;
+            path: {
+                /** @description repo owner */
+                org: string;
+                /** @description repo name */
+                repo: string;
+                /** @description Environment name */
+                name: string;
+            };
             cookie?: never;
         };
         requestBody?: never;
@@ -6576,6 +6619,13 @@ export interface operations {
             };
             /** @description no such external gate, or token release disabled */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the gate is not pending, or the run's Environment no longer exists or no longer admits its project */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
