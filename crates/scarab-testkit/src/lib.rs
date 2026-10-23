@@ -238,6 +238,12 @@ struct InMemoryState {
     /// reads fail with a backend error, modelling a "poison run" — one whose
     /// tick work cannot complete. See [`InMemoryDb::poison_run`].
     poisoned_runs: std::collections::HashSet<RunId>,
+    /// Test-only one-shot interleaving (slice b1-fix): when armed for a gate,
+    /// the next [`close_running_attempt`](Db::close_running_attempt) on it
+    /// first resolves the gate (pass, unfenced, at the armed instant) — a
+    /// concurrent release that committed between a caller's snapshot and its
+    /// close. See [`InMemoryDb::arm_gate_resolve_race`].
+    gate_resolve_race: Option<(StepId, Timestamp)>,
 }
 
 /// An in-memory [`Db`] for tests: an append-only event log, run/step state
@@ -336,6 +342,96 @@ impl InMemoryDb {
     pub fn heal_run(&self, run: &RunId) {
         self.state.lock().unwrap().poisoned_runs.remove(run);
     }
+
+    /// Arm a one-shot gate-resolve race (test seam for the b1-fix re-arm
+    /// ordering): the next [`close_running_attempt`](Db::close_running_attempt)
+    /// targeting gate `step` is preceded, under the same lock, by a passing
+    /// unfenced [`resolve_gate_wait`](Db::resolve_gate_wait) at `at` — a
+    /// release that landed between a rerun's snapshot (gate waiting) and its
+    /// supersede of that wait.
+    pub fn arm_gate_resolve_race(&self, step: &StepId, at: Timestamp) {
+        self.state.lock().unwrap().gate_resolve_race = Some((step.clone(), at));
+    }
+}
+
+/// The numeric suffix of an attempt id `a{n}` (0 for any other shape).
+fn attempt_number(a: &Attempt) -> u64 {
+    a.id.0
+        .strip_prefix('a')
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// [`Db::resolve_gate_wait`] under the caller's lock — shared by the port and
+/// the [`InMemoryDb::arm_gate_resolve_race`] seam.
+fn resolve_gate_wait_locked(
+    st: &mut InMemoryState,
+    run: &RunId,
+    step: &StepId,
+    res: &scarab_engine::GateResolution,
+) -> Option<AttemptId> {
+    let rec = st.steps.get_mut(&(run.clone(), step.clone()))?;
+    if rec.status != Some(StepStatus::Pending) {
+        return None;
+    }
+    rec.attempts.sort_by_key(attempt_order_key);
+    let (failure, outcome) = if res.passed {
+        (None, AttemptOutcome::Succeeded)
+    } else {
+        (Some(FailureKind::Gate), AttemptOutcome::Failed)
+    };
+    let detail = res.attempt_detail();
+    let close = |a: &mut Attempt| {
+        a.failure = failure;
+        a.failure_detail = detail.clone();
+        a.outcome = outcome;
+    };
+    let (attempt, minted) = match &res.fence {
+        Some(f) => {
+            let a = rec
+                .attempts
+                .iter_mut()
+                .find(|a| &a.id == f && a.outcome == AttemptOutcome::Running)?;
+            close(a);
+            (f.clone(), false)
+        }
+        None => match rec
+            .attempts
+            .last_mut()
+            .filter(|a| a.outcome == AttemptOutcome::Running)
+        {
+            Some(a) => {
+                close(a);
+                (a.id.clone(), false)
+            }
+            None => {
+                let n = rec.attempts.iter().map(attempt_number).max().unwrap_or(0) + 1;
+                let id = AttemptId(format!("a{n}"));
+                rec.attempts.push(Attempt {
+                    id: id.clone(),
+                    started_at: Timestamp(res.legacy_started_at.0.min(res.at.0)),
+                    failure,
+                    failure_detail: detail.clone(),
+                    outcome,
+                });
+                (id, true)
+            }
+        },
+    };
+    rec.status = Some(if res.passed {
+        StepStatus::Succeeded
+    } else {
+        StepStatus::Failed
+    });
+    for kind in scarab_engine::gate_resolution_events(step, &attempt, minted, res) {
+        st.events.push(EventKind {
+            version: scarab_engine::EVENT_VERSION,
+            run: run.clone(),
+            kind,
+            at: res.at,
+        });
+    }
+    Some(attempt)
 }
 
 impl Default for InMemoryDb {
@@ -1377,6 +1473,97 @@ impl Db for InMemoryDb {
     async fn append_event(&self, event: &EventKind) -> Result<(), DbError> {
         self.state.lock().unwrap().events.push(event.clone());
         Ok(())
+    }
+
+    async fn open_gate_wait(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        started_at: Timestamp,
+        at: Timestamp,
+    ) -> Result<Option<Attempt>, DbError> {
+        // One lock = the Postgres transaction with the step row locked.
+        let mut st = self.state.lock().unwrap();
+        let Some(rec) = st.steps.get_mut(&(run.clone(), step.clone())) else {
+            return Ok(None);
+        };
+        if rec.status != Some(StepStatus::Pending) {
+            return Ok(None);
+        }
+        rec.attempts.sort_by_key(attempt_order_key);
+        if let Some(open) = rec
+            .attempts
+            .last()
+            .filter(|a| a.outcome == AttemptOutcome::Running)
+        {
+            return Ok(Some(open.clone()));
+        }
+        let n = rec.attempts.iter().map(attempt_number).max().unwrap_or(0) + 1;
+        let attempt = Attempt {
+            id: AttemptId(format!("a{n}")),
+            started_at: Timestamp(started_at.0.min(at.0)),
+            failure: None,
+            failure_detail: None,
+            outcome: AttemptOutcome::Running,
+        };
+        rec.attempts.push(attempt.clone());
+        st.events.push(EventKind {
+            version: scarab_engine::EVENT_VERSION,
+            run: run.clone(),
+            kind: scarab_engine::EventPayload::AttemptStarted {
+                step: step.clone(),
+                attempt: attempt.id.clone(),
+            },
+            at,
+        });
+        Ok(Some(attempt))
+    }
+
+    async fn resolve_gate_wait(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        res: &scarab_engine::GateResolution,
+    ) -> Result<Option<AttemptId>, DbError> {
+        let mut st = self.state.lock().unwrap();
+        Ok(resolve_gate_wait_locked(&mut st, run, step, res))
+    }
+
+    async fn close_running_attempt(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        outcome: AttemptOutcome,
+        event: Option<&EventKind>,
+    ) -> Result<bool, DbError> {
+        let mut st = self.state.lock().unwrap();
+        if matches!(&st.gate_resolve_race, Some((s, _)) if s == step) {
+            let (_, at) = st.gate_resolve_race.take().unwrap();
+            let release = scarab_engine::GateResolution {
+                passed: true,
+                reason: "released".to_string(),
+                expired: false,
+                by: None,
+                fence: None,
+                legacy_started_at: at,
+                at,
+            };
+            resolve_gate_wait_locked(&mut st, run, step, &release);
+        }
+        let Some(a) = st
+            .steps
+            .get_mut(&(run.clone(), step.clone()))
+            .and_then(|rec| rec.attempts.iter_mut().find(|a| &a.id == attempt))
+            .filter(|a| a.outcome == AttemptOutcome::Running)
+        else {
+            return Ok(false);
+        };
+        a.outcome = outcome;
+        if let Some(e) = event {
+            st.events.push(e.clone());
+        }
+        Ok(true)
     }
 
     async fn enqueue_outbox(&self, msg: &OutboxMessage) -> Result<(), DbError> {

@@ -2419,9 +2419,12 @@ fn rerun_outcome<T>(res: Result<T, RerunError>) -> Result<T, ApiError> {
         Err(e @ RerunError::NotFailed { .. }) => Err(ApiError::Conflict(e.to_string())),
         // Gate-approval-only variants (never produced by rerun/retry); mapped to
         // 409 for exhaustiveness.
-        Err(e @ (RerunError::NotAManualGate(_) | RerunError::GateNotPending { .. })) => {
-            Err(ApiError::Conflict(e.to_string()))
-        }
+        Err(
+            e @ (RerunError::NotAManualGate(_)
+            | RerunError::GateNotPending { .. }
+            | RerunError::GateNotReached { .. }
+            | RerunError::NotARejectableGate(_)),
+        ) => Err(ApiError::Conflict(e.to_string())),
         Err(RerunError::Db(e)) => Err(ApiError::Db(e)),
     }
 }
@@ -6924,7 +6927,7 @@ fn gate_approvers(events: &[EventKind], step: &StepId) -> Vec<String> {
     responses(
         (status = 202, description = "approval recorded (released or awaiting more approvals)"),
         (status = 404, description = "no such run or gate"),
-        (status = 409, description = "not an approvable gate, or the run's Environment no longer exists or no longer admits its project")
+        (status = 409, description = "not an approvable gate (not a manual gate, not pending, or not reached yet), or the run's Environment no longer exists or no longer admits its project")
     )
 )]
 async fn approve_gate(
@@ -6957,7 +6960,9 @@ async fn approve_gate(
             e @ (RerunError::DependencyNotSatisfied { .. }
             | RerunError::NotFailed { .. }
             | RerunError::NotAManualGate(_)
-            | RerunError::GateNotPending { .. }),
+            | RerunError::GateNotPending { .. }
+            | RerunError::GateNotReached { .. }
+            | RerunError::NotARejectableGate(_)),
         ) => return Err(ApiError::Conflict(e.to_string())),
         Err(RerunError::Db(e)) => return Err(ApiError::Db(e)),
     }
@@ -7017,7 +7022,9 @@ async fn approve_gate(
             e @ (RerunError::DependencyNotSatisfied { .. }
             | RerunError::NotFailed { .. }
             | RerunError::NotAManualGate(_)
-            | RerunError::GateNotPending { .. }),
+            | RerunError::GateNotPending { .. }
+            | RerunError::GateNotReached { .. }
+            | RerunError::NotARejectableGate(_)),
         ) => return Err(ApiError::Conflict(e.to_string())),
         Err(RerunError::Db(e)) => return Err(ApiError::Db(e)),
     }
@@ -7063,6 +7070,95 @@ async fn approve_gate(
         .into_response())
 }
 
+/// `POST /v1/runs/{id}/gates/{step}/reject` body: why the gate is failed.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct RejectGateRequest {
+    /// The human reason, journalled on the gate's verdict and its Attempt.
+    /// Required: 1 to 1024 bytes once trimmed.
+    pub reason: String,
+}
+
+/// The longest gate-reject reason accepted, in bytes (after trimming).
+const GATE_REJECT_REASON_MAX_BYTES: usize = 1024;
+
+/// A reject reason, trimmed and bounded (1..=1024 bytes), or a 400.
+fn gate_reject_reason(reason: &str) -> Result<&str, ApiError> {
+    let reason = reason.trim();
+    if reason.is_empty() || reason.len() > GATE_REJECT_REASON_MAX_BYTES {
+        return Err(ApiError::BadRequest(format!(
+            "reason is required: 1 to {GATE_REJECT_REASON_MAX_BYTES} bytes"
+        )));
+    }
+    Ok(reason)
+}
+
+/// Reject a waiting gate: fail it with a reason (ADR-0070 §9).
+///
+/// For a `manual`, `timer` or `external` gate that is pending and reached
+/// (every step it needs has succeeded; slice b, criterion 3). The gate's Attempt fails with
+/// the reason and the rejecting principal, its dependents are skipped, and the
+/// run ends `failed`; retrying the gate opens a new wait that asks again.
+///
+/// Authz'd as a run write, the same as approve. A reject only ever stops a
+/// deploy — any writer can already cancel the run — so it does NOT consult the
+/// Environment's approver rules, and it works when the Environment is gone or
+/// no longer admits the project: the clean way out of a held gate.
+#[utoipa::path(
+    post,
+    path = "/v1/runs/{id}/gates/{step}/reject",
+    params(
+        ("id" = String, Path, description = "run id"),
+        ("step" = String, Path, description = "gate step id")
+    ),
+    request_body = RejectGateRequest,
+    responses(
+        (status = 202, description = "this call rejected the gate: `{\"rejected\": true}`"),
+        (status = 400, description = "missing, empty or over-long reason"),
+        (status = 404, description = "no such run or step"),
+        (status = 409, description = "not a rejectable gate, not pending, or not reached yet")
+    )
+)]
+async fn reject_gate(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((id, step)): Path<(String, String)>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let run = RunId(id);
+    let scope = run_scope(&st, &run).await;
+    let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
+    let req: RejectGateRequest = serde_json::from_slice(&body)
+        .map_err(|e| ApiError::BadRequest(format!("bad reject body: {e}")))?;
+    let reason = gate_reject_reason(&req.reason)?;
+    gate_reject_outcome(
+        scarab_engine::reject_gate(
+            st.db.as_ref(),
+            st.clock.as_ref(),
+            &run,
+            &StepId(step),
+            &principal.subject,
+            reason,
+        )
+        .await,
+    )?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "rejected": true })),
+    )
+        .into_response())
+}
+
+/// Map a [`scarab_engine::reject_gate`] outcome: `Ok(false)` (a racing
+/// resolver got there first) is a 409 like any other not-pending gate.
+fn gate_reject_outcome(res: Result<bool, RerunError>) -> Result<(), ApiError> {
+    match rerun_outcome(res)? {
+        true => Ok(()),
+        false => Err(ApiError::Conflict(
+            "the gate is no longer awaiting a verdict".into(),
+        )),
+    }
+}
+
 /// The governing Environment's effective rules for releasing a Deploy Run's
 /// gate, resolved NOW (ADR-0071 §2-3) — shared by every path that releases a
 /// gate by request (`approve_gate`, `release_gate_external`) so neither can
@@ -7105,6 +7201,29 @@ async fn gate_release_governance(
 /// HTTP header carrying an external-gate release token (`sha256=<hex>`).
 const GATE_TOKEN_HEADER: &str = "x-scarab-gate-token";
 
+/// Optional `POST /v1/runs/{id}/gates/{step}/release` body: an external gate's
+/// verdict. Absent (or `passed: true`) releases the gate; `passed: false`
+/// fails it with `reason`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ExternalGateVerdict {
+    /// `false` fails the gate; `true` (the default) releases it.
+    #[serde(default = "default_true")]
+    pub passed: bool,
+    /// Why the gate failed — required (1 to 1024 bytes, trimmed) with
+    /// `passed: false`; ignored on a release.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+impl Default for ExternalGateVerdict {
+    fn default() -> Self {
+        Self {
+            passed: true,
+            reason: None,
+        }
+    }
+}
+
 /// Release an **external** gate by presenting its token (ADR-0034) — the path an
 /// outside system (a deploy webhook, a change-management tool) uses instead of an
 /// interactive approval. The token is `HMAC-SHA256(secret, "{run}:{step}")`
@@ -7114,6 +7233,11 @@ const GATE_TOKEN_HEADER: &str = "x-scarab-gate-token";
 /// held (409) when the run's Environment no longer exists or no longer admits
 /// its Project (ADR-0071 §2) — the same check `approve_gate` makes. The token
 /// proves who is releasing, not that the deploy is still allowed.
+///
+/// The same token can instead **fail** the gate with a reason: a body of
+/// `{"passed": false, "reason": "…"}` rejects it (journalled `by
+/// external:{step}`). A fail is never held — it only stops the deploy — so it
+/// skips the Environment check. No body, or `"passed": true`, is a release.
 #[utoipa::path(
     post,
     path = "/v1/runs/{id}/gates/{step}/release",
@@ -7121,17 +7245,20 @@ const GATE_TOKEN_HEADER: &str = "x-scarab-gate-token";
         ("id" = String, Path, description = "run id"),
         ("step" = String, Path, description = "gate step id")
     ),
+    request_body(content = Option<ExternalGateVerdict>, description = "optional: `{\"passed\": false, \"reason\": \"…\"}` fails the gate instead of releasing it"),
     responses(
-        (status = 202, description = "gate released"),
+        (status = 202, description = "gate released (or, with a fail body, failed)"),
+        (status = 400, description = "malformed body, or a fail without a 1..1024-byte reason"),
         (status = 401, description = "bad or missing token"),
         (status = 404, description = "no such external gate, or token release disabled"),
-        (status = 409, description = "the gate is not pending, or the run's Environment no longer exists or no longer admits its project")
+        (status = 409, description = "the gate is not pending or not reached yet, or (a release) the run's Environment no longer exists or no longer admits its project")
     )
 )]
 async fn release_gate_external(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((id, step)): Path<(String, String)>,
+    body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     // Token release is opt-in: without a configured secret the endpoint 404s.
     let Some(secret) = st.gate_token_secret.as_ref() else {
@@ -7157,6 +7284,30 @@ async fn release_gate_external(
     scarab_forge_github::verify_signature(secret, message.as_bytes(), token)
         .map_err(|_| ApiError::Unauthorized)?;
 
+    // A fail verdict (only read once the token verifies): reject with the
+    // reason. Never held by the Environment — it only stops the deploy.
+    let verdict: ExternalGateVerdict = if body.iter().all(u8::is_ascii_whitespace) {
+        ExternalGateVerdict::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| ApiError::BadRequest(format!("bad gate verdict body: {e}")))?
+    };
+    if !verdict.passed {
+        let reason = gate_reject_reason(verdict.reason.as_deref().unwrap_or_default())?;
+        gate_reject_outcome(
+            scarab_engine::reject_gate(
+                st.db.as_ref(),
+                st.clock.as_ref(),
+                &run,
+                &step,
+                &format!("external:{}", step.0),
+                reason,
+            )
+            .await,
+        )?;
+        return Ok(StatusCode::ACCEPTED);
+    }
+
     // Only after the token verifies: an unauthenticated caller learns nothing
     // about the Environment. The rules themselves are not evaluated — the
     // token IS this gate's approval (ADR-0034) — only whether the deploy may
@@ -7171,7 +7322,9 @@ async fn release_gate_external(
             e @ (RerunError::DependencyNotSatisfied { .. }
             | RerunError::NotFailed { .. }
             | RerunError::NotAManualGate(_)
-            | RerunError::GateNotPending { .. }),
+            | RerunError::GateNotPending { .. }
+            | RerunError::GateNotReached { .. }
+            | RerunError::NotARejectableGate(_)),
         ) => Err(ApiError::Conflict(e.to_string())),
         Err(RerunError::Db(e)) => Err(ApiError::Db(e)),
     }
@@ -9909,6 +10062,7 @@ impl utoipa::Modify for SecuritySchemes {
         list_workspace,
         get_workspace_file,
         approve_gate,
+        reject_gate,
         release_gate_external,
         put_secret,
         list_secrets,
@@ -9944,6 +10098,8 @@ impl utoipa::Modify for SecuritySchemes {
         WorkspaceEntryDto,
         WorkspaceListing,
         PutSecretRequest,
+        RejectGateRequest,
+        ExternalGateVerdict,
         SecretListResponse,
         SecretMatrix,
         SecretMatrixRow,
@@ -10096,6 +10252,7 @@ fn router_inner(state: AppState) -> Router {
             get(get_workspace_file),
         )
         .route("/v1/runs/{id}/gates/{step}/approve", post(approve_gate))
+        .route("/v1/runs/{id}/gates/{step}/reject", post(reject_gate))
         .route(
             "/v1/runs/{id}/gates/{step}/release",
             post(release_gate_external),

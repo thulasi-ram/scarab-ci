@@ -23,7 +23,7 @@ pub mod scheduler;
 pub use ports::{Clock, Db, Executor, LogChunks, SnapshotRetention, WorkspaceSnapshots};
 pub use scheduler::{
     cancel_run_request, gate_approvers, pin_run_snapshots, plan_rerun, record_gate_approval,
-    release_gate, wait_began_at,
+    reject_gate, release_gate, wait_began_at,
     rerun_step, rerun_step_widened, retry_step, retry_step_widened, unpin_run_snapshots,
     ExpiredInput, PlanReason, PlannedStep, RerunError, RerunPlan, Scheduler, SchedulerError,
     SupersedeTeardown, SupersededAttempt, Supervision, TickHealth, CANCEL_RUN, LAUNCH_STEP,
@@ -350,6 +350,101 @@ impl AttemptOutcome {
             _ => return None,
         })
     }
+}
+
+/// How one gate wait ends — the verdict a [`Db::resolve_gate_wait`] writes in
+/// ONE transaction: the open Attempt closed, the gate step's `Pending →
+/// Succeeded|Failed` CAS, and the events of [`gate_resolution_events`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateResolution {
+    /// `true` → the gate step goes `Succeeded`; `false` → `Failed` with
+    /// [`FailureKind::Gate`].
+    pub passed: bool,
+    /// The human line journalled on `GateResolved`.
+    pub reason: String,
+    /// A `gate_expires_after` deadline — also journal the legacy `GateExpired`.
+    pub expired: bool,
+    /// Who decided (a rejecting principal, `external:{step}`); `None` for a
+    /// release, a timer or an expiry.
+    pub by: Option<String>,
+    /// The wait this verdict is for. `Some(a)` (the scheduler): resolve only
+    /// while `a` is still the open wait — a superseded or cancelled wait takes
+    /// no verdict. `None` (an API release or reject): close whichever wait is
+    /// open, or, when none is, mint one already closed.
+    pub fence: Option<AttemptId>,
+    /// `started_at` for an Attempt minted already closed (`fence: None` and no
+    /// open wait — a pre-upgrade suspended run). Clamped to no later than `at`.
+    pub legacy_started_at: Timestamp,
+    /// When the verdict lands — the `at` of every event it journals.
+    pub at: Timestamp,
+}
+
+impl GateResolution {
+    /// The `failure_detail` (and `AttemptFinished.cause`) a failed verdict
+    /// stamps on its Attempt: the reason, prefixed with who rejected it when a
+    /// person or system did. `None` on a pass.
+    pub fn attempt_detail(&self) -> Option<String> {
+        if self.passed {
+            return None;
+        }
+        Some(match &self.by {
+            Some(by) => format!("rejected by {by}: {}", self.reason),
+            None => self.reason.clone(),
+        })
+    }
+}
+
+/// The events one gate resolution journals, in order — the ONE definition
+/// every [`Db`] implementation appends inside its `resolve_gate_wait`
+/// transaction, so the Postgres and in-memory stores cannot drift:
+///
+/// `[AttemptStarted]` (only when the Attempt was `minted` closed),
+/// `AttemptFinished`, then on a pass `GateReleased` + `StepTransitioned
+/// Pending → Succeeded`, or on a fail `[GateExpired]` + `StepTransitioned
+/// Pending → Failed`, and last `GateResolved`.
+pub fn gate_resolution_events(
+    step: &StepId,
+    attempt: &AttemptId,
+    minted: bool,
+    res: &GateResolution,
+) -> Vec<EventPayload> {
+    let failure = (!res.passed).then_some(FailureKind::Gate);
+    let mut out = Vec::with_capacity(6);
+    if minted {
+        out.push(EventPayload::AttemptStarted {
+            step: step.clone(),
+            attempt: attempt.clone(),
+        });
+    }
+    out.push(EventPayload::AttemptFinished {
+        step: step.clone(),
+        attempt: attempt.clone(),
+        failure,
+        cause: res.attempt_detail(),
+    });
+    if res.passed {
+        out.push(EventPayload::GateReleased { step: step.clone() });
+    } else if res.expired {
+        out.push(EventPayload::GateExpired { step: step.clone() });
+    }
+    out.push(EventPayload::StepTransitioned {
+        step: step.clone(),
+        from: StepStatus::Pending,
+        to: if res.passed {
+            StepStatus::Succeeded
+        } else {
+            StepStatus::Failed
+        },
+    });
+    out.push(EventPayload::GateResolved {
+        step: step.clone(),
+        attempt: attempt.clone(),
+        passed: res.passed,
+        reason: Some(res.reason.clone()),
+        deployment: None,
+        by: res.by.clone(),
+    });
+    out
 }
 
 /// A **Run-scoped shared service** instance (ADR-0058): the durable projection
@@ -945,6 +1040,10 @@ pub enum EventPayload {
     /// - `deployment` — reserved for the DeploymentGate (ADR-0070): the
     ///   decisive Deployment's id (its creating seq). `None` for every other
     ///   gate kind; absent on the wire when `None`.
+    /// - `by` — who decided, when a person or system did: the principal who
+    ///   rejected the gate (`reject_gate`), or `external:{step}` for an
+    ///   external gate failed by its token. `None` for a release, a timer and
+    ///   an expiry; absent on the wire when `None`.
     ///
     /// **Forward-only**: a binary from before this variant cannot replay a
     /// log that carries it.
@@ -956,6 +1055,8 @@ pub enum EventPayload {
         reason: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         deployment: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<String>,
     },
     /// A human requested a step rerun (ADR-0056) — the **Take boundary**.
     /// Emitted before any re-arming, so a Take view is a pure replay up to

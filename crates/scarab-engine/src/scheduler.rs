@@ -46,8 +46,9 @@ pub const MAX_DELIVERY_ATTEMPTS: u32 = 10;
 const TIMEOUT_BACKSTOP_GRACE_MS: i64 = 60_000;
 use crate::{
     ports::WorkspaceSnapshots, Attempt, AttemptId, AttemptOutcome, Clock, ConcurrencyPolicy, Db,
-    DbError, EventKind, EventPayload, ExecError, Executor, FailureKind, OutboxMessage, RunId,
-    RunStatus, StepId, StepRun, StepSpec, StepStatus, Timestamp, TransitionError, EVENT_VERSION,
+    DbError, EventKind, EventPayload, ExecError, Executor, FailureKind, GateResolution,
+    OutboxMessage, RunId, RunStatus, StepId, StepRun, StepSpec, StepStatus, Timestamp,
+    TransitionError, EVENT_VERSION,
 };
 
 /// Outbox `kind` for "launch this step".
@@ -144,6 +145,17 @@ pub enum RerunError {
     /// governed environment, a false deployment record). Mapped to 409.
     #[error("gate {step:?} is not awaiting approval (is {status:?})")]
     GateNotPending { step: StepId, status: StepStatus },
+    /// Gate approval, release or reject refused: the gate is `Pending` but not
+    /// yet **reached** — a need has not Succeeded, so no wait is open to act
+    /// on. Releasing it early would run its dependents before (or beside) the
+    /// work it guards. Mapped to 409.
+    #[error("gate {step:?} is not reached yet: a step it needs has not succeeded")]
+    GateNotReached { step: StepId },
+    /// Gate reject refused: the step is not a `manual`, `timer` or `external`
+    /// gate (a plain step, or a gate kind that decides its own verdict).
+    /// Mapped to 409.
+    #[error("step {0:?} is not a gate that can be rejected")]
+    NotARejectableGate(StepId),
 }
 
 /// One expired input on a rerun: the Workspace Snapshot `consumer` would have
@@ -810,7 +822,16 @@ async fn rearm_invalidation_set(
         // Pod, so nothing joins the teardown intent.
         if invalid.contains(&s.step) && s.status == StepStatus::Pending {
             if let Some(a) = open_gate_attempt(s) {
-                supersede_gate_attempt(db, clock, run, &s.step, &a.id, by.as_deref()).await?;
+                let closed =
+                    supersede_gate_attempt(db, clock, run, &s.step, &a.id, by.as_deref()).await?;
+                if !closed {
+                    // The wait ended under us — the gate resolved between the
+                    // snapshot and now (or a cancel closed it). A resolved gate
+                    // is terminal, so re-arm it from its LIVE status, exactly
+                    // like a step that raced past the snapshot.
+                    rearm_raced_step(db, clock, run, &s.step, by.as_deref(), &mut superseded)
+                        .await?;
+                }
             }
         }
         if invalid.contains(&s.step) && s.status != StepStatus::Pending {
@@ -986,15 +1007,19 @@ async fn rearm_raced_step(
 /// Release a gate `step`: mark it Succeeded and resume its suspended run so the
 /// DAG continues (ADR-0008, 0011). Needs only the [`Db`] + [`Clock`] ports (no
 /// executor), so the API role calls it directly. Exactly-once — a second
-/// release finds the step already terminal (a no-op Conflict) and the run
-/// already Running, so it neither double-completes the gate nor double-resumes.
+/// release finds the step already terminal (a no-op) and resumes nothing.
 ///
-/// Closes the gate's open Attempt (`Succeeded`) and journals the verdict as
-/// [`GateResolved`](EventPayload::GateResolved) beside the legacy
-/// `GateReleased`. A gate with **no** open Attempt — a run suspended before
-/// gate Attempts existed, or a gate released before the scheduler reached it —
-/// still releases: the Attempt is minted already-closed, its `started_at`
-/// derived from the event log exactly as [`wait_began_at`] would have.
+/// The gate must be **reached** — every need Succeeded — or this is
+/// [`RerunError::GateNotReached`]: releasing it earlier would run its
+/// dependents before, or beside, the work it guards. Its open wait is closed
+/// `Succeeded` and the verdict journalled ([`resolve_gate`]). A reached gate
+/// with **no** open Attempt — a run suspended before gate Attempts existed, or
+/// one the scheduler has not visited since its needs finished — still
+/// releases: the Attempt is minted already closed, its `started_at` derived
+/// exactly as [`wait_began_at`] would have.
+///
+/// The run reopens `Suspended → Running` only when something is runnable
+/// after the release; one that leaves only other gate waits stays suspended.
 pub async fn release_gate(
     db: &dyn Db,
     clock: &dyn Clock,
@@ -1006,21 +1031,97 @@ pub async fn release_gate(
     let Some(gate) = steps.iter().find(|s| &s.step == step && s.is_gate()) else {
         return Err(RerunError::StepNotFound(step.clone()));
     };
+    if gate.status == StepStatus::Pending && !gate_reached(gate, &steps) {
+        return Err(RerunError::GateNotReached { step: step.clone() });
+    }
 
     let verdict = GateVerdict {
         passed: true,
         reason: "released".to_string(),
         expired: false,
     };
-    // Already released (or never gated) — exactly-once: do not resume again.
-    if !resolve_gate(db, clock, run, gate, &verdict).await? {
+    // Already resolved (or never gated) — exactly-once: do not resume again.
+    if !resolve_gate(db, clock, run, gate, &verdict, None, None).await? {
         return Ok(());
     }
+    reopen_if_runnable(db, clock, run).await
+}
 
-    if db.run_status(run).await? == Some(RunStatus::Suspended) {
+/// Reject gate `step`: fail its wait **with a reason** (slice b, criterion 3;
+/// ADR-0070 §9 "a rejected approval asks again"). Returns whether this call
+/// resolved it (`false`: a racing resolver got there first).
+///
+/// Only a `manual`, `timer` or `external` gate can be rejected
+/// ([`RerunError::NotARejectableGate`] otherwise — a gate kind with its own
+/// oracle decides its own verdict), and only while it waits: `Pending`
+/// ([`RerunError::GateNotPending`]) and reached
+/// ([`RerunError::GateNotReached`]).
+///
+/// The wait's Attempt fails with [`FailureKind::Gate`] and the detail
+/// `rejected by {by}: {reason}`; `GateResolved { passed: false, reason, by }`
+/// and `StepTransitioned → Failed` are journalled. The gate's dependents are
+/// Skipped on the next pass and the Run settles `Failed` — a verdict, never
+/// `DeadLettered`, never auto-retried. The wait's approvals stay in the log;
+/// a [`retry_step`] of the gate opens a new wait with a fresh clock and none
+/// of them.
+pub async fn reject_gate(
+    db: &dyn Db,
+    clock: &dyn Clock,
+    run: &RunId,
+    step: &StepId,
+    by: &str,
+    reason: &str,
+) -> Result<bool, RerunError> {
+    let steps = db.steps_of_run(run).await?;
+    let Some(gate) = steps.iter().find(|s| &s.step == step) else {
+        return Err(RerunError::StepNotFound(step.clone()));
+    };
+    if !matches!(
+        gate.gate_kind.as_deref(),
+        Some("manual") | Some("timer") | Some("external")
+    ) {
+        return Err(RerunError::NotARejectableGate(step.clone()));
+    }
+    if gate.status != StepStatus::Pending {
+        return Err(RerunError::GateNotPending {
+            step: step.clone(),
+            status: gate.status,
+        });
+    }
+    if !gate_reached(gate, &steps) {
+        return Err(RerunError::GateNotReached { step: step.clone() });
+    }
+    let verdict = GateVerdict {
+        passed: false,
+        reason: reason.to_string(),
+        expired: false,
+    };
+    let resolved = resolve_gate(db, clock, run, gate, &verdict, Some(by.to_string()), None).await?;
+    if resolved {
+        reopen_if_runnable(db, clock, run).await?;
+    }
+    Ok(resolved)
+}
+
+/// Reopen a `Suspended` run once something besides gate waits is outstanding
+/// (a gate just resolved). A run that still has only gate waits stays
+/// suspended — it bills no budget — and the next tick reopens it if needed.
+async fn reopen_if_runnable(db: &dyn Db, clock: &dyn Clock, run: &RunId) -> Result<(), RerunError> {
+    if db.run_status(run).await? == Some(RunStatus::Suspended)
+        && !only_gate_waits_outstanding(&db.steps_of_run(run).await?)
+    {
         reopen(db, clock, run, RunStatus::Suspended, RunStatus::Running).await?;
     }
     Ok(())
+}
+
+/// Is gate `gate` **reached** — has every one of its needs Succeeded?
+fn gate_reached(gate: &StepRun, steps: &[StepRun]) -> bool {
+    gate.needs.iter().all(|n| {
+        steps
+            .iter()
+            .any(|s| &s.step == n && s.status == StepStatus::Succeeded)
+    })
 }
 
 /// How one gate wait resolved (slice b, criterion 3).
@@ -1050,9 +1151,11 @@ fn open_gate_attempt(step: &StepRun) -> Option<&Attempt> {
 }
 
 /// Is `kind` a **re-arm** of gate `step` — the boundary between two wait
-/// episodes? Either the gate itself went back to `Pending` (a Retry/Rerun of a
-/// resolved gate), or its still-open Attempt was superseded (a Rerun of an
-/// upstream, or of the gate, while it waited).
+/// episodes? The gate itself went back to `Pending` (a Retry/Rerun of a
+/// resolved gate), its still-open Attempt was superseded (a Rerun of an
+/// upstream, or of the gate, while it waited), or a Rerun named it in its
+/// invalidation set — which also covers a gate that was reached but had no
+/// Attempt yet, so neither of the other two was written for it.
 fn is_gate_rearm(kind: &EventPayload, step: &StepId) -> bool {
     match kind {
         EventPayload::StepTransitioned {
@@ -1061,6 +1164,7 @@ fn is_gate_rearm(kind: &EventPayload, step: &StepId) -> bool {
             ..
         } => s == step,
         EventPayload::AttemptSuperseded { step: s, .. } => s == step,
+        EventPayload::RunRerunRequested { invalidated, .. } => invalidated.contains(step),
         _ => false,
     }
 }
@@ -1090,31 +1194,36 @@ pub fn gate_approvers(events: &[EventKind], step: &StepId) -> Vec<String> {
 }
 
 /// When gate `gate`'s current wait began — the per-gate clock start (slice b,
-/// criterion 3): the latest of
+/// criterion 3), never later than `now`: the later of
 ///
-/// - the latest **finish** of any of its `needs` (`StepTransitioned →
-///   Succeeded`, `GateReleased`, or `GateResolved { passed: true }` — a
-///   released gate emits no `StepTransitioned`);
+/// - its needs' finishes, taken **per need**: each need's latest finish
+///   (`StepTransitioned → Succeeded`, `GateReleased`, or
+///   `GateResolved { passed: true }`) since that need's own latest re-arm to
+///   `Pending`. A need with no such finish in the log — it is Succeeded in
+///   the rows, but its finish event was never written (a crash between a CAS
+///   and its journal) — counts as `now`, so the clock can only ever start
+///   late, never early: a wait is never shortened;
 /// - the latest **re-arm** of the gate itself (see [`is_gate_rearm`]), so a
 ///   Retry/Rerun starts a fresh clock;
-/// - the run's first `→ Running`, the floor for a gate with no needs.
+/// - for a gate with **no** needs only, the run's first `→ Running`.
 ///
 /// A pure function of the event log, computed once when the gate's Attempt
 /// is minted and then frozen on `Attempt::started_at` — so it survives a
-/// crash and is identical on every re-tick. `None` when the log holds none of
-/// these (a hand-seeded run); the caller falls back to "now".
-pub fn wait_began_at(events: &[EventKind], gate: &StepRun) -> Option<Timestamp> {
+/// crash and is identical on every re-tick. `now` when the log holds none of
+/// these (a hand-seeded run).
+pub fn wait_began_at(events: &[EventKind], gate: &StepRun, now: Timestamp) -> Timestamp {
     let mut first_running: Option<i64> = None;
-    let mut latest: Option<i64> = None;
+    let mut rearmed: Option<i64> = None;
+    let mut finished: HashMap<&StepId, Option<i64>> =
+        gate.needs.iter().map(|n| (n, None)).collect();
     for e in events {
         let at = e.at.0;
-        let counts = match &e.kind {
+        match &e.kind {
             EventPayload::RunTransitioned {
                 to: RunStatus::Running,
                 ..
             } => {
                 first_running.get_or_insert(at);
-                false
             }
             EventPayload::StepTransitioned {
                 step,
@@ -1124,30 +1233,51 @@ pub fn wait_began_at(events: &[EventKind], gate: &StepRun) -> Option<Timestamp> 
             | EventPayload::GateReleased { step }
             | EventPayload::GateResolved {
                 step, passed: true, ..
-            } => gate.needs.contains(step),
-            kind => is_gate_rearm(kind, &gate.step),
-        };
-        if counts {
-            latest = Some(latest.map_or(at, |l| l.max(at)));
+            } => {
+                if let Some(f) = finished.get_mut(step) {
+                    *f = Some(f.map_or(at, |l| l.max(at)));
+                }
+            }
+            // A need re-armed: its earlier finish belongs to an earlier episode.
+            EventPayload::StepTransitioned {
+                step,
+                to: StepStatus::Pending,
+                ..
+            } => {
+                if let Some(f) = finished.get_mut(step) {
+                    *f = None;
+                }
+            }
+            _ => {}
+        }
+        if is_gate_rearm(&e.kind, &gate.step) {
+            rearmed = Some(rearmed.map_or(at, |l| l.max(at)));
         }
     }
-    match (latest, first_running) {
-        (Some(l), Some(f)) => Some(Timestamp(l.max(f))),
-        (Some(t), None) | (None, Some(t)) => Some(Timestamp(t)),
-        (None, None) => None,
-    }
+    let needs_finished = if gate.needs.is_empty() {
+        first_running
+    } else if finished.values().any(Option::is_none) {
+        Some(now.0)
+    } else {
+        finished.values().flatten().copied().max()
+    };
+    let start = match (needs_finished, rearmed) {
+        (Some(f), Some(r)) => f.max(r),
+        (Some(t), None) | (None, Some(t)) => t,
+        (None, None) => now.0,
+    };
+    Timestamp(start.min(now.0))
 }
 
 /// Resolve gate `gate` per `verdict` — the ONE place a gate wait ends, shared
-/// by the scheduler's per-gate evaluation and the API's [`release_gate`].
-///
-/// Guarded: the `Pending → Succeeded|Failed` CAS runs first, and only its
-/// winner writes anything else, so a racing resolver appends nothing
-/// (exactly-once). Then the Attempt is closed — the open one, or (for a gate
-/// that never got one: a pre-upgrade suspended run, an early release) one
-/// minted already-closed — and the verdict journalled:
-/// `AttemptFinished`, the legacy facts (`GateReleased`, or `GateExpired` +
-/// `StepTransitioned → Failed`), then [`GateResolved`](EventPayload::GateResolved).
+/// by the scheduler's per-gate evaluation (`fence = Some(open attempt)`) and
+/// the API's [`release_gate`] / [`reject_gate`] (`fence = None`). A thin
+/// wrapper over [`Db::resolve_gate_wait`], which does all of it in one
+/// transaction: close the wait's Attempt (or, unfenced with none open, mint
+/// one already closed), CAS the gate `Pending → Succeeded|Failed`, and journal
+/// [`gate_resolution_events`](crate::gate_resolution_events). A racing
+/// resolver, a superseded or cancelled fence, or a gate no longer `Pending`
+/// writes nothing.
 ///
 /// Returns whether this call resolved it.
 async fn resolve_gate(
@@ -1156,115 +1286,35 @@ async fn resolve_gate(
     run: &RunId,
     gate: &StepRun,
     verdict: &GateVerdict,
+    by: Option<String>,
+    fence: Option<AttemptId>,
 ) -> Result<bool, DbError> {
-    let to = if verdict.passed {
-        StepStatus::Succeeded
-    } else {
-        StepStatus::Failed
-    };
-    match db
-        .record_step_transition(run, &gate.step, StepStatus::Pending, to)
-        .await
-    {
-        Ok(()) => {}
-        Err(DbError::Conflict) => return Ok(false),
-        Err(e) => return Err(e),
-    }
     let now = clock.now().await;
-    let failure = (!verdict.passed).then_some(FailureKind::Gate);
-    let cause = (!verdict.passed).then(|| verdict.reason.clone());
-    let append = |kind: EventPayload| EventKind {
-        version: EVENT_VERSION,
-        run: run.clone(),
-        kind,
+    // Only an unfenced resolve can mint a closed Attempt; it gets the clock
+    // start the scheduler would have frozen on the wait.
+    let legacy_started_at = match fence {
+        Some(_) => now,
+        None => wait_began_at(&db.events(run).await?, gate, now),
+    };
+    let res = GateResolution {
+        passed: verdict.passed,
+        reason: verdict.reason.clone(),
+        expired: verdict.expired,
+        by,
+        fence,
+        legacy_started_at,
         at: now,
     };
-
-    let attempt = match open_gate_attempt(gate) {
-        Some(a) => {
-            match failure {
-                Some(kind) => {
-                    db.set_attempt_failure(run, &gate.step, &a.id, kind, cause.as_deref())
-                        .await?
-                }
-                None => {
-                    db.set_attempt_outcome(run, &gate.step, &a.id, AttemptOutcome::Succeeded)
-                        .await?
-                }
-            }
-            a.id.clone()
-        }
-        None => {
-            // Only the CAS winner reaches here, so the minted id cannot race.
-            let events = db.events(run).await?;
-            let started = wait_began_at(&events, gate).unwrap_or(now);
-            let id = AttemptId(format!("a{}", gate.attempts.len() + 1));
-            db.record_attempt(
-                run,
-                &gate.step,
-                &Attempt {
-                    id: id.clone(),
-                    started_at: Timestamp(started.0.min(now.0)),
-                    failure,
-                    failure_detail: cause.clone(),
-                    outcome: if verdict.passed {
-                        AttemptOutcome::Succeeded
-                    } else {
-                        AttemptOutcome::Failed
-                    },
-                },
-            )
-            .await?;
-            db.append_event(&append(EventPayload::AttemptStarted {
-                step: gate.step.clone(),
-                attempt: id.clone(),
-            }))
-            .await?;
-            id
-        }
-    };
-    db.append_event(&append(EventPayload::AttemptFinished {
-        step: gate.step.clone(),
-        attempt: attempt.clone(),
-        failure,
-        cause,
-    }))
-    .await?;
-    if verdict.passed {
-        db.append_event(&append(EventPayload::GateReleased {
-            step: gate.step.clone(),
-        }))
-        .await?;
-    } else {
-        if verdict.expired {
-            db.append_event(&append(EventPayload::GateExpired {
-                step: gate.step.clone(),
-            }))
-            .await?;
-        }
-        db.append_event(&append(EventPayload::StepTransitioned {
-            step: gate.step.clone(),
-            from: StepStatus::Pending,
-            to: StepStatus::Failed,
-        }))
-        .await?;
-    }
-    db.append_event(&append(EventPayload::GateResolved {
-        step: gate.step.clone(),
-        attempt,
-        passed: verdict.passed,
-        reason: Some(verdict.reason.clone()),
-        deployment: None,
-    }))
-    .await?;
-    Ok(true)
+    Ok(db.resolve_gate_wait(run, &gate.step, &res).await?.is_some())
 }
 
 /// Close a gate's still-open wait as `Superseded` (no Pod to tear down — a
 /// gate launches none). Used when the wait's premise is gone: an upstream (or
 /// the gate itself) was re-armed while it waited. The `AttemptSuperseded`
 /// event is a re-arm boundary ([`is_gate_rearm`]), so the next wait is a new
-/// Attempt with a fresh clock and its own approvals.
+/// Attempt with a fresh clock and its own approvals. It is appended in the
+/// same transaction, and only when this call closed the wait: `false` means
+/// the wait had already ended (a concurrent resolve or cancel).
 async fn supersede_gate_attempt(
     db: &dyn Db,
     clock: &dyn Clock,
@@ -1272,11 +1322,9 @@ async fn supersede_gate_attempt(
     step: &StepId,
     attempt: &AttemptId,
     by: Option<&str>,
-) -> Result<(), DbError> {
-    db.set_attempt_outcome(run, step, attempt, AttemptOutcome::Superseded)
-        .await?;
+) -> Result<bool, DbError> {
     let now = clock.now().await;
-    db.append_event(&EventKind {
+    let event = EventKind {
         version: EVENT_VERSION,
         run: run.clone(),
         kind: EventPayload::AttemptSuperseded {
@@ -1285,16 +1333,27 @@ async fn supersede_gate_attempt(
             by: by.map(str::to_string),
         },
         at: now,
-    })
-    .await
+    };
+    db.close_running_attempt(run, step, attempt, AttemptOutcome::Superseded, Some(&event))
+        .await
 }
 
 /// Stamp a cancelled gate's open wait `Cancelled`, so a gate cancelled while
 /// waiting never shows a forever-`running` Attempt. A no-op for a non-gate or
-/// a gate with no open wait.
+/// a gate with no open wait. Call it AFTER the step's cancel CAS: it reads the
+/// Attempts fresh, so a wait minted concurrently (before the CAS — the mint
+/// holds the step row) is seen and closed, and one attempted after it finds
+/// the gate `Cancelled` and mints nothing.
 async fn cancel_open_gate_attempt(db: &dyn Db, run: &RunId, step: &StepRun) -> Result<(), DbError> {
-    if let Some(a) = open_gate_attempt(step) {
-        db.set_attempt_outcome(run, &step.step, &a.id, AttemptOutcome::Cancelled)
+    if !step.is_gate() {
+        return Ok(());
+    }
+    let attempts = db.attempts_of_step(run, &step.step).await?;
+    if let Some(a) = attempts
+        .last()
+        .filter(|a| a.outcome == AttemptOutcome::Running)
+    {
+        db.close_running_attempt(run, &step.step, &a.id, AttemptOutcome::Cancelled, None)
             .await?;
     }
     Ok(())
@@ -1396,6 +1455,11 @@ pub async fn record_gate_approval(
             step: step.clone(),
             status: gate.status,
         });
+    }
+    // ... and is reached: an approval counts toward a wait, and there is no
+    // wait until every need has Succeeded.
+    if !gate_reached(gate, &steps) {
+        return Err(RerunError::GateNotReached { step: step.clone() });
     }
 
     // Best-effort dedup: skip if this principal already approved this gate's
@@ -2214,7 +2278,12 @@ impl<'a> Scheduler<'a> {
         // no step Ready/Running, and every outstanding step is a waiting gate
         // or behind one. Suspended time bills no budget; the next pass reopens
         // the run the moment a gate resolves.
-        if only_gate_waits_outstanding(&self.db.steps_of_run(run).await?) {
+        // `steps` is this pass's snapshot: with no Pending gate in it, no
+        // gate can be waiting, so skip the re-read.
+        let any_pending_gate = steps
+            .iter()
+            .any(|s| s.is_gate() && s.status == StepStatus::Pending);
+        if any_pending_gate && only_gate_waits_outstanding(&self.db.steps_of_run(run).await?) {
             self.transition_run(run, RunStatus::Running, RunStatus::Suspended)
                 .await?;
         }
@@ -3250,10 +3319,18 @@ impl<'a> Scheduler<'a> {
     /// throughout its wait.
     async fn evaluate_waiting_gates(&self, run: &RunId) -> Result<(), SchedulerError> {
         let steps = self.db.steps_of_run(run).await?;
+        if !steps
+            .iter()
+            .any(|s| s.is_gate() && s.status == StepStatus::Pending)
+        {
+            return Ok(());
+        }
         let status_by_id: HashMap<&StepId, StepStatus> =
             steps.iter().map(|s| (&s.step, s.status)).collect();
-        // The event log is read at most once per pass, and only to mint.
+        // The event log is read at most once per pass, and only to mint; the
+        // IR at most once, and only once a reached gate needs its expiry.
         let mut events: Option<Vec<EventKind>> = None;
+        let mut expiries: Option<HashMap<String, i64>> = None;
         for gate in steps
             .iter()
             .filter(|s| s.is_gate() && s.status == StepStatus::Pending)
@@ -3275,52 +3352,46 @@ impl<'a> Scheduler<'a> {
                     if events.is_none() {
                         events = Some(self.db.events(run).await?);
                     }
-                    self.mint_gate_attempt(run, gate, events.as_deref().unwrap_or_default())
+                    let now = self.clock.now().await;
+                    let started = wait_began_at(events.as_deref().unwrap_or_default(), gate, now);
+                    // `None`: the gate left `Pending` under us (a release, a
+                    // reject, a cancel) — nothing to wait on.
+                    match self
+                        .db
+                        .open_gate_wait(run, &gate.step, started, now)
                         .await?
+                    {
+                        Some(a) => a,
+                        None => continue,
+                    }
                 }
             };
+            if expiries.is_none() {
+                expiries = Some(self.gate_expiries(run).await?);
+            }
+            let expiry_secs = expiries
+                .as_ref()
+                .and_then(|m| m.get(gate.step.0.as_str()).copied());
             let now = self.clock.now().await;
-            if let Some(verdict) = self.gate_verdict(run, gate, &attempt, now).await? {
-                // `resolve_gate` reads the open Attempt off the step; hand it
-                // the one just minted so it closes that, not a stale snapshot.
-                let mut current = gate.clone();
-                if current.attempts.last().map(|a| &a.id) != Some(&attempt.id) {
-                    current.attempts.push(attempt);
-                }
-                resolve_gate(self.db, self.clock, run, &current, &verdict).await?;
+            if let Some(verdict) = self
+                .gate_verdict(run, gate, &attempt, expiry_secs, now)
+                .await?
+            {
+                // Fenced on THIS wait: a wait superseded or cancelled since the
+                // snapshot takes no verdict.
+                resolve_gate(
+                    self.db,
+                    self.clock,
+                    run,
+                    gate,
+                    &verdict,
+                    None,
+                    Some(attempt.id.clone()),
+                )
+                .await?;
             }
         }
         Ok(())
-    }
-
-    /// Open a gate's wait: mint `a{n}` (`AttemptStarted`), its `started_at` the
-    /// wait's clock start from the event log — never later than now.
-    async fn mint_gate_attempt(
-        &self,
-        run: &RunId,
-        gate: &StepRun,
-        events: &[EventKind],
-    ) -> Result<Attempt, SchedulerError> {
-        let now = self.clock.now().await;
-        let started = wait_began_at(events, gate).unwrap_or(now);
-        let attempt = Attempt {
-            id: AttemptId(format!("a{}", gate.attempts.len() + 1)),
-            started_at: Timestamp(started.0.min(now.0)),
-            failure: None,
-            failure_detail: None,
-            outcome: AttemptOutcome::Running,
-        };
-        self.db.record_attempt(run, &gate.step, &attempt).await?;
-        self.append(
-            run,
-            EventPayload::AttemptStarted {
-                step: gate.step.clone(),
-                attempt: attempt.id.clone(),
-            },
-            now,
-        )
-        .await?;
-        Ok(attempt)
     }
 
     /// The decision, if any, for a waiting gate at `now` — measured from ITS
@@ -3332,13 +3403,14 @@ impl<'a> Scheduler<'a> {
     ///    explicit [`release_gate`]. This match is the extension point for a
     ///    kind with an oracle (the DeploymentGate, ADR-0070): its verdict is
     ///    asked here, with `started_at` as the window floor.
-    /// 2. Then **expiry**, for any kind with `gate_expires_after`: failed at
-    ///    `started_at + gate_expires_after`.
+    /// 2. Then **expiry**, for any kind with `gate_expires_after`
+    ///    (`expiry_secs`): failed at `started_at + gate_expires_after`.
     async fn gate_verdict(
         &self,
         run: &RunId,
         gate: &StepRun,
         attempt: &Attempt,
+        expiry_secs: Option<i64>,
         now: Timestamp,
     ) -> Result<Option<GateVerdict>, SchedulerError> {
         let started = attempt.started_at.0;
@@ -3353,7 +3425,7 @@ impl<'a> Scheduler<'a> {
                 }
             }
         }
-        if let Some(expiry_secs) = self.gate_expiry_secs(run, &gate.step).await? {
+        if let Some(expiry_secs) = expiry_secs {
             if now.0 >= started.saturating_add(expiry_secs.saturating_mul(1000)) {
                 return Ok(Some(GateVerdict {
                     passed: false,
@@ -3475,24 +3547,23 @@ impl<'a> Scheduler<'a> {
             .map(|b| b as i64))
     }
 
-    /// The gate's opt-in `gate_expires_after` (seconds) from the stored IR.
-    async fn gate_expiry_secs(
-        &self,
-        run: &RunId,
-        step: &StepId,
-    ) -> Result<Option<i64>, SchedulerError> {
+    /// Every gate's opt-in `gate_expires_after` (seconds) from the stored IR,
+    /// keyed by step id — one IR read for all of a pass's gates.
+    async fn gate_expiries(&self, run: &RunId) -> Result<HashMap<String, i64>, SchedulerError> {
         let Some(ir) = self.db.run_ir(run).await? else {
-            return Ok(None);
+            return Ok(HashMap::new());
         };
         Ok(ir
             .get("steps")
             .and_then(|s| s.as_array())
             .into_iter()
             .flatten()
-            .find(|s| s.get("id").and_then(|i| i.as_str()) == Some(step.0.as_str()))
-            .and_then(|s| s.get("gate_expires_after"))
-            .and_then(|t| t.as_u64())
-            .map(|t| t as i64))
+            .filter_map(|s| {
+                let id = s.get("id").and_then(|i| i.as_str())?;
+                let secs = s.get("gate_expires_after").and_then(|t| t.as_u64())?;
+                Some((id.to_string(), secs as i64))
+            })
+            .collect())
     }
 
     // --- helpers -----------------------------------------------------------
@@ -3666,6 +3737,9 @@ impl<'a> Scheduler<'a> {
                 if !step.status.is_terminal() {
                     self.transition_step(run, &step.step, step.status, StepStatus::Cancelled)
                         .await?;
+                    // A gate dead-lettered mid-wait: close its open Attempt
+                    // too, as the other cancel paths do.
+                    cancel_open_gate_attempt(self.db, run, &step).await?;
                 }
             }
             // Shared services (ADR-0058) are NOT steps, so the loop above never

@@ -10,10 +10,11 @@ use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_engine::ports::ExecState;
 use scarab_engine::{
-    release_gate, AttemptId, AttemptOutcome, Db, EventKind, EventPayload, RunId, RunStatus,
-    Scheduler, StepId, StepRun, StepSpec, StepStatus, Timestamp, EVENT_VERSION,
+    cancel_run_request, release_gate, AttemptId, AttemptOutcome, Db, EventKind, EventPayload,
+    FailureKind, GateResolution, RunId, RunStatus, Scheduler, StepId, StepRun, StepSpec,
+    StepStatus, Timestamp, EVENT_VERSION,
 };
-use scarab_testkit::{FakeClock, FakeExecutor};
+use scarab_testkit::{FakeClock, FakeExecutor, InMemoryDb};
 
 fn spec() -> StepSpec {
     serde_json::from_value(serde_json::json!({
@@ -274,3 +275,332 @@ async fn a_legacy_gate_with_no_attempt_still_releases() {
 
     tdb.cleanup().await;
 }
+
+// ---------------------------------------------------------------------------
+// b1-fix: gate-wait writes are atomic and fenced on the open Attempt. Each
+// scenario constructs one interleaving by calling the ports directly with a
+// stale fence, and runs twice: against real Postgres and against the
+// in-memory store, so the two cannot drift.
+// ---------------------------------------------------------------------------
+
+/// `build` ✓ → `approve` (manual, Pending, no Attempt yet).
+async fn seed_reached_gate(db: &dyn Db, run: &RunId) {
+    db.create_run(run, 1, 1, Timestamp(0)).await.unwrap();
+    db.create_step_run(run, &id("build"), Some(&spec()), &[], Timestamp(0))
+        .await
+        .unwrap();
+    db.create_step_run(run, &id("approve"), None, &[id("build")], Timestamp(0))
+        .await
+        .unwrap();
+    db.set_step_gate(run, &id("approve"), "manual", None)
+        .await
+        .unwrap();
+    db.record_step_transition(
+        run,
+        &id("build"),
+        StepStatus::Pending,
+        StepStatus::Succeeded,
+    )
+    .await
+    .unwrap();
+}
+
+fn resolution(passed: bool, fence: Option<&str>, at: i64) -> GateResolution {
+    GateResolution {
+        passed,
+        reason: if passed { "released" } else { "no" }.to_string(),
+        expired: false,
+        by: None,
+        fence: fence.map(|f| AttemptId(f.into())),
+        legacy_started_at: Timestamp(2_000),
+        at: Timestamp(at),
+    }
+}
+
+async fn gate_row(db: &dyn Db, run: &RunId) -> StepRun {
+    db.steps_of_run(run)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.step.0 == "approve")
+        .unwrap()
+}
+
+/// How many `AttemptStarted` and `GateResolved` the log holds for `approve`.
+async fn gate_facts(db: &dyn Db, run: &RunId) -> (usize, usize) {
+    let evs = db.events(run).await.unwrap();
+    let started = evs
+        .iter()
+        .filter(
+            |e| matches!(&e.kind, EventPayload::AttemptStarted { step, .. } if step.0 == "approve"),
+        )
+        .count();
+    let resolved = evs
+        .iter()
+        .filter(
+            |e| matches!(&e.kind, EventPayload::GateResolved { step, .. } if step.0 == "approve"),
+        )
+        .count();
+    (started, resolved)
+}
+
+/// (a) An API release lands after the scheduler opened the wait: it closes
+/// THAT Attempt — one `AttemptStarted`, one Attempt, Succeeded.
+async fn scenario_release_after_mint(db: &dyn Db, run: &RunId) {
+    seed_reached_gate(db, run).await;
+    let a1 = db
+        .open_gate_wait(run, &id("approve"), Timestamp(2_000), Timestamp(3_000))
+        .await
+        .unwrap()
+        .expect("a Pending gate opens its wait");
+    assert_eq!(a1.id, AttemptId("a1".into()));
+    assert_eq!(a1.outcome, AttemptOutcome::Running);
+    assert_eq!(a1.started_at, Timestamp(2_000));
+    // Asking again while it waits returns the same wait and writes nothing.
+    let again = db
+        .open_gate_wait(run, &id("approve"), Timestamp(2_500), Timestamp(3_500))
+        .await
+        .unwrap();
+    assert_eq!(again.map(|a| a.id), Some(AttemptId("a1".into())));
+
+    let closed = db
+        .resolve_gate_wait(run, &id("approve"), &resolution(true, None, 4_000))
+        .await
+        .unwrap();
+    assert_eq!(closed, Some(AttemptId("a1".into())));
+    let gate = gate_row(db, run).await;
+    assert_eq!(gate.status, StepStatus::Succeeded);
+    assert_eq!(gate.attempts.len(), 1, "{:?}", gate.attempts);
+    assert_eq!(gate.attempts[0].outcome, AttemptOutcome::Succeeded);
+    assert_eq!(gate_facts(db, run).await, (1, 1));
+}
+
+/// (b) An API release lands before the scheduler minted: it mints a closed
+/// a1, and the scheduler's later mint finds the gate resolved and writes
+/// nothing — never a second `AttemptStarted`.
+async fn scenario_mint_after_release(db: &dyn Db, run: &RunId) {
+    seed_reached_gate(db, run).await;
+    let closed = db
+        .resolve_gate_wait(run, &id("approve"), &resolution(true, None, 4_000))
+        .await
+        .unwrap();
+    assert_eq!(closed, Some(AttemptId("a1".into())));
+    let gate = gate_row(db, run).await;
+    assert_eq!(gate.attempts.len(), 1);
+    assert_eq!(gate.attempts[0].outcome, AttemptOutcome::Succeeded);
+    assert_eq!(
+        gate.attempts[0].started_at,
+        Timestamp(2_000),
+        "a closed mint takes the derived clock start"
+    );
+
+    let late = db
+        .open_gate_wait(run, &id("approve"), Timestamp(2_000), Timestamp(5_000))
+        .await
+        .unwrap();
+    assert_eq!(late, None, "a resolved gate opens no wait");
+    assert_eq!(gate_row(db, run).await.attempts.len(), 1);
+    assert_eq!(gate_facts(db, run).await, (1, 1));
+}
+
+/// (c) The scheduler's verdict is fenced on the wait it read: once that wait
+/// was superseded, the verdict lands nowhere — the gate stays Pending and no
+/// `GateResolved` is written. A second close of the same wait reports
+/// `false` and does not append its event.
+async fn scenario_superseded_fence(db: &dyn Db, run: &RunId) {
+    seed_reached_gate(db, run).await;
+    db.open_gate_wait(run, &id("approve"), Timestamp(2_000), Timestamp(3_000))
+        .await
+        .unwrap()
+        .unwrap();
+    let a1 = AttemptId("a1".into());
+    assert!(db
+        .close_running_attempt(run, &id("approve"), &a1, AttemptOutcome::Superseded, None)
+        .await
+        .unwrap());
+    let before = db.events(run).await.unwrap().len();
+    let superseded_again = EventKind {
+        version: EVENT_VERSION,
+        run: run.clone(),
+        kind: EventPayload::AttemptSuperseded {
+            step: id("approve"),
+            attempt: a1.clone(),
+            by: None,
+        },
+        at: Timestamp(3_500),
+    };
+    assert!(
+        !db.close_running_attempt(
+            run,
+            &id("approve"),
+            &a1,
+            AttemptOutcome::Superseded,
+            Some(&superseded_again)
+        )
+        .await
+        .unwrap(),
+        "the wait is already closed"
+    );
+    assert_eq!(
+        db.events(run).await.unwrap().len(),
+        before,
+        "a losing close appends nothing"
+    );
+
+    let verdict = db
+        .resolve_gate_wait(run, &id("approve"), &resolution(true, Some("a1"), 4_000))
+        .await
+        .unwrap();
+    assert_eq!(verdict, None, "a superseded wait takes no verdict");
+    let gate = gate_row(db, run).await;
+    assert_eq!(gate.status, StepStatus::Pending);
+    assert_eq!(gate.attempts[0].outcome, AttemptOutcome::Superseded);
+    assert_eq!(gate_facts(db, run).await.1, 0, "no GateResolved");
+}
+
+/// (d) A cancel lands after the mint: the open wait is closed `Cancelled`,
+/// and a later mint attempt finds the gate cancelled and writes nothing.
+async fn scenario_cancel_after_mint(db: &dyn Db, run: &RunId) {
+    seed_reached_gate(db, run).await;
+    db.open_gate_wait(run, &id("approve"), Timestamp(2_000), Timestamp(3_000))
+        .await
+        .unwrap()
+        .unwrap();
+    let clock = FakeClock::new(4_000);
+    assert!(cancel_run_request(db, &clock, run, Some("alice".into()))
+        .await
+        .unwrap());
+    let gate = gate_row(db, run).await;
+    assert_eq!(gate.status, StepStatus::Cancelled);
+    assert_eq!(gate.attempts.len(), 1);
+    assert_eq!(gate.attempts[0].outcome, AttemptOutcome::Cancelled);
+    let late = db
+        .open_gate_wait(run, &id("approve"), Timestamp(2_000), Timestamp(5_000))
+        .await
+        .unwrap();
+    assert_eq!(late, None);
+    assert_eq!(gate_row(db, run).await.attempts.len(), 1);
+}
+
+/// (e) The first resolver wins; every later one — fenced or not — writes
+/// nothing at all.
+async fn scenario_losing_resolver_writes_nothing(db: &dyn Db, run: &RunId) {
+    seed_reached_gate(db, run).await;
+    db.open_gate_wait(run, &id("approve"), Timestamp(2_000), Timestamp(3_000))
+        .await
+        .unwrap()
+        .unwrap();
+    let first = db
+        .resolve_gate_wait(run, &id("approve"), &resolution(false, Some("a1"), 4_000))
+        .await
+        .unwrap();
+    assert_eq!(first, Some(AttemptId("a1".into())));
+    let n = db.events(run).await.unwrap().len();
+    for late in [
+        resolution(true, Some("a1"), 5_000),
+        resolution(true, None, 5_000),
+    ] {
+        assert_eq!(
+            db.resolve_gate_wait(run, &id("approve"), &late)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+    assert_eq!(
+        db.events(run).await.unwrap().len(),
+        n,
+        "losers append nothing"
+    );
+    let gate = gate_row(db, run).await;
+    assert_eq!(gate.status, StepStatus::Failed);
+    assert_eq!(gate.attempts.len(), 1);
+    assert_eq!(gate.attempts[0].outcome, AttemptOutcome::Failed);
+    assert_eq!(gate.attempts[0].failure, Some(FailureKind::Gate));
+    assert_eq!(gate.attempts[0].failure_detail.as_deref(), Some("no"));
+}
+
+/// (g) A released gate replays as Succeeded: the row says so, and so does the
+/// journal — `StepTransitioned Pending → Succeeded` beside `GateReleased`, so
+/// a log replay (the UI's Takes view) does not leave it `running` forever.
+async fn scenario_released_gate_journals_its_transition(db: &dyn Db, run: &RunId) {
+    seed_reached_gate(db, run).await;
+    db.open_gate_wait(run, &id("approve"), Timestamp(2_000), Timestamp(3_000))
+        .await
+        .unwrap()
+        .unwrap();
+    db.resolve_gate_wait(run, &id("approve"), &resolution(true, Some("a1"), 4_000))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(gate_row(db, run).await.status, StepStatus::Succeeded);
+    let evs = db.events(run).await.unwrap();
+    let transitions: Vec<_> = evs
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventPayload::StepTransitioned { step, from, to } if step.0 == "approve" => {
+                Some((*from, *to, e.at))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        transitions,
+        vec![(StepStatus::Pending, StepStatus::Succeeded, Timestamp(4_000))]
+    );
+    assert!(evs
+        .iter()
+        .any(|e| matches!(&e.kind, EventPayload::GateReleased { step } if step.0 == "approve")));
+}
+
+macro_rules! pg_and_inmemory {
+    ($pg:ident, $mem:ident, $scenario:ident) => {
+        #[tokio::test]
+        async fn $pg() {
+            let Some(tdb) = fresh_db().await else {
+                eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+                return;
+            };
+            let db = PostgresDb::with_pool(tdb.pool.clone());
+            db.migrate().await.unwrap();
+            $scenario(&db, &RunId("run-gate-wait".into())).await;
+            tdb.cleanup().await;
+        }
+
+        #[tokio::test]
+        async fn $mem() {
+            $scenario(&InMemoryDb::new(), &RunId("run-gate-wait".into())).await;
+        }
+    };
+}
+
+pg_and_inmemory!(
+    pg_a_release_after_the_mint_closes_that_wait,
+    inmemory_a_release_after_the_mint_closes_that_wait,
+    scenario_release_after_mint
+);
+pg_and_inmemory!(
+    pg_a_mint_after_a_release_writes_nothing,
+    inmemory_a_mint_after_a_release_writes_nothing,
+    scenario_mint_after_release
+);
+pg_and_inmemory!(
+    pg_a_superseded_fence_takes_no_verdict,
+    inmemory_a_superseded_fence_takes_no_verdict,
+    scenario_superseded_fence
+);
+pg_and_inmemory!(
+    pg_a_cancel_after_the_mint_closes_the_wait,
+    inmemory_a_cancel_after_the_mint_closes_the_wait,
+    scenario_cancel_after_mint
+);
+pg_and_inmemory!(
+    pg_a_losing_resolver_writes_nothing,
+    inmemory_a_losing_resolver_writes_nothing,
+    scenario_losing_resolver_writes_nothing
+);
+pg_and_inmemory!(
+    pg_a_released_gate_journals_its_succeeded_transition,
+    inmemory_a_released_gate_journals_its_succeeded_transition,
+    scenario_released_gate_journals_its_transition
+);

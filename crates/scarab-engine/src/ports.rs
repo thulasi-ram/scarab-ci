@@ -711,6 +711,51 @@ pub trait Db: Send + Sync {
     /// Append one entry to the run's append-only event log.
     async fn append_event(&self, event: &EventKind) -> Result<(), DbError>;
 
+    /// Open gate `step`'s wait (slice b, criterion 3), atomically: with the
+    /// step row locked, `None` when the gate is no longer `Pending`; the open
+    /// Attempt as-is when its last Attempt is still `Running` (no write);
+    /// otherwise mint `a{n+1}` `Running` with `started_at` (clamped to no
+    /// later than `at`) and append its `AttemptStarted` at `at` — in one
+    /// transaction. The step-row lock is what serialises a mint against a
+    /// concurrent [`resolve_gate_wait`](Db::resolve_gate_wait) or cancel: a
+    /// mint can never land on a gate that already resolved.
+    async fn open_gate_wait(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        started_at: Timestamp,
+        at: Timestamp,
+    ) -> Result<Option<Attempt>, DbError>;
+
+    /// End gate `step`'s wait per `res`, in ONE transaction: lock the step
+    /// row (`None` unless it is `Pending`); close the fenced Attempt
+    /// (`res.fence = Some(a)`: only while `a` is still `Running`, else `None`
+    /// and nothing is written) or, unfenced, whichever Attempt is `Running` —
+    /// minting one already closed when none is; CAS the step to
+    /// `Succeeded|Failed`; and append
+    /// [`gate_resolution_events`](crate::gate_resolution_events). Returns the
+    /// closed Attempt's id when this call resolved the gate. A crash leaves
+    /// either all of it or none of it.
+    async fn resolve_gate_wait(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        res: &crate::GateResolution,
+    ) -> Result<Option<AttemptId>, DbError>;
+
+    /// Close `attempt` with `outcome` only while it is still `Running`, and
+    /// then (same transaction) append `event` when given. Returns whether it
+    /// was closed: `false` means someone else already ended it (a concurrent
+    /// resolve, supersede or cancel), and `event` was NOT appended.
+    async fn close_running_attempt(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        outcome: crate::AttemptOutcome,
+        event: Option<&EventKind>,
+    ) -> Result<bool, DbError>;
+
     /// Enqueue a message on the transactional outbox. Enqueuing the same
     /// `idempotency_key` twice is a no-op (the effect is enqueued exactly once).
     async fn enqueue_outbox(&self, msg: &OutboxMessage) -> Result<(), DbError>;
