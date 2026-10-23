@@ -157,6 +157,18 @@ async fn create_read_replace_and_delete_round_trip() {
                 { "installation": "argocd-eu", "vendor_grouping": "prod-eu" },
                 { "installation": "argocd-prod", "vendor_grouping": "prod" }
             ],
+            // ADR-0071 §1-2: a new Environment starts with the permissive
+            // baseline and eligibility CLOSED — an empty list admits no
+            // Project until an org admin names some. Pinned here because the
+            // whole-Environment PUT is how an Environment is born.
+            "protection": {
+                "approvers": [],
+                "allowed_refs": [],
+                "wait_timer_s": 0,
+                "require_reason": false,
+                "deployment_concurrency": null
+            },
+            "eligibility": { "all_projects": false, "projects": [] },
             "created_at": CLOCK_START_MS,
             "updated_at": CLOCK_START_MS,
             // Authz is off here: the dev principal.
