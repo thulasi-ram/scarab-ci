@@ -2437,6 +2437,15 @@ impl Executor for K8sExecutor {
                             });
                         }
                         Err(DriveErr::Transient(e)) => {
+                            // Logged here because the scheduler re-drives a
+                            // transient silently: a drain that can never be
+                            // read back otherwise wedges the step to its
+                            // backstop with no trace of why (git-bug 021b6bc).
+                            tracing::warn!(
+                                pod = %handle.0,
+                                cause = %e,
+                                "workspace settle is transient; re-driving next poll"
+                            );
                             return Err(ExecError::Other(format!("workspace: {e}")));
                         }
                     }
