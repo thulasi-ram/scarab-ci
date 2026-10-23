@@ -1614,6 +1614,46 @@ impl Db for PostgresDb {
             .collect())
     }
 
+    async fn deployment_requesting_runs(
+        &self,
+        org: &str,
+        environment: &str,
+        source: &str,
+        id: &str,
+        excluding: &RunId,
+    ) -> Result<u32, DbError> {
+        // Distinct Runs, not requests and not Deployments (slice b, criterion
+        // 4): a Run in flight on the target through any of its requests counts
+        // once. In flight = the Run is not terminal, and the requesting Step
+        // is promoted-and-unfinished, or Succeeded with a DeploymentGate on
+        // the request not yet terminal. Uses run_deployment_requests_target_idx.
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT r.run_id)
+             FROM run_deployment_requests r
+             JOIN runs ON runs.id = r.run_id
+             JOIN step_runs s ON s.run_id = r.run_id AND s.step_id = r.step_id
+             WHERE r.org = $1 AND r.environment = $2
+               AND r.target_source = $3 AND r.target_id = $4
+               AND r.run_id <> $5
+               AND runs.status IN ('pending', 'running', 'suspended')
+               AND (s.status IN ('ready', 'running')
+                    OR (s.status = 'succeeded' AND EXISTS (
+                        SELECT 1 FROM step_runs g
+                        WHERE g.run_id = r.run_id
+                          AND g.step_id = ANY(r.gate_steps)
+                          AND g.status IN ('pending', 'ready', 'running'))))",
+        )
+        .bind(org)
+        .bind(environment)
+        .bind(source)
+        .bind(id)
+        .bind(&excluding.0)
+        .fetch_one(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(u32::try_from(n).unwrap_or(u32::MAX))
+    }
+
     async fn finish_step_with_deployment_requests(
         &self,
         run: &RunId,

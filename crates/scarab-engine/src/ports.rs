@@ -133,6 +133,51 @@ pub trait DeploymentGates: Send + Sync {
         window_floor: Timestamp,
         now: Timestamp,
     ) -> Result<Option<DeploymentGateDecision>, String>;
+
+    /// The **per-DeploymentTarget concurrency hold** (slice b, criterion 4;
+    /// ADR-0071 §9) for deploy Step `step` of `run`, whose needs have all
+    /// Succeeded and which makes `requests` on success: `Some` = hold it
+    /// `Pending` this pass (never fail it), `None` = it may be promoted.
+    ///
+    /// A target is at its limit when the Runs **other than `run`** in flight
+    /// on it ([`Db::deployment_requesting_runs`]) number the effective
+    /// `deployment_concurrency` of `run`'s Project in the Environment; `None`
+    /// limit = never held. The engine asks only from its promotion loop —
+    /// never at admission — and asks again every pass while the step waits.
+    ///
+    /// `Err` = the oracle could not decide: the engine **holds** the step this
+    /// pass (fail closed — a hold is never an over-admission) and asks again
+    /// next pass. The implementation logs it.
+    async fn deployment_concurrency_hold(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        requests: &[crate::RunDeploymentRequest],
+    ) -> Result<Option<DeploymentConcurrencyHold>, String>;
+}
+
+/// Why a deploy Step is held `Pending` by per-DeploymentTarget concurrency
+/// (slice b, criterion 4): the first of its targets at its limit, as counted
+/// when the hold was decided. Derivable at any time (nothing is journalled
+/// per pass), so a view recomputes it rather than reading it back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentConcurrencyHold {
+    pub target_source: String,
+    pub target_id: String,
+    /// Other Runs in flight on the target ([`Db::deployment_requesting_runs`]).
+    pub in_flight: u32,
+    /// The effective `deployment_concurrency` limit in force.
+    pub limit: u32,
+}
+
+impl DeploymentConcurrencyHold {
+    /// The line a run page shows for the held Step.
+    pub fn reason(&self) -> String {
+        format!(
+            "held: waiting for deployment concurrency on `{}`/`{}` ({}/{} in flight)",
+            self.target_source, self.target_id, self.in_flight, self.limit
+        )
+    }
 }
 
 /// Opaque handle to a launched unit of execution (a pod, a local process…).
@@ -776,6 +821,27 @@ pub trait Db: Send + Sync {
         run: &RunId,
         step: &StepId,
     ) -> Result<Vec<crate::RunDeploymentRequest>, DbError>;
+
+    /// How many Runs **other than `excluding`** are in flight on the
+    /// DeploymentTarget `(source, id)` of `org`'s `environment` (slice b,
+    /// criterion 4) — what the per-target concurrency hold counts. Runs, not
+    /// Deployments: two Runs requesting the same version count 2.
+    ///
+    /// Run R is in flight on the target iff R is not terminal and one of its
+    /// [`RunDeploymentRequest`](crate::RunDeploymentRequest)s for the target
+    /// belongs to a Step that is `Ready`/`Running` (promoted, not yet
+    /// finished), or that `Succeeded` (the request recorded) while some
+    /// DeploymentGate in that request's `gate_steps` is not yet terminal (its
+    /// verdict outstanding). A Step that is still `Pending` (itself held, or
+    /// not reached) does not count; one that failed made no request.
+    async fn deployment_requesting_runs(
+        &self,
+        org: &str,
+        environment: &str,
+        source: &str,
+        id: &str,
+        excluding: &RunId,
+    ) -> Result<u32, DbError>;
 
     /// A Deploy Step's success **and** the DeploymentRequests it made, as one
     /// commit (slice b, criterion 1; ADR-0070 §7, §8): the guarded

@@ -21,8 +21,8 @@ pub mod ports;
 pub mod scheduler;
 
 pub use ports::{
-    Clock, Db, DeploymentGateDecision, DeploymentGates, Executor, LogChunks, SnapshotRetention,
-    WorkspaceSnapshots,
+    Clock, Db, DeploymentConcurrencyHold, DeploymentGateDecision, DeploymentGates, Executor,
+    LogChunks, SnapshotRetention, WorkspaceSnapshots,
 };
 pub use scheduler::{
     cancel_run_request, gate_approvers, pin_run_snapshots, plan_rerun, record_gate_approval,

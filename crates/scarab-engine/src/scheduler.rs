@@ -1387,18 +1387,36 @@ async fn cancel_open_gate_attempt(db: &dyn Db, run: &RunId, step: &StepRun) -> R
     Ok(())
 }
 
-/// Suspend predicate (slice b, criterion 3): the run may suspend iff at least
-/// one gate is **waiting** (Pending, every need Succeeded), no step is
-/// `Ready`/`Running`, and every other non-terminal step is transitively
-/// behind a waiting gate. A step held for any other reason — a `uses:`
-/// readiness hold, a Pending step a dead upstream will Skip next pass — keeps
-/// the run `Running`: only a gate wait is a near-zero-cost durable wait.
+/// Suspend predicate (slice b, criterion 3) with no concurrency holds known —
+/// see [`only_waits_outstanding`]. Used off the scheduler pass (an API gate
+/// resolution reopening a run), where not knowing a hold only ever reopens a
+/// run the next pass re-suspends: never a wrong suspend.
 fn only_gate_waits_outstanding(steps: &[StepRun]) -> bool {
+    only_waits_outstanding(steps, &std::collections::HashSet::new())
+}
+
+/// Suspend predicate (slice b, criteria 3 and 4): the run may suspend iff at
+/// least one step is **waiting** — a gate that is Pending with every need
+/// Succeeded, or a deploy Step in `concurrency_held` (Pending, needs met, held
+/// by per-DeploymentTarget concurrency this pass) — no step is
+/// `Ready`/`Running`, and every other non-terminal step is transitively behind
+/// a waiting one. A step held for any other reason — a `uses:` readiness hold,
+/// a Pending step a dead upstream will Skip next pass — keeps the run
+/// `Running`: only a gate wait or a concurrency hold is a near-zero-cost
+/// durable wait (each is re-evaluated every pass, Suspended or not).
+fn only_waits_outstanding(
+    steps: &[StepRun],
+    concurrency_held: &std::collections::HashSet<StepId>,
+) -> bool {
     let by_id: HashMap<&StepId, &StepRun> = steps.iter().map(|s| (&s.step, s)).collect();
     let succeeded = |id: &StepId| by_id.get(id).map(|s| s.status) == Some(StepStatus::Succeeded);
     let waiting: std::collections::HashSet<&StepId> = steps
         .iter()
-        .filter(|s| s.is_gate() && s.status == StepStatus::Pending && s.needs.iter().all(succeeded))
+        .filter(|s| {
+            s.status == StepStatus::Pending
+                && s.needs.iter().all(succeeded)
+                && (s.is_gate() || concurrency_held.contains(&s.step))
+        })
         .map(|s| &s.step)
         .collect();
     if waiting.is_empty() {
@@ -1776,9 +1794,10 @@ pub struct Scheduler<'a> {
     /// through it. `None` (the local executor) disables the cache — correct
     /// there, because there are no snapshots to key on.
     snapshots: Option<&'a dyn WorkspaceSnapshots>,
-    /// The DeploymentGate oracle (slice b, criterion 2), when the deployment
-    /// has one. `None`: a `gate: deployment` step makes no decision of its own
-    /// — see [`DeploymentGates`].
+    /// The DeploymentGate oracle (slice b, criteria 2 and 4), when the
+    /// deployment has one. `None`: a `gate: deployment` step makes no decision
+    /// of its own and no deploy Step is ever held by per-target concurrency —
+    /// see [`DeploymentGates`].
     deployments: Option<&'a dyn DeploymentGates>,
     owner: String,
     cfg: Config,
@@ -1830,7 +1849,9 @@ impl<'a> Scheduler<'a> {
     /// Wire the DeploymentGate oracle (slice b, criterion 2; ADR-0070 §8): a
     /// waiting `gate: deployment` step is resolved from what it answers.
     /// Without it such a gate waits for a human reject, its
-    /// `gate_expires_after`, or a cancel ([`DeploymentGates`]).
+    /// `gate_expires_after`, or a cancel ([`DeploymentGates`]). The same oracle
+    /// decides the per-DeploymentTarget concurrency hold (criterion 4);
+    /// without it nothing is held.
     pub fn with_deployments(mut self, deployments: Option<&'a dyn DeploymentGates>) -> Self {
         self.deployments = deployments;
         self
@@ -2077,12 +2098,19 @@ impl<'a> Scheduler<'a> {
         // that resolves now unblocks (or Skips) its dependents this same pass.
         self.evaluate_waiting_gates(run).await?;
 
-        // A suspended run is one whose only outstanding work is gate waits. It
-        // reopens as soon as that stops being true — a gate resolved, a rerun
-        // re-armed a sibling — and admission continues in this same pass.
+        // Per-DeploymentTarget concurrency (slice b, criterion 4): the deploy
+        // Steps this pass holds Pending. Decided once, here — after the gate
+        // evaluation, before the suspend check that must count them as
+        // waiting, and before the promotion loop that skips them.
+        let concurrency_held = self.deployment_concurrency_holds(run).await?;
+
+        // A suspended run is one whose only outstanding work is gate waits and
+        // concurrency holds. It reopens as soon as that stops being true — a
+        // gate resolved, a hold lifted, a rerun re-armed a sibling — and
+        // admission continues in this same pass.
         if status == RunStatus::Suspended {
             let steps = self.db.steps_of_run(run).await?;
-            if only_gate_waits_outstanding(&steps) {
+            if only_waits_outstanding(&steps, &concurrency_held) {
                 return Ok(());
             }
             self.transition_run(run, RunStatus::Suspended, RunStatus::Running)
@@ -2235,6 +2263,15 @@ impl<'a> Scheduler<'a> {
                         continue;
                     }
                 }
+                // Per-DeploymentTarget concurrency (slice b, criterion 4): a
+                // deploy Step whose target is at its limit stays Pending —
+                // held, never failed — and is asked about again next pass.
+                // Before skip-if-unchanged on purpose: a skip marks the Step
+                // Succeeded with its DeploymentGates outstanding, which is
+                // itself "in flight" on the target.
+                if concurrency_held.contains(&step.step) {
+                    continue;
+                }
                 // Skip-if-unchanged (ADR-0027): a re-armed step whose input
                 // signature matches the one it last consumed, and which produced
                 // a content-addressed output, is skipped — its prior output is
@@ -2316,16 +2353,19 @@ impl<'a> Scheduler<'a> {
                 .await?;
         }
 
-        // Suspend only when nothing else is runnable (slice b, criterion 3):
-        // no step Ready/Running, and every outstanding step is a waiting gate
-        // or behind one. Suspended time bills no budget; the next pass reopens
-        // the run the moment a gate resolves.
-        // `steps` is this pass's snapshot: with no Pending gate in it, no
-        // gate can be waiting, so skip the re-read.
+        // Suspend only when nothing else is runnable (slice b, criteria 3, 4):
+        // no step Ready/Running, and every outstanding step is a waiting gate,
+        // a concurrency-held deploy Step, or behind one. Suspended time bills
+        // no budget; the next pass reopens the run the moment a gate resolves
+        // or a hold lifts.
+        // `steps` is this pass's snapshot: with no Pending gate in it and no
+        // hold, nothing can be waiting, so skip the re-read.
         let any_pending_gate = steps
             .iter()
             .any(|s| s.is_gate() && s.status == StepStatus::Pending);
-        if any_pending_gate && only_gate_waits_outstanding(&self.db.steps_of_run(run).await?) {
+        if (any_pending_gate || !concurrency_held.is_empty())
+            && only_waits_outstanding(&self.db.steps_of_run(run).await?, &concurrency_held)
+        {
             self.transition_run(run, RunStatus::Running, RunStatus::Suspended)
                 .await?;
         }
@@ -3343,6 +3383,68 @@ impl<'a> Scheduler<'a> {
             self.db.release_slot(&group, run).await?;
         }
         Ok(())
+    }
+
+    /// The deploy Steps of `run` held `Pending` this pass by
+    /// **per-DeploymentTarget concurrency** (slice b, criterion 4; ADR-0071
+    /// §9): every `Pending` non-gate Step whose needs have all Succeeded (it
+    /// would otherwise be promoted now) and which makes DeploymentRequests,
+    /// for which the [`DeploymentGates`] oracle answers a hold — or cannot
+    /// answer (fail closed: a hold is never an over-admission). With no oracle
+    /// wired nothing is ever held and nothing is read.
+    ///
+    /// The hold lives here, at the point of use, never at admission: a held
+    /// Step stays `Pending` (it never fails), counts as waiting for the
+    /// suspend rule, and is asked about again every pass. Nothing is
+    /// journalled per pass; the reason is derivable from the same oracle.
+    ///
+    /// **Why two Runs cannot both pass at the limit.** The count reads other
+    /// Runs' Steps, and only this promotion loop moves a Step `Pending →
+    /// Ready`. Admission runs on the single scheduler leader ([`Self::admit`]
+    /// returns early otherwise), and [`Self::tick_all`] admits Runs one after
+    /// another: Run A's promotion of its deploy Step is committed (`Ready`,
+    /// counted) before Run B's pass reads the count. Within one Run, its own
+    /// Steps are excluded from the count, so their order does not matter. The
+    /// same leader-serialisation already bounds the project and global run
+    /// caps; like them, it assumes a leader that lost its lease mid-pass does
+    /// not keep promoting (a lease shorter than a pause is the shared caveat).
+    async fn deployment_concurrency_holds(
+        &self,
+        run: &RunId,
+    ) -> Result<std::collections::HashSet<StepId>, SchedulerError> {
+        let mut held = std::collections::HashSet::new();
+        let Some(oracle) = self.deployments else {
+            return Ok(held);
+        };
+        let steps = self.db.steps_of_run(run).await?;
+        let status_of: HashMap<&StepId, StepStatus> =
+            steps.iter().map(|s| (&s.step, s.status)).collect();
+        for step in &steps {
+            if step.status != StepStatus::Pending
+                || step.is_gate()
+                || !step
+                    .needs
+                    .iter()
+                    .all(|n| status_of.get(n) == Some(&StepStatus::Succeeded))
+            {
+                continue;
+            }
+            let requests = self.db.run_deployment_requests(run, &step.step).await?;
+            if requests.is_empty() {
+                continue;
+            }
+            match oracle
+                .deployment_concurrency_hold(run, &step.step, &requests)
+                .await
+            {
+                Ok(None) => {}
+                // Held, or undecidable this pass (the oracle logged it).
+                Ok(Some(_)) | Err(_) => {
+                    held.insert(step.step.clone());
+                }
+            }
+        }
+        Ok(held)
     }
 
     /// Evaluate **every** reached gate of `run` against its own clock (slice b,

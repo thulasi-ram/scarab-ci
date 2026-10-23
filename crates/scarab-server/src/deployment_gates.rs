@@ -27,6 +27,16 @@
 //! **Errors** are logged here and returned, and the engine takes no decision
 //! that tick (plan Q6): one unreadable row must not dead-letter every Deploy
 //! Run waiting in its Environment. `gate_expires_after` still bounds the wait.
+//!
+//! **Per-DeploymentTarget concurrency** (slice b, criterion 4; ADR-0071 §9)
+//! is decided here too: a deploy Step about to be promoted is held `Pending`
+//! while the Runs other than its own in flight on one of its targets
+//! ([`Db::deployment_requesting_runs`]) number its Project's effective
+//! `deployment_concurrency` in the Environment (the tighter of the baseline
+//! and the Project's overlay — so the limit a Run sees is its own Project's;
+//! the count is every Project's Runs on the target). The limit is cached per
+//! tick like the deadline; the count never is — a Run admitted earlier in the
+//! same tick must be counted. An error holds the Step (fail closed).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -37,7 +47,8 @@ use scarab_deployment::{
     DeploymentStore, DeploymentTarget, FoldedLedger, Millis, DEFAULT_DEPLOYMENT_DEADLINE_MS,
 };
 use scarab_engine::{
-    Db, DeploymentGateDecision, DeploymentGates, RunDeploymentRequest, RunId, StepId, Timestamp,
+    Db, DeploymentConcurrencyHold, DeploymentGateDecision, DeploymentGates, RunDeploymentRequest,
+    RunId, StepId, Timestamp,
 };
 use scarab_project::EnvironmentGovernanceStore;
 
@@ -57,8 +68,29 @@ pub struct ServerDeploymentGates {
     /// `None`: no org-level governance; every gate uses the default deadline.
     governance: Option<Arc<dyn EnvironmentGovernanceStore>>,
     folds: Mutex<HashMap<(String, String), Arc<CachedFold>>>,
-    /// The gate deadline, by (org, project, environment).
-    deadlines: Mutex<HashMap<(String, String, String), Millis>>,
+    /// The Project's deploy rules in an Environment, by (org, project,
+    /// environment).
+    rules: Mutex<HashMap<(String, String, String), ProjectDeployRules>>,
+}
+
+/// What this oracle reads from a Project's `EffectiveProtection` in one
+/// Environment.
+#[derive(Debug, Clone, Copy)]
+struct ProjectDeployRules {
+    /// The deadline the Project's DeploymentGates use.
+    gate_deadline: Millis,
+    /// Its per-DeploymentTarget concurrency limit; `None` = unlimited.
+    deployment_concurrency: Option<std::num::NonZeroU32>,
+}
+
+impl ProjectDeployRules {
+    /// No governance to read (none wired, or the Org no longer has the
+    /// Environment): the default deadline and no concurrency limit — a limit
+    /// is an explicit opt-in that only governance can express.
+    const UNGOVERNED: Self = Self {
+        gate_deadline: DEFAULT_DEPLOYMENT_DEADLINE_MS,
+        deployment_concurrency: None,
+    };
 }
 
 impl ServerDeploymentGates {
@@ -72,7 +104,7 @@ impl ServerDeploymentGates {
             store,
             governance,
             folds: Mutex::new(HashMap::new()),
-            deadlines: Mutex::new(HashMap::new()),
+            rules: Mutex::new(HashMap::new()),
         }
     }
 
@@ -108,6 +140,44 @@ impl ServerDeploymentGates {
         Ok(cached)
     }
 
+    /// `project`'s deploy rules in `environment`, cached for this tick.
+    async fn rules(
+        &self,
+        org: &str,
+        project: &str,
+        environment: &str,
+    ) -> Result<ProjectDeployRules, String> {
+        let key = (
+            org.to_string(),
+            project.to_string(),
+            environment.to_string(),
+        );
+        if let Some(r) = self.rules.lock().expect("rules cache poisoned").get(&key) {
+            return Ok(*r);
+        }
+        let rules = match &self.governance {
+            None => ProjectDeployRules::UNGOVERNED,
+            Some(store) => store
+                .deploy_governance(org, project, environment)
+                .await
+                .map_err(|e| format!("environment governance store: {e}"))?
+                // An Environment the Org no longer has: the default, as the
+                // Deployments view folds such a name (ADR-0071).
+                .map_or(ProjectDeployRules::UNGOVERNED, |g| {
+                    let effective = g.effective_protection();
+                    ProjectDeployRules {
+                        gate_deadline: effective.deployment_gate_deadline.millis(),
+                        deployment_concurrency: effective.deployment_concurrency,
+                    }
+                }),
+        };
+        self.rules
+            .lock()
+            .expect("rules cache poisoned")
+            .insert(key, rules);
+        Ok(rules)
+    }
+
     /// The deadline `project`'s DeploymentGates use in `environment`.
     async fn gate_deadline(
         &self,
@@ -115,36 +185,80 @@ impl ServerDeploymentGates {
         project: &str,
         environment: &str,
     ) -> Result<Millis, String> {
-        let key = (
-            org.to_string(),
-            project.to_string(),
-            environment.to_string(),
-        );
-        if let Some(d) = self
-            .deadlines
-            .lock()
-            .expect("deadline cache poisoned")
-            .get(&key)
-        {
-            return Ok(*d);
+        Ok(self.rules(org, project, environment).await?.gate_deadline)
+    }
+
+    /// The per-DeploymentTarget concurrency hold for deploy Step `step` of
+    /// `run` making `requests` — see [`DeploymentGates::deployment_concurrency_hold`].
+    /// The first target at its limit, in request order.
+    async fn concurrency_hold(
+        &self,
+        run: &RunId,
+        requests: &[RunDeploymentRequest],
+    ) -> Result<Option<DeploymentConcurrencyHold>, String> {
+        if requests.is_empty() {
+            return Ok(None);
         }
-        let deadline = match &self.governance {
-            None => DEFAULT_DEPLOYMENT_DEADLINE_MS,
-            Some(store) => store
-                .deploy_governance(org, project, environment)
+        // The limit is the Run's Project's; without a deploy context there is
+        // no Project to read it for. A Run with DeploymentRequests is a Deploy
+        // Run and always has one, so this is an anomaly: hold (fail closed).
+        let ctx = self
+            .db
+            .run_deploy_context(run)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| {
+                "a run with DeploymentRequests has no deploy context; cannot read its \
+                 deployment_concurrency"
+                    .to_string()
+            })?;
+        for request in requests {
+            let rules = self
+                .rules(&request.org, &ctx.project, &request.environment)
+                .await?;
+            let Some(limit) = rules.deployment_concurrency else {
+                continue;
+            };
+            let in_flight = self
+                .db
+                .deployment_requesting_runs(
+                    &request.org,
+                    &request.environment,
+                    &request.target_source,
+                    &request.target_id,
+                    run,
+                )
                 .await
-                .map_err(|e| format!("environment governance store: {e}"))?
-                // An Environment the Org no longer has: the default, as the
-                // Deployments view folds such a name (ADR-0071).
-                .map_or(DEFAULT_DEPLOYMENT_DEADLINE_MS, |g| {
-                    g.effective_protection().deployment_gate_deadline.millis()
-                }),
-        };
-        self.deadlines
-            .lock()
-            .expect("deadline cache poisoned")
-            .insert(key, deadline);
-        Ok(deadline)
+                .map_err(|e| e.to_string())?;
+            if !scarab_deployment::admits_deployment_concurrency(Some(limit), in_flight as usize) {
+                return Ok(Some(DeploymentConcurrencyHold {
+                    target_source: request.target_source.clone(),
+                    target_id: request.target_id.clone(),
+                    in_flight,
+                    limit: limit.get(),
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Why `step` of `run` is held by per-DeploymentTarget concurrency right
+    /// now, for a view (the run page, b5): `None` when it is not held — it
+    /// makes no DeploymentRequest, or every target admits it. Derived, never
+    /// read back: nothing is journalled per scheduler pass. Meaningful only
+    /// for a `Pending` Step whose needs have all Succeeded (the only Step the
+    /// scheduler asks about); the caller checks that.
+    pub async fn step_concurrency_hold(
+        &self,
+        run: &RunId,
+        step: &StepId,
+    ) -> Result<Option<DeploymentConcurrencyHold>, String> {
+        let requests = self
+            .db
+            .run_deployment_requests(run, step)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.concurrency_hold(run, &requests).await
     }
 
     async fn decide(
@@ -285,6 +399,22 @@ impl DeploymentGates for ServerDeploymentGates {
             tracing::warn!(
                 run = %run.0, gate = %gate.0, error = %e,
                 "deployment gate: no decision this tick; asked again next tick"
+            );
+        }
+        res
+    }
+
+    async fn deployment_concurrency_hold(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        requests: &[RunDeploymentRequest],
+    ) -> Result<Option<DeploymentConcurrencyHold>, String> {
+        let res = self.concurrency_hold(run, requests).await;
+        if let Err(e) = &res {
+            tracing::warn!(
+                run = %run.0, step = %step.0, error = %e,
+                "deployment concurrency: holding the step this tick (fail closed); asked again next tick"
             );
         }
         res

@@ -1588,6 +1588,50 @@ impl Db for InMemoryDb {
             .unwrap_or_default())
     }
 
+    async fn deployment_requesting_runs(
+        &self,
+        org: &str,
+        environment: &str,
+        source: &str,
+        id: &str,
+        excluding: &RunId,
+    ) -> Result<u32, DbError> {
+        // Mirrors the Postgres COUNT(DISTINCT run_id) — see the port.
+        let st = self.state.lock().unwrap();
+        let status = |run: &RunId, step: &StepId| {
+            st.steps
+                .get(&(run.clone(), step.clone()))
+                .and_then(|rec| rec.status)
+        };
+        let mut runs: std::collections::HashSet<&RunId> = std::collections::HashSet::new();
+        for ((run, step), rows) in &st.run_deployment_requests {
+            if run == excluding || !st.runs.get(run).is_some_and(|s| !s.is_terminal()) {
+                continue;
+            }
+            for r in rows {
+                if r.org != org
+                    || r.environment != environment
+                    || r.target_source != source
+                    || r.target_id != id
+                {
+                    continue;
+                }
+                let in_flight = match status(run, step) {
+                    Some(StepStatus::Ready | StepStatus::Running) => true,
+                    Some(StepStatus::Succeeded) => r
+                        .gate_steps
+                        .iter()
+                        .any(|g| status(run, g).is_some_and(|s| !s.is_terminal())),
+                    _ => false,
+                };
+                if in_flight {
+                    runs.insert(run);
+                }
+            }
+        }
+        Ok(u32::try_from(runs.len()).unwrap_or(u32::MAX))
+    }
+
     async fn finish_step_with_deployment_requests(
         &self,
         run: &RunId,
