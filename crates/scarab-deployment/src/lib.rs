@@ -104,6 +104,7 @@
 //!   explained it stays explained.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroU32;
 
 pub mod store;
 pub mod view;
@@ -492,6 +493,35 @@ impl DeploymentLedger {
         })
     }
 
+    /// How many Deployments on `target` are **in flight** at `now`
+    /// (ADR-0071 §9): `requested` or `in_progress` and not yet past
+    /// `deadline` on their stall clock. A `stalled` one does not count, so a
+    /// version-scheme mismatch that never converges cannot block a target
+    /// for Scarab deploys indefinitely; nor do `live`, `failed` or
+    /// `superseded` ones.
+    ///
+    /// `deadline` is the Environment's **baseline**
+    /// EnvironmentDeploymentDeadline — the one [`Deployment::status`] uses —
+    /// never a Project overlay's tighter gate deadline: one Deployment has
+    /// one status whoever asks (ADR-0071 §3).
+    ///
+    /// By INV-DEP-5 only the newest Deployment on a target can be in flight
+    /// (every other open one is `live`), so this is 0 or 1 under the current
+    /// fold: a newer request supersedes a not-yet-live one rather than
+    /// running beside it.
+    pub fn in_flight_on(&self, target: &DeploymentTarget, now: Millis, deadline: Millis) -> usize {
+        self.deployments
+            .iter()
+            .filter(|d| {
+                &d.target == target
+                    && matches!(
+                        d.status(now, deadline),
+                        DeploymentStatus::Requested | DeploymentStatus::InProgress
+                    )
+            })
+            .count()
+    }
+
     /// Fold one input in, returning the Deployment it landed on.
     ///
     /// Requires inputs in non-decreasing `at`: the fold walks them in arrival
@@ -648,6 +678,16 @@ impl DeploymentLedger {
             }
         }
     }
+}
+
+/// Whether one more Deployment may start on a DeploymentTarget that already
+/// has `in_flight` in flight ([`DeploymentLedger::in_flight_on`]), under an
+/// Environment's per-target concurrency `limit` (ADR-0071 §9). `None` is **no
+/// limit** — concurrency is an explicit opt-in — and a limit of 0 cannot be
+/// expressed. Pure: the caller decides what "not admitted" means (the Deploy
+/// Run slice holds the step rather than failing it).
+pub fn admits_deployment_concurrency(limit: Option<NonZeroU32>, in_flight: usize) -> bool {
+    limit.is_none_or(|limit| (in_flight as u64) < u64::from(limit.get()))
 }
 
 fn supersede(d: &mut Deployment, now: DeploymentInstant) {

@@ -160,9 +160,9 @@ async fn fork_pr_lockout_injects_no_secrets() {
     .await
     .unwrap();
     let secrets: Arc<dyn SecretProvider> = Arc::new(FakeSecrets::new().with_secret(
-        &SecretScope::Environment {
+        &SecretScope::EnvironmentProject {
             org: "acme".into(),
-            repo: "web".into(),
+            project: "web".into(),
             environment: "prod".into(),
         },
         "TOKEN",
@@ -189,9 +189,9 @@ async fn fork_pr_lockout_injects_no_secrets() {
 async fn non_deploy_run_injects_no_secrets() {
     let db = Arc::new(InMemoryDb::new()); // no deploy context set for r1
     let secrets: Arc<dyn SecretProvider> = Arc::new(FakeSecrets::new().with_secret(
-        &SecretScope::Environment {
+        &SecretScope::EnvironmentProject {
             org: "acme".into(),
-            repo: "web".into(),
+            project: "web".into(),
             environment: "prod".into(),
         },
         "TOKEN",

@@ -24,7 +24,7 @@ use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_engine::Db;
 use scarab_identity::{IdentityStore, ProviderIdentity, RbacStore, Role, Scope};
-use scarab_project::{EnvironmentStore, ProtectionRules};
+use scarab_project::{EnvironmentGovernanceStore, EnvironmentStore, ProtectionRules};
 use scarab_secrets::SecretScope;
 use scarab_server::config::OAuthConfig;
 use scarab_server::oauth::OAuthAuthenticator;
@@ -293,9 +293,9 @@ async fn linking_proves_and_merges_an_imported_account_without_email() {
                 wait_timer: 0,
                 allowed_refs: vec![],
                 concurrency: 1,
-                secret_scope: SecretScope::Environment {
+                secret_scope: SecretScope::EnvironmentProject {
                     org: "acme".into(),
-                    repo: "web".into(),
+                    project: "web".into(),
                     environment: "prod".into(),
                 },
                 oidc_subject: "scarab:org/acme/repo/web/env/prod".into(),
@@ -304,6 +304,28 @@ async fn linking_proves_and_merges_an_imported_account_without_email() {
                 require_reason: false,
             },
         },
+    )
+    .await
+    .unwrap();
+    // ADR-0071: admission reads approvers from the org Environment's overlay
+    // for `web` (what the migration made of the legacy row above) and from the
+    // baseline. Seed both to name `ada-gh`, so the fold must rewrite them.
+    let legacy_rules = pg
+        .get_environment("acme", "web", "prod")
+        .await
+        .unwrap()
+        .unwrap()
+        .protection;
+    common::governance::seed_migrated_environment(&pg, "acme", "web", "prod", legacy_rules).await;
+    pg.put_environment_protection(
+        "acme",
+        "prod",
+        &scarab_project::EnvironmentProtectionRules {
+            approvers: vec!["ada-gh".into(), "bob".into()],
+            ..Default::default()
+        },
+        "amy",
+        0,
     )
     .await
     .unwrap();
@@ -386,6 +408,21 @@ async fn linking_proves_and_merges_an_imported_account_without_email() {
         .unwrap()
         .unwrap();
     assert_eq!(env.protection.approvers, vec![ada_id.to_string()]);
+    // …and where admission reads approvers now (ADR-0071 §1, §3): the
+    // baseline (order kept) and `web`'s overlay.
+    let governance = pg
+        .deploy_governance("acme", "web", "prod")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        governance.environment.protection.approvers,
+        vec![ada_id.to_string(), "bob".to_string()]
+    );
+    assert_eq!(
+        governance.overlay.unwrap().rules.approvers,
+        vec![ada_id.to_string()]
+    );
     let linked = me(&app, &mut ada).await;
     assert_eq!(
         linked["identities"],

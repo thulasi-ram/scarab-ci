@@ -1,5 +1,7 @@
-//! [`OrgEnvironmentStore`] on Postgres (ADR-0071, migration 0054): the
-//! minimal org-level Environment and its EnvironmentDeploymentSources.
+//! [`OrgEnvironmentStore`] on Postgres (ADR-0071, migrations 0054 and 0057):
+//! the org-level Environment, its EnvironmentDeploymentSources and — read
+//! here, written by the `EnvironmentGovernanceStore` — its baseline protection
+//! and eligibility.
 //!
 //! A **write** is atomic: it replaces an Environment's row **and its whole
 //! source list in one transaction**, so no edit is ever half-stored, and a
@@ -21,24 +23,28 @@
 use async_trait::async_trait;
 use sqlx::Row;
 
+use std::num::NonZeroU32;
+
 use scarab_project::{
-    EnvironmentDeploymentDeadline, EnvironmentDeploymentSource, OrgEnvironment,
-    OrgEnvironmentError, OrgEnvironmentStore,
+    EnvironmentDeploymentDeadline, EnvironmentDeploymentSource, EnvironmentProjectEligibility,
+    EnvironmentProtectionRules, OrgEnvironment, OrgEnvironmentError, OrgEnvironmentStore,
 };
 
 use crate::PostgresDb;
 
-fn org_environment_store_err(e: sqlx::Error) -> OrgEnvironmentError {
+pub(crate) fn org_environment_store_err(e: sqlx::Error) -> OrgEnvironmentError {
     OrgEnvironmentError::Store(e.to_string())
 }
 
-/// Build an [`OrgEnvironment`] from its `org_environments` row and its
-/// sources. A deadline outside the domain bounds is a row this binary cannot
-/// read — refused, never clamped, so a status is never folded against a
-/// deadline nobody set.
-fn org_environment_from_row(
+/// Build an [`OrgEnvironment`] from its `org_environments` row (selected with
+/// [`ORG_ENVIRONMENT_COLUMNS`]), its sources and its eligibility patterns. A
+/// deadline outside the domain bounds is a row this binary cannot read —
+/// refused, never clamped, so a status is never folded against a deadline
+/// nobody set; likewise a rule the CHECKs should have kept out.
+pub(crate) fn org_environment_from_row(
     row: &sqlx::postgres::PgRow,
     deployment_sources: Vec<EnvironmentDeploymentSource>,
+    eligible_project_patterns: Vec<String>,
 ) -> Result<OrgEnvironment, OrgEnvironmentError> {
     let name: String = row.get("name");
     let ms: i64 = row.get("deployment_deadline_ms");
@@ -47,20 +53,110 @@ fn org_environment_from_row(
             "environment `{name}` holds an unreadable deadline: {e}"
         ))
     })?;
+    let protection = protection_rules_from_row(row, &name)?;
+    // The flag wins over any list: the eligibility write clears the list
+    // when it sets the flag, so both present is a hand-edited row, and
+    // reading it as "all" is what the flag literally says.
+    let eligibility = if row.get::<bool, _>("eligible_all_projects") {
+        EnvironmentProjectEligibility::AllProjects
+    } else {
+        EnvironmentProjectEligibility::Projects(eligible_project_patterns)
+    };
     Ok(OrgEnvironment {
         org: row.get("org"),
         name,
         description: row.get("description"),
         deployment_deadline,
         deployment_sources,
+        protection,
+        eligibility,
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
         updated_by: row.get("updated_by"),
     })
 }
 
-const ORG_ENVIRONMENT_COLUMNS: &str =
-    "org, name, description, deployment_deadline_ms, created_at, updated_at, updated_by";
+/// The five protection rules from a row carrying them as columns — an
+/// `org_environments` baseline or an `environment_project_overlays` overlay
+/// (one shape, ADR-0071 §1, §3). `what` names the row in an error.
+pub(crate) fn protection_rules_from_row(
+    row: &sqlx::postgres::PgRow,
+    what: &str,
+) -> Result<EnvironmentProtectionRules, OrgEnvironmentError> {
+    let unreadable =
+        |rule: &str| OrgEnvironmentError::Store(format!("`{what}` holds an unreadable {rule}"));
+    let wait_timer_s =
+        u32::try_from(row.get::<i32, _>("wait_timer_s")).map_err(|_| unreadable("wait timer"))?;
+    let deployment_concurrency = match row.get::<Option<i32>, _>("deployment_concurrency") {
+        None => None,
+        Some(n) => Some(
+            u32::try_from(n)
+                .ok()
+                .and_then(NonZeroU32::new)
+                .ok_or_else(|| unreadable("deployment concurrency"))?,
+        ),
+    };
+    Ok(EnvironmentProtectionRules {
+        approvers: row.get("approvers"),
+        allowed_refs: row.get("allowed_refs"),
+        wait_timer_s,
+        require_reason: row.get("require_reason"),
+        deployment_concurrency,
+    })
+}
+
+pub(crate) const ORG_ENVIRONMENT_COLUMNS: &str =
+    "org, name, description, deployment_deadline_ms, created_at, updated_at, updated_by, \
+     approvers, allowed_refs, wait_timer_s, require_reason, deployment_concurrency, \
+     eligible_all_projects";
+
+/// One Environment's sources, sorted, read with `executor`.
+pub(crate) async fn deployment_sources_of<'e, E>(
+    executor: E,
+    org: &str,
+    name: &str,
+) -> Result<Vec<EnvironmentDeploymentSource>, OrgEnvironmentError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    Ok(sqlx::query(
+        "SELECT installation, vendor_grouping FROM environment_deployment_sources
+         WHERE org = $1 AND environment = $2
+         ORDER BY installation, vendor_grouping",
+    )
+    .bind(org)
+    .bind(name)
+    .fetch_all(executor)
+    .await
+    .map_err(org_environment_store_err)?
+    .iter()
+    .map(|r| EnvironmentDeploymentSource {
+        installation: r.get("installation"),
+        vendor_grouping: r.get("vendor_grouping"),
+    })
+    .collect())
+}
+
+/// One Environment's eligible project patterns, sorted, read with `executor`.
+pub(crate) async fn eligible_project_patterns_of<'e, E>(
+    executor: E,
+    org: &str,
+    name: &str,
+) -> Result<Vec<String>, OrgEnvironmentError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_scalar(
+        "SELECT project_pattern FROM environment_project_eligibility
+         WHERE org = $1 AND environment = $2
+         ORDER BY project_pattern",
+    )
+    .bind(org)
+    .bind(name)
+    .fetch_all(executor)
+    .await
+    .map_err(org_environment_store_err)
+}
 
 #[async_trait]
 impl OrgEnvironmentStore for PostgresDb {
@@ -79,8 +175,12 @@ impl OrgEnvironmentStore for PostgresDb {
         // The upsert takes the Environment row's lock, so two concurrent
         // replaces of one Environment serialize here and the source list ends
         // up as exactly one of them wrote it. `created_at` is not in the SET:
-        // a replace keeps the original.
-        let created_at: i64 = sqlx::query_scalar(
+        // a replace keeps the original. Nor are the baseline and eligibility
+        // (ADR-0071 §1, §2): a create takes the column defaults (permissive,
+        // no eligible Project), a replace keeps what is stored — this is the
+        // c-min whole-Environment form, which knows nothing of governance and
+        // must never reset it by omission.
+        let stored_row = sqlx::query(&format!(
             "INSERT INTO org_environments
                  (org, name, description, deployment_deadline_ms, created_at, updated_at, updated_by)
              VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -89,8 +189,8 @@ impl OrgEnvironmentStore for PostgresDb {
                  deployment_deadline_ms = EXCLUDED.deployment_deadline_ms,
                  updated_at = EXCLUDED.updated_at,
                  updated_by = EXCLUDED.updated_by
-             RETURNING created_at",
-        )
+             RETURNING {ORG_ENVIRONMENT_COLUMNS}"
+        ))
         .bind(&env.org)
         .bind(&env.name)
         .bind(&env.description)
@@ -101,6 +201,8 @@ impl OrgEnvironmentStore for PostgresDb {
         .fetch_one(&mut *tx)
         .await
         .map_err(org_environment_store_err)?;
+        let eligible_project_patterns =
+            eligible_project_patterns_of(&mut *tx, &env.org, &env.name).await?;
 
         // F1 (c-min audit): every source must name a PluginInstallation in
         // this Org. Checked here, in the write's transaction, with the
@@ -224,11 +326,7 @@ impl OrgEnvironmentStore for PostgresDb {
             });
         }
         tx.commit().await.map_err(org_environment_store_err)?;
-        Ok(OrgEnvironment {
-            created_at,
-            deployment_sources,
-            ..env.clone()
-        })
+        org_environment_from_row(&stored_row, deployment_sources, eligible_project_patterns)
     }
 
     async fn get_org_environment(
@@ -248,23 +346,10 @@ impl OrgEnvironmentStore for PostgresDb {
         else {
             return Ok(None);
         };
-        let deployment_sources = sqlx::query(
-            "SELECT installation, vendor_grouping FROM environment_deployment_sources
-             WHERE org = $1 AND environment = $2
-             ORDER BY installation, vendor_grouping",
-        )
-        .bind(org)
-        .bind(name)
-        .fetch_all(self.pool())
-        .await
-        .map_err(org_environment_store_err)?
-        .iter()
-        .map(|r| EnvironmentDeploymentSource {
-            installation: r.get("installation"),
-            vendor_grouping: r.get("vendor_grouping"),
-        })
-        .collect();
-        org_environment_from_row(&row, deployment_sources).map(Some)
+        let deployment_sources = deployment_sources_of(self.pool(), org, name).await?;
+        let eligible_project_patterns =
+            eligible_project_patterns_of(self.pool(), org, name).await?;
+        org_environment_from_row(&row, deployment_sources, eligible_project_patterns).map(Some)
     }
 
     async fn list_org_environments(
@@ -302,11 +387,29 @@ impl OrgEnvironmentStore for PostgresDb {
                     vendor_grouping: r.get("vendor_grouping"),
                 });
         }
+        let mut patterns_by_environment: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for r in sqlx::query(
+            "SELECT environment, project_pattern FROM environment_project_eligibility
+             WHERE org = $1
+             ORDER BY environment, project_pattern",
+        )
+        .bind(org)
+        .fetch_all(self.pool())
+        .await
+        .map_err(org_environment_store_err)?
+        {
+            patterns_by_environment
+                .entry(r.get("environment"))
+                .or_default()
+                .push(r.get("project_pattern"));
+        }
         rows.iter()
             .map(|row| {
                 let name: String = row.get("name");
                 let sources = sources_by_environment.remove(&name).unwrap_or_default();
-                org_environment_from_row(row, sources)
+                let patterns = patterns_by_environment.remove(&name).unwrap_or_default();
+                org_environment_from_row(row, sources, patterns)
             })
             .collect()
     }
@@ -316,13 +419,44 @@ impl OrgEnvironmentStore for PostgresDb {
         org: &str,
         name: &str,
     ) -> Result<bool, OrgEnvironmentError> {
-        // Its sources go with it (ON DELETE CASCADE).
+        // Its sources and eligibility go with it (ON DELETE CASCADE). Overlays
+        // and grants do NOT (ON DELETE RESTRICT, ADR-0071 §3, §8): a Project's
+        // stricter rules and its privileges are never dropped as a side
+        // effect, so the delete is refused while any exist. The pre-check
+        // names them; the RESTRICT is what holds against a racing write.
+        let holders: Vec<String> = sqlx::query_scalar(
+            "SELECT project FROM environment_project_overlays WHERE org = $1 AND environment = $2
+             UNION
+             SELECT project FROM environment_project_privilege_grants
+             WHERE org = $1 AND environment = $2
+             ORDER BY 1",
+        )
+        .bind(org)
+        .bind(name)
+        .fetch_all(self.pool())
+        .await
+        .map_err(org_environment_store_err)?;
+        let in_use = |projects: &[String]| {
+            OrgEnvironmentError::InUse(format!(
+                "environment `{name}` still has project overlays or privilege grants \
+                 ({}); remove them first",
+                projects.join(", ")
+            ))
+        };
+        if !holders.is_empty() {
+            return Err(in_use(&holders));
+        }
         let deleted = sqlx::query("DELETE FROM org_environments WHERE org = $1 AND name = $2")
             .bind(org)
             .bind(name)
             .execute(self.pool())
             .await
-            .map_err(org_environment_store_err)?
+            .map_err(|e| match &e {
+                sqlx::Error::Database(d) if d.code().as_deref() == Some("23503") => {
+                    in_use(&["written concurrently".to_string()])
+                }
+                _ => org_environment_store_err(e),
+            })?
             .rows_affected();
         Ok(deleted > 0)
     }

@@ -9,15 +9,12 @@
 //!
 //! Hermetic — a FakeForge serves the in-repo pipeline, InMemoryDb is the store.
 
-use std::sync::Mutex;
-
-use async_trait::async_trait;
 use scarab_engine::Db;
 use scarab_forge::{Event, RepoRef};
-use scarab_project::{Deployment, Environment, EnvironmentStore, ProjectError, ProtectionRules};
+use scarab_project::{Environment, ProtectionRules};
 use scarab_secrets::SecretScope;
 use scarab_server::trigger_run_from_event;
-use scarab_testkit::{FakeClock, FakeForge, InMemoryDb};
+use scarab_testkit::{FakeClock, FakeForge, InMemoryDb, InMemoryEnvironmentGovernance};
 
 fn repo() -> RepoRef {
     RepoRef {
@@ -42,9 +39,9 @@ fn prod_rules(allowed_refs: &[&str]) -> ProtectionRules {
         wait_timer: 0,
         allowed_refs: allowed_refs.iter().map(|s| s.to_string()).collect(),
         concurrency: 1,
-        secret_scope: SecretScope::Environment {
+        secret_scope: SecretScope::EnvironmentProject {
             org: "acme".into(),
-            repo: "web".into(),
+            project: "web".into(),
             environment: "prod".into(),
         },
         oidc_subject: "scarab:acme/web/prod".into(),
@@ -54,75 +51,24 @@ fn prod_rules(allowed_refs: &[&str]) -> ProtectionRules {
     }
 }
 
-#[derive(Default)]
-struct FakeEnvironments {
-    envs: Mutex<std::collections::HashMap<String, Environment>>,
-}
-
-#[async_trait]
-impl EnvironmentStore for FakeEnvironments {
-    async fn put_environment(
-        &self,
-        _org: &str,
-        _repo: &str,
-        env: &Environment,
-    ) -> Result<(), ProjectError> {
-        self.envs
-            .lock()
-            .unwrap()
-            .insert(env.name.clone(), env.clone());
-        Ok(())
-    }
-    async fn get_environment(
-        &self,
-        _org: &str,
-        _repo: &str,
-        name: &str,
-    ) -> Result<Option<Environment>, ProjectError> {
-        Ok(self.envs.lock().unwrap().get(name).cloned())
-    }
-    async fn list_environments(
-        &self,
-        _org: &str,
-        _repo: &str,
-    ) -> Result<Vec<Environment>, ProjectError> {
-        Ok(self.envs.lock().unwrap().values().cloned().collect())
-    }
-    async fn delete_environment(
-        &self,
-        _org: &str,
-        _repo: &str,
-        name: &str,
-    ) -> Result<(), ProjectError> {
-        self.envs.lock().unwrap().remove(name);
-        Ok(())
-    }
-    async fn record_deployment(&self, _deployment: &Deployment) -> Result<(), ProjectError> {
-        Ok(())
-    }
-    async fn deployments(
-        &self,
-        _org: &str,
-        _repo: &str,
-        _environment: &str,
-    ) -> Result<Vec<Deployment>, ProjectError> {
-        Ok(Vec::new())
-    }
-}
-
-async fn env_store(allowed_refs: &[&str]) -> FakeEnvironments {
-    let envs = FakeEnvironments::default();
-    envs.put_environment(
+/// The legacy `prod` environment, as ADR-0071's migration hands it to
+/// admission: an org Environment `prod` (permissive baseline, `web` eligible)
+/// with `web`'s old rules as its overlay. The assertions below are the
+/// pre-ADR-0071 ones, unchanged — they now prove the migrated governance
+/// decides as the per-repo rules did.
+fn migrated(protection: ProtectionRules) -> InMemoryEnvironmentGovernance {
+    InMemoryEnvironmentGovernance::new().with_migrated_legacy_environment(
         "acme",
         "web",
         &Environment {
             name: "prod".into(),
-            protection: prod_rules(allowed_refs),
+            protection,
         },
     )
-    .await
-    .unwrap();
-    envs
+}
+
+async fn env_store(allowed_refs: &[&str]) -> InMemoryEnvironmentGovernance {
+    migrated(prod_rules(allowed_refs))
 }
 
 fn push(branch: &str) -> Event {
@@ -256,19 +202,9 @@ async fn pull_request_admitted_when_env_opts_in_via_pull_glob() {
 #[tokio::test]
 async fn push_into_a_require_reason_env_is_exempt() {
     let (forge, db, clock) = setup();
-    let envs = FakeEnvironments::default();
     let mut protection = prod_rules(&[]); // unrestricted refs
     protection.require_reason = true;
-    envs.put_environment(
-        "acme",
-        "web",
-        &Environment {
-            name: "prod".into(),
-            protection,
-        },
-    )
-    .await
-    .unwrap();
+    let envs = migrated(protection);
 
     let runs = trigger_run_from_event(&forge, &db, &clock, Some(&envs), &push("main"))
         .await

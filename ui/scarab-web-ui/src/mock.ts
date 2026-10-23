@@ -22,6 +22,12 @@ type ServiceStatusDto = components["schemas"]["ServiceStatusDto"];
 type DeploymentDto = components["schemas"]["DeploymentDto"];
 type BoardRowDto = components["schemas"]["EnvironmentBoardRowDto"];
 type OrgEnvironmentDto = components["schemas"]["OrgEnvironmentDto"];
+type RulesDto = components["schemas"]["EnvironmentProtectionRulesDto"];
+type OverlayDto = components["schemas"]["EnvironmentProjectOverlayDto"];
+type GrantDto = components["schemas"]["EnvironmentProjectPrivilegeGrantDto"];
+type ProjectEnvironmentDto = components["schemas"]["ProjectEnvironmentDto"];
+type EnvironmentProjectDto = components["schemas"]["EnvironmentProjectDto"];
+type MigrationReportDto = components["schemas"]["EnvironmentMigrationReportDto"];
 type PluginCatalogEntryDto = components["schemas"]["PluginCatalogEntryDto"];
 type PluginInstallationDto = components["schemas"]["PluginInstallationDto"];
 type UnmappedGroupingDto = components["schemas"]["UnmappedGroupingDto"];
@@ -393,38 +399,9 @@ const testLogLines = [
 ];
 
 // ── environments / secrets ───────────────────────────────────────────────────
-const environments = [
-  {
-    name: "production",
-    protection: {
-      approvers: ["ops-lead", "j.lee"],
-      wait_timer: 300,
-      allowed_refs: ["main"],
-      concurrency: 1,
-      require_reason: true,
-    },
-  },
-  {
-    name: "staging",
-    protection: {
-      approvers: ["ops-lead"],
-      wait_timer: 0,
-      allowed_refs: ["main", "release/*"],
-      concurrency: 1,
-      require_reason: false,
-    },
-  },
-  {
-    name: "preview",
-    protection: {
-      approvers: [],
-      wait_timer: 0,
-      allowed_refs: [],
-      concurrency: 1,
-      require_reason: false,
-    },
-  },
-];
+// A repository's Environments are org Environments now (ADR-0071): see
+// `orgEnvironments`, `overlays` and `projectEnvironments` below. This is the
+// legacy approval history per name.
 const deployments: Record<string, unknown[]> = {
   production: [
     {
@@ -644,6 +621,14 @@ const orgEnvironments: OrgEnvironmentDto[] = [
       { installation: "argocd", vendor_grouping: "production" },
       { installation: "argocd-us", vendor_grouping: "production" },
     ],
+    protection: {
+      approvers: ["ops-lead"],
+      allowed_refs: ["refs/heads/main"],
+      wait_timer_s: 0,
+      require_reason: false,
+      deployment_concurrency: null,
+    },
+    eligibility: { all_projects: true, projects: [] },
     created_at: ago(40 * 24 * 60 * min),
     updated_at: ago(3 * 24 * 60 * min),
     updated_by: "a.kim",
@@ -654,9 +639,178 @@ const orgEnvironments: OrgEnvironmentDto[] = [
     description: "",
     deployment_deadline_ms: 60 * min,
     deployment_sources: [{ installation: "argocd", vendor_grouping: "qa" }],
+    // Still the permissive baseline the migration gave it — the report flags it.
+    protection: {
+      approvers: [],
+      allowed_refs: [],
+      wait_timer_s: 0,
+      require_reason: false,
+      deployment_concurrency: null,
+    },
+    eligibility: { all_projects: false, projects: ["scarab", "web-*"] },
     created_at: ago(2 * 60 * min),
     updated_at: ago(2 * 60 * min),
     updated_by: "j.lee",
+  },
+];
+
+// Per-project overlays and grants (ADR-0071 §3, §8), keyed environment →
+// project. scarab tightens production (an extra approver, a reason, a wait);
+// it holds a grant for one privileged image there.
+const overlays: Record<string, Record<string, OverlayDto>> = {
+  production: {
+    scarab: {
+      approvers: ["j.lee"],
+      allowed_refs: [],
+      wait_timer_s: 300,
+      require_reason: true,
+      deployment_concurrency: null,
+      deployment_gate_deadline_ms: 15 * min,
+    },
+  },
+};
+const grants: Record<string, Record<string, GrantDto>> = {
+  production: {
+    scarab: {
+      privileged_images: [
+        {
+          image_digest: "sha256:4b1c0f9e2d7a8c3e5f6a1b2c3d4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5a6",
+          privileged: true,
+          capabilities: [],
+        },
+      ],
+      permit_k8s_overlay: false,
+    },
+  },
+};
+
+/** The server's merge (ADR-0071 §3), so the fixtures' `effective` blocks are
+ *  what the server would answer: approvers union, ref layers ANDed, the
+ *  stricter wait/limit/deadline, reason if either sets it. */
+function effectiveOf(env: OrgEnvironmentDto, overlay: OverlayDto | undefined) {
+  const b: RulesDto = env.protection;
+  const limits = [b.deployment_concurrency, overlay?.deployment_concurrency].filter(
+    (n): n is number => n != null,
+  );
+  return {
+    approvers: [...new Set([...b.approvers, ...(overlay?.approvers ?? [])])],
+    allowed_ref_layers: overlay ? [b.allowed_refs, overlay.allowed_refs] : [b.allowed_refs],
+    wait_timer_s: Math.max(b.wait_timer_s, overlay?.wait_timer_s ?? 0),
+    require_reason: b.require_reason || (overlay?.require_reason ?? false),
+    deployment_concurrency: limits.length ? Math.min(...limits) : null,
+    deployment_gate_deadline_ms: Math.min(
+      env.deployment_deadline_ms,
+      overlay?.deployment_gate_deadline_ms ?? Infinity,
+    ),
+  };
+}
+
+const eligible = (env: OrgEnvironmentDto, project: string) =>
+  env.eligibility.all_projects ||
+  (env.eligibility.projects ?? []).some((p) =>
+    new RegExp(`^${p.split("*").map((x) => x.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*")}$`).test(project),
+  );
+
+/** `GET /v1/repos/{org}/{repo}/environments`: the org Environments the
+ *  project may deploy into or holds an overlay/grant in, by name. */
+function projectEnvironments(project: string): ProjectEnvironmentDto[] {
+  return orgEnvironments
+    .map((env) => {
+      const overlay = overlays[env.name]?.[project];
+      return {
+        name: env.name,
+        eligible: eligible(env, project),
+        baseline: env.protection,
+        deployment_deadline_ms: env.deployment_deadline_ms,
+        overlay: overlay
+          ? {
+              approvers: overlay.approvers,
+              allowed_refs: overlay.allowed_refs,
+              wait_timer_s: overlay.wait_timer_s,
+              require_reason: overlay.require_reason,
+              deployment_concurrency: overlay.deployment_concurrency,
+            }
+          : null,
+        overlay_deployment_gate_deadline_ms: overlay?.deployment_gate_deadline_ms ?? null,
+        effective: effectiveOf(env, overlay),
+        privilege_grant: grants[env.name]?.[project] ?? null,
+      };
+    })
+    .filter((e) => e.eligible || e.overlay || e.privilege_grant)
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** `GET …/environments/{env}/projects`: who holds an overlay or grant. */
+function environmentProjects(env: OrgEnvironmentDto): EnvironmentProjectDto[] {
+  const names = new Set([
+    ...Object.keys(overlays[env.name] ?? {}),
+    ...Object.keys(grants[env.name] ?? {}),
+  ]);
+  return [...names].sort().map((project) => ({
+    project,
+    eligible: eligible(env, project),
+    overlay: overlays[env.name]?.[project] ?? null,
+    privilege_grant: grants[env.name]?.[project] ?? null,
+  }));
+}
+
+// The migration's split report (ADR-0071 §10 step 8): production was merged
+// from scarab's and web-app's per-repo environments (they disagreed on
+// approvers and require_reason); qa was only ever named, so it was opened to
+// all projects and still has a permissive baseline — reviewed already.
+const migrationReport: MigrationReportDto[] = [
+  {
+    environment: "production",
+    merged_projects: ["scarab", "web-app"],
+    referenced_only: false,
+    referencing_projects: [],
+    differing_rules: ["approvers", "require_reason"],
+    environment_exists: true,
+    permissive_baseline: false,
+    projects: [
+      {
+        project: "scarab",
+        legacy: {
+          approvers: ["ops-lead", "j.lee"],
+          allowed_refs: ["refs/heads/main"],
+          wait_timer: 300,
+          concurrency: 1,
+          require_reason: true,
+          privileged_images: grants.production!.scarab!.privileged_images,
+          permit_k8s_overlay: false,
+        },
+        overlay: overlays.production!.scarab!,
+      },
+      {
+        project: "web-app",
+        legacy: {
+          approvers: ["ops-lead"],
+          allowed_refs: ["refs/heads/main"],
+          wait_timer: 300,
+          concurrency: 1,
+          require_reason: false,
+          privileged_images: [],
+          permit_k8s_overlay: false,
+        },
+        overlay: null,
+      },
+    ],
+    created_at: ago(3 * 24 * 60 * min),
+    acknowledged_at: null,
+    acknowledged_by: null,
+  },
+  {
+    environment: "qa",
+    merged_projects: [],
+    referenced_only: true,
+    referencing_projects: ["scarab"],
+    differing_rules: [],
+    environment_exists: true,
+    permissive_baseline: true,
+    projects: [{ project: "scarab", legacy: null, overlay: null }],
+    created_at: ago(3 * 24 * 60 * min),
+    acknowledged_at: ago(2 * 24 * 60 * min),
+    acknowledged_by: "a.kim",
   },
 ];
 
@@ -894,24 +1048,26 @@ const availableRepos = [
 // The coverage matrix is now the repo/environment secret EDITOR (ADR-0060), so
 // the fixture carries the repo-default column ("") and inheritance origins:
 // GHCR_TOKEN comes from the org, DATABASE_URL is a repo default overridden in
-// both environments, SLACK_WEBHOOK_URL is production-only with staging silenced.
+// both environments, SLACK_WEBHOOK_URL is production-only with qa silenced.
+// Its environment columns are the org Environments the project may deploy
+// into (ADR-0071) — production and qa, as `projectEnvironments` lists them.
 const secretMatrix = {
-  columns: ["", "staging", "production"],
-  environments: ["staging", "production"],
+  columns: ["", "production", "qa"],
+  environments: ["production", "qa"],
   keys: [
     {
       key: "GHCR_TOKEN",
-      status: { "": "inherited", staging: "inherited", production: "inherited" },
-      inherited_from: { "": "org", staging: "org", production: "org" },
+      status: { "": "inherited", qa: "inherited", production: "inherited" },
+      inherited_from: { "": "org", qa: "org", production: "org" },
     },
     {
       key: "DATABASE_URL",
-      status: { "": "set", staging: "set", production: "set" },
+      status: { "": "set", qa: "set", production: "set" },
       inherited_from: {},
     },
     {
       key: "SLACK_WEBHOOK_URL",
-      status: { "": "unset", staging: "silenced", production: "set" },
+      status: { "": "unset", qa: "silenced", production: "set" },
       inherited_from: {},
     },
   ],
@@ -1028,7 +1184,15 @@ function route(pathname: string, search: string, method: string): Response | nul
     return json(repoRuns[m[1]] ?? strip("ooooooooooooo"));
   }
   // /v1/repos/{org}/{repo}/environments
-  if (/^\/v1\/repos\/[^/]+\/[^/]+\/environments$/.test(p)) return json(environments);
+  if ((m = p.match(/^\/v1\/repos\/[^/]+\/([^/]+)\/environments$/))) {
+    return json(projectEnvironments(decodeURIComponent(m[1]!)));
+  }
+  // The retired per-repo writes (ADR-0071 §10): 410, as the server answers.
+  if (/^\/v1\/repos\/[^/]+\/[^/]+\/environments\/[^/]+$/.test(p) && method !== "GET") {
+    return new Response("per-repo environments were replaced by org-level Environments", {
+      status: 410,
+    });
+  }
   // /v1/repos/{org}/{repo}/environments/{name}/deployments
   if ((m = p.match(/^\/v1\/repos\/[^/]+\/[^/]+\/environments\/([^/]+)\/deployments$/))) {
     return json(deployments[m[1]] ?? []);
@@ -1077,6 +1241,15 @@ function route(pathname: string, search: string, method: string): Response | nul
           description: "",
           deployment_deadline_ms: 60 * min,
           deployment_sources: [],
+          // A new Environment: permissive baseline, no eligible project.
+          protection: {
+            approvers: [],
+            allowed_refs: [],
+            wait_timer_s: 0,
+            require_reason: false,
+            deployment_concurrency: null,
+          },
+          eligibility: { all_projects: false, projects: [] },
           created_at: now,
           updated_at: now,
           updated_by: "a.kim",
@@ -1084,6 +1257,46 @@ function route(pathname: string, search: string, method: string): Response | nul
       );
     }
     return found ? json(found) : new Response("not found", { status: 404 });
+  }
+  // Governance (ADR-0071): baseline, eligibility, projects, overlays,
+  // grants. Bodies are not visible here, so writes echo what is stored.
+  if ((m = p.match(/^\/v1\/orgs\/[^/]+\/environments\/([^/]+)\/(protection|eligibility|projects)$/))) {
+    const env = orgEnvironments.find((e) => e.name === decodeURIComponent(m![1]!));
+    if (!env) return new Response("not found", { status: 404 });
+    if (m[2] === "projects") return json(environmentProjects(env));
+    if (m[2] === "protection") return json(method === "PUT" ? env : env.protection);
+    return json(env.eligibility);
+  }
+  if (
+    (m = p.match(
+      /^\/v1\/orgs\/[^/]+\/environments\/([^/]+)\/projects\/([^/]+)\/(overlay|privilege-grant)$/,
+    ))
+  ) {
+    const [env, project] = [decodeURIComponent(m[1]!), decodeURIComponent(m[2]!)];
+    const stored = (m[3] === "overlay" ? overlays : grants)[env]?.[project];
+    if (method === "DELETE") return new Response(null, { status: stored ? 204 : 404 });
+    if (method === "PUT") {
+      return json(
+        stored ??
+          (m[3] === "overlay"
+            ? {
+                approvers: [],
+                allowed_refs: [],
+                wait_timer_s: 0,
+                require_reason: false,
+                deployment_concurrency: null,
+                deployment_gate_deadline_ms: null,
+              }
+            : { privileged_images: [], permit_k8s_overlay: false }),
+      );
+    }
+    return stored ? json(stored) : new Response("not found", { status: 404 });
+  }
+  if (/^\/v1\/orgs\/[^/]+\/environment-migration-report$/.test(p)) return json(migrationReport);
+  if ((m = p.match(/^\/v1\/orgs\/[^/]+\/environment-migration-report\/([^/]+)\/acknowledge$/))) {
+    const line = migrationReport.find((l) => l.environment === decodeURIComponent(m![1]!));
+    if (!line) return new Response("not found", { status: 404 });
+    return json({ ...line, acknowledged_at: line.acknowledged_at ?? now, acknowledged_by: line.acknowledged_by ?? "a.kim" });
   }
 
   // Plugins (ADR-0072): catalog, installations, kill/enable, uninstall,

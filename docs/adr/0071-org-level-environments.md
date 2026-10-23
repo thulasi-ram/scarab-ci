@@ -56,6 +56,14 @@ from: *all projects*, or an explicit list in which project-name globs are allowe
 - It is **owned by the Environment, never the Project.**
 - A new Environment starts with **no** eligible Projects. It is fail-closed.
 - It is checked **at Run creation**, before any Pod is created or any secret resolved.
+  It is checked **again** wherever the Environment's authority is used later in the Run:
+  a manual or external gate does not release (409) for a Project no longer eligible, or
+  for an Environment that no longer exists, and **every** step of a Deploy Run is
+  re-checked at launch — whether or not it carries secrets, an OIDC token, governed
+  grants or a raw overlay — and fails cleanly (a configuration failure with the reason)
+  when the Project is no longer eligible. Timer gates are covered by that launch check.
+  An admin withdrawing eligibility therefore stops a long Run at its next step, not only
+  its next Run.
 - Reading and watching an Environment's DeploymentTargets needs only eligibility.
 
 ### 3. EnvironmentProjectOverlay: per-project, tighten-only
@@ -202,15 +210,30 @@ governed exactly as before:
    treats it as a deploy with no protection rules (`resolve_governance`,
    `crates/scarab-server/src/lib.rs`, around lines 3879-3908), so "only the Projects that
    had it" would start rejecting those Runs. The migration finds referenced-only names in
-   Run history. A name referenced only by a Pipeline that has never run is invisible to
-   it; that Pipeline's first Run is rejected until an admin creates the Environment. This
-   is the one behaviour change.
+   Run history, and nothing else: no Pipeline YAML is stored where it could read it, so
+   what a Pipeline that has never run names is invisible to it. That leaves **two
+   never-seen cases**, and both are now refused where they were admitted before:
+   - a **name** no Project defined and no Run ever used gets no org Environment, so that
+     Pipeline's first Run is refused as an unknown Environment until an admin creates it;
+   - a **Project** that names an Environment another Project *did* define, but never ran
+     a deploy into it, is not in that Environment's eligibility, so its first Run is
+     refused as not eligible until an admin adds it.
+
+   This is the behaviour change, and it is fail-closed on purpose: a scan is impossible
+   without a pipeline store, and a grace mode would fail open. A dispatch answers 403
+   saying exactly what the admin must do; a webhook names each refused pipeline in its
+   delivery body. An org Environment that already existed (created through
+   the minimal org-level API before the migration) and that no Project defined is treated
+   like a referenced-only name — a pipeline naming it deployed with no rules from any
+   Project — and also gets eligibility **all projects**.
 7. Old `deployments` rows stay readable as **legacy approval history** (ADR-0070 §1).
    They are not converted into Deployments, because they carry no target or version.
 8. A **split report** lists every name that merged across Projects, so an admin can
    split places that are genuinely different (for example a `prod` that is really
    `prod-eu` in one repository). It also lists names migrated with eligibility *all
-   projects*.
+   projects*, and a name one Project defined that another Project only ran into: that
+   Project is eligible under the permissive baseline with no overlay, so the definer's
+   rules do not govern it.
 
 ### 11. OIDC subject unchanged
 

@@ -922,6 +922,110 @@
         ]
       }
     },
+    "/v1/orgs/{org}/environment-migration-report": {
+      "get": {
+        "tags": [
+          "Environments"
+        ],
+        "summary": "The ADR-0071 migration's split report (ADR-0071 §10 step 8)",
+        "operationId": "get_environment_migration_report",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/EnvironmentMigrationReportDto"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/environment-migration-report/{env}/acknowledge": {
+      "post": {
+        "tags": [
+          "Environments"
+        ],
+        "summary": "Acknowledge a split-report line (ADR-0071 §10 step 8)",
+        "operationId": "acknowledge_environment_migration_report",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnvironmentMigrationReportDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "no report line for that name, or not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/orgs/{org}/environments": {
       "get": {
         "tags": [
@@ -1099,7 +1203,7 @@
           "Environments"
         ],
         "summary": "Delete an org Environment with no Deployments (ADR-0071)",
-        "description": "Refused (409) while the Deployment record holds anything for the name:\nthe record is keyed by name, so deleting and re-creating the Environment\nwould silently re-adopt that history under whatever the new one says.",
+        "description": "Refused (409) while any Project holds an overlay or privilege grant in\nit (ADR-0071 §3, §8: those are never dropped as a side effect), and while\nthe Deployment record holds anything for the name:\nthe record is keyed by name, so deleting and re-creating the Environment\nwould silently re-adopt that history under whatever the new one says.",
         "operationId": "delete_org_environment",
         "parameters": [
           {
@@ -1132,7 +1236,7 @@
             "description": "no such Environment, or not configured"
           },
           "409": {
-            "description": "the Environment has Deployments"
+            "description": "the Environment has Deployments, or project overlays or grants"
           }
         },
         "security": [
@@ -1369,6 +1473,698 @@
           },
           "404": {
             "description": "no such Deployment in this Environment"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/environments/{env}/eligibility": {
+      "get": {
+        "tags": [
+          "Environments"
+        ],
+        "summary": "Which projects may deploy into an org Environment (ADR-0071 §2)",
+        "operationId": "get_environment_eligibility",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnvironmentEligibilityDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "no Read on the org"
+          },
+          "404": {
+            "description": "no such Environment, or not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "Environments"
+        ],
+        "summary": "Replace which projects may deploy into an org Environment (ADR-0071 §2)",
+        "operationId": "put_environment_eligibility",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EnvironmentEligibilityDto"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnvironmentEligibilityDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "an empty or duplicated pattern, or patterns with all_projects"
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "no such Environment, or not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/environments/{env}/projects": {
+      "get": {
+        "tags": [
+          "Environments"
+        ],
+        "summary": "Projects with an overlay or privilege grant in an org Environment (ADR-0071 §3, §8)",
+        "operationId": "list_environment_projects",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/EnvironmentProjectDto"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "no Read on the org"
+          },
+          "404": {
+            "description": "no such Environment, or not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/environments/{env}/projects/{project}/overlay": {
+      "get": {
+        "tags": [
+          "Environments"
+        ],
+        "summary": "A project's tighten-only overlay in an org Environment (ADR-0071 §3)",
+        "operationId": "get_environment_project_overlay",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "project",
+            "in": "path",
+            "description": "project (repo) name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnvironmentProjectOverlayDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "no Read on the project"
+          },
+          "404": {
+            "description": "no such Environment, no overlay, or not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "Environments"
+        ],
+        "summary": "Tighten an org Environment for one project (ADR-0071 §3)",
+        "description": "Refused (409) for a Project the Environment does not admit and which\nholds no overlay there yet: a Project that may not deploy here has\nnothing to tighten, and an overlay pins the Environment against deletion\n(ON DELETE RESTRICT), so a stray one would let any Project admin block an\norg admin's delete. An existing overlay stays editable after eligibility\nis withdrawn.",
+        "operationId": "put_environment_project_overlay",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "project",
+            "in": "path",
+            "description": "project (repo) name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PutEnvironmentProjectOverlayRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnvironmentProjectOverlayDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "an approver who is not a Scarab user, an empty entry, a zero concurrency or an out-of-range deadline"
+          },
+          "403": {
+            "description": "not an admin of the project or org"
+          },
+          "404": {
+            "description": "no such Environment, or not configured"
+          },
+          "409": {
+            "description": "the project is not eligible for the Environment"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "Environments"
+        ],
+        "summary": "Remove a project's overlay in an org Environment (ADR-0071 §3)",
+        "operationId": "delete_environment_project_overlay",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "project",
+            "in": "path",
+            "description": "project (repo) name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "removed"
+          },
+          "403": {
+            "description": "not an admin of the project or org"
+          },
+          "404": {
+            "description": "no overlay, or not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/environments/{env}/projects/{project}/privilege-grant": {
+      "get": {
+        "tags": [
+          "Environments"
+        ],
+        "summary": "A project's privilege grant in an org Environment (ADR-0071 §8)",
+        "operationId": "get_environment_project_privilege_grant",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "project",
+            "in": "path",
+            "description": "project (repo) name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnvironmentProjectPrivilegeGrantDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "no Read on the org"
+          },
+          "404": {
+            "description": "no such Environment, no grant, or not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "Environments"
+        ],
+        "summary": "Grant a project privileges in an org Environment (ADR-0071 §8)",
+        "operationId": "put_environment_project_privilege_grant",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "project",
+            "in": "path",
+            "description": "project (repo) name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PutEnvironmentProjectPrivilegeGrantRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnvironmentProjectPrivilegeGrantDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "a digest that is not `sha256:…`, or one listed twice"
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "no such Environment, or not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "Environments"
+        ],
+        "summary": "Withdraw a project's privilege grant in an org Environment (ADR-0071 §8)",
+        "operationId": "delete_environment_project_privilege_grant",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "project",
+            "in": "path",
+            "description": "project (repo) name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "withdrawn"
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "no grant, or not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/environments/{env}/protection": {
+      "get": {
+        "tags": [
+          "Environments"
+        ],
+        "summary": "An org Environment's baseline protection rules (ADR-0071 §1)",
+        "operationId": "get_environment_protection",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnvironmentProtectionRulesDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "no Read on the org"
+          },
+          "404": {
+            "description": "no such Environment, or not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "Environments"
+        ],
+        "summary": "Replace an org Environment's baseline protection rules (ADR-0071 §1)",
+        "operationId": "put_environment_protection",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PutEnvironmentProtectionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrgEnvironmentDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "an approver who is not a Scarab user, an empty entry, or a zero concurrency"
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "no such Environment, or not configured"
           }
         },
         "security": [
@@ -2347,6 +3143,9 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "the caller may not dispatch, or the pipeline's Environment does not exist in the org or does not admit this project (ADR-0071); the body says what an org admin must do. No run is created"
           }
         },
         "security": [
@@ -2364,11 +3163,41 @@
         "tags": [
           "Environments"
         ],
-        "summary": "List a repo's environments",
+        "summary": "The environments this project may deploy into, with baseline/overlay/effective rules (ADR-0071)",
         "operationId": "list_environments",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "repo owner",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "repo name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
-            "description": "the environments"
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ProjectEnvironmentDto"
+                  }
+                }
+              }
+            }
           }
         },
         "security": [
@@ -2386,14 +3215,50 @@
         "tags": [
           "Environments"
         ],
-        "summary": "One environment's protection rules",
+        "summary": "One environment as this project sees it: baseline, overlay, effective (ADR-0071)",
         "operationId": "get_environment",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "repo owner",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "repo name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
-            "description": "the environment"
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectEnvironmentDto"
+                }
+              }
+            }
           },
           "404": {
-            "description": "unknown"
+            "description": "unknown, or not this project's"
           }
         },
         "security": [
@@ -2409,11 +3274,40 @@
         "tags": [
           "Environments"
         ],
-        "summary": "Create/replace a protected environment (ADR-0024/0037)",
+        "summary": "Retired: per-repo environments are org-level Environments now (ADR-0071)",
         "operationId": "put_environment",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "repo owner",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "repo name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
-          "200": {
-            "description": "stored"
+          "410": {
+            "description": "gone; the body says where it went"
           }
         },
         "security": [
@@ -2429,11 +3323,40 @@
         "tags": [
           "Environments"
         ],
-        "summary": "Delete an environment (idempotent)",
+        "summary": "Retired: per-repo environments are org-level Environments now (ADR-0071)",
         "operationId": "delete_environment",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "repo owner",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "repo name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
-          "204": {
-            "description": "deleted"
+          "410": {
+            "description": "gone; the body says where it went"
           }
         },
         "security": [
@@ -2453,6 +3376,35 @@
         ],
         "summary": "Legacy approval history (ADR-0070 §1)",
         "operationId": "list_deployments",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "repo owner",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "repo name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "most recent first"
@@ -3131,7 +4083,7 @@
         "tags": [
           "Runs"
         ],
-        "summary": "Approve a `manual` gate (ADR-0008, 0037). The authenticated principal's\napproval is recorded on the event log (append-only, idempotent). For a\n**deploy** run (one with a target environment), the gate is released only\nonce the accumulated approvers satisfy the environment's protection rules\n(`admits`); on release the deployment is written to history. A plain gate (no\nenvironment) releases on the first approval. Authz'd as a write.",
+        "summary": "Approve a `manual` gate (ADR-0008, 0037). The authenticated principal's\napproval is recorded on the event log (append-only, idempotent). For a\n**deploy** run (one with a target environment), the gate is released only\nonce the accumulated approvers satisfy the Environment's effective rules for\nthe run's Project (ADR-0071 §3, `admits`); on release the deployment is\nwritten to the legacy history. If the Environment no longer exists or no\nlonger admits the Project, the gate does not release (409). A plain gate (no\nenvironment) releases on the first approval. Authz'd as a write.",
         "operationId": "approve_gate",
         "parameters": [
           {
@@ -3159,6 +4111,9 @@
           },
           "404": {
             "description": "no such run or gate"
+          },
+          "409": {
+            "description": "not an approvable gate, or the run's Environment no longer exists or no longer admits its project"
           }
         },
         "security": [
@@ -3176,7 +4131,7 @@
         "tags": [
           "Runs"
         ],
-        "summary": "Release an **external** gate by presenting its token (ADR-0034) — the path an\noutside system (a deploy webhook, a change-management tool) uses instead of an\ninteractive approval. The token is `HMAC-SHA256(secret, \"{run}:{step}\")`\n(`sha256=<hex>`), verified in constant time; no per-gate storage. The endpoint\nis 404 when no token secret is configured, and only releases gates of kind\n`external` (manual gates stay approval-only).",
+        "summary": "Release an **external** gate by presenting its token (ADR-0034) — the path an\noutside system (a deploy webhook, a change-management tool) uses instead of an\ninteractive approval. The token is `HMAC-SHA256(secret, \"{run}:{step}\")`\n(`sha256=<hex>`), verified in constant time; no per-gate storage. The endpoint\nis 404 when no token secret is configured, and only releases gates of kind\n`external` (manual gates stay approval-only). In a Deploy Run, the gate is\nheld (409) when the run's Environment no longer exists or no longer admits\nits Project (ADR-0071 §2) — the same check `approve_gate` makes. The token\nproves who is releasing, not that the deploy is still allowed.",
         "operationId": "release_gate_external",
         "parameters": [
           {
@@ -3207,6 +4162,9 @@
           },
           "404": {
             "description": "no such external gate, or token release disabled"
+          },
+          "409": {
+            "description": "the gate is not pending, or the run's Environment no longer exists or no longer admits its project"
           }
         },
         "security": [
@@ -5181,6 +6139,57 @@
           }
         }
       },
+      "EffectiveProtectionDto": {
+        "type": "object",
+        "description": "The rules admission enforces for one Project in one Environment: the\nbaseline merged with the Project's overlay (ADR-0071 §3), computed by the\nserver so no client re-implements the merge.",
+        "required": [
+          "approvers",
+          "allowed_ref_layers",
+          "wait_timer_s",
+          "require_reason",
+          "deployment_gate_deadline_ms"
+        ],
+        "properties": {
+          "allowed_ref_layers": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "description": "One list per layer (baseline first, then overlay): a ref must match\n**every** non-empty layer. Never pre-intersected — `[main]` and\n`[tags/*]` intersect to `[]`, which would read as \"any ref\"."
+          },
+          "approvers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Baseline approvers, then the overlay's not already listed — all required."
+          },
+          "deployment_concurrency": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "deployment_gate_deadline_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The deadline this Project's DeploymentGates use."
+          },
+          "require_reason": {
+            "type": "boolean"
+          },
+          "wait_timer_s": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
       "EnvironmentBoardRowDto": {
         "type": "object",
         "description": "One DeploymentTarget's line on the Environment board.",
@@ -5245,6 +6254,286 @@
         },
         "additionalProperties": false
       },
+      "EnvironmentEligibilityDto": {
+        "type": "object",
+        "description": "Which Projects may run Deploy Runs into an Environment (ADR-0071 §2):\nevery Project in the org, or exactly those matching one of `projects`\n(project-name globs, `*` wildcards).",
+        "required": [
+          "all_projects"
+        ],
+        "properties": {
+          "all_projects": {
+            "type": "boolean",
+            "description": "Every Project in the org. `projects` must then be empty."
+          },
+          "projects": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Project-name globs. An empty list with `all_projects: false` admits\n**no** Project — eligibility starts closed."
+          }
+        },
+        "additionalProperties": false
+      },
+      "EnvironmentMigrationReportDto": {
+        "type": "object",
+        "description": "One line of the split report: an Environment name merged across several\nProjects, or created with eligibility *all projects* because no Project\ndefined it. If the merged Projects really meant different places (one\n`prod` that is `prod-eu`), the split is a YAML change: those Projects\nrename their `environment:` and an org admin creates the new\nEnvironment — nothing is renamed for them.",
+        "required": [
+          "environment",
+          "merged_projects",
+          "referenced_only",
+          "referencing_projects",
+          "differing_rules",
+          "environment_exists",
+          "permissive_baseline",
+          "projects",
+          "created_at"
+        ],
+        "properties": {
+          "acknowledged_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix-ms; absent until an admin acknowledges the line."
+          },
+          "acknowledged_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix-ms."
+          },
+          "differing_rules": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The legacy rules the merged Projects disagreed on, by ADR-0037 field\nname (`approvers`, `allowed_refs`, `wait_timer`, `require_reason`,\n`privileged_images`, `permit_k8s_overlay`). Lists compare as sets."
+          },
+          "environment": {
+            "type": "string"
+          },
+          "environment_exists": {
+            "type": "boolean",
+            "description": "The Environment still exists."
+          },
+          "merged_projects": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "permissive_baseline": {
+            "type": "boolean",
+            "description": "Its baseline is still the permissive one the migration gave it:\nnothing org-wide protects it yet — set a baseline."
+          },
+          "projects": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EnvironmentMigrationReportProjectDto"
+            }
+          },
+          "referenced_only": {
+            "type": "boolean",
+            "description": "No Project defined it: migrated with eligibility *all projects*."
+          },
+          "referencing_projects": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Projects whose Runs named it without defining it."
+          }
+        }
+      },
+      "EnvironmentMigrationReportProjectDto": {
+        "type": "object",
+        "description": "One Project in a split-report line: what it had, and what it has now.",
+        "required": [
+          "project"
+        ],
+        "properties": {
+          "legacy": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LegacyProtectionRulesDto",
+                "description": "Its per-repo rules before the migration; absent for a Project whose\nRuns only named the Environment."
+              }
+            ]
+          },
+          "overlay": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EnvironmentProjectOverlayDto",
+                "description": "Its overlay now (the migration wrote it from `legacy`; it may have\nbeen changed or removed since)."
+              }
+            ]
+          },
+          "project": {
+            "type": "string"
+          }
+        }
+      },
+      "EnvironmentProjectDto": {
+        "type": "object",
+        "description": "One Project's standing in one Environment, for the Environment's admin.",
+        "required": [
+          "project",
+          "eligible"
+        ],
+        "properties": {
+          "eligible": {
+            "type": "boolean",
+            "description": "Whether the Environment's eligibility admits it now."
+          },
+          "overlay": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EnvironmentProjectOverlayDto"
+              }
+            ]
+          },
+          "privilege_grant": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EnvironmentProjectPrivilegeGrantDto"
+              }
+            ]
+          },
+          "project": {
+            "type": "string"
+          }
+        }
+      },
+      "EnvironmentProjectOverlayDto": {
+        "type": "object",
+        "description": "A Project's overlay as stored.",
+        "required": [
+          "approvers",
+          "allowed_refs",
+          "wait_timer_s",
+          "require_reason"
+        ],
+        "properties": {
+          "allowed_refs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "approvers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "deployment_concurrency": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "deployment_gate_deadline_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "require_reason": {
+            "type": "boolean"
+          },
+          "wait_timer_s": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "EnvironmentProjectPrivilegeGrantDto": {
+        "type": "object",
+        "description": "The privileges one Project holds within one Environment (ADR-0071 §8).",
+        "required": [
+          "privileged_images",
+          "permit_k8s_overlay"
+        ],
+        "properties": {
+          "permit_k8s_overlay": {
+            "type": "boolean"
+          },
+          "privileged_images": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ImageGrantDto"
+            }
+          }
+        }
+      },
+      "EnvironmentProtectionRulesDto": {
+        "type": "object",
+        "description": "Protection rules as one layer holds them — an Environment's baseline or a\nProject's overlay (ADR-0071 §1, §3).",
+        "required": [
+          "approvers",
+          "allowed_refs",
+          "wait_timer_s",
+          "require_reason"
+        ],
+        "properties": {
+          "allowed_refs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Ref globs a deploy's symbolic ref must match; empty = any ref."
+          },
+          "approvers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Principal ids; every one must approve (AND)."
+          },
+          "deployment_concurrency": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "In-flight Deployments per DeploymentTarget; absent = no limit.\nEnforced once deployment requests ship (ADR-0071 §9).",
+            "minimum": 0
+          },
+          "require_reason": {
+            "type": "boolean",
+            "description": "A human dispatch must carry a reason (ADR-0057 §3)."
+          },
+          "wait_timer_s": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Seconds. Carried and merged, not yet enforced (git-bug 2b94989).",
+            "minimum": 0
+          }
+        }
+      },
       "ExpiredInputDto": {
         "type": "object",
         "description": "One expired Workspace Snapshot behind a widened rerun (ADR-0061 s5).",
@@ -5283,6 +6572,31 @@
             "type": "string"
           }
         }
+      },
+      "ImageGrantDto": {
+        "type": "object",
+        "description": "One entry of a privilege whitelist (ADR-0039).",
+        "required": [
+          "image_digest"
+        ],
+        "properties": {
+          "capabilities": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The Linux capabilities it may add."
+          },
+          "image_digest": {
+            "type": "string",
+            "description": "`sha256:…` — the digest a step's image must be pinned to\n(`repo@sha256:…`). Matched exactly."
+          },
+          "privileged": {
+            "type": "boolean",
+            "description": "May run as a privileged container."
+          }
+        },
+        "additionalProperties": false
       },
       "InstallPluginRequest": {
         "type": "object",
@@ -5341,6 +6655,57 @@
           "enabled",
           "killed"
         ]
+      },
+      "LegacyProtectionRulesDto": {
+        "type": "object",
+        "description": "A Project's ADR-0037 per-repo rules as the migration found them. The\ncanonical `secret_scope` / `oidc_subject` are left out: the server always\nderived them from the coordinates, so they never differed by choice.",
+        "required": [
+          "approvers",
+          "allowed_refs",
+          "wait_timer",
+          "concurrency",
+          "require_reason",
+          "privileged_images",
+          "permit_k8s_overlay"
+        ],
+        "properties": {
+          "allowed_refs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "approvers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "concurrency": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Stored but never read; not carried by the migration (§10 step 3).",
+            "minimum": 0
+          },
+          "permit_k8s_overlay": {
+            "type": "boolean"
+          },
+          "privileged_images": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ImageGrantDto"
+            }
+          },
+          "require_reason": {
+            "type": "boolean"
+          },
+          "wait_timer": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Seconds.",
+            "minimum": 0
+          }
+        }
       },
       "LinkIdentityRequest": {
         "type": "object",
@@ -5508,6 +6873,8 @@
           "description",
           "deployment_deadline_ms",
           "deployment_sources",
+          "protection",
+          "eligibility",
           "created_at",
           "updated_at",
           "updated_by"
@@ -5533,11 +6900,19 @@
           "description": {
             "type": "string"
           },
+          "eligibility": {
+            "$ref": "#/components/schemas/EnvironmentEligibilityDto",
+            "description": "Which Projects may deploy here. Read-only here: written through\n`…/eligibility`."
+          },
           "name": {
             "type": "string"
           },
           "org": {
             "type": "string"
+          },
+          "protection": {
+            "$ref": "#/components/schemas/EnvironmentProtectionRulesDto",
+            "description": "The baseline every Project's Deploy Runs obey. Read-only here:\nwritten through `…/protection`, never by the whole-Environment PUT."
           },
           "updated_at": {
             "type": "integer",
@@ -6060,6 +7435,170 @@
             "description": "The forge WEB base for this repo (e.g. `https://github.com/owner/name`) —\nwhat the UI appends `/commit/<sha>` or `/pull/<n>` to for deep links.\nDerived from the connection's kind + base_url (the stored base is the API\nhost, which differs from the web host on GitHub)."
           }
         }
+      },
+      "ProjectEnvironmentDto": {
+        "type": "object",
+        "description": "An org-level Environment as one Project sees it (ADR-0071): the read\nmodel behind `GET /v1/repos/{org}/{repo}/environments`, which until\nADR-0071 returned the repo's own per-repo environments.",
+        "required": [
+          "name",
+          "eligible",
+          "baseline",
+          "deployment_deadline_ms",
+          "effective"
+        ],
+        "properties": {
+          "baseline": {
+            "$ref": "#/components/schemas/EnvironmentProtectionRulesDto",
+            "description": "The Environment's baseline, set by an org admin."
+          },
+          "deployment_deadline_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The Environment's EnvironmentDeploymentDeadline."
+          },
+          "effective": {
+            "$ref": "#/components/schemas/EffectiveProtectionDto",
+            "description": "What admission enforces: the baseline merged with the overlay."
+          },
+          "eligible": {
+            "type": "boolean",
+            "description": "Whether this Project may deploy here now (EnvironmentProjectEligibility).\n`false` only for an Environment the Project still holds an overlay or\ngrant in after an admin made it ineligible."
+          },
+          "name": {
+            "type": "string"
+          },
+          "overlay": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EnvironmentProtectionRulesDto",
+                "description": "This Project's tighten-only overlay, if it has one."
+              }
+            ]
+          },
+          "overlay_deployment_gate_deadline_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The overlay's tighter deadline for this Project's DeploymentGates."
+          },
+          "privilege_grant": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EnvironmentProjectPrivilegeGrantDto",
+                "description": "This Project's privileges here, if an admin granted any."
+              }
+            ]
+          }
+        }
+      },
+      "PutEnvironmentProjectOverlayRequest": {
+        "type": "object",
+        "description": "A Project overlay (`…/projects/{project}/overlay`) body: the baseline's\nfive rules, which can only **tighten** (ADR-0071 §3), plus a tighter\ndeadline for this Project's DeploymentGates. Replaced whole, omitted =\npermissive default, unknown fields refused — as for the baseline.",
+        "properties": {
+          "allowed_refs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "approvers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "deployment_concurrency": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "deployment_gate_deadline_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "60000 to 604800000; applies to this Project's DeploymentGates only,\nand only when shorter than the Environment's. Omitted = none."
+          },
+          "require_reason": {
+            "type": "boolean"
+          },
+          "wait_timer_s": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "PutEnvironmentProjectPrivilegeGrantRequest": {
+        "type": "object",
+        "description": "A Project's privilege grant (`…/projects/{project}/privilege-grant`)\nbody, replaced whole.",
+        "properties": {
+          "permit_k8s_overlay": {
+            "type": "boolean",
+            "description": "May the Project's steps here set a raw `k8s_overlay` (ADR-0055)."
+          },
+          "privileged_images": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ImageGrantDto"
+            },
+            "description": "The ADR-0039 whitelist; each digest listed once."
+          }
+        },
+        "additionalProperties": false
+      },
+      "PutEnvironmentProtectionRequest": {
+        "type": "object",
+        "description": "A baseline (`…/protection`) body: the five rules, replaced whole. Every\nfield is optional and an omitted one takes the **permissive** default —\nnever the stored value — so `{}` resets the baseline to permissive.\nUnknown fields are refused, so the retired per-repo shape (`wait_timer`,\n`concurrency`) is a 400, not a silently ignored rule.",
+        "properties": {
+          "allowed_refs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Ref globs (`refs/heads/main`, `refs/tags/*`); empty = any ref."
+          },
+          "approvers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Principal ids (ADR-0069): each must name an existing Principal; a\nmerged id is stored as the Principal it now is. All must approve."
+          },
+          "deployment_concurrency": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "In-flight Deployments per DeploymentTarget, at least 1; omitted or\n`null` = no limit. Enforced once deployment requests ship (§9).",
+            "minimum": 0
+          },
+          "require_reason": {
+            "type": "boolean",
+            "description": "A human dispatch must carry a reason (ADR-0057 §3). Omitted = off."
+          },
+          "wait_timer_s": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Seconds. Carried and merged, not yet enforced (git-bug 2b94989).",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
       },
       "PutOrgEnvironmentRequest": {
         "type": "object",

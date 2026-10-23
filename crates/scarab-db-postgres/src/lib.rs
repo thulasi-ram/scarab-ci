@@ -30,7 +30,10 @@ use scarab_forge::{
 };
 use scarab_project::{Deployment, Environment, EnvironmentStore, ProjectError};
 
-/// `OrgEnvironmentStore` (ADR-0071): the minimal org-level Environment.
+/// `EnvironmentGovernanceStore` (ADR-0071 §2, §3, §8): baseline, eligibility,
+/// overlays and grants, and the one-snapshot read admission makes.
+mod environment_governance;
+/// `OrgEnvironmentStore` (ADR-0071): the org-level Environment.
 mod org_environments;
 /// `PluginStore` (ADR-0072): PluginInstallations, the kill switch, and report
 /// ingest into the Deployment record.
@@ -2312,6 +2315,12 @@ fn reg_err(e: sqlx::Error) -> RegistryError {
     RegistryError::Store(e.to_string())
 }
 
+/// The legacy per-Project environments (ADR-0037) on the table migration 0057
+/// renamed to `legacy_project_environments` and froze (ADR-0071 §10). The
+/// server never calls the environment half any more — the per-repo write API
+/// answers 410 and admission reads [`scarab_project::EnvironmentGovernanceStore`]
+/// — so it serves the golden tests that seed legacy rows; the approval-history
+/// half is still written on every gate release.
 #[async_trait::async_trait]
 impl EnvironmentStore for PostgresDb {
     async fn put_environment(
@@ -2323,7 +2332,8 @@ impl EnvironmentStore for PostgresDb {
         let protection = serde_json::to_value(&env.protection)
             .map_err(|e| ProjectError::Store(e.to_string()))?;
         sqlx::query(
-            "INSERT INTO environments (org, project, name, protection) VALUES ($1, $2, $3, $4)
+            "INSERT INTO legacy_project_environments (org, project, name, protection)
+             VALUES ($1, $2, $3, $4)
              ON CONFLICT (org, project, name) DO UPDATE SET protection = EXCLUDED.protection",
         )
         .bind(org)
@@ -2343,7 +2353,8 @@ impl EnvironmentStore for PostgresDb {
         name: &str,
     ) -> Result<Option<Environment>, ProjectError> {
         let row = sqlx::query(
-            "SELECT protection FROM environments WHERE org = $1 AND project = $2 AND name = $3",
+            "SELECT protection FROM legacy_project_environments
+             WHERE org = $1 AND project = $2 AND name = $3",
         )
         .bind(org)
         .bind(project)
@@ -2368,7 +2379,8 @@ impl EnvironmentStore for PostgresDb {
         project: &str,
     ) -> Result<Vec<Environment>, ProjectError> {
         let rows = sqlx::query(
-            "SELECT name, protection FROM environments WHERE org = $1 AND project = $2 ORDER BY name",
+            "SELECT name, protection FROM legacy_project_environments
+             WHERE org = $1 AND project = $2 ORDER BY name",
         )
         .bind(org)
         .bind(project)
@@ -2393,13 +2405,15 @@ impl EnvironmentStore for PostgresDb {
         project: &str,
         name: &str,
     ) -> Result<(), ProjectError> {
-        sqlx::query("DELETE FROM environments WHERE org = $1 AND project = $2 AND name = $3")
-            .bind(org)
-            .bind(project)
-            .bind(name)
-            .execute(self.pool())
-            .await
-            .map_err(|e| ProjectError::Store(e.to_string()))?;
+        sqlx::query(
+            "DELETE FROM legacy_project_environments WHERE org = $1 AND project = $2 AND name = $3",
+        )
+        .bind(org)
+        .bind(project)
+        .bind(name)
+        .execute(self.pool())
+        .await
+        .map_err(|e| ProjectError::Store(e.to_string()))?;
         Ok(())
     }
 
@@ -3353,8 +3367,31 @@ async fn merge_principal(
             .map_err(identity_err)?;
     }
 
+    // Approver lists name Principals by exact id (ADR-0069 §3), so a folded id
+    // is rewritten wherever admission reads approvers — the org Environment
+    // baselines and the Project overlays (ADR-0071 §1, §3) — order kept, the
+    // survivor not listed twice.
+    for table in ["org_environments", "environment_project_overlays"] {
+        sqlx::query(&format!(
+            "UPDATE {table} SET approvers = (
+                 SELECT COALESCE(array_agg(a ORDER BY first_seen), '{{}}')
+                 FROM (SELECT a, min(i) AS first_seen
+                       FROM unnest(array_replace(approvers, $1, $2)) WITH ORDINALITY u(a, i)
+                       GROUP BY a) folded)
+             WHERE $1 = ANY(approvers)"
+        ))
+        .bind(from)
+        .bind(into)
+        .execute(&mut **tx)
+        .await
+        .map_err(identity_err)?;
+    }
+    // The frozen legacy rows too. Not a governance edit — nothing admits by
+    // them (ADR-0071 §10) — but the split report shows them to an admin, and
+    // a folded id must not reappear there as a Principal that no longer
+    // signs in.
     let envs = sqlx::query(
-        "SELECT org, project, name, protection FROM environments
+        "SELECT org, project, name, protection FROM legacy_project_environments
          WHERE protection->'approvers' ? $1 FOR UPDATE",
     )
     .bind(from)
@@ -3378,7 +3415,8 @@ async fn merge_principal(
             *list = rewritten;
         }
         sqlx::query(
-            "UPDATE environments SET protection = $4 WHERE org = $1 AND project = $2 AND name = $3",
+            "UPDATE legacy_project_environments SET protection = $4
+             WHERE org = $1 AND project = $2 AND name = $3",
         )
         .bind(e.get::<String, _>("org"))
         .bind(e.get::<String, _>("project"))

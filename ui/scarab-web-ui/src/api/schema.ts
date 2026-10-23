@@ -489,6 +489,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/orgs/{org}/environment-migration-report": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The ADR-0071 migration's split report (ADR-0071 §10 step 8) */
+        get: operations["get_environment_migration_report"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/environment-migration-report/{env}/acknowledge": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Acknowledge a split-report line (ADR-0071 §10 step 8) */
+        post: operations["acknowledge_environment_migration_report"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/orgs/{org}/environments": {
         parameters: {
             query?: never;
@@ -520,7 +554,9 @@ export interface paths {
         post?: never;
         /**
          * Delete an org Environment with no Deployments (ADR-0071)
-         * @description Refused (409) while the Deployment record holds anything for the name:
+         * @description Refused (409) while any Project holds an overlay or privilege grant in
+         *     it (ADR-0071 §3, §8: those are never dropped as a side effect), and while
+         *     the Deployment record holds anything for the name:
          *     the record is keyed by name, so deleting and re-creating the Environment
          *     would silently re-adopt that history under whatever the new one says.
          */
@@ -574,6 +610,105 @@ export interface paths {
         /** One Deployment and its stages (ADR-0070) */
         get: operations["get_deployment"];
         put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/environments/{env}/eligibility": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Which projects may deploy into an org Environment (ADR-0071 §2) */
+        get: operations["get_environment_eligibility"];
+        /** Replace which projects may deploy into an org Environment (ADR-0071 §2) */
+        put: operations["put_environment_eligibility"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/environments/{env}/projects": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Projects with an overlay or privilege grant in an org Environment (ADR-0071 §3, §8) */
+        get: operations["list_environment_projects"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/environments/{env}/projects/{project}/overlay": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** A project's tighten-only overlay in an org Environment (ADR-0071 §3) */
+        get: operations["get_environment_project_overlay"];
+        /**
+         * Tighten an org Environment for one project (ADR-0071 §3)
+         * @description Refused (409) for a Project the Environment does not admit and which
+         *     holds no overlay there yet: a Project that may not deploy here has
+         *     nothing to tighten, and an overlay pins the Environment against deletion
+         *     (ON DELETE RESTRICT), so a stray one would let any Project admin block an
+         *     org admin's delete. An existing overlay stays editable after eligibility
+         *     is withdrawn.
+         */
+        put: operations["put_environment_project_overlay"];
+        post?: never;
+        /** Remove a project's overlay in an org Environment (ADR-0071 §3) */
+        delete: operations["delete_environment_project_overlay"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/environments/{env}/projects/{project}/privilege-grant": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** A project's privilege grant in an org Environment (ADR-0071 §8) */
+        get: operations["get_environment_project_privilege_grant"];
+        /** Grant a project privileges in an org Environment (ADR-0071 §8) */
+        put: operations["put_environment_project_privilege_grant"];
+        post?: never;
+        /** Withdraw a project's privilege grant in an org Environment (ADR-0071 §8) */
+        delete: operations["delete_environment_project_privilege_grant"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/environments/{env}/protection": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** An org Environment's baseline protection rules (ADR-0071 §1) */
+        get: operations["get_environment_protection"];
+        /** Replace an org Environment's baseline protection rules (ADR-0071 §1) */
+        put: operations["put_environment_protection"];
         post?: never;
         delete?: never;
         options?: never;
@@ -865,7 +1000,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List a repo's environments */
+        /** The environments this project may deploy into, with baseline/overlay/effective rules (ADR-0071) */
         get: operations["list_environments"];
         put?: never;
         post?: never;
@@ -882,12 +1017,12 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** One environment's protection rules */
+        /** One environment as this project sees it: baseline, overlay, effective (ADR-0071) */
         get: operations["get_environment"];
-        /** Create/replace a protected environment (ADR-0024/0037) */
+        /** Retired: per-repo environments are org-level Environments now (ADR-0071) */
         put: operations["put_environment"];
         post?: never;
-        /** Delete an environment (idempotent) */
+        /** Retired: per-repo environments are org-level Environments now (ADR-0071) */
         delete: operations["delete_environment"];
         options?: never;
         head?: never;
@@ -1179,8 +1314,10 @@ export interface paths {
          * Approve a `manual` gate (ADR-0008, 0037). The authenticated principal's
          *     approval is recorded on the event log (append-only, idempotent). For a
          *     **deploy** run (one with a target environment), the gate is released only
-         *     once the accumulated approvers satisfy the environment's protection rules
-         *     (`admits`); on release the deployment is written to history. A plain gate (no
+         *     once the accumulated approvers satisfy the Environment's effective rules for
+         *     the run's Project (ADR-0071 §3, `admits`); on release the deployment is
+         *     written to the legacy history. If the Environment no longer exists or no
+         *     longer admits the Project, the gate does not release (409). A plain gate (no
          *     environment) releases on the first approval. Authz'd as a write.
          */
         post: operations["approve_gate"];
@@ -1205,7 +1342,10 @@ export interface paths {
          *     interactive approval. The token is `HMAC-SHA256(secret, "{run}:{step}")`
          *     (`sha256=<hex>`), verified in constant time; no per-gate storage. The endpoint
          *     is 404 when no token secret is configured, and only releases gates of kind
-         *     `external` (manual gates stay approval-only).
+         *     `external` (manual gates stay approval-only). In a Deploy Run, the gate is
+         *     held (409) when the run's Environment no longer exists or no longer admits
+         *     its Project (ADR-0071 §2) — the same check `approve_gate` makes. The token
+         *     proves who is releasing, not that the deploy is still allowed.
          */
         post: operations["release_gate_external"];
         delete?: never;
@@ -2193,6 +2333,31 @@ export interface components {
              */
             ref: string;
         };
+        /**
+         * @description The rules admission enforces for one Project in one Environment: the
+         *     baseline merged with the Project's overlay (ADR-0071 §3), computed by the
+         *     server so no client re-implements the merge.
+         */
+        EffectiveProtectionDto: {
+            /**
+             * @description One list per layer (baseline first, then overlay): a ref must match
+             *     **every** non-empty layer. Never pre-intersected — `[main]` and
+             *     `[tags/*]` intersect to `[]`, which would read as "any ref".
+             */
+            allowed_ref_layers: string[][];
+            /** @description Baseline approvers, then the overlay's not already listed — all required. */
+            approvers: string[];
+            /** Format: int32 */
+            deployment_concurrency?: number | null;
+            /**
+             * Format: int64
+             * @description The deadline this Project's DeploymentGates use.
+             */
+            deployment_gate_deadline_ms: number;
+            require_reason: boolean;
+            /** Format: int32 */
+            wait_timer_s: number;
+        };
         /** @description One DeploymentTarget's line on the Environment board. */
         EnvironmentBoardRowDto: {
             live?: null | components["schemas"]["DeploymentDto"];
@@ -2215,6 +2380,115 @@ export interface components {
              */
             vendor_grouping: string;
         };
+        /**
+         * @description Which Projects may run Deploy Runs into an Environment (ADR-0071 §2):
+         *     every Project in the org, or exactly those matching one of `projects`
+         *     (project-name globs, `*` wildcards).
+         */
+        EnvironmentEligibilityDto: {
+            /** @description Every Project in the org. `projects` must then be empty. */
+            all_projects: boolean;
+            /**
+             * @description Project-name globs. An empty list with `all_projects: false` admits
+             *     **no** Project — eligibility starts closed.
+             */
+            projects?: string[];
+        };
+        /**
+         * @description One line of the split report: an Environment name merged across several
+         *     Projects, or created with eligibility *all projects* because no Project
+         *     defined it. If the merged Projects really meant different places (one
+         *     `prod` that is `prod-eu`), the split is a YAML change: those Projects
+         *     rename their `environment:` and an org admin creates the new
+         *     Environment — nothing is renamed for them.
+         */
+        EnvironmentMigrationReportDto: {
+            /**
+             * Format: int64
+             * @description Unix-ms; absent until an admin acknowledges the line.
+             */
+            acknowledged_at?: number | null;
+            acknowledged_by?: string | null;
+            /**
+             * Format: int64
+             * @description Unix-ms.
+             */
+            created_at: number;
+            /**
+             * @description The legacy rules the merged Projects disagreed on, by ADR-0037 field
+             *     name (`approvers`, `allowed_refs`, `wait_timer`, `require_reason`,
+             *     `privileged_images`, `permit_k8s_overlay`). Lists compare as sets.
+             */
+            differing_rules: string[];
+            environment: string;
+            /** @description The Environment still exists. */
+            environment_exists: boolean;
+            merged_projects: string[];
+            /**
+             * @description Its baseline is still the permissive one the migration gave it:
+             *     nothing org-wide protects it yet — set a baseline.
+             */
+            permissive_baseline: boolean;
+            projects: components["schemas"]["EnvironmentMigrationReportProjectDto"][];
+            /** @description No Project defined it: migrated with eligibility *all projects*. */
+            referenced_only: boolean;
+            /** @description Projects whose Runs named it without defining it. */
+            referencing_projects: string[];
+        };
+        /** @description One Project in a split-report line: what it had, and what it has now. */
+        EnvironmentMigrationReportProjectDto: {
+            legacy?: null | components["schemas"]["LegacyProtectionRulesDto"];
+            overlay?: null | components["schemas"]["EnvironmentProjectOverlayDto"];
+            project: string;
+        };
+        /** @description One Project's standing in one Environment, for the Environment's admin. */
+        EnvironmentProjectDto: {
+            /** @description Whether the Environment's eligibility admits it now. */
+            eligible: boolean;
+            overlay?: null | components["schemas"]["EnvironmentProjectOverlayDto"];
+            privilege_grant?: null | components["schemas"]["EnvironmentProjectPrivilegeGrantDto"];
+            project: string;
+        };
+        /** @description A Project's overlay as stored. */
+        EnvironmentProjectOverlayDto: {
+            allowed_refs: string[];
+            approvers: string[];
+            /** Format: int32 */
+            deployment_concurrency?: number | null;
+            /** Format: int64 */
+            deployment_gate_deadline_ms?: number | null;
+            require_reason: boolean;
+            /** Format: int32 */
+            wait_timer_s: number;
+        };
+        /** @description The privileges one Project holds within one Environment (ADR-0071 §8). */
+        EnvironmentProjectPrivilegeGrantDto: {
+            permit_k8s_overlay: boolean;
+            privileged_images: components["schemas"]["ImageGrantDto"][];
+        };
+        /**
+         * @description Protection rules as one layer holds them — an Environment's baseline or a
+         *     Project's overlay (ADR-0071 §1, §3).
+         */
+        EnvironmentProtectionRulesDto: {
+            /** @description Ref globs a deploy's symbolic ref must match; empty = any ref. */
+            allowed_refs: string[];
+            /** @description Principal ids; every one must approve (AND). */
+            approvers: string[];
+            /**
+             * Format: int32
+             * @description In-flight Deployments per DeploymentTarget; absent = no limit.
+             *     Enforced once deployment requests ship (ADR-0071 §9).
+             */
+            deployment_concurrency?: number | null;
+            /** @description A human dispatch must carry a reason (ADR-0057 §3). */
+            require_reason: boolean;
+            /**
+             * Format: int32
+             * @description Seconds. Carried and merged, not yet enforced (git-bug 2b94989).
+             */
+            wait_timer_s: number;
+        };
         /** @description One expired Workspace Snapshot behind a widened rerun (ADR-0061 s5). */
         ExpiredInputDto: {
             /** @description The step whose input workspace is incomplete. */
@@ -2228,6 +2502,18 @@ export interface components {
         GrantedPermissionDto: {
             level: string;
             name: string;
+        };
+        /** @description One entry of a privilege whitelist (ADR-0039). */
+        ImageGrantDto: {
+            /** @description The Linux capabilities it may add. */
+            capabilities?: string[];
+            /**
+             * @description `sha256:…` — the digest a step's image must be pinned to
+             *     (`repo@sha256:…`). Matched exactly.
+             */
+            image_digest: string;
+            /** @description May run as a privileged container. */
+            privileged?: boolean;
         };
         /** @description `POST /v1/orgs/{org}/plugins`. */
         InstallPluginRequest: {
@@ -2255,6 +2541,28 @@ export interface components {
          * @enum {string}
          */
         InstallationStateDto: "enabled" | "killed";
+        /**
+         * @description A Project's ADR-0037 per-repo rules as the migration found them. The
+         *     canonical `secret_scope` / `oidc_subject` are left out: the server always
+         *     derived them from the coordinates, so they never differed by choice.
+         */
+        LegacyProtectionRulesDto: {
+            allowed_refs: string[];
+            approvers: string[];
+            /**
+             * Format: int32
+             * @description Stored but never read; not carried by the migration (§10 step 3).
+             */
+            concurrency: number;
+            permit_k8s_overlay: boolean;
+            privileged_images: components["schemas"]["ImageGrantDto"][];
+            require_reason: boolean;
+            /**
+             * Format: int32
+             * @description Seconds.
+             */
+            wait_timer: number;
+        };
         /** @description `POST /v1/me/identities/link` body. */
         LinkIdentityRequest: {
             /** @description The login provider to link an account from (`GET /v1/auth/providers`). */
@@ -2371,8 +2679,18 @@ export interface components {
             /** @description Sorted by installation, then vendor grouping. */
             deployment_sources: components["schemas"]["EnvironmentDeploymentSourceDto"][];
             description: string;
+            /**
+             * @description Which Projects may deploy here. Read-only here: written through
+             *     `…/eligibility`.
+             */
+            eligibility: components["schemas"]["EnvironmentEligibilityDto"];
             name: string;
             org: string;
+            /**
+             * @description The baseline every Project's Deploy Runs obey. Read-only here:
+             *     written through `…/protection`, never by the whole-Environment PUT.
+             */
+            protection: components["schemas"]["EnvironmentProtectionRulesDto"];
             /**
              * Format: int64
              * @description Unix-ms.
@@ -2637,6 +2955,96 @@ export interface components {
              *     host, which differs from the web host on GitHub).
              */
             repo_url: string;
+        };
+        /**
+         * @description An org-level Environment as one Project sees it (ADR-0071): the read
+         *     model behind `GET /v1/repos/{org}/{repo}/environments`, which until
+         *     ADR-0071 returned the repo's own per-repo environments.
+         */
+        ProjectEnvironmentDto: {
+            /** @description The Environment's baseline, set by an org admin. */
+            baseline: components["schemas"]["EnvironmentProtectionRulesDto"];
+            /**
+             * Format: int64
+             * @description The Environment's EnvironmentDeploymentDeadline.
+             */
+            deployment_deadline_ms: number;
+            /** @description What admission enforces: the baseline merged with the overlay. */
+            effective: components["schemas"]["EffectiveProtectionDto"];
+            /**
+             * @description Whether this Project may deploy here now (EnvironmentProjectEligibility).
+             *     `false` only for an Environment the Project still holds an overlay or
+             *     grant in after an admin made it ineligible.
+             */
+            eligible: boolean;
+            name: string;
+            overlay?: null | components["schemas"]["EnvironmentProtectionRulesDto"];
+            /**
+             * Format: int64
+             * @description The overlay's tighter deadline for this Project's DeploymentGates.
+             */
+            overlay_deployment_gate_deadline_ms?: number | null;
+            privilege_grant?: null | components["schemas"]["EnvironmentProjectPrivilegeGrantDto"];
+        };
+        /**
+         * @description A Project overlay (`…/projects/{project}/overlay`) body: the baseline's
+         *     five rules, which can only **tighten** (ADR-0071 §3), plus a tighter
+         *     deadline for this Project's DeploymentGates. Replaced whole, omitted =
+         *     permissive default, unknown fields refused — as for the baseline.
+         */
+        PutEnvironmentProjectOverlayRequest: {
+            allowed_refs?: string[];
+            approvers?: string[];
+            /** Format: int32 */
+            deployment_concurrency?: number | null;
+            /**
+             * Format: int64
+             * @description 60000 to 604800000; applies to this Project's DeploymentGates only,
+             *     and only when shorter than the Environment's. Omitted = none.
+             */
+            deployment_gate_deadline_ms?: number | null;
+            require_reason?: boolean;
+            /** Format: int32 */
+            wait_timer_s?: number;
+        };
+        /**
+         * @description A Project's privilege grant (`…/projects/{project}/privilege-grant`)
+         *     body, replaced whole.
+         */
+        PutEnvironmentProjectPrivilegeGrantRequest: {
+            /** @description May the Project's steps here set a raw `k8s_overlay` (ADR-0055). */
+            permit_k8s_overlay?: boolean;
+            /** @description The ADR-0039 whitelist; each digest listed once. */
+            privileged_images?: components["schemas"]["ImageGrantDto"][];
+        };
+        /**
+         * @description A baseline (`…/protection`) body: the five rules, replaced whole. Every
+         *     field is optional and an omitted one takes the **permissive** default —
+         *     never the stored value — so `{}` resets the baseline to permissive.
+         *     Unknown fields are refused, so the retired per-repo shape (`wait_timer`,
+         *     `concurrency`) is a 400, not a silently ignored rule.
+         */
+        PutEnvironmentProtectionRequest: {
+            /** @description Ref globs (`refs/heads/main`, `refs/tags/*`); empty = any ref. */
+            allowed_refs?: string[];
+            /**
+             * @description Principal ids (ADR-0069): each must name an existing Principal; a
+             *     merged id is stored as the Principal it now is. All must approve.
+             */
+            approvers?: string[];
+            /**
+             * Format: int32
+             * @description In-flight Deployments per DeploymentTarget, at least 1; omitted or
+             *     `null` = no limit. Enforced once deployment requests ship (§9).
+             */
+            deployment_concurrency?: number | null;
+            /** @description A human dispatch must carry a reason (ADR-0057 §3). Omitted = off. */
+            require_reason?: boolean;
+            /**
+             * Format: int32
+             * @description Seconds. Carried and merged, not yet enforced (git-bug 2b94989).
+             */
+            wait_timer_s?: number;
         };
         /**
          * @description `PUT /v1/orgs/{org}/environments/{env}`: the whole Environment, replaced.
@@ -4053,6 +4461,80 @@ export interface operations {
             };
         };
     };
+    get_environment_migration_report: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EnvironmentMigrationReportDto"][];
+                };
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    acknowledge_environment_migration_report: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description environment name */
+                env: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EnvironmentMigrationReportDto"];
+                };
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no report line for that name, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     list_org_environments: {
         parameters: {
             query?: never;
@@ -4218,7 +4700,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description the Environment has Deployments */
+            /** @description the Environment has Deployments, or project overlays or grants */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -4357,6 +4839,485 @@ export interface operations {
                 content?: never;
             };
             /** @description no such Deployment in this Environment */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_environment_eligibility: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description environment name */
+                env: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EnvironmentEligibilityDto"];
+                };
+            };
+            /** @description no Read on the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such Environment, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    put_environment_eligibility: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description environment name */
+                env: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EnvironmentEligibilityDto"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EnvironmentEligibilityDto"];
+                };
+            };
+            /** @description an empty or duplicated pattern, or patterns with all_projects */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such Environment, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_environment_projects: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description environment name */
+                env: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EnvironmentProjectDto"][];
+                };
+            };
+            /** @description no Read on the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such Environment, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_environment_project_overlay: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description environment name */
+                env: string;
+                /** @description project (repo) name */
+                project: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EnvironmentProjectOverlayDto"];
+                };
+            };
+            /** @description no Read on the project */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such Environment, no overlay, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    put_environment_project_overlay: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description environment name */
+                env: string;
+                /** @description project (repo) name */
+                project: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PutEnvironmentProjectOverlayRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EnvironmentProjectOverlayDto"];
+                };
+            };
+            /** @description an approver who is not a Scarab user, an empty entry, a zero concurrency or an out-of-range deadline */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an admin of the project or org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such Environment, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the project is not eligible for the Environment */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_environment_project_overlay: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description environment name */
+                env: string;
+                /** @description project (repo) name */
+                project: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an admin of the project or org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no overlay, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_environment_project_privilege_grant: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description environment name */
+                env: string;
+                /** @description project (repo) name */
+                project: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EnvironmentProjectPrivilegeGrantDto"];
+                };
+            };
+            /** @description no Read on the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such Environment, no grant, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    put_environment_project_privilege_grant: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description environment name */
+                env: string;
+                /** @description project (repo) name */
+                project: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PutEnvironmentProjectPrivilegeGrantRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EnvironmentProjectPrivilegeGrantDto"];
+                };
+            };
+            /** @description a digest that is not `sha256:…`, or one listed twice */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such Environment, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_environment_project_privilege_grant: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description environment name */
+                env: string;
+                /** @description project (repo) name */
+                project: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description withdrawn */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no grant, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_environment_protection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description environment name */
+                env: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EnvironmentProtectionRulesDto"];
+                };
+            };
+            /** @description no Read on the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such Environment, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    put_environment_protection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description environment name */
+                env: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PutEnvironmentProtectionRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrgEnvironmentDto"];
+                };
+            };
+            /** @description an approver who is not a Scarab user, an empty entry, or a zero concurrency */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such Environment, or not configured */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -5052,23 +6013,36 @@ export interface operations {
                     "application/json": components["schemas"]["CreateRunResponse"];
                 };
             };
+            /** @description the caller may not dispatch, or the pipeline's Environment does not exist in the org or does not admit this project (ADR-0071); the body says what an org admin must do. No run is created */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     list_environments: {
         parameters: {
             query?: never;
             header?: never;
-            path?: never;
+            path: {
+                /** @description repo owner */
+                org: string;
+                /** @description repo name */
+                repo: string;
+            };
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description the environments */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["ProjectEnvironmentDto"][];
+                };
             };
         };
     };
@@ -5076,19 +6050,27 @@ export interface operations {
         parameters: {
             query?: never;
             header?: never;
-            path?: never;
+            path: {
+                /** @description repo owner */
+                org: string;
+                /** @description repo name */
+                repo: string;
+                /** @description Environment name */
+                name: string;
+            };
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description the environment */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["ProjectEnvironmentDto"];
+                };
             };
-            /** @description unknown */
+            /** @description unknown, or not this project's */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -5101,13 +6083,20 @@ export interface operations {
         parameters: {
             query?: never;
             header?: never;
-            path?: never;
+            path: {
+                /** @description repo owner */
+                org: string;
+                /** @description repo name */
+                repo: string;
+                /** @description Environment name */
+                name: string;
+            };
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description stored */
-            200: {
+            /** @description gone; the body says where it went */
+            410: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -5119,13 +6108,20 @@ export interface operations {
         parameters: {
             query?: never;
             header?: never;
-            path?: never;
+            path: {
+                /** @description repo owner */
+                org: string;
+                /** @description repo name */
+                repo: string;
+                /** @description Environment name */
+                name: string;
+            };
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description deleted */
-            204: {
+            /** @description gone; the body says where it went */
+            410: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -5137,7 +6133,14 @@ export interface operations {
         parameters: {
             query?: never;
             header?: never;
-            path?: never;
+            path: {
+                /** @description repo owner */
+                org: string;
+                /** @description repo name */
+                repo: string;
+                /** @description Environment name */
+                name: string;
+            };
             cookie?: never;
         };
         requestBody?: never;
@@ -5577,6 +6580,13 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description not an approvable gate, or the run's Environment no longer exists or no longer admits its project */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     release_gate_external: {
@@ -5609,6 +6619,13 @@ export interface operations {
             };
             /** @description no such external gate, or token release disabled */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the gate is not pending, or the run's Environment no longer exists or no longer admits its project */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -145,9 +145,20 @@ pub struct AppState {
     /// `scarab_pat_…` bearer a 401: an unwired store must refuse tokens, never
     /// fall through to treating one as a session id.
     pub api_tokens: Option<Arc<dyn scarab_identity::ApiTokenStore>>,
-    /// Environments + deployment history store. `None` disables the environment
-    /// endpoints.
+    /// The legacy per-Project environment store (ADR-0037), kept for the
+    /// legacy approval history (`record_deployment` on every gate release and
+    /// its read endpoint). Admission never reads it since ADR-0071 — see
+    /// [`environment_governance`](AppState::environment_governance). `None`
+    /// disables the history endpoint.
     pub environments: Option<Arc<dyn scarab_project::EnvironmentStore>>,
+    /// Org-level Environment governance (ADR-0071 §2, §3, §8): what admits
+    /// and governs every Deploy Run — eligibility, effective protection,
+    /// privilege grants — at Run creation, at gate approval and at secret
+    /// launch. `main.rs` always wires it. `None` is a hand-built state only (a
+    /// test or the inline stack): deploys are then admitted as an undefined
+    /// environment was before ADR-0071, and the per-repo environment reads
+    /// answer 404.
+    pub environment_governance: Option<Arc<dyn scarab_project::EnvironmentGovernanceStore>>,
     /// The Deployment record's input log (ADR-0070). `None` disables the
     /// Deployments endpoints (404) — the board and the Deployments view.
     pub deployments: Option<Arc<dyn scarab_deployment::DeploymentStore>>,
@@ -283,6 +294,7 @@ impl AppState {
             sessions: None,
             api_tokens: None,
             environments: None,
+            environment_governance: None,
             deployments: None,
             org_environments: None,
             plugins: None,
@@ -354,12 +366,23 @@ impl AppState {
         self
     }
 
-    /// Enable the environment / deployment endpoints.
+    /// Enable the legacy approval history (ADR-0037, ADR-0070 §1).
     pub fn with_environments(
         mut self,
         environments: Arc<dyn scarab_project::EnvironmentStore>,
     ) -> Self {
         self.environments = Some(environments);
+        self
+    }
+
+    /// Govern Deploy Runs by org-level Environments (ADR-0071): eligibility
+    /// and effective protection at Run creation and gate approval, and the
+    /// per-repo environment reads.
+    pub fn with_environment_governance(
+        mut self,
+        governance: Arc<dyn scarab_project::EnvironmentGovernanceStore>,
+    ) -> Self {
+        self.environment_governance = Some(governance);
         self
     }
 
@@ -1277,6 +1300,10 @@ pub enum ApiError {
     /// (that is [`ApiError::Forbidden`]) but a policy: a third-party plugin,
     /// a killed installation (ADR-0072).
     Denied(String),
+    /// The resource used to exist here and was retired on purpose; the text
+    /// says where it went (410). The per-repo environment writes, replaced by
+    /// the org-level Environment (ADR-0071).
+    Gone(String),
     Db(DbError),
     /// A log body read failed while the index says chunks exist — the bytes are
     /// gone or unreachable, and the reader must be told rather than handed a
@@ -1304,6 +1331,11 @@ impl From<DispatchError> for ApiError {
             // (fail-closed, no run created).
             DispatchError::Db(d) => ApiError::Db(d),
             DispatchError::PipelineNotFound(_) => ApiError::NotFound,
+            // ADR-0071 §2, §10: the caller may dispatch, but the Environment
+            // does not let this Project deploy — a policy refusal (403) with
+            // the actionable text, not a malformed request.
+            refused @ (DispatchError::UnknownEnvironment { .. }
+            | DispatchError::NotEligible { .. }) => ApiError::Denied(refused.to_string()),
             other => ApiError::BadRequest(other.to_string()),
         }
     }
@@ -1318,6 +1350,7 @@ impl IntoResponse for ApiError {
             }
             ApiError::Forbidden => (StatusCode::FORBIDDEN, "insufficient role").into_response(),
             ApiError::Denied(m) => (StatusCode::FORBIDDEN, m).into_response(),
+            ApiError::Gone(m) => (StatusCode::GONE, m).into_response(),
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m).into_response(),
             ApiError::Conflict(m) => (StatusCode::CONFLICT, m).into_response(),
             ApiError::NotImplemented(m) => (StatusCode::NOT_IMPLEMENTED, m).into_response(),
@@ -1506,7 +1539,10 @@ async fn create_run(
         ("repo" = String, Path, description = "repo name")
     ),
     request_body = DispatchRequest,
-    responses((status = 201, description = "Run created", body = CreateRunResponse))
+    responses(
+        (status = 201, description = "Run created", body = CreateRunResponse),
+        (status = 403, description = "the caller may not dispatch, or the pipeline's Environment does not exist in the org or does not admit this project (ADR-0071); the body says what an org admin must do. No run is created")
+    )
 )]
 async fn dispatch(
     State(st): State<AppState>,
@@ -1530,7 +1566,7 @@ async fn dispatch(
         forge.as_ref(),
         st.db.as_ref(),
         st.clock.as_ref(),
-        st.environments.as_deref(),
+        st.environment_governance.as_deref(),
         principal.subject,
         scarab_forge::RepoRef {
             owner: org,
@@ -3826,17 +3862,65 @@ fn origin_pr_base(event: &scarab_forge::Event) -> Option<String> {
 /// Pipelines are evaluated independently and in a deterministic (path-sorted)
 /// order; a file that fails to compile fails the whole trigger (a broken
 /// pipeline is a submit-time error, ADR-0009), so a repo's CI is all-or-nothing
-/// per delivery rather than silently partial.
+/// per delivery rather than silently partial. A pipeline that admission
+/// **refuses** (a disallowed ref, an unknown Environment, an ineligible
+/// Project — ADR-0037, ADR-0071) is skipped on its own and never aborts the
+/// delivery: the other pipelines still run.
+///
+/// `governance` is the org-level Environment governance store (ADR-0071);
+/// `None` only in a hand-built state, where a deploy is admitted as an
+/// undefined environment was before ADR-0071 ([`GovernedRules::Unwired`]).
+///
+/// The run ids only; [`trigger_runs_from_event`] also reports the deploy
+/// pipelines the Environment refused.
 pub async fn trigger_run_from_event(
     forge: &dyn scarab_forge::ForgePort,
     db: &dyn Db,
     clock: &dyn Clock,
-    environments: Option<&dyn scarab_project::EnvironmentStore>,
+    governance: Option<&dyn scarab_project::EnvironmentGovernanceStore>,
     event: &scarab_forge::Event,
 ) -> Result<Vec<RunId>, TriggerError> {
+    Ok(trigger_runs_from_event(forge, db, clock, governance, event)
+        .await?
+        .runs)
+}
+
+/// A deploy pipeline a delivery did not run because its Environment does not
+/// exist in the Org or does not admit the Project (ADR-0071 §2, §10). Reported
+/// in the webhook delivery body: for a pipeline whose name the ADR-0071
+/// migration could never see (it had never run), this is the only place the
+/// refusal surfaces besides the server log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RefusedPipeline {
+    /// The pipeline file, e.g. `.scarab/deploy.yaml`.
+    pub pipeline: String,
+    /// The Environment it named.
+    pub environment: String,
+    /// What is missing and who can fix it.
+    pub reason: String,
+}
+
+/// What one delivery did: the Runs it created and the deploy pipelines the
+/// Environment refused. A `RefNotAllowed` skip is not listed — a
+/// branch-scoped Environment ignoring other branches is the rule working.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TriggerOutcome {
+    pub runs: Vec<RunId>,
+    pub refused: Vec<RefusedPipeline>,
+}
+
+/// [`trigger_run_from_event`], also reporting every deploy pipeline refused
+/// as `UnknownEnvironment` / `NotEligible`.
+pub async fn trigger_runs_from_event(
+    forge: &dyn scarab_forge::ForgePort,
+    db: &dyn Db,
+    clock: &dyn Clock,
+    governance: Option<&dyn scarab_project::EnvironmentGovernanceStore>,
+    event: &scarab_forge::Event,
+) -> Result<TriggerOutcome, TriggerError> {
     // Repo-less events (cron/manual/api) don't carry in-repo config here.
     let Some(repo) = event.repo() else {
-        return Ok(Vec::new());
+        return Ok(TriggerOutcome::default());
     };
     let git_ref = config_ref(event);
 
@@ -3844,7 +3928,7 @@ pub async fn trigger_run_from_event(
     // empty listing → nothing to run (not an error).
     let entries = match forge.list_dir_at_ref(repo, &git_ref, CONFIG_DIR).await {
         Ok(e) => e,
-        Err(scarab_forge::ForgeError::Api(_)) => return Ok(Vec::new()),
+        Err(scarab_forge::ForgeError::Api(_)) => return Ok(TriggerOutcome::default()),
         Err(e) => return Err(TriggerError::Forge(e)),
     };
     let mut paths: Vec<String> = entries
@@ -3855,7 +3939,7 @@ pub async fn trigger_run_from_event(
 
     let ctx = event.context();
     let kind = event.trigger_kind();
-    let mut runs = Vec::new();
+    let mut outcome = TriggerOutcome::default();
     for path in &paths {
         let bytes = match forge.read_file_at_ref(repo, &git_ref, path).await {
             Ok(b) => b,
@@ -3886,19 +3970,44 @@ pub async fn trigger_run_from_event(
             continue;
         }
 
-        // Fetch protection rules, reject a disallowed ref, admit privilege
-        // grants, and durably create the run — the shared admission primitive the
-        // dispatch path also rides (ADR-0037/0039). A ref the Environment
-        // disallows yields `None` here → skip this pipeline (a webhook trigger is
-        // silent; the dispatch path turns the same `None` into a fail-closed
-        // error). Webhook-triggered runs supply no launch parameters.
-        if let Some(run) =
-            admit_and_create_run(db, clock, environments, event, &ir, path, &excluded, None).await?
+        // Resolve governance, refuse what may not deploy, admit privilege
+        // grants, and durably create the run — the shared admission primitive
+        // the dispatch path also rides (ADR-0037/0039, ADR-0071). A refusal
+        // skips this pipeline only (the dispatch path turns the same refusal
+        // into a fail-closed error). Webhook-triggered runs supply no launch
+        // parameters.
+        match admit_and_create_run(db, clock, governance, event, &ir, path, &excluded, None).await?
         {
-            runs.push(run);
+            Admission::Created(run) => outcome.runs.push(run),
+            // A branch-scoped Environment ignoring every other branch is the
+            // rule working, not news: silent, as it always was.
+            Admission::Refused(AdmissionRefusal::RefNotAllowed) => {}
+            // ADR-0071 §2, §10: an Environment that does not exist or does not
+            // admit this Project is a configuration gap an operator must see.
+            // Logged AND returned: the delivery body is where a forge's
+            // "recent deliveries" view shows it, and for a name the migration
+            // could not see (never run before ADR-0071) it is the first sign.
+            Admission::Refused(
+                ref refusal @ (AdmissionRefusal::UnknownEnvironment { ref environment }
+                | AdmissionRefusal::NotEligible { ref environment }),
+            ) => {
+                let reason = admission_refusal_message(refusal, &repo.owner, &repo.name);
+                tracing::warn!(
+                    org = %repo.owner,
+                    project = %repo.name,
+                    pipeline = %path,
+                    trigger = event.trigger_kind().as_str(),
+                    "deploy pipeline not run: {reason}"
+                );
+                outcome.refused.push(RefusedPipeline {
+                    pipeline: path.clone(),
+                    environment: environment.clone(),
+                    reason,
+                });
+            }
         }
     }
-    Ok(runs)
+    Ok(outcome)
 }
 
 /// Pre-fetch a pipeline's transitive `invoke:` library sources at `read_ref`
@@ -3945,41 +4054,110 @@ async fn prefetch_libs_and_compile(
     Ok(ir)
 }
 
+/// Why admission refused to create a Deploy Run. Every refusal is decided
+/// **before** the Run is persisted, so a refused Run never launches a Pod or
+/// resolves a secret (ADR-0071 §2: eligibility is checked at Run creation).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AdmissionRefusal {
+    /// The event's symbolic ref is not allowed by the effective allowed refs
+    /// (ADR-0037), or it has none and some layer restricts refs.
+    RefNotAllowed,
+    /// The pipeline names an Environment its Org does not have. Before
+    /// ADR-0071 such a name deployed with no rules at all; §10 ends that
+    /// coexistence — the migration created an Environment for every name it
+    /// could see, so this is a name no Run had used before.
+    UnknownEnvironment { environment: String },
+    /// The Environment exists but its EnvironmentProjectEligibility does not
+    /// admit this Project (ADR-0071 §2).
+    NotEligible { environment: String },
+}
+
+/// The outcome of admitting one compiled pipeline (ADR-0037, ADR-0071 §2):
+/// the Run created, or why not. A missing `require_reason` reason is an
+/// error rather than a refusal — an answerable request, surfaced like a
+/// missing approval (ADR-0057 §3).
+#[derive(Debug)]
+enum Admission {
+    Created(RunId),
+    Refused(AdmissionRefusal),
+}
+
 /// Governance resolved once for a run from its `environment:` reference
-/// (ADR-0037/0039), so `ir.environment` is unpacked a single time and every
-/// downstream admission/persistence site reads intent instead of re-deriving it.
+/// (ADR-0037/0039, ADR-0071), so `ir.environment` is unpacked a single time and
+/// every downstream admission/persistence site reads intent instead of
+/// re-deriving it.
 ///
 /// The variant is the **deploy vs ordinary-CI** discriminator: targeting an
 /// Environment makes a run a deploy (opts out of newest-wins auto-cancel,
-/// ADR-0032, and records a deploy context). Whether that Environment is actually
-/// *defined* is the nested `protection` — an environment referenced but undefined
-/// (or with the store unwired) is still a deploy, just permissive on refs and
-/// fail-closed on grants. Keeping these two axes distinct preserves the existing
-/// behavior, where deploy-ness keys on the *reference* and ref/grant enforcement
-/// keys on the *resolved rules*.
+/// ADR-0032, and records a deploy context). What governs the deploy is the
+/// nested [`GovernedRules`].
+// Built once per admitted pipeline and dropped with it, never held in bulk,
+// so the size gap between the variants costs nothing worth a Box.
+#[allow(clippy::large_enum_variant)]
 enum RunGovernance {
     /// No `environment:` referenced: an ordinary CI run. Permissive on refs,
     /// fail-closed on governed grants, eligible for auto-cancel.
     Ungoverned,
-    /// The pipeline targets an Environment — a deploy. `protection` is `Some`
-    /// only when that Environment is defined and the store is wired.
+    /// The pipeline targets an Environment — a deploy — that admitted this
+    /// Project.
     Governed {
         environment: String,
         /// A fork PR locked out of this environment's secrets is also locked out
         /// of its governed privilege grants (ADR-0039).
         locked_out: bool,
-        protection: Option<scarab_project::ProtectionRules>,
+        rules: GovernedRules,
     },
 }
 
+/// What a Deploy Run is governed by.
+enum GovernedRules {
+    /// No governance store is wired. Only a hand-built `AppState` (a test,
+    /// or the inline dev stack) can be in this state — `main.rs` always wires
+    /// the Postgres store. It decides exactly as an environment that was
+    /// referenced but undefined did before ADR-0071: any ref, no reason
+    /// check, no governed grants and no raw overlay.
+    Unwired,
+    /// The Environment's baseline merged with this Project's overlay
+    /// (ADR-0071 §3), and the Project's own privilege grant there (§8 —
+    /// never merged with anything).
+    Resolved {
+        protection: scarab_project::EffectiveProtection,
+        privilege_grant: Option<scarab_project::EnvironmentProjectPrivilegeGrant>,
+    },
+}
+
+/// The privilege grant a step's request is decided against (ADR-0039,
+/// ADR-0071 §8): `None` when the run targets no Environment that can grant
+/// anything (ordinary CI, an inline API run, the unwired legacy path) —
+/// governed grants then "require a target Environment" — and `Some(grant)`
+/// when it does, `grant` being the Project's grant there, if it holds one.
+type PrivilegeGrantScope<'a> = Option<Option<&'a scarab_project::EnvironmentProjectPrivilegeGrant>>;
+
 impl RunGovernance {
-    /// The resolved protection rules, if the target Environment is defined. `None`
-    /// for an ordinary run *and* for a referenced-but-undefined environment —
-    /// both are permissive on refs and fail-closed on governed grants.
-    fn protection(&self) -> Option<&scarab_project::ProtectionRules> {
+    /// The effective protection rules, when an Environment resolved them.
+    /// `None` for an ordinary run and for the unwired legacy path — both
+    /// permissive on refs.
+    fn protection(&self) -> Option<&scarab_project::EffectiveProtection> {
         match self {
-            RunGovernance::Governed { protection, .. } => protection.as_ref(),
-            RunGovernance::Ungoverned => None,
+            RunGovernance::Governed {
+                rules: GovernedRules::Resolved { protection, .. },
+                ..
+            } => Some(protection),
+            _ => None,
+        }
+    }
+
+    /// Where this run's step privileges are decided ([`PrivilegeGrantScope`]).
+    fn privilege_grant_scope(&self) -> PrivilegeGrantScope<'_> {
+        match self {
+            RunGovernance::Governed {
+                rules:
+                    GovernedRules::Resolved {
+                        privilege_grant, ..
+                    },
+                ..
+            } => Some(privilege_grant.as_ref()),
+            _ => None,
         }
     }
 
@@ -3996,41 +4174,79 @@ impl RunGovernance {
     }
 }
 
-/// Resolve a run's [`RunGovernance`] from the pipeline's `environment:` reference.
-/// Fetches the target Environment's protection rules once (ADR-0037/0039); an
-/// environment referenced but undefined — or referenced with the store unwired —
-/// resolves to `Governed { protection: None }`: still a deploy, permissive on
-/// refs, fail-closed on grants.
+/// A governance store failure: the store is down or holds a row this binary
+/// cannot read. A 500, never a silent "no rules" — that would be fail-open.
+fn governance_store_err(e: scarab_project::OrgEnvironmentError) -> TriggerError {
+    TriggerError::Db(DbError::Other(format!("environment governance store: {e}")))
+}
+
+/// Resolve a run's [`RunGovernance`] from the pipeline's `environment:`
+/// reference — or the reason it may not deploy at all — reading the
+/// Environment, the Project's eligibility, overlay and privilege grant in one
+/// consistent read ([`EnvironmentGovernanceStore::deploy_governance`]).
+///
+/// **Fail-closed** (ADR-0071 §2, §10): a name the Org has no Environment for
+/// is [`AdmissionRefusal::UnknownEnvironment`], and an Environment that does
+/// not admit this Project is [`AdmissionRefusal::NotEligible`] — both before
+/// anything is persisted. Only an unwired store ([`GovernedRules::Unwired`])
+/// keeps the pre-ADR-0071 permissive reading.
+///
+/// **Tripwire — admission never reads `owner_projects`.** Eligibility is the
+/// Environment's own record, set by its admin. A DeploymentTarget's
+/// `owner_projects` (DeploymentTargetProjectOwnership, ADR-0071 §4) is
+/// *reported by a plugin* and mirrored for display and for Deployment
+/// requests; it is whoever can write the gitops source, and a deploy Step can
+/// write it into its own commit. Reading it here would let a plugin's report
+/// (or a pipeline's own commit) decide which Projects may deploy. Nothing in
+/// this function, or anything it calls, may consult it.
+///
+/// [`EnvironmentGovernanceStore::deploy_governance`]: scarab_project::EnvironmentGovernanceStore::deploy_governance
 async fn resolve_governance(
-    environments: Option<&dyn scarab_project::EnvironmentStore>,
+    store: Option<&dyn scarab_project::EnvironmentGovernanceStore>,
     event: &scarab_forge::Event,
     ir: &scarab_pipeline::PipelineIr,
     repo: &scarab_forge::RepoRef,
-) -> Result<RunGovernance, TriggerError> {
+) -> Result<Result<RunGovernance, AdmissionRefusal>, TriggerError> {
     let Some(env_name) = &ir.environment else {
-        return Ok(RunGovernance::Ungoverned);
+        return Ok(Ok(RunGovernance::Ungoverned));
     };
-    let protection = match environments {
-        Some(store) => store
-            .get_environment(&repo.owner, &repo.name, env_name)
-            .await
-            .map_err(|e| TriggerError::Pipeline(e.to_string()))?
-            .map(|e| e.protection),
-        None => None,
+    let rules = match store {
+        None => GovernedRules::Unwired,
+        Some(store) => {
+            let Some(governance) = store
+                .deploy_governance(&repo.owner, &repo.name, env_name)
+                .await
+                .map_err(governance_store_err)?
+            else {
+                return Ok(Err(AdmissionRefusal::UnknownEnvironment {
+                    environment: env_name.clone(),
+                }));
+            };
+            if !governance.eligible {
+                return Ok(Err(AdmissionRefusal::NotEligible {
+                    environment: env_name.clone(),
+                }));
+            }
+            GovernedRules::Resolved {
+                protection: governance.effective_protection(),
+                privilege_grant: governance.privilege_grant,
+            }
+        }
     };
-    Ok(RunGovernance::Governed {
+    Ok(Ok(RunGovernance::Governed {
         environment: env_name.clone(),
         locked_out: fork_policy(event, env_name).secrets_locked_out,
-        protection,
-    })
+        rules,
+    }))
 }
 
-/// Fetch the target Environment's protection rules, enforce allowed-refs
-/// fail-closed, admit per-step privilege grants, and durably create the run for
-/// a single compiled pipeline — the admission primitive shared by the webhook
-/// trigger path and [`dispatch_run`]. Returns `Ok(None)` when the Environment
-/// disallows the event's ref (the caller decides whether that is a silent skip
-/// or a hard error), `Ok(Some(run))` on success.
+/// Resolve the target Environment's governance, refuse an unknown
+/// Environment, an ineligible Project or a disallowed ref, enforce
+/// `require_reason`, admit per-step privilege grants, and durably create the
+/// run for a single compiled pipeline — the admission primitive shared by the
+/// webhook trigger path and [`dispatch_run`]. A refusal is
+/// [`Admission::Refused`] (the caller decides whether it is a warned skip or
+/// a hard error); nothing is persisted for it.
 ///
 /// A dispatch is a *trigger, never authority* (ADR-0043 §6): it rides the exact
 /// same Environment protection (approvers, wait timer, allowed-refs, concurrency)
@@ -4040,36 +4256,36 @@ async fn resolve_governance(
 async fn admit_and_create_run(
     db: &dyn Db,
     clock: &dyn Clock,
-    environments: Option<&dyn scarab_project::EnvironmentStore>,
+    governance: Option<&dyn scarab_project::EnvironmentGovernanceStore>,
     event: &scarab_forge::Event,
     ir: &scarab_pipeline::PipelineIr,
     path: &str,
     excluded: &[String],
     params: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
-) -> Result<Option<RunId>, TriggerError> {
+) -> Result<Admission, TriggerError> {
     // Both callers pass a repo-aware event (webhook events carry a repo; dispatch
     // builds a repo+ref Manual/Api event, ADR-0043).
     let repo = event
         .repo()
         .ok_or_else(|| TriggerError::Pipeline("event carries no repository".into()))?;
 
-    // ADR-0037/0039: resolve the run's governance once (a deploy pipeline targets
-    // an Environment; an ordinary CI run does not). Used to reject a disallowed
-    // ref at creation (ADR-0037 — enforced even without an approver gate) and to
-    // admit per-step privilege grants (ADR-0039).
-    let gov = resolve_governance(environments, event, ir, repo).await?;
+    // ADR-0037/0039, ADR-0071: resolve the run's governance once (a deploy
+    // pipeline targets an Environment; an ordinary CI run does not) — refusing
+    // an unknown Environment or an ineligible Project outright. Then reject a
+    // disallowed ref at creation (enforced even without an approver gate) and
+    // admit per-step privilege grants against the Project's grant.
+    let gov = match resolve_governance(governance, event, ir, repo).await? {
+        Ok(gov) => gov,
+        Err(refusal) => return Ok(Admission::Refused(refusal)),
+    };
     if let Some(p) = gov.protection() {
         // ADR-0037: match allowed_refs against the *symbolic* branch/tag ref
         // (`refs/heads/main`, `refs/tags/*`, …), NOT the immutable commit the
         // config is read at (`git_ref` above is a SHA for push/dispatch). An event
-        // with no symbolic ref (cron/comment/upstream) is admitted only by an
-        // unrestricted environment — fail-closed.
-        let admitted = match event.protection_ref() {
-            Some(r) => p.ref_allowed(&r),
-            None => p.allowed_refs.is_empty(),
-        };
-        if !admitted {
-            return Ok(None);
+        // with no symbolic ref (cron/comment/upstream) is admitted only where no
+        // layer restricts refs — fail-closed.
+        if !p.admits_protection_ref(event.protection_ref().as_deref()) {
+            return Ok(Admission::Refused(AdmissionRefusal::RefNotAllowed));
         }
 
         // ADR-0057 §3: a `require_reason` environment blocks a reasonless human
@@ -4077,8 +4293,8 @@ async fn admit_and_create_run(
         // allowed_refs/approvers. `trigger_title()` is `None` exactly when a
         // manual/api dispatch carried no non-blank reason (slice C's canonical
         // empty-reason signal); push/PR/tag/release/cron/upstream are exempt via
-        // `is_human_dispatch == false`. Unlike a disallowed ref (a silent `None`
-        // skip for the webhook path), a missing reason is an answerable request —
+        // `is_human_dispatch == false`. Unlike a disallowed ref (a refusal the
+        // webhook path skips), a missing reason is an answerable request —
         // surface it fail-closed with a clear diagnostic (like a missing approval).
         let is_human_dispatch = matches!(
             event.trigger_kind(),
@@ -4099,7 +4315,7 @@ async fn admit_and_create_run(
     if let Some(params) = params {
         db.set_run_params(&run, params).await?;
     }
-    Ok(Some(run))
+    Ok(Admission::Created(run))
 }
 
 /// Which trigger a dispatch opts into: a human [`Manual`](DispatchKind::Manual)
@@ -4188,8 +4404,55 @@ pub enum DispatchError {
     /// environment applies, fail-closed. Surfaces the violation to the dispatcher.
     #[error("{0}")]
     ReasonRequired(String),
+    /// The pipeline names an Environment its Org does not have (ADR-0071
+    /// §10) — fail-closed; the message says who can fix it.
+    #[error("{}", unknown_environment_message(.org, .project, .environment))]
+    UnknownEnvironment {
+        org: String,
+        project: String,
+        environment: String,
+    },
+    /// The Environment does not admit this Project (ADR-0071 §2) —
+    /// fail-closed; the message says who can fix it.
+    #[error("{}", not_eligible_message(.org, .project, .environment))]
+    NotEligible {
+        org: String,
+        project: String,
+        environment: String,
+    },
     #[error(transparent)]
     Db(DbError),
+}
+
+/// The actionable text for an eligibility refusal (ADR-0071 §2, §10): what
+/// is missing and who can fix it — an org admin, since only an
+/// Environment's admin may change who deploys into it (§7).
+fn admission_refusal_message(refusal: &AdmissionRefusal, org: &str, project: &str) -> String {
+    match refusal {
+        AdmissionRefusal::UnknownEnvironment { environment } => {
+            unknown_environment_message(org, project, environment)
+        }
+        AdmissionRefusal::NotEligible { environment } => {
+            not_eligible_message(org, project, environment)
+        }
+        AdmissionRefusal::RefNotAllowed => {
+            "the ref is not allowed to deploy to this environment".to_string()
+        }
+    }
+}
+
+fn unknown_environment_message(org: &str, project: &str, environment: &str) -> String {
+    format!(
+        "environment `{environment}` does not exist in org `{org}`: an org admin must create \
+         it and make `{project}` eligible for `{environment}` (ADR-0071)"
+    )
+}
+
+fn not_eligible_message(org: &str, project: &str, environment: &str) -> String {
+    format!(
+        "project `{project}` may not deploy to environment `{environment}` in org `{org}`: an \
+         org admin must make `{project}` eligible for `{environment}` (ADR-0071)"
+    )
 }
 
 impl From<TriggerError> for DispatchError {
@@ -4289,7 +4552,7 @@ pub async fn dispatch_run(
     forge: &dyn scarab_forge::ForgePort,
     db: &dyn Db,
     clock: &dyn Clock,
-    environments: Option<&dyn scarab_project::EnvironmentStore>,
+    governance: Option<&dyn scarab_project::EnvironmentGovernanceStore>,
     actor: String,
     repo: scarab_forge::RepoRef,
     r#ref: String,
@@ -4351,14 +4614,14 @@ pub async fn dispatch_run(
     let excluded = scarab_pipeline::excluded_steps(&ir, &ctx)
         .map_err(|e| DispatchError::Pipeline(e.to_string()))?;
 
-    // Create the run through the shared admission path (Environment protection,
-    // privilege admission), freezing the resolved params. A ref the Environment
-    // disallows comes back as `None` → a fail-closed error here (the webhook path
-    // skips silently; a dispatch is an explicit, answerable request).
-    match admit_and_create_run(
+    // Create the run through the shared admission path (Environment
+    // eligibility and protection, privilege admission), freezing the resolved
+    // params. A refusal is a fail-closed error here (the webhook path skips the
+    // pipeline; a dispatch is an explicit, answerable request).
+    let refusal = match admit_and_create_run(
         db,
         clock,
-        environments,
+        governance,
         &event,
         &ir,
         &path,
@@ -4367,13 +4630,29 @@ pub async fn dispatch_run(
     )
     .await?
     {
-        Some(run) => Ok(run),
+        Admission::Created(run) => return Ok(run),
+        Admission::Refused(refusal) => refusal,
+    };
+    let repo = event
+        .repo()
+        .expect("a dispatch event always carries its repository");
+    Err(match refusal {
         // Report the symbolic ref the launcher named (what allowed_refs is matched
         // against), not the opaque resolved commit.
-        None => Err(DispatchError::RefNotAllowed(
+        AdmissionRefusal::RefNotAllowed => DispatchError::RefNotAllowed(
             event.protection_ref().unwrap_or_else(|| config_ref(&event)),
-        )),
-    }
+        ),
+        AdmissionRefusal::UnknownEnvironment { environment } => DispatchError::UnknownEnvironment {
+            org: repo.owner.clone(),
+            project: repo.name.clone(),
+            environment,
+        },
+        AdmissionRefusal::NotEligible { environment } => DispatchError::NotEligible {
+            org: repo.owner.clone(),
+            project: repo.name.clone(),
+            environment,
+        },
+    })
 }
 
 /// Admit a step's privilege request (ADR-0039) against the run's target
@@ -4381,13 +4660,17 @@ pub async fn dispatch_run(
 /// or the violations (which must reject the run — never downgrade).
 ///
 /// - No request (or a baseline one) → the restricted baseline (no grants).
-/// - With an Environment → delegate to [`ProtectionRules::admit_grants`] (digest
-///   whitelist, fork-lockout, capability bounds).
+/// - With an Environment → the Project's privilege grant there decides
+///   ([`EnvironmentProjectPrivilegeGrant::admit_grants`]: digest whitelist,
+///   fork-lockout, capability bounds); no grant decides as an empty whitelist
+///   (ADR-0071 §8).
 /// - Without an Environment → governed grants (`add-capabilities`/`privileged`)
 ///   are impossible ("privileged requires an Environment"); self-service
 ///   `run-as-root` is still allowed (it cannot escape the sandbox).
+///
+/// [`EnvironmentProjectPrivilegeGrant::admit_grants`]: scarab_project::EnvironmentProjectPrivilegeGrant::admit_grants
 fn admit_step_grants(
-    protection: Option<&scarab_project::ProtectionRules>,
+    grant_scope: PrivilegeGrantScope<'_>,
     security: Option<&scarab_pipeline::StepSecurity>,
     image: &str,
     locked_out: bool,
@@ -4400,8 +4683,10 @@ fn admit_step_grants(
         add_capabilities: sec.add_capabilities.clone(),
         privileged: sec.privileged,
     };
-    match protection {
-        Some(p) => p.admit_grants(&req, image, locked_out),
+    match grant_scope {
+        Some(grant) => scarab_project::EnvironmentProjectPrivilegeGrant::admit_grants(
+            grant, &req, image, locked_out,
+        ),
         None if req.privileged || !req.add_capabilities.is_empty() => Err(vec![
             "governed grants (add-capabilities/privileged) require a target Environment"
                 .to_string(),
@@ -4415,10 +4700,11 @@ fn admit_step_grants(
 
 /// Admit a step's raw `k8s_overlay` (ADR-0055) against the target Environment.
 /// A raw overlay carries no authority — mirroring a governed grant
-/// ([`admit_step_grants`]), it is honored only under an Environment whose
-/// `permit_k8s_overlay` is set, else the run is rejected **fail-closed**. An
-/// inline API run (no Environment) therefore never gets one. Returns the overlay
-/// to persist (or `None`).
+/// ([`admit_step_grants`]), it is honored only where the Project's privilege
+/// grant in the target Environment sets `permit_k8s_overlay` (ADR-0071 §8),
+/// else the run is rejected **fail-closed**. An inline API run (no
+/// Environment) therefore never gets one. Returns the overlay to persist (or
+/// `None`).
 /// Translate an authored `cache:` (ADR-0065 s1) into the launch spec's
 /// [`scarab_engine::CacheConfig`]. Only the authored halves cross here —
 /// `key`/`restore` are launch-time enrichment the scheduler owns.
@@ -4432,19 +4718,24 @@ fn cache_config(step: &scarab_pipeline::StepSpec) -> Option<scarab_engine::Cache
 }
 
 fn admit_k8s_overlay(
-    protection: Option<&scarab_project::ProtectionRules>,
+    grant_scope: PrivilegeGrantScope<'_>,
     overlay: Option<&serde_json::Value>,
 ) -> Result<Option<serde_json::Value>, Vec<String>> {
     match overlay {
         None => Ok(None),
-        Some(o) => match protection {
-            Some(p) if p.permit_k8s_overlay => Ok(Some(o.clone())),
-            _ => Err(vec![
-                "raw `k8s_overlay` requires a target Environment that permits raw overlays \
-                 (set `permit_k8s_overlay` on the environment)"
-                    .to_string(),
-            ]),
-        },
+        Some(o)
+            if scarab_project::EnvironmentProjectPrivilegeGrant::permits_k8s_overlay(
+                grant_scope.flatten(),
+            ) =>
+        {
+            Ok(Some(o.clone()))
+        }
+        Some(_) => Err(vec![
+            "raw `k8s_overlay` requires a target Environment that permits raw overlays for \
+             this project (an org admin sets `permit_k8s_overlay` in the project's privilege \
+             grant there)"
+                .to_string(),
+        ]),
     }
 }
 
@@ -4675,10 +4966,13 @@ async fn persist_run_from_ir(
                 artifacts: vec![],
                 placement_profiles: step.placement_profiles.clone(),
                 resources: step.resources.clone(),
-                k8s_overlay: admit_k8s_overlay(gov.protection(), step.k8s_overlay.as_ref())
-                    .map_err(|v| {
-                        TriggerError::Pipeline(format!("step `{}`: {}", step.id, v.join("; ")))
-                    })?,
+                k8s_overlay: admit_k8s_overlay(
+                    gov.privilege_grant_scope(),
+                    step.k8s_overlay.as_ref(),
+                )
+                .map_err(|v| {
+                    TriggerError::Pipeline(format!("step `{}`: {}", step.id, v.join("; ")))
+                })?,
                 oidc_token: None,
                 // A clone step runs the canonical scarab-clone image; validation
                 // forbids `services` on it, so this is always empty.
@@ -4690,11 +4984,12 @@ async fn persist_run_from_ir(
             db.create_step_run(run, &step_id, Some(&spec), &needs, now)
                 .await?;
         } else {
-            // ADR-0039: admit the step's privilege request against the target
-            // Environment's whitelist, fail-closed. A rejected request aborts the
+            // ADR-0039: admit the step's privilege request against the
+            // Project's privilege grant in the target Environment (ADR-0071
+            // §8), fail-closed. A rejected request aborts the
             // whole run creation with a diagnostic — never a silent downgrade.
             let admitted = admit_step_grants(
-                gov.protection(),
+                gov.privilege_grant_scope(),
                 step.security.as_ref(),
                 &step.image,
                 locked_out,
@@ -4752,10 +5047,13 @@ async fn persist_run_from_ir(
                 artifacts: step.artifacts.clone(),
                 placement_profiles: step.placement_profiles.clone(),
                 resources: step.resources.clone(),
-                k8s_overlay: admit_k8s_overlay(gov.protection(), step.k8s_overlay.as_ref())
-                    .map_err(|v| {
-                        TriggerError::Pipeline(format!("step `{}`: {}", step.id, v.join("; ")))
-                    })?,
+                k8s_overlay: admit_k8s_overlay(
+                    gov.privilege_grant_scope(),
+                    step.k8s_overlay.as_ref(),
+                )
+                .map_err(|v| {
+                    TriggerError::Pipeline(format!("step `{}`: {}", step.id, v.join("; ")))
+                })?,
                 oidc_token: None,
                 // Sidecar services (ADR-0058) co-locate in this executed step's Pod.
                 services: step.services.clone(),
@@ -4953,25 +5251,38 @@ async fn ingest_event(
             Json(serde_json::json!({ "ignored": "no forge configured" })),
         ));
     };
-    match trigger_run_from_event(
+    match trigger_runs_from_event(
         forge.as_ref(),
         st.db.as_ref(),
         st.clock.as_ref(),
-        st.environments.as_deref(),
+        st.environment_governance.as_deref(),
         &event,
     )
     .await
     {
-        Ok(runs) if !runs.is_empty() => {
-            let run_ids: Vec<&str> = runs.iter().map(|r| r.0.as_str()).collect();
-            Ok((
-                StatusCode::ACCEPTED,
-                Json(serde_json::json!({
-                    "run_ids": run_ids,
-                    "trigger": event.trigger_kind(),
-                })),
-            ))
+        // ADR-0071 §2: every deploy pipeline the Environment refused is named
+        // in the body as `refused: [{pipeline, environment, reason}]` — beside
+        // the runs that did start, or alone (200: nothing was accepted, but
+        // "no matching pipeline" would misdescribe a pipeline that matched
+        // and was refused).
+        Ok(outcome) if !outcome.runs.is_empty() => {
+            let run_ids: Vec<&str> = outcome.runs.iter().map(|r| r.0.as_str()).collect();
+            let mut body = serde_json::json!({
+                "run_ids": run_ids,
+                "trigger": event.trigger_kind(),
+            });
+            if !outcome.refused.is_empty() {
+                body["refused"] = serde_json::json!(outcome.refused);
+            }
+            Ok((StatusCode::ACCEPTED, Json(body)))
         }
+        Ok(outcome) if !outcome.refused.is_empty() => Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "refused": outcome.refused,
+                "trigger": event.trigger_kind(),
+            })),
+        )),
         Ok(_) => Ok((
             StatusCode::OK,
             Json(serde_json::json!({ "ignored": "no matching pipeline" })),
@@ -6601,8 +6912,10 @@ fn gate_approvers(events: &[EventKind], step: &StepId) -> Vec<String> {
 /// Approve a `manual` gate (ADR-0008, 0037). The authenticated principal's
 /// approval is recorded on the event log (append-only, idempotent). For a
 /// **deploy** run (one with a target environment), the gate is released only
-/// once the accumulated approvers satisfy the environment's protection rules
-/// (`admits`); on release the deployment is written to history. A plain gate (no
+/// once the accumulated approvers satisfy the Environment's effective rules for
+/// the run's Project (ADR-0071 §3, `admits`); on release the deployment is
+/// written to the legacy history. If the Environment no longer exists or no
+/// longer admits the Project, the gate does not release (409). A plain gate (no
 /// environment) releases on the first approval. Authz'd as a write.
 #[utoipa::path(
     post,
@@ -6613,7 +6926,8 @@ fn gate_approvers(events: &[EventKind], step: &StepId) -> Vec<String> {
     ),
     responses(
         (status = 202, description = "approval recorded (released or awaiting more approvals)"),
-        (status = 404, description = "no such run or gate")
+        (status = 404, description = "no such run or gate"),
+        (status = 409, description = "not an approvable gate, or the run's Environment no longer exists or no longer admits its project")
     )
 )]
 async fn approve_gate(
@@ -6668,22 +6982,26 @@ async fn approve_gate(
             .into_response());
     }
 
-    // 2. Gather the accumulated approvers and the governing environment's rules.
+    // 2. Gather the accumulated approvers and the governing Environment's
+    //    effective rules for this Project (ADR-0071 §3), resolved NOW rather
+    //    than at Run creation: an admin's change since — tightened rules, a
+    //    withdrawn eligibility, a deleted Environment — governs the release.
     let approvers = gate_approvers(&st.db.events(&run).await.map_err(ApiError::Db)?, &step);
     let ctx = st.db.run_deploy_context(&run).await.map_err(ApiError::Db)?;
-    let rules = match (&ctx, st.environments.as_ref()) {
-        (Some(c), Some(store)) => store
-            .get_environment(&c.org, &c.project, &c.environment)
-            .await
-            .map_err(|e| ApiError::BadRequest(e.to_string()))?
-            .map(|e| e.protection),
-        _ => None,
-    };
+    // The approval above stays recorded when the gate is held; it counts if
+    // the Environment is restored.
+    let protection = gate_release_governance(
+        &st,
+        ctx.as_ref(),
+        "approval recorded, but the gate cannot release",
+    )
+    .await?;
 
     // 3. A protected deploy releases only when admits() passes over the
-    //    accumulated approvers; an unprotected/plain gate releases now.
-    let admitted = match (&ctx, &rules) {
-        (Some(c), Some(r)) => r.admits(&c.git_ref, &approvers).is_ok(),
+    //    accumulated approvers (every required approver, and the ref still
+    //    allowed); an unprotected/plain gate releases now.
+    let admitted = match (&ctx, &protection) {
+        (Some(c), Some(p)) => p.admits(&c.git_ref, &approvers).is_ok(),
         _ => true,
     };
     if !admitted {
@@ -6719,8 +7037,10 @@ async fn approve_gate(
         .iter()
         .any(|s| s.step == step && s.status == StepStatus::Succeeded);
 
-    // 5. Record the deployment in history (ADR-0024, 0037) — only on a real
-    //    release (a no-op re-release writes no duplicate history record).
+    // 5. Record the deployment in the legacy approval history (ADR-0024, 0037,
+    //    ADR-0070 §1) — only on a real release (a no-op re-release writes no
+    //    duplicate history record). Kept through ADR-0071: it is the record
+    //    `GET …/environments/{name}/deployments` still serves.
     if released {
         if let (Some(c), Some(store)) = (&ctx, st.environments.as_ref()) {
             let now = st.clock.now().await.0;
@@ -6746,6 +7066,45 @@ async fn approve_gate(
         .into_response())
 }
 
+/// The governing Environment's effective rules for releasing a Deploy Run's
+/// gate, resolved NOW (ADR-0071 §2-3) — shared by every path that releases a
+/// gate by request (`approve_gate`, `release_gate_external`) so neither can
+/// drift into "no rules, release".
+///
+/// Fail-closed: a gate is the last point before the deploy proceeds, so an
+/// Environment that no longer exists, or no longer admits this Project, holds
+/// it with a 409 whose message starts with `held`. `Ok(None)` = a plain gate
+/// (no deploy context) or a hand-built state with no governance store, which
+/// releases as it always did.
+///
+/// Timer gates release inside the engine with no request to hold; they are
+/// covered by the launch re-check instead (`SecretInjectingExecutor`): the
+/// first step after the gate is refused at launch and fails `Config`.
+async fn gate_release_governance(
+    st: &AppState,
+    ctx: Option<&scarab_engine::DeployContext>,
+    held: &str,
+) -> Result<Option<scarab_project::EffectiveProtection>, ApiError> {
+    let (Some(c), Some(store)) = (ctx, st.environment_governance.as_ref()) else {
+        return Ok(None);
+    };
+    let governance = store
+        .deploy_governance(&c.org, &c.project, &c.environment)
+        .await
+        .map_err(org_environments::org_environment_api_error)?;
+    match governance {
+        None => Err(ApiError::Conflict(format!(
+            "{held}: {}",
+            unknown_environment_message(&c.org, &c.project, &c.environment)
+        ))),
+        Some(g) if !g.eligible => Err(ApiError::Conflict(format!(
+            "{held}: {}",
+            not_eligible_message(&c.org, &c.project, &c.environment)
+        ))),
+        Some(g) => Ok(Some(g.effective_protection())),
+    }
+}
+
 /// HTTP header carrying an external-gate release token (`sha256=<hex>`).
 const GATE_TOKEN_HEADER: &str = "x-scarab-gate-token";
 
@@ -6754,7 +7113,10 @@ const GATE_TOKEN_HEADER: &str = "x-scarab-gate-token";
 /// interactive approval. The token is `HMAC-SHA256(secret, "{run}:{step}")`
 /// (`sha256=<hex>`), verified in constant time; no per-gate storage. The endpoint
 /// is 404 when no token secret is configured, and only releases gates of kind
-/// `external` (manual gates stay approval-only).
+/// `external` (manual gates stay approval-only). In a Deploy Run, the gate is
+/// held (409) when the run's Environment no longer exists or no longer admits
+/// its Project (ADR-0071 §2) — the same check `approve_gate` makes. The token
+/// proves who is releasing, not that the deploy is still allowed.
 #[utoipa::path(
     post,
     path = "/v1/runs/{id}/gates/{step}/release",
@@ -6765,7 +7127,8 @@ const GATE_TOKEN_HEADER: &str = "x-scarab-gate-token";
     responses(
         (status = 202, description = "gate released"),
         (status = 401, description = "bad or missing token"),
-        (status = 404, description = "no such external gate, or token release disabled")
+        (status = 404, description = "no such external gate, or token release disabled"),
+        (status = 409, description = "the gate is not pending, or the run's Environment no longer exists or no longer admits its project")
     )
 )]
 async fn release_gate_external(
@@ -6796,6 +7159,13 @@ async fn release_gate_external(
     let token = headers.get(GATE_TOKEN_HEADER).and_then(|v| v.to_str().ok());
     scarab_forge_github::verify_signature(secret, message.as_bytes(), token)
         .map_err(|_| ApiError::Unauthorized)?;
+
+    // Only after the token verifies: an unauthenticated caller learns nothing
+    // about the Environment. The rules themselves are not evaluated — the
+    // token IS this gate's approval (ADR-0034) — only whether the deploy may
+    // still proceed at all.
+    let ctx = st.db.run_deploy_context(&run).await?;
+    gate_release_governance(&st, ctx.as_ref(), "the gate cannot release").await?;
 
     match scarab_engine::release_gate(st.db.as_ref(), st.clock.as_ref(), &run, &step).await {
         Ok(()) => Ok(StatusCode::ACCEPTED),
@@ -6926,9 +7296,9 @@ fn secret_scope(
     match (repo, environment) {
         (None, None) => Ok(scarab_secrets::SecretScope::Org { org }),
         (Some(repo), None) => Ok(scarab_secrets::SecretScope::Repo { org, repo }),
-        (Some(repo), Some(environment)) => Ok(scarab_secrets::SecretScope::Environment {
+        (Some(repo), Some(environment)) => Ok(scarab_secrets::SecretScope::EnvironmentProject {
             org,
-            repo,
+            project: repo,
             environment,
         }),
         (None, Some(_)) => Err(ApiError::BadRequest(
@@ -7043,97 +7413,90 @@ async fn delete_secret(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Create/replace a repo's protected environment (ADR-0024, 0037). Editing the
-/// deployment target's rules requires the Administer capability — so a pipeline
-/// author (Write) cannot grant themselves deploy access by changing the YAML.
-#[utoipa::path(put, path = "/v1/repos/{org}/{repo}/environments/{name}", summary = "Create/replace a protected environment (ADR-0024/0037)", responses((status = 200, description = "stored")))]
-async fn put_environment(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Path((org, repo, name)): Path<(String, String, String)>,
-    Json(mut protection): Json<scarab_project::ProtectionRules>,
-) -> Result<StatusCode, ApiError> {
-    let scope = rbac_scope(&org, Some(&repo));
-    authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
-    let store = st.environments.as_ref().ok_or(ApiError::NotFound)?;
-    // `secret_scope` and `oidc_subject` are canonical — fully determined by the
-    // environment's `(org, repo, name)` coordinate — and are re-derived at run
-    // time (secret resolution + OIDC minting). Stamp them server-side so the
-    // stored rules are authoritative and callers cannot inject a bogus scope.
-    protection.secret_scope = scarab_secrets::SecretScope::Environment {
-        org: org.clone(),
-        repo: repo.clone(),
-        environment: name.clone(),
-    };
-    protection.oidc_subject = format!("scarab:org/{org}/repo/{repo}/env/{name}");
-    // Approvers are matched by exact string against the approving Principal's
-    // id (`ProtectionRules::admits`), so each must name one (ADR-0069 §3).
-    let mut approvers = Vec::with_capacity(protection.approvers.len());
-    for a in &protection.approvers {
-        approvers.push(resolve_typed_subject(&st, a).await?);
-    }
-    protection.approvers = approvers;
-    let env = scarab_project::Environment {
-        name: name.clone(),
-        protection,
-    };
-    store
-        .put_environment(&org, &repo, &env)
-        .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    Ok(StatusCode::OK)
+/// Where the retired per-repo environment writes went (ADR-0071 §10). Said in
+/// the 410 body, so a script still calling them learns the replacement from
+/// the failure itself.
+fn per_repo_environment_writes_gone(org: &str, repo: &str, name: &str) -> ApiError {
+    ApiError::Gone(format!(
+        "per-repo environments were replaced by org-level Environments (ADR-0071): \
+         `{name}` is now the org Environment `/v1/orgs/{org}/environments/{name}`, \
+         administered by an org admin (who also decides, via \
+         `/v1/orgs/{org}/environments/{name}/eligibility`, whether `{repo}` may deploy there). \
+         `{repo}`'s own stricter rules are its project overlay, written at \
+         `PUT /v1/orgs/{org}/environments/{name}/projects/{repo}/overlay`; its \
+         privileges are an org admin's grant at \
+         `/v1/orgs/{org}/environments/{name}/projects/{repo}/privilege-grant`. \
+         Read all of it at `GET /v1/repos/{org}/{repo}/environments/{name}`"
+    ))
 }
 
-/// Fetch one environment's definition (rules). Read capability.
-#[utoipa::path(get, path = "/v1/repos/{org}/{repo}/environments/{name}", summary = "One environment's protection rules", responses((status = 200, description = "the environment"), (status = 404, description = "unknown")))]
+/// **Retired** (ADR-0071 §10): per-repo environments were migrated to org-level
+/// Environments — each repo's old rules became its tighten-only overlay — and
+/// this write would edit a table nothing reads any more. Always 410 with a
+/// pointer to the replacement.
+#[utoipa::path(put, path = "/v1/repos/{org}/{repo}/environments/{name}", params(("org" = String, Path, description = "repo owner"), ("repo" = String, Path, description = "repo name"), ("name" = String, Path, description = "Environment name")), summary = "Retired: per-repo environments are org-level Environments now (ADR-0071)", responses((status = 410, description = "gone; the body says where it went")))]
+async fn put_environment(
+    Path((org, repo, name)): Path<(String, String, String)>,
+) -> Result<StatusCode, ApiError> {
+    Err(per_repo_environment_writes_gone(&org, &repo, &name))
+}
+
+/// One Environment as this repo's Project sees it (ADR-0071): its baseline,
+/// the Project's overlay, the effective rules admission enforces, and the
+/// Project's privilege grant. 404 for an Environment that does not exist or
+/// that the Project has nothing to do with (not eligible, no overlay, no
+/// grant). Read capability.
+#[utoipa::path(get, path = "/v1/repos/{org}/{repo}/environments/{name}", params(("org" = String, Path, description = "repo owner"), ("repo" = String, Path, description = "repo name"), ("name" = String, Path, description = "Environment name")), summary = "One environment as this project sees it: baseline, overlay, effective (ADR-0071)", responses((status = 200, body = org_environments::ProjectEnvironmentDto), (status = 404, description = "unknown, or not this project's")))]
 async fn get_environment(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((org, repo, name)): Path<(String, String, String)>,
-) -> Result<Json<scarab_project::Environment>, ApiError> {
+) -> Result<Json<org_environments::ProjectEnvironmentDto>, ApiError> {
     let scope = rbac_scope(&org, Some(&repo));
     authorize_scoped(&st, &headers, Action::Read, Some(&scope)).await?;
-    let store = st.environments.as_ref().ok_or(ApiError::NotFound)?;
-    let env = store
-        .get_environment(&org, &repo, &name)
-        .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?
+    let store = st
+        .environment_governance
+        .as_ref()
         .ok_or(ApiError::NotFound)?;
-    Ok(Json(env))
+    let governance = store
+        .deploy_governance(&org, &repo, &name)
+        .await
+        .map_err(org_environments::org_environment_api_error)?
+        .filter(|g| g.eligible || g.overlay.is_some() || g.privilege_grant.is_some())
+        .ok_or(ApiError::NotFound)?;
+    Ok(Json((&governance).into()))
 }
 
-/// List a repo's environments. Read capability.
-#[utoipa::path(get, path = "/v1/repos/{org}/{repo}/environments", summary = "List a repo's environments", responses((status = 200, description = "the environments")))]
+/// The Environments this repo's Project may deploy into or holds an overlay
+/// or privilege grant in (ADR-0071), by name, each with its baseline,
+/// overlay and effective rules computed server-side. Read capability.
+#[utoipa::path(get, path = "/v1/repos/{org}/{repo}/environments", params(("org" = String, Path, description = "repo owner"), ("repo" = String, Path, description = "repo name")), summary = "The environments this project may deploy into, with baseline/overlay/effective rules (ADR-0071)", responses((status = 200, body = [org_environments::ProjectEnvironmentDto])))]
 async fn list_environments(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((org, repo)): Path<(String, String)>,
-) -> Result<Json<Vec<scarab_project::Environment>>, ApiError> {
+) -> Result<Json<Vec<org_environments::ProjectEnvironmentDto>>, ApiError> {
     let scope = rbac_scope(&org, Some(&repo));
     authorize_scoped(&st, &headers, Action::Read, Some(&scope)).await?;
-    let store = st.environments.as_ref().ok_or(ApiError::NotFound)?;
-    let envs = store
-        .list_environments(&org, &repo)
+    let store = st
+        .environment_governance
+        .as_ref()
+        .ok_or(ApiError::NotFound)?;
+    let governance = store
+        .project_environment_governance(&org, &repo)
         .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    Ok(Json(envs))
+        .map_err(org_environments::org_environment_api_error)?;
+    Ok(Json(governance.iter().map(Into::into).collect()))
 }
 
-/// Delete an environment (idempotent). Administer capability.
-#[utoipa::path(delete, path = "/v1/repos/{org}/{repo}/environments/{name}", summary = "Delete an environment (idempotent)", responses((status = 204, description = "deleted")))]
+/// **Retired** (ADR-0071 §10), like [`put_environment`]: always 410 with a
+/// pointer. An org Environment is deleted by an org admin; a Project's
+/// overlay by its own endpoint.
+#[utoipa::path(delete, path = "/v1/repos/{org}/{repo}/environments/{name}", params(("org" = String, Path, description = "repo owner"), ("repo" = String, Path, description = "repo name"), ("name" = String, Path, description = "Environment name")), summary = "Retired: per-repo environments are org-level Environments now (ADR-0071)", responses((status = 410, description = "gone; the body says where it went")))]
 async fn delete_environment(
-    State(st): State<AppState>,
-    headers: HeaderMap,
     Path((org, repo, name)): Path<(String, String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    let scope = rbac_scope(&org, Some(&repo));
-    authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
-    let store = st.environments.as_ref().ok_or(ApiError::NotFound)?;
-    store
-        .delete_environment(&org, &repo, &name)
-        .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    Ok(StatusCode::NO_CONTENT)
+    Err(per_repo_environment_writes_gone(&org, &repo, &name))
 }
 
 /// Legacy approval history (ADR-0070 §1): who approved which run into this
@@ -7142,7 +7505,7 @@ async fn delete_environment(
 /// target, version or outcome. The Deployment record is
 /// `/v1/orgs/{org}/environments/{env}/deployments`. Kept readable, read-only;
 /// admission happens in the run's gate-approval path. Read cap.
-#[utoipa::path(get, path = "/v1/repos/{org}/{repo}/environments/{name}/deployments", summary = "Legacy approval history (ADR-0070 §1)", responses((status = 200, description = "most recent first")))]
+#[utoipa::path(get, path = "/v1/repos/{org}/{repo}/environments/{name}/deployments", params(("org" = String, Path, description = "repo owner"), ("repo" = String, Path, description = "repo name"), ("name" = String, Path, description = "Environment name")), summary = "Legacy approval history (ADR-0070 §1)", responses((status = 200, description = "most recent first")))]
 async fn list_deployments(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -7635,14 +7998,23 @@ async fn secret_matrix(
 ) -> Result<Json<SecretMatrix>, ApiError> {
     let scope = rbac_scope(&org, Some(&repo));
     authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
-    let envs_store = st.environments.as_ref().ok_or(ApiError::NotFound)?;
+    let governance = st
+        .environment_governance
+        .as_ref()
+        .ok_or(ApiError::NotFound)?;
     let secrets = st.secrets.as_ref().ok_or(ApiError::NotFound)?;
 
-    let environments = envs_store
-        .list_environments(&org, &repo)
+    // The environment columns are the Environments this Project may deploy
+    // into, plus any it still holds an overlay or grant in (ADR-0071): every
+    // EnvironmentProjectSecretScope its Deploy Runs could resolve, and none
+    // of another Project's.
+    let env_names: Vec<String> = governance
+        .project_environment_governance(&org, &repo)
         .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let env_names: Vec<String> = environments.iter().map(|e| e.name.clone()).collect();
+        .map_err(org_environments::org_environment_api_error)?
+        .into_iter()
+        .map(|g| g.environment.name)
+        .collect();
 
     // The two broader scopes, kept apart (not merged as "inherited") so a cell
     // can name where it falls through FROM — the difference between overriding
@@ -7667,9 +8039,9 @@ async fn secret_matrix(
     let mut all_keys: std::collections::BTreeSet<String> =
         org_keys.union(&repo_keys).cloned().collect();
     for name in &env_names {
-        let keys = keys_at(scarab_secrets::SecretScope::Environment {
+        let keys = keys_at(scarab_secrets::SecretScope::EnvironmentProject {
             org: org.clone(),
-            repo: repo.clone(),
+            project: repo.clone(),
             environment: name.clone(),
         })
         .await?;
@@ -9291,7 +9663,7 @@ fn tag_for_path(path: &str) -> Option<&'static str> {
         // path segment with the repo-scoped legacy approval history, which
         // stays under Environments.
         "Deployments"
-    } else if path.contains("/environments") {
+    } else if path.contains("/environments") || path.contains("/environment-migration-report") {
         "Environments"
     } else if path.contains("/secrets") {
         "Secrets"
@@ -9470,6 +9842,19 @@ impl utoipa::Modify for SecuritySchemes {
         org_environments::get_org_environment,
         org_environments::put_org_environment,
         org_environments::delete_org_environment,
+        org_environments::get_environment_eligibility,
+        org_environments::put_environment_eligibility,
+        org_environments::get_environment_protection,
+        org_environments::put_environment_protection,
+        org_environments::list_environment_projects,
+        org_environments::get_environment_project_overlay,
+        org_environments::put_environment_project_overlay,
+        org_environments::delete_environment_project_overlay,
+        org_environments::get_environment_project_privilege_grant,
+        org_environments::put_environment_project_privilege_grant,
+        org_environments::delete_environment_project_privilege_grant,
+        org_environments::get_environment_migration_report,
+        org_environments::acknowledge_environment_migration_report,
         plugins::environment_deployment_targets,
         plugins::plugin_catalog,
         plugins::list_plugins,
@@ -9597,6 +9982,20 @@ impl utoipa::Modify for SecuritySchemes {
         org_environments::OrgEnvironmentDto,
         org_environments::EnvironmentDeploymentSourceDto,
         org_environments::PutOrgEnvironmentRequest,
+        org_environments::EnvironmentEligibilityDto,
+        org_environments::ProjectEnvironmentDto,
+        org_environments::EnvironmentProtectionRulesDto,
+        org_environments::EffectiveProtectionDto,
+        org_environments::EnvironmentProjectPrivilegeGrantDto,
+        org_environments::ImageGrantDto,
+        org_environments::PutEnvironmentProtectionRequest,
+        org_environments::PutEnvironmentProjectOverlayRequest,
+        org_environments::EnvironmentProjectOverlayDto,
+        org_environments::PutEnvironmentProjectPrivilegeGrantRequest,
+        org_environments::EnvironmentProjectDto,
+        org_environments::LegacyProtectionRulesDto,
+        org_environments::EnvironmentMigrationReportProjectDto,
+        org_environments::EnvironmentMigrationReportDto,
         plugins::PluginCapabilityDto,
         plugins::RequestRuleDto,
         plugins::ConnectionSlotDto,
@@ -9739,6 +10138,40 @@ fn router_inner(state: AppState) -> Router {
             axum::routing::put(org_environments::put_org_environment)
                 .get(org_environments::get_org_environment)
                 .delete(org_environments::delete_org_environment),
+        )
+        .route(
+            "/v1/orgs/{org}/environments/{env}/eligibility",
+            axum::routing::put(org_environments::put_environment_eligibility)
+                .get(org_environments::get_environment_eligibility),
+        )
+        .route(
+            "/v1/orgs/{org}/environments/{env}/protection",
+            axum::routing::put(org_environments::put_environment_protection)
+                .get(org_environments::get_environment_protection),
+        )
+        .route(
+            "/v1/orgs/{org}/environments/{env}/projects",
+            get(org_environments::list_environment_projects),
+        )
+        .route(
+            "/v1/orgs/{org}/environments/{env}/projects/{project}/overlay",
+            axum::routing::put(org_environments::put_environment_project_overlay)
+                .get(org_environments::get_environment_project_overlay)
+                .delete(org_environments::delete_environment_project_overlay),
+        )
+        .route(
+            "/v1/orgs/{org}/environments/{env}/projects/{project}/privilege-grant",
+            axum::routing::put(org_environments::put_environment_project_privilege_grant)
+                .get(org_environments::get_environment_project_privilege_grant)
+                .delete(org_environments::delete_environment_project_privilege_grant),
+        )
+        .route(
+            "/v1/orgs/{org}/environment-migration-report",
+            get(org_environments::get_environment_migration_report),
+        )
+        .route(
+            "/v1/orgs/{org}/environment-migration-report/{env}/acknowledge",
+            post(org_environments::acknowledge_environment_migration_report),
         )
         .route(
             "/v1/orgs/{org}/environments/{env}/deployment-targets",
@@ -9911,8 +10344,23 @@ fn step_status_name(s: StepStatus) -> &'static str {
 mod grant_admission_tests {
     use super::{admit_k8s_overlay, admit_step_grants};
     use scarab_pipeline::StepSecurity;
-    use scarab_project::{ImageGrant, ProtectionRules};
+    use scarab_project::{
+        migrate_legacy_environment, Environment, EnvironmentProjectPrivilegeGrant, ImageGrant,
+        ProtectionRules,
+    };
     use scarab_secrets::SecretScope;
+
+    /// What ADR-0071 §10 step 5 makes of a legacy environment's privileges:
+    /// the Project's grant (or none). Admission decides against it now, so
+    /// these cases are ported by migrating their legacy rules — the
+    /// assertions are the pre-ADR-0071 ones, unchanged.
+    fn grant(p: &ProtectionRules) -> Option<EnvironmentProjectPrivilegeGrant> {
+        let legacy = Environment {
+            name: "prod".into(),
+            protection: p.clone(),
+        };
+        migrate_legacy_environment("acme", "web", &legacy).1
+    }
 
     const IMG: &str = "ghcr.io/acme/deployer@sha256:aaaa";
 
@@ -9947,7 +10395,8 @@ mod grant_admission_tests {
     #[test]
     fn k8s_overlay_rejected_when_environment_does_not_permit() {
         let overlay = serde_json::json!({"spec": {"schedulerName": "x"}});
-        let err = admit_k8s_overlay(Some(&rules(vec![])), Some(&overlay)).unwrap_err();
+        let g = grant(&rules(vec![]));
+        let err = admit_k8s_overlay(Some(g.as_ref()), Some(&overlay)).unwrap_err();
         assert!(err.join("; ").contains("permit_k8s_overlay"));
     }
 
@@ -9957,7 +10406,7 @@ mod grant_admission_tests {
         let mut p = rules(vec![]);
         p.permit_k8s_overlay = true;
         assert_eq!(
-            admit_k8s_overlay(Some(&p), Some(&overlay)).unwrap(),
+            admit_k8s_overlay(Some(grant(&p).as_ref()), Some(&overlay)).unwrap(),
             Some(overlay)
         );
     }
@@ -10001,7 +10450,7 @@ mod grant_admission_tests {
             privileged: true,
             capabilities: vec![],
         }]);
-        let g = admit_step_grants(Some(&p), Some(&sec), IMG, false).unwrap();
+        let g = admit_step_grants(Some(grant(&p).as_ref()), Some(&sec), IMG, false).unwrap();
         assert!(g.privileged);
     }
 }
