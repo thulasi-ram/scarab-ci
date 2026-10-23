@@ -239,6 +239,20 @@ pub enum FailureKind {
     /// **Forward-only**, like `MissingInputs`: a binary from before this
     /// variant cannot read an attempt row or event that carries it.
     Gate,
+    /// **DeploymentRequest incomplete** (slice b, criterion 1; ADR-0070 §7):
+    /// the Step exited 0, but a DeploymentRequest it declares could not be
+    /// completed from its own results — the version result is missing or not
+    /// a non-empty string, or an evidence result is missing or not a string /
+    /// array of strings. The author's Step did run, so this is not `Config`
+    /// ("refused before it ran"); it is not `Step` either (the command
+    /// succeeded). The Step goes `Failed`, the run settles `Failed` (never
+    /// `DeadLettered`), and it is **never auto-retried**, even with `retry:` —
+    /// the same command writes the same results, and re-running a deploy Step
+    /// that already pushed its change is the double effect `retry:` warns of.
+    /// Nothing is recorded in the Deployment record for it.
+    ///
+    /// **Forward-only**, like `MissingInputs`.
+    DeploymentRequestIncomplete,
 }
 
 // ---------------------------------------------------------------------------
@@ -956,6 +970,131 @@ pub struct DeployContext {
     pub locked_out: bool,
 }
 
+/// One DeploymentRequest of a Deploy Run Step, as resolved when the Run was
+/// created (slice b, criterion 1; ADR-0070 §7): the static DeploymentTarget —
+/// its Environment the Run's own, its `${{ inputs.* }}` parts already bound to
+/// the frozen launch parameters — and the names of the Step results the
+/// DeploymentVersion and the evidence are read from when the Step succeeds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunDeploymentRequest {
+    pub step: StepId,
+    /// Position in the Step's authored `deployment_requests`.
+    pub ordinal: u32,
+    pub org: String,
+    pub environment: String,
+    pub target_source: String,
+    pub target_id: String,
+    /// The declared result holding the DeploymentVersion.
+    pub version_result: String,
+    /// The declared results holding the evidence, in authored order.
+    pub evidence_results: Vec<String>,
+    /// The DeploymentGates in this Run waiting on this request (filled by the
+    /// DeploymentGate sub-slice; empty until then).
+    pub gate_steps: Vec<StepId>,
+}
+
+/// Complete a succeeding Step's DeploymentRequests from its own `results`
+/// (slice b, criterion 1; plan Q10): each request's DeploymentVersion is its
+/// version result, which must be a **non-empty JSON string**; its evidence is
+/// the concatenation of its evidence results, each a JSON string or an array
+/// of strings. Every request is effective at `effective_at` (the succeeding
+/// Attempt's start). `at` inside each input is set to `effective_at` too — the
+/// store ignores it and stamps its own receipt time.
+///
+/// `Err` is the whole failure detail, starting "DeploymentRequest incomplete:"
+/// and naming every problem, so the author fixes them in one round.
+pub fn deployment_inputs(
+    run: &RunId,
+    step: &StepId,
+    requests: &[RunDeploymentRequest],
+    results: &std::collections::BTreeMap<String, serde_json::Value>,
+    effective_at: Timestamp,
+) -> Result<Vec<scarab_deployment::DeploymentInput>, String> {
+    use scarab_deployment::{
+        DeploymentInput, DeploymentRequester, DeploymentTarget, DeploymentVersion,
+    };
+    let mut problems: Vec<String> = Vec::new();
+    let mut inputs = Vec::new();
+    for req in requests {
+        let target = format!("`{}`/`{}`", req.target_source, req.target_id);
+        let version = match results.get(&req.version_result) {
+            None => {
+                problems.push(format!(
+                    "result `{}` (the version for {target}) is missing",
+                    req.version_result
+                ));
+                None
+            }
+            Some(serde_json::Value::String(v)) if !v.trim().is_empty() => Some(v.clone()),
+            Some(other) => {
+                problems.push(format!(
+                    "result `{}` (the version for {target}) must be a non-empty string, got {}",
+                    req.version_result,
+                    json_kind(other)
+                ));
+                None
+            }
+        };
+        let mut evidence = Vec::new();
+        for name in &req.evidence_results {
+            match results.get(name) {
+                None => problems.push(format!(
+                    "result `{name}` (evidence for {target}) is missing"
+                )),
+                Some(serde_json::Value::String(e)) => evidence.push(e.clone()),
+                Some(serde_json::Value::Array(items))
+                    if items.iter().all(serde_json::Value::is_string) =>
+                {
+                    evidence.extend(items.iter().filter_map(|i| i.as_str().map(String::from)));
+                }
+                Some(other) => problems.push(format!(
+                    "result `{name}` (evidence for {target}) must be a string or an array of \
+                     strings, got {}",
+                    json_kind(other)
+                )),
+            }
+        }
+        if let Some(version) = version {
+            inputs.push(DeploymentInput::Request {
+                target: DeploymentTarget {
+                    environment: req.environment.clone(),
+                    source: req.target_source.clone(),
+                    id: req.target_id.clone(),
+                },
+                version: DeploymentVersion(version),
+                requester: DeploymentRequester {
+                    run: run.0.clone(),
+                    step: step.0.clone(),
+                },
+                effective_at: effective_at.0,
+                at: effective_at.0,
+                evidence,
+            });
+        }
+    }
+    if problems.is_empty() {
+        Ok(inputs)
+    } else {
+        Err(format!(
+            "DeploymentRequest incomplete: {} (the step exited 0, but a DeploymentRequest it \
+             declares is read from these results — write them to /scarab/results/<name>.json)",
+            problems.join("; ")
+        ))
+    }
+}
+
+/// A JSON value's kind, for a diagnostic.
+fn json_kind(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "an empty string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
 /// The discriminated payload carried by an [`EventKind`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventPayload {
@@ -1620,7 +1759,8 @@ impl StepRun {
                 | FailureKind::Timeout
                 | FailureKind::Config
                 | FailureKind::MissingInputs
-                | FailureKind::Gate,
+                | FailureKind::Gate
+                | FailureKind::DeploymentRequestIncomplete,
             ) => StepStatus::Failed,
             Some(FailureKind::Infra {
                 never_started: true,

@@ -708,6 +708,48 @@ pub trait Db: Send + Sync {
         outcome: crate::AttemptOutcome,
     ) -> Result<(), DbError>;
 
+    /// Record a Run's resolved DeploymentRequests (slice b, criterion 1;
+    /// ADR-0070 §7), once, at Run creation — every Step's, in one call.
+    async fn set_run_deployment_requests(
+        &self,
+        run: &RunId,
+        requests: &[crate::RunDeploymentRequest],
+    ) -> Result<(), DbError>;
+
+    /// The DeploymentRequests `step` of `run` makes on success, by ordinal.
+    /// Empty for a Step that makes none (every ordinary Step).
+    async fn run_deployment_requests(
+        &self,
+        run: &RunId,
+        step: &StepId,
+    ) -> Result<Vec<crate::RunDeploymentRequest>, DbError>;
+
+    /// A Deploy Step's success **and** the DeploymentRequests it made, as one
+    /// commit (slice b, criterion 1; ADR-0070 §7, §8): the guarded
+    /// `Running → Succeeded` step transition, `attempt`'s `Succeeded` outcome,
+    /// and one append per `inputs` entry to `org`'s Deployment input log as
+    /// received at `received_at` (the control plane's clock, read right before
+    /// the call). Either all of it lands or none of it does:
+    ///
+    /// - the step is no longer `Running` (a peer finalized it) →
+    ///   [`DbError::Conflict`], nothing appended — exactly-once, as
+    ///   [`record_step_transition`](Db::record_step_transition);
+    /// - an append is refused (a `received_at` too far ahead of the store's
+    ///   clock) or fails → an error, and the step stays `Running`: no success
+    ///   without its request, no request without its success.
+    ///
+    /// Postgres runs it in ONE READ COMMITTED transaction, taking the Org's
+    /// Deployment counter row last (see `append_deployment_input`).
+    async fn finish_step_with_deployment_requests(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        org: &str,
+        inputs: &[scarab_deployment::DeploymentInput],
+        received_at: Timestamp,
+    ) -> Result<(), DbError>;
+
     /// Append one entry to the run's append-only event log.
     async fn append_event(&self, event: &EventKind) -> Result<(), DbError>;
 

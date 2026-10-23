@@ -115,6 +115,7 @@ fn request(environment: &str, id: &str, version: &str) -> DeploymentInput {
         },
         effective_at: 0,
         at: 0,
+        evidence: Vec::new(),
     }
 }
 

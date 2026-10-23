@@ -5421,7 +5421,7 @@
               "string",
               "null"
             ],
-            "description": "Coarse failure kind when `failed`: `infra` | `step` | `timeout` | `lost`\n| `config` | `missing-inputs` (an input snapshot gone from every tier —\nRerun/Retry regenerates it; ticket e140121) | `gate` (a gate's wait\nresolved failed — e.g. not released within `gate_expires_after`; the\nreason is in `failure_detail`)."
+            "description": "Coarse failure kind when `failed`: `infra` | `step` | `timeout` | `lost`\n| `config` | `missing-inputs` (an input snapshot gone from every tier —\nRerun/Retry regenerates it; ticket e140121) | `gate` (a gate's wait\nresolved failed — e.g. not released within `gate_expires_after`; the\nreason is in `failure_detail`) | `deployment-request-incomplete` (the\nstep exited 0 but its results could not complete a DeploymentRequest\nit declares; never auto-retried; what is missing is in\n`failure_detail`)."
           },
           "failure_detail": {
             "type": [
@@ -5999,7 +5999,8 @@
           "run",
           "step",
           "effective_at",
-          "claim"
+          "claim",
+          "evidence"
         ],
         "properties": {
           "claim": {
@@ -6010,6 +6011,13 @@
             "type": "integer",
             "format": "int64",
             "description": "Unix-ms the requesting Step started."
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "What the Step offered as evidence for the change — image digests,\ntypically — read from its results (ADR-0070 §7). Shown, never used to\ncorrelate; empty when it declared none."
           },
           "project": {
             "type": [

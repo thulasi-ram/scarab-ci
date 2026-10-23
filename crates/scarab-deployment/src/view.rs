@@ -15,7 +15,7 @@
 //! same whether the whole Environment, one DeploymentTarget, or (later) the
 //! whole Org is folded.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     DeploymentInput, DeploymentLedger, DeploymentRequester, DeploymentStatus,
@@ -32,6 +32,9 @@ pub struct DeploymentRequesterView {
     /// started after core first saw that Deployment, so it did not make it
     /// live and does not explain it (see "Explanation" in the crate docs).
     pub claim: bool,
+    /// The evidence its latest request carried (image digests, typically) —
+    /// display only; the fold never reads it.
+    pub evidence: Vec<String>,
 }
 
 /// One stage of a Deployment as reported: the report as the fold holds it
@@ -132,6 +135,11 @@ pub fn fold_environment(
     // reports landed — i.e. index for index with that Deployment's `reports`.
     let mut report_source_ats: Vec<Vec<Option<Millis>>> = Vec::new();
     let mut reported_targets: BTreeSet<&DeploymentTarget> = BTreeSet::new();
+    // Indexed the same way: each requester's latest evidence. The fold keeps
+    // only a requester's latest mark (a retried Step replaces its own), and
+    // the evidence follows the same rule — but it is kept beside the fold, not
+    // in it, so it can never influence a Deployment's identity or status.
+    let mut evidence: Vec<BTreeMap<&DeploymentRequester, &[String]>> = Vec::new();
     for logged in inputs {
         if let DeploymentInput::Report { target, .. } = &logged.input {
             reported_targets.insert(target);
@@ -141,6 +149,15 @@ pub fn fold_environment(
         if ledger.deployments().len() > before {
             created_by.push(logged.seq);
             report_source_ats.push(Vec::new());
+            evidence.push(BTreeMap::new());
+        }
+        if let DeploymentInput::Request {
+            requester,
+            evidence: e,
+            ..
+        } = &logged.input
+        {
+            evidence[landed.0 as usize].insert(requester, e);
         }
         if matches!(logged.input, DeploymentInput::Report { .. }) {
             report_source_ats[landed.0 as usize].push(logged.report_source_at);
@@ -150,8 +167,8 @@ pub fn fold_environment(
     let views: Vec<DeploymentView> = ledger
         .deployments()
         .iter()
-        .zip(created_by.iter().zip(&report_source_ats))
-        .map(|(d, (&id, source_ats))| {
+        .zip(created_by.iter().zip(&report_source_ats).zip(&evidence))
+        .map(|(d, ((&id, source_ats), evidence))| {
             let mut requesters: Vec<_> = d.requesters.iter().collect();
             requesters.sort_by_key(|(_, mark)| mark.seq);
             DeploymentView {
@@ -165,6 +182,7 @@ pub fn fold_environment(
                         requester: r.clone(),
                         effective_at: mark.effective_at,
                         claim: mark.claim,
+                        evidence: evidence.get(r).map(|e| e.to_vec()).unwrap_or_default(),
                     })
                     .collect(),
                 reports: d

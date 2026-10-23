@@ -244,6 +244,133 @@ struct InMemoryState {
     /// concurrent release that committed between a caller's snapshot and its
     /// close. See [`InMemoryDb::arm_gate_resolve_race`].
     gate_resolve_race: Option<(StepId, Timestamp)>,
+    /// Each Run's resolved DeploymentRequests (slice b; mirrors
+    /// `run_deployment_requests`), keyed (run, step), by ordinal.
+    run_deployment_requests: HashMap<(RunId, StepId), Vec<scarab_engine::RunDeploymentRequest>>,
+    /// The Deployment record's input log per Org (mirrors `deployment_inputs`),
+    /// in seq order, and each Org's `(last_seq, last_at)` counter.
+    deployment_inputs: HashMap<String, Vec<scarab_deployment::LoggedDeploymentInput>>,
+    deployment_counters: HashMap<String, (u64, i64)>,
+}
+
+/// Stamp `inputs` onto `org`'s in-memory log the way `append_deployment_input`
+/// stamps them in Postgres — seq +1 each, `at` = GREATEST(`received_at`, the
+/// Org's last `at`), a request's `effective_at` clamped to it, a report's own
+/// time kept as `report_source_at` — refusing a `received_at` more than
+/// `RECEIVED_AT_MAX_LEAD_MS` ahead of the wall clock (the fake's stand-in for
+/// the database clock). All or nothing: on a refusal nothing is appended.
+fn append_deployment_inputs_locked(
+    st: &mut InMemoryState,
+    org: &str,
+    inputs: &[scarab_deployment::DeploymentInput],
+    received_at: i64,
+) -> Result<Vec<scarab_deployment::LoggedDeploymentInput>, scarab_deployment::DeploymentStoreError>
+{
+    use scarab_deployment::{DeploymentInput, DeploymentStoreError, LoggedDeploymentInput};
+    let store_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(i64::MAX);
+    if received_at > store_now.saturating_add(scarab_deployment::RECEIVED_AT_MAX_LEAD_MS) {
+        return Err(DeploymentStoreError::ReceivedAtAhead {
+            received_at,
+            store_now: Some(store_now),
+        });
+    }
+    let (mut seq, mut last_at) = st
+        .deployment_counters
+        .get(org)
+        .copied()
+        .unwrap_or((0, i64::MIN));
+    let mut logged = Vec::new();
+    for input in inputs {
+        seq += 1;
+        last_at = last_at.max(received_at);
+        let mut input = input.clone();
+        let report_source_at = match &mut input {
+            DeploymentInput::Request {
+                at, effective_at, ..
+            } => {
+                *at = last_at;
+                *effective_at = (*effective_at).min(last_at);
+                None
+            }
+            DeploymentInput::Report { report, .. } => {
+                let source_at = report.at;
+                report.at = last_at;
+                Some(source_at)
+            }
+        };
+        logged.push(LoggedDeploymentInput {
+            seq,
+            input,
+            report_source_at,
+        });
+    }
+    st.deployment_counters
+        .insert(org.to_string(), (seq, last_at));
+    st.deployment_inputs
+        .entry(org.to_string())
+        .or_default()
+        .extend(logged.iter().cloned());
+    Ok(logged)
+}
+
+/// The in-memory Deployment record (slice b): the same log the fake's
+/// [`Db::finish_step_with_deployment_requests`] appends to, so an in-memory
+/// server test can fold what a Step success recorded.
+#[async_trait]
+impl scarab_deployment::DeploymentStore for InMemoryDb {
+    async fn append(
+        &self,
+        org: &str,
+        input: &scarab_deployment::DeploymentInput,
+        received_at: scarab_deployment::Millis,
+    ) -> Result<scarab_deployment::LoggedDeploymentInput, scarab_deployment::DeploymentStoreError>
+    {
+        let mut st = self.state.lock().unwrap();
+        let mut logged = append_deployment_inputs_locked(
+            &mut st,
+            org,
+            std::slice::from_ref(input),
+            received_at,
+        )?;
+        Ok(logged.remove(0))
+    }
+
+    async fn inputs(
+        &self,
+        org: &str,
+        environment: &str,
+    ) -> Result<
+        Vec<scarab_deployment::LoggedDeploymentInput>,
+        scarab_deployment::DeploymentStoreError,
+    > {
+        let st = self.state.lock().unwrap();
+        Ok(st
+            .deployment_inputs
+            .get(org)
+            .into_iter()
+            .flatten()
+            .filter(|l| l.input.target().environment == environment)
+            .cloned()
+            .collect())
+    }
+
+    async fn environments(
+        &self,
+        org: &str,
+    ) -> Result<Vec<String>, scarab_deployment::DeploymentStoreError> {
+        let st = self.state.lock().unwrap();
+        let envs: std::collections::BTreeSet<String> = st
+            .deployment_inputs
+            .get(org)
+            .into_iter()
+            .flatten()
+            .map(|l| l.input.target().environment.clone())
+            .collect();
+        Ok(envs.into_iter().collect())
+    }
 }
 
 /// An in-memory [`Db`] for tests: an append-only event log, run/step state
@@ -1423,6 +1550,76 @@ impl Db for InMemoryDb {
                     a.failure_detail = detail.map(str::to_string);
                     a.outcome = AttemptOutcome::Failed;
                 }
+            }
+        }
+        Ok(())
+    }
+
+    async fn set_run_deployment_requests(
+        &self,
+        run: &RunId,
+        requests: &[scarab_engine::RunDeploymentRequest],
+    ) -> Result<(), DbError> {
+        let mut st = self.state.lock().unwrap();
+        for r in requests {
+            let rows = st
+                .run_deployment_requests
+                .entry((run.clone(), r.step.clone()))
+                .or_default();
+            // Idempotent on (run, step, ordinal), like the Postgres insert.
+            if !rows.iter().any(|x| x.ordinal == r.ordinal) {
+                rows.push(r.clone());
+                rows.sort_by_key(|x| x.ordinal);
+            }
+        }
+        Ok(())
+    }
+
+    async fn run_deployment_requests(
+        &self,
+        run: &RunId,
+        step: &StepId,
+    ) -> Result<Vec<scarab_engine::RunDeploymentRequest>, DbError> {
+        let st = self.state.lock().unwrap();
+        Ok(st
+            .run_deployment_requests
+            .get(&(run.clone(), step.clone()))
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn finish_step_with_deployment_requests(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        org: &str,
+        inputs: &[scarab_deployment::DeploymentInput],
+        received_at: Timestamp,
+    ) -> Result<(), DbError> {
+        // One lock = one transaction: the guard, the appends and the
+        // transition all land or none does.
+        let mut st = self.state.lock().unwrap();
+        let running = st
+            .steps
+            .get(&(run.clone(), step.clone()))
+            .is_some_and(|rec| rec.status == Some(StepStatus::Running));
+        if !running {
+            return Err(DbError::Conflict);
+        }
+        append_deployment_inputs_locked(&mut st, org, inputs, received_at.0)
+            .map_err(|e| DbError::Other(e.to_string()))?;
+        let rec = st
+            .steps
+            .get_mut(&(run.clone(), step.clone()))
+            .expect("checked above");
+        rec.status = Some(StepStatus::Succeeded);
+        if let Some(a) = rec.attempts.iter_mut().find(|a| &a.id == attempt) {
+            if !matches!(
+                a.outcome,
+                AttemptOutcome::Superseded | AttemptOutcome::Cancelled
+            ) {
+                a.outcome = AttemptOutcome::Succeeded;
             }
         }
         Ok(())

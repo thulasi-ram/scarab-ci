@@ -15,11 +15,11 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use scarab_project::{
-    migrate_legacy_environment, DeployGovernance, Environment, EnvironmentDeploymentDeadline,
-    EnvironmentGovernanceStore, EnvironmentMigrationAcknowledgement, EnvironmentMigrationReport,
-    EnvironmentMigrationReportProject, EnvironmentProjectEligibility, EnvironmentProjectOverlay,
-    EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord, EnvironmentProtectionRules,
-    OrgEnvironment, OrgEnvironmentError, ProtectionRules,
+    migrate_legacy_environment, DeployGovernance, DeploymentTargetHome, Environment,
+    EnvironmentDeploymentDeadline, EnvironmentGovernanceStore, EnvironmentMigrationAcknowledgement,
+    EnvironmentMigrationReport, EnvironmentMigrationReportProject, EnvironmentProjectEligibility,
+    EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord,
+    EnvironmentProtectionRules, OrgEnvironment, OrgEnvironmentError, ProtectionRules,
 };
 
 type EnvironmentKey = (String, String);
@@ -42,6 +42,9 @@ struct State {
     /// The frozen legacy rows, keyed (org, environment, project).
     legacy: BTreeMap<ProjectKey, ProtectionRules>,
     reports: BTreeMap<EnvironmentKey, ReportLine>,
+    /// Seeded DeploymentTarget homes, keyed (org, source, target id) — what
+    /// Postgres derives from routing and the Deployment record.
+    target_homes: BTreeMap<ProjectKey, String>,
 }
 
 /// An in-memory [`EnvironmentGovernanceStore`]. Reads are one lock, so
@@ -86,6 +89,22 @@ fn new_environment(
 impl InMemoryEnvironmentGovernance {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Seed where a DeploymentTarget `(source, id)` of `org` is homed now
+    /// ([`EnvironmentGovernanceStore::deployment_target_homes`]).
+    pub fn with_deployment_target_home(
+        self,
+        org: &str,
+        source: &str,
+        id: &str,
+        environment: &str,
+    ) -> Self {
+        self.state.lock().unwrap().target_homes.insert(
+            (org.to_string(), source.to_string(), id.to_string()),
+            environment.to_string(),
+        );
+        self
     }
 
     /// Seed an Environment with the permissive baseline and `eligibility`,
@@ -440,6 +459,27 @@ impl EnvironmentGovernanceStore for InMemoryEnvironmentGovernance {
             .iter()
             .filter(|((o, _), _)| o == org)
             .map(|((o, name), line)| Self::report(&state, o, name, line))
+            .collect())
+    }
+
+    async fn deployment_target_homes(
+        &self,
+        org: &str,
+        targets: &[(String, String)],
+    ) -> Result<Vec<DeploymentTargetHome>, OrgEnvironmentError> {
+        let state = self.state.lock().unwrap();
+        Ok(targets
+            .iter()
+            .filter_map(|(source, id)| {
+                let env = state
+                    .target_homes
+                    .get(&(org.to_string(), source.clone(), id.clone()))?;
+                Some(DeploymentTargetHome {
+                    source: source.clone(),
+                    id: id.clone(),
+                    environment: env.clone(),
+                })
+            })
             .collect())
     }
 
