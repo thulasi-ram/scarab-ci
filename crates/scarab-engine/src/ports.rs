@@ -82,6 +82,59 @@ pub trait WorkspaceSnapshots: Send + Sync {
     async fn file_blob_hash(&self, root: &str, path: &str) -> Result<Option<String>, String>;
 }
 
+/// A DeploymentGate's verdict as its oracle reached it (ADR-0070 §8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentGateDecision {
+    /// `true`: the gate passes; `false`: it fails with
+    /// [`FailureKind::Gate`](crate::FailureKind::Gate).
+    pub passed: bool,
+    /// The human line journalled on `GateResolved` (and, on a failure, the
+    /// Attempt's `failure_detail`): the decisive report's label, "superseded
+    /// by <version>", "stalled: not live within <deadline>".
+    pub reason: String,
+    /// The public id (creating seq) of the Deployment the gate waited on.
+    pub deployment: Option<u64>,
+}
+
+/// The **DeploymentGate oracle** (slice b, criterion 2; ADR-0070 §8): what a
+/// `gate: deployment` step's verdict is read from. Core resolves a
+/// DeploymentGate — never a plugin — by folding its Environment's Deployment
+/// record, which lives behind the server's stores (the input log, the
+/// Environment's deadline and the Project's overlay), so the pure engine asks
+/// through this port.
+///
+/// The engine asks only for a gate that is **waiting** (Pending, reached, an
+/// open Attempt), passing that Attempt's frozen `started_at` as
+/// `window_floor`; the window opens at the later of the request's effective
+/// time and the floor. Whatever the oracle answers is journalled once, per
+/// Attempt, and never asked again (INV-DEP-10): a terminal gate is never
+/// re-evaluated, and a Retry is a new Attempt with a later floor.
+///
+/// `Ok(None)` = still waiting. `Err` = the oracle could not decide this tick
+/// (a store read failed, a row would not parse): the engine takes **no
+/// decision** and asks again next tick — it neither fails the gate nor counts
+/// it as a tick failure, so one unreadable row in an Environment's log cannot
+/// dead-letter every Deploy Run waiting there (ADR-0059). The implementation
+/// logs it; `gate_expires_after`, evaluated by the engine, still bounds the
+/// wait.
+///
+/// With **no oracle wired** ([`Scheduler::with_deployments`] not called) a
+/// DeploymentGate makes no decision of its own: it waits until a human
+/// rejects it, its `gate_expires_after` fires, or the Run is cancelled.
+///
+/// [`Scheduler::with_deployments`]: crate::Scheduler::with_deployments
+#[async_trait]
+pub trait DeploymentGates: Send + Sync {
+    async fn deployment_gate_verdict(
+        &self,
+        run: &RunId,
+        gate: &StepId,
+        request: &crate::RunDeploymentRequest,
+        window_floor: Timestamp,
+        now: Timestamp,
+    ) -> Result<Option<DeploymentGateDecision>, String>;
+}
+
 /// Opaque handle to a launched unit of execution (a pod, a local process…).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecHandle(pub String);

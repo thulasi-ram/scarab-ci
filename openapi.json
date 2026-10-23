@@ -4132,7 +4132,7 @@
           "Runs"
         ],
         "summary": "Reject a waiting gate: fail it with a reason (ADR-0070 §9).",
-        "description": "For a `manual`, `timer` or `external` gate that is pending and reached\n(every step it needs has succeeded; slice b, criterion 3). The gate's Attempt fails with\nthe reason and the rejecting principal, its dependents are skipped, and the\nrun ends `failed`; retrying the gate opens a new wait that asks again.\n\nAuthz'd as a run write, the same as approve. A reject only ever stops a\ndeploy — any writer can already cancel the run — so it does NOT consult the\nEnvironment's approver rules, and it works when the Environment is gone or\nno longer admits the project: the clean way out of a held gate.",
+        "description": "For any gate — `manual`, `timer`, `external` or `deployment` — that is\npending and reached (every step it needs has succeeded; slice b, criteria 2\nand 3). A deployment gate can only be rejected, never approved or\nreleased: core passes it from the Deployment record. The gate's Attempt fails with\nthe reason and the rejecting principal, its dependents are skipped, and the\nrun ends `failed`; retrying the gate opens a new wait that asks again.\n\nAuthz'd as a run write, the same as approve. A reject only ever stops a\ndeploy — any writer can already cancel the run — so it does NOT consult the\nEnvironment's approver rules, and it works when the Environment is gone or\nno longer admits the project: the clean way out of a held gate.",
         "operationId": "reject_gate",
         "parameters": [
           {

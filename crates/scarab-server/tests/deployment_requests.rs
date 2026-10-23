@@ -388,3 +388,75 @@ async fn webhook_skips_and_names_a_pipeline_requesting_a_target_homed_elsewhere(
     assert_eq!(outcome.runs.len(), 1, "{outcome:?}");
     tdb.cleanup().await;
 }
+
+/// Run creation attaches each DeploymentGate to the request it waits on
+/// (slice b, criterion 2): `gate_steps` on that request's row — the one its
+/// `deployment.target` spells, `${{ inputs.* }}` and all — and nothing on the
+/// step's other request. The gate step is created with kind `deployment`.
+#[tokio::test]
+async fn run_creation_attaches_a_deployment_gate_to_its_request() {
+    let Some((tdb, pg)) = seeded().await else {
+        return;
+    };
+    let yaml = r#"
+on:
+  manual: {}
+environment: prod
+interface:
+  inputs:
+    - { name: app, type: string, required: false, default: web }
+steps:
+  - id: bump
+    image: busybox
+    command: ["true"]
+    results: [version]
+    deployment_requests:
+      - target: { source: argocd, id: "${{ inputs.app }}" }
+        version: version
+      - target: { source: argocd, id: worker }
+        version: version
+  - id: live
+    gate: deployment
+    deployment: { step: bump, target: { source: argocd, id: "${{ inputs.app }}" } }
+    needs: [bump]
+"#;
+    let forge = FakeForge::new()
+        .with_file(".scarab/deploy.yaml", yaml)
+        .with_commit("refs/heads/main", SHA);
+    let run = dispatch_run(
+        &forge,
+        pg.as_ref(),
+        &FakeClock::new(1_000),
+        Some(pg.as_ref()),
+        "bob".into(),
+        repo(),
+        "refs/heads/main".into(),
+        "deploy".into(),
+        BTreeMap::from([("app".to_string(), json!("web"))]),
+        DispatchKind::Manual,
+        None,
+    )
+    .await
+    .unwrap();
+    let requests = pg
+        .run_deployment_requests(&run, &StepId("bump".into()))
+        .await
+        .unwrap();
+    let gates: Vec<(&str, Vec<StepId>)> = requests
+        .iter()
+        .map(|r| (r.target_id.as_str(), r.gate_steps.clone()))
+        .collect();
+    assert_eq!(
+        gates,
+        vec![("web", vec![StepId("live".into())]), ("worker", Vec::new())]
+    );
+    let live = pg
+        .steps_of_run(&run)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.step.0 == "live")
+        .unwrap();
+    assert_eq!(live.gate_kind.as_deref(), Some("deployment"));
+    tdb.cleanup().await;
+}
