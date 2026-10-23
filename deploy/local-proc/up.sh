@@ -109,8 +109,10 @@ export KUBECONFIG="$kubeconfig"
 # workspace service has two audiences with different views of the network. The
 # host reaches it over loopback. A Pod cannot — `localhost` inside a Pod is the
 # Pod — and `kind.yaml` provides no route, no `extraPortMappings`, no
-# `extraMounts`. (`SCARAB_RESULTS_API_URL` has exactly this problem and is simply
-# unset here, which is why results egress is off in proc mode.)
+# `extraMounts`. (`SCARAB_RESULTS_API_URL` has exactly this problem. Results
+# egress stays OFF by default in proc mode; a caller that turns it on — by
+# setting SCARAB_RESULTS_TOKEN_SECRET in its overlay, as `just plugin-verify`
+# can — gets a URL derived from the SAME probed host below, never a guess.)
 #
 # The obvious answer is WRONG on this platform, and it fails silently, so it is
 # worth writing down: "use the kind docker network's gateway" assumes the gateway
@@ -324,6 +326,28 @@ fi
 echo "    a Pod reached the workspace service at http://$ws_host:$ws_port"
 export SCARAB_WORKSPACE_URL="http://$ws_host:$ws_port"
 
+# Results egress (ADR-0042), only when the caller turned it on (overlay sets
+# SCARAB_RESULTS_TOKEN_SECRET). The step Pod's sidecar POSTs to the CONTROL
+# PLANE's API port — a host process, so the same routing problem as the
+# workspace service, and the same answer: the host a Pod was just proven to
+# reach. Unlike a plugin Pod a step Pod has cluster DNS, so the name is fine.
+# A loopback-bound API is unreachable from any Pod: fatal, not a silent drop
+# (the sidecar's failed POST does not fail the step — the results would just
+# never arrive).
+if [ -n "${SCARAB_RESULTS_TOKEN_SECRET:-}" ] && [ -z "${SCARAB_RESULTS_API_URL:-}" ]; then
+  case "$addr" in
+    127.*|localhost:*|\[::1\]:*)
+      echo "error: results egress is on (SCARAB_RESULTS_TOKEN_SECRET) but SCARAB_ADDR=$addr is" >&2
+      echo "  loopback-bound: no Pod can reach it. Bind 0.0.0.0 in the overlay." >&2
+      rm -f "$here/workspace.pid"
+      kill "$workspace_pid" 2>/dev/null || true
+      exit 1
+      ;;
+  esac
+  export SCARAB_RESULTS_API_URL="http://$ws_host:${addr##*:}"
+  echo "    results egress on: step sidecars POST to $SCARAB_RESULTS_API_URL"
+fi
+
 # The workspace helper image (ADR-0061): the s3-feed fetcher init container AND
 # the egress hold/drain sidecar. kind cannot pull from the host's docker daemon,
 # so proc mode builds it and `kind load`s it — the same reason the clone image
@@ -458,6 +482,9 @@ if [ -n "$broker_url" ]; then
 fi
 if [ -n "$broker_peer" ]; then
   echo "SCARAB_PLUGIN_BROKER_PEER=$broker_peer" >> "$generated"
+fi
+if [ -n "${SCARAB_RESULTS_TOKEN_SECRET:-}" ] && [ -n "${SCARAB_RESULTS_API_URL:-}" ]; then
+  echo "SCARAB_RESULTS_API_URL=$SCARAB_RESULTS_API_URL" >> "$generated"
 fi
 echo "    live-tier env written to deploy/local-proc/.env.generated ('just kube-tests' reads it)"
 
