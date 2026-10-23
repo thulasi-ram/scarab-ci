@@ -2922,6 +2922,9 @@ fn failure_str(f: FailureKind) -> &'static str {
         // unreadable to a binary from before the variant — deliberate, no
         // unknown-variant fallback (see `FailureKind::MissingInputs`).
         FailureKind::MissingInputs => "missing-inputs",
+        // Forward-only, like "missing-inputs": a gate that resolved failed
+        // (slice b, criterion 3).
+        FailureKind::Gate => "gate",
     }
 }
 
@@ -2938,6 +2941,7 @@ fn failure_from_str(s: &str) -> Result<FailureKind, DbError> {
         "lost" => Ok(FailureKind::Lost),
         "config" => Ok(FailureKind::Config),
         "missing-inputs" => Ok(FailureKind::MissingInputs),
+        "gate" => Ok(FailureKind::Gate),
         other => Err(DbError::Other(format!("unknown failure kind {other:?}"))),
     }
 }

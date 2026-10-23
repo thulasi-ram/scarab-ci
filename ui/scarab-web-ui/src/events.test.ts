@@ -215,3 +215,30 @@ describe("RunDeadLettered", () => {
     expect(eventCategory(dl("whatever"))).toBe("err");
   });
 });
+
+describe("GateResolved (slice b: gates fail with a reason)", () => {
+  const passed = ev(1, {
+    GateResolved: { step: "approve", attempt: "a1", passed: true, reason: "released" },
+  });
+  const failedGate = ev(2, {
+    GateResolved: {
+      step: "approve",
+      attempt: "a2",
+      passed: false,
+      reason: "not released within 300s of its needs finishing",
+    },
+  });
+
+  it("a failed gate is an error on the rail; a passed one is a gate mark", () => {
+    expect(eventCategory(passed)).toBe("gate");
+    expect(eventCategory(failedGate)).toBe("err");
+  });
+
+  it("names the verdict and its reason, step in the chip", () => {
+    expect(eventParts(failedGate)).toEqual({
+      step: "approve",
+      text: "gate failed — not released within 300s of its needs finishing",
+    });
+    expect(describeEvent(passed)).toBe("approve — gate passed — released");
+  });
+});

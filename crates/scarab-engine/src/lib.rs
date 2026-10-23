@@ -22,7 +22,8 @@ pub mod scheduler;
 
 pub use ports::{Clock, Db, Executor, LogChunks, SnapshotRetention, WorkspaceSnapshots};
 pub use scheduler::{
-    cancel_run_request, pin_run_snapshots, plan_rerun, record_gate_approval, release_gate,
+    cancel_run_request, gate_approvers, pin_run_snapshots, plan_rerun, record_gate_approval,
+    release_gate, wait_began_at,
     rerun_step, rerun_step_widened, retry_step, retry_step_widened, unpin_run_snapshots,
     ExpiredInput, PlanReason, PlannedStep, RerunError, RerunPlan, Scheduler, SchedulerError,
     SupersedeTeardown, SupersededAttempt, Supervision, TickHealth, CANCEL_RUN, LAUNCH_STEP,
@@ -227,6 +228,17 @@ pub enum FailureKind {
     /// carries it. Deliberate — no unknown-variant fallback (a fallback would
     /// silently reclassify, which is worse than a loud refusal).
     MissingInputs,
+    /// A **gate** resolved *failed* (criterion 3 of slice b; ADR-0047 expiry,
+    /// and the DeploymentGate verdict that rides the same path later): nobody
+    /// released it within `gate_expires_after`, or its oracle said no. The
+    /// reason is on the attempt's `failure_detail` and the `GateResolved`
+    /// event. A verdict, not an infra fault: the gate step goes `Failed`, its
+    /// dependents are Skipped, and the run settles `Failed` — never
+    /// `DeadLettered`, never auto-retried (a human Retry opens a new wait).
+    ///
+    /// **Forward-only**, like `MissingInputs`: a binary from before this
+    /// variant cannot read an attempt row or event that carries it.
+    Gate,
 }
 
 // ---------------------------------------------------------------------------
@@ -257,8 +269,11 @@ pub struct StepRun {
     #[serde(default)]
     pub needs: Vec<StepId>,
     /// If set (`manual`/`timer`/`external`), this is a **gate** step: it launches
-    /// no Pod; when its needs are satisfied the run suspends until released
-    /// (ADR-0008). `None` for ordinary executed steps.
+    /// no Pod. When its needs are satisfied it *waits* — status stays
+    /// `Pending`, with an open (outcome `Running`) gate Attempt whose
+    /// `started_at` is the wait's clock start — holding only its dependents
+    /// until it resolves; the run suspends only when nothing else is runnable
+    /// (ADR-0008, slice b). `None` for ordinary executed steps.
     #[serde(default)]
     pub gate_kind: Option<String>,
 }
@@ -908,9 +923,39 @@ pub enum EventPayload {
         by: Option<String>,
     },
     /// An unapproved gate outlived its opt-in `gate_expires_after` deadline and
-    /// failed the run (ADR-0047).
+    /// failed the run (ADR-0047). Still emitted beside the
+    /// [`GateResolved`](EventPayload::GateResolved) that now carries the
+    /// verdict, so readers keyed on it keep working.
     GateExpired {
         step: StepId,
+    },
+    /// A gate's wait **resolved** — passed or failed — and this is the
+    /// journalled verdict (slice b, criterion 3). Appended exactly once per
+    /// gate Attempt, and only after the guarded step transition out of
+    /// `Pending` succeeded (a racing resolver that lost the CAS appends
+    /// nothing). A terminal gate is never re-evaluated: readers take the
+    /// verdict from here, never by re-deriving it.
+    ///
+    /// - `attempt` — the gate Attempt (one per wait episode) this closes.
+    /// - `passed` — `true`: the gate step went `Succeeded` (a release, an
+    ///   elapsed timer); `false`: it went `Failed` with
+    ///   [`FailureKind::Gate`].
+    /// - `reason` — the human line: why it failed ("not released within
+    ///   300s of its needs finishing"), or how it passed.
+    /// - `deployment` — reserved for the DeploymentGate (ADR-0070): the
+    ///   decisive Deployment's id (its creating seq). `None` for every other
+    ///   gate kind; absent on the wire when `None`.
+    ///
+    /// **Forward-only**: a binary from before this variant cannot replay a
+    /// log that carries it.
+    GateResolved {
+        step: StepId,
+        attempt: AttemptId,
+        passed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        deployment: Option<u64>,
     },
     /// A human requested a step rerun (ADR-0056) — the **Take boundary**.
     /// Emitted before any re-arming, so a Take view is a pure replay up to
@@ -1473,7 +1518,8 @@ impl StepRun {
                 FailureKind::Step
                 | FailureKind::Timeout
                 | FailureKind::Config
-                | FailureKind::MissingInputs,
+                | FailureKind::MissingInputs
+                | FailureKind::Gate,
             ) => StepStatus::Failed,
             Some(FailureKind::Infra {
                 never_started: true,

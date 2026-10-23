@@ -1813,7 +1813,9 @@ export interface components {
             /**
              * @description Coarse failure kind when `failed`: `infra` | `step` | `timeout` | `lost`
              *     | `config` | `missing-inputs` (an input snapshot gone from every tier —
-             *     Rerun/Retry regenerates it; ticket e140121).
+             *     Rerun/Retry regenerates it; ticket e140121) | `gate` (a gate's wait
+             *     resolved failed — e.g. not released within `gate_expires_after`; the
+             *     reason is in `failure_detail`).
              */
             failure?: string | null;
             /**

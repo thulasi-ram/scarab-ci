@@ -350,13 +350,15 @@ pub struct StepSpec {
     /// inlining — no compiled step retains it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub with: BTreeMap<String, String>,
-    /// For a `timer` gate, how long (seconds) to wait before the run
-    /// auto-releases and resumes (ADR-0008). Required for `timer`; forbidden on
-    /// any other kind.
+    /// For a `timer` gate, how long (seconds) to wait — measured from when its
+    /// `needs` finished — before the gate auto-releases (ADR-0008). Required
+    /// for `timer`; forbidden on any other kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_after: Option<u32>,
     /// Opt-in gate **expiry** (ADR-0047), in seconds: fail the gate (and hence
-    /// the run) if it is still unapproved this long after the run suspended.
+    /// the run) if it is still unapproved this long after its `needs`
+    /// finished (each gate keeps its own clock, whether or not the run is
+    /// suspended).
     /// Distinct from [`gate_after`](StepSpec::gate_after) (a timer's
     /// auto-release). Default = indefinite — gates may wait forever.
     #[serde(default, skip_serializing_if = "Option::is_none")]
