@@ -2242,6 +2242,13 @@ export interface components {
             environment: string;
             /** @description The latest source report's label, when it has one. */
             latest_label?: string | null;
+            /**
+             * @description `true` when the Deployment record could not be read for this view (a
+             *     store error, logged): the Deployment fields are then absent because
+             *     they are unknown, not because no Deployment is recorded. Omitted when
+             *     `false`.
+             */
+            record_unreadable?: boolean;
             target_id: string;
             target_source: string;
             /** @description The DeploymentVersion asked for. */

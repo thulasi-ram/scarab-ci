@@ -1259,6 +1259,12 @@ pub struct DeploymentGateDto {
     /// The latest source report's label, when it has one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_label: Option<String>,
+    /// `true` when the Deployment record could not be read for this view (a
+    /// store error, logged): the Deployment fields are then absent because
+    /// they are unknown, not because no Deployment is recorded. Omitted when
+    /// `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub record_unreadable: bool,
 }
 
 /// One of a step's co-located **sidecar services** (ADR-0058) — a throwaway

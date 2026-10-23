@@ -5,7 +5,9 @@
 //!   its Deployment stands), and once core resolves it, `gate_resolution` —
 //!   the verdict and reason from the journal's `GateResolved`;
 //! - a deploy Step held by per-DeploymentTarget concurrency carries `held`,
-//!   the oracle's reason.
+//!   the oracle's reason — never while its Run is still queued (`Pending`);
+//! - a Deployment record that cannot be read is said so
+//!   (`record_unreadable`), never shown as "no Deployment recorded yet".
 //!
 //! No kind: steps run on the `FakeExecutor`, reports go through
 //! `DeploymentStore::append`, the scheduler is ticked by hand with the
@@ -27,13 +29,13 @@ use tower::ServiceExt;
 
 use scarab_db_postgres::PostgresDb;
 use scarab_deployment::{
-    DeploymentInput, DeploymentStatusReport, DeploymentStore, DeploymentTarget, DeploymentVersion,
-    SourceAssertedStatus,
+    DeploymentInput, DeploymentStatusReport, DeploymentStore, DeploymentStoreError,
+    DeploymentTarget, DeploymentVersion, LoggedDeploymentInput, Millis, SourceAssertedStatus,
 };
 use scarab_engine::ports::ExecState;
 use scarab_engine::{
-    AttemptOutcome, Clock, Db, DeployContext, RunDeploymentRequest, RunId, Scheduler, StepId,
-    StepRun, StepSpec, StepStatus,
+    AttemptOutcome, Clock, Db, DeployContext, RunDeploymentRequest, RunId, RunStatus, Scheduler,
+    StepId, StepRun, StepSpec, StepStatus,
 };
 use scarab_project::{
     EnvironmentDeploymentDeadline, EnvironmentGovernanceStore, EnvironmentProjectEligibility,
@@ -371,6 +373,10 @@ async fn a_resolved_deployment_gate_shows_its_verdict_and_reason(w: World) {
     assert_eq!(waiting["deployment_status"], "requested");
     assert!(waiting["deployment_id"].is_u64(), "{live}");
     assert!(
+        waiting.get("record_unreadable").is_none(),
+        "the record was read: {live}"
+    );
+    assert!(
         live.get("gate_resolution").is_none(),
         "no verdict yet: {live}"
     );
@@ -442,3 +448,107 @@ async fn a_held_deploy_step_says_why(w: World) {
     w.finish().await;
 }
 both!(a_held_deploy_step_says_why, Some(1));
+
+/// Limit 1, A deploying on `argocd`/`web`: B has been created but not yet
+/// admitted — still queued (`Pending`), as when its run-level concurrency
+/// slot or a run cap is busy. The scheduler has not asked about B's deploy
+/// Step, so the view says nothing about a deployment-concurrency hold —
+/// that reason could be the wrong one. Once B is admitted, it is held and
+/// says so.
+async fn a_queued_run_shows_no_hold(w: World) {
+    w.seed("ra").await;
+    w.deploying("ra").await;
+    w.seed("rb").await;
+    assert_eq!(
+        w.db.run_status(&rid("rb")).await.unwrap(),
+        Some(RunStatus::Pending)
+    );
+
+    let bump = w.step_dto("rb", "bump").await;
+    assert!(
+        bump.get("held").is_none(),
+        "a queued Run is not held by deployment concurrency: {bump}"
+    );
+
+    w.tick().await;
+    assert_ne!(
+        w.db.run_status(&rid("rb")).await.unwrap(),
+        Some(RunStatus::Pending)
+    );
+    let bump = w.step_dto("rb", "bump").await;
+    assert_eq!(
+        bump["held"], "held: waiting for deployment concurrency on `argocd`/`web` (1/1 in flight)",
+        "{bump}"
+    );
+    w.finish().await;
+}
+both!(a_queued_run_shows_no_hold, Some(1));
+
+/// A Deployment record no read can get (a lasting store outage, a row this
+/// binary cannot parse) — a true external at this seam, so a fake. Appends
+/// are irrelevant: the step's success records through `Db`.
+struct UnreadableRecord;
+
+#[async_trait::async_trait]
+impl DeploymentStore for UnreadableRecord {
+    async fn append(
+        &self,
+        _: &str,
+        _: &DeploymentInput,
+        _: Millis,
+    ) -> Result<LoggedDeploymentInput, DeploymentStoreError> {
+        Err(DeploymentStoreError::Store("connection refused".into()))
+    }
+    async fn inputs(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<Vec<LoggedDeploymentInput>, DeploymentStoreError> {
+        Err(DeploymentStoreError::Store("connection refused".into()))
+    }
+    async fn inputs_as_of(
+        &self,
+        _: &str,
+        _: &str,
+        _: Millis,
+    ) -> Result<(Vec<LoggedDeploymentInput>, Millis), DeploymentStoreError> {
+        Err(DeploymentStoreError::Store("connection refused".into()))
+    }
+    async fn environments(&self, _: &str) -> Result<Vec<String>, DeploymentStoreError> {
+        Err(DeploymentStoreError::Store("connection refused".into()))
+    }
+}
+
+/// The record cannot be read while A's DeploymentGate waits: the view still
+/// names the target, carries no Deployment fields (they are unknown), and
+/// says the record was unreadable — not that no Deployment is recorded.
+#[tokio::test]
+async fn an_unreadable_record_is_said_so() {
+    let db = Arc::new(InMemoryDb::new());
+    let governance: Arc<dyn EnvironmentGovernanceStore> =
+        Arc::new(InMemoryEnvironmentGovernance::new().with_environment(
+            ORG,
+            ENV,
+            EnvironmentProjectEligibility::AllProjects,
+        ));
+    let w = World::new(
+        db.clone(),
+        Arc::new(UnreadableRecord),
+        governance,
+        None,
+        None,
+    )
+    .await;
+    w.seed("ra").await;
+    w.deploying("ra").await;
+    w.gate_waiting("ra").await;
+
+    let live = w.step_dto("ra", "live").await;
+    let waiting = &live["deployment_gate"];
+    assert_eq!(waiting["target_source"], "argocd", "{live}");
+    assert_eq!(waiting["target_id"], "web");
+    assert_eq!(waiting["record_unreadable"], true, "{live}");
+    assert!(waiting.get("deployment_status").is_none(), "{live}");
+    assert!(waiting.get("deployment_id").is_none(), "{live}");
+    w.finish().await;
+}

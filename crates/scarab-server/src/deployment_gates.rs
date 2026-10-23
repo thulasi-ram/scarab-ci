@@ -47,7 +47,11 @@
 //! and the Project's overlay — so the limit a Run sees is its own Project's;
 //! the count is every Project's Runs on the target). The limit is cached per
 //! tick like the deadline; the count never is — a Run admitted earlier in the
-//! same tick must be counted. An error holds the Step (fail closed).
+//! same tick must be counted. An error holds the Step (fail closed). A Run
+//! counted only through DeploymentGates that are not yet reached stops
+//! counting once the Environment's baseline deadline has elapsed since its
+//! request's effective time — the moment its Deployment reads `stalled` on
+//! the record — so opposite-order holds cannot deadlock two Runs (R3).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -90,6 +94,10 @@ pub struct ServerDeploymentGates {
 struct ProjectDeployRules {
     /// The deadline the Project's DeploymentGates use.
     gate_deadline: Millis,
+    /// The Environment's **baseline** deadline — never shorter than any
+    /// Project's `gate_deadline` there (tighten-only), and one value per
+    /// Environment: what bounds an unreached gate's hold on a target (R3).
+    baseline_deadline: Millis,
     /// Its per-DeploymentTarget concurrency limit; `None` = unlimited.
     deployment_concurrency: Option<std::num::NonZeroU32>,
 }
@@ -100,6 +108,7 @@ impl ProjectDeployRules {
     /// is an explicit opt-in that only governance can express.
     const UNGOVERNED: Self = Self {
         gate_deadline: DEFAULT_DEPLOYMENT_DEADLINE_MS,
+        baseline_deadline: DEFAULT_DEPLOYMENT_DEADLINE_MS,
         deployment_concurrency: None,
     };
 }
@@ -140,8 +149,11 @@ impl ServerDeploymentGates {
         Ok((self.read_fold(org, environment, now).await?, false))
     }
 
-    /// The Environment's fold read NOW, uncached, replacing this tick's cache
-    /// entry (so later gates of the tick share the newer read).
+    /// The Environment's fold read NOW, uncached and below the store's
+    /// horizon ([`DeploymentStore::inputs_as_of`]), replacing this tick's
+    /// cache entry (so later gates of the tick share the newer read). The
+    /// one place both the first read and the "missing request" re-read go
+    /// through.
     async fn read_fold(
         &self,
         org: &str,
@@ -149,11 +161,18 @@ impl ServerDeploymentGates {
         now: Millis,
     ) -> Result<Arc<CachedFold>, String> {
         let key = (org.to_string(), environment.to_string());
-        let inputs = self
+        // Below the store's horizon (ADR-0070 §8): the read first fences the
+        // Org's stamp clock past `now`, so every input it does not see is
+        // stamped after `now` — the fold is complete for the instant this
+        // gate decides for, and a verdict reached by absence (`stalled`) or
+        // by the state before the window (`passed`) can never be contradicted
+        // by an input stamped at or before it (R3).
+        let (inputs, horizon) = self
             .store
-            .inputs(org, environment)
+            .inputs_as_of(org, environment, now)
             .await
             .map_err(|e| e.to_string())?;
+        debug_assert!(horizon > now, "the fence stamps after now");
         let cached = Arc::new(CachedFold {
             folded: fold_ledger(&inputs),
             read_now: now,
@@ -192,6 +211,7 @@ impl ServerDeploymentGates {
                     let effective = g.effective_protection();
                     ProjectDeployRules {
                         gate_deadline: effective.deployment_gate_deadline.millis(),
+                        baseline_deadline: g.environment.deployment_deadline.millis(),
                         deployment_concurrency: effective.deployment_concurrency,
                     }
                 }),
@@ -215,11 +235,15 @@ impl ServerDeploymentGates {
 
     /// The per-DeploymentTarget concurrency hold for deploy Step `step` of
     /// `run` making `requests` — see [`DeploymentGates::deployment_concurrency_hold`].
-    /// The first target at its limit, in request order.
+    /// The first target at its limit, in request order. A Run counted
+    /// through only unreached DeploymentGates stops counting once the
+    /// Environment's baseline deadline has elapsed by `now` since its
+    /// request's effective time (the cutoff `now − baseline`).
     async fn concurrency_hold(
         &self,
         run: &RunId,
         requests: &[RunDeploymentRequest],
+        now: Timestamp,
     ) -> Result<Option<DeploymentConcurrencyHold>, String> {
         if requests.is_empty() {
             return Ok(None);
@@ -244,6 +268,7 @@ impl ServerDeploymentGates {
             let Some(limit) = rules.deployment_concurrency else {
                 continue;
             };
+            let unreached_gate_cutoff = Timestamp(now.0.saturating_sub(rules.baseline_deadline));
             let in_flight = self
                 .db
                 .deployment_requesting_runs(
@@ -252,6 +277,7 @@ impl ServerDeploymentGates {
                     &request.target_source,
                     &request.target_id,
                     run,
+                    unreached_gate_cutoff,
                 )
                 .await
                 .map_err(|e| e.to_string())?;
@@ -272,18 +298,20 @@ impl ServerDeploymentGates {
     /// makes no DeploymentRequest, or every target admits it. Derived, never
     /// read back: nothing is journalled per scheduler pass. Meaningful only
     /// for a `Pending` Step whose needs have all Succeeded (the only Step the
-    /// scheduler asks about); the caller checks that.
+    /// scheduler asks about); the caller checks that. `now` is the control
+    /// plane's clock, as the scheduler passes it.
     pub async fn step_concurrency_hold(
         &self,
         run: &RunId,
         step: &StepId,
+        now: Timestamp,
     ) -> Result<Option<DeploymentConcurrencyHold>, String> {
         let requests = self
             .db
             .run_deployment_requests(run, step)
             .await
             .map_err(|e| e.to_string())?;
-        self.concurrency_hold(run, &requests).await
+        self.concurrency_hold(run, &requests, now).await
     }
 
     async fn decide(
@@ -493,8 +521,9 @@ impl DeploymentGates for ServerDeploymentGates {
         run: &RunId,
         step: &StepId,
         requests: &[RunDeploymentRequest],
+        now: Timestamp,
     ) -> Result<Option<DeploymentConcurrencyHold>, String> {
-        let res = self.concurrency_hold(run, requests).await;
+        let res = self.concurrency_hold(run, requests, now).await;
         if let Err(e) = &res {
             tracing::warn!(
                 run = %run.0, step = %step.0, error = %e,

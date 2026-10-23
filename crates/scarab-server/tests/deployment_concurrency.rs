@@ -8,7 +8,9 @@
 //! when no gate references it. Runs are counted, not Deployments: two Runs
 //! requesting the same version (one Deployment) count 2. A held Step stays
 //! `Pending` with no Attempt, and its Run suspends (no budget billed) when
-//! nothing else is runnable.
+//! nothing else is runnable. A DeploymentGate that is not yet reached stops
+//! counting once the Environment's baseline deadline has elapsed since the
+//! request's effective time; a reached one counts until its verdict (R3).
 //!
 //! No kind: steps run on the `FakeExecutor`, reports go through
 //! `DeploymentStore::append`, the scheduler is ticked by hand with the
@@ -33,6 +35,7 @@ use scarab_engine::ports::ExecState;
 use scarab_engine::{
     cancel_run_request, AttemptOutcome, Clock, Db, DeployContext, EventPayload,
     RunDeploymentRequest, RunId, RunStatus, Scheduler, StepId, StepRun, StepSpec, StepStatus,
+    Timestamp,
 };
 use scarab_project::{
     EnvironmentDeploymentDeadline, EnvironmentGovernanceStore, EnvironmentProjectEligibility,
@@ -94,6 +97,10 @@ struct World {
     oracle: ServerDeploymentGates,
     clock: FakeClock,
     exec: FakeExecutor,
+    /// The Environment's baseline deployment deadline in this twin (5 min in
+    /// Postgres, the 1-hour default in memory): what bounds a hold through
+    /// an unreached DeploymentGate.
+    baseline_ms: i64,
     pg: Option<common::TestDb>,
 }
 
@@ -126,7 +133,7 @@ impl World {
         .await
         .unwrap();
         let governance: Arc<dyn EnvironmentGovernanceStore> = pg.clone();
-        Some(World::new(pg.clone(), pg, governance, limit, Some(tdb)).await)
+        Some(World::new(pg.clone(), pg, governance, limit, 5 * 60_000, Some(tdb)).await)
     }
 
     async fn inmemory(limit: Option<u32>) -> World {
@@ -137,7 +144,15 @@ impl World {
                 ENV,
                 EnvironmentProjectEligibility::AllProjects,
             ));
-        World::new(db.clone(), db, governance, limit, None).await
+        World::new(
+            db.clone(),
+            db,
+            governance,
+            limit,
+            scarab_deployment::DEFAULT_DEPLOYMENT_DEADLINE_MS,
+            None,
+        )
+        .await
     }
 
     /// The Project's overlay carries the limit (tighten-only over a baseline
@@ -147,6 +162,7 @@ impl World {
         store: Arc<dyn DeploymentStore>,
         governance: Arc<dyn EnvironmentGovernanceStore>,
         limit: Option<u32>,
+        baseline_ms: i64,
         pg: Option<common::TestDb>,
     ) -> World {
         governance
@@ -175,6 +191,7 @@ impl World {
             oracle,
             clock: FakeClock::new(T0),
             exec,
+            baseline_ms,
             pg,
         }
     }
@@ -373,9 +390,10 @@ impl World {
 
     /// What the oracle says about `run`'s `bump` right now (the b5 view).
     async fn hold_reason(&self, run: &str) -> Option<String> {
+        let now = self.clock.now().await;
         self.oracle
             .for_tick()
-            .step_concurrency_hold(&rid(run), &id("bump"))
+            .step_concurrency_hold(&rid(run), &id("bump"), now)
             .await
             .unwrap()
             .map(|h| h.reason())
@@ -580,8 +598,10 @@ async fn two_runs_on_one_deployment_still_count_two(w: World) {
     w.seed("rb", GATED).await;
     w.ticks(3).await;
     w.assert_held("rb").await;
+    // The cutoff the oracle passes now (now − the baseline deadline).
+    let cutoff = Timestamp(w.clock.now().await.0 - w.baseline_ms);
     assert_eq!(
-        w.db.deployment_requesting_runs(ORG, ENV, "argocd", WEB, &rid("rb"))
+        w.db.deployment_requesting_runs(ORG, ENV, "argocd", WEB, &rid("rb"), cutoff)
             .await
             .unwrap(),
         2
@@ -655,3 +675,39 @@ async fn the_hold_journals_nothing(w: World) {
     w.finish().await;
 }
 both!(the_hold_journals_nothing, Some(1));
+
+/// The unreached-gate bound (R3) never lets a REACHED gate go early. A's
+/// deploy Step starts at T0 (its request's effective time) and succeeds 30 s
+/// later; its gate then waits from T0 + 30 s. At T0 + the baseline deadline
+/// the request is past the unreached cutoff, but the gate is reached and its
+/// own deadline (from T0 + 30 s) has not elapsed: A is still in flight, and
+/// B stays held.
+async fn a_reached_gate_still_counts_past_the_cutoff(w: World) {
+    w.seed("ra", GATED).await;
+    w.deploying("ra").await;
+    assert_eq!(
+        w.step("ra", "bump").await.attempts[0].started_at,
+        Timestamp(T0)
+    );
+    w.seed("rb", GATED).await;
+    w.ticks(2).await;
+    w.assert_held("rb").await;
+
+    w.clock.advance(30_000);
+    w.deployed_and_gates_waiting(&["ra"]).await;
+    w.clock.advance(w.baseline_ms - 30_000);
+    w.ticks(3).await;
+    let live = w.step("ra", "live").await;
+    assert_eq!(live.status, StepStatus::Pending, "A's gate still waits");
+    assert_eq!(
+        live.attempts.last().map(|a| a.outcome),
+        Some(AttemptOutcome::Running)
+    );
+    w.assert_held("rb").await;
+    assert_eq!(
+        w.hold_reason("rb").await.as_deref(),
+        Some("held: waiting for deployment concurrency on `argocd`/`web` (1/1 in flight)")
+    );
+    w.finish().await;
+}
+both!(a_reached_gate_still_counts_past_the_cutoff, Some(1));

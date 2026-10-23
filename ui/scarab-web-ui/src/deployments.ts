@@ -94,7 +94,9 @@ export function requesterHref(org: string, r: Pick<DeploymentRequester, "run" | 
  *  (null when the Project is unknown — shown, not linked), its text, and the
  *  hover title. The run is named by its short id: `DeploymentRequesterDto`
  *  carries no run number (`#N`), and looking one up per requester would cost
- *  a query each. */
+ *  a query each. The short id is the id's LAST 8 characters — a run id is a
+ *  UUIDv7, whose leading characters are its timestamp, so two runs created
+ *  close together share a prefix and only the random tail tells them apart. */
 export function requesterRow(
   org: string,
   r: Pick<DeploymentRequester, "run" | "step" | "project">,
@@ -102,7 +104,7 @@ export function requesterRow(
   const href = requesterHref(org, r);
   return {
     href,
-    text: `${r.run.slice(0, 8)} · ${r.step}`,
+    text: `${r.run.slice(-8)} · ${r.step}`,
     title: href ? `run ${r.run} in ${r.project}` : `run ${r.run} (project unknown)`,
   };
 }

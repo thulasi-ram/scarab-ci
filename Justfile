@@ -513,7 +513,8 @@ plugin-kube-tests filter="":
 # DeploymentGate passes when the fake syncs it, Run B (r4) fails its gate on the
 # exhausted migrate hook. PLUGIN_VERIFY_DEPLOY_RUN=0 skips it;
 # PLUGIN_VERIFY_DEPLOY_EXECUTOR=local (default) | k8s picks where `bump` runs
-# (k8s = a kind Pod + the results sidecar; see the script header for its gap).
+# (k8s = a kind Pod + the results sidecar; NOT yet proven green live, and it
+# binds the unauthenticated dev API on 0.0.0.0 — see the script header).
 # Usage: `just plugin-verify` | `KEEP=1 just plugin-verify` (keep the fake Argo).
 plugin-verify:
     bash deploy/local-proc/plugin-verify.sh

@@ -305,6 +305,16 @@ impl DeploymentStore for UnreadableLog {
             "row 17: unknown report status".into(),
         ))
     }
+    async fn inputs_as_of(
+        &self,
+        _org: &str,
+        _environment: &str,
+        _now: Millis,
+    ) -> Result<(Vec<LoggedDeploymentInput>, Millis), DeploymentStoreError> {
+        Err(DeploymentStoreError::Store(
+            "row 17: unknown report status".into(),
+        ))
+    }
     async fn environments(&self, _org: &str) -> Result<Vec<String>, DeploymentStoreError> {
         Err(DeploymentStoreError::Store("unreadable".into()))
     }

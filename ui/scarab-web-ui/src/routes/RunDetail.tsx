@@ -48,6 +48,7 @@ import {
 } from "../takes";
 import { stripTries as stripTriesOf } from "../attempts";
 import {
+  actionableGateIds,
   actionableGates,
   gateBlockers,
   gateStatus,
@@ -569,6 +570,10 @@ export default function RunDetail() {
   // rejected — core passes it), beside Approve on manual gates; a gate whose
   // needs are unmet lists with both disabled (the server 409s it).
   const pendingGates = () => actionableGates(run()?.steps ?? []);
+  // What the gate bar iterates: IDs, which survive a poll that replaces every
+  // step object, so an open row (and its Reject form) is never re-mounted.
+  const pendingGateIds = () => actionableGateIds(run()?.steps ?? []);
+  const gateStep = (gid: string) => pendingGates().find((s) => s.id === gid);
 
   const statusOf = (step: string) => (run()?.steps ?? []).find((s) => s.id === step)?.status;
 
@@ -721,90 +726,98 @@ export default function RunDetail() {
                 read-only. */}
             <Show when={pendingGates().length > 0 && !timeTraveling()}>
               <div class="gate-bar">
-                <For each={pendingGates()}>
-                  {(g) => (
-                    <div class="gate-row" classList={{ blocked: blockersOf(g).length > 0 }}>
-                      <Icon icon="shield-check" size={13} />
-                      <span class="gate-step mono">{g.id}</span>
-                      <span class="gate-kind mono">{g.gate}</span>
-                      <span class="gate-hint" title={gateWaitHint(g, statusOf)}>
-                        {gateWaitHint(g, statusOf)}
-                      </span>
-                      <Show when={gateNotes()[g.id]}>
-                        {(note) => <span class="gate-note">{note()}</span>}
-                      </Show>
-                      <Show
-                        when={rejectFor() === g.id}
-                        fallback={
-                          <span class="gate-actions">
-                            <button
-                              class="btn btn-sm btn-ghost"
-                              onClick={() => openReject(g.id)}
-                              disabled={rejecting() !== null || !isRejectable(g, statusOf)}
-                              title={
-                                blockersOf(g).length > 0
-                                  ? `blocked — ${blockersOf(g).join(", ")} has not succeeded`
-                                  : `reject ${g.id} — fail it with a reason; the run fails`
-                              }
-                            >
-                              Reject
-                            </button>
-                            <Show when={isApprovable(g)}>
-                              <button
-                                class="btn btn-sm btn-primary"
-                                onClick={() => void onApprove(g.id)}
-                                disabled={approving() !== null || blockersOf(g).length > 0}
-                                title={
-                                  blockersOf(g).length > 0
-                                    ? `blocked — ${blockersOf(g).join(", ")} has not succeeded`
-                                    : `approve ${g.id}`
-                                }
-                              >
-                                {approving() === g.id ? "approving…" : "Approve"}
-                              </button>
-                            </Show>
+                {/* Keyed by gate ID, not by step object: every poll replaces
+                    the run's step objects, and a row keyed by object would be
+                    rebuilt each time — re-mounting an open Reject form (its
+                    caret, an IME composition) about once a second. */}
+                <For each={pendingGateIds()}>
+                  {(gid) => (
+                    <Show when={gateStep(gid)}>
+                      {(g) => (
+                        <div class="gate-row" classList={{ blocked: blockersOf(g()).length > 0 }}>
+                          <Icon icon="shield-check" size={13} />
+                          <span class="gate-step mono">{g().id}</span>
+                          <span class="gate-kind mono">{g().gate}</span>
+                          <span class="gate-hint" title={gateWaitHint(g(), statusOf)}>
+                            {gateWaitHint(g(), statusOf)}
                           </span>
-                        }
-                      >
-                        {/* The in-page confirm: a required reason, then an
-                            explicit "Reject gate". The reason is journalled on
-                            the verdict and the gate's Attempt. */}
-                        <form
-                          class="gate-reject"
-                          onSubmit={(e) => {
-                            e.preventDefault();
-                            void onReject(g.id);
-                          }}
-                        >
-                          <input
-                            class="input input-sm"
-                            type="text"
-                            required
-                            maxlength={1024}
-                            placeholder="why reject? (required)"
-                            aria-label={`reason for rejecting ${g.id}`}
-                            value={rejectReason()}
-                            onInput={(e) => setRejectReason(e.currentTarget.value)}
-                            ref={(el) => queueMicrotask(() => el.focus())}
-                          />
-                          <button
-                            type="submit"
-                            class="btn btn-sm btn-danger"
-                            disabled={rejecting() !== null || rejectReasonError(rejectReason()) !== null}
+                          <Show when={gateNotes()[g().id]}>
+                            {(note) => <span class="gate-note">{note()}</span>}
+                          </Show>
+                          <Show
+                            when={rejectFor() === g().id}
+                            fallback={
+                              <span class="gate-actions">
+                                <button
+                                  class="btn btn-sm btn-ghost"
+                                  onClick={() => openReject(g().id)}
+                                  disabled={rejecting() !== null || !isRejectable(g(), statusOf)}
+                                  title={
+                                    blockersOf(g()).length > 0
+                                      ? `blocked — ${blockersOf(g()).join(", ")} has not succeeded`
+                                      : `reject ${g().id} — fail it with a reason; the run fails`
+                                  }
+                                >
+                                  Reject
+                                </button>
+                                <Show when={isApprovable(g())}>
+                                  <button
+                                    class="btn btn-sm btn-primary"
+                                    onClick={() => void onApprove(g().id)}
+                                    disabled={approving() !== null || blockersOf(g()).length > 0}
+                                    title={
+                                      blockersOf(g()).length > 0
+                                        ? `blocked — ${blockersOf(g()).join(", ")} has not succeeded`
+                                        : `approve ${g().id}`
+                                    }
+                                  >
+                                    {approving() === g().id ? "approving…" : "Approve"}
+                                  </button>
+                                </Show>
+                              </span>
+                            }
                           >
-                            {rejecting() === g.id ? "rejecting…" : "Reject gate"}
-                          </button>
-                          <button
-                            type="button"
-                            class="btn btn-sm btn-ghost"
-                            onClick={() => setRejectFor(null)}
-                            disabled={rejecting() !== null}
-                          >
-                            Cancel
-                          </button>
-                        </form>
-                      </Show>
-                    </div>
+                            {/* The in-page confirm: a required reason, then an
+                                explicit "Reject gate". The reason is journalled on
+                                the verdict and the gate's Attempt. */}
+                            <form
+                              class="gate-reject"
+                              onSubmit={(e) => {
+                                e.preventDefault();
+                                void onReject(g().id);
+                              }}
+                            >
+                              <input
+                                class="input input-sm"
+                                type="text"
+                                required
+                                maxlength={1024}
+                                placeholder="why reject? (required)"
+                                aria-label={`reason for rejecting ${g().id}`}
+                                value={rejectReason()}
+                                onInput={(e) => setRejectReason(e.currentTarget.value)}
+                                ref={(el) => queueMicrotask(() => el.focus())}
+                              />
+                              <button
+                                type="submit"
+                                class="btn btn-sm btn-danger"
+                                disabled={rejecting() !== null || rejectReasonError(rejectReason()) !== null}
+                              >
+                                {rejecting() === g().id ? "rejecting…" : "Reject gate"}
+                              </button>
+                              <button
+                                type="button"
+                                class="btn btn-sm btn-ghost"
+                                onClick={() => setRejectFor(null)}
+                                disabled={rejecting() !== null}
+                              >
+                                Cancel
+                              </button>
+                            </form>
+                          </Show>
+                        </div>
+                      )}
+                    </Show>
                   )}
                 </For>
               </div>
