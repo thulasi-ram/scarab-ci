@@ -11,11 +11,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use scarab_engine::{
-    Clock, Db, Executor, Scheduler, SchedulerError, ServiceStatus, StepStatus, Supervision,
-    TickHealth, WorkspaceSnapshots,
+    Clock, Db, DeploymentGates, Executor, Scheduler, SchedulerError, ServiceStatus, StepStatus,
+    Supervision, TickHealth, WorkspaceSnapshots,
 };
 use scarab_forge::ForgePort;
 
+use crate::deployment_gates::ServerDeploymentGates;
 use crate::{InfraObserver, LogTailer};
 
 /// Run one converged cycle across all active runs: tick the scheduler, ensure a
@@ -29,6 +30,7 @@ pub async fn tick_once(
     clock: &Arc<dyn Clock>,
     executor: &Arc<dyn Executor>,
     snapshots: Option<&Arc<dyn WorkspaceSnapshots>>,
+    deployment_gates: Option<&ServerDeploymentGates>,
     forge: Option<&Arc<dyn ForgePort>>,
     tailer: Option<&LogTailer>,
     observer: Option<&InfraObserver>,
@@ -50,10 +52,16 @@ pub async fn tick_once(
     // 6825830 for reconcile_services alone) come back here — the pure engine
     // does not log; the driver, which owns tracing, surfaces them without
     // aborting the tick.
+    // The DeploymentGate oracle (ADR-0070 §8) caches each Environment's fold
+    // for ONE tick, so every cycle asks a fresh view of it.
+    let gates = deployment_gates.map(ServerDeploymentGates::for_tick);
     let isolated = Scheduler::new(&**db, &**clock, &**executor, owner)
         // Cache-key resolution at launch (ADR-0065 s1) rides the same oracle
         // the rerun-widening legs use; `None` = the cache is silently off.
         .with_snapshots(snapshots.map(|s| &**s as &dyn WorkspaceSnapshots))
+        // DeploymentGates resolve from the Deployment record; `None` = they
+        // make no decision of their own (see `DeploymentGates`).
+        .with_deployments(gates.as_ref().map(|g| g as &dyn DeploymentGates))
         .with_outbox_visibility_ms(visibility_ms)
         .with_default_step_timeout_ms(step_timeout_ms)
         .with_supervision(supervision.clone())
@@ -192,7 +200,10 @@ async fn ensure_service_tails(db: &Arc<dyn Db>, tailer: &LogTailer) -> Result<()
 ///
 /// When `logs` is supplied the driver also runs the log-tail source (ADR-0013):
 /// each tick it ensures a best-effort tail into that [`LogService`] for every
-/// running step, using the same `executor` as the launch path.
+/// running step, using the same `executor` as the launch path. When
+/// `deployment_gates` is supplied, a waiting `gate: deployment` step is
+/// resolved from the Deployment record (ADR-0070 §8); without it such a gate
+/// makes no decision of its own.
 // Wiring seam: all inputs are distinct composition-root dependencies, so bundling
 // them into a config struct would only add indirection.
 #[allow(clippy::too_many_arguments)]
@@ -201,6 +212,7 @@ pub fn spawn_driver(
     clock: Arc<dyn Clock>,
     executor: Arc<dyn Executor>,
     snapshots: Option<Arc<dyn WorkspaceSnapshots>>,
+    deployment_gates: Option<ServerDeploymentGates>,
     forge: Option<Arc<dyn ForgePort>>,
     logs: Option<Arc<crate::LogService>>,
     owner: String,
@@ -228,6 +240,7 @@ pub fn spawn_driver(
                 &clock,
                 &executor,
                 snapshots.as_ref(),
+                deployment_gates.as_ref(),
                 forge.as_ref(),
                 tailer.as_ref(),
                 Some(&observer),

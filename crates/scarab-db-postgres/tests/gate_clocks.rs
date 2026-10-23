@@ -311,6 +311,7 @@ fn resolution(passed: bool, fence: Option<&str>, at: i64) -> GateResolution {
         reason: if passed { "released" } else { "no" }.to_string(),
         expired: false,
         by: None,
+        deployment: None,
         fence: fence.map(|f| AttemptId(f.into())),
         legacy_started_at: Timestamp(2_000),
         at: Timestamp(at),

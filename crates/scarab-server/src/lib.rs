@@ -60,6 +60,7 @@ pub mod clone_executor;
 pub mod config;
 pub mod connections_config;
 pub mod converged;
+pub mod deployment_gates;
 pub mod depot_expiry;
 pub mod forge_router;
 pub mod infra_observer;
@@ -2432,7 +2433,8 @@ fn rerun_outcome<T>(res: Result<T, RerunError>) -> Result<T, ApiError> {
             e @ (RerunError::NotAManualGate(_)
             | RerunError::GateNotPending { .. }
             | RerunError::GateNotReached { .. }
-            | RerunError::NotARejectableGate(_)),
+            | RerunError::NotARejectableGate(_)
+            | RerunError::NotAReleasableGate(_)),
         ) => Err(ApiError::Conflict(e.to_string())),
         Err(RerunError::Db(e)) => Err(ApiError::Db(e)),
     }
@@ -4366,7 +4368,8 @@ async fn admit_and_create_run(
 /// resolved for one Run: the Environment is the pipeline's own, each target
 /// part a literal or its `${{ inputs.<name> }}` bound to the launch parameters
 /// (`params`; for a webhook Run, which supplies none, the interface's
-/// defaults). Fails closed: a target that does not resolve to a non-empty
+/// defaults), and each carrying the DeploymentGates that wait on it
+/// (`gate_steps`, criterion 2). Fails closed: a target that does not resolve to a non-empty
 /// value is a pipeline error and no Run is created — the same rule the
 /// concurrency group follows.
 fn resolve_deployment_requests(
@@ -4426,6 +4429,20 @@ fn resolve_deployment_requests(
                 evidence_results: req.evidence.clone(),
                 gate_steps: Vec::new(),
             });
+        }
+    }
+    // Each DeploymentGate onto the request it waits on (ADR-0070 §8), so the
+    // engine finds it by the gate's id. Validation has resolved every
+    // reference; one that does not resolve stays unattached, and that gate
+    // fails with the reason when it is reached.
+    for gate in &ir.steps {
+        if let Some((requester, ordinal)) = scarab_pipeline::deployment_gate_request(ir, gate) {
+            if let Some(req) = out
+                .iter_mut()
+                .find(|r| r.step.0 == requester.id && r.ordinal as usize == ordinal)
+            {
+                req.gate_steps.push(StepId(gate.id.clone()));
+            }
         }
     }
     Ok(out)
@@ -7163,7 +7180,8 @@ async fn approve_gate(
             | RerunError::NotAManualGate(_)
             | RerunError::GateNotPending { .. }
             | RerunError::GateNotReached { .. }
-            | RerunError::NotARejectableGate(_)),
+            | RerunError::NotARejectableGate(_)
+            | RerunError::NotAReleasableGate(_)),
         ) => return Err(ApiError::Conflict(e.to_string())),
         Err(RerunError::Db(e)) => return Err(ApiError::Db(e)),
     }
@@ -7225,7 +7243,8 @@ async fn approve_gate(
             | RerunError::NotAManualGate(_)
             | RerunError::GateNotPending { .. }
             | RerunError::GateNotReached { .. }
-            | RerunError::NotARejectableGate(_)),
+            | RerunError::NotARejectableGate(_)
+            | RerunError::NotAReleasableGate(_)),
         ) => return Err(ApiError::Conflict(e.to_string())),
         Err(RerunError::Db(e)) => return Err(ApiError::Db(e)),
     }
@@ -7295,8 +7314,10 @@ fn gate_reject_reason(reason: &str) -> Result<&str, ApiError> {
 
 /// Reject a waiting gate: fail it with a reason (ADR-0070 §9).
 ///
-/// For a `manual`, `timer` or `external` gate that is pending and reached
-/// (every step it needs has succeeded; slice b, criterion 3). The gate's Attempt fails with
+/// For any gate — `manual`, `timer`, `external` or `deployment` — that is
+/// pending and reached (every step it needs has succeeded; slice b, criteria 2
+/// and 3). A deployment gate can only be rejected, never approved or
+/// released: core passes it from the Deployment record. The gate's Attempt fails with
 /// the reason and the rejecting principal, its dependents are skipped, and the
 /// run ends `failed`; retrying the gate opens a new wait that asks again.
 ///
@@ -7525,7 +7546,8 @@ async fn release_gate_external(
             | RerunError::NotAManualGate(_)
             | RerunError::GateNotPending { .. }
             | RerunError::GateNotReached { .. }
-            | RerunError::NotARejectableGate(_)),
+            | RerunError::NotARejectableGate(_)
+            | RerunError::NotAReleasableGate(_)),
         ) => Err(ApiError::Conflict(e.to_string())),
         Err(RerunError::Db(e)) => Err(ApiError::Db(e)),
     }

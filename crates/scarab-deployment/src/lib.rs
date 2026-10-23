@@ -90,10 +90,11 @@
 //! - **INV-DEP-8** No input is lost: every request is a requester, and every
 //!   report is a report, on exactly one Deployment with the input's key.
 //! - **INV-DEP-9** A DeploymentGate looks forward: it fails on `failed` only
-//!   for a `failed` report at or after its request's effective time, passes
-//!   only if the Deployment was live then or is reported live after, and
-//!   fails on `stalled` only once the deadline has elapsed since then. A
-//!   failure that predates the request never fails it.
+//!   for a `failed` report at or after its window start — the later of its
+//!   request's effective time and its gate Attempt's start — passes only if
+//!   the Deployment was live then or is reported live after, and fails on
+//!   `stalled` only once the deadline has elapsed since then. A failure that
+//!   predates the window never fails it.
 //! - **INV-DEP-10** A DeploymentGate verdict, once reached, never changes.
 //! - **INV-DEP-11** A request never creates a Deployment when its key's
 //!   newest Deployment was first seen at or after the request's effective
@@ -102,6 +103,11 @@
 //!   un-explains one: a report-created Deployment is explained only by a
 //!   request whose effective time is at or before its creation, and once
 //!   explained it stays explained.
+//! - **INV-DEP-13** A gate Attempt's start only ever narrows its window: an
+//!   input received at or before the Attempt started never fails the gate,
+//!   and a floor never makes a verdict arrive sooner or land earlier than the
+//!   floor-free one ([`Deployment::gate_verdict_from`]; the retry of a failed
+//!   DeploymentGate waits afresh on the same Deployment).
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
@@ -113,8 +119,8 @@ pub use store::{
     DeploymentStore, DeploymentStoreError, LoggedDeploymentInput, RECEIVED_AT_MAX_LEAD_MS,
 };
 pub use view::{
-    fold_environment, DeploymentRequesterView, DeploymentStatusReportView, DeploymentView,
-    EnvironmentBoardRow, EnvironmentDeployments,
+    fold_environment, fold_ledger, DeploymentRequesterView, DeploymentStatusReportView,
+    DeploymentView, EnvironmentBoardRow, EnvironmentDeployments, FoldedLedger,
 };
 
 /// Milliseconds since the epoch. Time is an input to the fold, never read.
@@ -303,6 +309,8 @@ pub struct Deployment {
     pub stall_clock_from: Millis,
     pub superseded_at: Option<Millis>,
     superseded_seq: Option<u64>,
+    /// The Deployment that took its place, when it was superseded.
+    superseded_by: Option<DeploymentId>,
     /// A source report created it, not a request.
     created_by_report: bool,
     /// Some request explains it — the one that created it, or one whose step
@@ -321,6 +329,16 @@ pub enum DeploymentGateVerdict {
         reason: DeploymentGateFailure,
         at: Millis,
     },
+}
+
+/// A DeploymentGate's verdict together with the report that decided it, if
+/// one did (a `live` or `failed` report; not an earlier live state, a
+/// supersession or the deadline) — the source's label is the reason a
+/// `failed` gate shows (ADR-0070 §8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeploymentGateDecision<'a> {
+    pub verdict: DeploymentGateVerdict,
+    pub report: Option<&'a DeploymentStatusReport>,
 }
 
 /// Why a DeploymentGate failed.
@@ -403,12 +421,22 @@ impl Deployment {
                 .is_some_and(|(_, r)| r.status == SourceAssertedStatus::Live)
     }
 
+    /// The Deployment that superseded this one, if it was superseded: the
+    /// newer Deployment created on its target, or the one reported live in
+    /// its place.
+    pub fn superseded_by(&self) -> Option<DeploymentId> {
+        self.superseded_by
+    }
+
     /// The verdict, as of `now`, of a DeploymentGate on `requester`'s
     /// DeploymentRequest — `None` while it is still waiting (or if that
     /// requester never landed here). Looks only forward from the request
     /// (INV-DEP-9): it passes if the Deployment was already live, otherwise
     /// the earliest of a decisive report, supersession or the deadline
     /// decides, so the verdict never changes once reached (INV-DEP-10).
+    ///
+    /// The window opens at the request itself: this is
+    /// [`gate_verdict_from`](Self::gate_verdict_from) with no floor.
     pub fn gate_verdict(
         &self,
         requester: &DeploymentRequester,
@@ -416,13 +444,73 @@ impl Deployment {
         deadline: Millis,
     ) -> Option<DeploymentGateVerdict> {
         let start = self.requesters.get(requester)?.instant();
+        self.decide(start, now, deadline).map(|(v, _)| v)
+    }
+
+    /// The verdict, as of `now`, of a DeploymentGate whose window may open
+    /// no earlier than `window_floor` — its gate Attempt's start (ADR-0070
+    /// §8): the window opens at the later of the request and the floor.
+    ///
+    /// The floor is the instant `(window_floor, u64::MAX)`: an input received
+    /// in the same millisecond as the Attempt started counts as **before**
+    /// the window (a `live` then passes the gate at once; a `failed` then is
+    /// history). So a retried DeploymentGate — a new Attempt with a later
+    /// start — waits afresh on the same Deployment: the failure that failed
+    /// its last Attempt cannot fail this one (INV-DEP-13), and its stall
+    /// deadline runs from the new start.
+    ///
+    /// A window that has not opened by `now` has no verdict.
+    pub fn gate_verdict_from(
+        &self,
+        requester: &DeploymentRequester,
+        window_floor: Millis,
+        now: Millis,
+        deadline: Millis,
+    ) -> Option<DeploymentGateVerdict> {
+        self.gate_decision_from(requester, window_floor, now, deadline)
+            .map(|d| d.verdict)
+    }
+
+    /// [`gate_verdict_from`](Self::gate_verdict_from), with the report that
+    /// decided it.
+    pub fn gate_decision_from(
+        &self,
+        requester: &DeploymentRequester,
+        window_floor: Millis,
+        now: Millis,
+        deadline: Millis,
+    ) -> Option<DeploymentGateDecision<'_>> {
+        let mark = self.requesters.get(requester)?.instant();
+        let floor = DeploymentInstant {
+            at: window_floor,
+            seq: u64::MAX,
+        };
+        let (verdict, report) = self.decide(mark.max(floor), now, deadline)?;
+        Some(DeploymentGateDecision {
+            verdict,
+            report: report.map(|i| &self.reports[i]),
+        })
+    }
+
+    /// The verdict of a window opening at `start`, and the index of the
+    /// report that decided it, if one did.
+    fn decide(
+        &self,
+        start: DeploymentInstant,
+        now: Millis,
+        deadline: Millis,
+    ) -> Option<(DeploymentGateVerdict, Option<usize>)> {
+        if start.at > now {
+            return None;
+        }
         if self.live_before(start) {
-            return Some(DeploymentGateVerdict::Passed { at: start.at });
+            return Some((DeploymentGateVerdict::Passed { at: start.at }, None));
         }
         let report = self
             .reports_in_order()
-            .find(|(i, r)| *i > start && r.status != SourceAssertedStatus::InProgress)
-            .map(|(i, r)| {
+            .enumerate()
+            .find(|(_, (i, r))| *i > start && r.status != SourceAssertedStatus::InProgress)
+            .map(|(idx, (i, r))| {
                 let verdict = match r.status {
                     SourceAssertedStatus::Live => DeploymentGateVerdict::Passed { at: r.at },
                     _ => DeploymentGateVerdict::Failed {
@@ -430,16 +518,16 @@ impl Deployment {
                         at: r.at,
                     },
                 };
-                (i, verdict)
+                (i, verdict, Some(idx))
             });
         let superseded = self.superseded_instant().map(|i| {
             let verdict = DeploymentGateVerdict::Failed {
                 reason: DeploymentGateFailure::Superseded,
                 at: i.at.max(start.at),
             };
-            (i, verdict)
+            (i, verdict, None)
         });
-        let stall_at = start.at + deadline;
+        let stall_at = start.at.saturating_add(deadline);
         let stalled = Some((
             DeploymentInstant {
                 at: stall_at,
@@ -449,13 +537,14 @@ impl Deployment {
                 reason: DeploymentGateFailure::Stalled,
                 at: stall_at,
             },
+            None,
         ));
         [report, superseded, stalled]
             .into_iter()
             .flatten()
-            .filter(|(i, _)| i.at <= now)
-            .min_by_key(|(i, _)| *i)
-            .map(|(_, verdict)| verdict)
+            .filter(|(i, _, _)| i.at <= now)
+            .min_by_key(|(i, _, _)| *i)
+            .map(|(_, verdict, report)| (verdict, report))
     }
 }
 
@@ -486,6 +575,24 @@ impl DeploymentLedger {
     /// The newest Deployment on `target`, if any.
     pub fn newest_on(&self, target: &DeploymentTarget) -> Option<&Deployment> {
         self.deployments.iter().rev().find(|d| &d.target == target)
+    }
+
+    /// The Deployment `requester`'s **current** DeploymentRequest on
+    /// `target` landed on — the one its latest request joined or created
+    /// (the mark with the highest arrival sequence), since a re-request of
+    /// a different version lands on another Deployment and leaves the old
+    /// mark where it was. `None` if it never requested anything there.
+    pub fn request_of(
+        &self,
+        requester: &DeploymentRequester,
+        target: &DeploymentTarget,
+    ) -> Option<&Deployment> {
+        self.deployments
+            .iter()
+            .filter(|d| &d.target == target)
+            .filter_map(|d| d.requesters.get(requester).map(|m| (m.seq, d)))
+            .max_by_key(|(seq, _)| *seq)
+            .map(|(_, d)| d)
     }
 
     /// The Deployment currently live on `target`, if any (INV-DEP-1 makes
@@ -608,7 +715,11 @@ impl DeploymentLedger {
                     // An older Deployment is kept open only while it is the
                     // live one; it stopped being live, so the newer one has
                     // taken its place.
-                    supersede(&mut self.deployments[idx], now);
+                    let newest = self
+                        .newest_on(&self.deployments[idx].target)
+                        .map(|d| d.id)
+                        .expect("a Deployment that is not the newest has a newer one");
+                    supersede(&mut self.deployments[idx], now, newest);
                 }
             }
         }
@@ -643,15 +754,15 @@ impl DeploymentLedger {
         now: DeploymentInstant,
         created_by_report: bool,
     ) -> usize {
+        let id = DeploymentId(self.deployments.len() as u64);
         for d in self.deployments.iter_mut() {
             if d.target == target
                 && d.is_open()
                 && d.latest_report() != Some(SourceAssertedStatus::Live)
             {
-                supersede(d, now);
+                supersede(d, now, id);
             }
         }
-        let id = DeploymentId(self.deployments.len() as u64);
         self.deployments.push(Deployment {
             id,
             target,
@@ -663,6 +774,7 @@ impl DeploymentLedger {
             stall_clock_from: now.at,
             superseded_at: None,
             superseded_seq: None,
+            superseded_by: None,
             created_by_report,
             explained: false,
         });
@@ -673,13 +785,14 @@ impl DeploymentLedger {
     /// is now superseded.
     fn supersede_other_live(&mut self, idx: usize, now: DeploymentInstant) {
         let target = self.deployments[idx].target.clone();
+        let by = self.deployments[idx].id;
         for (i, d) in self.deployments.iter_mut().enumerate() {
             if i != idx
                 && d.target == target
                 && d.is_open()
                 && d.latest_report() == Some(SourceAssertedStatus::Live)
             {
-                supersede(d, now);
+                supersede(d, now, by);
             }
         }
     }
@@ -695,7 +808,8 @@ pub fn admits_deployment_concurrency(limit: Option<NonZeroU32>, in_flight: usize
     limit.is_none_or(|limit| (in_flight as u64) < u64::from(limit.get()))
 }
 
-fn supersede(d: &mut Deployment, now: DeploymentInstant) {
+fn supersede(d: &mut Deployment, now: DeploymentInstant, by: DeploymentId) {
     d.superseded_at = Some(now.at);
     d.superseded_seq = Some(now.seq);
+    d.superseded_by = Some(by);
 }

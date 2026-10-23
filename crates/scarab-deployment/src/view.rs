@@ -106,6 +106,55 @@ impl EnvironmentDeployments {
     }
 }
 
+/// One Environment's log folded into a [`DeploymentLedger`], with each
+/// Deployment's **public id** (the seq of the input that created it — see the
+/// module docs). What a DeploymentGate's verdict is read from
+/// ([`Deployment::gate_decision_from`](crate::Deployment::gate_decision_from)):
+/// unlike [`EnvironmentDeployments`] it keeps the ledger, so a gate can ask
+/// about a requester's own request window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoldedLedger {
+    ledger: DeploymentLedger,
+    /// Indexed by ledger position: the seq of the input that created it.
+    created_by: Vec<u64>,
+}
+
+impl FoldedLedger {
+    pub fn ledger(&self) -> &DeploymentLedger {
+        &self.ledger
+    }
+
+    /// The public id of `d`, a Deployment of this ledger.
+    pub fn public_id(&self, d: &crate::Deployment) -> u64 {
+        self.created_by[d.id.0 as usize]
+    }
+
+    /// The Deployment of this ledger with ledger id `id`.
+    pub fn get(&self, id: crate::DeploymentId) -> Option<&crate::Deployment> {
+        self.ledger.get(id)
+    }
+}
+
+/// Fold `inputs` — one Environment's log, in seq order — into a
+/// [`FoldedLedger`]. Time-independent: the fold never reads `now`; a
+/// verdict or a status is asked of the result.
+pub fn fold_ledger(inputs: &[LoggedDeploymentInput]) -> FoldedLedger {
+    debug_assert!(
+        inputs.windows(2).all(|w| w[0].seq < w[1].seq),
+        "inputs must be in strictly increasing seq order"
+    );
+    let mut ledger = DeploymentLedger::new();
+    let mut created_by = Vec::new();
+    for logged in inputs {
+        let before = ledger.deployments().len();
+        ledger.apply(logged.input.clone());
+        if ledger.deployments().len() > before {
+            created_by.push(logged.seq);
+        }
+    }
+    FoldedLedger { ledger, created_by }
+}
+
 /// Fold `inputs` — one Environment's log, in seq order — into its
 /// Deployments and board as of `now`, under `deadline` (the
 /// EnvironmentDeploymentDeadline).

@@ -1338,8 +1338,10 @@ export interface paths {
         put?: never;
         /**
          * Reject a waiting gate: fail it with a reason (ADR-0070 §9).
-         * @description For a `manual`, `timer` or `external` gate that is pending and reached
-         *     (every step it needs has succeeded; slice b, criterion 3). The gate's Attempt fails with
+         * @description For any gate — `manual`, `timer`, `external` or `deployment` — that is
+         *     pending and reached (every step it needs has succeeded; slice b, criteria 2
+         *     and 3). A deployment gate can only be rejected, never approved or
+         *     released: core passes it from the Deployment record. The gate's Attempt fails with
          *     the reason and the rejecting principal, its dependents are skipped, and the
          *     run ends `failed`; retrying the gate opens a new wait that asks again.
          *

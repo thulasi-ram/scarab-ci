@@ -20,7 +20,10 @@
 pub mod ports;
 pub mod scheduler;
 
-pub use ports::{Clock, Db, Executor, LogChunks, SnapshotRetention, WorkspaceSnapshots};
+pub use ports::{
+    Clock, Db, DeploymentGateDecision, DeploymentGates, Executor, LogChunks, SnapshotRetention,
+    WorkspaceSnapshots,
+};
 pub use scheduler::{
     cancel_run_request, gate_approvers, pin_run_snapshots, plan_rerun, record_gate_approval,
     reject_gate, release_gate, wait_began_at,
@@ -381,6 +384,10 @@ pub struct GateResolution {
     /// Who decided (a rejecting principal, `external:{step}`); `None` for a
     /// release, a timer or an expiry.
     pub by: Option<String>,
+    /// A DeploymentGate's verdict: the public id of the Deployment it waited
+    /// on (journalled as `GateResolved.deployment`). `None` for every other
+    /// verdict, a human reject of a DeploymentGate included.
+    pub deployment: Option<u64>,
     /// The wait this verdict is for. `Some(a)` (the scheduler): resolve only
     /// while `a` is still the open wait — a superseded or cancelled wait takes
     /// no verdict. `None` (an API release or reject): close whichever wait is
@@ -455,7 +462,7 @@ pub fn gate_resolution_events(
         attempt: attempt.clone(),
         passed: res.passed,
         reason: Some(res.reason.clone()),
-        deployment: None,
+        deployment: res.deployment,
         by: res.by.clone(),
     });
     out
@@ -988,8 +995,9 @@ pub struct RunDeploymentRequest {
     pub version_result: String,
     /// The declared results holding the evidence, in authored order.
     pub evidence_results: Vec<String>,
-    /// The DeploymentGates in this Run waiting on this request (filled by the
-    /// DeploymentGate sub-slice; empty until then).
+    /// The DeploymentGates in this Run that wait on this request — filled at
+    /// Run creation from each `gate: deployment` step's `deployment:`
+    /// reference. The engine finds a DeploymentGate's request here.
     pub gate_steps: Vec<StepId>,
 }
 
@@ -1176,9 +1184,10 @@ pub enum EventPayload {
     ///   [`FailureKind::Gate`].
     /// - `reason` — the human line: why it failed ("not released within
     ///   300s of its needs finishing"), or how it passed.
-    /// - `deployment` — reserved for the DeploymentGate (ADR-0070): the
-    ///   decisive Deployment's id (its creating seq). `None` for every other
-    ///   gate kind; absent on the wire when `None`.
+    /// - `deployment` — a DeploymentGate's verdict (ADR-0070 §8): the public
+    ///   id (creating seq) of the Deployment it waited on. `None` for every
+    ///   other gate kind and for a human reject; absent on the wire when
+    ///   `None`.
     /// - `by` — who decided, when a person or system did: the principal who
     ///   rejected the gate (`reject_gate`), or `external:{step}` for an
     ///   external gate failed by its token. `None` for a release, a timer and

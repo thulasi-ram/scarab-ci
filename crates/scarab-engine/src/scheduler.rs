@@ -45,10 +45,10 @@ pub const MAX_DELIVERY_ATTEMPTS: u32 = 10;
 /// and the grace keeps the two from racing in the normal case.
 const TIMEOUT_BACKSTOP_GRACE_MS: i64 = 60_000;
 use crate::{
-    ports::WorkspaceSnapshots, Attempt, AttemptId, AttemptOutcome, Clock, ConcurrencyPolicy, Db,
-    DbError, EventKind, EventPayload, ExecError, Executor, FailureKind, GateResolution,
-    OutboxMessage, RunId, RunStatus, StepId, StepRun, StepSpec, StepStatus, Timestamp,
-    TransitionError, EVENT_VERSION,
+    ports::{DeploymentGates, WorkspaceSnapshots},
+    Attempt, AttemptId, AttemptOutcome, Clock, ConcurrencyPolicy, Db, DbError, EventKind,
+    EventPayload, ExecError, Executor, FailureKind, GateResolution, OutboxMessage, RunId,
+    RunStatus, StepId, StepRun, StepSpec, StepStatus, Timestamp, TransitionError, EVENT_VERSION,
 };
 
 /// Outbox `kind` for "launch this step".
@@ -156,6 +156,11 @@ pub enum RerunError {
     /// Mapped to 409.
     #[error("step {0:?} is not a gate that can be rejected")]
     NotARejectableGate(StepId),
+    /// Gate release refused: the step is a `deployment` gate, which core
+    /// resolves from the Deployment record (ADR-0070 §8) — no approval or
+    /// token may pass it. A reject is still allowed. Mapped to 409.
+    #[error("gate {0:?} is a deployment gate: core resolves it from the Deployment record")]
+    NotAReleasableGate(StepId),
 }
 
 /// One expired input on a rerun: the Workspace Snapshot `consumer` would have
@@ -1031,6 +1036,11 @@ pub async fn release_gate(
     let Some(gate) = steps.iter().find(|s| &s.step == step && s.is_gate()) else {
         return Err(RerunError::StepNotFound(step.clone()));
     };
+    // A DeploymentGate passes only on the Deployment record's say-so
+    // (ADR-0070 §8): defence in depth behind the API's own kind checks.
+    if gate.gate_kind.as_deref() == Some("deployment") {
+        return Err(RerunError::NotAReleasableGate(step.clone()));
+    }
     if gate.status == StepStatus::Pending && !gate_reached(gate, &steps) {
         return Err(RerunError::GateNotReached { step: step.clone() });
     }
@@ -1039,6 +1049,7 @@ pub async fn release_gate(
         passed: true,
         reason: "released".to_string(),
         expired: false,
+        deployment: None,
     };
     // Already resolved (or never gated) — exactly-once: do not resume again.
     if !resolve_gate(db, clock, run, gate, &verdict, None, None).await? {
@@ -1051,9 +1062,12 @@ pub async fn release_gate(
 /// ADR-0070 §9 "a rejected approval asks again"). Returns whether this call
 /// resolved it (`false`: a racing resolver got there first).
 ///
-/// Only a `manual`, `timer` or `external` gate can be rejected
-/// ([`RerunError::NotARejectableGate`] otherwise — a gate kind with its own
-/// oracle decides its own verdict), and only while it waits: `Pending`
+/// Any gate kind can be rejected ([`RerunError::NotARejectableGate`] for a
+/// plain step), a `deployment` gate included: a reject only ever stops a
+/// deploy — the same as cancelling the Run, which any writer can — so a human
+/// may give up on a Deployment that is taking too long without waiting out
+/// its deadline. (What a DeploymentGate refuses is a *release*: only the
+/// Deployment record passes it.) Only while it waits: `Pending`
 /// ([`RerunError::GateNotPending`]) and reached
 /// ([`RerunError::GateNotReached`]).
 ///
@@ -1078,7 +1092,7 @@ pub async fn reject_gate(
     };
     if !matches!(
         gate.gate_kind.as_deref(),
-        Some("manual") | Some("timer") | Some("external")
+        Some("manual") | Some("timer") | Some("external") | Some("deployment")
     ) {
         return Err(RerunError::NotARejectableGate(step.clone()));
     }
@@ -1095,6 +1109,7 @@ pub async fn reject_gate(
         passed: false,
         reason: reason.to_string(),
         expired: false,
+        deployment: None,
     };
     let resolved = resolve_gate(db, clock, run, gate, &verdict, Some(by.to_string()), None).await?;
     if resolved {
@@ -1135,6 +1150,18 @@ struct GateVerdict {
     /// The failure is a `gate_expires_after` deadline — also emit the legacy
     /// `GateExpired` fact.
     expired: bool,
+    /// A DeploymentGate's verdict: the Deployment it waited on.
+    deployment: Option<u64>,
+}
+
+/// A gate's settings that live only in the run's IR (see
+/// `Scheduler::gate_settings`).
+#[derive(Debug, Clone, Default)]
+struct GateSettings {
+    /// `gate_expires_after`, seconds.
+    expires_after_secs: Option<i64>,
+    /// A DeploymentGate's `deployment.step`: the step whose request it waits on.
+    deployment_step: Option<String>,
 }
 
 /// The gate's open wait: its last Attempt while that Attempt is still
@@ -1301,6 +1328,7 @@ async fn resolve_gate(
         reason: verdict.reason.clone(),
         expired: verdict.expired,
         by,
+        deployment: verdict.deployment,
         fence,
         legacy_started_at,
         at: now,
@@ -1748,6 +1776,10 @@ pub struct Scheduler<'a> {
     /// through it. `None` (the local executor) disables the cache — correct
     /// there, because there are no snapshots to key on.
     snapshots: Option<&'a dyn WorkspaceSnapshots>,
+    /// The DeploymentGate oracle (slice b, criterion 2), when the deployment
+    /// has one. `None`: a `gate: deployment` step makes no decision of its own
+    /// — see [`DeploymentGates`].
+    deployments: Option<&'a dyn DeploymentGates>,
     owner: String,
     cfg: Config,
     /// See [`Supervision`]. Defaults to a fresh set (fine when the Scheduler
@@ -1770,6 +1802,7 @@ impl<'a> Scheduler<'a> {
             clock,
             executor,
             snapshots: None,
+            deployments: None,
             owner: owner.into(),
             supervised: Supervision::new(),
             health: TickHealth::new(),
@@ -1791,6 +1824,15 @@ impl<'a> Scheduler<'a> {
     /// correct degradation for deployments with no workspace CAS.
     pub fn with_snapshots(mut self, snapshots: Option<&'a dyn WorkspaceSnapshots>) -> Self {
         self.snapshots = snapshots;
+        self
+    }
+
+    /// Wire the DeploymentGate oracle (slice b, criterion 2; ADR-0070 §8): a
+    /// waiting `gate: deployment` step is resolved from what it answers.
+    /// Without it such a gate waits for a human reject, its
+    /// `gate_expires_after`, or a cancel ([`DeploymentGates`]).
+    pub fn with_deployments(mut self, deployments: Option<&'a dyn DeploymentGates>) -> Self {
+        self.deployments = deployments;
         self
     }
 
@@ -3331,9 +3373,9 @@ impl<'a> Scheduler<'a> {
         let status_by_id: HashMap<&StepId, StepStatus> =
             steps.iter().map(|s| (&s.step, s.status)).collect();
         // The event log is read at most once per pass, and only to mint; the
-        // IR at most once, and only once a reached gate needs its expiry.
+        // IR at most once, and only once a reached gate needs its settings.
         let mut events: Option<Vec<EventKind>> = None;
-        let mut expiries: Option<HashMap<String, i64>> = None;
+        let mut settings: Option<HashMap<String, GateSettings>> = None;
         for gate in steps
             .iter()
             .filter(|s| s.is_gate() && s.status == StepStatus::Pending)
@@ -3369,15 +3411,16 @@ impl<'a> Scheduler<'a> {
                     }
                 }
             };
-            if expiries.is_none() {
-                expiries = Some(self.gate_expiries(run).await?);
+            if settings.is_none() {
+                settings = Some(self.gate_settings(run).await?);
             }
-            let expiry_secs = expiries
+            let gate_settings = settings
                 .as_ref()
-                .and_then(|m| m.get(gate.step.0.as_str()).copied());
+                .and_then(|m| m.get(gate.step.0.as_str()).cloned())
+                .unwrap_or_default();
             let now = self.clock.now().await;
             if let Some(verdict) = self
-                .gate_verdict(run, gate, &attempt, expiry_secs, now)
+                .gate_verdict(run, gate, &attempt, &gate_settings, now)
                 .await?
             {
                 // Fenced on THIS wait: a wait superseded or cancelled since the
@@ -3400,44 +3443,139 @@ impl<'a> Scheduler<'a> {
     /// The decision, if any, for a waiting gate at `now` — measured from ITS
     /// Attempt's frozen `started_at`, never from the run's suspension.
     ///
-    /// 1. The kind's own **pass** condition first (so a timer that elapses at
-    ///    the same instant as its deadline passes): `timer` passes at
-    ///    `started_at + gate_after`. `manual` and `external` pass only by an
-    ///    explicit [`release_gate`]. This match is the extension point for a
-    ///    kind with an oracle (the DeploymentGate, ADR-0070): its verdict is
-    ///    asked here, with `started_at` as the window floor.
-    /// 2. Then **expiry**, for any kind with `gate_expires_after`
-    ///    (`expiry_secs`): failed at `started_at + gate_expires_after`.
+    /// 1. The kind's own verdict first (so a timer that elapses at the same
+    ///    instant as its deadline passes): `timer` passes at
+    ///    `started_at + gate_after`; `deployment` asks the
+    ///    [`DeploymentGates`] oracle, with `started_at` as the window floor
+    ///    ([`deployment_gate_verdict`](Self::deployment_gate_verdict)).
+    ///    `manual` and `external` pass only by an explicit [`release_gate`].
+    /// 2. Then **expiry**, for any kind with `gate_expires_after`: failed at
+    ///    `started_at + gate_expires_after`.
     async fn gate_verdict(
         &self,
         run: &RunId,
         gate: &StepRun,
         attempt: &Attempt,
-        expiry_secs: Option<i64>,
+        settings: &GateSettings,
         now: Timestamp,
     ) -> Result<Option<GateVerdict>, SchedulerError> {
         let started = attempt.started_at.0;
-        if gate.gate_kind.as_deref() == Some("timer") {
-            if let Some(wait_secs) = self.db.gate_timer_seconds(run, &gate.step).await? {
-                if now.0 >= started.saturating_add(wait_secs.saturating_mul(1000)) {
-                    return Ok(Some(GateVerdict {
-                        passed: true,
-                        reason: format!("timer elapsed ({wait_secs}s after its needs finished)"),
-                        expired: false,
-                    }));
+        match gate.gate_kind.as_deref() {
+            Some("timer") => {
+                if let Some(wait_secs) = self.db.gate_timer_seconds(run, &gate.step).await? {
+                    if now.0 >= started.saturating_add(wait_secs.saturating_mul(1000)) {
+                        return Ok(Some(GateVerdict {
+                            passed: true,
+                            reason: format!(
+                                "timer elapsed ({wait_secs}s after its needs finished)"
+                            ),
+                            expired: false,
+                            deployment: None,
+                        }));
+                    }
                 }
             }
+            Some("deployment") => {
+                if let Some(verdict) = self
+                    .deployment_gate_verdict(run, gate, attempt, settings, now)
+                    .await?
+                {
+                    return Ok(Some(verdict));
+                }
+            }
+            _ => {}
         }
-        if let Some(expiry_secs) = expiry_secs {
+        if let Some(expiry_secs) = settings.expires_after_secs {
             if now.0 >= started.saturating_add(expiry_secs.saturating_mul(1000)) {
                 return Ok(Some(GateVerdict {
                     passed: false,
                     reason: format!("not released within {expiry_secs}s of its needs finishing"),
                     expired: true,
+                    deployment: None,
                 }));
             }
         }
         Ok(None)
+    }
+
+    /// A waiting DeploymentGate's verdict (slice b, criterion 2; ADR-0070 §8).
+    ///
+    /// The request it waits on is the one Run creation recorded for it — the
+    /// `run_deployment_requests` row of its `deployment.step` (any step's,
+    /// for a run with no stored IR) whose `gate_steps` names it. A
+    /// DeploymentGate with **no** such row (its
+    /// reference was lost, or the Run was created before DeploymentGates
+    /// existed) fails at once, with that as its reason: the rows are written
+    /// before any step exists and never change, so waiting could only end in
+    /// its expiry or forever.
+    ///
+    /// Otherwise the [`DeploymentGates`] oracle is asked with the Attempt's
+    /// `started_at` as the window floor. No oracle wired, or an oracle error,
+    /// is **no decision** this tick (see [`DeploymentGates`]).
+    async fn deployment_gate_verdict(
+        &self,
+        run: &RunId,
+        gate: &StepRun,
+        attempt: &Attempt,
+        settings: &GateSettings,
+        now: Timestamp,
+    ) -> Result<Option<GateVerdict>, SchedulerError> {
+        let Some(oracle) = self.deployments else {
+            return Ok(None);
+        };
+        let request = match &settings.deployment_step {
+            Some(requester) => self
+                .db
+                .run_deployment_requests(run, &StepId(requester.clone()))
+                .await?
+                .into_iter()
+                .find(|r| r.gate_steps.contains(&gate.step)),
+            // No IR to name the step (a hand-built run): look through every
+            // step's requests for the one recorded for this gate.
+            None => {
+                let mut found = None;
+                for step in self.db.steps_of_run(run).await? {
+                    if step.is_gate() {
+                        continue;
+                    }
+                    found = self
+                        .db
+                        .run_deployment_requests(run, &step.step)
+                        .await?
+                        .into_iter()
+                        .find(|r| r.gate_steps.contains(&gate.step));
+                    if found.is_some() {
+                        break;
+                    }
+                }
+                found
+            }
+        };
+        let Some(request) = request else {
+            return Ok(Some(GateVerdict {
+                passed: false,
+                reason: format!(
+                    "no DeploymentRequest of step `{}` was recorded for this deployment gate",
+                    settings.deployment_step.as_deref().unwrap_or("?")
+                ),
+                expired: false,
+                deployment: None,
+            }));
+        };
+        match oracle
+            .deployment_gate_verdict(run, &gate.step, &request, attempt.started_at, now)
+            .await
+        {
+            Ok(Some(d)) => Ok(Some(GateVerdict {
+                passed: d.passed,
+                reason: d.reason,
+                expired: false,
+                deployment: d.deployment,
+            })),
+            // Still waiting, or the oracle could not decide this tick (it
+            // logs): ask again next tick.
+            Ok(None) | Err(_) => Ok(None),
+        }
     }
 
     /// Enforce the run's opt-in active-time `budget:` (ADR-0047). Returns
@@ -3552,7 +3690,12 @@ impl<'a> Scheduler<'a> {
 
     /// Every gate's opt-in `gate_expires_after` (seconds) from the stored IR,
     /// keyed by step id — one IR read for all of a pass's gates.
-    async fn gate_expiries(&self, run: &RunId) -> Result<HashMap<String, i64>, SchedulerError> {
+    /// Every gate's settings that live only in the run's IR, by step id: its
+    /// `gate_expires_after` and, for a DeploymentGate, its `deployment.step`.
+    async fn gate_settings(
+        &self,
+        run: &RunId,
+    ) -> Result<HashMap<String, GateSettings>, SchedulerError> {
         let Some(ir) = self.db.run_ir(run).await? else {
             return Ok(HashMap::new());
         };
@@ -3563,8 +3706,18 @@ impl<'a> Scheduler<'a> {
             .flatten()
             .filter_map(|s| {
                 let id = s.get("id").and_then(|i| i.as_str())?;
-                let secs = s.get("gate_expires_after").and_then(|t| t.as_u64())?;
-                Some((id.to_string(), secs as i64))
+                let settings = GateSettings {
+                    expires_after_secs: s
+                        .get("gate_expires_after")
+                        .and_then(|t| t.as_u64())
+                        .map(|secs| secs as i64),
+                    deployment_step: s
+                        .get("deployment")
+                        .and_then(|d| d.get("step"))
+                        .and_then(|d| d.as_str())
+                        .map(str::to_string),
+                };
+                Some((id.to_string(), settings))
             })
             .collect())
     }
