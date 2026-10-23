@@ -12,12 +12,17 @@
 //! A fork-PR run (its deploy context's `locked_out` flag) receives no secrets. A
 //! run without a deploy context (ordinary CI) resolves nothing here.
 //!
-//! With the Environment governance store wired, a deploy step that would carry
-//! one of its Environment's credentials (a secret or an OIDC token) is
-//! **re-admitted at launch**: the Environment must still exist and still admit
-//! the run's Project (ADR-0071 §2). Admission at Run creation is not enough on
-//! its own — a long Run outlives an admin withdrawing eligibility, and the
-//! point of use is where ADR-0037 places the check.
+//! With the Environment governance store wired, **every** launch of a step in a
+//! deploy-context run is **re-admitted**: the Environment must still exist and
+//! still admit the run's Project (ADR-0071 §2). Admission at Run creation is
+//! not enough on its own — a long Run outlives an admin withdrawing
+//! eligibility, and a rerun or retry of an old Run launches again long after.
+//! It is not limited to steps that carry a credential: a step with no secret
+//! and no OIDC token can still carry admitted `privileged` /
+//! `add_capabilities` / `k8s_overlay` grants, which are Environment authority
+//! too. A refusal is [`ExecError::Refused`], which the scheduler turns into a
+//! `Config` step failure carrying the reason. Timer and external gates rely on
+//! this check: whatever releases the gate, the next launch fails closed.
 
 use std::sync::Arc;
 
@@ -66,9 +71,8 @@ impl SecretInjectingExecutor {
         }
     }
 
-    /// Re-check, at every launch that would carry an Environment credential,
-    /// that the run's Environment still exists and still admits its Project
-    /// (ADR-0071 §2).
+    /// Re-check, at every launch of a deploy-context step, that the run's
+    /// Environment still exists and still admits its Project (ADR-0071 §2).
     pub fn with_environment_governance(
         mut self,
         governance: Arc<dyn scarab_project::EnvironmentGovernanceStore>,
@@ -78,8 +82,9 @@ impl SecretInjectingExecutor {
     }
 
     /// Refuse the launch when the run is a deploy whose Environment is gone or
-    /// no longer admits its Project. A refusal is a launch failure, exactly as
-    /// an unresolvable secret is: the step fails, no credential is read.
+    /// no longer admits its Project. A refusal is [`ExecError::Refused`]: the
+    /// scheduler fails the step (`Config`, with this reason) and nothing —
+    /// credential, privilege grant, Pod — is used.
     async fn ensure_still_admitted(&self, step: &StepRun) -> Result<(), ExecError> {
         let Some(governance) = &self.governance else {
             return Ok(());
@@ -109,7 +114,7 @@ impl SecretInjectingExecutor {
                 ctx.environment, ctx.org
             ),
         };
-        Err(ExecError::Launch(refusal))
+        Err(ExecError::Refused(refusal))
     }
 
     /// Enable per-attempt OIDC token minting (ADR-0015): every launched step
@@ -191,13 +196,14 @@ impl Executor for SecretInjectingExecutor {
     }
 
     async fn launch(&self, step: &StepRun, spec: &StepSpec) -> Result<ExecHandle, ExecError> {
-        // ADR-0071 §2 at the point of use: before minting a token or resolving a
-        // secret on the Environment's behalf, the run must still be admitted. A
-        // launch carrying neither needs no Environment authority, so it is not
-        // re-checked (a plain step of a deploy run is not a credential use).
-        if self.oidc.is_some() || !spec.secrets.is_empty() {
-            self.ensure_still_admitted(step).await?;
-        }
+        // ADR-0071 §2 at the point of use: every launch of a deploy-context
+        // step is re-admitted, not only one that mints a token or resolves a
+        // secret. A step with neither can still carry admitted privileges
+        // (`privileged`, capabilities, a raw k8s overlay) frozen into its spec
+        // at Run creation; gating only credential use let a revoked Project's
+        // privileged rerun launch indefinitely. A run with no deploy context
+        // (ordinary CI) returns early inside the check.
+        self.ensure_still_admitted(step).await?;
         // Per-attempt OIDC token (ADR-0015): minted fresh on every launch,
         // in memory only — the k8s executor delivers it via a tmpfs file.
         let now_ms = std::time::SystemTime::now()
