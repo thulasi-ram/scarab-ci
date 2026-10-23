@@ -1539,7 +1539,10 @@ async fn create_run(
         ("repo" = String, Path, description = "repo name")
     ),
     request_body = DispatchRequest,
-    responses((status = 201, description = "Run created", body = CreateRunResponse))
+    responses(
+        (status = 201, description = "Run created", body = CreateRunResponse),
+        (status = 403, description = "the caller may not dispatch, or the pipeline's Environment does not exist in the org or does not admit this project (ADR-0071); the body says what an org admin must do. No run is created")
+    )
 )]
 async fn dispatch(
     State(st): State<AppState>,
@@ -7431,7 +7434,7 @@ fn per_repo_environment_writes_gone(org: &str, repo: &str, name: &str) -> ApiErr
 /// Environments — each repo's old rules became its tighten-only overlay — and
 /// this write would edit a table nothing reads any more. Always 410 with a
 /// pointer to the replacement.
-#[utoipa::path(put, path = "/v1/repos/{org}/{repo}/environments/{name}", summary = "Retired: per-repo environments are org-level Environments now (ADR-0071)", responses((status = 410, description = "gone; the body says where it went")))]
+#[utoipa::path(put, path = "/v1/repos/{org}/{repo}/environments/{name}", params(("org" = String, Path, description = "repo owner"), ("repo" = String, Path, description = "repo name"), ("name" = String, Path, description = "Environment name")), summary = "Retired: per-repo environments are org-level Environments now (ADR-0071)", responses((status = 410, description = "gone; the body says where it went")))]
 async fn put_environment(
     Path((org, repo, name)): Path<(String, String, String)>,
 ) -> Result<StatusCode, ApiError> {
@@ -7443,7 +7446,7 @@ async fn put_environment(
 /// Project's privilege grant. 404 for an Environment that does not exist or
 /// that the Project has nothing to do with (not eligible, no overlay, no
 /// grant). Read capability.
-#[utoipa::path(get, path = "/v1/repos/{org}/{repo}/environments/{name}", summary = "One environment as this project sees it: baseline, overlay, effective (ADR-0071)", responses((status = 200, body = org_environments::ProjectEnvironmentDto), (status = 404, description = "unknown, or not this project's")))]
+#[utoipa::path(get, path = "/v1/repos/{org}/{repo}/environments/{name}", params(("org" = String, Path, description = "repo owner"), ("repo" = String, Path, description = "repo name"), ("name" = String, Path, description = "Environment name")), summary = "One environment as this project sees it: baseline, overlay, effective (ADR-0071)", responses((status = 200, body = org_environments::ProjectEnvironmentDto), (status = 404, description = "unknown, or not this project's")))]
 async fn get_environment(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -7467,7 +7470,7 @@ async fn get_environment(
 /// The Environments this repo's Project may deploy into or holds an overlay
 /// or privilege grant in (ADR-0071), by name, each with its baseline,
 /// overlay and effective rules computed server-side. Read capability.
-#[utoipa::path(get, path = "/v1/repos/{org}/{repo}/environments", summary = "The environments this project may deploy into, with baseline/overlay/effective rules (ADR-0071)", responses((status = 200, body = [org_environments::ProjectEnvironmentDto])))]
+#[utoipa::path(get, path = "/v1/repos/{org}/{repo}/environments", params(("org" = String, Path, description = "repo owner"), ("repo" = String, Path, description = "repo name")), summary = "The environments this project may deploy into, with baseline/overlay/effective rules (ADR-0071)", responses((status = 200, body = [org_environments::ProjectEnvironmentDto])))]
 async fn list_environments(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -7489,7 +7492,7 @@ async fn list_environments(
 /// **Retired** (ADR-0071 §10), like [`put_environment`]: always 410 with a
 /// pointer. An org Environment is deleted by an org admin; a Project's
 /// overlay by its own endpoint.
-#[utoipa::path(delete, path = "/v1/repos/{org}/{repo}/environments/{name}", summary = "Retired: per-repo environments are org-level Environments now (ADR-0071)", responses((status = 410, description = "gone; the body says where it went")))]
+#[utoipa::path(delete, path = "/v1/repos/{org}/{repo}/environments/{name}", params(("org" = String, Path, description = "repo owner"), ("repo" = String, Path, description = "repo name"), ("name" = String, Path, description = "Environment name")), summary = "Retired: per-repo environments are org-level Environments now (ADR-0071)", responses((status = 410, description = "gone; the body says where it went")))]
 async fn delete_environment(
     Path((org, repo, name)): Path<(String, String, String)>,
 ) -> Result<StatusCode, ApiError> {
@@ -7502,7 +7505,7 @@ async fn delete_environment(
 /// target, version or outcome. The Deployment record is
 /// `/v1/orgs/{org}/environments/{env}/deployments`. Kept readable, read-only;
 /// admission happens in the run's gate-approval path. Read cap.
-#[utoipa::path(get, path = "/v1/repos/{org}/{repo}/environments/{name}/deployments", summary = "Legacy approval history (ADR-0070 §1)", responses((status = 200, description = "most recent first")))]
+#[utoipa::path(get, path = "/v1/repos/{org}/{repo}/environments/{name}/deployments", params(("org" = String, Path, description = "repo owner"), ("repo" = String, Path, description = "repo name"), ("name" = String, Path, description = "Environment name")), summary = "Legacy approval history (ADR-0070 §1)", responses((status = 200, description = "most recent first")))]
 async fn list_deployments(
     State(st): State<AppState>,
     headers: HeaderMap,
