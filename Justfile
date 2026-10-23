@@ -507,6 +507,13 @@ plugin-kube-tests filter="":
 # isolation probe passed and that the kill switch makes the broker answer 403
 # and scales the workload to 0. Asserts the ISOLATED kubeconfig's context is
 # kind-scarab-dev before any cluster command. Leaves the stack up (`just down`).
+# Before the kill switch, the Deploy Run leg (slice b): a REAL Forgejo
+# (deploy/local-forgejo/up.sh, left running) holds `.scarab/deploy.yaml`, bound
+# declaratively via SCARAB_CONNECTIONS; Run A (r3) requests a Deployment and its
+# DeploymentGate passes when the fake syncs it, Run B (r4) fails its gate on the
+# exhausted migrate hook. PLUGIN_VERIFY_DEPLOY_RUN=0 skips it;
+# PLUGIN_VERIFY_DEPLOY_EXECUTOR=local (default) | k8s picks where `bump` runs
+# (k8s = a kind Pod + the results sidecar; see the script header for its gap).
 # Usage: `just plugin-verify` | `KEEP=1 just plugin-verify` (keep the fake Argo).
 plugin-verify:
     bash deploy/local-proc/plugin-verify.sh
