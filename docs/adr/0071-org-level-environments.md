@@ -109,7 +109,7 @@ authority stronger than it is; it only refuses to invent a weaker parallel one.
 example a new service whose source object is created by the very change being deployed.
 It is recorded *Unconfirmed*, and flagged if the source later reports owners that
 exclude the requester. A request is rejected only when **other** Projects own the target.
-**No PluginAction is offered on a DeploymentTarget with no owners.** The fix is for the
+That rejection and the flag are not built yet (git-bug `9c1173a`). **No PluginAction is offered on a DeploymentTarget with no owners.** The fix is for the
 source to report one, not a side door around Runs.
 
 **A request never explains a Deployment a report created.** If a request joins one, it is
@@ -176,14 +176,30 @@ one never widens anyone's privileges.
 
 ### 9. Concurrency is per DeploymentTarget
 
-An Environment's concurrency limits in-flight Deployments **on one DeploymentTarget**
-(at most N). It is never an org-wide serialisation of the Environment: twenty services
+An Environment's concurrency limits in-flight deploys **on one DeploymentTarget**
+(at most N), counted as defined below. It is never an org-wide serialisation of the Environment: twenty services
 deploying to prod do not queue behind each other. This is the first time the rule is
 read at all.
 
-- **In-flight** means `requested` or `in_progress` and not past the
-  EnvironmentDeploymentDeadline. A `stalled` Deployment does not count, so one
-  version-scheme mismatch cannot block a target for Scarab deploys indefinitely.
+- **What is counted** (as built, ADR-0070 MMP slice (b)) is **requesting Runs**, not
+  Deployments. The fold allows at most one in-flight Deployment per target, and two Runs
+  requesting the same version join one Deployment yet still count two. A Run is in flight
+  on a target if it is not terminal and has a Step that requests the target and is in one
+  of two states:
+  - `Ready` or `Running`, that is, from its promotion until it finishes;
+  - `Succeeded` while some DeploymentGate on that request has no verdict yet.
+
+  A Step that requests the target with no DeploymentGate stops counting when it finishes.
+  Counting from the promotion, not from the moment the request is recorded, is
+  deliberate. Otherwise two Runs could pass the limit together while both deploy Steps
+  run. A Deployment that goes `stalled` stops counting when its DeploymentGate fails at
+  the deadline, so one version-scheme mismatch still cannot block a target indefinitely.
+- **It holds, never rejects.** The check runs at the point of use, as a deploy Step is
+  about to be promoted, never at admission. A Step at the limit stays `Pending`, and its
+  Run may suspend while it waits, so the wait bills no Run budget. The Run page shows why
+  the Step is held. The limit is the asking Run's Project's effective one, the tighter of
+  the baseline and the Project's overlay, and the count covers every Project's Runs on the
+  target. If the count cannot be decided, the Step is held (fail closed).
 - **Unset means no limit.** Concurrency is an explicit opt-in.
 
 ### 10. Migration that keeps what every Run does today
@@ -301,8 +317,9 @@ moving to org level changes nothing in it, so no cloud trust policy needs editin
   3. **The full migration** (with the split report): EnvironmentProjectEligibility;
      EnvironmentProjectOverlay; EnvironmentProjectSecretScope (the renamed scope);
      EnvironmentProjectPrivilegeGrants.
-  4. (ADR-0070: the Run side.) Ownership and per-DeploymentTarget concurrency are
-     enforced from here, because only requests need them.
+  4. (ADR-0070: the Run side.) Per-DeploymentTarget concurrency is enforced from here,
+     because only requests need it. Ownership was planned for this step too, but its
+     rejection of a request is **not built** (git-bug `9c1173a`).
 
   Org admins administer Environments throughout.
 - **MLP:** the RBAC Environment scope (*Administer on Environment X*).
