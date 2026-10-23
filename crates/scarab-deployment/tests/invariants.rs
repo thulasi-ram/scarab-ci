@@ -1045,7 +1045,8 @@ fn a_retried_gate_waits_afresh_past_the_failure_that_failed_it() {
 fn an_input_in_the_attempt_starts_millisecond_counts_as_before_it() {
     // Plan Q3: the floor sorts after every input stamped in its millisecond.
     // A `failed` received then does not fail the gate; a `live` received
-    // then passes it at once, at the floor.
+    // then passes it at the floor — once that millisecond is over (see
+    // `a_floored_gate_waits_out_its_own_millisecond`).
     let mut l = DeploymentLedger::new();
     let d = l.apply(request("api", "c1", "r1", 0));
     l.apply(report("api", "c1", Failed, 20));
@@ -1058,13 +1059,55 @@ fn an_input_in_the_attempt_starts_millisecond_counts_as_before_it() {
     let mut m = DeploymentLedger::new();
     let e = m.apply(request("api", "c1", "r1", 0));
     m.apply(report("api", "c1", Live, 20));
+    assert_eq!(
+        m.get(e)
+            .unwrap()
+            .gate_decision_from(&requester("r1"), 20, 20, DEADLINE),
+        None,
+        "more inputs stamped 20 can still arrive"
+    );
     let at_once = m
         .get(e)
         .unwrap()
-        .gate_decision_from(&requester("r1"), 20, 20, DEADLINE)
+        .gate_decision_from(&requester("r1"), 20, 21, DEADLINE)
         .unwrap();
     assert_eq!(at_once.verdict, DeploymentGateVerdict::Passed { at: 20 });
     assert_eq!(at_once.report, None, "an earlier live state decided it");
+}
+
+#[test]
+fn a_floored_gate_waits_out_its_own_millisecond() {
+    // Found by proptest (`backdated_inputs_keep_every_invariant_after_the_clamp`,
+    // regression `cc 6929c13…`). The floor is `(20, u64::MAX)`: it sorts after
+    // every input stamped 20 — including ones that have not arrived yet when
+    // core asks at `now` = 20. Deciding then passed the gate on the `live` at
+    // 20; a `failed` (or a supersession) arriving next, also stamped 20, then
+    // sat "before" the window, and the verdict was withdrawn (or flipped to
+    // superseded). The window stays closed until `now` is past the floor.
+    let superseded = Some(DeploymentGateVerdict::Failed {
+        reason: DeploymentGateFailure::Superseded,
+        at: 20,
+    });
+    for (late, then) in [
+        (report("api", "c1", Failed, 20), None),
+        (report("api", "c2", Live, 20), superseded),
+    ] {
+        let mut l = DeploymentLedger::new();
+        let d = l.apply(request("api", "c1", "r1", 0));
+        l.apply(report("api", "c1", Live, 20));
+        let gate = |l: &DeploymentLedger, now| {
+            l.get(d)
+                .unwrap()
+                .gate_verdict_from(&requester("r1"), 20, now, DEADLINE)
+        };
+        assert_eq!(gate(&l, 20), None, "the floor's millisecond is not over");
+        l.apply(late);
+        assert_eq!(gate(&l, 20), None);
+        assert_eq!(gate(&l, 21), then);
+        if then.is_some() {
+            assert_eq!(gate(&l, 21 + 2 * DEADLINE), then, "and it never changes");
+        }
+    }
 }
 
 #[test]
@@ -1108,8 +1151,10 @@ fn a_gate_retried_after_its_deployment_was_superseded_fails_at_its_start() {
     let c2 = l.apply(request("api", "c2", "r2", 10));
     let d = l.get(c1).unwrap();
     assert_eq!(d.superseded_by(), Some(c2));
+    // Decided as soon as the Attempt's start millisecond is over, at that
+    // start.
     assert_eq!(
-        d.gate_verdict_from(&requester("r1"), 50, 50, DEADLINE),
+        d.gate_verdict_from(&requester("r1"), 50, 51, DEADLINE),
         Some(DeploymentGateVerdict::Failed {
             reason: DeploymentGateFailure::Superseded,
             at: 50

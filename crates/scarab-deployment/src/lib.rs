@@ -459,7 +459,10 @@ impl Deployment {
     /// its last Attempt cannot fail this one (INV-DEP-13), and its stall
     /// deadline runs from the new start.
     ///
-    /// A window that has not opened by `now` has no verdict.
+    /// A window that has not opened by `now` has no verdict — and a floored
+    /// window opens only once `now` is past `window_floor`: until that
+    /// millisecond ends, more inputs stamped in it can still arrive, and each
+    /// would count as before the window.
     pub fn gate_verdict_from(
         &self,
         requester: &DeploymentRequester,
@@ -500,7 +503,19 @@ impl Deployment {
         now: Millis,
         deadline: Millis,
     ) -> Option<(DeploymentGateVerdict, Option<usize>)> {
-        if start.at > now {
+        // A window opens only once no input still to arrive can sort before
+        // its start. Inputs keep arriving at `now` itself, each with a higher
+        // sequence — after every real mark, but *before* a floor
+        // `(now, u64::MAX)`. So a floored window is still closed while `now`
+        // is its own millisecond: deciding then let a `failed` or a
+        // supersession received later that millisecond slip in "before" it
+        // and withdraw or flip a verdict already reached (INV-DEP-10).
+        if start
+            >= (DeploymentInstant {
+                at: now,
+                seq: u64::MAX,
+            })
+        {
             return None;
         }
         if self.live_before(start) {
