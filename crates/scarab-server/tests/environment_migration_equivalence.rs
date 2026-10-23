@@ -9,7 +9,9 @@
 //! `ProtectionRules`** of that row make, applied exactly as the pre-ADR-0071
 //! server applied them (the oracle functions below quote it). Covered:
 //! corpus row × {push main, push feature, PR, tag, comment, cron, manual
-//! ± reason} × grant requests × approval sets.
+//! ± reason} × grant requests × approval sets — plus a Project that only RAN
+//! a deploy into another Project's name, and the two never-seen cases the
+//! migration cannot preserve (a never-run referencer, a never-run name).
 //!
 //! Skips cleanly when `SCARAB_TEST_DATABASE_URL` is unset.
 
@@ -121,6 +123,19 @@ async fn migrated_corpus(pool: &sqlx::PgPool) {
         .await
         .unwrap();
     }
+    // Run history: `edge` deployed into `canary` (which `ops` defines)
+    // without defining it — the cross-project referencer (c-full review L3).
+    sqlx::query(
+        "INSERT INTO runs (id, status, ir_version, event_schema_version, created_at,
+                           updated_at, deploy_org, deploy_project, deploy_environment,
+                           deploy_git_ref)
+         VALUES ('r-edge-canary', 'succeeded', 1, 1, 0, 0, $1, 'edge', 'canary',
+                 'refs/heads/main')",
+    )
+    .bind(ORG)
+    .execute(pool)
+    .await
+    .unwrap();
     let m = MIGRATOR.iter().find(|m| m.version == 57).unwrap();
     sqlx::raw_sql(&m.sql).execute(pool).await.unwrap();
     for m in MIGRATOR.iter().filter(|m| m.version > 57) {
@@ -244,70 +259,160 @@ async fn migrated_governance_admits_and_refuses_every_run_exactly_as_the_legacy_
     let clock = FakeClock::new(1_000);
 
     for (project, environment, json) in corpus() {
-        let old = legacy(&json);
+        assert_decides_as_legacy(&pg, &clock, project, environment, &legacy(&json)).await;
+    }
+
+    tdb.cleanup().await;
+}
+
+/// Every webhook event, cron, and manual dispatch ± reason for `project`'s
+/// deploy into `environment` decides on the migrated governance exactly as
+/// the legacy rules `old` decided it.
+async fn assert_decides_as_legacy(
+    pg: &Arc<PostgresDb>,
+    clock: &FakeClock,
+    project: &str,
+    environment: &str,
+    old: &ProtectionRules,
+) {
+    let forge = FakeForge::new()
+        .with_file(".scarab/deploy.yaml", deploy_yaml(environment).as_str())
+        .with_commit("refs/heads/main", SHA);
+
+    // Webhook events: created iff the old ref check admitted it.
+    for (label, event) in webhook_events(project) {
+        let before = legacy_admits_ref(old, event.protection_ref().as_deref());
+        let runs = trigger_run_from_event(&forge, pg.as_ref(), clock, Some(pg.as_ref()), &event)
+            .await
+            .unwrap_or_else(|e| panic!("{project}/{environment} {label}: {e}"));
+        assert_eq!(
+            runs.len(),
+            usize::from(before),
+            "{project}/{environment} {label}: admitted before = {before}"
+        );
+    }
+
+    // Cron is repo-less: it never reaches admission, before or after.
+    let cron = Event::Cron {
+        schedule: "0 * * * *".into(),
+    };
+    assert!(
+        trigger_run_from_event(&forge, pg.as_ref(), clock, Some(pg.as_ref()), &cron)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Manual dispatch ± reason, on a branch, a tag and a PR ref.
+    for (dispatch_ref, sym_ref) in [
+        ("main", "refs/heads/main"),
+        ("refs/tags/v1", "refs/tags/v1"),
+        ("refs/pull/7/head", "refs/pull/7/head"),
+    ] {
+        for reason in [None, Some("ship it".to_string())] {
+            let before = legacy_dispatch(old, sym_ref, reason.is_some());
+            let after = match dispatch(
+                pg,
+                clock,
+                project,
+                environment,
+                dispatch_ref,
+                reason.clone(),
+            )
+            .await
+            {
+                Ok(_) => DispatchOutcome::Created,
+                Err(DispatchError::RefNotAllowed(_)) => DispatchOutcome::RefNotAllowed,
+                Err(DispatchError::ReasonRequired(_)) => DispatchOutcome::ReasonRequired,
+                Err(other) => panic!("{project}/{environment} {dispatch_ref}: {other:?}"),
+            };
+            assert_eq!(
+                after, before,
+                "{project}/{environment} dispatch {dispatch_ref} reason={reason:?}"
+            );
+        }
+    }
+}
+
+/// Manual dispatch of `project`'s deploy pipeline into `environment`.
+async fn dispatch(
+    pg: &Arc<PostgresDb>,
+    clock: &FakeClock,
+    project: &str,
+    environment: &str,
+    dispatch_ref: &str,
+    reason: Option<String>,
+) -> Result<RunId, DispatchError> {
+    let forge = FakeForge::new()
+        .with_file(".scarab/deploy.yaml", deploy_yaml(environment).as_str())
+        .with_commit("refs/heads/main", SHA);
+    dispatch_run(
+        &forge,
+        pg.as_ref(),
+        clock,
+        Some(pg.as_ref()),
+        "bob".into(),
+        repo(project),
+        dispatch_ref.into(),
+        "deploy".into(),
+        BTreeMap::new(),
+        DispatchKind::Manual,
+        reason,
+    )
+    .await
+}
+
+/// The cases the ADR-0071 migration can and cannot see beyond the defining
+/// Projects (c-full review F1/L3), pinned so the behaviour change is explicit:
+///
+/// - `edge` never defined `canary` (`ops` did) but RAN a deploy into it: the
+///   migration saw that Run, so `edge` is eligible and decides exactly as it
+///   did before — with no rules at all (the permissive baseline, no overlay).
+/// - `fresh` references `canary` too but never ran: the migration could not
+///   see its YAML, so it is NOT eligible — refused where d4 admitted it.
+/// - `nightly` was named by no Project and no Run: there is no org
+///   Environment, so it is UnknownEnvironment — refused where d4 admitted it.
+#[tokio::test]
+async fn a_run_referencer_keeps_its_permissive_deploy_and_never_seen_cases_are_refused() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    migrated_corpus(&tdb.pool).await;
+    let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
+    let clock = FakeClock::new(1_000);
+
+    // d4 admitted a Project with no definition as "no rules": no approvers,
+    // any ref (including refless events), no reason required.
+    let no_rules = legacy(&serde_json::json!({
+        "approvers": [], "wait_timer": 0, "allowed_refs": [], "concurrency": 0,
+        "secret_scope": { "Org": { "org": "" } }, "oidc_subject": ""
+    }));
+    assert_decides_as_legacy(&pg, &clock, "edge", "canary", &no_rules).await;
+
+    let err = dispatch(&pg, &clock, "fresh", "canary", "main", Some("x".into()))
+        .await
+        .expect_err("a never-run referencer of a defined name is not eligible");
+    assert!(matches!(err, DispatchError::NotEligible { .. }), "{err:?}");
+
+    let err = dispatch(&pg, &clock, "web", "nightly", "main", Some("x".into()))
+        .await
+        .expect_err("a never-run, never-defined name has no Environment");
+    assert!(
+        matches!(err, DispatchError::UnknownEnvironment { .. }),
+        "{err:?}"
+    );
+
+    // The webhook path refuses both too: the deploy pipeline starts no Run.
+    for (project, environment) in [("fresh", "canary"), ("web", "nightly")] {
         let forge = FakeForge::new()
             .with_file(".scarab/deploy.yaml", deploy_yaml(environment).as_str())
             .with_commit("refs/heads/main", SHA);
-
-        // Webhook events: created iff the old ref check admitted it.
-        for (label, event) in webhook_events(project) {
-            let before = legacy_admits_ref(&old, event.protection_ref().as_deref());
-            let runs =
-                trigger_run_from_event(&forge, pg.as_ref(), &clock, Some(pg.as_ref()), &event)
-                    .await
-                    .unwrap_or_else(|e| panic!("{project}/{environment} {label}: {e}"));
-            assert_eq!(
-                runs.len(),
-                usize::from(before),
-                "{project}/{environment} {label}: admitted before = {before}"
-            );
-        }
-
-        // Cron is repo-less: it never reaches admission, before or after.
-        let cron = Event::Cron {
-            schedule: "0 * * * *".into(),
-        };
-        assert!(
-            trigger_run_from_event(&forge, pg.as_ref(), &clock, Some(pg.as_ref()), &cron)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-
-        // Manual dispatch ± reason, on a branch, a tag and a PR ref.
-        for (dispatch_ref, sym_ref) in [
-            ("main", "refs/heads/main"),
-            ("refs/tags/v1", "refs/tags/v1"),
-            ("refs/pull/7/head", "refs/pull/7/head"),
-        ] {
-            for reason in [None, Some("ship it".to_string())] {
-                let before = legacy_dispatch(&old, sym_ref, reason.is_some());
-                let after = match dispatch_run(
-                    &forge,
-                    pg.as_ref(),
-                    &clock,
-                    Some(pg.as_ref()),
-                    "bob".into(),
-                    repo(project),
-                    dispatch_ref.into(),
-                    "deploy".into(),
-                    BTreeMap::new(),
-                    DispatchKind::Manual,
-                    reason.clone(),
-                )
-                .await
-                {
-                    Ok(_) => DispatchOutcome::Created,
-                    Err(DispatchError::RefNotAllowed(_)) => DispatchOutcome::RefNotAllowed,
-                    Err(DispatchError::ReasonRequired(_)) => DispatchOutcome::ReasonRequired,
-                    Err(other) => panic!("{project}/{environment} {dispatch_ref}: {other:?}"),
-                };
-                assert_eq!(
-                    after, before,
-                    "{project}/{environment} dispatch {dispatch_ref} reason={reason:?}"
-                );
-            }
-        }
+        let (_, push) = webhook_events(project).swap_remove(0);
+        let runs = trigger_run_from_event(&forge, pg.as_ref(), &clock, Some(pg.as_ref()), &push)
+            .await
+            .unwrap();
+        assert!(runs.is_empty(), "{project}/{environment}: refused, no Run");
     }
 
     tdb.cleanup().await;
