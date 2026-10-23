@@ -4,6 +4,7 @@ import {
   deploymentTags,
   targetLabel,
   requesterHref,
+  requesterRow,
   inFlight,
   groupBoard,
   madeLiveBy,
@@ -101,6 +102,39 @@ describe("requesterHref", () => {
   it("is null when the project is unknown, rather than guessing a repo", () => {
     expect(requesterHref("acme", { run: "0190f8", project: null })).toBeNull();
     expect(requesterHref("acme", { run: "0190f8" })).toBeNull();
+  });
+});
+
+describe("requesterRow", () => {
+  it("links a real requester row of a Deployment to its run page", () => {
+    // A DeploymentDto as the server sends it: the requester names its run,
+    // step and (stamped, in this org) project.
+    const d = dep({
+      requesters: [
+        {
+          run: "0190f8a2000071fb8c0011223344aabb",
+          step: "deploy",
+          effective_at: 1,
+          project: "orders-api",
+          claim: false,
+          evidence: [],
+        },
+      ],
+    });
+    const [row] = madeLiveBy(d).map((r) => requesterRow("acme", r));
+    expect(row).toEqual({
+      href: "/acme/orders-api/runs/0190f8a2000071fb8c0011223344aabb",
+      text: "0190f8a2 · deploy",
+      title: "run 0190f8a2000071fb8c0011223344aabb in orders-api",
+    });
+  });
+
+  it("shows, but does not link, a requester whose project is unknown", () => {
+    expect(requesterRow("acme", { run: "0190f8", step: "deploy", project: null })).toEqual({
+      href: null,
+      text: "0190f8 · deploy",
+      title: "run 0190f8 (project unknown)",
+    });
   });
 });
 

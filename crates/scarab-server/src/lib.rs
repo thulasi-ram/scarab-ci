@@ -78,6 +78,9 @@ pub mod plugins;
 /// ADR-0072 §9: the plugin runtime's leased reconcile loop — namespace
 /// baseline, isolation probe, one workload per installation.
 pub mod plugin_runtime;
+/// Slice b, criterion 5: the Run page's gate resolution, DeploymentGate and
+/// concurrency-hold facts per step.
+mod run_gate_view;
 pub mod retention;
 pub mod secret_executor;
 /// `--role workspace`: the ADR-0061 workspace service. Its own router, its own
@@ -1179,10 +1182,29 @@ pub struct StepStatusDto {
     /// UI folds these into the run's graph view.
     #[serde(default)]
     pub needs: Vec<String>,
-    /// `manual`/`timer`/`external` if this step is a gate (ADR-0008), else absent.
-    /// Gates launch no pod and suspend the run until released.
+    /// `manual`/`timer`/`external`/`deployment` if this step is a gate
+    /// (ADR-0008, ADR-0070 §8), else absent. Gates launch no pod; a waiting
+    /// gate holds only the steps that need it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gate: Option<String>,
+    /// How this gate's latest wait resolved — its latest `GateResolved` in
+    /// the run's journal, never re-derived. Absent for a step that is not a
+    /// gate or a gate that has never resolved. A gate re-armed since (a
+    /// retry or rerun) keeps showing the old verdict here; compare `attempt`
+    /// with the latest of `attempt_list` to tell.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate_resolution: Option<GateResolutionDto>,
+    /// For a `deployment` gate that is waiting right now: the
+    /// DeploymentTarget it waits on and where its Deployment stands. Display
+    /// only — the verdict is core's (ADR-0070 §8). Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment_gate: Option<DeploymentGateDto>,
+    /// Why this deploy Step is held `pending` by per-DeploymentTarget
+    /// concurrency (ADR-0071 §9), e.g. "held: waiting for deployment
+    /// concurrency on `argocd`/`web` (1/1 in flight)". Derived each read
+    /// (nothing is journalled per scheduler pass). Absent when not held.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub held: Option<String>,
     /// Co-located sidecar services (ADR-0058) this step declares — rendered as
     /// sidecar nodes attached to the step, each with its own log stream (fetched
     /// via `?sidecar=<index>` on the step-logs endpoint). Empty for a step with
@@ -1193,6 +1215,50 @@ pub struct StepStatusDto {
     /// (ADR-0058) — the DAG's service edges. Empty for a step that uses none.
     #[serde(default)]
     pub uses: Vec<String>,
+}
+
+/// How a gate's wait resolved: its `GateResolved` journal entry.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GateResolutionDto {
+    /// `true`: the gate passed and its dependents may run.
+    pub passed: bool,
+    /// Why — a timer elapsing, a DeploymentGate's "v1 live on …", the
+    /// source's failure label, a rejection's reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Unix-ms the verdict was journalled.
+    pub at: i64,
+    /// The gate Attempt the verdict closed (`a1`, `a2`, …).
+    pub attempt: String,
+    /// Who rejected it, for a rejection by request (`external:{step}` for an
+    /// external gate's token). Absent for a verdict the engine reached.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+    /// The Deployment a DeploymentGate's verdict was read from (its
+    /// Org-scoped id, as the Deployments view shows it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment_id: Option<u64>,
+}
+
+/// A waiting DeploymentGate: the DeploymentTarget it waits on and, once its
+/// requester's DeploymentRequest is in the record, where that Deployment
+/// stands (as the Deployments view folds it).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DeploymentGateDto {
+    pub environment: String,
+    pub target_source: String,
+    pub target_id: String,
+    /// The Deployment the requester's current request landed on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment_status: Option<DeploymentStatusDto>,
+    /// The DeploymentVersion asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// The latest source report's label, when it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_label: Option<String>,
 }
 
 /// One of a step's co-located **sidecar services** (ADR-0058) — a throwaway
@@ -1984,8 +2050,10 @@ async fn get_run(
     // 0058) from the stored spec, so the FE can render sidecar nodes and `uses`
     // edges and address per-sidecar logs by index. A step with no stored spec
     // (e.g. a gate) carries empty vecs.
+    let mut gate_views = run_gate_view::step_gate_views(&st, &run, status, &steps).await?;
     let mut step_dtos = Vec::with_capacity(steps.len());
     for s in steps {
+        let view = gate_views.remove(&s.step.0).unwrap_or_default();
         let (services, uses) = match st.db.step_spec(&run, &s.step).await? {
             Some(spec) => (
                 spec.services
@@ -2008,6 +2076,9 @@ async fn get_run(
             attempt_list: s.attempts.iter().map(attempt_dto).collect(),
             needs: s.needs.into_iter().map(|n| n.0).collect(),
             gate: s.gate_kind,
+            gate_resolution: view.gate_resolution,
+            deployment_gate: view.deployment_gate,
+            held: view.held,
             services,
             uses,
         });
@@ -10372,6 +10443,8 @@ impl utoipa::Modify for SecuritySchemes {
         PlanReasonDto,
         ExpiredInputDto,
         StepStatusDto,
+        GateResolutionDto,
+        DeploymentGateDto,
         StepServiceDto,
         AttemptDto,
         ServiceStatusDto,

@@ -241,4 +241,12 @@ describe("GateResolved (slice b: gates fail with a reason)", () => {
     });
     expect(describeEvent(passed)).toBe("approve — gate passed — released");
   });
+
+  it("names who rejected a gate", () => {
+    const rejected = ev(3, {
+      GateResolved: { step: "approve", attempt: "a1", passed: false, reason: "wrong build", by: "j.lee" },
+    });
+    expect(eventParts(rejected)).toEqual({ step: "approve", text: "gate rejected by j.lee — wrong build" });
+    expect(eventCategory(rejected)).toBe("err");
+  });
 });

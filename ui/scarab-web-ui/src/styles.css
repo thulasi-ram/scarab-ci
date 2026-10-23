@@ -687,8 +687,29 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   color: var(--muted);
   font-variant-numeric: tabular-nums;
 }
-/* Push the action to the trailing edge, matching .run-toolbar's alignment. */
-.gate-row .btn { margin-left: auto; }
+/* Push the actions to the trailing edge, matching .run-toolbar's alignment. */
+.gate-row { flex-wrap: wrap; }
+.gate-kind { font-size: 11px; color: var(--muted-sage); }
+.gate-hint { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gate-actions, .gate-reject {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.gate-reject .input { width: 18rem; max-width: 50vw; padding: 3px 8px; font-size: 12px; }
+/* A gate verdict / DeploymentGate wait / concurrency hold (slice b, crit. 5):
+ * the step pane's status line and the DAG node's meta tint. */
+.gate-status {
+  padding: 2px 12px 8px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--muted-sage);
+  overflow-wrap: anywhere;
+}
+.gate-status.passed, .dnode-meta.gnote.passed { color: var(--emerald); }
+.gate-status.failed, .dnode-meta.gnote.failed { color: var(--danger); }
+.gate-status.held, .dnode-meta.gnote.held { color: var(--copper); }
 .run-toolbar .btn-sm {
   display: inline-flex;
   align-items: center;
