@@ -3867,6 +3867,9 @@ fn origin_pr_base(event: &scarab_forge::Event) -> Option<String> {
 /// `governance` is the org-level Environment governance store (ADR-0071);
 /// `None` only in a hand-built state, where a deploy is admitted as an
 /// undefined environment was before ADR-0071 ([`GovernedRules::Unwired`]).
+///
+/// The run ids only; [`trigger_runs_from_event`] also reports the deploy
+/// pipelines the Environment refused.
 pub async fn trigger_run_from_event(
     forge: &dyn scarab_forge::ForgePort,
     db: &dyn Db,
@@ -3874,9 +3877,47 @@ pub async fn trigger_run_from_event(
     governance: Option<&dyn scarab_project::EnvironmentGovernanceStore>,
     event: &scarab_forge::Event,
 ) -> Result<Vec<RunId>, TriggerError> {
+    Ok(trigger_runs_from_event(forge, db, clock, governance, event)
+        .await?
+        .runs)
+}
+
+/// A deploy pipeline a delivery did not run because its Environment does not
+/// exist in the Org or does not admit the Project (ADR-0071 §2, §10). Reported
+/// in the webhook delivery body: for a pipeline whose name the ADR-0071
+/// migration could never see (it had never run), this is the only place the
+/// refusal surfaces besides the server log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RefusedPipeline {
+    /// The pipeline file, e.g. `.scarab/deploy.yaml`.
+    pub pipeline: String,
+    /// The Environment it named.
+    pub environment: String,
+    /// What is missing and who can fix it.
+    pub reason: String,
+}
+
+/// What one delivery did: the Runs it created and the deploy pipelines the
+/// Environment refused. A `RefNotAllowed` skip is not listed — a
+/// branch-scoped Environment ignoring other branches is the rule working.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TriggerOutcome {
+    pub runs: Vec<RunId>,
+    pub refused: Vec<RefusedPipeline>,
+}
+
+/// [`trigger_run_from_event`], also reporting every deploy pipeline refused
+/// as `UnknownEnvironment` / `NotEligible`.
+pub async fn trigger_runs_from_event(
+    forge: &dyn scarab_forge::ForgePort,
+    db: &dyn Db,
+    clock: &dyn Clock,
+    governance: Option<&dyn scarab_project::EnvironmentGovernanceStore>,
+    event: &scarab_forge::Event,
+) -> Result<TriggerOutcome, TriggerError> {
     // Repo-less events (cron/manual/api) don't carry in-repo config here.
     let Some(repo) = event.repo() else {
-        return Ok(Vec::new());
+        return Ok(TriggerOutcome::default());
     };
     let git_ref = config_ref(event);
 
@@ -3884,7 +3925,7 @@ pub async fn trigger_run_from_event(
     // empty listing → nothing to run (not an error).
     let entries = match forge.list_dir_at_ref(repo, &git_ref, CONFIG_DIR).await {
         Ok(e) => e,
-        Err(scarab_forge::ForgeError::Api(_)) => return Ok(Vec::new()),
+        Err(scarab_forge::ForgeError::Api(_)) => return Ok(TriggerOutcome::default()),
         Err(e) => return Err(TriggerError::Forge(e)),
     };
     let mut paths: Vec<String> = entries
@@ -3895,7 +3936,7 @@ pub async fn trigger_run_from_event(
 
     let ctx = event.context();
     let kind = event.trigger_kind();
-    let mut runs = Vec::new();
+    let mut outcome = TriggerOutcome::default();
     for path in &paths {
         let bytes = match forge.read_file_at_ref(repo, &git_ref, path).await {
             Ok(b) => b,
@@ -3934,29 +3975,36 @@ pub async fn trigger_run_from_event(
         // parameters.
         match admit_and_create_run(db, clock, governance, event, &ir, path, &excluded, None).await?
         {
-            Admission::Created(run) => runs.push(run),
+            Admission::Created(run) => outcome.runs.push(run),
             // A branch-scoped Environment ignoring every other branch is the
             // rule working, not news: silent, as it always was.
             Admission::Refused(AdmissionRefusal::RefNotAllowed) => {}
             // ADR-0071 §2, §10: an Environment that does not exist or does not
-            // admit this Project is a configuration gap an operator must see —
-            // nobody is waiting on a webhook's response body.
+            // admit this Project is a configuration gap an operator must see.
+            // Logged AND returned: the delivery body is where a forge's
+            // "recent deliveries" view shows it, and for a name the migration
+            // could not see (never run before ADR-0071) it is the first sign.
             Admission::Refused(
-                refusal @ (AdmissionRefusal::UnknownEnvironment { .. }
-                | AdmissionRefusal::NotEligible { .. }),
+                ref refusal @ (AdmissionRefusal::UnknownEnvironment { ref environment }
+                | AdmissionRefusal::NotEligible { ref environment }),
             ) => {
+                let reason = admission_refusal_message(refusal, &repo.owner, &repo.name);
                 tracing::warn!(
                     org = %repo.owner,
                     project = %repo.name,
                     pipeline = %path,
                     trigger = event.trigger_kind().as_str(),
-                    "deploy pipeline not run: {}",
-                    admission_refusal_message(&refusal, &repo.owner, &repo.name)
+                    "deploy pipeline not run: {reason}"
                 );
+                outcome.refused.push(RefusedPipeline {
+                    pipeline: path.clone(),
+                    environment: environment.clone(),
+                    reason,
+                });
             }
         }
     }
-    Ok(runs)
+    Ok(outcome)
 }
 
 /// Pre-fetch a pipeline's transitive `invoke:` library sources at `read_ref`
@@ -5200,7 +5248,7 @@ async fn ingest_event(
             Json(serde_json::json!({ "ignored": "no forge configured" })),
         ));
     };
-    match trigger_run_from_event(
+    match trigger_runs_from_event(
         forge.as_ref(),
         st.db.as_ref(),
         st.clock.as_ref(),
@@ -5209,16 +5257,29 @@ async fn ingest_event(
     )
     .await
     {
-        Ok(runs) if !runs.is_empty() => {
-            let run_ids: Vec<&str> = runs.iter().map(|r| r.0.as_str()).collect();
-            Ok((
-                StatusCode::ACCEPTED,
-                Json(serde_json::json!({
-                    "run_ids": run_ids,
-                    "trigger": event.trigger_kind(),
-                })),
-            ))
+        // ADR-0071 §2: every deploy pipeline the Environment refused is named
+        // in the body as `refused: [{pipeline, environment, reason}]` — beside
+        // the runs that did start, or alone (200: nothing was accepted, but
+        // "no matching pipeline" would misdescribe a pipeline that matched
+        // and was refused).
+        Ok(outcome) if !outcome.runs.is_empty() => {
+            let run_ids: Vec<&str> = outcome.runs.iter().map(|r| r.0.as_str()).collect();
+            let mut body = serde_json::json!({
+                "run_ids": run_ids,
+                "trigger": event.trigger_kind(),
+            });
+            if !outcome.refused.is_empty() {
+                body["refused"] = serde_json::json!(outcome.refused);
+            }
+            Ok((StatusCode::ACCEPTED, Json(body)))
         }
+        Ok(outcome) if !outcome.refused.is_empty() => Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "refused": outcome.refused,
+                "trigger": event.trigger_kind(),
+            })),
+        )),
         Ok(_) => Ok((
             StatusCode::OK,
             Json(serde_json::json!({ "ignored": "no matching pipeline" })),
@@ -6924,37 +6985,14 @@ async fn approve_gate(
     //    withdrawn eligibility, a deleted Environment — governs the release.
     let approvers = gate_approvers(&st.db.events(&run).await.map_err(ApiError::Db)?, &step);
     let ctx = st.db.run_deploy_context(&run).await.map_err(ApiError::Db)?;
-    let protection = match (&ctx, st.environment_governance.as_ref()) {
-        (Some(c), Some(store)) => {
-            let governance = store
-                .deploy_governance(&c.org, &c.project, &c.environment)
-                .await
-                .map_err(org_environments::org_environment_api_error)?;
-            // Fail-closed (ADR-0071 §2): a gate is the last point before the
-            // deploy proceeds, so an Environment that no longer exists, or no
-            // longer admits this Project, holds it — never "no rules, release".
-            // The approval above stays recorded; it counts if the Environment
-            // is restored.
-            match governance {
-                None => {
-                    return Err(ApiError::Conflict(format!(
-                        "approval recorded, but the gate cannot release: {}",
-                        unknown_environment_message(&c.org, &c.project, &c.environment)
-                    )))
-                }
-                Some(g) if !g.eligible => {
-                    return Err(ApiError::Conflict(format!(
-                        "approval recorded, but the gate cannot release: {}",
-                        not_eligible_message(&c.org, &c.project, &c.environment)
-                    )))
-                }
-                Some(g) => Some(g.effective_protection()),
-            }
-        }
-        // A plain gate (no deploy context), or a hand-built state with no
-        // governance store: releases on the first approval, as it always did.
-        _ => None,
-    };
+    // The approval above stays recorded when the gate is held; it counts if
+    // the Environment is restored.
+    let protection = gate_release_governance(
+        &st,
+        ctx.as_ref(),
+        "approval recorded, but the gate cannot release",
+    )
+    .await?;
 
     // 3. A protected deploy releases only when admits() passes over the
     //    accumulated approvers (every required approver, and the ref still
@@ -7025,6 +7063,45 @@ async fn approve_gate(
         .into_response())
 }
 
+/// The governing Environment's effective rules for releasing a Deploy Run's
+/// gate, resolved NOW (ADR-0071 §2-3) — shared by every path that releases a
+/// gate by request (`approve_gate`, `release_gate_external`) so neither can
+/// drift into "no rules, release".
+///
+/// Fail-closed: a gate is the last point before the deploy proceeds, so an
+/// Environment that no longer exists, or no longer admits this Project, holds
+/// it with a 409 whose message starts with `held`. `Ok(None)` = a plain gate
+/// (no deploy context) or a hand-built state with no governance store, which
+/// releases as it always did.
+///
+/// Timer gates release inside the engine with no request to hold; they are
+/// covered by the launch re-check instead (`SecretInjectingExecutor`): the
+/// first step after the gate is refused at launch and fails `Config`.
+async fn gate_release_governance(
+    st: &AppState,
+    ctx: Option<&scarab_engine::DeployContext>,
+    held: &str,
+) -> Result<Option<scarab_project::EffectiveProtection>, ApiError> {
+    let (Some(c), Some(store)) = (ctx, st.environment_governance.as_ref()) else {
+        return Ok(None);
+    };
+    let governance = store
+        .deploy_governance(&c.org, &c.project, &c.environment)
+        .await
+        .map_err(org_environments::org_environment_api_error)?;
+    match governance {
+        None => Err(ApiError::Conflict(format!(
+            "{held}: {}",
+            unknown_environment_message(&c.org, &c.project, &c.environment)
+        ))),
+        Some(g) if !g.eligible => Err(ApiError::Conflict(format!(
+            "{held}: {}",
+            not_eligible_message(&c.org, &c.project, &c.environment)
+        ))),
+        Some(g) => Ok(Some(g.effective_protection())),
+    }
+}
+
 /// HTTP header carrying an external-gate release token (`sha256=<hex>`).
 const GATE_TOKEN_HEADER: &str = "x-scarab-gate-token";
 
@@ -7033,7 +7110,10 @@ const GATE_TOKEN_HEADER: &str = "x-scarab-gate-token";
 /// interactive approval. The token is `HMAC-SHA256(secret, "{run}:{step}")`
 /// (`sha256=<hex>`), verified in constant time; no per-gate storage. The endpoint
 /// is 404 when no token secret is configured, and only releases gates of kind
-/// `external` (manual gates stay approval-only).
+/// `external` (manual gates stay approval-only). In a Deploy Run, the gate is
+/// held (409) when the run's Environment no longer exists or no longer admits
+/// its Project (ADR-0071 §2) — the same check `approve_gate` makes. The token
+/// proves who is releasing, not that the deploy is still allowed.
 #[utoipa::path(
     post,
     path = "/v1/runs/{id}/gates/{step}/release",
@@ -7044,7 +7124,8 @@ const GATE_TOKEN_HEADER: &str = "x-scarab-gate-token";
     responses(
         (status = 202, description = "gate released"),
         (status = 401, description = "bad or missing token"),
-        (status = 404, description = "no such external gate, or token release disabled")
+        (status = 404, description = "no such external gate, or token release disabled"),
+        (status = 409, description = "the gate is not pending, or the run's Environment no longer exists or no longer admits its project")
     )
 )]
 async fn release_gate_external(
@@ -7075,6 +7156,13 @@ async fn release_gate_external(
     let token = headers.get(GATE_TOKEN_HEADER).and_then(|v| v.to_str().ok());
     scarab_forge_github::verify_signature(secret, message.as_bytes(), token)
         .map_err(|_| ApiError::Unauthorized)?;
+
+    // Only after the token verifies: an unauthenticated caller learns nothing
+    // about the Environment. The rules themselves are not evaluated — the
+    // token IS this gate's approval (ADR-0034) — only whether the deploy may
+    // still proceed at all.
+    let ctx = st.db.run_deploy_context(&run).await?;
+    gate_release_governance(&st, ctx.as_ref(), "the gate cannot release").await?;
 
     match scarab_engine::release_gate(st.db.as_ref(), st.clock.as_ref(), &run, &step).await {
         Ok(()) => Ok(StatusCode::ACCEPTED),
