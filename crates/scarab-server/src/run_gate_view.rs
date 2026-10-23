@@ -15,7 +15,8 @@
 //! - **`held`** — why a deploy Step is held by per-DeploymentTarget
 //!   concurrency, asked of the same oracle the scheduler asks
 //!   ([`ServerDeploymentGates::step_concurrency_hold`]). Derived, because
-//!   nothing is journalled per scheduler pass.
+//!   nothing is journalled per scheduler pass. Never for a queued (`Pending`)
+//!   Run, which the scheduler has not yet asked about.
 //!
 //! Cheap by construction: the journal is read only when the run has a gate,
 //! request rows only when it has a waiting DeploymentGate or a Step that could
@@ -126,7 +127,13 @@ pub(crate) async fn step_gate_views(
     }
 
     // A deploy Step the scheduler would ask about: Pending, needs met. The
-    // oracle answers `None` for one that makes no DeploymentRequest.
+    // oracle answers `None` for one that makes no DeploymentRequest. Never
+    // for a queued (`Pending`) Run: the scheduler asks only once the Run has
+    // its run-level slot, so "held: deployment concurrency" could name the
+    // wrong reason for a Run that waits on its concurrency group or a cap.
+    if run_status == RunStatus::Pending {
+        return Ok(views);
+    }
     if let Some(store) = st.deployments.clone() {
         let candidates: Vec<&StepRun> = steps
             .iter()
@@ -135,8 +142,9 @@ pub(crate) async fn step_gate_views(
         if !candidates.is_empty() {
             let oracle =
                 ServerDeploymentGates::new(st.db.clone(), store, st.environment_governance.clone());
+            let now = st.clock.now().await;
             for s in candidates {
-                let held = match oracle.step_concurrency_hold(run, &s.step).await {
+                let held = match oracle.step_concurrency_hold(run, &s.step, now).await {
                     Ok(hold) => hold.map(|h| h.reason()),
                     // The scheduler holds an undecidable Step (fail closed);
                     // say so rather than show it as merely pending.
@@ -158,8 +166,8 @@ pub(crate) async fn step_gate_views(
 }
 
 /// Where a waiting DeploymentGate's request stands, as the Deployments page
-/// would show it. Without a Deployment store, or on a read error (logged),
-/// only the target is known.
+/// would show it. Without a Deployment store only the target is known; on a
+/// read error (logged) only the target, and `record_unreadable` says why.
 async fn deployment_gate_dto(
     st: &AppState,
     run: &RunId,
@@ -175,6 +183,7 @@ async fn deployment_gate_dto(
         deployment_status: None,
         version: None,
         latest_label: None,
+        record_unreadable: false,
     };
     let Some(store) = st.deployments.as_ref() else {
         return dto;
@@ -196,6 +205,9 @@ async fn deployment_gate_dto(
         }
     };
     let Some(folded) = folded else {
+        // The read failed (logged above): say so, rather than let the view
+        // read as "no Deployment recorded yet", which would be false.
+        dto.record_unreadable = true;
         return dto;
     };
     let target = DeploymentTarget {

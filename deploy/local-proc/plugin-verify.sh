@@ -40,11 +40,15 @@
 #   local (default) — the server's host-process executor; its results are read
 #     back by the executor itself. The plugin still runs in kind.
 #   k8s — a kind Pod with the ADR-0042 results sidecar POSTing to the API
-#     (SCARAB_ADDR bound 0.0.0.0, SCARAB_RESULTS_API_URL derived by up.sh).
-#     KNOWN BLOCKED today: the k8s executor has no `results()`, and the step's
-#     DeploymentRequest is completed from the executor's results, not from the
-#     ingested rows — so `bump` fails `deployment-request-incomplete` even
-#     when the sidecar delivered. This mode reports exactly that.
+#     (SCARAB_RESULTS_API_URL derived by up.sh from its probe). Results arrive
+#     through the sidecar and are overlaid at the step's success (f3004a1), so
+#     the DeploymentRequest is completed from the ingested rows. Live status:
+#     the last k8s-mode run (at 1eb7dc5) saw Run A's `bump` not reach a
+#     terminal status within 240 s — this mode is NOT yet proven green.
+#     SECURITY: this mode binds the API, which runs with SCARAB_DEV_INSECURE
+#     (no authentication), on 0.0.0.0 — every interface — because a Pod must
+#     reach it and up.sh discovers only the hostname a Pod uses (e.g.
+#     host.docker.internal), not a host interface to bind. It says so loudly.
 # The pipeline's gate step is ONE variable (deploy_gate_yaml below, or
 # PLUGIN_VERIFY_DEPLOY_GATE_YAML). Forgejo is left running; stop it with
 # `bash deploy/local-forgejo/down.sh`.
@@ -259,9 +263,12 @@ EOF
 SCARAB_EXECUTOR=local
 EOF
   else
+    echo "WARNING: unauthenticated API (SCARAB_DEV_INSECURE) on all interfaces (0.0.0.0:$api_port) for k8s mode — anyone who can reach this host can drive it" >&2
     cat >> "$overlay" <<EOF
 # Results egress (ADR-0042) from a step Pod: the sidecar POSTs to the API, so it
 # must be Pod-reachable; up.sh derives SCARAB_RESULTS_API_URL from its probe.
+# UNAUTHENTICATED (SCARAB_DEV_INSECURE) and on ALL interfaces: up.sh discovers
+# only the hostname a Pod uses, not a host interface to bind.
 SCARAB_ADDR=0.0.0.0:$api_port
 SCARAB_RESULTS_TOKEN_SECRET=plugin-verify-results-$(date +%s)
 SCARAB_SIDECAR_IMAGE=$sidecar_image
@@ -275,6 +282,9 @@ set -a
 set +a
 export KUBECONFIG="$kubeconfig"
 assert_context
+if [ "$deploy_run" = 1 ] && [ "$deploy_exec" = k8s ]; then
+  echo "WARNING: unauthenticated API (SCARAB_DEV_INSECURE) is listening on all interfaces ($SCARAB_ADDR) until \`just down\`" >&2
+fi
 
 api="http://${SCARAB_ADDR:-127.0.0.1:8080}"
 api="${api/0.0.0.0/127.0.0.1}"
@@ -482,7 +492,9 @@ assert_requested() {
   if [ "$bstatus" != succeeded ]; then
     bdetail="$(echo "$out" | json '" | ".join("%s: %s" % (a.get("failure"), a.get("failure_detail")) for a in [s for s in d["steps"] if s["id"] == "bump"][0]["attempt_list"])')"
     if [ "$deploy_exec" = k8s ] && [ "$has" = True ]; then
-      fail "BLOCKED (k8s): the sidecar DID deliver \`images\`, but bump failed ($bdetail) — the k8s executor has no results(), and the success path completes the DeploymentRequest from the executor's results, not the ingested rows"
+      echo "---- attempt_results rows for bump (GET …/steps/bump/results) ----" >&2
+      echo "$res" >&2
+      fail "$label (k8s): the results sidecar delivered \`images\`=$version, and bump still failed: $bdetail"
     fi
     fail "$label: bump $bstatus ($bdetail); results: $res"
   fi

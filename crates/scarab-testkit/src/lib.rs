@@ -357,6 +357,52 @@ impl scarab_deployment::DeploymentStore for InMemoryDb {
             .collect())
     }
 
+    async fn inputs_as_of(
+        &self,
+        org: &str,
+        environment: &str,
+        now: scarab_deployment::Millis,
+    ) -> Result<
+        (
+            Vec<scarab_deployment::LoggedDeploymentInput>,
+            scarab_deployment::Millis,
+        ),
+        scarab_deployment::DeploymentStoreError,
+    > {
+        // The Postgres fence, under the one mutex every append also takes:
+        // raise the Org's `last_at` to `now + 1` (seq untouched), refusing a
+        // `now` too far ahead of the wall clock as the append does, then read.
+        let fence = now.saturating_add(1);
+        let mut st = self.state.lock().unwrap();
+        let store_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(i64::MAX);
+        if fence > store_now.saturating_add(scarab_deployment::RECEIVED_AT_MAX_LEAD_MS) {
+            return Err(scarab_deployment::DeploymentStoreError::ReceivedAtAhead {
+                received_at: fence,
+                store_now: Some(store_now),
+            });
+        }
+        let (seq, last_at) = st
+            .deployment_counters
+            .get(org)
+            .copied()
+            .unwrap_or((0, i64::MIN));
+        let horizon = last_at.max(fence);
+        st.deployment_counters
+            .insert(org.to_string(), (seq, horizon));
+        let inputs = st
+            .deployment_inputs
+            .get(org)
+            .into_iter()
+            .flatten()
+            .filter(|l| l.input.target().environment == environment)
+            .cloned()
+            .collect();
+        Ok((inputs, horizon))
+    }
+
     async fn environments(
         &self,
         org: &str,
@@ -1595,6 +1641,7 @@ impl Db for InMemoryDb {
         source: &str,
         id: &str,
         excluding: &RunId,
+        unreached_gate_cutoff: Timestamp,
     ) -> Result<u32, DbError> {
         // Mirrors the Postgres COUNT(DISTINCT run_id) — see the port.
         let st = self.state.lock().unwrap();
@@ -1602,6 +1649,24 @@ impl Db for InMemoryDb {
             st.steps
                 .get(&(run.clone(), step.clone()))
                 .and_then(|rec| rec.status)
+        };
+        // A gate is reached when every need of it has Succeeded.
+        let reached = |run: &RunId, gate: &StepId| {
+            st.steps
+                .get(&(run.clone(), gate.clone()))
+                .is_some_and(|rec| {
+                    rec.needs
+                        .iter()
+                        .all(|n| status(run, n) == Some(StepStatus::Succeeded))
+                })
+        };
+        // The request's effective time: the requesting Step's latest Attempt
+        // start, else the Run's creation.
+        let effective_at = |run: &RunId, step: &StepId| {
+            st.steps
+                .get(&(run.clone(), step.clone()))
+                .and_then(|rec| rec.attempts.iter().map(|a| a.started_at).max())
+                .unwrap_or_else(|| st.run_created.get(run).copied().unwrap_or(Timestamp(0)))
         };
         let mut runs: std::collections::HashSet<&RunId> = std::collections::HashSet::new();
         for ((run, step), rows) in &st.run_deployment_requests {
@@ -1618,10 +1683,16 @@ impl Db for InMemoryDb {
                 }
                 let in_flight = match status(run, step) {
                     Some(StepStatus::Ready | StepStatus::Running) => true,
-                    Some(StepStatus::Succeeded) => r
-                        .gate_steps
-                        .iter()
-                        .any(|g| status(run, g).is_some_and(|s| !s.is_terminal())),
+                    Some(StepStatus::Succeeded) => {
+                        let open: Vec<&StepId> = r
+                            .gate_steps
+                            .iter()
+                            .filter(|g| status(run, g).is_some_and(|s| !s.is_terminal()))
+                            .collect();
+                        !open.is_empty()
+                            && (open.iter().any(|g| reached(run, g))
+                                || effective_at(run, step) > unreached_gate_cutoff)
+                    }
                     _ => false,
                 };
                 if in_flight {

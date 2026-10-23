@@ -1621,12 +1621,17 @@ impl Db for PostgresDb {
         source: &str,
         id: &str,
         excluding: &RunId,
+        unreached_gate_cutoff: Timestamp,
     ) -> Result<u32, DbError> {
         // Distinct Runs, not requests and not Deployments (slice b, criterion
         // 4): a Run in flight on the target through any of its requests counts
         // once. In flight = the Run is not terminal, and the requesting Step
         // is promoted-and-unfinished, or Succeeded with a DeploymentGate on
-        // the request not yet terminal. Uses run_deployment_requests_target_idx.
+        // the request not yet terminal that is either REACHED (no need of it
+        // is anything but succeeded — a need with no row is not succeeded) or
+        // whose request's effective time (the requesting Step's latest
+        // Attempt start, else the Run's creation) is after the cutoff — see
+        // the port. Uses run_deployment_requests_target_idx.
         let n: i64 = sqlx::query_scalar(
             "SELECT COUNT(DISTINCT r.run_id)
              FROM run_deployment_requests r
@@ -1641,13 +1646,24 @@ impl Db for PostgresDb {
                         SELECT 1 FROM step_runs g
                         WHERE g.run_id = r.run_id
                           AND g.step_id = ANY(r.gate_steps)
-                          AND g.status IN ('pending', 'ready', 'running'))))",
+                          AND g.status IN ('pending', 'ready', 'running')
+                          AND (NOT EXISTS (
+                                   SELECT 1
+                                   FROM jsonb_array_elements_text(g.needs) AS n(step_id)
+                                   LEFT JOIN step_runs d
+                                     ON d.run_id = g.run_id AND d.step_id = n.step_id
+                                   WHERE d.status IS DISTINCT FROM 'succeeded')
+                               OR COALESCE(
+                                   (SELECT MAX(a.started_at) FROM attempts a
+                                    WHERE a.run_id = r.run_id AND a.step_id = r.step_id),
+                                   runs.created_at) > $6))))",
         )
         .bind(org)
         .bind(environment)
         .bind(source)
         .bind(id)
         .bind(&excluding.0)
+        .bind(unreached_gate_cutoff.0)
         .fetch_one(self.pool())
         .await
         .map_err(db_err)?;
@@ -2822,7 +2838,12 @@ const DEPLOYMENT_INPUT_COLUMNS: &str =
 /// transaction.
 ///
 /// **Core stamps time** (migration 0053): the stored `at` is
-/// GREATEST(`received_at`, the Org's last `at`), never `input.at()`.
+/// GREATEST(`received_at`, the Org's last `at`), never `input.at()`. The
+/// Org's last `at` is also raised by every decider's horizon fence
+/// ([`DeploymentStore::inputs_as_of`]), so an input committed after a
+/// DeploymentGate read stamps after the `now` it decided for (ADR-0070 §8).
+/// That fence waits on the counter row this statement holds to commit, which
+/// is why a decider can never miss an input stamped at or before its `now`.
 /// `received_at` is the control plane's clock (ADR-0070 §8) — the one a
 /// request's `effective_at` and a reader's `now` also come from — so read it
 /// right before this call, not at the start of a long transaction: an early
@@ -3052,6 +3073,73 @@ impl DeploymentStore for PostgresDb {
             .await
             .map_err(deployment_store_err)?;
         rows.iter().map(deployment_input_from_row).collect()
+    }
+
+    async fn inputs_as_of(
+        &self,
+        org: &str,
+        environment: &str,
+        now: scarab_deployment::Millis,
+    ) -> Result<
+        (
+            Vec<scarab_deployment::LoggedDeploymentInput>,
+            scarab_deployment::Millis,
+        ),
+        DeploymentStoreError,
+    > {
+        use scarab_deployment::RECEIVED_AT_MAX_LEAD_MS;
+        // The horizon fence, in ONE autocommitted statement on the pool —
+        // never inside a caller's transaction. LOCK ORDER: it takes only the
+        // Org's `deployment_input_counters` row and holds nothing else while
+        // it waits for it, then commits at once; every other holder of the
+        // counter (a request append inside a Step-success transaction, an
+        // ingest batch — migration 0055's order) takes it LAST and never
+        // waits on anything the fence holds. So no cycle, no deadlock.
+        //
+        // Why it closes the window: an append holding the counter commits
+        // before this UPDATE can take the row (READ COMMITTED re-reads the
+        // committed row, so the GREATEST sees its `last_at`); the SELECT
+        // below, a later statement with a fresh snapshot, therefore sees
+        // that input. Every append after the fence stamps GREATEST(its
+        // received_at, ≥ now + 1). The insert's `last_seq` 0 means a fresh
+        // Org's first append still gets seq 1. The same lead refusal as the
+        // append: a runaway `now` must not ratchet `last_at` for good.
+        let fence = now.saturating_add(1);
+        let horizon: Option<i64> = sqlx::query_scalar(
+            "INSERT INTO deployment_input_counters (org, last_seq, last_at)
+             SELECT $1, 0, $2::bigint
+             WHERE $2::bigint
+                 <= (extract(epoch FROM clock_timestamp()) * 1000)::bigint + $3::bigint
+             ON CONFLICT (org) DO UPDATE
+                 SET last_at = GREATEST(deployment_input_counters.last_at, EXCLUDED.last_at)
+             RETURNING last_at",
+        )
+        .bind(org)
+        .bind(fence)
+        .bind(RECEIVED_AT_MAX_LEAD_MS)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(deployment_store_err)?;
+        let Some(horizon) = horizon else {
+            let store_now = sqlx::query_scalar::<_, i64>(
+                "SELECT (extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+            )
+            .fetch_one(self.pool())
+            .await
+            .ok();
+            tracing::warn!(
+                org,
+                now,
+                store_now,
+                max_lead_ms = RECEIVED_AT_MAX_LEAD_MS,
+                "deployment record fence refused: now runs ahead of the database clock"
+            );
+            return Err(DeploymentStoreError::ReceivedAtAhead {
+                received_at: fence,
+                store_now,
+            });
+        };
+        Ok((self.inputs(org, environment).await?, horizon))
     }
 
     async fn environments(&self, org: &str) -> Result<Vec<String>, DeploymentStoreError> {

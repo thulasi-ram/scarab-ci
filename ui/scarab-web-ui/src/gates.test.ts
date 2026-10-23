@@ -8,6 +8,7 @@ import {
   gateStatusText,
   currentResolution,
   isRejectable,
+  actionableGateIds,
   actionableGates,
   rejectReasonError,
   gateWaitHint,
@@ -154,6 +155,13 @@ describe("gateStatus", () => {
     expect(gateStatusText(s)).toBe("waiting on argocd/web (no Deployment recorded yet)");
   });
 
+  it("says the record could not be read, never that no Deployment is recorded", () => {
+    const s = waitingDeploy({
+      deployment_gate: { target_source: "argocd", target_id: "web", record_unreadable: true },
+    });
+    expect(gateStatusText(s)).toBe("waiting on argocd/web (Deployment record could not be read)");
+  });
+
   it("shows a passed verdict with its reason", () => {
     expect(gateStatus(resolved(true))).toEqual({
       tone: "passed",
@@ -242,6 +250,19 @@ describe("actionableGates", () => {
       { id: "build", status: "pending" },
     ];
     expect(actionableGates(steps).map((s) => s.id)).toEqual(["approve", "wait", "live"]);
+  });
+});
+
+describe("actionableGateIds", () => {
+  it("is the same ids, in step order, across polls that replace every step object", () => {
+    // Two polls of one run: fresh objects, same gates. The gate bar keys its
+    // rows by these, so an open Reject form survives the second poll.
+    const poll = () => [gate("approve", "pending"), gate("live", "pending", "deployment")];
+    const first = poll();
+    const second = poll();
+    expect(first[1]).not.toBe(second[1]);
+    expect(actionableGateIds(first)).toEqual(["approve", "live"]);
+    expect(actionableGateIds(second)).toEqual(actionableGateIds(first));
   });
 });
 

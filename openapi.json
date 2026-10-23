@@ -6030,6 +6030,10 @@
             ],
             "description": "The latest source report's label, when it has one."
           },
+          "record_unreadable": {
+            "type": "boolean",
+            "description": "`true` when the Deployment record could not be read for this view (a\nstore error, logged): the Deployment fields are then absent because\nthey are unknown, not because no Deployment is recorded. Omitted when\n`false`."
+          },
           "target_id": {
             "type": "string"
           },

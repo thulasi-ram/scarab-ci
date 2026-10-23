@@ -31,6 +31,17 @@
 //! Org's floor into the future for good, stamping every later input — and so
 //! every stall clock and deadline — late. Cross-replica skew below that only
 //! compresses stamps; it never reorders them.
+//!
+//! **A decider reads below the horizon.** The stamp ties an input to the
+//! Org's last `at`, never to any *reader's* `now`: an append whose
+//! `received_at` was read before a reader's `now`, but which commits after
+//! the reader's read (it waited on the Org's counter), or that comes from a
+//! replica whose clock lags, would stamp an input the reader never saw at or
+//! before the instant it decided for (R3). So a reader that decides — the
+//! DeploymentGate oracle — reads with [`DeploymentStore::inputs_as_of`],
+//! which first fences the Org's stamp clock to after its `now`: every input
+//! it did not read is then stamped after `now`. Views, which never decide,
+//! read [`DeploymentStore::inputs`].
 
 use std::fmt;
 
@@ -94,7 +105,9 @@ pub trait DeploymentStore: Send + Sync {
     /// the control plane's clock right before the call), returning it as
     /// logged: its seq (from 1 per Org, committed in order) and its stamped
     /// receipt time, `max(received_at, the Org's last at)` (see the module
-    /// docs — the `at` inside `input` is not what is stored). Refuses with
+    /// docs — the `at` inside `input` is not what is stored). The Org's last
+    /// `at` includes every [`inputs_as_of`](Self::inputs_as_of) fence, so an
+    /// input appended after a decider's read stamps after its `now`. Refuses with
     /// [`DeploymentStoreError::ReceivedAtAhead`] a `received_at` more than
     /// [`RECEIVED_AT_MAX_LEAD_MS`] ahead of the store's own clock.
     async fn append(
@@ -113,6 +126,27 @@ pub trait DeploymentStore: Send + Sync {
         org: &str,
         environment: &str,
     ) -> Result<Vec<LoggedDeploymentInput>, DeploymentStoreError>;
+
+    /// [`inputs`](Self::inputs) for a reader that **decides** as of `now`
+    /// (the DeploymentGate oracle): first fence `org`'s stamp clock so that
+    /// every later append stamps at or after `now + 1` — waiting out any
+    /// append still holding the Org's counter, so it is visible to the read
+    /// — then read. Returns the inputs and the **horizon**, the fenced clock
+    /// (`≥ now + 1`): the fold of these inputs is complete for every instant
+    /// below it, whatever an appender's clock or commit latency.
+    ///
+    /// The fence takes only the Org's counter and holds nothing else, so it
+    /// cannot deadlock with an append (which takes the counter last). It
+    /// writes no input and no seq: the first input still gets seq 1. Refuses
+    /// with [`DeploymentStoreError::ReceivedAtAhead`] a `now` more than
+    /// [`RECEIVED_AT_MAX_LEAD_MS`] ahead of the store's clock, for the same
+    /// reason an append does.
+    async fn inputs_as_of(
+        &self,
+        org: &str,
+        environment: &str,
+        now: Millis,
+    ) -> Result<(Vec<LoggedDeploymentInput>, Millis), DeploymentStoreError>;
 
     /// The Environments `org`'s log has any input for, distinct and sorted.
     async fn environments(&self, org: &str) -> Result<Vec<String>, DeploymentStoreError>;

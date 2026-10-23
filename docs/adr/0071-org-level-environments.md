@@ -192,14 +192,23 @@ read at all.
   A Step that requests the target with no DeploymentGate stops counting when it finishes.
   Counting from the promotion, not from the moment the request is recorded, is
   deliberate. Otherwise two Runs could pass the limit together while both deploy Steps
-  run. A Deployment that goes `stalled` stops counting when its DeploymentGate fails at
-  the deadline, so one version-scheme mismatch still cannot block a target indefinitely.
+  run. A Run whose DeploymentGate on the request has **not been reached** (one of the
+  gate's needs has not succeeded) stops counting once the Environment's baseline deadline
+  has elapsed since the request's effective time, the moment its Deployment reads
+  `stalled` on the record. A reached gate counts until its verdict, which the deadline
+  bounds. Without this bound, two Runs that acquired two targets in opposite orders, each
+  with gates needing both deploys, would hold each other forever (R3). With it, they wait
+  at most one deadline, then proceed, and their superseded gates fail `superseded`.
 - **It holds, never rejects.** The check runs at the point of use, as a deploy Step is
-  about to be promoted, never at admission. A Step at the limit stays `Pending`, and its
+  about to be promoted, never at admission. It is decided for each Step at its `Pending →
+  Ready`, from the same snapshot that found its needs succeeded, so a need finishing
+  mid-pass cannot slip a Step past the limit. A Step at the limit stays `Pending`, and its
   Run may suspend while it waits, so the wait bills no Run budget. The Run page shows why
   the Step is held. The limit is the asking Run's Project's effective one, the tighter of
   the baseline and the Project's overlay, and the count covers every Project's Runs on the
   target. If the count cannot be decided, the Step is held (fail closed).
+- **A cancelled or rerun holder frees its slot at Step terminal**, before its Pod's
+  termination grace ends (git-bug D1).
 - **Unset means no limit.** Concurrency is an explicit opt-in.
 
 ### 10. Migration that keeps what every Run does today

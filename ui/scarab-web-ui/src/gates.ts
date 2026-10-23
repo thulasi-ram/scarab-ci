@@ -90,6 +90,9 @@ export type DeploymentGateLike = {
   target_id: string;
   deployment_status?: string | null;
   latest_label?: string | null;
+  /** The server could not read the Deployment record for this view: the
+   * Deployment fields are absent because they are unknown. */
+  record_unreadable?: boolean | null;
 };
 
 export type GateStatusLike = GateLike & {
@@ -132,6 +135,9 @@ const holdReason = (held: string): string => held.replace(/^held:\s*/i, "").trim
  *   passed: <reason>                     a settled gate's verdict
  *   failed: <reason> (rejected by <who>) a settled gate's verdict
  *   waiting on <source/id> (<status>, "<label>")   a waiting DeploymentGate
+ *
+ * A waiting DeploymentGate whose record could not be read says exactly that —
+ * never "no Deployment recorded yet", which would be false.
  */
 export function gateStatus(s: GateStatusLike): GateStatus | null {
   if (s.held) return { tone: "held", text: `held: ${holdReason(s.held)}` };
@@ -149,7 +155,9 @@ export function gateStatus(s: GateStatusLike): GateStatus | null {
       ? [pretty(d.deployment_status), d.latest_label ? `"${d.latest_label}"` : null]
           .filter(Boolean)
           .join(", ")
-      : "no Deployment recorded yet";
+      : d.record_unreadable
+        ? "Deployment record could not be read"
+        : "no Deployment recorded yet";
     return { tone: "waiting", text: `waiting on ${d.target_source}/${d.target_id} (${detail})` };
   }
   return null;
@@ -173,6 +181,14 @@ export function isRejectable(s: GateLike, statusOf: (step: string) => string | u
  * listed too, with its actions disabled, so "not your turn yet" is visible. */
 export function actionableGates<T extends GateLike>(steps: readonly T[]): T[] {
   return steps.filter((s) => isGateOpen(s) && REJECTABLE_KINDS.has(s.gate ?? ""));
+}
+
+/** {@link actionableGates} as step IDs — what the gate bar iterates. A poll
+ * replaces every step object, so a list keyed by object rebuilds each row
+ * (and re-mounts an open Reject form, losing its caret) once a poll; IDs are
+ * strings, equal across polls, so a row lives as long as its gate is open. */
+export function actionableGateIds(steps: readonly (GateLike & { id: string })[]): string[] {
+  return actionableGates(steps).map((s) => s.id);
 }
 
 /** The server's bound on a reject reason, in UTF-8 bytes. */

@@ -124,9 +124,27 @@ describe("requesterRow", () => {
     const [row] = madeLiveBy(d).map((r) => requesterRow("acme", r));
     expect(row).toEqual({
       href: "/acme/orders-api/runs/0190f8a2000071fb8c0011223344aabb",
-      text: "0190f8a2 · deploy",
+      text: "3344aabb · deploy",
       title: "run 0190f8a2000071fb8c0011223344aabb in orders-api",
     });
+  });
+
+  it("tells apart two runs created close together (a UUIDv7 shares its time prefix)", () => {
+    // The two Deploy Runs of a live plugin-verify run (gate-v2): the same
+    // leading 8 characters, so the text must come from the random tail.
+    const a = requesterRow("acme", {
+      run: "01a1682f-899f-7da1-ace8-fa18a1299cc0",
+      step: "bump",
+      project: "web",
+    });
+    const b = requesterRow("acme", {
+      run: "01a1682f-a858-7881-9f4a-c54c914047c6",
+      step: "bump",
+      project: "web",
+    });
+    expect(a.text).toBe("a1299cc0 · bump");
+    expect(b.text).toBe("914047c6 · bump");
+    expect(a.text).not.toBe(b.text);
   });
 
   it("shows, but does not link, a requester whose project is unknown", () => {

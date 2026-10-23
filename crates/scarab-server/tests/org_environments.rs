@@ -749,6 +749,20 @@ impl DeploymentStore for OneEmptyEnvironment {
     > {
         Ok(vec![])
     }
+    async fn inputs_as_of(
+        &self,
+        _: &str,
+        _: &str,
+        now: scarab_deployment::Millis,
+    ) -> Result<
+        (
+            Vec<scarab_deployment::LoggedDeploymentInput>,
+            scarab_deployment::Millis,
+        ),
+        scarab_deployment::DeploymentStoreError,
+    > {
+        Ok((vec![], now + 1))
+    }
     async fn environments(
         &self,
         _: &str,

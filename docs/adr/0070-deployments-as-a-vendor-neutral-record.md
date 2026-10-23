@@ -357,7 +357,11 @@ Org's last stamp) in the transaction that appends the input, so receipt order an
 order agree. A receipt time more than a minute ahead of the database's own clock is
 refused, so one replica's runaway clock cannot push every later stamp into the future.
 The request's effective time, the gate Attempt's start and the gate's `now` come from
-that same control-plane clock. A source's own timestamp is display
+that same control-plane clock. A DeploymentGate decides only below the store's
+**horizon**. Before folding, the oracle fences the Org's stamp clock to after its `now`,
+in one statement that waits out any append holding the counter. So every input it did
+not read is stamped after the instant it decides for, whatever the appender's clock or
+commit latency. A source's own timestamp is display
 only. The fold requires non-decreasing time and clamps an input that arrives backdated up
 to the last one rather than trusting it. Two inputs can still share a millisecond, so ties
 are broken by arrival sequence, and a deadline sorts before every input stamped the same
@@ -518,8 +522,8 @@ crate disagree, the crate wins and this ADR is stale.
   request's effective time and its gate Attempt's start. A failure **received before**
   the window opens never fails it; one **received after** may.
 - **INV-DEP-10** A DeploymentGate verdict, once reached, never changes. The fold keeps
-  this only for inputs in receipt order; the engine keeps it outright by journaling the
-  verdict per Attempt (§8).
+  this for a reader whose `now` is below the store's horizon (§8). The oracle reads only
+  so, and the engine also journals the verdict per Attempt.
 - **INV-DEP-11** A late request joins the Deployment the source already saw. It is not a
   rollback.
 - **INV-DEP-12** A claim never explains a Deployment, and nothing un-explains one (§2).
@@ -539,7 +543,10 @@ holds INV-DEP-1..11 after the clamp. The same backdated-input property test late
 fifth, in the Attempt-start bound itself. A window bounded at *(Attempt start, after
 every sequence number)* could decide while `now` was still that millisecond, and a
 `failed` received later in the same millisecond then withdrew the verdict (INV-DEP-10).
-A window bounded this way now opens only once its own millisecond has ended (§8).
+A window bounded this way now opens only once its own millisecond has ended (§8). R3
+found a sixth, the same hole as the fifth with a wider trigger. A commit slower than one
+millisecond, or a lagging replica clock, stamped an input before a verdict already
+reached. It is closed by the store horizon, not by the fold.
 
 ### 13. One Environment per Run now; one per `invoke` segment in the target state
 

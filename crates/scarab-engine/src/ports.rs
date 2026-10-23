@@ -145,6 +145,13 @@ pub trait DeploymentGates: Send + Sync {
     /// limit = never held. The engine asks only from its promotion loop —
     /// never at admission — and asks again every pass while the step waits.
     ///
+    /// `now` is the control plane's clock: a Run whose only outstanding
+    /// DeploymentGates on the request are **not reached** stops counting once
+    /// the Environment's baseline deadline has elapsed since the request's
+    /// effective time (see [`Db::deployment_requesting_runs`]'s
+    /// `unreached_gate_cutoff`), so two Runs holding targets in opposite
+    /// orders cannot hold each other forever.
+    ///
     /// `Err` = the oracle could not decide: the engine **holds** the step this
     /// pass (fail closed — a hold is never an over-admission) and asks again
     /// next pass. The implementation logs it.
@@ -153,6 +160,7 @@ pub trait DeploymentGates: Send + Sync {
         run: &RunId,
         step: &StepId,
         requests: &[crate::RunDeploymentRequest],
+        now: Timestamp,
     ) -> Result<Option<DeploymentConcurrencyHold>, String>;
 }
 
@@ -830,10 +838,23 @@ pub trait Db: Send + Sync {
     /// Run R is in flight on the target iff R is not terminal and one of its
     /// [`RunDeploymentRequest`](crate::RunDeploymentRequest)s for the target
     /// belongs to a Step that is `Ready`/`Running` (promoted, not yet
-    /// finished), or that `Succeeded` (the request recorded) while some
+    /// finished), or that `Succeeded` (the request recorded) while a
     /// DeploymentGate in that request's `gate_steps` is not yet terminal (its
-    /// verdict outstanding). A Step that is still `Pending` (itself held, or
-    /// not reached) does not count; one that failed made no request.
+    /// verdict outstanding) and either
+    ///
+    /// - some such gate is **reached** (every one of its `needs` Succeeded):
+    ///   it counts until its verdict, which the gate's deadline bounds; or
+    /// - the request's **effective time** — the requesting Step's latest
+    ///   Attempt `started_at`, or the Run's `created_at` if it has none — is
+    ///   after `unreached_gate_cutoff` (the caller passes `now − the
+    ///   Environment's baseline deadline`). A gate that is not reached has no
+    ///   clock of its own, so without this bound two Runs that acquired two
+    ///   targets in opposite orders, each gate needing both deploys, would
+    ///   hold each other forever (R3). Past it the Deployment reads `stalled`
+    ///   on the record, and the Run stops counting.
+    ///
+    /// A Step that is still `Pending` (itself held, or not reached) does not
+    /// count; one that failed made no request.
     async fn deployment_requesting_runs(
         &self,
         org: &str,
@@ -841,6 +862,7 @@ pub trait Db: Send + Sync {
         source: &str,
         id: &str,
         excluding: &RunId,
+        unreached_gate_cutoff: Timestamp,
     ) -> Result<u32, DbError>;
 
     /// A Deploy Step's success **and** the DeploymentRequests it made, as one

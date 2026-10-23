@@ -329,6 +329,12 @@ fn verdict_of(
 /// gate has one, its Attempt's start (`floors[i]` after the request at index
 /// `i` was received, the gap a gate waits for its needs to finish) — and its
 /// verdict never changes once reached.
+///
+/// Precondition (the pure fold cannot know a reader's `now`): every input
+/// appended after a decision stamps later than the decider's `now`. The store
+/// guarantees it for the deciding reader — `DeploymentStore::inputs_as_of`
+/// fences the Org's stamp clock past `now` before the read (ADR-0070 §8, R3)
+/// — so the inputs here only ever arrive after the instants they are judged at.
 fn check_inv_dep_9_10(inputs: &[DeploymentInput], floors: &[Option<i64>], probe: Millis) {
     let mut ledger = DeploymentLedger::new();
     // A step that requests again is a new attempt with a new gate, so it

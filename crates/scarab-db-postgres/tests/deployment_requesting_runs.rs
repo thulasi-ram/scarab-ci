@@ -4,7 +4,9 @@
 //!
 //! In flight = the Run is not terminal and a Step of it requesting the target
 //! is `Ready`/`Running`, or `Succeeded` with a DeploymentGate on that request
-//! not yet terminal. Distinct Runs, scoped to (org, environment, source, id).
+//! not yet terminal — reached (every need of it Succeeded), or not reached
+//! and its request's effective time after the caller's cutoff. Distinct Runs,
+//! scoped to (org, environment, source, id).
 //! One scenario, run against real Postgres (skipped when
 //! `SCARAB_TEST_DATABASE_URL` is unset) and the in-memory twin, so the two
 //! stay equivalent.
@@ -14,7 +16,8 @@ mod common;
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_engine::{
-    Db, RunDeploymentRequest, RunId, RunStatus, StepId, StepSpec, StepStatus, Timestamp,
+    Attempt, AttemptId, AttemptOutcome, Db, RunDeploymentRequest, RunId, RunStatus, StepId,
+    StepSpec, StepStatus, Timestamp,
 };
 use scarab_testkit::InMemoryDb;
 
@@ -122,10 +125,31 @@ async fn seed(
     }
 }
 
+/// Every gate [`seed`] makes needs nothing, so it is **reached**: the
+/// unreached-gate cutoff is passed as late as it goes, so a Run here counts
+/// through a reached gate alone (see
+/// [`an_unreached_gate_stops_counting_at_the_cutoff`] for the cutoff).
 async fn count(db: &dyn Db, env: &str, target: &str, excluding: &str) -> u32 {
-    db.deployment_requesting_runs(ORG, env, "argocd", target, &RunId(excluding.into()))
-        .await
-        .unwrap()
+    count_at(db, env, target, excluding, Timestamp(i64::MAX)).await
+}
+
+async fn count_at(
+    db: &dyn Db,
+    env: &str,
+    target: &str,
+    excluding: &str,
+    unreached_gate_cutoff: Timestamp,
+) -> u32 {
+    db.deployment_requesting_runs(
+        ORG,
+        env,
+        "argocd",
+        target,
+        &RunId(excluding.into()),
+        unreached_gate_cutoff,
+    )
+    .await
+    .unwrap()
 }
 
 async fn in_flight_runs_are_counted_once_each(db: &dyn Db) {
@@ -275,4 +299,133 @@ async fn pg_in_flight_runs_are_counted_once_each() {
 #[tokio::test]
 async fn inmemory_in_flight_runs_are_counted_once_each() {
     in_flight_runs_are_counted_once_each(&InMemoryDb::new()).await;
+}
+
+/// Run `run` (created at `created_at`, Running): `bump` Succeeded with
+/// Attempts started at `attempts`, requesting `prod`/`web` with DeploymentGate
+/// `live` (Pending) on it, which needs `live_needs`; `verify` stays Pending.
+async fn seed_gated(
+    db: &dyn Db,
+    run: &str,
+    created_at: i64,
+    attempts: &[i64],
+    live_needs: &[&str],
+) {
+    let run = RunId(run.into());
+    let (bump, verify, live) = (
+        StepId("bump".into()),
+        StepId("verify".into()),
+        StepId("live".into()),
+    );
+    db.create_run(&run, 2, 1, Timestamp(created_at))
+        .await
+        .unwrap();
+    db.record_transition(&run, RunStatus::Pending, RunStatus::Running)
+        .await
+        .unwrap();
+    for step in [&bump, &verify] {
+        db.create_step_run(&run, step, Some(&spec()), &[], Timestamp(created_at))
+            .await
+            .unwrap();
+    }
+    for (from, to) in path(StepStatus::Succeeded) {
+        db.record_step_transition(&run, &bump, *from, *to)
+            .await
+            .unwrap();
+    }
+    for (n, at) in attempts.iter().enumerate() {
+        db.record_attempt(
+            &run,
+            &bump,
+            &Attempt {
+                id: AttemptId(format!("a{}", n + 1)),
+                started_at: Timestamp(*at),
+                failure: None,
+                failure_detail: None,
+                outcome: AttemptOutcome::Succeeded,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let needs: Vec<StepId> = live_needs.iter().map(|n| StepId((*n).into())).collect();
+    db.create_step_run(&run, &live, None, &needs, Timestamp(created_at))
+        .await
+        .unwrap();
+    db.set_step_gate(&run, &live, "deployment", None)
+        .await
+        .unwrap();
+    db.set_run_deployment_requests(
+        &run,
+        &[RunDeploymentRequest {
+            step: bump,
+            ordinal: 0,
+            org: ORG.into(),
+            environment: "prod".into(),
+            target_source: "argocd".into(),
+            target_id: "web".into(),
+            version_result: "version".into(),
+            evidence_results: Vec::new(),
+            gate_steps: vec![live],
+        }],
+    )
+    .await
+    .unwrap();
+}
+
+/// A Run counted only through a DeploymentGate that is **not reached** (it
+/// needs `verify`, still Pending) stops counting once its request's
+/// effective time — the requesting Step's LATEST Attempt start, or the Run's
+/// creation when it has none — is no longer after the cutoff (R3: two Runs
+/// holding targets in opposite orders would otherwise wait forever). A
+/// REACHED gate counts whatever the cutoff: its verdict, bounded by its own
+/// deadline, ends it.
+async fn an_unreached_gate_stops_counting_at_the_cutoff(db: &dyn Db) {
+    // Unreached; Attempts at 200 and 500 → effective 500.
+    seed_gated(db, "u-attempt", 100, &[200, 500], &["verify"]).await;
+    // Unreached; no Attempt row → effective = created 300.
+    seed_gated(db, "u-created", 300, &[], &["bump", "verify"]).await;
+    // Reached (its one need, `bump`, Succeeded); effective 50.
+    seed_gated(db, "reached", 10, &[50], &["bump"]).await;
+
+    let at = |cutoff: i64| count_at(db, "prod", "web", "nobody", Timestamp(cutoff));
+    assert_eq!(at(0).await, 3, "every Run inside the deadline counts");
+    assert_eq!(at(299).await, 3);
+    assert_eq!(
+        at(300).await,
+        2,
+        "no Attempt: the Run's creation is the effective time"
+    );
+    assert_eq!(
+        at(499).await,
+        2,
+        "the latest Attempt, not the first, is the effective time"
+    );
+    assert_eq!(
+        at(500).await,
+        1,
+        "past the cutoff an unreached gate stops counting"
+    );
+    assert_eq!(
+        at(i64::MAX).await,
+        1,
+        "a reached gate counts until its verdict, whatever the cutoff"
+    );
+}
+
+#[tokio::test]
+async fn pg_an_unreached_gate_stops_counting_at_the_cutoff() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+    an_unreached_gate_stops_counting_at_the_cutoff(&db).await;
+    tdb.cleanup().await;
+}
+
+#[tokio::test]
+async fn inmemory_an_unreached_gate_stops_counting_at_the_cutoff() {
+    an_unreached_gate_stops_counting_at_the_cutoff(&InMemoryDb::new()).await;
 }
