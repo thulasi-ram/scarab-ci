@@ -44,6 +44,8 @@ fn request(environment: &str, id: &str, version: &str, run: &str, at: i64) -> De
         },
         effective_at: at - 5,
         at,
+        // Evidence round-trips with the request (migration 0058).
+        evidence: vec!["sha256:aaa".into(), "sha256:bbb".into()],
     }
 }
 
@@ -203,6 +205,7 @@ async fn a_request_effective_after_its_receipt_is_clamped() {
                 },
                 effective_at: far_future,
                 at: far_future,
+                evidence: Vec::new(),
             },
             500,
         )

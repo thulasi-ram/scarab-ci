@@ -421,6 +421,19 @@ pub fn migrate_legacy_environment(
     (overlay, grant)
 }
 
+/// Where a DeploymentTarget is **homed** now (slice b, criterion 1; ADR-0070
+/// §7): the Environment a Deploy Run must target to request it. A target
+/// belongs to exactly one Environment (CONTEXT §4.6), so a Run of another
+/// Environment that requests it is refused at creation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentTargetHome {
+    /// The reporting source (a plugin installation name).
+    pub source: String,
+    /// The source's own id for the target.
+    pub id: String,
+    pub environment: String,
+}
+
 /// Everything admission needs to decide one Project's Deploy Run into one
 /// Environment (ADR-0071 §2, §3, §8), read **together** by
 /// [`EnvironmentGovernanceStore::deploy_governance`] so one decision never
@@ -763,6 +776,22 @@ pub trait EnvironmentGovernanceStore: Send + Sync {
         &self,
         org: &str,
     ) -> Result<Vec<EnvironmentMigrationReport>, OrgEnvironmentError>;
+
+    /// Where each of `targets` — `(source, target id)` pairs in `org` — is
+    /// homed now ([`DeploymentTargetHome`]): the Environment its source's
+    /// grouping routes to, when the source has reported the target and an
+    /// Environment lists that grouping; otherwise the Environment of the
+    /// target's newest input in the Deployment record. A target neither knows
+    /// is absent — nothing claims it, so any Environment may request it first.
+    ///
+    /// Read at Run creation, never folded: a home is a routing fact, not a
+    /// Deployment's status. Not an ownership check — admission never reads
+    /// `owner_projects` (see `resolve_governance`'s tripwire).
+    async fn deployment_target_homes(
+        &self,
+        org: &str,
+        targets: &[(String, String)],
+    ) -> Result<Vec<DeploymentTargetHome>, OrgEnvironmentError>;
 
     /// Mark one report line reviewed. The first acknowledgement stands, so
     /// a repeat is a no-op that still answers the line. `None` if the

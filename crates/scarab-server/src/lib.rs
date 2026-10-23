@@ -1213,7 +1213,10 @@ pub struct AttemptDto {
     /// | `config` | `missing-inputs` (an input snapshot gone from every tier —
     /// Rerun/Retry regenerates it; ticket e140121) | `gate` (a gate's wait
     /// resolved failed — e.g. not released within `gate_expires_after`; the
-    /// reason is in `failure_detail`).
+    /// reason is in `failure_detail`) | `deployment-request-incomplete` (the
+    /// step exited 0 but its results could not complete a DeploymentRequest
+    /// it declares; never auto-retried; what is missing is in
+    /// `failure_detail`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure: Option<String>,
     /// The executor's human-readable cause for a failed attempt (ticket
@@ -1241,6 +1244,9 @@ fn attempt_dto(a: &scarab_engine::Attempt) -> AttemptDto {
             scarab_engine::FailureKind::Config => "config",
             scarab_engine::FailureKind::MissingInputs => "missing-inputs",
             scarab_engine::FailureKind::Gate => "gate",
+            scarab_engine::FailureKind::DeploymentRequestIncomplete => {
+                "deployment-request-incomplete"
+            }
         }
         .to_string()
     });
@@ -1338,7 +1344,10 @@ impl From<DispatchError> for ApiError {
             // does not let this Project deploy — a policy refusal (403) with
             // the actionable text, not a malformed request.
             refused @ (DispatchError::UnknownEnvironment { .. }
-            | DispatchError::NotEligible { .. }) => ApiError::Denied(refused.to_string()),
+            | DispatchError::NotEligible { .. }
+            | DispatchError::DeploymentTargetElsewhere { .. }) => {
+                ApiError::Denied(refused.to_string())
+            }
             other => ApiError::BadRequest(other.to_string()),
         }
     }
@@ -3916,7 +3925,7 @@ pub struct TriggerOutcome {
 }
 
 /// [`trigger_run_from_event`], also reporting every deploy pipeline refused
-/// as `UnknownEnvironment` / `NotEligible`.
+/// as `UnknownEnvironment` / `NotEligible` / `DeploymentTargetElsewhere`.
 pub async fn trigger_runs_from_event(
     forge: &dyn scarab_forge::ForgePort,
     db: &dyn Db,
@@ -3995,7 +4004,10 @@ pub async fn trigger_runs_from_event(
             // could not see (never run before ADR-0071) it is the first sign.
             Admission::Refused(
                 ref refusal @ (AdmissionRefusal::UnknownEnvironment { ref environment }
-                | AdmissionRefusal::NotEligible { ref environment }),
+                | AdmissionRefusal::NotEligible { ref environment }
+                | AdmissionRefusal::DeploymentTargetElsewhere {
+                    ref environment, ..
+                }),
             ) => {
                 let reason = admission_refusal_message(refusal, &repo.owner, &repo.name);
                 tracing::warn!(
@@ -4076,6 +4088,16 @@ enum AdmissionRefusal {
     /// The Environment exists but its EnvironmentProjectEligibility does not
     /// admit this Project (ADR-0071 §2).
     NotEligible { environment: String },
+    /// A Step requests a DeploymentTarget that is homed in another
+    /// Environment (slice b, criterion 1; ADR-0070 §7): a target belongs to
+    /// exactly one Environment, so a Run of `environment` may not request it.
+    DeploymentTargetElsewhere {
+        environment: String,
+        step: String,
+        target_source: String,
+        target_id: String,
+        home: String,
+    },
 }
 
 /// The outcome of admitting one compiled pipeline (ADR-0037, ADR-0071 §2):
@@ -4312,9 +4334,25 @@ async fn admit_and_create_run(
         }
     }
 
+    // Slice b, criterion 1 (ADR-0070 §7): resolve each Step's static
+    // DeploymentTargets against the launch parameters, and refuse a Run that
+    // requests a target homed in another Environment — before anything is
+    // persisted, like every other refusal here.
+    let requests = resolve_deployment_requests(ir, repo, params)?;
+    if let (Some(store), RunGovernance::Governed { environment, .. }) = (governance, &gov) {
+        if let Some(refusal) =
+            deployment_target_elsewhere(store, &repo.owner, environment, &requests).await?
+        {
+            return Ok(Admission::Refused(refusal));
+        }
+    }
+
     let now = clock.now().await;
     let run = new_run_id();
-    persist_run_from_ir(db, &run, ir, event, path, &gov, excluded, params, now).await?;
+    persist_run_from_ir(
+        db, &run, ir, event, path, &gov, excluded, params, &requests, now,
+    )
+    .await?;
     // Freeze the resolved launch parameters on the run so every step's
     // interpolation (`${{ inputs.… }}`) and `SCARAB_PARAM_*` env re-derive
     // deterministically (ADR-0043 §5).
@@ -4322,6 +4360,113 @@ async fn admit_and_create_run(
         db.set_run_params(&run, params).await?;
     }
     Ok(Admission::Created(run))
+}
+
+/// Every Step's DeploymentRequests (slice b, criterion 1; ADR-0070 §7),
+/// resolved for one Run: the Environment is the pipeline's own, each target
+/// part a literal or its `${{ inputs.<name> }}` bound to the launch parameters
+/// (`params`; for a webhook Run, which supplies none, the interface's
+/// defaults). Fails closed: a target that does not resolve to a non-empty
+/// value is a pipeline error and no Run is created — the same rule the
+/// concurrency group follows.
+fn resolve_deployment_requests(
+    ir: &scarab_pipeline::PipelineIr,
+    repo: &scarab_forge::RepoRef,
+    params: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
+) -> Result<Vec<scarab_engine::RunDeploymentRequest>, TriggerError> {
+    let Some(environment) = &ir.environment else {
+        // Validation refuses `deployment_requests` without an `environment:`.
+        return Ok(Vec::new());
+    };
+    let defaults;
+    let inputs = match params {
+        Some(p) => p,
+        None => {
+            defaults = scarab_pipeline::params::resolve_params(
+                &ir.interface,
+                &std::collections::BTreeMap::new(),
+            )
+            .unwrap_or_default();
+            &defaults
+        }
+    };
+    let mut out = Vec::new();
+    for step in &ir.steps {
+        for (ordinal, req) in step.deployment_requests.iter().enumerate() {
+            let bind = |part: &str, text: &str| -> Result<String, TriggerError> {
+                let value = match scarab_pipeline::deployment_target_input(text) {
+                    Some(name) => inputs
+                        .get(name)
+                        .map(scarab_pipeline::params::stringify)
+                        .ok_or_else(|| {
+                            TriggerError::Pipeline(format!(
+                                "step `{}`: deployment request target `{part}` reads \
+                                 `inputs.{name}`, which this launch does not supply",
+                                step.id
+                            ))
+                        })?,
+                    None => text.to_string(),
+                };
+                if value.trim().is_empty() {
+                    return Err(TriggerError::Pipeline(format!(
+                        "step `{}`: deployment request target `{part}` resolved empty",
+                        step.id
+                    )));
+                }
+                Ok(value)
+            };
+            out.push(scarab_engine::RunDeploymentRequest {
+                step: StepId(step.id.clone()),
+                ordinal: ordinal as u32,
+                org: repo.owner.clone(),
+                environment: environment.clone(),
+                target_source: bind("source", &req.target.source)?,
+                target_id: bind("id", &req.target.id)?,
+                version_result: req.version.clone(),
+                evidence_results: req.evidence.clone(),
+                gate_steps: Vec::new(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// The first of `requests` whose DeploymentTarget is homed in an Environment
+/// other than the Run's `environment`
+/// ([`EnvironmentGovernanceStore::deployment_target_homes`]), as a refusal.
+/// A target with no home yet is free: the first Environment to request it
+/// records it.
+///
+/// [`EnvironmentGovernanceStore::deployment_target_homes`]: scarab_project::EnvironmentGovernanceStore::deployment_target_homes
+async fn deployment_target_elsewhere(
+    store: &dyn scarab_project::EnvironmentGovernanceStore,
+    org: &str,
+    environment: &str,
+    requests: &[scarab_engine::RunDeploymentRequest],
+) -> Result<Option<AdmissionRefusal>, TriggerError> {
+    if requests.is_empty() {
+        return Ok(None);
+    }
+    let targets: Vec<(String, String)> = requests
+        .iter()
+        .map(|r| (r.target_source.clone(), r.target_id.clone()))
+        .collect();
+    let homes = store
+        .deployment_target_homes(org, &targets)
+        .await
+        .map_err(governance_store_err)?;
+    Ok(requests.iter().find_map(|r| {
+        let home = homes
+            .iter()
+            .find(|h| h.source == r.target_source && h.id == r.target_id)?;
+        (home.environment != environment).then(|| AdmissionRefusal::DeploymentTargetElsewhere {
+            environment: environment.to_string(),
+            step: r.step.0.clone(),
+            target_source: r.target_source.clone(),
+            target_id: r.target_id.clone(),
+            home: home.environment.clone(),
+        })
+    }))
 }
 
 /// Which trigger a dispatch opts into: a human [`Manual`](DispatchKind::Manual)
@@ -4426,6 +4571,19 @@ pub enum DispatchError {
         project: String,
         environment: String,
     },
+    /// A Step requests a DeploymentTarget homed in another Environment (slice
+    /// b, criterion 1) — fail-closed, no run; the message names the home.
+    #[error(
+        "{}",
+        deployment_target_elsewhere_message(.environment, .step, .target_source, .target_id, .home)
+    )]
+    DeploymentTargetElsewhere {
+        environment: String,
+        step: String,
+        target_source: String,
+        target_id: String,
+        home: String,
+    },
     #[error(transparent)]
     Db(DbError),
 }
@@ -4444,7 +4602,29 @@ fn admission_refusal_message(refusal: &AdmissionRefusal, org: &str, project: &st
         AdmissionRefusal::RefNotAllowed => {
             "the ref is not allowed to deploy to this environment".to_string()
         }
+        AdmissionRefusal::DeploymentTargetElsewhere {
+            environment,
+            step,
+            target_source,
+            target_id,
+            home,
+        } => deployment_target_elsewhere_message(environment, step, target_source, target_id, home),
     }
+}
+
+fn deployment_target_elsewhere_message(
+    environment: &str,
+    step: &str,
+    target_source: &str,
+    target_id: &str,
+    home: &str,
+) -> String {
+    format!(
+        "step `{step}` requests DeploymentTarget `{target_source}`/`{target_id}`, which belongs to \
+         environment `{home}`, not `{environment}`: a DeploymentTarget belongs to exactly one \
+         Environment — deploy it from a pipeline whose `environment:` is `{home}`, or an org \
+         admin must route its source to `{environment}` (ADR-0070 §7)"
+    )
 }
 
 fn unknown_environment_message(org: &str, project: &str, environment: &str) -> String {
@@ -4658,6 +4838,19 @@ pub async fn dispatch_run(
             project: repo.name.clone(),
             environment,
         },
+        AdmissionRefusal::DeploymentTargetElsewhere {
+            environment,
+            step,
+            target_source,
+            target_id,
+            home,
+        } => DispatchError::DeploymentTargetElsewhere {
+            environment,
+            step,
+            target_source,
+            target_id,
+            home,
+        },
     })
 }
 
@@ -4775,6 +4968,7 @@ async fn persist_run_from_ir(
     gov: &RunGovernance,
     excluded: &[String],
     params: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
+    deployment_requests: &[scarab_engine::RunDeploymentRequest],
     now: Timestamp,
 ) -> Result<(), TriggerError> {
     let locked_out = gov.locked_out();
@@ -4900,6 +5094,13 @@ async fn persist_run_from_ir(
         if let Some(key) = supersede_key(event, pipeline) {
             db.set_supersede_key(run, &key).await?;
         }
+    }
+    // The resolved DeploymentRequests (slice b, criterion 1) travel with the
+    // run — written before any step row exists, so no step can be claimed,
+    // run and succeed without the requests its success must record.
+    if !deployment_requests.is_empty() {
+        db.set_run_deployment_requests(run, deployment_requests)
+            .await?;
     }
     db.append_event(&EventKind {
         version: EVENT_VERSION,
@@ -7766,6 +7967,10 @@ pub struct DeploymentRequesterDto {
     /// and its Step started after Scarab first saw that Deployment — so it
     /// did not make it live and does not explain it (ADR-0070 §2).
     pub claim: bool,
+    /// What the Step offered as evidence for the change — image digests,
+    /// typically — read from its results (ADR-0070 §7). Shown, never used to
+    /// correlate; empty when it declared none.
+    pub evidence: Vec<String>,
 }
 
 /// One stage of a Deployment as its source reported it.
@@ -7943,6 +8148,7 @@ fn deployment_dto(
                 effective_at: r.effective_at,
                 project: projects.get(&r.requester.run).cloned(),
                 claim: r.claim,
+                evidence: r.evidence.clone(),
             })
             .collect(),
         reports: view

@@ -64,7 +64,7 @@ describe("targetLabel", () => {
 });
 
 describe("madeLiveBy", () => {
-  const r = (run: string, claim: boolean) => ({ run, step: "deploy", effective_at: 0, project: "web", claim });
+  const r = (run: string, claim: boolean) => ({ run, step: "deploy", effective_at: 0, project: "web", claim, evidence: [] });
 
   it("leaves out claims, which did not make the change", () => {
     // An Unexplained hotfix a later run named: nobody made it live.

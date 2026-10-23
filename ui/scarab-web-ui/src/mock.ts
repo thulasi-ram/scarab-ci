@@ -444,6 +444,7 @@ const req = (run: string, project: string | null, at: number, claim = false) => 
   effective_at: at,
   project,
   claim,
+  evidence: [] as string[],
 });
 const report = (
   status: "in_progress" | "live" | "failed",

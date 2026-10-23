@@ -1847,7 +1847,10 @@ export interface components {
              *     | `config` | `missing-inputs` (an input snapshot gone from every tier —
              *     Rerun/Retry regenerates it; ticket e140121) | `gate` (a gate's wait
              *     resolved failed — e.g. not released within `gate_expires_after`; the
-             *     reason is in `failure_detail`).
+             *     reason is in `failure_detail`) | `deployment-request-incomplete` (the
+             *     step exited 0 but its results could not complete a DeploymentRequest
+             *     it declares; never auto-retried; what is missing is in
+             *     `failure_detail`).
              */
             failure?: string | null;
             /**
@@ -2235,6 +2238,12 @@ export interface components {
              * @description Unix-ms the requesting Step started.
              */
             effective_at: number;
+            /**
+             * @description What the Step offered as evidence for the change — image digests,
+             *     typically — read from its results (ADR-0070 §7). Shown, never used to
+             *     correlate; empty when it declared none.
+             */
+            evidence: string[];
             /**
              * @description The Project the run belongs to, when it is stamped and in this Org —
              *     what a link to the run (`/{org}/{project}/runs/{run}`) needs.

@@ -2813,8 +2813,11 @@ impl<'a> Scheduler<'a> {
                     // overwrite is ADR-0007 semantics, this makes it loud.
                     self.record_workspace_collisions(&run, &step, &attempt, &handle)
                         .await;
-                    self.finalize_step(&run, &step, &attempt, StepStatus::Succeeded, None, None)
-                        .await?;
+                    // Exit 0: succeed the step — recording its
+                    // DeploymentRequests (if it makes any) in the same commit,
+                    // or failing it `DeploymentRequestIncomplete` when its
+                    // results cannot complete one (slice b, criterion 1).
+                    self.succeed_step(&run, &step, &attempt, &results).await?;
                     self.db.mark_dispatched(msg.id).await?;
                 }
                 ExecState::Failed { class, cause, .. } => {
@@ -3701,7 +3704,13 @@ impl<'a> Scheduler<'a> {
             // (ADR-0061 s5) — burning 3 attempts first was the bug.
             // A gate verdict is final for its wait; a new wait is a human
             // Retry (gates never route here today — belt and braces).
-            FailureKind::Config | FailureKind::MissingInputs | FailureKind::Gate => 1,
+            // A DeploymentRequest the Step's results cannot complete is
+            // finalized directly by `succeed_step` (never routed here) — also
+            // belt and braces: the same command writes the same results.
+            FailureKind::Config
+            | FailureKind::MissingInputs
+            | FailureKind::Gate
+            | FailureKind::DeploymentRequestIncomplete => 1,
             _ => configured.unwrap_or(1),
         };
 
@@ -3872,6 +3881,85 @@ impl<'a> Scheduler<'a> {
             .and_then(|r| serde_json::from_value(r.clone()).ok()))
     }
 
+    /// Finalize a step whose execution exited 0 (slice b, criterion 1;
+    /// ADR-0070 §7, §8). A step that makes no DeploymentRequest is plain
+    /// [`finalize_step`](Self::finalize_step)`(Succeeded)`. One that does
+    /// completes each request from `results` — this Attempt's own:
+    ///
+    /// - a request its results cannot complete fails the step
+    ///   [`FailureKind::DeploymentRequestIncomplete`] ("DeploymentRequest
+    ///   incomplete: …"), directly — never through the retry loop, so a
+    ///   `retry:` does not re-run a deploy Step that already pushed;
+    /// - otherwise the success transition, the attempt outcome and one
+    ///   Deployment input per request land in ONE commit
+    ///   ([`Db::finish_step_with_deployment_requests`]), each request
+    ///   effective at the succeeding Attempt's `started_at` (when the change
+    ///   was made, on the control-plane clock) and received at `now`. A
+    ///   `Conflict` (a peer finalized the step) appends nothing and no events;
+    ///   any other error leaves the step `Running` for the next re-drive.
+    ///
+    /// Then the usual `AttemptFinished` + `StepTransitioned` events, exactly as
+    /// `finalize_step` appends them.
+    async fn succeed_step(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        results: &BTreeMap<String, serde_json::Value>,
+    ) -> Result<(), SchedulerError> {
+        let requests = self.db.run_deployment_requests(run, step).await?;
+        let Some(org) = requests.first().map(|r| r.org.clone()) else {
+            return self
+                .finalize_step(run, step, attempt, StepStatus::Succeeded, None, None)
+                .await;
+        };
+        let started_at = self
+            .db
+            .attempts_of_step(run, step)
+            .await?
+            .into_iter()
+            .find(|a| &a.id == attempt)
+            .map(|a| a.started_at)
+            .ok_or_else(|| {
+                DbError::Other(format!(
+                    "step `{}` attempt `{}`: no attempt row to take the \
+                     DeploymentRequest's effective time from",
+                    step.0, attempt.0
+                ))
+            })?;
+        let inputs = match crate::deployment_inputs(run, step, &requests, results, started_at) {
+            Ok(inputs) => inputs,
+            Err(reason) => {
+                return self
+                    .finalize_step(
+                        run,
+                        step,
+                        attempt,
+                        StepStatus::Failed,
+                        Some(FailureKind::DeploymentRequestIncomplete),
+                        Some(reason),
+                    )
+                    .await;
+            }
+        };
+        // The receipt time is read right before the commit (see
+        // `append_deployment_input`): an early reading is monotone through the
+        // store's GREATEST, but needlessly early.
+        let received_at = self.clock.now().await;
+        match self
+            .db
+            .finish_step_with_deployment_requests(run, step, attempt, &org, &inputs, received_at)
+            .await
+        {
+            Ok(()) => {
+                self.append_finalize_events(run, step, attempt, StepStatus::Succeeded, None, None)
+                    .await
+            }
+            Err(DbError::Conflict) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     async fn finalize_step(
         &self,
         run: &RunId,
@@ -3915,33 +4003,48 @@ impl<'a> Scheduler<'a> {
                     }
                     _ => {}
                 }
-                let now = self.clock.now().await;
-                self.append(
-                    run,
-                    EventPayload::AttemptFinished {
-                        step: step.clone(),
-                        attempt: attempt.clone(),
-                        failure,
-                        cause,
-                    },
-                    now,
-                )
-                .await?;
-                self.append(
-                    run,
-                    EventPayload::StepTransitioned {
-                        step: step.clone(),
-                        from: StepStatus::Running,
-                        to,
-                    },
-                    now,
-                )
-                .await?;
-                Ok(())
+                self.append_finalize_events(run, step, attempt, to, failure, cause)
+                    .await
             }
             Err(DbError::Conflict) => Ok(()),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// The events of a won `Running → to` step finalization: `AttemptFinished`
+    /// then `StepTransitioned`, at one instant. Only the CAS winner calls it.
+    async fn append_finalize_events(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        to: StepStatus,
+        failure: Option<FailureKind>,
+        cause: Option<String>,
+    ) -> Result<(), SchedulerError> {
+        let now = self.clock.now().await;
+        self.append(
+            run,
+            EventPayload::AttemptFinished {
+                step: step.clone(),
+                attempt: attempt.clone(),
+                failure,
+                cause,
+            },
+            now,
+        )
+        .await?;
+        self.append(
+            run,
+            EventPayload::StepTransitioned {
+                step: step.clone(),
+                from: StepStatus::Running,
+                to,
+            },
+            now,
+        )
+        .await?;
+        Ok(())
     }
 
     /// The pipeline-level shared services declared in the run's stored IR

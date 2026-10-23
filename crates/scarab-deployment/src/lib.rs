@@ -197,6 +197,11 @@ pub enum DeploymentInput {
         requester: DeploymentRequester,
         effective_at: Millis,
         at: Millis,
+        /// What the Step offered as evidence for the change — image digests,
+        /// typically — read from its own results (ADR-0070 §7). Carried and
+        /// shown, **never** part of identity or status: the fold ignores it, so
+        /// two requests that differ only here land exactly alike.
+        evidence: Vec<String>,
     },
     /// A source's report about a *(target, version)*.
     Report {

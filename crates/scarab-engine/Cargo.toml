@@ -16,3 +16,9 @@ scarab-pipeline = { workspace = true }
 # I/O-free-library carve-out (ADR-0031): the cache key (ADR-0065 s1) is a
 # domain fact — sha256 over the project and the key files' blob hashes.
 sha2 = { workspace = true }
+# Pure (ADR-0031; its only dependency is the async-trait macro) home of the
+# DeploymentInput a Step success records in the same transaction as the
+# success itself (slice b, ADR-0070 §7). The fold and the governance behind a
+# DeploymentGate stay server-side. No cycle: scarab-deployment depends on
+# nothing of ours.
+scarab-deployment = { workspace = true }

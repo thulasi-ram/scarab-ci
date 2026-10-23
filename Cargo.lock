@@ -2703,6 +2703,7 @@ name = "scarab-engine"
 version = "0.1.1"
 dependencies = [
  "async-trait",
+ "scarab-deployment",
  "scarab-pipeline",
  "serde",
  "serde_json",
