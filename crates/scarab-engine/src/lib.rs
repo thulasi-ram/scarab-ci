@@ -1088,6 +1088,16 @@ pub enum DbError {
 pub enum ExecError {
     #[error("failed to launch step: {0}")]
     Launch(String),
+    /// The launch was **refused by policy**, not failed by infrastructure:
+    /// a decorator decided this step may not run at all (ADR-0071 §2 — the
+    /// Deploy Run's Environment is gone or no longer admits its Project). The
+    /// scheduler fails the step with `FailureKind::Config` and this reason,
+    /// instead of propagating it as a tick error: a refusal is permanent until
+    /// an admin acts, so retrying the tick only spins for
+    /// `tick_failure_deadline_ms` and then dead-letters the whole Run with the
+    /// reason buried. The `String` is the operator-facing reason.
+    #[error("launch refused: {0}")]
+    Refused(String),
     #[error("execution backend unavailable")]
     Unavailable,
     #[error("exec error: {0}")]

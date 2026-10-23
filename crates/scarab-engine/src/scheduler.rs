@@ -2293,7 +2293,33 @@ impl<'a> Scheduler<'a> {
                         needs: Vec::new(),
                         gate_kind: None,
                     };
-                    let handle = self.executor.launch(&step_run, &spec).await?;
+                    let handle = match self.executor.launch(&step_run, &spec).await {
+                        Ok(handle) => handle,
+                        // A policy refusal (ADR-0071 §2: the Deploy Run's
+                        // Environment is gone or no longer admits its Project)
+                        // is a step verdict, not a scheduler error. Mapped
+                        // exactly like the interpolation failure above:
+                        // `Config` — pre-start, permanent until someone acts,
+                        // never auto-retried — with the reason as the
+                        // attempt's evidence. Propagating it with `?` instead
+                        // made it a per-run tick failure that spun for
+                        // `tick_failure_deadline_ms` and then dead-lettered the
+                        // whole Run with the reason buried.
+                        Err(ExecError::Refused(reason)) => {
+                            self.finalize_step(
+                                &run,
+                                &step,
+                                &attempt,
+                                StepStatus::Failed,
+                                Some(FailureKind::Config),
+                                Some(reason),
+                            )
+                            .await?;
+                            self.db.mark_dispatched(msg.id).await?;
+                            return Ok(());
+                        }
+                        Err(e) => return Err(e.into()),
+                    };
                     self.db
                         .set_attempt_handle(&run, &step, &attempt, &handle.0)
                         .await?;
