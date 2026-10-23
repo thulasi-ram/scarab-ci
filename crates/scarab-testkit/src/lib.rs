@@ -1643,12 +1643,28 @@ impl Db for InMemoryDb {
     ) -> Result<(), DbError> {
         // One lock = one transaction: the guard, the appends and the
         // transition all land or none does.
+        // Mirrors Postgres: the step must be `running` AND `attempt` its
+        // latest (the `attempts_of_step` order) and not torn down by intent
+        // (`Superseded`/`Cancelled`) — otherwise `Conflict`, nothing lands.
         let mut st = self.state.lock().unwrap();
-        let running = st
+        let finishable = st
             .steps
             .get(&(run.clone(), step.clone()))
-            .is_some_and(|rec| rec.status == Some(StepStatus::Running));
-        if !running {
+            .is_some_and(|rec| {
+                rec.status == Some(StepStatus::Running)
+                    && rec
+                        .attempts
+                        .iter()
+                        .max_by_key(|a| attempt_order_key(a))
+                        .is_some_and(|latest| {
+                            &latest.id == attempt
+                                && !matches!(
+                                    latest.outcome,
+                                    AttemptOutcome::Superseded | AttemptOutcome::Cancelled
+                                )
+                        })
+            });
+        if !finishable {
             return Err(DbError::Conflict);
         }
         append_deployment_inputs_locked(&mut st, org, inputs, received_at.0)
@@ -1659,12 +1675,7 @@ impl Db for InMemoryDb {
             .expect("checked above");
         rec.status = Some(StepStatus::Succeeded);
         if let Some(a) = rec.attempts.iter_mut().find(|a| &a.id == attempt) {
-            if !matches!(
-                a.outcome,
-                AttemptOutcome::Superseded | AttemptOutcome::Cancelled
-            ) {
-                a.outcome = AttemptOutcome::Succeeded;
-            }
+            a.outcome = AttemptOutcome::Succeeded;
         }
         Ok(())
     }

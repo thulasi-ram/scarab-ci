@@ -460,3 +460,120 @@ steps:
     assert_eq!(live.gate_kind.as_deref(), Some("deployment"));
     tdb.cleanup().await;
 }
+
+/// Two requests of one Step that RESOLVE to the same DeploymentTarget — a
+/// literal `web` beside `${{ inputs.app }}` launched with `app=web`, which
+/// validation's authored-text comparison passes — refuse the Run as a
+/// pipeline error naming the target, before anything is persisted (judge-b23
+/// J3). Over the in-memory store, which has no UNIQUE (run, step, source, id):
+/// the refusal is the server's, not a store constraint's, and no Run exists.
+#[tokio::test]
+async fn two_requests_resolving_to_one_target_refuse_the_run_before_persist() {
+    let yaml = r#"
+on:
+  manual: {}
+environment: prod
+interface:
+  inputs:
+    - { name: app, type: string, required: false, default: web }
+steps:
+  - id: bump
+    image: busybox
+    command: ["true"]
+    results: [version]
+    deployment_requests:
+      - target: { source: argocd, id: web }
+        version: version
+      - target: { source: argocd, id: "${{ inputs.app }}" }
+        version: version
+"#;
+    let forge = FakeForge::new()
+        .with_file(".scarab/deploy.yaml", yaml)
+        .with_commit("refs/heads/main", SHA);
+    let db = scarab_testkit::InMemoryDb::new();
+    let res = dispatch_run(
+        &forge,
+        &db,
+        &FakeClock::new(1_000),
+        None,
+        "bob".into(),
+        repo(),
+        "refs/heads/main".into(),
+        "deploy".into(),
+        BTreeMap::from([("app".to_string(), json!("web"))]),
+        DispatchKind::Manual,
+        None,
+    )
+    .await;
+    assert!(
+        matches!(
+            &res,
+            Err(DispatchError::Pipeline(m))
+                if m.contains("step `bump`") && m.contains("`argocd`/`web`")
+        ),
+        "a duplicate resolved target is refused as the author's error, got {res:?}"
+    );
+    assert!(
+        db.list_runs(100).await.unwrap().is_empty(),
+        "nothing was persisted"
+    );
+}
+
+/// The inline `POST /v1/runs` escape hatch has no Environment and never
+/// records DeploymentRequests, so a step declaring them — or a `gate:
+/// deployment` step, which would wait on one — is a 400 naming the step and
+/// what it needs, and no Run is created (judge-b23 J10). Accepting either
+/// would report success for a deployment that cannot be recorded.
+#[tokio::test]
+async fn inline_runs_refuse_deployment_requests_and_deployment_gates() {
+    let db = Arc::new(scarab_testkit::InMemoryDb::new());
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        db.clone(),
+    ));
+    let app = router(AppState::new(
+        db.clone(),
+        Arc::new(FakeClock::new(1_000)),
+        logs,
+    ));
+    let bodies = [
+        json!({ "pipeline": { "ir_version": 2, "steps": [
+            { "id": "bump", "image": "busybox", "command": ["true"],
+              "deployment_requests": [
+                  { "target": { "source": "argocd", "id": "web" }, "version": "version" }
+              ] },
+        ] } }),
+        json!({ "pipeline": { "ir_version": 2, "steps": [
+            { "id": "bump", "image": "busybox", "command": ["true"] },
+            { "id": "live", "image": "", "gate": "deployment", "needs": ["bump"] },
+        ] } }),
+    ];
+    for (body, step) in bodies.into_iter().zip(["bump", "live"]) {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/runs")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let text = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(text.to_vec()).unwrap();
+        assert!(
+            text.contains(&format!("step `{step}`"))
+                && text.contains("deployment requests need a Deploy Run"),
+            "{text}"
+        );
+    }
+    assert!(
+        db.list_runs(100).await.unwrap().is_empty(),
+        "no run created"
+    );
+}

@@ -741,6 +741,20 @@ pub struct StepDto {
     /// this step reaches over the network (DNS `<name>:<port>` + readiness gate).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub uses: Vec<String>,
+    /// NOT part of the inline IR subset: read only so [`create_run`] can
+    /// refuse a step that declares DeploymentRequests (slice b) instead of
+    /// silently dropping them — they need a Deploy Run (a repo pipeline with
+    /// `environment:`). Never serialized into the stored IR; not in the schema.
+    #[serde(default, skip_serializing)]
+    #[schema(ignore)]
+    pub deployment_requests: Option<serde_json::Value>,
+    /// NOT part of the inline IR subset: read only so [`create_run`] can
+    /// refuse a `gate: deployment` step (a DeploymentGate needs a Deploy
+    /// Run's DeploymentRequest to wait on). Never serialized; not in the
+    /// schema.
+    #[serde(default, skip_serializing)]
+    #[schema(ignore)]
+    pub gate: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1403,6 +1417,26 @@ async fn create_run(
     // per-parameter message and creates **no** run.
     let resolved = scarab_pipeline::params::resolve_params(&req.pipeline.interface, &req.params)
         .map_err(|e| ApiError::BadRequest(format!("invalid launch parameters: {e}")))?;
+
+    // Slice b: DeploymentRequests and DeploymentGates need a Deploy Run — a
+    // repo pipeline with `environment:`, whose Run creation resolves and
+    // records the requests. The inline IR has neither the Environment nor the
+    // recording, so accepting them would report success for a deployment that
+    // can never be recorded or waited on: refuse, before any run exists.
+    for step in &req.pipeline.steps {
+        let requests = step
+            .deployment_requests
+            .as_ref()
+            .is_some_and(|v| !(v.is_null() || v.as_array().is_some_and(Vec::is_empty)));
+        let deployment_gate = step.gate.as_ref().and_then(|g| g.as_str()) == Some("deployment");
+        if requests || deployment_gate {
+            return Err(ApiError::BadRequest(format!(
+                "step `{}`: deployment requests need a Deploy Run (a repo pipeline with \
+                 `environment:`)",
+                step.id
+            )));
+        }
+    }
 
     // Same retry bound the YAML compiler enforces (ADR-0047): a liveness bound,
     // rejected before any run exists.
@@ -4429,6 +4463,27 @@ fn resolve_deployment_requests(
                 evidence_results: req.evidence.clone(),
                 gate_steps: Vec::new(),
             });
+        }
+    }
+    // Validation's "one request per target per step" compares the AUTHORED
+    // text, so a literal `web` beside `${{ inputs.app }}` with `app=web`
+    // passes it and resolves twice to one target. Refuse that here, before
+    // anything is persisted — never de-duplicate: the two requests may name
+    // different version results, and which one the author meant is theirs to
+    // say. (The store's UNIQUE (run, step, source, id) would otherwise fail
+    // AFTER the run row exists, leaving a stepless Run; the in-memory store
+    // has no such constraint at all.)
+    let mut seen = std::collections::BTreeSet::new();
+    for r in &out {
+        if !seen.insert((
+            r.step.0.as_str(),
+            r.target_source.as_str(),
+            r.target_id.as_str(),
+        )) {
+            return Err(TriggerError::Pipeline(format!(
+                "step `{}`: two deployment requests resolve to `{}`/`{}`",
+                r.step.0, r.target_source, r.target_id
+            )));
         }
     }
     // Each DeploymentGate onto the request it waits on (ADR-0070 §8), so the
