@@ -17,8 +17,30 @@
 --     410), and it is never dropped — it is the evidence the split report and
 --     the golden tests read.
 --
--- The backfill is a function so the golden test can call it a second time
--- and prove it a no-op; sqlx runs this whole file in one transaction.
+-- What this migration CANNOT see. It reads only the database: the legacy
+-- per-Project rows and the deploy context of Runs that happened. No pipeline
+-- YAML is stored anywhere it could read, so a pipeline's `environment:` name
+-- that never produced a Run is invisible to it. Before ADR-0071 such a deploy
+-- was admitted with no rules; after it, two never-seen cases are REFUSED:
+--   * a NAME no Project defined and no Run ever named (say a manual-only
+--     `production` pipeline never dispatched) has no org Environment →
+--     UnknownEnvironment;
+--   * a PROJECT that references a name another Project DID define, but never
+--     ran a deploy into it, is not in that name's eligibility list →
+--     NotEligible.
+-- Both are fail-closed by design (no scan is possible, and a grace mode would
+-- fail open). An org admin fixes either by creating the Environment or
+-- widening its eligibility; the webhook names each refused pipeline in its
+-- delivery body and a dispatch answers 403 saying exactly that.
+--
+-- The backfill is a function so it can be written once with its guards, run
+-- here, and DROPPED at the end of this file: it is not idempotent against an
+-- admin's later edits (step 6a would flip an explicit empty eligibility list
+-- back to "all projects", step 2 would re-create a deleted overlay), so
+-- leaving it callable in the schema would be a way to loosen governance. The
+-- golden tests re-create it from this file to prove a second run on the
+-- state the first produced is a no-op. sqlx runs this whole file in one
+-- transaction.
 
 ALTER TABLE org_environments
     ADD COLUMN approvers              TEXT[]  NOT NULL DEFAULT '{}',
@@ -91,8 +113,8 @@ CREATE TABLE environment_migration_report (
 -- The ADR-0071 §10 backfill. Every write is INSERT … ON CONFLICT DO NOTHING
 -- or an UPDATE guarded to rows it has not touched yet, so a second call on
 -- the state the first produced changes nothing (the golden test proves it).
--- It never removes or loosens anything; it is meant to be called by this
--- migration and the golden test only.
+-- It never removes or loosens anything on the state it just produced; it is
+-- called by this migration once and then dropped (see the header).
 CREATE FUNCTION adr0071_backfill() RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
     now_ms BIGINT := (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT;
@@ -186,8 +208,15 @@ BEGIN
     -- Step 7: the legacy `deployments` table stays as legacy approval
     -- history, untouched (ADR-0070 §1).
 
-    -- Step 8: the split report — every name merged from more than one
-    -- Project, and every name migrated with eligibility "all projects".
+    -- Step 8: the split report — every name whose governance an admin should
+    -- look at because the migration MERGED something into one Environment:
+    --   * no definer (referenced-only / c-min only → "all projects"), or more
+    --     than one definer (their rules now share one baseline) — count <> 1;
+    --   * OR one definer plus a Project whose Runs named it without defining
+    --     it: that Project is now eligible under the permissive baseline with
+    --     no overlay, so the definer's rules (in ITS overlay) do not govern
+    --     it. Without this row an admin reading the overlays would believe
+    --     the name is approver-gated for everyone (c-full review M3/F2).
     INSERT INTO environment_migration_report
         (org, environment, merged_projects, referenced_only, referencing_projects, created_at)
     SELECT o.org, o.name,
@@ -206,8 +235,17 @@ BEGIN
     FROM org_environments o
     WHERE (SELECT count(*) FROM legacy_project_environments l
            WHERE l.org = o.org AND l.name = o.name) <> 1
+       OR EXISTS (SELECT 1 FROM runs r
+                  WHERE r.deploy_org = o.org AND r.deploy_environment = o.name
+                    AND r.deploy_project IS NOT NULL AND r.deploy_project <> ''
+                    AND NOT EXISTS (SELECT 1 FROM legacy_project_environments l
+                                    WHERE l.org = o.org AND l.name = o.name
+                                      AND l.project = r.deploy_project))
     ON CONFLICT (org, environment) DO NOTHING;
 END;
 $$;
 
 SELECT adr0071_backfill();
+
+-- One-shot: see the header. Nothing in the running system may call it again.
+DROP FUNCTION adr0071_backfill();

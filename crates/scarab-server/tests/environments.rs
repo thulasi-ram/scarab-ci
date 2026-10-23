@@ -473,6 +473,23 @@ async fn require_reason_persists_and_defaults_off_through_the_api() {
     tdb.cleanup().await;
 }
 
+/// The `CREATE FUNCTION adr0071_backfill()` section of migration 0057,
+/// verbatim — the migration drops the function after its one call, so a test
+/// that replays the backfill re-creates it from the migration's own text.
+fn backfill_function_sql() -> &'static str {
+    const MIGRATION: &str =
+        include_str!("../../scarab-db-postgres/migrations/0057_org_environment_governance.sql");
+    let start = MIGRATION
+        .find("CREATE FUNCTION adr0071_backfill()")
+        .expect("0057 defines the backfill");
+    let end = start
+        + MIGRATION[start..]
+            .find("\n$$;")
+            .expect("the backfill body ends with `$$;`")
+        + "\n$$;".len();
+    &MIGRATION[start..end]
+}
+
 /// ADR-0071 §10 step 8 through the API: a name two Projects defined is one
 /// report line naming both, each with its legacy rules beside its overlay
 /// now, the rule they disagreed on, and the permissive baseline flagged
@@ -498,6 +515,12 @@ async fn split_report_shows_merged_rules_and_acknowledges_once() {
         .await
         .unwrap();
     }
+    // 0057 dropped its one-shot backfill; re-create it from the migration's
+    // own text and run it over the pre-migration rows seeded above.
+    sqlx::raw_sql(backfill_function_sql())
+        .execute(&tdb.pool)
+        .await
+        .unwrap();
     sqlx::query("SELECT adr0071_backfill()")
         .execute(&tdb.pool)
         .await
