@@ -10,9 +10,10 @@
 
 use scarab_engine::ports::ExecState;
 use scarab_engine::{
-    gate_approvers, record_gate_approval, release_gate, retry_step, Attempt, AttemptId,
-    AttemptOutcome, Clock, Db, EventKind, EventPayload, Executor, FailureKind, RunId, RunStatus,
-    Scheduler, StepId, StepRun, StepSpec, StepStatus, Timestamp,
+    gate_approvers, record_gate_approval, reject_gate, release_gate, rerun_step, retry_step,
+    Attempt, AttemptId, AttemptOutcome, Clock, Db, EventKind, EventPayload, Executor, FailureKind,
+    OutboxId, OutboxMessage, RerunError, RunId, RunStatus, Scheduler, StepId, StepRun, StepSpec,
+    StepStatus, Timestamp, LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS,
 };
 use scarab_testkit::{FakeClock, FakeExecutor, InMemoryDb};
 
@@ -113,6 +114,7 @@ async fn resolutions(db: &InMemoryDb, gate: &str) -> Vec<(AttemptId, bool, Optio
                 passed,
                 reason,
                 deployment,
+                by: _,
             } if step.0 == gate => {
                 assert_eq!(
                     deployment, None,
@@ -587,4 +589,228 @@ async fn retrying_an_expired_gate_opens_a_fresh_attempt_and_forgets_old_approval
             (AttemptId("a2".into()), false)
         ]
     );
+}
+
+// ---------------------------------------------------------------------------
+// b1-fix
+// ---------------------------------------------------------------------------
+
+/// The `finalize_step` crash shape: an ORDINARY need is CAS'd Succeeded but
+/// its `StepTransitioned` was never written. The gate's clock must not fall
+/// back to the run's start (it would expire the instant it is reached); a
+/// missing finish counts as the mint instant. And the clock is FROZEN there:
+/// still waiting 59s later, failed 61s later — a start re-derived each tick
+/// as "now" would never expire at all.
+#[tokio::test]
+async fn a_gate_clock_starts_at_the_mint_when_a_needs_finish_was_never_journalled() {
+    let (db, clock, exec) = (
+        InMemoryDb::new(),
+        FakeClock::new(1_000),
+        FakeExecutor::new(),
+    );
+    new_run(&db).await;
+    step(&db, "build", &[]).await;
+    gate(&db, "approve", &["build"], "manual", None).await;
+    step(&db, "deploy", &["approve"]).await;
+    ir(
+        &db,
+        serde_json::json!({ "ir_version": 1, "steps": [
+            { "id": "build", "image": "img" },
+            { "id": "approve", "gate": "manual", "needs": ["build"],
+              "gate_expires_after": 60 },
+            { "id": "deploy", "image": "img", "needs": ["approve"] },
+        ]}),
+    )
+    .await;
+
+    tick(&db, &clock, &exec).await; // the run starts @1000; build is running
+    assert_eq!(step_of(&db, "build").await.status, StepStatus::Running);
+
+    clock.advance(99_000); // t = 100000
+    db.record_step_transition(
+        &run_id(),
+        &id("build"),
+        StepStatus::Running,
+        StepStatus::Succeeded,
+    )
+    .await
+    .unwrap(); // ... and the process dies before journalling it
+    tick(&db, &clock, &exec).await; // the gate is reached: its wait opens
+    let approve = step_of(&db, "approve").await;
+    assert_eq!(
+        only_attempt(&approve).started_at,
+        Timestamp(100_000),
+        "no finish event for build → the clock starts at the mint, not at the run's start"
+    );
+
+    clock.advance(59_000);
+    tick(&db, &clock, &exec).await;
+    assert_eq!(step_of(&db, "approve").await.status, StepStatus::Pending);
+
+    clock.advance(2_000);
+    tick(&db, &clock, &exec).await;
+    let approve = step_of(&db, "approve").await;
+    assert_eq!(
+        approve.status,
+        StepStatus::Failed,
+        "the frozen clock expires 60s after the mint"
+    );
+    assert_eq!(only_attempt(&approve).failure, Some(FailureKind::Gate));
+}
+
+/// A gate acts only once reached: while its upstream still runs, an approval,
+/// a release and a reject are all refused (`GateNotReached`), nothing is
+/// journalled, and the gate stays Pending with no wait.
+#[tokio::test]
+async fn a_gate_that_is_not_reached_refuses_approve_release_and_reject() {
+    let (db, clock, exec) = (
+        InMemoryDb::new(),
+        FakeClock::new(1_000),
+        FakeExecutor::new(),
+    );
+    new_run(&db).await;
+    step(&db, "build", &[]).await;
+    gate(&db, "approve", &["build"], "manual", None).await;
+    step(&db, "deploy", &["approve"]).await;
+    tick(&db, &clock, &exec).await; // build is running (unscripted)
+    assert_eq!(step_of(&db, "build").await.status, StepStatus::Running);
+    let g = id("approve");
+    let before = events(&db).await.len();
+
+    let not_reached = |e: RerunError| matches!(e, RerunError::GateNotReached { step } if step == g);
+    let err = record_gate_approval(&db, &clock, &run_id(), &g, "alice")
+        .await
+        .unwrap_err();
+    assert!(not_reached(err));
+    let err = release_gate(&db, &clock, &run_id(), &g).await.unwrap_err();
+    assert!(not_reached(err));
+    let err = reject_gate(&db, &clock, &run_id(), &g, "alice", "no")
+        .await
+        .unwrap_err();
+    assert!(not_reached(err));
+
+    assert_eq!(events(&db).await.len(), before, "nothing journalled");
+    assert!(!events(&db)
+        .await
+        .iter()
+        .any(|e| matches!(e.kind, EventPayload::GateApproved { .. })));
+    let approve = step_of(&db, "approve").await;
+    assert_eq!(approve.status, StepStatus::Pending);
+    assert!(approve.attempts.is_empty());
+    assert_eq!(step_of(&db, "deploy").await.status, StepStatus::Pending);
+}
+
+/// The re-arm race, reversed (b1-fix): a rerun of the gate's upstream reads
+/// the gate WAITING, but a release lands before the rerun closes that wait.
+/// The supersede then finds the wait already closed, so it journals no
+/// `AttemptSuperseded` — and re-arms the now-Succeeded gate to Pending from
+/// its live status, so the next wait is a2 over the rerun's output rather
+/// than a release of build #1 carrying into build #2.
+#[tokio::test]
+async fn a_gate_released_inside_an_upstream_reruns_window_is_rearmed_by_it() {
+    let (db, clock, exec) = (
+        InMemoryDb::new(),
+        FakeClock::new(1_000),
+        FakeExecutor::new(),
+    );
+    new_run(&db).await;
+    step(&db, "build", &[]).await;
+    gate(&db, "approve", &["build"], "manual", None).await;
+    step(&db, "deploy", &["approve"]).await;
+    exec.script_outcome(ExecState::Succeeded); // build #1
+    tick(&db, &clock, &exec).await;
+    tick(&db, &clock, &exec).await; // a1 open; the run suspends
+    assert_eq!(
+        only_attempt(&step_of(&db, "approve").await).outcome,
+        AttemptOutcome::Running
+    );
+
+    clock.advance(10_000);
+    db.arm_gate_resolve_race(&id("approve"), clock.now().await);
+    rerun_step(&db, &clock, &run_id(), &id("build"), Some("bob".into()))
+        .await
+        .unwrap();
+
+    let approve = step_of(&db, "approve").await;
+    assert_eq!(approve.status, StepStatus::Pending, "re-armed by the rerun");
+    assert_eq!(
+        only_attempt(&approve).outcome,
+        AttemptOutcome::Succeeded,
+        "the release closed a1"
+    );
+    let evs = events(&db).await;
+    let resolved_at = evs
+        .iter()
+        .position(
+            |e| matches!(&e.kind, EventPayload::GateResolved { step, .. } if step.0 == "approve"),
+        )
+        .expect("the release journalled its verdict");
+    assert!(
+        evs[resolved_at..].iter().any(|e| matches!(&e.kind,
+            EventPayload::StepTransitioned { step, from: StepStatus::Succeeded, to: StepStatus::Pending }
+                if step.0 == "approve")),
+        "the rerun re-arms the released gate with a StepTransitioned"
+    );
+    assert!(
+        !evs.iter().any(|e| matches!(&e.kind,
+            EventPayload::AttemptSuperseded { step, .. } if step.0 == "approve")),
+        "the wait was not open when the rerun tried to close it"
+    );
+
+    exec.script_outcome(ExecState::Succeeded); // build #2
+    for _ in 0..3 {
+        tick(&db, &clock, &exec).await;
+    }
+    let approve = step_of(&db, "approve").await;
+    assert_eq!(approve.status, StepStatus::Pending);
+    assert_eq!(approve.attempts.len(), 2, "{:?}", approve.attempts);
+    assert_eq!(approve.attempts[1].id, AttemptId("a2".into()));
+    assert_eq!(approve.attempts[1].outcome, AttemptOutcome::Running);
+    assert_eq!(step_of(&db, "deploy").await.status, StepStatus::Pending);
+}
+
+/// Dead-lettering a run (a poison launch intent, ADR-0047) while a gate waits
+/// closes that wait `Cancelled`, like every other cancel path — never a
+/// forever-`running` Attempt on a terminal run.
+#[tokio::test]
+async fn dead_lettering_a_run_closes_its_waiting_gates_attempt() {
+    let (db, clock, exec) = (
+        InMemoryDb::new(),
+        FakeClock::new(1_000),
+        FakeExecutor::new(),
+    );
+    new_run(&db).await;
+    step(&db, "build", &[]).await;
+    gate(&db, "approve", &["build"], "manual", None).await;
+    step(&db, "deploy", &["approve"]).await;
+    exec.script_outcome(ExecState::Succeeded); // build
+    tick(&db, &clock, &exec).await;
+    tick(&db, &clock, &exec).await; // a1 open; the run suspends
+    assert_eq!(run_status(&db).await, RunStatus::Suspended);
+
+    db.enqueue_outbox(&OutboxMessage {
+        id: OutboxId(0),
+        run: run_id(),
+        kind: LAUNCH_STEP.to_string(),
+        payload: serde_json::json!("garbage — not a LaunchIntent"),
+        idempotency_key: "poison-1".to_string(),
+        at: clock.now().await,
+    })
+    .await
+    .unwrap();
+    let sched = Scheduler::new(
+        &db as &dyn Db,
+        &clock as &dyn Clock,
+        &exec as &dyn Executor,
+        "sched",
+    )
+    .with_outbox_visibility_ms(0);
+    for _ in 0..(MAX_DELIVERY_ATTEMPTS + 2) {
+        sched.reconcile().await.unwrap();
+    }
+
+    assert_eq!(run_status(&db).await, RunStatus::DeadLettered);
+    let approve = step_of(&db, "approve").await;
+    assert_eq!(approve.status, StepStatus::Cancelled);
+    assert_eq!(only_attempt(&approve).outcome, AttemptOutcome::Cancelled);
 }

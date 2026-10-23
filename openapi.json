@@ -4113,7 +4113,69 @@
             "description": "no such run or gate"
           },
           "409": {
-            "description": "not an approvable gate, or the run's Environment no longer exists or no longer admits its project"
+            "description": "not an approvable gate (not a manual gate, not pending, or not reached yet), or the run's Environment no longer exists or no longer admits its project"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/runs/{id}/gates/{step}/reject": {
+      "post": {
+        "tags": [
+          "Runs"
+        ],
+        "summary": "Reject a waiting gate: fail it with a reason (ADR-0070 §9).",
+        "description": "For a `manual`, `timer` or `external` gate that is pending and reached\n(every step it needs has succeeded; slice b, criterion 3). The gate's Attempt fails with\nthe reason and the rejecting principal, its dependents are skipped, and the\nrun ends `failed`; retrying the gate opens a new wait that asks again.\n\nAuthz'd as a run write, the same as approve. A reject only ever stops a\ndeploy — any writer can already cancel the run — so it does NOT consult the\nEnvironment's approver rules, and it works when the Environment is gone or\nno longer admits the project: the clean way out of a held gate.",
+        "operationId": "reject_gate",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "run id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "step",
+            "in": "path",
+            "description": "gate step id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RejectGateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "this call rejected the gate: `{\"rejected\": true}`"
+          },
+          "400": {
+            "description": "missing, empty or over-long reason"
+          },
+          "404": {
+            "description": "no such run or step"
+          },
+          "409": {
+            "description": "not a rejectable gate, not pending, or not reached yet"
           }
         },
         "security": [
@@ -4132,6 +4194,7 @@
           "Runs"
         ],
         "summary": "Release an **external** gate by presenting its token (ADR-0034) — the path an\noutside system (a deploy webhook, a change-management tool) uses instead of an\ninteractive approval. The token is `HMAC-SHA256(secret, \"{run}:{step}\")`\n(`sha256=<hex>`), verified in constant time; no per-gate storage. The endpoint\nis 404 when no token secret is configured, and only releases gates of kind\n`external` (manual gates stay approval-only). In a Deploy Run, the gate is\nheld (409) when the run's Environment no longer exists or no longer admits\nits Project (ADR-0071 §2) — the same check `approve_gate` makes. The token\nproves who is releasing, not that the deploy is still allowed.",
+        "description": "The same token can instead **fail** the gate with a reason: a body of\n`{\"passed\": false, \"reason\": \"…\"}` rejects it (journalled `by\nexternal:{step}`). A fail is never held — it only stops the deploy — so it\nskips the Environment check. No body, or `\"passed\": true`, is a release.",
         "operationId": "release_gate_external",
         "parameters": [
           {
@@ -4153,9 +4216,29 @@
             }
           }
         ],
+        "requestBody": {
+          "description": "optional: `{\"passed\": false, \"reason\": \"…\"}` fails the gate instead of releasing it",
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ExternalGateVerdict"
+                  }
+                ]
+              }
+            }
+          }
+        },
         "responses": {
           "202": {
-            "description": "gate released"
+            "description": "gate released (or, with a fail body, failed)"
+          },
+          "400": {
+            "description": "malformed body, or a fail without a 1..1024-byte reason"
           },
           "401": {
             "description": "bad or missing token"
@@ -4164,7 +4247,7 @@
             "description": "no such external gate, or token release disabled"
           },
           "409": {
-            "description": "the gate is not pending, or the run's Environment no longer exists or no longer admits its project"
+            "description": "the gate is not pending or not reached yet, or (a release) the run's Environment no longer exists or no longer admits its project"
           }
         },
         "security": [
@@ -6557,6 +6640,23 @@
           }
         }
       },
+      "ExternalGateVerdict": {
+        "type": "object",
+        "description": "Optional `POST /v1/runs/{id}/gates/{step}/release` body: an external gate's\nverdict. Absent (or `passed: true`) releases the gate; `passed: false`\nfails it with `reason`.",
+        "properties": {
+          "passed": {
+            "type": "boolean",
+            "description": "`false` fails the gate; `true` (the default) releases it."
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the gate failed — required (1 to 1024 bytes, trimmed) with\n`passed: false`; ignored on a release."
+          }
+        }
+      },
       "GrantedPermissionDto": {
         "type": "object",
         "description": "A permission the forge reports as granted.",
@@ -7731,6 +7831,19 @@
               "$ref": "#/components/schemas/RefDto"
             },
             "description": "Branches first, then tags; each group name-sorted."
+          }
+        }
+      },
+      "RejectGateRequest": {
+        "type": "object",
+        "description": "`POST /v1/runs/{id}/gates/{step}/reject` body: why the gate is failed.",
+        "required": [
+          "reason"
+        ],
+        "properties": {
+          "reason": {
+            "type": "string",
+            "description": "The human reason, journalled on the gate's verdict and its Attempt.\nRequired: 1 to 1024 bytes once trimmed."
           }
         }
       },
