@@ -14,8 +14,10 @@
 //!   c-min Environment keeps its deadline and description;
 //! - eligibility is definers ∪ run-referencers, and "all projects" for a name
 //!   no Project defined (referenced-only, or c-min only);
-//! - the split report lists merged and all-projects names, nothing else;
-//! - the second run changes nothing.
+//! - the split report lists merged, all-projects, and single-definer-plus-
+//!   referencer names, nothing else;
+//! - the second run changes nothing — and the function is gone from the
+//!   migrated schema (it is re-created here from the migration's own text).
 
 mod common;
 
@@ -123,6 +125,10 @@ const RUNS: &[(&str, &str, &str, &str)] = &[
     // Referenced without a definition by a Project that never defined it:
     // must stay admitted after the migration → eligible for `prod`.
     ("r-mobile-prod", "acme", "mobile", "prod"),
+    // One definer (`web`) plus a run-referencer: `ops` becomes eligible under
+    // the permissive baseline with no overlay, so `web`'s rules do not govern
+    // it — the report must say so even though only one Project defined it.
+    ("r-ops-staging", "acme", "ops", "staging"),
     // A name no Project defined, only referenced → all projects.
     ("r-docs-preview", "acme", "docs", "preview"),
     ("r-docs-preview-2", "acme", "docs", "preview"),
@@ -147,6 +153,24 @@ async fn apply_0057(pool: &PgPool) {
         .execute(pool)
         .await
         .expect("apply 0057");
+}
+
+/// The `CREATE FUNCTION adr0071_backfill()` section of migration 0057,
+/// verbatim. The migration drops the function after its one call (calling it
+/// again later would loosen governance an admin has since tightened), so a
+/// test that proves the second run a no-op re-creates it from the migration's
+/// own text — never from a copy that could drift.
+fn backfill_function_sql() -> &'static str {
+    const MIGRATION: &str = include_str!("../migrations/0057_org_environment_governance.sql");
+    let start = MIGRATION
+        .find("CREATE FUNCTION adr0071_backfill()")
+        .expect("0057 defines the backfill");
+    let end = start
+        + MIGRATION[start..]
+            .find("\n$$;")
+            .expect("the backfill body ends with `$$;`")
+        + "\n$$;".len();
+    &MIGRATION[start..end]
 }
 
 async fn seed_corpus(pool: &PgPool) {
@@ -249,6 +273,10 @@ async fn backfill_reproduces_the_pure_migration_and_is_a_no_op_the_second_time()
     apply_0057(&pool).await;
 
     let first = governance_snapshot(&pool).await;
+    sqlx::raw_sql(backfill_function_sql())
+        .execute(&pool)
+        .await
+        .expect("re-create the backfill the migration dropped");
     sqlx::query("SELECT adr0071_backfill()")
         .execute(&pool)
         .await
@@ -363,7 +391,11 @@ async fn backfill_reproduces_the_pure_migration_and_is_a_no_op_the_second_time()
         projects(&["api", "mobile", "web"]),
         "definers ∪ run-referencers"
     );
-    assert_eq!(eligibility("acme", "staging").await, projects(&["web"]));
+    assert_eq!(
+        eligibility("acme", "staging").await,
+        projects(&["ops", "web"]),
+        "the definer ∪ its run-referencer"
+    );
     assert_eq!(eligibility("acme", "release").await, projects(&["api"]));
     assert_eq!(eligibility("globex", "prod").await, projects(&["shop"]));
     assert_eq!(
@@ -403,7 +435,9 @@ async fn backfill_reproduces_the_pure_migration_and_is_a_no_op_the_second_time()
     );
     assert_eq!(deadline("preview").await.updated_by, "migration:adr-0071");
 
-    // The split report: merged names and all-projects names only.
+    // The split report: merged names, all-projects names, and a single
+    // definer with a run-referencer — nothing else (`release`, `globex/prod`:
+    // one definer, no referencer).
     let report = sqlx::query(
         "SELECT org, environment, merged_projects, referenced_only, referencing_projects
          FROM environment_migration_report ORDER BY org, environment",
@@ -435,6 +469,13 @@ async fn backfill_reproduces_the_pure_migration_and_is_a_no_op_the_second_time()
                 s(&["mobile"])
             ),
             ("acme".into(), "sandbox".into(), s(&[]), true, s(&[])),
+            (
+                "acme".into(),
+                "staging".into(),
+                s(&["web"]),
+                false,
+                s(&["ops"])
+            ),
         ]
     );
 
@@ -452,6 +493,13 @@ async fn a_fresh_database_migrates_and_governance_writes_need_an_environment() {
     };
     let db = PostgresDb::with_pool(tdb.pool.clone());
     db.migrate().await.expect("migrations apply");
+    // The one-shot backfill is not left callable in the schema.
+    let backfill_exists: bool =
+        sqlx::query_scalar("SELECT to_regprocedure('adr0071_backfill()') IS NOT NULL")
+            .fetch_one(&tdb.pool)
+            .await
+            .unwrap();
+    assert!(!backfill_exists, "0057 drops adr0071_backfill()");
     assert!(db
         .deploy_governance("acme", "web", "prod")
         .await
