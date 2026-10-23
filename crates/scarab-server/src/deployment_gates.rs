@@ -22,11 +22,22 @@
 //! **as of when it was read**: the `now` it is asked with is lowered to the
 //! `now` of the read that filled it, so an input committed after the read can
 //! delay a verdict to the next tick but never be decided past. For the same
-//! reason a window that opened after the read has no verdict yet.
+//! reason a window that opened after the read has no verdict yet. The one
+//! irreversible verdict a fold can give without any input — "the request is
+//! missing" — is never taken from a cached fold: the record is re-read
+//! uncached first (the cache entry replaced) and the gate fails only if that
+//! fresh read still lacks the request. That is causal, not clock order:
+//! the request commits with the deploy Step's success, which the gate's wait
+//! opened after, so a read issued after the wait opened sees it.
 //!
 //! **Errors** are logged here and returned, and the engine takes no decision
 //! that tick (plan Q6): one unreadable row must not dead-letter every Deploy
-//! Run waiting in its Environment. `gate_expires_after` still bounds the wait.
+//! Run waiting in its Environment — but only until the deadline. A record
+//! that still cannot be read once the deadline has elapsed since the window
+//! start fails the gate `stalled`, the read error in the reason, so the
+//! deadline bounds the wait even with no `gate_expires_after`. An error
+//! reading the deadline itself (governance store, deploy context) stays no
+//! decision.
 //!
 //! **Per-DeploymentTarget concurrency** (slice b, criterion 4; ADR-0071 §9)
 //! is decided here too: a deploy Step about to be promoted is held `Pending`
@@ -114,16 +125,30 @@ impl ServerDeploymentGates {
     }
 
     /// The Environment's fold, read (and cached for this tick) at `now`.
+    /// `true` with it when it was served from the cache — read EARLIER in
+    /// this tick, so possibly before an input this caller needs committed.
     async fn fold(
+        &self,
+        org: &str,
+        environment: &str,
+        now: Millis,
+    ) -> Result<(Arc<CachedFold>, bool), String> {
+        let key = (org.to_string(), environment.to_string());
+        if let Some(cached) = self.folds.lock().expect("fold cache poisoned").get(&key) {
+            return Ok((cached.clone(), true));
+        }
+        Ok((self.read_fold(org, environment, now).await?, false))
+    }
+
+    /// The Environment's fold read NOW, uncached, replacing this tick's cache
+    /// entry (so later gates of the tick share the newer read).
+    async fn read_fold(
         &self,
         org: &str,
         environment: &str,
         now: Millis,
     ) -> Result<Arc<CachedFold>, String> {
         let key = (org.to_string(), environment.to_string());
-        if let Some(cached) = self.folds.lock().expect("fold cache poisoned").get(&key) {
-            return Ok(cached.clone());
-        }
         let inputs = self
             .store
             .inputs(org, environment)
@@ -288,12 +313,14 @@ impl ServerDeploymentGates {
                 DEFAULT_DEPLOYMENT_DEADLINE_MS
             }
         };
-        let cached = self.fold(&request.org, &request.environment, now.0).await?;
-        let now = now.0.min(cached.read_now);
-        if now < window_floor.0 {
-            // The fold predates the window: it cannot speak for it yet.
-            return Ok(None);
-        }
+        let tick_now = now;
+        let (mut cached, mut from_cache) = match self
+            .fold(&request.org, &request.environment, tick_now.0)
+            .await
+        {
+            Ok(fold) => fold,
+            Err(e) => return unreadable_record(e, window_floor, tick_now, deadline),
+        };
         let target = DeploymentTarget {
             environment: request.environment.clone(),
             source: request.target_source.clone(),
@@ -303,12 +330,37 @@ impl ServerDeploymentGates {
             run: run.0.clone(),
             step: request.step.0.clone(),
         };
-        let ledger = cached.folded.ledger();
-        let Some(deployment) = ledger.request_of(&requester, &target) else {
-            // The requesting step succeeded before this gate's wait began,
-            // and its request was recorded in the same commit as that
-            // success — and this fold was read after the wait began. So the
-            // request is not late: it is missing, and waiting cannot bring it.
+        let deployment = loop {
+            let now = tick_now.0.min(cached.read_now);
+            if now < window_floor.0 {
+                // The fold predates the window: it cannot speak for it yet.
+                return Ok(None);
+            }
+            if let Some(deployment) = cached.folded.ledger().request_of(&requester, &target) {
+                break deployment;
+            }
+            if from_cache {
+                // A fold read earlier in this tick may predate the request's
+                // commit (another replica succeeded the deploy Step after
+                // it). Clocks cannot settle that — replicas share none — so
+                // re-read the record now and decide from that.
+                cached = match self
+                    .read_fold(&request.org, &request.environment, tick_now.0)
+                    .await
+                {
+                    Ok(fresh) => fresh,
+                    Err(e) => return unreadable_record(e, window_floor, tick_now, deadline),
+                };
+                from_cache = false;
+                continue;
+            }
+            // Missing, decided causally: this gate's wait opened only after
+            // this replica read its need `Succeeded`, and the deploy Step's
+            // request commits in the SAME transaction as that success — so
+            // any read issued after the wait opened sees the request. This
+            // fold was read uncached, after the wait opened (by this call),
+            // and still lacks it: the request is missing, and waiting cannot
+            // bring it.
             return Ok(Some(DeploymentGateDecision {
                 passed: false,
                 reason: format!(
@@ -319,6 +371,8 @@ impl ServerDeploymentGates {
                 deployment: None,
             }));
         };
+        let now = tick_now.0.min(cached.read_now);
+        let ledger = cached.folded.ledger();
         let Some(decision) =
             deployment.gate_decision_from(&requester, window_floor.0, now, deadline)
         else {
@@ -372,6 +426,36 @@ impl ServerDeploymentGates {
             deployment: Some(cached.folded.public_id(deployment)),
         }))
     }
+}
+
+/// The Deployment record could not be read (the fold errored) — judge Q6 as
+/// amended: **no decision** (`Err`, logged by the caller) while the deadline
+/// has not elapsed since the window start; at or after it, the gate fails
+/// `stalled` with the read error in the reason, so a persistent read error
+/// can never make the wait unbounded (criterion 2's deadline clause).
+///
+/// The window start here is `window_floor`: the window opens at
+/// max(request effective_at, Attempt start), and the request's effective_at
+/// is the deploy Step Attempt's start, which precedes that Step's success,
+/// which is at or before this gate Attempt's start (`window_floor`). So the
+/// max is `window_floor` — known without the record.
+fn unreadable_record(
+    error: String,
+    window_floor: Timestamp,
+    now: Timestamp,
+    deadline: Millis,
+) -> Result<Option<DeploymentGateDecision>, String> {
+    if now.0 >= window_floor.0.saturating_add(deadline) {
+        return Ok(Some(DeploymentGateDecision {
+            passed: false,
+            reason: format!(
+                "stalled: not live within {} (the Deployment record could not be read: {error})",
+                deadline_text(deadline)
+            ),
+            deployment: None,
+        }));
+    }
+    Err(error)
 }
 
 /// A deadline as a reason shows it: whole seconds when it is a whole number

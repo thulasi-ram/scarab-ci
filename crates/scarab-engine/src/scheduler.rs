@@ -2899,7 +2899,21 @@ impl<'a> Scheduler<'a> {
                     // DeploymentRequests (if it makes any) in the same commit,
                     // or failing it `DeploymentRequestIncomplete` when its
                     // results cannot complete one (slice b, criterion 1).
-                    self.succeed_step(&run, &step, &attempt, &results).await?;
+                    //
+                    // The results that complete a request are the attempt's
+                    // STORED results overlaid with the executor's map. On k8s
+                    // the executor map is empty (the port default): the
+                    // results-egress sidecar POSTs them to the results-ingest
+                    // API, which commits them with `set_step_results` under
+                    // this attempt's fence — and the k8s backend withholds
+                    // `Succeeded` until that sidecar has terminated (its
+                    // `curl -f` returned 2xx only after the commit), so the
+                    // read below sees them. The local/fake backends hand them
+                    // over in-process and were just written above.
+                    let mut completing = self.db.attempt_results(&run, &step, &attempt).await?;
+                    completing.extend(results);
+                    self.succeed_step(&run, &step, &attempt, &completing)
+                        .await?;
                     self.db.mark_dispatched(msg.id).await?;
                 }
                 ExecState::Failed { class, cause, .. } => {
@@ -4162,16 +4176,33 @@ impl<'a> Scheduler<'a> {
         attempt: &AttemptId,
         results: &BTreeMap<String, serde_json::Value>,
     ) -> Result<(), SchedulerError> {
+        // The same stale-/torn-down-observation guard as
+        // `settle_failed_attempt`, before EITHER branch: an exit 0 observed for
+        // an attempt that is no longer the step's frontier (a successor runs
+        // under a higher fence) or that carries a terminal-by-intent outcome
+        // (`Superseded`, `Cancelled`) is not this step's verdict. It writes
+        // nothing — no step transition, no DeploymentRequest — and returns
+        // `Ok`, so the caller still retires the outbox message. The Db call
+        // re-checks "latest attempt" inside its commit (the window between
+        // this read and that commit).
+        let attempts = self.db.attempts_of_step(run, step).await?;
+        let is_frontier = attempts.last().map(|a| &a.id) == Some(attempt);
+        let torn_down = attempts.iter().find(|a| &a.id == attempt).is_some_and(|a| {
+            matches!(
+                a.outcome,
+                AttemptOutcome::Superseded | AttemptOutcome::Cancelled
+            )
+        });
+        if !is_frontier || torn_down {
+            return Ok(());
+        }
         let requests = self.db.run_deployment_requests(run, step).await?;
         let Some(org) = requests.first().map(|r| r.org.clone()) else {
             return self
                 .finalize_step(run, step, attempt, StepStatus::Succeeded, None, None)
                 .await;
         };
-        let started_at = self
-            .db
-            .attempts_of_step(run, step)
-            .await?
+        let started_at = attempts
             .into_iter()
             .find(|a| &a.id == attempt)
             .map(|a| a.started_at)

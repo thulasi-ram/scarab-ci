@@ -194,10 +194,18 @@ async fn step_success_records_one_request_effective_at_the_attempt_start() {
 
     let clock = FakeClock::new(1_000);
     let exec = FakeExecutor::new();
+    // Time passes between Run creation (1 000) and the claim, so the
+    // Attempt's start is distinguishable from the Run's and the step's
+    // creation instant.
+    clock.advance(2_000);
     // Launch; the Pod is still running.
     tick(&db, &clock, &exec).await;
     tick(&db, &clock, &exec).await;
     let started_at = db.attempts_of_step(&run_id(), &step).await.unwrap()[0].started_at;
+    assert_ne!(
+        started_at.0, 1_000,
+        "the Attempt starts at the claim, after the Run was created"
+    );
 
     // The step runs for a while, then exits 0 with its results.
     clock.advance(5_000);
@@ -246,6 +254,10 @@ async fn step_success_records_one_request_effective_at_the_attempt_start() {
     assert_eq!(
         *effective_at, started_at.0,
         "effective_at is the Step's start (the control-plane clock), not its success"
+    );
+    assert_ne!(
+        *effective_at, 1_000,
+        "effective_at is the Attempt's start, not the Run's creation"
     );
     assert!(
         *at >= started_at.0 + 5_000,
@@ -554,5 +566,68 @@ async fn a_target_is_homed_by_its_routing_else_by_its_newest_input() {
         .await
         .unwrap()
         .is_empty());
+    tdb.cleanup().await;
+}
+
+/// A non-frontier attempt's exit 0 never succeeds the step (judge-b23 J2):
+/// `bump` is `running` on its successor `a2`, so the step-row guard alone
+/// would pass. Finishing for `a1` — merely non-latest, then torn down
+/// (`Superseded`) — is a `Conflict` that appends nothing, spends no seq and
+/// leaves the step `running`; the frontier `a2` then finishes normally.
+#[tokio::test]
+async fn a_non_latest_attempt_cannot_finish_the_step() {
+    let Some((tdb, db)) = migrated().await else {
+        return;
+    };
+    seed_running(&db, &["bump"]).await;
+    let step = StepId("bump".into());
+    let (a1, a2) = (AttemptId("a1".into()), AttemptId("a2".into()));
+    db.record_attempt(
+        &run_id(),
+        &step,
+        &Attempt {
+            id: a2.clone(),
+            started_at: Timestamp(2_000),
+            failure: None,
+            failure_detail: None,
+            outcome: AttemptOutcome::Running,
+        },
+    )
+    .await
+    .unwrap();
+    let input = [request_input("bump", "web", 1_000)];
+
+    let stale = db
+        .finish_step_with_deployment_requests(&run_id(), &step, &a1, ORG, &input, Timestamp(3_000))
+        .await;
+    assert!(
+        matches!(stale, Err(DbError::Conflict)),
+        "non-latest: got {stale:?}"
+    );
+    db.set_attempt_outcome(&run_id(), &step, &a1, AttemptOutcome::Superseded)
+        .await
+        .unwrap();
+    let superseded = db
+        .finish_step_with_deployment_requests(&run_id(), &step, &a1, ORG, &input, Timestamp(3_100))
+        .await;
+    assert!(
+        matches!(superseded, Err(DbError::Conflict)),
+        "superseded: got {superseded:?}"
+    );
+    assert!(
+        db.inputs(ORG, ENV).await.unwrap().is_empty(),
+        "nothing appended"
+    );
+    assert_eq!(counter(&tdb.pool).await, None, "no seq was spent");
+    assert_eq!(step_status(&db, "bump").await, StepStatus::Running);
+    let attempts = db.attempts_of_step(&run_id(), &step).await.unwrap();
+    assert_eq!(attempts[0].outcome, AttemptOutcome::Superseded);
+    assert_eq!(attempts[1].outcome, AttemptOutcome::Running);
+
+    db.finish_step_with_deployment_requests(&run_id(), &step, &a2, ORG, &input, Timestamp(3_200))
+        .await
+        .unwrap();
+    assert_eq!(step_status(&db, "bump").await, StepStatus::Succeeded);
+    assert_eq!(db.inputs(ORG, ENV).await.unwrap().len(), 1);
     tdb.cleanup().await;
 }

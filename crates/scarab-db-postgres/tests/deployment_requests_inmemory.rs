@@ -137,8 +137,15 @@ async fn a_complete_request_is_recorded_effective_at_the_attempt_start() {
     seed(&db).await;
     let clock = FakeClock::new(1_000);
     let exec = FakeExecutor::new();
+    // Time passes between Run creation (1 000) and the claim, so the
+    // Attempt's start is distinguishable from the Run's creation instant.
+    clock.advance(2_000);
     tick(&db, &clock, &exec).await;
     let started_at = db.attempts_of_step(&run_id(), &step_id()).await.unwrap()[0].started_at;
+    assert_ne!(
+        started_at.0, 1_000,
+        "the Attempt starts at the claim, after the Run was created"
+    );
 
     clock.advance(7_000);
     exec.set_results(
@@ -168,6 +175,10 @@ async fn a_complete_request_is_recorded_effective_at_the_attempt_start() {
         panic!("expected a request, got {:?}", logged[0]);
     };
     assert_eq!(*effective_at, started_at.0);
+    assert_ne!(
+        *effective_at, 1_000,
+        "the Attempt's start, not the Run's creation"
+    );
     assert_eq!(*at, started_at.0 + 7_000);
     assert_eq!(version.0, "v42");
     assert_eq!(evidence, &vec!["sha256:aaa".to_string()]);
@@ -228,4 +239,109 @@ fn completion_needs_a_string_version_and_string_evidence() {
         deployment_inputs(&run_id(), &step_id(), &[requested()], &number, Timestamp(5)).is_err(),
         "a number is not a DeploymentVersion"
     );
+}
+
+/// The in-memory twin of `deployment_requests.rs`'
+/// `a_non_latest_attempt_cannot_finish_the_step` (judge-b23 J2): with `bump`
+/// `running` on `a2`, finishing for `a1` — non-latest, then `Superseded` —
+/// is a `Conflict` that appends nothing and leaves the step `running`; the
+/// frontier `a2` then finishes.
+#[tokio::test]
+async fn a_non_latest_attempt_cannot_finish_the_step() {
+    use scarab_deployment::{DeploymentRequester, DeploymentTarget, DeploymentVersion};
+    use scarab_engine::{Attempt, AttemptId, AttemptOutcome, DbError};
+
+    let db = InMemoryDb::new();
+    seed(&db).await;
+    db.record_step_transition(
+        &run_id(),
+        &step_id(),
+        StepStatus::Pending,
+        StepStatus::Running,
+    )
+    .await
+    .unwrap();
+    for (id, at) in [("a1", 1_000), ("a2", 2_000)] {
+        db.record_attempt(
+            &run_id(),
+            &step_id(),
+            &Attempt {
+                id: AttemptId(id.into()),
+                started_at: Timestamp(at),
+                failure: None,
+                failure_detail: None,
+                outcome: AttemptOutcome::Running,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let input = [DeploymentInput::Request {
+        target: DeploymentTarget {
+            environment: "prod".into(),
+            source: "argocd".into(),
+            id: "web".into(),
+        },
+        version: DeploymentVersion("v42".into()),
+        requester: DeploymentRequester {
+            run: "r1".into(),
+            step: "bump".into(),
+        },
+        effective_at: 1_000,
+        at: 1_000,
+        evidence: Vec::new(),
+    }];
+    let (a1, a2) = (AttemptId("a1".into()), AttemptId("a2".into()));
+
+    let stale = db
+        .finish_step_with_deployment_requests(
+            &run_id(),
+            &step_id(),
+            &a1,
+            "acme",
+            &input,
+            Timestamp(3_000),
+        )
+        .await;
+    assert!(
+        matches!(stale, Err(DbError::Conflict)),
+        "non-latest: got {stale:?}"
+    );
+    db.set_attempt_outcome(&run_id(), &step_id(), &a1, AttemptOutcome::Superseded)
+        .await
+        .unwrap();
+    let superseded = db
+        .finish_step_with_deployment_requests(
+            &run_id(),
+            &step_id(),
+            &a1,
+            "acme",
+            &input,
+            Timestamp(3_100),
+        )
+        .await;
+    assert!(
+        matches!(superseded, Err(DbError::Conflict)),
+        "superseded: got {superseded:?}"
+    );
+    assert!(
+        db.inputs("acme", "prod").await.unwrap().is_empty(),
+        "nothing appended"
+    );
+    let step = db.steps_of_run(&run_id()).await.unwrap().remove(0);
+    assert_eq!(step.status, StepStatus::Running);
+
+    db.finish_step_with_deployment_requests(
+        &run_id(),
+        &step_id(),
+        &a2,
+        "acme",
+        &input,
+        Timestamp(3_200),
+    )
+    .await
+    .unwrap();
+    let step = db.steps_of_run(&run_id()).await.unwrap().remove(0);
+    assert_eq!(step.status, StepStatus::Succeeded);
+    assert_eq!(db.inputs("acme", "prod").await.unwrap().len(), 1);
 }

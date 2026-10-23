@@ -90,6 +90,7 @@ struct World {
     db: Arc<dyn Db>,
     store: Arc<dyn DeploymentStore>,
     oracle: ServerDeploymentGates,
+    governance: Arc<dyn EnvironmentGovernanceStore>,
     clock: FakeClock,
     exec: FakeExecutor,
     pg: Option<common::TestDb>,
@@ -144,31 +145,37 @@ impl World {
         governance: Arc<dyn EnvironmentGovernanceStore>,
         pg: Option<common::TestDb>,
     ) -> World {
-        governance
+        let oracle =
+            ServerDeploymentGates::new(db.clone(), store.clone(), Some(governance.clone()));
+        let w = World {
+            db,
+            store,
+            oracle,
+            governance,
+            clock: FakeClock::new(T0),
+            exec: FakeExecutor::new(),
+            pg,
+        };
+        w.set_gate_deadline(GATE_DEADLINE_MS).await;
+        w
+    }
+
+    /// The Project's overlay deadline for its DeploymentGates in [`ENV`].
+    async fn set_gate_deadline(&self, ms: i64) {
+        self.governance
             .put_environment_project_overlay(
                 &EnvironmentProjectOverlay {
                     org: ORG.into(),
                     environment: ENV.into(),
                     project: PROJECT.into(),
                     rules: Default::default(),
-                    deployment_gate_deadline: Some(
-                        EnvironmentDeploymentDeadline::new(GATE_DEADLINE_MS).unwrap(),
-                    ),
+                    deployment_gate_deadline: Some(EnvironmentDeploymentDeadline::new(ms).unwrap()),
                 },
                 "amy",
                 1,
             )
             .await
             .unwrap();
-        let oracle = ServerDeploymentGates::new(db.clone(), store.clone(), Some(governance));
-        World {
-            db,
-            store,
-            oracle,
-            clock: FakeClock::new(T0),
-            exec: FakeExecutor::new(),
-            pg,
-        }
     }
 
     async fn finish(self) {
@@ -543,6 +550,10 @@ async fn silence_stalls_the_gate_at_its_deadline_and_the_verdict_holds(w: World)
     let stalled = Some("stalled: not live within 120s".to_string());
     assert_eq!(gate.attempts[0].failure_detail, stalled);
 
+    // Make a re-derivation PASS: lengthen the deadline well past now (the
+    // effective one is then the Environment's baseline, ≥ 300s) and report
+    // `live` inside it. Only a journalled verdict stays Failed.
+    w.set_gate_deadline(10 * GATE_DEADLINE_MS).await;
     w.clock.advance(1_000);
     w.report("v1", SourceAssertedStatus::Live, "synced at last")
         .await;

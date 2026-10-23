@@ -1695,12 +1695,27 @@ impl Db for PostgresDb {
             tx.rollback().await.map_err(db_err)?;
             return Err(DbError::Conflict);
         }
-        // The attempt's outcome, exactly as `set_attempt_outcome(Succeeded)`.
-        sqlx::query(
+        // The attempt's outcome, as `set_attempt_outcome(Succeeded)` — AND
+        // only while `attempt` is still the step's latest (the
+        // `attempts_on` order). The step row is `running` for a successor
+        // `a2` too, so the transition guard alone would let a superseded or
+        // merely non-latest `a1`'s exit 0 succeed the step and record a
+        // DeploymentRequest. The scheduler checks the frontier before calling;
+        // this closes the window between that read and this commit (a rerun
+        // or retry that mints a successor takes the step row, which we hold).
+        // Zero rows (non-latest, or torn down by intent) → roll back,
+        // `Conflict`: nothing of ours lands.
+        let affected = sqlx::query(
             "UPDATE attempts SET outcome = $4
              WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3
                AND outcome IS DISTINCT FROM 'superseded'
-               AND outcome IS DISTINCT FROM 'cancelled'",
+               AND outcome IS DISTINCT FROM 'cancelled'
+               AND attempt_id = (
+                   SELECT latest.attempt_id FROM attempts latest
+                   WHERE latest.run_id = $1 AND latest.step_id = $2
+                   ORDER BY latest.started_at DESC,
+                            CAST(substring(latest.attempt_id FROM 2) AS INTEGER) DESC
+                   LIMIT 1)",
         )
         .bind(&run.0)
         .bind(&step.0)
@@ -1708,7 +1723,12 @@ impl Db for PostgresDb {
         .bind(AttemptOutcome::Succeeded.as_str())
         .execute(&mut *tx)
         .await
-        .map_err(db_err)?;
+        .map_err(db_err)?
+        .rows_affected();
+        if affected == 0 {
+            tx.rollback().await.map_err(db_err)?;
+            return Err(DbError::Conflict);
+        }
         // The requests, LAST (the counter lock). A refusal or failure here
         // rolls the transition back with it: no success without its request.
         for input in inputs {
