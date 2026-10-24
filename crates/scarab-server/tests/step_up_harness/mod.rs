@@ -12,8 +12,10 @@ use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
+use scarab_db_postgres::PostgresDb;
 use scarab_identity::{
-    Binding, BindingOrigin, Principal, RbacStore, Role, Scope, Session, SessionStore,
+    Binding, BindingOrigin, ChallengeStore, PasskeyStore, Principal, RbacStore, Role, Scope,
+    SecurityEvent, SecurityEventFilter, SecurityEventLog, Session, SessionStore, StepUpStore,
     LOGIN_KIND_BROWSER,
 };
 use scarab_server::step_up::StepUpService;
@@ -44,6 +46,21 @@ pub struct Harness {
     pub passkeys: Arc<InMemoryPasskeys>,
     pub step_up: Arc<InMemoryStepUp>,
     pub events: Arc<InMemorySecurityEvents>,
+    /// The stores the app ACTUALLY uses — the in-memory ones above, or
+    /// Postgres under [`Backend::Pg`].
+    pub rbac_store: Arc<dyn RbacStore>,
+    pub passkey_store: Arc<dyn PasskeyStore>,
+    pub challenge_store: Arc<dyn ChallengeStore>,
+    pub requests: Arc<dyn StepUpStore>,
+    pub log: Arc<dyn SecurityEventLog>,
+}
+
+/// Where the step-up stores (and the role bindings the Org log joins) live.
+pub enum Backend {
+    Memory,
+    /// A migrated Postgres: passkeys, challenges, confirmations, requests,
+    /// the event log and the RBAC bindings.
+    Pg(Arc<PostgresDb>),
 }
 
 /// A signed-in browser (or a Bearer client): the session id and its CSRF.
@@ -71,6 +88,11 @@ pub fn scoped(subject: &str) -> Principal {
 
 /// An enforcing harness. `extra` adjusts the state before step-up is wired.
 pub fn harness_with(extra: impl FnOnce(AppState) -> AppState) -> Harness {
+    harness_on(Backend::Memory, extra)
+}
+
+/// [`harness_with`] over `backend`.
+pub fn harness_on(backend: Backend, extra: impl FnOnce(AppState) -> AppState) -> Harness {
     let db = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(T0));
     let logs = Arc::new(LogService::new(
@@ -88,18 +110,36 @@ pub fn harness_with(extra: impl FnOnce(AppState) -> AppState) -> Harness {
     let passkeys = Arc::new(InMemoryPasskeys::new());
     let step_up = Arc::new(InMemoryStepUp::new());
     let events = Arc::new(InMemorySecurityEvents::new().with_rbac(rbac.clone()));
+    let challenges = Arc::new(InMemoryChallenges::new());
+    #[allow(clippy::type_complexity)]
+    let (rbac_store, passkey_store, challenge_store, requests, log): (
+        Arc<dyn RbacStore>,
+        Arc<dyn PasskeyStore>,
+        Arc<dyn ChallengeStore>,
+        Arc<dyn StepUpStore>,
+        Arc<dyn SecurityEventLog>,
+    ) = match backend {
+        Backend::Memory => (
+            rbac.clone(),
+            passkeys.clone(),
+            challenges,
+            step_up.clone(),
+            events.clone(),
+        ),
+        Backend::Pg(pg) => (pg.clone(), pg.clone(), pg.clone(), pg.clone(), pg),
+    };
     let rp = RelyingParty::from_public_url(PUBLIC_URL, "Scarab").unwrap();
     let st = AppState::new(db.clone(), clock.clone(), logs)
         .with_auth(auth, sessions.clone())
-        .with_rbac(rbac.clone())
+        .with_rbac(rbac_store.clone())
         .with_api_tokens(tokens.clone())
         .with_secrets(Arc::new(FakeSecrets::new()))
         .with_public_url(PUBLIC_URL);
     let st = extra(st).with_step_up(StepUpService::new(
-        passkeys.clone(),
-        Arc::new(InMemoryChallenges::new()),
-        step_up.clone(),
-        events.clone(),
+        passkey_store.clone(),
+        challenge_store.clone(),
+        requests.clone(),
+        log.clone(),
         Arc::new(InMemorySealer::new()),
         rp,
     ));
@@ -113,6 +153,11 @@ pub fn harness_with(extra: impl FnOnce(AppState) -> AppState) -> Harness {
         passkeys,
         step_up,
         events,
+        rbac_store,
+        passkey_store,
+        challenge_store,
+        requests,
+        log,
     }
 }
 
@@ -148,7 +193,7 @@ impl Harness {
     }
 
     pub async fn grant(&self, subject: &str, scope: Scope, role: Role) {
-        self.rbac
+        self.rbac_store
             .grant(
                 &Binding {
                     subject: subject.into(),
@@ -261,6 +306,23 @@ impl Harness {
         conf
     }
 
+    /// Every event of `kind` in the log the app writes (whatever the
+    /// backend), oldest first.
+    pub async fn events(&self, kind: &str) -> Vec<SecurityEvent> {
+        let mut all = self
+            .log
+            .list(&SecurityEventFilter {
+                kinds: vec![kind.to_string()],
+                limit: 10_000,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        all.reverse();
+        all
+    }
+
+    /// The in-memory log only ([`Backend::Memory`]).
     pub fn events_of(&self, kind: &str) -> Vec<scarab_identity::SecurityEvent> {
         self.events
             .all()

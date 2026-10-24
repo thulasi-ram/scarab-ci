@@ -516,7 +516,10 @@ fn no_broker_path_is_in_the_main_route_table() {
         .filter(|r| r.path.starts_with(prefix) || r.path.starts_with("/_scarab"))
         .map(|r| format!("{} {}", r.method, r.path))
         .collect();
-    assert!(leaked.is_empty(), "broker paths in the main router: {leaked:?}");
+    assert!(
+        leaked.is_empty(),
+        "broker paths in the main router: {leaked:?}"
+    );
 }
 
 /// ADR-0073 C8: the operator break-glass has no route. The only passkey
@@ -526,7 +529,14 @@ fn the_break_glass_is_not_reachable_over_http() {
     let resets: Vec<_> = route_table()
         .iter()
         .filter(|r| r.op.id.contains("reset") || r.path.contains("reset"))
-        .map(|r| (r.method.as_str().to_string(), r.path, r.op.id, r.op.class.code()))
+        .map(|r| {
+            (
+                r.method.as_str().to_string(),
+                r.path,
+                r.op.id,
+                r.op.class.code(),
+            )
+        })
         .collect();
     assert_eq!(
         resets,
