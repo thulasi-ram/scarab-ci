@@ -1031,7 +1031,6 @@ async fn rt_reserved_org_spellings_do_not_reach_the_plugin_scope() {
 /// the very listing the ticket called an audit bypass. (The matrix's
 /// silence/unsilence writes take a reserved org as well.)
 #[tokio::test]
-#[ignore = "redteam: BROKE the secret matrix lists _plugin_connections credential keys; the reserved-org refusal covers /v1/secrets only"]
 async fn rt_the_secret_matrix_lists_the_reserved_plugin_scope() {
     let secrets = Arc::new(FakeSecrets::new());
     secrets
@@ -1056,6 +1055,29 @@ async fn rt_the_secret_matrix_lists_the_reserved_plugin_scope() {
         st == StatusCode::BAD_REQUEST && !b.contains("pc-0f1e2d"),
         "{st}: {b}"
     );
+}
+
+/// The matrix's silence/unsilence annotations into a reserved org are
+/// refused by the same rule as `/v1/secrets` (redteam auth-4): a 400 before
+/// any store is reached.
+#[tokio::test]
+async fn rt_the_secret_matrix_annotations_refuse_a_reserved_org() {
+    let app = bare_app(Arc::new(FakeSecrets::new()));
+    let silence = Request::builder()
+        .method("PUT")
+        .uri("/v1/repos/%5Fplugin_connections/anything/secrets/matrix/silenced")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({"key": "pc-0f1e2d"}).to_string()))
+        .unwrap();
+    let (st, b) = call(&app, silence).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+    let unsilence = Request::builder()
+        .method("DELETE")
+        .uri("/v1/repos/_plugin_connections/anything/secrets/matrix/silenced?key=pc-0f1e2d")
+        .body(Body::empty())
+        .unwrap();
+    let (st, b) = call(&app, unsilence).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
 }
 
 /// ATTACK: bind a repo into a reserved org through the REGISTRY (the path

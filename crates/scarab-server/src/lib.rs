@@ -8926,6 +8926,9 @@ async fn secret_matrix(
 ) -> Result<Json<SecretMatrix>, ApiError> {
     let scope = rbac_scope(&org, Some(&repo));
     authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
+    // The matrix is a read (and annotation) surface over the same scopes
+    // as `/v1/secrets`, so it is held to the same rule (redteam auth-4).
+    refuse_reserved_secret_org(&org)?;
     let governance = st
         .environment_governance
         .as_ref()
@@ -9070,6 +9073,9 @@ async fn silence_secret_cell(
 ) -> Result<StatusCode, ApiError> {
     let scope = rbac_scope(&org, Some(&repo));
     authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
+    // The matrix is a read (and annotation) surface over the same scopes
+    // as `/v1/secrets`, so it is held to the same rule (redteam auth-4).
+    refuse_reserved_secret_org(&org)?;
     let store = st.secret_coverage.as_ref().ok_or(ApiError::NotFound)?;
     if req.key.is_empty() {
         return Err(ApiError::BadRequest("key is required".into()));
@@ -9103,6 +9109,9 @@ async fn unsilence_secret_cell(
 ) -> Result<StatusCode, ApiError> {
     let scope = rbac_scope(&org, Some(&repo));
     authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
+    // The matrix is a read (and annotation) surface over the same scopes
+    // as `/v1/secrets`, so it is held to the same rule (redteam auth-4).
+    refuse_reserved_secret_org(&org)?;
     let store = st.secret_coverage.as_ref().ok_or(ApiError::NotFound)?;
     if q.key.is_empty() {
         return Err(ApiError::BadRequest("key is required".into()));
