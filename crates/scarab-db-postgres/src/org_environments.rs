@@ -160,9 +160,10 @@ where
 
 #[async_trait]
 impl OrgEnvironmentStore for PostgresDb {
-    async fn put_org_environment(
+    async fn put_org_environment_expecting(
         &self,
         env: &OrgEnvironment,
+        expected_sources: Option<&[EnvironmentDeploymentSource]>,
     ) -> Result<OrgEnvironment, OrgEnvironmentError> {
         // The server validates too; checking here keeps the store's contract
         // ("refuses an invalid env") true for every caller.
@@ -203,6 +204,19 @@ impl OrgEnvironmentStore for PostgresDb {
         .map_err(org_environment_store_err)?;
         let eligible_project_patterns =
             eligible_project_patterns_of(&mut *tx, &env.org, &env.name).await?;
+
+        // ADR-0073 §3: the sources as stored now, read under the row lock the
+        // upsert just took (a create holds none), must be the ones the
+        // caller judged this write against. A mismatch rolls the upsert back.
+        if let Some(expected) = expected_sources {
+            let stored = deployment_sources_of(&mut *tx, &env.org, &env.name).await?;
+            let mut expected = expected.to_vec();
+            expected.sort();
+            expected.dedup();
+            if stored != expected {
+                return Err(OrgEnvironmentError::changed_concurrently());
+            }
+        }
 
         // F1 (c-min audit): every source must name a PluginInstallation in
         // this Org. Checked here, in the write's transaction, with the
