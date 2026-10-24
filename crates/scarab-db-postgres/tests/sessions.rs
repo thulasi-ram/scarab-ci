@@ -57,7 +57,10 @@ async fn session_lifecycle_put_get_refresh_delete() {
     // the caller puts (the server re-puts the session it read).
     assert_eq!(got.created_at, 1_000);
     assert_eq!(got.login_kind, "browser");
-    assert_eq!(got.fresh_login_until(), Some(1_000 + scarab_identity::FRESH_LOGIN_MS));
+    assert_eq!(
+        got.fresh_login_until(),
+        Some(1_000 + scarab_identity::FRESH_LOGIN_MS)
+    );
 
     // delete revokes; deleting an unknown id is a no-op.
     db.delete("sid-1").await.unwrap();

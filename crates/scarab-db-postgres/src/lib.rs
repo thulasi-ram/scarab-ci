@@ -3738,13 +3738,12 @@ impl scarab_identity::RbacStore for PostgresDb {
         // Every scope, tombstones excluded. The max is taken here, on the
         // typed role, not in SQL: the column is text and its order is not
         // the role order. An unreadable role grants nothing.
-        let rows = sqlx::query(
-            "SELECT role FROM rbac_bindings WHERE subject = $1 AND role IS NOT NULL",
-        )
-        .bind(subject)
-        .fetch_all(self.pool())
-        .await
-        .map_err(identity_err)?;
+        let rows =
+            sqlx::query("SELECT role FROM rbac_bindings WHERE subject = $1 AND role IS NOT NULL")
+                .bind(subject)
+                .fetch_all(self.pool())
+                .await
+                .map_err(identity_err)?;
         Ok(rows
             .into_iter()
             .filter_map(|r| role_from_str(&r.get::<String, _>("role")))
