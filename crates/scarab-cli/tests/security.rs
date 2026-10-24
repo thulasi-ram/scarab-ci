@@ -281,11 +281,8 @@ async fn setup_waits_for_a_passkey_enrolled_mid_poll_and_is_idempotent() {
     };
     assert_eq!(
         url.trim(),
-        format!(
-            "{}/v1/auth/login?next=%2Faccount%2Fsecurity%3Fenroll%3D1",
-            srv.base
-        ),
-        "a fresh login that lands on enrollment"
+        format!("{}{}", srv.base, scarab_server::FRESH_LOGIN_URL),
+        "the server's fresh login, which lands on enrollment"
     );
     assert!(
         seen.iter().any(|l| l.contains("`amy`")),
@@ -401,10 +398,7 @@ async fn setup_names_the_login_provider_when_there_is_no_default() {
         .trim()
         .to_string();
     assert!(url.contains("provider=okta"), "{url}");
-    assert!(
-        url.contains("next=%2Faccount%2Fsecurity%3Fenroll%3D1"),
-        "{url}"
-    );
+    assert!(url.contains("next=/account/security%3Fenroll%3D1"), "{url}");
     // Following it reaches Okta, not a 400.
     let resp = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())

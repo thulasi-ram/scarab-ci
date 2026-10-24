@@ -1374,6 +1374,7 @@ const meSecurity: components["schemas"]["MeSecurityResponse"] = {
   passkeys_hidden: false,
   can_enroll_first: false,
   fresh_login_until: null,
+  fresh_login_url: "/v1/auth/login?next=/account/security%3Fenroll%3D1",
   window_expires_at: now + 3 * min,
   passkeys: [
     {

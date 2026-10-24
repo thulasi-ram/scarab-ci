@@ -20,75 +20,11 @@ use std::time::{Duration, Instant};
 use clap::{Args, Subcommand};
 use serde_json::Value;
 
-/// Where `security setup` sends the browser: a fresh login that lands on the
-/// personal security page with the enrollment dialog open. The provider the
-/// human signs in with is added by [`setup_login_path`].
+/// Where `security setup` sends the browser when the server does not say
+/// (`GET /v1/me/security`'s `fresh_login_url`, which names the login
+/// provider the human signs in with): a fresh login that lands on the
+/// personal security page with the enrollment dialog open.
 pub const SETUP_LOGIN_PATH: &str = "/v1/auth/login?next=%2Faccount%2Fsecurity%3Fenroll%3D1";
-
-/// The login provider `subject` signs in again through (git-bug 584bd03) —
-/// the server's `AppState::login_provider_for`, from what a CLI can see:
-/// `providers` is `GET /v1/auth/providers`, `pinned` the providers of
-/// `GET /v1/me`'s `identities`. Among the configured providers: the pinned
-/// one the id is prefixed with, else the first pinned; else the id's
-/// `provider:` prefix (ADR-0069 §2 mints `provider:handle`); else the
-/// default. An unnamed login answers 400 with several providers and no
-/// default, and with a default would sign a non-default user in as somebody
-/// else.
-pub fn login_provider(subject: &str, providers: &Value, pinned: &[String]) -> Option<String> {
-    let listed: Vec<(&str, bool)> = providers
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|p| Some((p["id"].as_str()?, p["default"] == true)))
-                .collect()
-        })
-        .unwrap_or_default();
-    let configured = |id: &str| listed.iter().any(|(i, _)| *i == id);
-    let prefix = subject
-        .split_once(':')
-        .map(|(p, _)| p)
-        .filter(|p| configured(p));
-    let pinned: Vec<&str> = pinned
-        .iter()
-        .map(String::as_str)
-        .filter(|p| configured(p))
-        .collect();
-    if let Some(p) = prefix.filter(|p| pinned.contains(p)) {
-        return Some(p.to_string());
-    }
-    if let Some(p) = pinned.first() {
-        return Some(p.to_string());
-    }
-    if let Some(p) = prefix {
-        return Some(p.to_string());
-    }
-    listed
-        .iter()
-        .find(|(_, default)| *default)
-        .map(|(id, _)| id.to_string())
-}
-
-/// [`SETUP_LOGIN_PATH`] naming `provider`, when there is one.
-pub fn setup_login_path(provider: Option<&str>) -> String {
-    match provider {
-        Some(p) => format!("{SETUP_LOGIN_PATH}&provider={}", encode_component(p)),
-        None => SETUP_LOGIN_PATH.to_string(),
-    }
-}
-
-/// Percent-encode a query value (RFC 3986: everything but unreserved).
-fn encode_component(v: &str) -> String {
-    let mut out = String::with_capacity(v.len());
-    for b in v.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
 
 /// How often `security setup` asks whether the passkey exists yet.
 const POLL_EVERY: Duration = Duration::from_secs(2);
@@ -422,25 +358,10 @@ async fn setup(args: SetupArgs) -> i32 {
     } else {
         raw_subject
     });
-    // Best-effort: a server that cannot say leaves the login unnamed, which
-    // is right for one provider or a default one.
-    let providers = api
-        .try_get_json("/v1/auth/providers")
-        .await
-        .unwrap_or(Value::Null);
-    let pinned: Vec<String> = match api.try_get_json("/v1/me").await {
-        Ok(v) => v["identities"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|i| i["provider"].as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        Err(_) => Vec::new(),
-    };
-    let provider = login_provider(raw_subject, &providers, &pinned);
-    let url = api.url(&setup_login_path(provider.as_deref()));
+    // The server picks the login provider (git-bug 584bd03); an older
+    // server that does not say gets the unnamed login.
+    let path = me["fresh_login_url"].as_str().unwrap_or(SETUP_LOGIN_PATH);
+    let url = api.url(path);
     println!("You have no passkey yet. This CLI acts for `{subject}`: sign in as that account.");
     println!("Log in and enroll a passkey at:");
     println!("{url}");
@@ -633,56 +554,6 @@ mod tests {
             "passkeys": [{"clone_suspected": false}, {"clone_suspected": true}]
         });
         assert_eq!(passkey_count(&older_server), 1);
-    }
-
-    /// git-bug 584bd03: the provider `security setup` logs in through.
-    #[test]
-    fn the_setup_login_names_the_subjects_provider() {
-        let none_default = serde_json::json!([
-            {"id": "gitea", "name": "Gitea", "default": false},
-            {"id": "okta", "name": "Okta", "default": false},
-        ]);
-        // By the id's prefix.
-        assert_eq!(
-            login_provider("okta:amy", &none_default, &[]).as_deref(),
-            Some("okta")
-        );
-        // A pinned identity wins over the spelling; a prefix it holds wins
-        // over the other pinned ones.
-        let pinned = vec!["gitea".to_string()];
-        assert_eq!(
-            login_provider("okta:amy", &none_default, &pinned).as_deref(),
-            Some("gitea")
-        );
-        let both = vec!["gitea".to_string(), "okta".to_string()];
-        assert_eq!(
-            login_provider("okta:amy", &none_default, &both).as_deref(),
-            Some("okta")
-        );
-        // Nothing to go on and no default: unnamed (the server says so).
-        assert_eq!(login_provider("amy", &none_default, &[]), None);
-        // An unknown prefix is not a provider.
-        assert_eq!(login_provider("ldap:amy", &none_default, &[]), None);
-        let with_default = serde_json::json!([
-            {"id": "default", "name": "GitHub", "default": true},
-            {"id": "okta", "name": "Okta", "default": false},
-        ]);
-        assert_eq!(
-            login_provider("amy", &with_default, &[]).as_deref(),
-            Some("default")
-        );
-        assert_eq!(
-            login_provider("okta:amy", &with_default, &[]).as_deref(),
-            Some("okta")
-        );
-        // A server that could not list its providers.
-        assert_eq!(login_provider("okta:amy", &Value::Null, &[]), None);
-
-        assert_eq!(setup_login_path(None), SETUP_LOGIN_PATH);
-        assert_eq!(
-            setup_login_path(Some("ok ta")),
-            "/v1/auth/login?next=%2Faccount%2Fsecurity%3Fenroll%3D1&provider=ok%20ta"
-        );
     }
 
     #[test]

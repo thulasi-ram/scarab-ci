@@ -8074,7 +8074,8 @@
           "usable_passkey_count",
           "passkeys",
           "passkeys_hidden",
-          "can_enroll_first"
+          "can_enroll_first",
+          "fresh_login_url"
         ],
         "properties": {
           "can_enroll_first": {
@@ -8088,6 +8089,10 @@
             ],
             "format": "int64",
             "description": "Until when this session's login is fresh (a browser login only)."
+          },
+          "fresh_login_url": {
+            "type": "string",
+            "description": "Where this human logs in again — through the login provider they sign\nin with — landing on enrollment (a relative URL). The one place the\nprovider is chosen: `scarab security setup` prints this."
           },
           "has_passkey": {
             "type": "boolean",

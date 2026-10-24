@@ -2988,6 +2988,12 @@ export interface components {
              * @description Until when this session's login is fresh (a browser login only).
              */
             fresh_login_until?: number | null;
+            /**
+             * @description Where this human logs in again — through the login provider they sign
+             *     in with — landing on enrollment (a relative URL). The one place the
+             *     provider is chosen: `scarab security setup` prints this.
+             */
+            fresh_login_url: string;
             /** @description Holds at least one usable (not clone-flagged) passkey. */
             has_passkey: boolean;
             /** @description The passkeys — empty for an API-token caller (see `passkeys_hidden`). */

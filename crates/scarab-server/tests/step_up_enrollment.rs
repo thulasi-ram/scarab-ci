@@ -331,3 +331,20 @@ async fn the_fresh_login_link_follows_the_principals_pinned_identity() {
     assert!(to.starts_with("https://okta.example.com/authorize"), "{to}");
     tdb.cleanup().await;
 }
+
+/// Review F5: the server is the one owner of the provider choice — it hands
+/// the caller's fresh-login URL out on `GET /v1/me/security`, which
+/// `scarab security setup` prints, so no client re-derives it.
+#[tokio::test]
+async fn me_security_names_the_callers_fresh_login_url() {
+    let h = harness_with(|st: AppState| {
+        st.with_oauth_login(provider("gitea", false))
+            .with_oauth_login(provider("okta", false))
+    });
+    let s = h.session(owner("okta:amy"), LOGIN_KIND_API).await;
+    let (st, me) = h.cookie("GET", "/v1/me/security", None, &s).await;
+    assert_eq!(st, StatusCode::OK, "{me}");
+    let url = me["fresh_login_url"].as_str().expect("named");
+    assert!(url.contains("provider=okta"), "{url}");
+    assert!(url.contains("next=/account/security%3Fenroll%3D1"), "{url}");
+}

@@ -97,6 +97,10 @@ pub struct MeSecurityResponse {
     pub can_enroll_first: bool,
     /// Until when this session's login is fresh (a browser login only).
     pub fresh_login_until: Option<i64>,
+    /// Where this human logs in again — through the login provider they sign
+    /// in with — landing on enrollment (a relative URL). The one place the
+    /// provider is chosen: `scarab security setup` prints this.
+    pub fresh_login_url: String,
 }
 
 /// `POST /v1/me/passkeys/registration/options`.
@@ -256,6 +260,7 @@ pub(crate) async fn me_security(
         .as_ref()
         .and_then(|s| s.fresh_login_until)
         .filter(|_| caller.is_browser_session());
+    let fresh_login_url = st.fresh_login_url(&subject).await;
     let Some(svc) = st.step_up.service() else {
         return Ok(Json(MeSecurityResponse {
             subject,
@@ -267,6 +272,7 @@ pub(crate) async fn me_security(
             window_expires_at: None,
             can_enroll_first: false,
             fresh_login_until,
+            fresh_login_url,
         }));
     };
     let passkeys = svc.passkeys.list(&subject).await.map_err(store_err)?;
@@ -302,6 +308,7 @@ pub(crate) async fn me_security(
         window_expires_at,
         can_enroll_first: !has_passkey && fresh_login_until.is_some_and(|t| t > now),
         fresh_login_until,
+        fresh_login_url,
     }))
 }
 
