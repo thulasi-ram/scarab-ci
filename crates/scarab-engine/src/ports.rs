@@ -830,6 +830,16 @@ pub trait Db: Send + Sync {
     /// the scheduler folds to decide admission and completion.
     async fn steps_of_run(&self, run: &RunId) -> Result<Vec<StepRun>, DbError>;
 
+    /// [`Self::steps_of_run`] for many runs in a fixed number of round trips
+    /// (review fit-F8 / safety S9): each run with steps maps to exactly what
+    /// `steps_of_run` returns for it; a run with none (or unknown) is absent.
+    /// For a read that annotates a list — the polled run lists' waiting gates
+    /// — where one query per run grows with the page.
+    async fn steps_of_runs(
+        &self,
+        runs: &[RunId],
+    ) -> Result<std::collections::HashMap<RunId, Vec<StepRun>>, DbError>;
+
     /// The durable launch spec for a step, or `None` if unset. Stored at run
     /// creation so a resumed run can re-launch the same step after a crash.
     async fn step_spec(&self, run: &RunId, step: &StepId) -> Result<Option<StepSpec>, DbError>;

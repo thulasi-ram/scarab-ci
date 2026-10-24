@@ -560,3 +560,66 @@ contract_test!(
     ingest_attempt_results_frontier,
     ingested_results_land_only_on_the_running_frontier
 );
+
+// ---------------------------------------------------------------------------
+// Batched step read (review fit-F8): `steps_of_runs` is `steps_of_run` for a
+// whole page — the same steps, statuses, needs, gate kinds and attempt order
+// per run — with a run that has no steps (or is unknown) absent.
+// ---------------------------------------------------------------------------
+
+async fn steps_of_runs_is_steps_of_run_per_run(db: &dyn Db) {
+    let (r1, r2, empty) = (
+        RunId("r-batch-1".into()),
+        RunId("r-batch-2".into()),
+        RunId("r-batch-empty".into()),
+    );
+    for run in [&r1, &r2] {
+        db.create_run(run, 1, 1, Timestamp(0)).await.unwrap();
+        let (build, gate) = (StepId("build".into()), StepId("gate".into()));
+        db.create_step_run(run, &build, None, &[], Timestamp(0))
+            .await
+            .unwrap();
+        db.create_step_run(run, &gate, None, std::slice::from_ref(&build), Timestamp(0))
+            .await
+            .unwrap();
+        db.set_step_gate(run, &gate, "manual", None).await.unwrap();
+        db.record_step_transition(run, &build, StepStatus::Pending, StepStatus::Running)
+            .await
+            .unwrap();
+        // Out of insertion order, and `a10` after `a2` numerically.
+        for (id, at) in [("a10", 10), ("a1", 1), ("a2", 2)] {
+            db.record_attempt(run, &build, &attempt(id, at))
+                .await
+                .unwrap();
+        }
+    }
+    db.create_run(&empty, 1, 1, Timestamp(0)).await.unwrap();
+
+    let batched = db
+        .steps_of_runs(&[
+            r1.clone(),
+            r2.clone(),
+            empty.clone(),
+            RunId("r-batch-unknown".into()),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(batched.len(), 2, "only runs with steps");
+    for run in [&r1, &r2] {
+        assert_eq!(
+            format!("{:?}", batched[run]),
+            format!("{:?}", db.steps_of_run(run).await.unwrap()),
+            "{} batched like steps_of_run",
+            run.0
+        );
+    }
+    let ids: Vec<&str> = batched[&r1][0]
+        .attempts
+        .iter()
+        .map(|a| a.id.0.as_str())
+        .collect();
+    assert_eq!(ids, ["a1", "a2", "a10"]);
+    assert!(db.steps_of_runs(&[]).await.unwrap().is_empty());
+}
+
+contract_test!(steps_of_runs_batched, steps_of_runs_is_steps_of_run_per_run);

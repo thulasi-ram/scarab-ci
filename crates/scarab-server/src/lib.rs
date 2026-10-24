@@ -1152,13 +1152,26 @@ async fn run_summaries(
     st: &AppState,
     runs: Vec<scarab_engine::RunSummary>,
 ) -> Result<Vec<RunSummaryDto>, ApiError> {
+    // Only an active run can wait on a gate. Their steps are read in ONE
+    // batched query for the page (review fit-F8): the list endpoints are
+    // polled, and one `steps_of_run` per active run grew with the page.
+    let active: Vec<RunId> = runs
+        .iter()
+        .filter(|r| matches!(r.status, RunStatus::Running | RunStatus::Suspended))
+        .map(|r| r.run.clone())
+        .collect();
+    let mut steps_by_run = if active.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        st.db.steps_of_runs(&active).await?
+    };
     let mut out = Vec::with_capacity(runs.len());
     for r in runs {
         let active = matches!(r.status, RunStatus::Running | RunStatus::Suspended);
         let run = r.run.clone();
         let mut dto = RunSummaryDto::from(r);
         if active {
-            let steps = st.db.steps_of_run(&run).await?;
+            let steps = steps_by_run.remove(&run).unwrap_or_default();
             dto.waiting_gates = run_gate_view::waiting_gates(&steps)
                 .into_iter()
                 .filter_map(|s| {

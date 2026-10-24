@@ -1437,6 +1437,65 @@ impl Db for PostgresDb {
         Ok(steps)
     }
 
+    async fn steps_of_runs(
+        &self,
+        runs: &[RunId],
+    ) -> Result<std::collections::HashMap<RunId, Vec<StepRun>>, DbError> {
+        let mut out: std::collections::HashMap<RunId, Vec<StepRun>> =
+            std::collections::HashMap::new();
+        if runs.is_empty() {
+            return Ok(out);
+        }
+        let ids: Vec<&str> = runs.iter().map(|r| r.0.as_str()).collect();
+        // Two queries for the whole page, in `steps_of_run`'s orders: steps by
+        // id, each step's attempts by their `a{n}` number.
+        let rows = sqlx::query(
+            "SELECT run_id, step_id, status, needs, gate_kind FROM step_runs
+             WHERE run_id = ANY($1) ORDER BY run_id, step_id",
+        )
+        .bind(&ids)
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?;
+        let attempt_rows = sqlx::query(
+            "SELECT run_id, step_id, attempt_id, started_at, failure, failure_detail, outcome
+             FROM attempts
+             WHERE run_id = ANY($1)
+             ORDER BY run_id, step_id, CAST(substring(attempt_id FROM 2) AS INTEGER)",
+        )
+        .bind(&ids)
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?;
+        let mut attempts: std::collections::HashMap<(String, String), Vec<Attempt>> =
+            std::collections::HashMap::new();
+        for r in &attempt_rows {
+            attempts
+                .entry((r.get::<String, _>("run_id"), r.get::<String, _>("step_id")))
+                .or_default()
+                .push(attempt_from_row(r)?);
+        }
+        for r in rows {
+            let run = r.get::<String, _>("run_id");
+            let step = r.get::<String, _>("step_id");
+            let status = step_status_from_str(r.get::<String, _>("status"))?;
+            let needs = needs_from_value(r.get::<Value, _>("needs"))?;
+            let gate_kind = r.get::<Option<String>, _>("gate_kind");
+            let step_attempts = attempts
+                .remove(&(run.clone(), step.clone()))
+                .unwrap_or_default();
+            out.entry(RunId(run.clone())).or_default().push(StepRun {
+                run: RunId(run),
+                step: StepId(step),
+                status,
+                attempts: step_attempts,
+                needs,
+                gate_kind,
+            });
+        }
+        Ok(out)
+    }
+
     async fn step_spec(&self, run: &RunId, step: &StepId) -> Result<Option<StepSpec>, DbError> {
         let row = sqlx::query("SELECT spec FROM step_runs WHERE run_id = $1 AND step_id = $2")
             .bind(&run.0)
@@ -3569,32 +3628,34 @@ async fn attempts_on<'e, E: sqlx::PgExecutor<'e>>(
     .fetch_all(exec)
     .await
     .map_err(db_err)?;
-    rows.into_iter()
-        .map(|r| {
-            let failure = r
-                .get::<Option<String>, _>("failure")
-                .map(|s| failure_from_str(&s))
-                .transpose()?;
-            // Back-compat derivation lives at this storage boundary — the
-            // only place the NULL `outcome` column is observed — so the
-            // in-memory `Attempt.outcome` is authoritative for every
-            // consumer. A pre-migration row (NULL outcome) derives `Failed`
-            // when a failure was recorded, else `Running`.
-            let outcome = match r.get::<Option<String>, _>("outcome") {
-                Some(s) => AttemptOutcome::from_str(&s)
-                    .ok_or_else(|| DbError::Other(format!("unknown attempt outcome {s:?}")))?,
-                None if failure.is_some() => AttemptOutcome::Failed,
-                None => AttemptOutcome::Running,
-            };
-            Ok(Attempt {
-                id: AttemptId(r.get::<String, _>("attempt_id")),
-                started_at: Timestamp(r.get::<i64, _>("started_at")),
-                failure,
-                failure_detail: r.get::<Option<String>, _>("failure_detail"),
-                outcome,
-            })
-        })
-        .collect()
+    rows.iter().map(attempt_from_row).collect()
+}
+
+/// One `attempts` row (`attempt_id, started_at, failure, failure_detail,
+/// outcome`) as an [`Attempt`].
+fn attempt_from_row(r: &sqlx::postgres::PgRow) -> Result<Attempt, DbError> {
+    let failure = r
+        .get::<Option<String>, _>("failure")
+        .map(|s| failure_from_str(&s))
+        .transpose()?;
+    // Back-compat derivation lives at this storage boundary — the only place
+    // the NULL `outcome` column is observed — so the in-memory
+    // `Attempt.outcome` is authoritative for every consumer. A pre-migration
+    // row (NULL outcome) derives `Failed` when a failure was recorded, else
+    // `Running`.
+    let outcome = match r.get::<Option<String>, _>("outcome") {
+        Some(s) => AttemptOutcome::from_str(&s)
+            .ok_or_else(|| DbError::Other(format!("unknown attempt outcome {s:?}")))?,
+        None if failure.is_some() => AttemptOutcome::Failed,
+        None => AttemptOutcome::Running,
+    };
+    Ok(Attempt {
+        id: AttemptId(r.get::<String, _>("attempt_id")),
+        started_at: Timestamp(r.get::<i64, _>("started_at")),
+        failure,
+        failure_detail: r.get::<Option<String>, _>("failure_detail"),
+        outcome,
+    })
 }
 
 /// SQL predicate: the `attempts` row is still in flight. A pre-migration row
