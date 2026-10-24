@@ -159,19 +159,58 @@ impl GetFailure {
     }
 }
 
-/// `s` with every control character written as `\u{XX}`: a server string
-/// (another member's label, an Org name, a refusal's target) printed raw
-/// could carry terminal escape sequences.
+/// `s` with every control, bidi and invisible character written as
+/// `\u{XX}`: a server string (another member's label, an Org name, a
+/// refusal's target) printed raw could carry terminal escape sequences, or
+/// reorder or hide what the human reads.
 pub fn sanitize(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        if c.is_control() {
+        if is_invisible(c) {
             out.push_str(&format!("\\u{{{:02X}}}", c as u32));
         } else {
             out.push(c);
         }
     }
     out
+}
+
+/// Does `c` render as nothing, or rearrange or break the text around it?
+/// Every control (Cc), format (Cf — bidi controls included), line- and
+/// paragraph-separator (Zl, Zp) character, plus the other default-ignorable
+/// code points. The same set as the server's
+/// `scarab_server::step_up::ops::is_invisible` (the CLI does not link the
+/// server), enumerated by hand (Unicode 15.1).
+fn is_invisible(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{00AD}'
+                | '\u{034F}'
+                | '\u{0600}'..='\u{0605}'
+                | '\u{061C}'
+                | '\u{06DD}'
+                | '\u{070F}'
+                | '\u{0890}'..='\u{0891}'
+                | '\u{08E2}'
+                | '\u{115F}'..='\u{1160}'
+                | '\u{17B4}'..='\u{17B5}'
+                | '\u{180B}'..='\u{180F}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{206F}'
+                | '\u{3164}'
+                | '\u{FE00}'..='\u{FE0F}'
+                | '\u{FEFF}'
+                | '\u{FFA0}'
+                | '\u{FFF0}'..='\u{FFFB}'
+                | '\u{110BD}'
+                | '\u{110CD}'
+                | '\u{13430}'..='\u{1343F}'
+                | '\u{1BCA0}'..='\u{1BCA3}'
+                | '\u{1D173}'..='\u{1D17A}'
+                | '\u{E0000}'..='\u{E0FFF}'
+        )
 }
 
 /// Report a non-2xx API answer on stderr. Step-up refusals get guidance a
@@ -523,6 +562,27 @@ mod tests {
         .to_string();
         let g = refusal_guidance("http://s", 403, &body).unwrap();
         assert!(!g.contains('\x1b'), "{g}");
+    }
+
+    #[test]
+    fn sanitize_escapes_bidi_and_invisible_characters() {
+        for c in [
+            '\u{202E}',
+            '\u{2066}',
+            '\u{061C}',
+            '\u{200B}',
+            '\u{2028}',
+            '\u{2029}',
+            '\u{00AD}',
+            '\u{180E}',
+            '\u{FEFF}',
+            '\u{E0041}',
+        ] {
+            let s = sanitize(&format!("Laptop{c}key"));
+            assert!(!s.contains(c), "U+{:04X} printed raw: {s:?}", c as u32);
+        }
+        assert_eq!(sanitize("evil\u{202E}txt"), "evil\\u{202E}txt");
+        assert_eq!(sanitize("plain é label"), "plain é label");
     }
 
     #[test]
