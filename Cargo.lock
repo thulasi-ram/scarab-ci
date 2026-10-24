@@ -2729,6 +2729,7 @@ dependencies = [
  "futures",
  "k8s-openapi",
  "kube",
+ "rustls",
  "scarab-engine",
  "scarab-forge-github",
  "scarab-pipeline",

@@ -41,3 +41,8 @@ scarab-storage-s3 = { workspace = true }
 scarab-testkit = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
+# The cluster tier builds a kube client (rustls) in a test graph that links more
+# than one rustls CryptoProvider, so rustls cannot pick one and panics on the
+# first handshake; tests/cluster.rs installs `ring` (git-bug 2852828), as
+# scarab-plugin-k8s's tier and scarab-server's main.rs do.
+rustls = { workspace = true }
