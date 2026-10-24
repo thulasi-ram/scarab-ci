@@ -22,8 +22,8 @@ use scarab_server::step_up::StepUpService;
 use scarab_server::{router, AppState, LogService};
 use scarab_testkit::{
     FakeAuthenticator, FakeClock, FakeSecrets, InMemoryApiTokens, InMemoryChallenges, InMemoryDb,
-    InMemoryObjectStore, InMemoryPasskeys, InMemoryRbac, InMemorySecurityEvents,
-    InMemorySessions, InMemoryStepUp,
+    InMemoryObjectStore, InMemoryPasskeys, InMemoryRbac, InMemorySecurityEvents, InMemorySessions,
+    InMemoryStepUp,
 };
 use scarab_webauthn::soft::{SoftAlg, SoftPasskey};
 use scarab_webauthn::RelyingParty;

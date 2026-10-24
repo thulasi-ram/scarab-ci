@@ -455,7 +455,10 @@ mod tests {
     #[test]
     fn a_path_parameter_keeps_its_plus() {
         assert_eq!(
-            path_params("/v1/orgs/{org}/plugins/{name}", "/v1/orgs/acme/plugins/argo+cd"),
+            path_params(
+                "/v1/orgs/{org}/plugins/{name}",
+                "/v1/orgs/acme/plugins/argo+cd"
+            ),
             vec![
                 ("org".to_string(), "acme".to_string()),
                 ("name".to_string(), "argo+cd".to_string())
