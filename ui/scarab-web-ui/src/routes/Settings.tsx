@@ -14,6 +14,7 @@
 // what they cover), **Members**, **Environments** (ADR-0071 — the org-level
 // places deployments land in: deadline and reporting sources), **Plugins**
 // (ADR-0072 — the installations that report into them, and their kill switch),
+// **Security** (ADR-0073 — step-up posture, refusals, the event log),
 // **API tokens**
 // (ADR-0049 — the credential a machine can hold, minted here and nowhere else)
 // and **Org Secrets** (the top of the `env → repo → org` inheritance chain,
@@ -29,6 +30,7 @@ import ApiTokens from "../components/ApiTokens";
 import Members from "../components/Members";
 import OrgEnvironments from "../components/OrgEnvironments";
 import Plugins from "../components/Plugins";
+import OrgSecurity from "../components/OrgSecurity";
 import Icon from "../components/Icon";
 
 export default function Settings() {
@@ -90,6 +92,10 @@ export default function Settings() {
                 {/* Who holds what (ADR-0049/0069) — first among the org panels,
                     because every other permission on this page is someone's. */}
                 <Members org={o()} />
+                {/* Step-up (ADR-0073): who can still confirm a crown jewel, who
+                    was refused, and the Org's security event log — next to
+                    Members, because the admins it counts are theirs. */}
+                <OrgSecurity org={o()} />
                 {/* Org-level Environments (ADR-0071): org admins administer
                     them until an Environment gets an RBAC scope of its own. */}
                 <OrgEnvironments org={o()} epoch={envEpoch()} />
