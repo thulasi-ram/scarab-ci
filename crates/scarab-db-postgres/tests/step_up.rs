@@ -666,3 +666,155 @@ async fn a_request_row_must_name_its_requester() {
     drop(db);
     tdb.cleanup().await;
 }
+
+/// ADR-0073 C5: an Org's waiting requests (the security summary).
+#[tokio::test]
+async fn pending_in_org_counts_only_that_org_s_live_pending_requests() {
+    let Some((tdb, db)) = db().await else { return };
+    db.put_request(&request("r1", token("t1"), 5_000))
+        .await
+        .unwrap();
+    db.put_request(&request("r2", token("t1"), 1_000))
+        .await
+        .unwrap();
+    db.put_request(&request("r3", token("t1"), 5_000))
+        .await
+        .unwrap();
+    let mut other = request("r4", token("t1"), 5_000);
+    other.org = Some("beta".into());
+    db.put_request(&other).await.unwrap();
+    db.begin_execution("r3", "amy", "c", 10).await.unwrap();
+
+    assert_eq!(db.pending_in_org("acme", 10).await.unwrap(), 2); // r1, r2
+    assert_eq!(db.pending_in_org("acme", 1_000).await.unwrap(), 1); // r2 expired
+    assert_eq!(db.pending_in_org("beta", 10).await.unwrap(), 1);
+    assert_eq!(db.pending_in_org("zeta", 10).await.unwrap(), 0);
+    tdb.cleanup().await;
+}
+
+/// ADR-0073 C5 retention: expired challenges and confirmations go; an
+/// expired (or abandoned-executing) request's sealed body goes at once; a
+/// request settled, expired or abandoned before the cutoff goes; live rows
+/// stay.
+#[tokio::test]
+async fn reaping_drops_dead_rows_and_dead_bodies_only() {
+    let Some((tdb, db)) = db().await else { return };
+    let now = 1_000_000;
+    db.put(&challenge("c-dead", "s1", now)).await.unwrap();
+    db.put(&challenge("c-live", "s1", now + 1)).await.unwrap();
+    assert_eq!(db.reap_expired(now).await.unwrap(), 1);
+    assert!(db.consume("c-dead", "s1", 0).await.unwrap().is_none());
+    assert!(db.consume("c-live", "s1", now).await.unwrap().is_some());
+
+    let dead = now - STEP_UP_WINDOW_MS; // expires exactly now
+    db.put_confirmation(&confirmation(
+        "w-dead",
+        "s1",
+        ConfirmationKind::Window,
+        None,
+        dead,
+    ))
+    .await
+    .unwrap();
+    db.put_confirmation(&confirmation(
+        "w-live",
+        "s1",
+        ConfirmationKind::Window,
+        None,
+        dead + 1,
+    ))
+    .await
+    .unwrap();
+
+    let cutoff = now - 30 * 24 * 60 * 60 * 1000;
+    // Pending, expired now: body cleared, row kept.
+    db.put_request(&request("expired", token("t1"), now))
+        .await
+        .unwrap();
+    // Pending, live: untouched.
+    db.put_request(&request("live", token("t1"), now + 1))
+        .await
+        .unwrap();
+    // Executing since long ago (a crash mid-replay): body cleared, row kept
+    // until the cutoff.
+    db.put_request(&request("stuck", token("t1"), now + 1))
+        .await
+        .unwrap();
+    db.begin_execution("stuck", "amy", "c1", now - 6 * 60 * 1000)
+        .await
+        .unwrap();
+    // Settled before the cutoff: gone.
+    db.put_request(&request("old", token("t1"), cutoff))
+        .await
+        .unwrap();
+    db.begin_execution("old", "amy", "c2", cutoff - 2)
+        .await
+        .unwrap();
+    db.finish_request("old", RequestState::Executed, Some(204), None, cutoff - 1)
+        .await
+        .unwrap();
+    // Expired before the cutoff: gone.
+    db.put_request(&request("ancient", token("t1"), cutoff - 1))
+        .await
+        .unwrap();
+
+    assert_eq!(db.reap(now, cutoff).await.unwrap(), 1 + 2);
+    assert!(
+        db.window_expiry("s1", "amy", now).await.unwrap().is_some(),
+        "w-live stays"
+    );
+    assert!(db.get_request("old").await.unwrap().is_none());
+    assert!(db.get_request("ancient").await.unwrap().is_none());
+    let expired = db.get_request("expired").await.unwrap().unwrap();
+    assert!(expired.sealed.is_none());
+    let stuck = db.get_request("stuck").await.unwrap().unwrap();
+    assert!(stuck.sealed.is_none());
+    let live = db.get_request("live").await.unwrap().unwrap();
+    assert!(live.sealed.is_some());
+    tdb.cleanup().await;
+}
+
+/// ADR-0073 §10: the Orgs a subject is a member of (the Owner reset's
+/// cross-org rule) — live bindings only, Org- or Project-scoped.
+#[tokio::test]
+async fn orgs_of_lists_the_orgs_a_subject_is_bound_in() {
+    use scarab_identity::{Binding, BindingOrigin, RbacStore, Scope};
+    let Some((tdb, db)) = db().await else { return };
+    for (scope, role) in [
+        (Scope::Org("acme".into()), Role::Admin),
+        (
+            Scope::Project {
+                org: "beta".into(),
+                name: "web".into(),
+            },
+            Role::Member,
+        ),
+        (Scope::Org("gamma".into()), Role::Viewer),
+    ] {
+        db.grant(
+            &Binding {
+                subject: "bob".into(),
+                scope,
+                role,
+            },
+            BindingOrigin::Native,
+        )
+        .await
+        .unwrap();
+    }
+    db.revoke("bob", &Scope::Org("gamma".into())).await.unwrap();
+    assert_eq!(db.orgs_of("bob").await.unwrap(), vec!["acme", "beta"]);
+    assert!(db.orgs_of("nobody").await.unwrap().is_empty());
+    tdb.cleanup().await;
+}
+
+/// The break-glass reads (never writes) the applied schema version.
+#[tokio::test]
+async fn schema_version_reads_the_applied_migrations() {
+    let Some(tdb) = fresh_db().await else { return };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    assert_eq!(db.schema_version().await.unwrap(), None);
+    db.migrate().await.unwrap();
+    assert!(db.schema_version().await.unwrap().unwrap() >= 62);
+    tdb.cleanup().await;
+}
