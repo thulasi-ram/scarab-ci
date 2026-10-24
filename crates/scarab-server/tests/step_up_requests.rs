@@ -485,8 +485,10 @@ async fn an_expired_request_is_gone_on_postgres() {
 /// A token whose ceiling is Member never even raises a request for an
 /// Administer operation (its effective role cannot reach the operation, so
 /// the handler refuses it for its role) — and a token scoped to one Project
-/// that raises one for an Org-level secret has it confirmed by an Owner
-/// human and still FAILS at replay: the token's scope narrows it.
+/// raises none for an Org-level secret: the handler checks the Org scope,
+/// which a Project token never covers, so it could never run whoever
+/// confirmed it (redteam auth-1). Its own Project's secret it may ask for,
+/// and that one runs once confirmed.
 #[tokio::test]
 async fn the_token_s_scope_and_ceiling_narrow_the_replay() {
     let (h, secrets) = world(Backend::Memory).await;
@@ -515,16 +517,23 @@ async fn the_token_s_scope_and_ceiling_narrow_the_replay() {
         Role::Admin,
     )
     .await;
-    let id = raise(&h, &project, "v").await;
+    let (st, b) = h
+        .bearer("POST", "/v1/secrets", Some(secret("v")), &project)
+        .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{b}");
+    assert_eq!(b["code"], "outside_token_scope", "{b}");
+    assert!(h.step_up.requests().is_empty(), "no request for it: {b}");
+
+    let own = json!({"org": "acme", "repo": "web", "name": "DB_PASSWORD", "value": "v"});
+    let (st, b) = h
+        .bearer("POST", "/v1/secrets", Some(own), &project)
+        .await;
+    assert_step_up(st, &b, "window");
+    let id = b["request_id"].as_str().expect("a request id").to_string();
     let (st, done) = confirm(&h, &amy, &mut soft, &id).await;
     assert_eq!(st, StatusCode::OK, "{done}");
-    assert_eq!(done["state"], "failed", "{done}");
-    assert_eq!(done["result_status"], 403);
-    assert_eq!(secrets.puts(), 0);
-    let row = stored(&h, &id).await;
-    assert_eq!(row.state, RequestState::Failed);
-    assert!(row.sealed.is_none());
-    assert_eq!(h.events("request.failed").await.len(), 1);
+    assert_eq!(done["state"], "executed", "{done}");
+    assert_eq!(secrets.puts(), 1);
 }
 
 /// The human is demoted between the raise and the confirm: the replay runs

@@ -102,6 +102,24 @@ pub enum OrgOf {
     None,
 }
 
+/// Where an Org-bound operation's Project comes from, when its handler
+/// authorizes at that Project rather than at the Org (`rbac_scope(org,
+/// Some(project))`). Together with [`OrgOf`] it is the scope an API token's
+/// must cover before a request is raised for it ([`Op::project_of`]).
+/// [`OrgOf::Run`] needs none: the run's tenant is the whole scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectOf {
+    /// The handler authorizes at the Org.
+    None,
+    /// A path parameter.
+    Path(&'static str),
+    /// A JSON pointer into the request body; present (a string) means the
+    /// Project, absent or `null` means the Org.
+    Body(&'static str),
+    /// A query parameter; present means the Project, absent the Org.
+    Query(&'static str),
+}
+
 /// What a describe function sees: the request, its body already redacted.
 #[derive(Debug, Clone)]
 pub struct OpInput {
@@ -208,6 +226,10 @@ pub struct Op {
     /// skips the step-up.
     pub min_role: Option<Role>,
     pub org_of: OrgOf,
+    /// The Project its handler authorizes at, if it is Project-level. Never
+    /// leave a Project-level handler at [`ProjectOf::None`]: a token scoped
+    /// to that Project would be refused a request it could run.
+    pub project_of: ProjectOf,
     /// JSON pointers into the body hidden in summaries and events
     /// (`/value`, `/credential`). The digest still covers them.
     pub redact: &'static [&'static str],
@@ -243,6 +265,14 @@ impl Op {
     const fn not_by_token(self) -> Op {
         Op {
             machine: StepUpMachineUse::NotByToken,
+            ..self
+        }
+    }
+
+    /// Its handler authorizes at the Project named by `project`.
+    const fn in_project(self, project: ProjectOf) -> Op {
+        Op {
+            project_of: project,
             ..self
         }
     }
@@ -492,6 +522,7 @@ const fn op(
         adr,
         min_role,
         org_of,
+        project_of: ProjectOf::None,
         redact,
         target,
         describe: describe_generic,
@@ -844,7 +875,8 @@ pub static BINDINGS_IMPORT: Op = op(
     OrgOf::Path("org"),
     &[],
     &["path:org", "path:repo"],
-);
+)
+.in_project(ProjectOf::Path("repo"));
 pub static SECRET_PUT: Op = op(
     "secret.put",
     "Write a secret",
@@ -855,6 +887,7 @@ pub static SECRET_PUT: Op = op(
     &["/value"],
     &["body:/org", "body:/repo", "body:/environment", "body:/name"],
 )
+.in_project(ProjectOf::Body("/repo"))
 // A secret value (a certificate chain, a kubeconfig) may be bigger.
 .max_request_body(256 * 1024);
 pub static SECRET_DELETE: Op = op(
@@ -866,7 +899,8 @@ pub static SECRET_DELETE: Op = op(
     OrgOf::Query("org"),
     &[],
     &["query:org", "query:repo", "query:environment", "query:name"],
-);
+)
+.in_project(ProjectOf::Query("repo"));
 pub static ENVIRONMENT_DELETE: Op = op(
     "environment.delete",
     "Delete an Environment",
@@ -886,7 +920,8 @@ pub static OVERLAY_DELETE: Op = op(
     OrgOf::Path("org"),
     &[],
     &["path:org", "path:env", "path:project"],
-);
+)
+.in_project(ProjectOf::Path("project"));
 pub static PLUGIN_ENABLE: Op = op(
     "plugin.enable",
     "Re-enable a killed plugin",
@@ -1058,7 +1093,8 @@ pub static OVERLAY_PUT: Op = op(
     OrgOf::Path("org"),
     &[],
     &["path:org", "path:env", "path:project"],
-);
+)
+.in_project(ProjectOf::Path("project"));
 pub static PRIVILEGE_GRANT_PUT: Op = op(
     "environment.privilege_grant.put",
     "Change a project's privilege grant",

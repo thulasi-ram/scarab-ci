@@ -30,9 +30,9 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 
-use scarab_identity::{security_event_kind as kind, Action};
+use scarab_identity::{security_event_kind as kind, Action, Scope};
 
-use super::ops::{self, Class, Op, OpInput, OrgOf};
+use super::ops::{self, Class, Op, OpInput, OrgOf, ProjectOf};
 use super::{event, GuardCtx, Prepared, Ticket};
 use crate::{authenticate, route_table, run_scope, AppState, Caller, RouteEntry};
 
@@ -135,33 +135,60 @@ pub async fn guard_with(table: &[RouteEntry], st: AppState, req: Request, next: 
     let canonical = canonical_form(parts.method.as_str(), &path, &query, &bytes, json.as_ref());
     let digest = svc.digest(&canonical);
     let body_view = json.clone().unwrap_or(Value::Null);
-    let org = match op.org_of {
-        OrgOf::Path(name) => params
+    let param = |name: &str| {
+        params
             .iter()
             .find(|(k, _)| k == name)
-            .map(|(_, v)| v.clone()),
-        OrgOf::Query(name) => query
+            .map(|(_, v)| v.clone())
+    };
+    let query_param = |name: &str| {
+        query
             .iter()
             .find(|(k, _)| k == name)
-            .map(|(_, v)| v.clone()),
-        OrgOf::Body(ptr) => body_view
+            .map(|(_, v)| v.clone())
+    };
+    let body_str = |ptr: &str| {
+        body_view
             .pointer(ptr)
             .and_then(Value::as_str)
-            .map(str::to_string),
-        OrgOf::Run => match params.iter().find(|(k, _)| k == "id") {
-            Some((_, id)) => run_scope(&st, &scarab_engine::RunId(id.clone()))
-                .await
-                .map(|s| s.org().to_string()),
+            .map(str::to_string)
+    };
+    // The scope the operation's handler authorizes at — what a token's scope
+    // must cover before a request is raised for it.
+    let requested_scope = match op.org_of {
+        OrgOf::Run => match param("id") {
+            Some(id) => run_scope(&st, &scarab_engine::RunId(id)).await,
             None => None,
         },
+        OrgOf::Path(name) => param(name).map(Scope::Org),
+        OrgOf::Query(name) => query_param(name).map(Scope::Org),
+        OrgOf::Body(ptr) => body_str(ptr).map(Scope::Org),
         OrgOf::None => None,
     }
-    .filter(|o| !o.is_empty());
+    .and_then(|scope| match scope {
+        scope @ Scope::Project { .. } => Some(scope),
+        Scope::Org(org) if org.is_empty() => None,
+        Scope::Org(org) => Some(
+            match match op.project_of {
+                ProjectOf::None => None,
+                ProjectOf::Path(name) => param(name),
+                ProjectOf::Query(name) => query_param(name),
+                ProjectOf::Body(ptr) => body_str(ptr),
+            } {
+                // Exactly as the handler's `rbac_scope(org, repo)`.
+                Some(name) => Scope::Project { org, name },
+                None => Scope::Org(org),
+            },
+        ),
+    });
+    let org = requested_scope
+        .as_ref()
+        .map(|s| s.org().to_string())
+        .filter(|o| !o.is_empty());
     // An Org is recorded only for a caller who holds a role in it: the Org is
     // resolved from client input before any handler authorization, so a
     // non-member's confirmation (with her own summary text) must not land
     // in another Org's log. Hers is Org-less, so redacted there.
-    let requested_org = org.clone();
     let org = match org {
         Some(o) if holds_role_in(&st, &caller, &o).await => Some(o),
         _ => None,
@@ -177,7 +204,7 @@ pub async fn guard_with(table: &[RouteEntry], st: AppState, req: Request, next: 
         svc: svc.clone(),
         caller,
         org,
-        requested_org,
+        requested_scope,
         summary: summary.clone(),
         digest,
         method: parts.method.as_str().to_string(),

@@ -173,7 +173,6 @@ async fn call(app: &axum::Router, req: Request<Body>) -> (StatusCode, String) {
 /// ff7a014's "ops outside the token's scope" (a plausible prompt for a
 /// compromised agent to send its human), left open for Project tokens.
 #[tokio::test]
-#[ignore = "redteam: BROKE a Project-scoped token still raises an org-scope request it can never execute (requestable compares Org only)"]
 async fn rt_project_token_raises_an_org_scope_request_it_can_never_run() {
     let h = harness();
     h.grant("amy", Scope::Org("acme".into()), Role::Owner).await;

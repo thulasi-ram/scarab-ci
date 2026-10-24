@@ -151,7 +151,8 @@ pub(crate) enum Unrequestable {
     BrowserOnly,
     /// An API token can never perform it ([`StepUpMachineUse::NotByToken`]).
     NotByToken,
-    /// It acts on an Org the API token's scope does not reach.
+    /// It acts on a scope (an Org, or an Org-level write for a Project
+    /// token) the API token's scope does not reach.
     OutsideTokenScope,
 }
 
@@ -195,10 +196,16 @@ pub(crate) fn requestable(op: &Op, p: &Prepared) -> Result<(), Unrequestable> {
         if op.machine == StepUpMachineUse::NotByToken {
             return Err(Unrequestable::NotByToken);
         }
-        // An Org-bound operation on an Org the token does not cover (or
+        // An Org-bound operation on a scope the token does not cover (a
+        // Project token asking for an Org-level write, another Org, or
         // naming none at all) is refused by its handler for the token's
         // scope, whoever confirms it.
-        if op.org_of != OrgOf::None && p.requested_org.as_deref() != Some(token.scope.org()) {
+        if op.org_of != OrgOf::None
+            && !p
+                .requested_scope
+                .as_ref()
+                .is_some_and(|scope| token.covers(scope))
+        {
             return Err(Unrequestable::OutsideTokenScope);
         }
     }

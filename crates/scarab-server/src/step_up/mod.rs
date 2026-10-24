@@ -38,7 +38,7 @@ use scarab_identity::{
 use scarab_secrets::Sealer;
 use scarab_webauthn::{CredentialDescriptor, RelyingParty};
 
-pub use ops::{Class, Mode, Op, OpInput, OpSummary, OrgOf, StepUpMachineUse};
+pub use ops::{Class, Mode, Op, OpInput, OpSummary, OrgOf, ProjectOf, StepUpMachineUse};
 
 use crate::{ApiError, AppState, Caller};
 
@@ -606,11 +606,12 @@ pub(crate) struct Prepared {
     pub(crate) svc: Arc<StepUpService>,
     pub(crate) caller: Caller,
     pub(crate) org: Option<String>,
-    /// The Org the request names (from its path, query, body or run),
+    /// The scope the request names (its Org from its path, query, body or
+    /// run, narrowed to the Project its handler authorizes at, if any),
     /// whether or not the caller holds a role there — what a token's scope
-    /// is checked against before a request is raised. `org` is this, kept
-    /// only for a member.
-    pub(crate) requested_org: Option<String>,
+    /// must cover before a request is raised. `org` is its Org, kept only
+    /// for a member.
+    pub(crate) requested_scope: Option<scarab_identity::Scope>,
     pub(crate) summary: OpSummary,
     pub(crate) digest: [u8; 32],
     // The raw request, kept for a StepUpConfirmationRequest (ADR-0073 §6):
