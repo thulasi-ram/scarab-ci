@@ -127,6 +127,16 @@ fn state_of(status: std::process::ExitStatus) -> ExecState {
 
 #[async_trait]
 impl Executor for LocalExecutor {
+    async fn results_delivery_failure(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<String>, ExecError> {
+        // The local backend hands results over in-process (`results`): there
+        // is no delivery leg that could fail apart from the step. REQUIRED
+        // method, so this None is a decision the compiler saw.
+        Ok(None)
+    }
+
     async fn infra_condition(
         &self,
         _handle: &ExecHandle,

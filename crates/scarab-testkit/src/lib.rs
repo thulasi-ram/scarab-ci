@@ -2295,6 +2295,10 @@ struct FakeExecState {
     churning_roots: std::collections::HashSet<String>,
     /// Named results (ADR-0041) each *step* emits on success, keyed by step id.
     results: HashMap<String, std::collections::BTreeMap<String, serde_json::Value>>,
+    /// How each *step*'s results delivery failed, keyed by step id — what
+    /// `Executor::results_delivery_failure` answers (git-bug 0cb5895). Absent
+    /// = delivered (the in-process default).
+    delivery_failures: HashMap<String, String>,
     /// Artifacts of record (ADR-0052) each *step* published, keyed by step id —
     /// the harvest the backend reports back once the blobs are in the object
     /// store, which the orchestrator must durably index.
@@ -2471,6 +2475,16 @@ impl FakeExecutor {
             .unwrap()
             .results
             .insert(step.to_string(), results);
+    }
+
+    /// Script that `step`'s results delivery failed, `how` being the clause
+    /// a backend reports (on k8s: "the results sidecar … exited 1 (Error)").
+    pub fn set_results_delivery_failure(&self, step: &str, how: &str) {
+        self.inner
+            .lock()
+            .unwrap()
+            .delivery_failures
+            .insert(step.to_string(), how.to_string());
     }
 
     /// Set the artifacts of record `step` (by id) published (ADR-0052) — what a
@@ -2699,6 +2713,22 @@ impl Executor for FakeExecutor {
         Ok(step
             .and_then(|s| self.inner.lock().unwrap().results.get(s).cloned())
             .unwrap_or_default())
+    }
+
+    async fn results_delivery_failure(
+        &self,
+        handle: &ExecHandle,
+    ) -> Result<Option<String>, ExecError> {
+        let Some((step, _)) = Self::step_and_attempt(handle) else {
+            return Ok(None);
+        };
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .delivery_failures
+            .get(&step)
+            .cloned())
     }
 
     async fn artifacts(

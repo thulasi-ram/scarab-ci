@@ -230,6 +230,15 @@ impl Executor for CloneEnrichingExecutor {
         self.inner.results(handle).await
     }
 
+    async fn results_delivery_failure(
+        &self,
+        handle: &ExecHandle,
+    ) -> Result<Option<String>, ExecError> {
+        // REQUIRED evidence method: forward, or a k8s results-sidecar failure
+        // behind this decorator reads as the author's missing result (0cb5895).
+        self.inner.results_delivery_failure(handle).await
+    }
+
     async fn artifacts(
         &self,
         handle: &ExecHandle,

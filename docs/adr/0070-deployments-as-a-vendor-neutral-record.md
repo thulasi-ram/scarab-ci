@@ -101,13 +101,16 @@ exactly one Environment.)
   un-explains a Deployment, and a requester that explained it is never demoted to a claim.
   With two requesters, any one that qualifies explains it. "Made live by" lists only the
   requesters that are not claims.
-- **Known limits of the timing rule.** A retried Attempt whose new start is after the
-  source's report reads as a claim, although its first Attempt made the change. Widening
-  the effective time to the first Attempt would open the gate window over that Attempt's
-  failure (§8). The DeploymentRequest writer (MMP slice (b)) stamps the **succeeding**
-  Attempt's start (§7), so this limit still stands. A
-  long-running Step that spans a hand-applied change of the same version explains it; the
-  record cannot tell the two apart, and that ambiguity is inherent.
+- **Known limits of the timing rule.** A retried Step used to read as a claim when its
+  succeeding Attempt started after the source's report, although its first Attempt made
+  the change. That limit is **closed** (owner decision 2026-10-24, git-bug `2b5d9d9`):
+  the effective time is the start of the Step's **first Attempt in its current Take**
+  (§7), so automatic retries and an operator Retry share it, and a DeploymentGate's
+  first wait then also covers the first Attempt's push, its failure included (§8). A
+  Rerun of the Step starts a new Take with its own, later effective time, so a change
+  made by hand between two Takes is never laundered. What remains is inherent: a
+  long-running Step, its retries included, that spans a hand-applied change of the same
+  version explains it; the record cannot tell the two apart.
 
 ### 3. DeploymentTarget: the smallest unit that independently succeeds or fails
 
@@ -251,9 +254,13 @@ steps:
 - **On Kubernetes, results arrive through the results-egress sidecar**, not from the
   executor. The executor withholds the Step's success until the sidecar has terminated,
   and the sidecar exits only after the results were committed or its POST failed. A
-  failed drain therefore reads as "exit 0, result missing" and fails the Step as
-  DeploymentRequest incomplete, which misattributes an infrastructure loss to the author
-  (git-bug `0cb5895`).
+  failed drain therefore reads as "exit 0, result missing" and still fails the Step as
+  DeploymentRequest incomplete, never auto-retried. Its **reason** says what happened
+  (git-bug `0cb5895`, owner-approved): when the sidecar terminated non-zero (its POST
+  gave up, or it was killed at the grace period), the reason names the sidecar and its
+  exit code, says the Step's own output may be fine and asks for a retry of the Step,
+  instead of telling the author to write `/scarab/results/<name>.json`. The engine asks
+  the executor for this only when a request is incomplete.
 - **The DeploymentTarget is static**: a literal or a launch input, resolved once at Run
   creation against the launch parameters (a webhook Run uses the inputs' defaults). An
   unresolved or empty part refuses the Run, and so do two requests of one Step that
@@ -263,13 +270,19 @@ steps:
   (git-bug `9c1173a`).
 - **Effective time.** A request carries the time its Step *started* (when the change was
   made) as well as the time it was recorded (when the Step succeeded). As built, the
-  effective time is the **succeeding Attempt's** `started_at`, and the receipt time is
-  read right before the commit. Both are control-plane times, and the effective time is
-  clamped to be no later than the request's receipt time; a source's clock never enters
-  the comparison. If the key's newest Deployment is already final, the request still
-  **joins it as history** when core first received that Deployment at or after the
-  effective time: the source simply got there before the request was recorded. Only an
-  *older* final Deployment makes the request a genuine rollback (INV-DEP-11).
+  effective time is the `started_at` of the Step's **first Attempt in its current Take**
+  (git-bug `2b5d9d9`), and the receipt time is read right before the commit. Takes are a
+  derived lens (ADR-0056), so "current Take" is judged on the Run's journal by position:
+  the first `AttemptStarted` of the Step after the latest Rerun that re-armed it. An
+  automatic retry and an operator Retry do not start a new Take; a Rerun of an unrelated
+  Step is no boundary for this one. A journal that names no such Attempt falls back to
+  the succeeding Attempt's start, the later and so the more conservative time. Both
+  times are control-plane times, and the effective time is clamped to be no later than
+  the request's receipt time; a source's clock never enters the comparison. If the key's
+  newest Deployment is already final, the request still **joins it as history** when core
+  first received that Deployment at or after the effective time: the source simply got
+  there before the request was recorded. Only an *older* final Deployment makes the
+  request a genuine rollback (INV-DEP-11).
 - **Scheme check.** A version that does not fit the target's published scheme id (§4), or
   the source's default scheme for a target it has not named yet, is to be rejected when
   the request is recorded, failing the Step as **DeploymentRequest incomplete** below.
@@ -305,8 +318,10 @@ every gate (§9), because rejecting only tightens. `gate_expires_after` still bo
 wait.
 
 A gate's **first wait** on a request opens at the **request's effective time**, which is
-the deploy Step's start. Only a wait that **waits afresh** opens at **max(request
-effective time, gate Attempt start)**. A wait waits afresh when an earlier wait of the same
+the deploy Step's start: its first Attempt in the current Take (§7), so a `failed`
+received while an earlier, failed Attempt of the deploy Step ran fails the first wait.
+Only a wait that **waits afresh** opens at **max(request effective time, gate Attempt
+start)**. A wait waits afresh when an earlier wait of the same
 gate already reached a verdict while this same request stood: a Retry, or a Rerun of the
 gate alone. From there:
 
@@ -670,7 +685,10 @@ cut** keeps ADR-0037's one Environment per Run. Promotion is chained Deploy Runs
 - **Known follow-ups**, deferred from slice (b) with tickets:
   - the scheme check (§7, `5fc1860`) and the ownership rejection (`9c1173a`);
   - a target first claimed by two Environments at once (`9e66f2c`);
-  - a failed results drain on Kubernetes reads as DeploymentRequest incomplete (`0cb5895`);
+  - a failed results drain on Kubernetes reads as DeploymentRequest incomplete (`0cb5895`):
+    **decided** 2026-10-24 and built — same class, an honest reason (§7);
+  - a retried deploy Step's request reads as a claim (`2b5d9d9`): **decided** 2026-10-24
+    and built — effective at the first Attempt of the current Take (§2, §7);
   - when the first gate Attempt's window should open (`fce05da`): **decided** 2026-10-24
     and built, at the request's effective time (§8);
   - a wait with no bound when its deadline cannot be read (`eace9a8`);

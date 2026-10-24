@@ -2094,8 +2094,9 @@ const RESULTS_EGRESS_CONTAINER: &str = "scarab-results-egress";
 ///   the Pod's verdict is unchanged.
 /// - Terminated, exit 0 or not → not draining. A failed drain (non-zero, or
 ///   SIGKILLed at the grace period) reads as results missing — a Deploy Step
-///   then fails `DeploymentRequestIncomplete` (judge-b23 D7 tracks
-///   reclassifying it as infra).
+///   then fails `DeploymentRequestIncomplete`, its reason naming the failed
+///   delivery ([`pod_results_delivery_failure`], git-bug `0cb5895`) rather
+///   than the author's results.
 /// - `waiting` with a previous termination (a crash-looping sidecar the
 ///   kubelet will not restart once the step is done) → not draining either:
 ///   nothing is in flight, and withholding would only run out the clock.
@@ -2131,6 +2132,59 @@ fn results_draining(pod: &Pod) -> bool {
                         .is_some_and(|st| st.terminated.is_some()))
         });
     !settled
+}
+
+/// How the results-egress drain **failed** on this Pod, or `None` (ADR-0042;
+/// git-bug `0cb5895`). `Some` when the Pod's spec declares the
+/// [`RESULTS_EGRESS_CONTAINER`] native sidecar and its status shows it
+/// terminated non-zero — its bounded `curl -f` retries gave up (exit 1), or the
+/// kubelet SIGKILLed it at the termination grace (137) — either now or as its
+/// previous termination while it waits (a crash-looping sidecar the kubelet
+/// will not restart once the step is done). The clause names the exit code and
+/// the kubelet's reason when it gave one.
+///
+/// `None` for no sidecar (results egress not configured), an exit 0 (the POST
+/// committed), and a drain still in flight or never observed (no status, or
+/// `running`) — nothing proves a failure, so the author-facing reason stands.
+fn pod_results_delivery_failure(pod: &Pod) -> Option<String> {
+    let declared = pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.init_containers.as_ref())
+        .into_iter()
+        .flatten()
+        .any(|c| c.name == RESULTS_EGRESS_CONTAINER);
+    if !declared {
+        return None;
+    }
+    let status = pod
+        .status
+        .as_ref()
+        .and_then(|s| s.init_container_statuses.as_ref())
+        .into_iter()
+        .flatten()
+        .find(|c| c.name == RESULTS_EGRESS_CONTAINER)?;
+    let terminated = match status.state.as_ref() {
+        Some(st) if st.terminated.is_some() => st.terminated.as_ref(),
+        Some(st) if st.waiting.is_some() => status
+            .last_state
+            .as_ref()
+            .and_then(|l| l.terminated.as_ref()),
+        _ => None,
+    }?;
+    if terminated.exit_code == 0 {
+        return None;
+    }
+    let why = terminated
+        .reason
+        .as_deref()
+        .filter(|r| !r.trim().is_empty())
+        .map(|r| format!(" ({r})"))
+        .unwrap_or_default();
+    Some(format!(
+        "the results sidecar `{RESULTS_EGRESS_CONTAINER}` exited {}{why}",
+        terminated.exit_code
+    ))
 }
 
 /// [`pod_state`] with `Succeeded` withheld (reported `Running`) while the
@@ -2603,6 +2657,21 @@ impl Executor for K8sExecutor {
                 condition
             }
         }))
+    }
+
+    /// The results-egress sidecar's failed delivery ([`pod_results_delivery_failure`],
+    /// git-bug `0cb5895`), read from the Pod at settle. Pod gone ⇒ `None`:
+    /// nothing proves the delivery failed, so the author-facing reason stands.
+    async fn results_delivery_failure(
+        &self,
+        handle: &ExecHandle,
+    ) -> Result<Option<String>, ExecError> {
+        let pods = self.pods()?;
+        let pod = pods
+            .get_opt(&handle.0)
+            .await
+            .map_err(|e| ExecError::Other(e.to_string()))?;
+        Ok(pod.as_ref().and_then(pod_results_delivery_failure))
     }
 
     async fn workspace_provisioning(
@@ -7090,6 +7159,77 @@ mod tests {
         assert!(!results_draining(&pod));
         assert_eq!(results_settled_state(&pod), ExecState::Succeeded);
         assert_eq!(results_settled_state(&pod), pod_state(&pod));
+    }
+
+    /// git-bug 0cb5895: a results sidecar that terminated non-zero is a FAILED
+    /// DELIVERY — named, with its exit code and the kubelet's reason — so the
+    /// engine's DeploymentRequest-incomplete reason blames the delivery, not
+    /// the author. Exit 0, no sidecar, a drain still in flight, and a sidecar
+    /// never observed prove no failure: `None`, the author-facing reason
+    /// stands. A crash-looping sidecar reports its previous termination.
+    #[test]
+    fn a_results_sidecar_that_exited_non_zero_is_a_failed_delivery() {
+        let failed = with_results_sidecar(
+            plain_pod("Succeeded", 0),
+            Some(results_status(results_terminated(1), false)),
+        );
+        assert_eq!(
+            pod_results_delivery_failure(&failed).as_deref(),
+            Some("the results sidecar `scarab-results-egress` exited 1")
+        );
+
+        let mut killed = results_status(results_terminated(137), false);
+        if let Some(t) = killed.state.as_mut().and_then(|s| s.terminated.as_mut()) {
+            t.reason = Some("Error".into());
+        }
+        let killed = with_results_sidecar(plain_pod("Succeeded", 0), Some(killed));
+        assert_eq!(
+            pod_results_delivery_failure(&killed).as_deref(),
+            Some("the results sidecar `scarab-results-egress` exited 137 (Error)")
+        );
+
+        // Waiting after a previous non-zero termination (results_status's
+        // last_state exits 1): the failure is that previous termination.
+        let crash_looped = with_results_sidecar(
+            plain_pod("Succeeded", 0),
+            Some(results_status(
+                k8s_openapi::api::core::v1::ContainerState {
+                    waiting: Some(Default::default()),
+                    ..Default::default()
+                },
+                true,
+            )),
+        );
+        assert_eq!(
+            pod_results_delivery_failure(&crash_looped).as_deref(),
+            Some("the results sidecar `scarab-results-egress` exited 1")
+        );
+
+        let delivered = with_results_sidecar(
+            plain_pod("Succeeded", 0),
+            Some(results_status(results_terminated(0), false)),
+        );
+        assert_eq!(pod_results_delivery_failure(&delivered), None, "exit 0");
+        assert_eq!(
+            pod_results_delivery_failure(&plain_pod("Succeeded", 0)),
+            None,
+            "no results sidecar declared"
+        );
+        let in_flight = with_results_sidecar(
+            plain_pod("Succeeded", 0),
+            Some(results_status(results_running(), false)),
+        );
+        assert_eq!(
+            pod_results_delivery_failure(&in_flight),
+            None,
+            "still draining"
+        );
+        let unseen = with_results_sidecar(plain_pod("Succeeded", 0), None);
+        assert_eq!(
+            pod_results_delivery_failure(&unseen),
+            None,
+            "no status entry"
+        );
     }
 
     /// Only `Succeeded` is withheld: a failed Pod owes no results the engine
