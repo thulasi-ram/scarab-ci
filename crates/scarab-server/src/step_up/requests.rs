@@ -49,8 +49,8 @@ use super::ceremony::{
     browser_session, challenge_invalid, consume, service, verify_assertion, StepUpConfirmRequest,
 };
 use super::{
-    descriptors, event, random_id, store_err, Op, OpSummary, Prepared, StepUpRefusal,
-    StepUpService, WebauthnChallengeDto,
+    descriptors, event, random_id, store_err, MachineUse, Op, OpSummary, OrgOf, Prepared,
+    StepUpRefusal, StepUpService, WebauthnChallengeDto,
 };
 use crate::{authenticate, ApiError, AppState, AuthVia, Caller, SessionFacts};
 
@@ -133,6 +133,70 @@ pub(crate) fn requester_of(caller: &Caller) -> Option<StepUpRequester> {
         }),
         _ => None,
     }
+}
+
+/// Why a machine caller may not raise a StepUpConfirmationRequest for an
+/// operation: it could never execute it, so the request would only ever end
+/// `failed` — and would hand a compromised machine a plausible prompt to
+/// send its human.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unrequestable {
+    /// Only a human in a browser can perform it ([`MachineUse::BrowserOnly`]).
+    BrowserOnly,
+    /// An API token can never perform it ([`MachineUse::NotByToken`]).
+    NotByToken,
+    /// It acts on an Org the API token's scope does not reach.
+    OutsideTokenScope,
+}
+
+impl Unrequestable {
+    /// The `code` of the 403 and the `reason` of the `step_up.refused` event.
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::BrowserOnly => "browser_session_required",
+            Self::NotByToken => "not_by_api_token",
+            Self::OutsideTokenScope => "outside_token_scope",
+        }
+    }
+
+    pub(crate) fn message(self, op: &Op) -> String {
+        let what = op.label;
+        match self {
+            Self::BrowserOnly => format!(
+                "{what} can only be done by a human in a signed-in browser — never with an API \
+                 token or a session presented as Bearer — so no confirmation request was raised"
+            ),
+            Self::NotByToken => format!(
+                "{what} can never be done with an API token, so no confirmation request was raised"
+            ),
+            Self::OutsideTokenScope => format!(
+                "{what} acts outside this API token's scope, so it could never run with it and \
+                 no confirmation request was raised"
+            ),
+        }
+    }
+}
+
+/// May `p`'s machine caller raise a request for `op` — could it ever execute
+/// it once confirmed? Checked BEFORE a request is raised. The handler stays
+/// the authority on what runs; this only refuses what it is certain to
+/// refuse.
+pub(crate) fn requestable(op: &Op, p: &Prepared) -> Result<(), Unrequestable> {
+    if op.machine == MachineUse::BrowserOnly {
+        return Err(Unrequestable::BrowserOnly);
+    }
+    if let Some(token) = &p.caller.grant {
+        if op.machine == MachineUse::NotByToken {
+            return Err(Unrequestable::NotByToken);
+        }
+        // An Org-bound operation on an Org the token does not cover (or
+        // naming none at all) is refused by its handler for the token's
+        // scope, whoever confirms it.
+        if op.org_of != OrgOf::None && p.requested_org.as_deref() != Some(token.scope.org()) {
+            return Err(Unrequestable::OutsideTokenScope);
+        }
+    }
+    Ok(())
 }
 
 /// What the KEK seals.

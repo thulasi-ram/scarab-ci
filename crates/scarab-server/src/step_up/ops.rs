@@ -172,6 +172,23 @@ pub struct OpSummary {
     pub changes: Vec<String>,
 }
 
+/// Who, besides a human in a browser, an operation can ever be performed by
+/// — and so whether a machine caller may raise a StepUpConfirmationRequest
+/// for it (ADR-0073 §6). A request its requester could never execute would
+/// only ever end `failed`, and would hand a compromised machine a plausible
+/// prompt to send its human.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineUse {
+    /// An API token or a Bearer session may perform it (once confirmed).
+    Requestable,
+    /// Only a cookie session: the handler refuses every token and Bearer
+    /// session (the identity-link flows, like `passkey.add`).
+    BrowserOnly,
+    /// Never an API token (a token may not mint tokens); a Bearer session
+    /// may.
+    NotByToken,
+}
+
 /// One governed operation.
 #[derive(Debug)]
 pub struct Op {
@@ -198,11 +215,29 @@ pub struct Op {
     /// `path:<name>`, `query:<name>`, `body:<json pointer>`.
     pub target: &'static [&'static str],
     pub describe: fn(&Op, &OpInput) -> OpSummary,
+    /// Whether a machine caller may raise a request for it.
+    pub machine: MachineUse,
 }
 
 impl Op {
     pub fn summary(&self, input: &OpInput) -> OpSummary {
         (self.describe)(self, input)
+    }
+
+    /// Only a human in a browser can ever perform it.
+    const fn browser_only(self) -> Op {
+        Op {
+            machine: MachineUse::BrowserOnly,
+            ..self
+        }
+    }
+
+    /// An API token can never perform it.
+    const fn not_by_token(self) -> Op {
+        Op {
+            machine: MachineUse::NotByToken,
+            ..self
+        }
     }
 }
 
@@ -445,6 +480,7 @@ const fn op(
         redact,
         target,
         describe: describe_generic,
+        machine: MachineUse::Requestable,
     }
 }
 
@@ -750,7 +786,8 @@ pub static IDENTITY_LINK: Op = op(
     OrgOf::None,
     &[],
     &["body:/provider"],
-);
+)
+.browser_only();
 pub static IDENTITY_UNLINK: Op = op(
     "identity.unlink",
     "Unlink a login identity",
@@ -760,7 +797,8 @@ pub static IDENTITY_UNLINK: Op = op(
     OrgOf::None,
     &[],
     &["path:provider"],
-);
+)
+.browser_only();
 pub static BINDING_PUT: Op = op(
     "binding.put",
     "Change a role binding",
@@ -893,7 +931,8 @@ pub static TOKEN_MINT: Op = op(
     OrgOf::Path("org"),
     &[],
     &["path:org", "body:/project", "body:/name"],
-);
+)
+.not_by_token();
 pub static PLUGIN_INSTALL: Op = op(
     "plugin.install",
     "Install a plugin",
@@ -1027,7 +1066,8 @@ pub static PASSKEY_ADD: Op = op(
     OrgOf::None,
     &[],
     &["body:/label"],
-);
+)
+.browser_only();
 
 // --- the ceremony endpoints ----------------------------------------------------
 
@@ -1095,6 +1135,28 @@ mod tests {
             query: vec![],
             body,
         }
+    }
+
+    /// The operations a machine caller may never raise a request for: the
+    /// browser-only flows, and token minting for a token (git-bug ff7a014).
+    #[test]
+    fn only_the_browser_flows_and_token_minting_refuse_a_machine() {
+        let mut browser_only = Vec::new();
+        let mut not_by_token = Vec::new();
+        for e in crate::route_table() {
+            match e.op.machine {
+                MachineUse::BrowserOnly => browser_only.push(e.op.id),
+                MachineUse::NotByToken => not_by_token.push(e.op.id),
+                MachineUse::Requestable => {}
+            }
+        }
+        browser_only.sort_unstable();
+        browser_only.dedup();
+        assert_eq!(
+            browser_only,
+            vec!["identity.link", "identity.unlink", "passkey.add"]
+        );
+        assert_eq!(not_by_token, vec!["token.mint"]);
     }
 
     #[test]

@@ -681,6 +681,89 @@ async fn the_eleventh_pending_request_is_429() {
     raise(&h, &token, "later").await;
 }
 
+/// A machine caller never raises a request it could never execute
+/// (git-bug ff7a014): the identity-link flows are browser-only (from a token
+/// AND from a Bearer session), a token may not mint tokens, and a token
+/// cannot act on an Org outside its scope. Each is a plain 403 naming why,
+/// recorded as a refusal; no request is raised, so its human is never sent
+/// a prompt that could only fail.
+#[tokio::test]
+async fn a_request_the_requester_could_never_execute_is_not_raised() {
+    let (h, _) = world(Backend::Memory).await;
+    h.grant("amy", Scope::Org("beta".into()), Role::Owner).await;
+    let token = pat(&h, "t1", Scope::Org("acme".into()), Role::Owner).await;
+    let cli = h.session(owner("amy"), LOGIN_KIND_API).await;
+    let mint = json!({"name": "next", "role": "admin", "expires_in_days": 1});
+    let beta_secret = json!({"org": "beta", "name": "DB_PASSWORD", "value": "v"});
+    let cases: Vec<(&str, &str, Option<Value>, &str, &str)> = vec![
+        (
+            "POST",
+            "/v1/me/identities/link",
+            Some(json!({"provider": "github"})),
+            &token,
+            "browser_session_required",
+        ),
+        (
+            "DELETE",
+            "/v1/me/identities/github",
+            None,
+            &token,
+            "browser_session_required",
+        ),
+        (
+            "POST",
+            "/v1/me/identities/link",
+            Some(json!({"provider": "github"})),
+            &cli.id,
+            "browser_session_required",
+        ),
+        (
+            "DELETE",
+            "/v1/me/identities/github",
+            None,
+            &cli.id,
+            "browser_session_required",
+        ),
+        (
+            "POST",
+            "/v1/orgs/acme/tokens",
+            Some(mint.clone()),
+            &token,
+            "not_by_api_token",
+        ),
+        (
+            "POST",
+            "/v1/secrets",
+            Some(beta_secret),
+            &token,
+            "outside_token_scope",
+        ),
+    ];
+    for (method, uri, body, bearer, code) in cases {
+        let (st, b) = h.bearer(method, uri, body, bearer).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{method} {uri}: {b}");
+        assert_eq!(b["code"], code, "{method} {uri}: {b}");
+        assert!(b.get("request_id").is_none(), "{method} {uri}: {b}");
+        assert!(
+            h.step_up.requests().is_empty(),
+            "{method} {uri} raised a request"
+        );
+        let refused = h.events("step_up.refused").await;
+        assert_eq!(refused.last().unwrap().detail["reason"], code, "{uri}");
+    }
+    assert!(h.events("request.raised").await.is_empty());
+
+    // What the requester CAN execute still raises one: a Bearer session may
+    // mint a token, and the token may write acme's secret.
+    let (st, b) = h
+        .bearer("POST", "/v1/orgs/acme/tokens", Some(mint), &cli.id)
+        .await;
+    assert_step_up(st, &b, "action");
+    assert!(b["request_id"].is_string(), "{b}");
+    raise(&h, &token, "v").await;
+    assert_eq!(h.step_up.requests().len(), 2);
+}
+
 /// A request runs exactly what was raised: a challenge for another request
 /// confirms nothing, and a stored body that no longer matches the digest
 /// the human confirmed is refused at replay.

@@ -161,6 +161,7 @@ pub async fn guard_with(table: &[RouteEntry], st: AppState, req: Request, next: 
     // resolved from client input before any handler authorization, so a
     // non-member's confirmation (with her own summary text) must not land
     // in another Org's log. Hers is Org-less, so redacted there.
+    let requested_org = org.clone();
     let org = match org {
         Some(o) if holds_role_in(&st, &caller, &o).await => Some(o),
         _ => None,
@@ -176,6 +177,7 @@ pub async fn guard_with(table: &[RouteEntry], st: AppState, req: Request, next: 
         svc: svc.clone(),
         caller,
         org,
+        requested_org,
         summary: summary.clone(),
         digest,
         method: parts.method.as_str().to_string(),

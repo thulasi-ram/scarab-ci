@@ -38,7 +38,7 @@ use scarab_identity::{
 use scarab_secrets::Sealer;
 use scarab_webauthn::{CredentialDescriptor, RelyingParty};
 
-pub use ops::{Class, Mode, Op, OpInput, OpSummary, OrgOf};
+pub use ops::{Class, MachineUse, Mode, Op, OpInput, OpSummary, OrgOf};
 
 use crate::{ApiError, AppState, Caller};
 
@@ -407,6 +407,11 @@ pub(crate) struct Prepared {
     pub(crate) svc: Arc<StepUpService>,
     pub(crate) caller: Caller,
     pub(crate) org: Option<String>,
+    /// The Org the request names (from its path, query, body or run),
+    /// whether or not the caller holds a role there — what a token's scope
+    /// is checked against before a request is raised. `org` is this, kept
+    /// only for a member.
+    pub(crate) requested_org: Option<String>,
     pub(crate) summary: OpSummary,
     pub(crate) digest: [u8; 32],
     // The raw request, kept for a StepUpConfirmationRequest (ADR-0073 §6):
@@ -580,6 +585,11 @@ pub(crate) async fn require(
         // An API token or a Bearer session raises a StepUpConfirmationRequest
         // for its human, and the refusal carries the one-time link.
         if let Some(requester) = requests::requester_of(caller) {
+            // …unless it could never execute the operation: then a plain
+            // refusal, and no request for its human.
+            if let Err(why) = requests::requestable(op, p) {
+                return refuse_unrequestable(st, op, p, mode, why).await;
+            }
             let r = refusal(MSG_MACHINE, mode.as_str());
             return requests::raise(st, op, p, summary, requester, r).await;
         }
@@ -687,6 +697,36 @@ pub(crate) async fn refuse_with<T>(
     }
     p.svc.record(ev).await;
     Err(ApiError::StepUpRequired(Box::new(refusal)))
+}
+
+/// A machine caller's operation it could never execute (ADR-0073 §6): no
+/// request is raised; the refusal is recorded (best-effort) and answered as
+/// a plain 403 naming why.
+async fn refuse_unrequestable<T>(
+    st: &AppState,
+    op: &'static Op,
+    p: &Prepared,
+    mode: Mode,
+    why: requests::Unrequestable,
+) -> Result<T, ApiError> {
+    let now = st.clock.now().await.0;
+    let mut ev = event(
+        kind::STEP_UP_REFUSED,
+        &p.caller.principal.subject,
+        p.caller.event_label(),
+        p.org.clone(),
+        now,
+    );
+    ev.op = Some(op.id.to_string());
+    ev.target = Some(p.summary.target.clone());
+    ev.session_hash = p.caller.session.as_ref().map(|s| s.id_hash.clone());
+    ev.detail = serde_json::json!({ "mode": mode.as_str(), "reason": why.code() });
+    p.svc.record(ev).await;
+    Err(ApiError::Ceremony {
+        status: axum::http::StatusCode::FORBIDDEN,
+        code: why.code(),
+        message: why.message(op),
+    })
 }
 
 #[cfg(test)]
