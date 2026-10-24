@@ -1241,6 +1241,44 @@ pub fn deployment_gate_waits_afresh(
     })
 }
 
+/// The Attempt whose start is a succeeding deploy Step's DeploymentRequest
+/// **effective time** (ADR-0070 §2, §7; git-bug `2b5d9d9`): the step's
+/// **first** Attempt in its current Take — the first `AttemptStarted` of
+/// `step` after the latest `RunRerunRequested` that re-armed it (its
+/// `invalidated` names `step`), or since the Run began if none did. Judged by
+/// event *position*, never by time.
+///
+/// Takes are a derived lens (ADR-0056: no Take is stored; the UI splits the
+/// log at every `RunRerunRequested`), so "the current Take" here means
+/// "since the step's latest re-arm by a Rerun": an automatic retry and an
+/// operator **Retry** (`StepRetryRequested`, not a Take boundary) stay in it,
+/// so a change pushed by `a1` before it died is explained by the request `a2`
+/// records. A Rerun that re-arms the step opens a new window, so its request
+/// gets its own, later effective time and never launders a change made
+/// between the two. A Rerun of an unrelated step (one that does not re-arm
+/// this one) is no boundary for it: the step's own execution went on
+/// untouched.
+///
+/// `None` when the log holds no such `AttemptStarted` (a hand-seeded run, or
+/// an Attempt row whose event a crash lost); the caller then falls back to the
+/// succeeding Attempt's own start, the later and so the conservative time (a
+/// claim rather than an explanation).
+pub fn deployment_request_first_attempt(events: &[EventKind], step: &StepId) -> Option<AttemptId> {
+    let from = events
+        .iter()
+        .rposition(|e| {
+            matches!(
+                &e.kind,
+                EventPayload::RunRerunRequested { invalidated, .. } if invalidated.contains(step)
+            )
+        })
+        .map_or(0, |i| i + 1);
+    events[from..].iter().find_map(|e| match &e.kind {
+        EventPayload::AttemptStarted { step: s, attempt } if s == step => Some(attempt.clone()),
+        _ => None,
+    })
+}
+
 /// The distinct principals who approved gate `step` **in its current wait**,
 /// in approval order (ADR-0037; ADR-0070 §9 "a rejected approval asks
 /// again"). Only `GateApproved` events appended after the gate's latest re-arm
@@ -2968,7 +3006,7 @@ impl<'a> Scheduler<'a> {
                     // over in-process and were just written above.
                     let mut completing = self.db.attempt_results(&run, &step, &attempt).await?;
                     completing.extend(results);
-                    self.succeed_step(&run, &step, &attempt, &completing)
+                    self.succeed_step(&run, &step, &attempt, &handle, &completing)
                         .await?;
                     self.db.mark_dispatched(msg.id).await?;
                 }
@@ -4257,13 +4295,20 @@ impl<'a> Scheduler<'a> {
     ///   [`FailureKind::DeploymentRequestIncomplete`] ("DeploymentRequest
     ///   incomplete: …"), directly — never through the retry loop, so a
     ///   `retry:` does not re-run a deploy Step that already pushed;
+    ///   When the backend reports that it failed to *deliver* the Attempt's
+    ///   results ([`Executor::results_delivery_failure`] — on Kubernetes the
+    ///   results-egress sidecar exited non-zero), the reason says so instead
+    ///   of telling the author to write `/scarab/results/<name>.json`
+    ///   (git-bug `0cb5895`); the class and the no-retry rule are unchanged;
     /// - otherwise the success transition, the attempt outcome and one
     ///   Deployment input per request land in ONE commit
     ///   ([`Db::finish_step_with_deployment_requests`]), each request
-    ///   effective at the succeeding Attempt's `started_at` (when the change
-    ///   was made, on the control-plane clock) and received at `now`. A
-    ///   `Conflict` (a peer finalized the step) appends nothing and no events;
-    ///   any other error leaves the step `Running` for the next re-drive.
+    ///   effective at the `started_at` of the step's **first Attempt in its
+    ///   current Take** ([`deployment_request_first_attempt`]; git-bug
+    ///   `2b5d9d9`) — when the change was first being made, on the
+    ///   control-plane clock — and received at `now`. A `Conflict` (a peer
+    ///   finalized the step) appends nothing and no events; any other error
+    ///   leaves the step `Running` for the next re-drive.
     ///
     /// Then the usual `AttemptFinished` + `StepTransitioned` events, exactly as
     /// `finalize_step` appends them.
@@ -4272,6 +4317,7 @@ impl<'a> Scheduler<'a> {
         run: &RunId,
         step: &StepId,
         attempt: &AttemptId,
+        handle: &ExecHandle,
         results: &BTreeMap<String, serde_json::Value>,
     ) -> Result<(), SchedulerError> {
         // The same stale-/torn-down-observation guard as
@@ -4301,7 +4347,7 @@ impl<'a> Scheduler<'a> {
                 .await;
         };
         let started_at = attempts
-            .into_iter()
+            .iter()
             .find(|a| &a.id == attempt)
             .map(|a| a.started_at)
             .ok_or_else(|| {
@@ -4311,9 +4357,19 @@ impl<'a> Scheduler<'a> {
                     step.0, attempt.0
                 ))
             })?;
-        let inputs = match crate::deployment_inputs(run, step, &requests, results, started_at) {
+        // The effective time is the start of the step's FIRST Attempt in its
+        // current Take (git-bug 2b5d9d9): an `a1` that pushed the change and
+        // then died made it, so the request `a2` records must explain the
+        // Deployment the source reported in between. Never later than the
+        // succeeding Attempt's own start (the fallback when the log cannot
+        // name the first Attempt).
+        let effective_at = deployment_request_first_attempt(&self.db.events(run).await?, step)
+            .and_then(|first| attempts.iter().find(|a| a.id == first))
+            .map_or(started_at, |a| a.started_at.min(started_at));
+        let inputs = match crate::deployment_inputs(run, step, &requests, results, effective_at) {
             Ok(inputs) => inputs,
             Err(reason) => {
+                let reason = self.undelivered_reason(handle).await.unwrap_or(reason);
                 return self
                     .finalize_step(
                         run,
@@ -4341,6 +4397,23 @@ impl<'a> Scheduler<'a> {
             }
             Err(DbError::Conflict) => Ok(()),
             Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The DeploymentRequest-incomplete reason when the backend failed to
+    /// deliver the Attempt's results (git-bug `0cb5895`), or `None` — then the
+    /// author-facing reason stands. Best-effort, like the other settle-time
+    /// evidence reads (`record_cache_saves`): a backend error here is dropped
+    /// (the author-facing reason stands), since the verdict — incomplete,
+    /// never auto-retried — is the same either way; only its wording depends
+    /// on this.
+    async fn undelivered_reason(&self, handle: &ExecHandle) -> Option<String> {
+        match self.executor.results_delivery_failure(handle).await {
+            Ok(Some(how)) => Some(format!(
+                "DeploymentRequest incomplete: {how}, so this step's results were not \
+                 delivered; the step's own output may be fine — retry the step"
+            )),
+            Ok(None) | Err(_) => None,
         }
     }
 

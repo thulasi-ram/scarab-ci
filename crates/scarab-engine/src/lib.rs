@@ -25,7 +25,7 @@ pub use ports::{
     DeploymentGates, Executor, LogChunks, SnapshotRetention, WorkspaceSnapshots,
 };
 pub use scheduler::{
-    cancel_run_request, deployment_gate_waits_afresh,
+    cancel_run_request, deployment_gate_waits_afresh, deployment_request_first_attempt,
     gate_approvers, pin_run_snapshots, plan_rerun, record_gate_approval,
     reject_gate, release_gate, wait_began_at,
     rerun_step, rerun_step_widened, retry_step, retry_step_widened, unpin_run_snapshots,
@@ -1006,8 +1006,10 @@ pub struct RunDeploymentRequest {
 /// (slice b, criterion 1; plan Q10): each request's DeploymentVersion is its
 /// version result, which must be a **non-empty JSON string**; its evidence is
 /// the concatenation of its evidence results, each a JSON string or an array
-/// of strings. Every request is effective at `effective_at` (the succeeding
-/// Attempt's start). `at` inside each input is set to `effective_at` too — the
+/// of strings. Every request is effective at `effective_at` (the start of the
+/// step's first Attempt in its current Take — see
+/// [`deployment_request_first_attempt`]). `at` inside each input is set to
+/// `effective_at` too — the
 /// store ignores it and stamps its own receipt time.
 ///
 /// `Err` is the whole failure detail, starting "DeploymentRequest incomplete:"

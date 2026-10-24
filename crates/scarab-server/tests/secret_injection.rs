@@ -21,6 +21,13 @@ struct CapturingExec {
 }
 #[async_trait]
 impl Executor for CapturingExec {
+    async fn results_delivery_failure(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<String>, ExecError> {
+        Ok(None)
+    }
+
     async fn infra_condition(
         &self,
         _handle: &ExecHandle,
@@ -227,6 +234,13 @@ struct SpecCapturingExec {
 }
 #[async_trait]
 impl Executor for SpecCapturingExec {
+    async fn results_delivery_failure(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<String>, ExecError> {
+        Ok(None)
+    }
+
     async fn infra_condition(
         &self,
         _handle: &ExecHandle,
@@ -409,6 +423,13 @@ struct ConditionExec;
 
 #[async_trait]
 impl Executor for ConditionExec {
+    async fn results_delivery_failure(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<String>, ExecError> {
+        Ok(None)
+    }
+
     async fn infra_condition(
         &self,
         _handle: &ExecHandle,

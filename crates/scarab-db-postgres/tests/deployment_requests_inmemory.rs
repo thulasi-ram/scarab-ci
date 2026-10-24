@@ -9,7 +9,10 @@
 //! writes the same results, and re-running a deploy Step that already pushed
 //! is the double effect `retry:` warns of — records nothing, and settles the
 //! run `Failed` (never `DeadLettered`). And the request a complete one
-//! records: effective at the Attempt's start, received at success.
+//! records: effective at the start of the step's FIRST Attempt in its
+//! current Take (git-bug 2b5d9d9) — an automatic retry shares it, a Rerun
+//! gets its own — received at success. A results delivery the backend
+//! reports failed (git-bug 0cb5895) keeps the class but says so.
 
 use std::collections::BTreeMap;
 
@@ -344,4 +347,295 @@ async fn a_non_latest_attempt_cannot_finish_the_step() {
     let step = db.steps_of_run(&run_id()).await.unwrap().remove(0);
     assert_eq!(step.status, StepStatus::Succeeded);
     assert_eq!(db.inputs("acme", "prod").await.unwrap().len(), 1);
+}
+
+/// A Report of `version` on `argocd`/`web` as a plugin's ingest appends it.
+fn report(status: scarab_deployment::SourceAssertedStatus, at: i64) -> DeploymentInput {
+    DeploymentInput::Report {
+        target: scarab_deployment::DeploymentTarget {
+            environment: "prod".into(),
+            source: "argocd".into(),
+            id: "web".into(),
+        },
+        version: scarab_deployment::DeploymentVersion("v42".into()),
+        report: scarab_deployment::DeploymentStatusReport {
+            status,
+            label: "Progressing · OutOfSync".into(),
+            link: None,
+            at,
+        },
+    }
+}
+
+fn complete_results() -> BTreeMap<String, serde_json::Value> {
+    BTreeMap::from([
+        ("version".to_string(), json!("v42")),
+        ("images".to_string(), json!("sha256:aaa")),
+    ])
+}
+
+/// Tick (advancing the clock 1 s each time) until `bump` has `n` attempts;
+/// returns them.
+async fn tick_until_attempts(
+    db: &InMemoryDb,
+    clock: &FakeClock,
+    exec: &FakeExecutor,
+    n: usize,
+) -> Vec<scarab_engine::Attempt> {
+    for _ in 0..10 {
+        let attempts = db.attempts_of_step(&run_id(), &step_id()).await.unwrap();
+        if attempts.len() >= n {
+            return attempts;
+        }
+        tick(db, clock, exec).await;
+        clock.advance(1_000);
+    }
+    panic!("`bump` never reached {n} attempts");
+}
+
+fn step_failure() -> ExecState {
+    ExecState::Failed {
+        exit_code: Some(1),
+        class: scarab_engine::ports::FailureClass::Step,
+        cause: None,
+    }
+}
+
+/// git-bug 2b5d9d9: `a1` starts at T1, Argo reports the change at T2, `a1`
+/// dies, `retry:` starts `a2` at T3 > T2 and it succeeds. The request is
+/// effective at T1 — `a1` made the change — so it EXPLAINS the Deployment the
+/// report created; under the old rule (the succeeding Attempt's start, T3) it
+/// was a claim and the Deployment stayed Unexplained.
+#[tokio::test]
+async fn a_retried_deploy_step_is_effective_at_its_first_attempt_and_explains_the_report() {
+    let db = InMemoryDb::new();
+    seed(&db).await;
+    let clock = FakeClock::new(1_000);
+    let exec = FakeExecutor::new();
+    exec.set_results("bump", complete_results());
+    clock.advance(2_000);
+    let a1 = tick_until_attempts(&db, &clock, &exec, 1).await[0].clone();
+
+    // While a1 runs, the source shows the change: the report creates the
+    // Deployment, received at T2.
+    clock.advance(1_000);
+    let t2 = scarab_engine::Clock::now(&clock).await.0;
+    db.append(
+        "acme",
+        &report(scarab_deployment::SourceAssertedStatus::InProgress, t2),
+        t2,
+    )
+    .await
+    .unwrap();
+
+    clock.advance(1_000);
+    exec.script_outcome(step_failure());
+    let attempts = tick_until_attempts(&db, &clock, &exec, 2).await;
+    assert_eq!(attempts[0].failure, Some(FailureKind::Step), "a1 failed");
+    let a2 = attempts[1].clone();
+    assert!(
+        a2.started_at.0 > t2,
+        "a2 starts after the report, so its own start would make a claim"
+    );
+
+    exec.script_outcome(ExecState::Succeeded);
+    for _ in 0..3 {
+        tick(&db, &clock, &exec).await;
+    }
+    let step = db.steps_of_run(&run_id()).await.unwrap().remove(0);
+    assert_eq!(step.status, StepStatus::Succeeded);
+
+    let logged = db.inputs("acme", "prod").await.unwrap();
+    assert_eq!(logged.len(), 2, "the report, then the request: {logged:?}");
+    let DeploymentInput::Request { effective_at, .. } = &logged[1].input else {
+        panic!("expected the request second, got {:?}", logged[1]);
+    };
+    assert_eq!(
+        *effective_at, a1.started_at.0,
+        "effective at the FIRST Attempt's start, not a2's"
+    );
+
+    let folded = scarab_deployment::fold_environment(
+        &logged,
+        scarab_engine::Clock::now(&clock).await.0,
+        600_000,
+    );
+    assert_eq!(
+        folded.deployments.len(),
+        1,
+        "the request joined the report's Deployment"
+    );
+    let d = &folded.deployments[0];
+    assert!(!d.unexplained, "the retried Step's request explains it");
+    assert_eq!(d.requesters.len(), 1);
+    assert!(!d.requesters[0].claim, "made live by this Run, not a claim");
+}
+
+/// A Rerun of the deploy Step opens a new Take: its request is effective at
+/// the new Take's FIRST Attempt (`a2`, which then fails and is auto-retried
+/// as `a3`) — never at the old Take's `a1`, and not at the succeeding `a3`.
+#[tokio::test]
+async fn a_rerun_is_effective_at_its_own_takes_first_attempt() {
+    let db = InMemoryDb::new();
+    seed(&db).await;
+    let clock = FakeClock::new(1_000);
+    let exec = FakeExecutor::new();
+    exec.set_results("bump", complete_results());
+    clock.advance(2_000);
+    let a1 = tick_until_attempts(&db, &clock, &exec, 1).await[0].clone();
+    exec.script_outcome(ExecState::Succeeded);
+    for _ in 0..3 {
+        tick(&db, &clock, &exec).await;
+    }
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Succeeded)
+    );
+
+    clock.advance(5_000);
+    scarab_engine::rerun_step(&db, &clock, &run_id(), &step_id(), None)
+        .await
+        .unwrap();
+    clock.advance(1_000);
+    let a2 = tick_until_attempts(&db, &clock, &exec, 2).await[1].clone();
+    exec.script_outcome(step_failure());
+    let attempts = tick_until_attempts(&db, &clock, &exec, 3).await;
+    let a3 = attempts[2].clone();
+    exec.script_outcome(ExecState::Succeeded);
+    for _ in 0..3 {
+        tick(&db, &clock, &exec).await;
+    }
+    let step = db.steps_of_run(&run_id()).await.unwrap().remove(0);
+    assert_eq!(step.status, StepStatus::Succeeded);
+
+    let logged = db.inputs("acme", "prod").await.unwrap();
+    let effective: Vec<i64> = logged
+        .iter()
+        .filter_map(|l| match &l.input {
+            DeploymentInput::Request { effective_at, .. } => Some(*effective_at),
+            DeploymentInput::Report { .. } => None,
+        })
+        .collect();
+    assert_eq!(
+        effective,
+        vec![a1.started_at.0, a2.started_at.0],
+        "Take 1 at a1; Take 2 at its own first Attempt a2"
+    );
+    assert!(a1.started_at.0 < a2.started_at.0 && a2.started_at.0 < a3.started_at.0);
+}
+
+/// git-bug 0cb5895: exit 0, nothing delivered, and the backend reports the
+/// delivery FAILED (on k8s: the results sidecar exited non-zero). Still
+/// `DeploymentRequestIncomplete`, still one attempt under `retry: { max: 3 }`,
+/// but the reason blames the delivery and asks for a retry — not the author's
+/// `/scarab/results/<name>.json`.
+#[tokio::test]
+async fn a_failed_results_delivery_fails_incomplete_with_an_honest_reason() {
+    let db = InMemoryDb::new();
+    seed(&db).await;
+    let clock = FakeClock::new(1_000);
+    let exec = FakeExecutor::new();
+    exec.set_results_delivery_failure(
+        "bump",
+        "the results sidecar `scarab-results-egress` exited 1",
+    );
+    for _ in 0..4 {
+        exec.script_outcome(ExecState::Succeeded);
+    }
+    for _ in 0..8 {
+        tick(&db, &clock, &exec).await;
+        clock.advance(1_000);
+    }
+
+    let attempts = db.attempts_of_step(&run_id(), &step_id()).await.unwrap();
+    assert_eq!(attempts.len(), 1, "never auto-retried, even with `retry:`");
+    assert_eq!(
+        attempts[0].failure,
+        Some(FailureKind::DeploymentRequestIncomplete)
+    );
+    let detail = attempts[0].failure_detail.as_deref().unwrap_or_default();
+    assert_eq!(
+        detail,
+        "DeploymentRequest incomplete: the results sidecar `scarab-results-egress` exited 1, \
+         so this step's results were not delivered; the step's own output may be fine — \
+         retry the step"
+    );
+    assert!(!detail.contains("/scarab/results"), "{detail}");
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Failed)
+    );
+    assert!(db.inputs("acme", "prod").await.unwrap().is_empty());
+}
+
+/// The Take identity the effective time uses, read off the journal by
+/// POSITION: the first `AttemptStarted` of the step after the latest
+/// `RunRerunRequested` that re-armed it. A `StepRetryRequested` (operator
+/// Retry) and a Rerun of an unrelated step are no boundary.
+#[test]
+fn the_first_attempt_is_counted_from_the_steps_latest_rerun() {
+    use scarab_engine::{
+        deployment_request_first_attempt, AttemptId, EventKind, EventPayload, EVENT_VERSION,
+    };
+    let (bump, lint) = (step_id(), StepId("lint".into()));
+    let ev = |kind: EventPayload| EventKind {
+        version: EVENT_VERSION,
+        run: run_id(),
+        kind,
+        at: Timestamp(1_000),
+    };
+    let started = |step: &StepId, a: &str| {
+        ev(EventPayload::AttemptStarted {
+            step: step.clone(),
+            attempt: AttemptId(a.into()),
+        })
+    };
+    let rerun = |target: &StepId, invalidated: &[&StepId]| {
+        ev(EventPayload::RunRerunRequested {
+            target: target.clone(),
+            invalidated: invalidated.iter().map(|s| (*s).clone()).collect(),
+            by: None,
+            widened: Vec::new(),
+        })
+    };
+    let first = |log: &[EventKind]| deployment_request_first_attempt(log, &bump).map(|a| a.0);
+
+    assert_eq!(first(&[]), None, "no Attempt in the journal");
+    let mut log = vec![
+        started(&lint, "a1"),
+        started(&bump, "a1"),
+        started(&bump, "a2"),
+    ];
+    assert_eq!(
+        first(&log).as_deref(),
+        Some("a1"),
+        "an automatic retry shares a1"
+    );
+    log.push(ev(EventPayload::StepRetryRequested {
+        target: bump.clone(),
+        invalidated: vec![bump.clone()],
+        by: None,
+        widened: Vec::new(),
+    }));
+    log.push(started(&bump, "a3"));
+    assert_eq!(
+        first(&log).as_deref(),
+        Some("a1"),
+        "an operator Retry stays in the Take"
+    );
+    log.push(rerun(&lint, &[&lint]));
+    assert_eq!(
+        first(&log).as_deref(),
+        Some("a1"),
+        "a Rerun of another step is no boundary"
+    );
+    log.push(rerun(&bump, &[&bump]));
+    assert_eq!(first(&log), None, "re-armed by a Rerun, not started yet");
+    log.push(started(&bump, "a4"));
+    log.push(started(&bump, "a5"));
+    assert_eq!(
+        first(&log).as_deref(),
+        Some("a4"),
+        "the new Take's first Attempt"
+    );
 }

@@ -36,6 +36,13 @@ struct RecordingExec {
 }
 #[async_trait]
 impl Executor for RecordingExec {
+    async fn results_delivery_failure(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<String>, ExecError> {
+        Ok(None)
+    }
+
     async fn infra_condition(
         &self,
         _handle: &ExecHandle,

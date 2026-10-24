@@ -477,7 +477,7 @@ impl ServerDeploymentGates {
 /// The deadline here runs from the gate Attempt's start (`wait_started`),
 /// the one window start known without the record. It is the window start of
 /// a wait that waits afresh (max(request effective_at, Attempt start), and the
-/// effective_at — the deploy Step Attempt's start — precedes that Step's
+/// effective_at — the deploy Step's first Attempt start in its Take — precedes that Step's
 /// success, which is at or before the gate Attempt's start). A first wait's
 /// window opens earlier, at the effective_at itself, so measured from the
 /// Attempt's start this stall comes no sooner than the record's would: an

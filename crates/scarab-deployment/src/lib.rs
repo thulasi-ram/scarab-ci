@@ -27,11 +27,12 @@
 //!   resolves, but it never explains the Deployment. Being explained is
 //!   decided as inputs arrive and is sticky: a step that requests again with a
 //!   later effective time never un-explains it, and a requester that once
-//!   explained it is never demoted to a claim. Two known edges: a retried
-//!   Attempt whose new start is after the source's report reads as a claim
-//!   (its first Attempt made the change), and a long step spanning a
-//!   hand-applied change of the same version explains it — the record cannot
-//!   tell those apart.
+//!   explained it is never demoted to a claim. The engine stamps a request
+//!   with the start of its step's **first** Attempt in the current Take, so
+//!   a retried step whose first Attempt made the change before dying still
+//!   explains the Deployment (git-bug `2b5d9d9`). The known edge: a long
+//!   step — retries included — spanning a hand-applied change of the same
+//!   version explains it; the record cannot tell those apart.
 //! - **Effective time.** A request carries the time its Step *started* (when
 //!   the change was made) besides the time it was recorded (when the Step
 //!   succeeded). A request whose key's newest Deployment is final still
@@ -53,8 +54,9 @@
 //!   clock — started at creation and **restarted by every request that
 //!   joins it**; a later `live` or `failed` report still recovers it.
 //! - **DeploymentGate.** A gate on a request looks **forward from the
-//!   request's effective time** — the deploy Step's start, so a report
-//!   received while that Step still ran counts: it passes if the Deployment
+//!   request's effective time** — the deploy Step's start (its first
+//!   Attempt in the current Take), so a report received while that Step
+//!   still ran, an earlier failed Attempt of it included, counts: it passes if the Deployment
 //!   was live at that time or is reported live after it; it fails on a
 //!   `failed` report after it, on supersession, or once the deadline has
 //!   elapsed since it. Whatever happens first decides, and the verdict never

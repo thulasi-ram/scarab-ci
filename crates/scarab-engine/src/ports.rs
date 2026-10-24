@@ -1199,6 +1199,28 @@ pub trait Executor: Send + Sync {
         Ok(std::collections::BTreeMap::new())
     }
 
+    /// How the backend **failed to deliver** a finished execution's results,
+    /// or `Ok(None)` when it did not fail (delivered, nothing to deliver, or a
+    /// backend that hands results over in-process through
+    /// [`results`](Self::results)). A short clause naming the failure, e.g.
+    /// "the results sidecar `scarab-results-egress` exited 1 (Error)".
+    ///
+    /// Read only when an exit-0 Step's DeploymentRequest cannot be completed
+    /// from its results (git-bug `0cb5895`): the Step still fails
+    /// DeploymentRequest incomplete and is never auto-retried, but the reason
+    /// then says the results were lost in delivery — the author's step may
+    /// be fine — instead of telling them to write `/scarab/results/<name>.json`.
+    /// Best-effort: an `Err` is dropped and the author-facing reason stands.
+    ///
+    /// **Deliberately REQUIRED — no default**, for the reason spelled out on
+    /// [`workspace_provisioning`](Self::workspace_provisioning): a defaulted
+    /// evidence method answers the default through a decorator instead of the
+    /// executor it wraps, and nothing fails. Every impl must visibly decide.
+    async fn results_delivery_failure(
+        &self,
+        handle: &ExecHandle,
+    ) -> Result<Option<String>, ExecError>;
+
     /// The **artifacts** a finished execution published to `/scarab/artifacts/`
     /// (ADR-0052): collected post-step by the backend, blobs already in the
     /// object store; the orchestrator persists the metadata. Default empty.

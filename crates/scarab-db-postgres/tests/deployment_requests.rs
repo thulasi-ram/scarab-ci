@@ -9,9 +9,11 @@
 //! racing a plugin's report ingest on the same Org's counter neither
 //! deadlocks nor leaves a seq gap (the lock order of migration 0055: the
 //! counter last, on both sides). The scheduler-driven case pins what the
-//! request carries: one input per request, effective at the succeeding
-//! Attempt's start, received at the engine clock, version and evidence from
-//! the Step's own results. Also: where a DeploymentTarget is homed for Run
+//! request carries: one input per request, effective at the start of the
+//! Step's FIRST Attempt in its current Take (git-bug 2b5d9d9: a retried
+//! Step's request explains the report its first Attempt caused; a Rerun's
+//! is effective at its own Take's first Attempt), received at the engine
+//! clock, version and evidence from the Step's own results. Also: where a DeploymentTarget is homed for Run
 //! creation's refusal (current routing first, else its newest input). Every
 //! test gets its own database. Skips cleanly when `SCARAB_TEST_DATABASE_URL`
 //! is unset.
@@ -165,8 +167,8 @@ fn wall_ms() -> i64 {
 }
 
 /// Criterion 1, end to end through the scheduler: a Step that exits 0 with
-/// its results records exactly ONE request input — effective at the
-/// succeeding Attempt's start (not at its success), received at the engine
+/// its results records exactly ONE request input — effective at its (first
+/// and only) Attempt's start (not at its success), received at the engine
 /// clock's reading at success, version and evidence from its own results —
 /// and the step is `Succeeded` with one `StepTransitioned`.
 #[tokio::test]
@@ -629,5 +631,186 @@ async fn a_non_latest_attempt_cannot_finish_the_step() {
         .unwrap();
     assert_eq!(step_status(&db, "bump").await, StepStatus::Succeeded);
     assert_eq!(db.inputs(ORG, ENV).await.unwrap().len(), 1);
+    tdb.cleanup().await;
+}
+
+/// A one-step Deploy Run whose `bump` requests `argocd`/`web`, opted into
+/// `retry: { max: 3 }`.
+async fn seed_retrying_deploy(db: &PostgresDb) {
+    let step = StepId("bump".into());
+    db.create_run(&run_id(), 2, 1, Timestamp(1_000))
+        .await
+        .unwrap();
+    db.create_step_run(&run_id(), &step, Some(&spec()), &[], Timestamp(1_000))
+        .await
+        .unwrap();
+    db.store_run_ir(
+        &run_id(),
+        &serde_json::json!({ "ir_version": 2, "environment": ENV, "steps": [{
+            "id": "bump", "image": "img",
+            "retry": { "on": "failure", "max": 3 },
+            "results": ["version", "images"],
+        }] }),
+    )
+    .await
+    .unwrap();
+    db.set_run_deployment_requests(&run_id(), &[requested("bump", "web")])
+        .await
+        .unwrap();
+}
+
+fn complete_results() -> BTreeMap<String, serde_json::Value> {
+    BTreeMap::from([
+        ("version".to_string(), serde_json::json!("v42")),
+        ("images".to_string(), serde_json::json!("sha256:aaa")),
+    ])
+}
+
+fn step_failure() -> ExecState {
+    ExecState::Failed {
+        exit_code: Some(1),
+        class: scarab_engine::ports::FailureClass::Step,
+        cause: None,
+    }
+}
+
+/// Tick (advancing the clock 1 s each time) until `bump` has `n` attempts.
+async fn tick_until_attempts(
+    db: &PostgresDb,
+    clock: &FakeClock,
+    exec: &FakeExecutor,
+    n: usize,
+) -> Vec<Attempt> {
+    let step = StepId("bump".into());
+    for _ in 0..10 {
+        let attempts = db.attempts_of_step(&run_id(), &step).await.unwrap();
+        if attempts.len() >= n {
+            return attempts;
+        }
+        tick(db, clock, exec).await;
+        clock.advance(1_000);
+    }
+    panic!("`bump` never reached {n} attempts");
+}
+
+/// git-bug 2b5d9d9 against Postgres: `a1` starts at T1, the source reports
+/// the change at T2, `a1` dies, `a2` starts at T3 > T2 and succeeds. The
+/// request is effective at T1, so it EXPLAINS the report-created Deployment —
+/// under the old rule (the succeeding Attempt's start) it was a claim.
+#[tokio::test]
+async fn a_retried_deploy_step_is_effective_at_its_first_attempt_and_explains_the_report() {
+    let Some((tdb, db)) = migrated().await else {
+        return;
+    };
+    seed_retrying_deploy(&db).await;
+    let clock = FakeClock::new(1_000);
+    let exec = FakeExecutor::new();
+    exec.set_results("bump", complete_results());
+    clock.advance(2_000);
+    let a1 = tick_until_attempts(&db, &clock, &exec, 1).await[0].clone();
+
+    clock.advance(1_000);
+    let t2 = scarab_engine::Clock::now(&clock).await.0;
+    let report = DeploymentInput::Report {
+        target: DeploymentTarget {
+            environment: ENV.into(),
+            source: "argocd".into(),
+            id: "web".into(),
+        },
+        version: DeploymentVersion("v42".into()),
+        report: scarab_deployment::DeploymentStatusReport {
+            status: scarab_deployment::SourceAssertedStatus::InProgress,
+            label: "Progressing · OutOfSync".into(),
+            link: None,
+            at: t2,
+        },
+    };
+    db.append(ORG, &report, t2).await.unwrap();
+
+    clock.advance(1_000);
+    exec.script_outcome(step_failure());
+    let attempts = tick_until_attempts(&db, &clock, &exec, 2).await;
+    assert_eq!(attempts[0].outcome, AttemptOutcome::Failed, "a1 failed");
+    let a2 = attempts[1].clone();
+    assert!(a2.started_at.0 > t2, "a2 starts after the report");
+
+    exec.script_outcome(ExecState::Succeeded);
+    for _ in 0..3 {
+        tick(&db, &clock, &exec).await;
+    }
+    assert_eq!(step_status(&db, "bump").await, StepStatus::Succeeded);
+
+    let logged = db.inputs(ORG, ENV).await.unwrap();
+    assert_eq!(logged.len(), 2, "the report, then the request: {logged:?}");
+    let DeploymentInput::Request { effective_at, .. } = &logged[1].input else {
+        panic!("expected the request second, got {:?}", logged[1]);
+    };
+    assert_eq!(
+        *effective_at, a1.started_at.0,
+        "effective at the FIRST Attempt's start, not a2's"
+    );
+    let folded = scarab_deployment::fold_environment(
+        &logged,
+        scarab_engine::Clock::now(&clock).await.0,
+        600_000,
+    );
+    assert_eq!(folded.deployments.len(), 1);
+    let d = &folded.deployments[0];
+    assert!(!d.unexplained, "the retried Step's request explains it");
+    assert_eq!(d.requesters.len(), 1);
+    assert!(!d.requesters[0].claim, "made live by this Run, not a claim");
+    tdb.cleanup().await;
+}
+
+/// A Rerun opens a new Take: its request is effective at that Take's FIRST
+/// Attempt (`a2`, then auto-retried as `a3`), not at `a1` nor at `a3`.
+#[tokio::test]
+async fn a_rerun_is_effective_at_its_own_takes_first_attempt() {
+    let Some((tdb, db)) = migrated().await else {
+        return;
+    };
+    seed_retrying_deploy(&db).await;
+    let step = StepId("bump".into());
+    let clock = FakeClock::new(1_000);
+    let exec = FakeExecutor::new();
+    exec.set_results("bump", complete_results());
+    clock.advance(2_000);
+    let a1 = tick_until_attempts(&db, &clock, &exec, 1).await[0].clone();
+    exec.script_outcome(ExecState::Succeeded);
+    for _ in 0..3 {
+        tick(&db, &clock, &exec).await;
+    }
+    assert_eq!(step_status(&db, "bump").await, StepStatus::Succeeded);
+
+    clock.advance(5_000);
+    scarab_engine::rerun_step(&db, &clock, &run_id(), &step, None)
+        .await
+        .unwrap();
+    clock.advance(1_000);
+    let a2 = tick_until_attempts(&db, &clock, &exec, 2).await[1].clone();
+    exec.script_outcome(step_failure());
+    let a3 = tick_until_attempts(&db, &clock, &exec, 3).await[2].clone();
+    exec.script_outcome(ExecState::Succeeded);
+    for _ in 0..3 {
+        tick(&db, &clock, &exec).await;
+    }
+    assert_eq!(step_status(&db, "bump").await, StepStatus::Succeeded);
+
+    let effective: Vec<i64> = db
+        .inputs(ORG, ENV)
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|l| match &l.input {
+            DeploymentInput::Request { effective_at, .. } => Some(*effective_at),
+            DeploymentInput::Report { .. } => None,
+        })
+        .collect();
+    assert_eq!(
+        effective,
+        vec![a1.started_at.0, a2.started_at.0],
+        "Take 1 at a1; Take 2 at its own first Attempt a2"
+    );
+    assert!(a1.started_at.0 < a2.started_at.0 && a2.started_at.0 < a3.started_at.0);
     tdb.cleanup().await;
 }
