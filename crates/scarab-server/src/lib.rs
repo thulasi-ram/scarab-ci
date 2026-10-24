@@ -4168,14 +4168,12 @@ fn origin_pr_base(event: &scarab_forge::Event) -> Option<String> {
 /// (empty when there is no config, or no pipeline's trigger matches).
 ///
 /// Pipelines are evaluated independently and in a deterministic (path-sorted)
-/// order. A pipeline that admission **refuses** (a disallowed ref, an unknown
-/// Environment, an ineligible Project — ADR-0037, ADR-0071) is skipped on its
-/// own and never aborts the delivery: the other pipelines still run. So is a
-/// pipeline that cannot run at all — not UTF-8, does not compile, a trigger or
-/// `when:` it cannot evaluate, a launch it cannot bind: it is reported in
-/// [`TriggerOutcome::refused`], not silently dropped, and one broken file no
-/// longer stops every other pipeline of the repo (git-bug 66171a0). Only a
-/// forge or Db failure — not the pipeline's — fails the delivery.
+/// order; a file that fails to compile fails the whole trigger (a broken
+/// pipeline is a submit-time error, ADR-0009), so a repo's CI is all-or-nothing
+/// per delivery rather than silently partial. A pipeline that admission
+/// **refuses** (a disallowed ref, an unknown Environment, an ineligible
+/// Project — ADR-0037, ADR-0071) is skipped on its own and never aborts the
+/// delivery: the other pipelines still run.
 ///
 /// `governance` is the org-level Environment governance store (ADR-0071);
 /// `None` only in a hand-built state, where a deploy is admitted as an
@@ -4195,21 +4193,18 @@ pub async fn trigger_run_from_event(
         .runs)
 }
 
-/// A pipeline a delivery did not run: a deploy whose Environment does not
-/// exist in the Org or does not admit the Project (ADR-0071 §2, §10), or any
-/// pipeline that could not run at all — it does not compile, or its launch
-/// cannot bind (git-bug 66171a0). Reported in the webhook delivery body: for
-/// a pipeline whose name the ADR-0071 migration could never see (it had
-/// never run), this is the only place the refusal surfaces besides the
-/// server log.
+/// A deploy pipeline a delivery did not run because its Environment does not
+/// exist in the Org or does not admit the Project (ADR-0071 §2, §10), or its
+/// launch cannot bind a DeploymentTarget (git-bug 66171a0). Reported
+/// in the webhook delivery body: for a pipeline whose name the ADR-0071
+/// migration could never see (it had never run), this is the only place the
+/// refusal surfaces besides the server log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RefusedPipeline {
     /// The pipeline file, e.g. `.scarab/deploy.yaml`.
     pub pipeline: String,
-    /// The Environment it named — absent when it named none, or never
-    /// compiled far enough to say.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub environment: Option<String>,
+    /// The Environment it named.
+    pub environment: String,
     /// What is missing and who can fix it.
     pub reason: String,
 }
@@ -4224,7 +4219,8 @@ pub struct TriggerOutcome {
 }
 
 /// [`trigger_run_from_event`], also reporting every deploy pipeline refused
-/// as `UnknownEnvironment` / `NotEligible` / `DeploymentTargetElsewhere`.
+/// as `UnknownEnvironment` / `NotEligible` / `DeploymentTargetElsewhere` /
+/// `DeploymentRequestUnresolved`.
 pub async fn trigger_runs_from_event(
     forge: &dyn scarab_forge::ForgePort,
     db: &dyn Db,
@@ -4261,33 +4257,15 @@ pub async fn trigger_runs_from_event(
             Err(scarab_forge::ForgeError::Api(_)) => continue,
             Err(e) => return Err(TriggerError::Forge(e)),
         };
-        // A pipeline's own defect is its refusal, not the delivery's: see
-        // `pipeline_cannot_run`.
-        let Ok(yaml) = String::from_utf8(bytes) else {
-            pipeline_cannot_run(&mut outcome, event, path, None, TriggerError::NotUtf8)?;
-            continue;
-        };
+        let yaml = String::from_utf8(bytes).map_err(|_| TriggerError::NotUtf8)?;
 
         // Pre-fetch transitive `invoke:` libraries at this ref and compile
         // (ADR-0038) — the shared read-at-ref → compile primitive also used by
         // the manual/api dispatch path.
-        let ir = match prefetch_libs_and_compile(forge, repo, &git_ref, &yaml).await {
-            Ok(ir) => ir,
-            Err(e) => {
-                pipeline_cannot_run(&mut outcome, event, path, None, e)?;
-                continue;
-            }
-        };
-        let environment = ir.environment.as_deref();
+        let ir = prefetch_libs_and_compile(forge, repo, &git_ref, &yaml).await?;
 
-        let matched = match scarab_pipeline::matches_trigger(&ir, kind.as_str(), &ctx) {
-            Ok(matched) => matched,
-            Err(e) => {
-                let e = TriggerError::Pipeline(e.to_string());
-                pipeline_cannot_run(&mut outcome, event, path, environment, e)?;
-                continue;
-            }
-        };
+        let matched = scarab_pipeline::matches_trigger(&ir, kind.as_str(), &ctx)
+            .map_err(|e| TriggerError::Pipeline(e.to_string()))?;
         if !matched {
             continue;
         }
@@ -4296,14 +4274,8 @@ pub async fn trigger_runs_from_event(
         // guarded-off steps are kept in the DAG but marked Skipped, so the engine
         // transitively skips their descendants. A pipeline whose every step is
         // excluded starts no run.
-        let excluded = match scarab_pipeline::excluded_steps(&ir, &ctx) {
-            Ok(excluded) => excluded,
-            Err(e) => {
-                let e = TriggerError::Pipeline(e.to_string());
-                pipeline_cannot_run(&mut outcome, event, path, environment, e)?;
-                continue;
-            }
-        };
+        let excluded = scarab_pipeline::excluded_steps(&ir, &ctx)
+            .map_err(|e| TriggerError::Pipeline(e.to_string()))?;
         if excluded.len() == ir.steps.len() {
             continue;
         }
@@ -4314,17 +4286,8 @@ pub async fn trigger_runs_from_event(
         // skips this pipeline only (the dispatch path turns the same refusal
         // into a fail-closed error). Webhook-triggered runs supply no launch
         // parameters.
-        let admission =
-            match admit_and_create_run(db, clock, governance, event, &ir, path, &excluded, None)
-                .await
-            {
-                Ok(admission) => admission,
-                Err(e) => {
-                    pipeline_cannot_run(&mut outcome, event, path, environment, e)?;
-                    continue;
-                }
-            };
-        match admission {
+        match admit_and_create_run(db, clock, governance, event, &ir, path, &excluded, None).await?
+        {
             Admission::Created(run) => outcome.runs.push(run),
             // A branch-scoped Environment ignoring every other branch is the
             // rule working, not news: silent, as it always was.
@@ -4334,10 +4297,15 @@ pub async fn trigger_runs_from_event(
             // Logged AND returned: the delivery body is where a forge's
             // "recent deliveries" view shows it, and for a name the migration
             // could not see (never run before ADR-0071) it is the first sign.
+            // A deploy target its launch cannot bind (git-bug 66171a0) is the
+            // same: that pipeline alone is skipped, the repo's CI still runs.
             Admission::Refused(
                 ref refusal @ (AdmissionRefusal::UnknownEnvironment { ref environment }
                 | AdmissionRefusal::NotEligible { ref environment }
                 | AdmissionRefusal::DeploymentTargetElsewhere {
+                    ref environment, ..
+                }
+                | AdmissionRefusal::DeploymentRequestUnresolved {
                     ref environment, ..
                 }),
             ) => {
@@ -4351,44 +4319,13 @@ pub async fn trigger_runs_from_event(
                 );
                 outcome.refused.push(RefusedPipeline {
                     pipeline: path.clone(),
-                    environment: Some(environment.clone()),
+                    environment: environment.clone(),
                     reason,
                 });
             }
         }
     }
     Ok(outcome)
-}
-
-/// One pipeline of a delivery failed with `e`. A forge or Db failure is not
-/// the pipeline's — it fails the delivery, so the forge can redeliver. Any
-/// other failure is the pipeline's own defect (it does not compile, a
-/// trigger or `when:` it cannot evaluate, a launch it cannot bind): logged
-/// and reported as that pipeline's refusal, and the delivery goes on to the
-/// rest (git-bug 66171a0).
-fn pipeline_cannot_run(
-    outcome: &mut TriggerOutcome,
-    event: &scarab_forge::Event,
-    path: &str,
-    environment: Option<&str>,
-    e: TriggerError,
-) -> Result<(), TriggerError> {
-    if matches!(e, TriggerError::Forge(_) | TriggerError::Db(_)) {
-        return Err(e);
-    }
-    let reason = e.to_string();
-    tracing::warn!(
-        repo = ?event.repo(),
-        pipeline = %path,
-        trigger = event.trigger_kind().as_str(),
-        "pipeline not run: {reason}"
-    );
-    outcome.refused.push(RefusedPipeline {
-        pipeline: path.to_string(),
-        environment: environment.map(str::to_string),
-        reason,
-    });
-    Ok(())
 }
 
 /// Pre-fetch a pipeline's transitive `invoke:` library sources at `read_ref`
@@ -4461,6 +4398,12 @@ enum AdmissionRefusal {
         target_id: String,
         home: String,
     },
+    /// A Step's DeploymentTarget does not resolve for this launch — it reads
+    /// an input the launch does not supply (a webhook Run supplies none, so a
+    /// required, default-less input never binds), resolves empty, or two
+    /// requests resolve to one target (git-bug 66171a0). Decided before
+    /// anything is persisted; `reason` names the step and the input.
+    DeploymentRequestUnresolved { environment: String, reason: String },
 }
 
 /// The outcome of admitting one compiled pipeline (ADR-0037, ADR-0071 §2):
@@ -4701,7 +4644,10 @@ async fn admit_and_create_run(
     // DeploymentTargets against the launch parameters, and refuse a Run that
     // requests a target homed in another Environment — before anything is
     // persisted, like every other refusal here.
-    let requests = resolve_deployment_requests(ir, repo, params)?;
+    let requests = match resolve_deployment_requests(ir, repo, params) {
+        Ok(requests) => requests,
+        Err(refusal) => return Ok(Admission::Refused(refusal)),
+    };
     if let (Some(store), RunGovernance::Governed { environment, .. }) = (governance, &gov) {
         if let Some(refusal) =
             deployment_target_elsewhere(store, &repo.owner, environment, &requests).await?
@@ -4731,13 +4677,14 @@ async fn admit_and_create_run(
 /// (`params`; for a webhook Run, which supplies none, the interface's
 /// defaults), and each carrying the DeploymentGates that wait on it
 /// (`gate_steps`, criterion 2). Fails closed: a target that does not resolve to a non-empty
-/// value is a pipeline error and no Run is created — the same rule the
-/// concurrency group follows.
+/// value is [`AdmissionRefusal::DeploymentRequestUnresolved`] and no Run is
+/// created — the webhook path skips that pipeline alone (git-bug 66171a0), a
+/// dispatch reports it as a pipeline error.
 fn resolve_deployment_requests(
     ir: &scarab_pipeline::PipelineIr,
     repo: &scarab_forge::RepoRef,
     params: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
-) -> Result<Vec<scarab_engine::RunDeploymentRequest>, TriggerError> {
+) -> Result<Vec<scarab_engine::RunDeploymentRequest>, AdmissionRefusal> {
     let Some(environment) = &ir.environment else {
         // Validation refuses `deployment_requests` without an `environment:`.
         return Ok(Vec::new());
@@ -4754,16 +4701,20 @@ fn resolve_deployment_requests(
             &defaults
         }
     };
+    let unresolved = |reason: String| AdmissionRefusal::DeploymentRequestUnresolved {
+        environment: environment.clone(),
+        reason,
+    };
     let mut out = Vec::new();
     for step in &ir.steps {
         for (ordinal, req) in step.deployment_requests.iter().enumerate() {
-            let bind = |part: &str, text: &str| -> Result<String, TriggerError> {
+            let bind = |part: &str, text: &str| -> Result<String, AdmissionRefusal> {
                 let value = match scarab_pipeline::deployment_target_input(text) {
                     Some(name) => inputs
                         .get(name)
                         .map(scarab_pipeline::params::stringify)
                         .ok_or_else(|| {
-                            TriggerError::Pipeline(format!(
+                            unresolved(format!(
                                 "step `{}`: deployment request target `{part}` reads \
                                  `inputs.{name}`, which this launch does not supply",
                                 step.id
@@ -4772,7 +4723,7 @@ fn resolve_deployment_requests(
                     None => text.to_string(),
                 };
                 if value.trim().is_empty() {
-                    return Err(TriggerError::Pipeline(format!(
+                    return Err(unresolved(format!(
                         "step `{}`: deployment request target `{part}` resolved empty",
                         step.id
                     )));
@@ -4807,7 +4758,7 @@ fn resolve_deployment_requests(
             r.target_source.as_str(),
             r.target_id.as_str(),
         )) {
-            return Err(TriggerError::Pipeline(format!(
+            return Err(unresolved(format!(
                 "step `{}`: two deployment requests resolve to `{}`/`{}`",
                 r.step.0, r.target_source, r.target_id
             )));
@@ -5008,6 +4959,7 @@ fn admission_refusal_message(refusal: &AdmissionRefusal, org: &str, project: &st
             target_id,
             home,
         } => deployment_target_elsewhere_message(environment, step, target_source, target_id, home),
+        AdmissionRefusal::DeploymentRequestUnresolved { reason, .. } => reason.clone(),
     }
 }
 
@@ -5250,6 +5202,11 @@ pub async fn dispatch_run(
             target_id,
             home,
         },
+        // A dispatch names its inputs: one that leaves a target unbound is
+        // the pipeline error it always was.
+        AdmissionRefusal::DeploymentRequestUnresolved { reason, .. } => {
+            DispatchError::Pipeline(reason)
+        }
     })
 }
 
