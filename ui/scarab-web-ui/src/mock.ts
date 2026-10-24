@@ -483,6 +483,8 @@ const deployRunStatus: RunStatusDto = {
         target_id: "edge-gateway",
         deployment_id: 16,
         deployment_status: "in_progress",
+        // The gate's own clock: `bump`'s start + the Project's 15 min gate deadline.
+        fails_at: ago(5 * min) + 15 * min,
         version: "sha-a1b2c3d",
         latest_label: "sync wave 3: rollout",
       },

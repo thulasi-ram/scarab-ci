@@ -80,7 +80,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use scarab_deployment::{
-    fold_ledger, DeploymentGateFailure, DeploymentGateVerdict, DeploymentRequester,
+    fold_ledger, Deployment, DeploymentGateFailure, DeploymentGateVerdict, DeploymentRequester,
     DeploymentStore, DeploymentTarget, FoldedLedger, Millis, DEFAULT_DEPLOYMENT_DEADLINE_MS,
 };
 use scarab_engine::{
@@ -336,14 +336,17 @@ impl ServerDeploymentGates {
         self.concurrency_hold(run, &requests, now).await
     }
 
-    async fn decide(
+    /// The deadline `run`'s DeploymentGates on `request` use: its Project's
+    /// effective `deployment_gate_deadline` in the request's Environment, or
+    /// the default for a Run with no deploy context. The one value the
+    /// verdict ([`DeploymentGates::deployment_gate_verdict`]) and the run
+    /// view's `fails_at` are both computed from (git-bug `ec84c5d`).
+    pub async fn run_gate_deadline(
         &self,
         run: &RunId,
         request: &RunDeploymentRequest,
-        wait: DeploymentGateWait,
-        now: Timestamp,
-    ) -> Result<Option<DeploymentGateDecision>, String> {
-        let deadline = match self
+    ) -> Result<Millis, String> {
+        match self
             .db
             .run_deploy_context(run)
             .await
@@ -351,7 +354,7 @@ impl ServerDeploymentGates {
         {
             Some(ctx) => {
                 self.gate_deadline(&request.org, &ctx.project, &request.environment)
-                    .await?
+                    .await
             }
             None => {
                 // A Run with a DeploymentRequest is a Deploy Run, which has a
@@ -360,9 +363,19 @@ impl ServerDeploymentGates {
                     run = %run.0,
                     "deployment gate on a run with no deploy context; using the default deadline"
                 );
-                DEFAULT_DEPLOYMENT_DEADLINE_MS
+                Ok(DEFAULT_DEPLOYMENT_DEADLINE_MS)
             }
-        };
+        }
+    }
+
+    async fn decide(
+        &self,
+        run: &RunId,
+        request: &RunDeploymentRequest,
+        wait: DeploymentGateWait,
+        now: Timestamp,
+    ) -> Result<Option<DeploymentGateDecision>, String> {
+        let deadline = self.run_gate_deadline(run, request).await?;
         let tick_now = now;
         let (mut cached, mut from_cache) = match self
             .fold(&request.org, &request.environment, tick_now.0)
@@ -429,11 +442,7 @@ impl ServerDeploymentGates {
         // the request's effective time (a retried deploy Step) — a wait that
         // waits afresh at its own Attempt's start. `request_of` found the
         // requester here, so its mark is present.
-        let effective_at = deployment
-            .requesters
-            .get(&requester)
-            .map_or(Timestamp(0), |m| Timestamp(m.effective_at));
-        let floor = wait.window_floor(effective_at);
+        let floor = GateWindow::of(deployment, &requester, &wait).and_then(|w| w.floor);
         let decision = match floor {
             Some(floor) => deployment.gate_decision_from(&requester, floor.0, now, deadline),
             None => deployment.gate_decision(&requester, now, deadline),
@@ -499,6 +508,44 @@ impl ServerDeploymentGates {
             reason,
             deployment: Some(cached.folded.public_id(deployment)),
         }))
+    }
+}
+
+/// Where a DeploymentGate's wait on a Deployment opens (ADR-0070 §8) — the
+/// one computation the verdict and the run view's `fails_at` share
+/// (git-bug `ec84c5d`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GateWindow {
+    /// The window floor, when the wait has one
+    /// ([`DeploymentGateWait::window_floor`]).
+    pub floor: Option<Timestamp>,
+    /// The instant the window opens: the later of the request's effective
+    /// time and the floor. The stall deadline runs from it.
+    pub opens_at: Millis,
+}
+
+impl GateWindow {
+    /// The window of `wait` on `deployment`'s request from `requester`;
+    /// `None` when that requester's request did not land on `deployment`.
+    pub fn of(
+        deployment: &Deployment,
+        requester: &DeploymentRequester,
+        wait: &DeploymentGateWait,
+    ) -> Option<Self> {
+        let effective_at = deployment.requesters.get(requester)?.effective_at;
+        let floor = wait.window_floor(Timestamp(effective_at));
+        Some(Self {
+            floor,
+            opens_at: floor.map_or(effective_at, |f| f.0.max(effective_at)),
+        })
+    }
+
+    /// When the gate fails `stalled` if nothing decisive arrives first: the
+    /// window's opening plus the gate's `deadline`
+    /// ([`ServerDeploymentGates::run_gate_deadline`]) — the instant
+    /// [`Deployment::gate_decision_from`] stalls at.
+    pub fn fails_at(&self, deadline: Millis) -> Millis {
+        self.opens_at.saturating_add(deadline)
     }
 }
 

@@ -1243,6 +1243,46 @@ pub fn deployment_gate_waits_afresh(
     })
 }
 
+/// The [`DeploymentGateWait`] of DeploymentGate `gate`'s open Attempt
+/// `attempt`, on the request deploy Step `requester` recorded — the ONE
+/// computation both the scheduler asks the oracle with and the run view shows
+/// the gate's deadline from (git-bug `ec84c5d`):
+///
+/// - `started_at`: the gate Attempt's frozen start;
+/// - `afresh`: [`deployment_gate_waits_afresh`] over `events` (the run's
+///   journal) — only when `gate` has an Attempt other than `attempt`, since
+///   only an earlier Attempt can have resolved; a caller may pass `&[]` for a
+///   gate with one Attempt;
+/// - `deploy_attempt_started_at`: the start of `requester`'s latest
+///   `Succeeded` Attempt in `steps` — the Attempt that recorded the request,
+///   where a first wait opens (and its stall clock starts) — not the deploy
+///   Step's first Attempt, whose start is the request's effective time.
+pub fn deployment_gate_wait(
+    gate: &StepRun,
+    attempt: &Attempt,
+    requester: &StepId,
+    steps: &[StepRun],
+    events: &[EventKind],
+) -> DeploymentGateWait {
+    let afresh = gate.attempts.iter().any(|a| a.id != attempt.id)
+        && deployment_gate_waits_afresh(events, &gate.step, &attempt.id, requester);
+    let deploy_attempt_started_at = steps
+        .iter()
+        .find(|s| &s.step == requester)
+        .and_then(|s| {
+            s.attempts
+                .iter()
+                .rev()
+                .find(|a| a.outcome == AttemptOutcome::Succeeded)
+        })
+        .map(|a| a.started_at);
+    DeploymentGateWait {
+        started_at: attempt.started_at,
+        afresh,
+        deploy_attempt_started_at,
+    }
+}
+
 /// The Attempt whose start is a succeeding deploy Step's DeploymentRequest
 /// **effective time** (ADR-0070 §2, §7; git-bug `2b5d9d9`): the step's
 /// **first** Attempt in its current Take — the first `AttemptStarted` of
@@ -3901,31 +3941,12 @@ impl<'a> Scheduler<'a> {
         };
         // Only an earlier Attempt can have resolved: the first wait never
         // reads the journal.
-        let afresh = gate.attempts.iter().any(|a| a.id != attempt.id)
-            && deployment_gate_waits_afresh(
-                &self.db.events(run).await?,
-                &gate.step,
-                &attempt.id,
-                &request.step,
-            );
-        // The Attempt that succeeded and recorded the request: where the
-        // first wait opens (and its stall clock starts) — not the deploy
-        // Step's first Attempt, whose start is the request's effective time.
-        let deploy_attempt_started_at = steps
-            .iter()
-            .find(|s| s.step == request.step)
-            .and_then(|s| {
-                s.attempts
-                    .iter()
-                    .rev()
-                    .find(|a| a.outcome == AttemptOutcome::Succeeded)
-            })
-            .map(|a| a.started_at);
-        let wait = DeploymentGateWait {
-            started_at: attempt.started_at,
-            afresh,
-            deploy_attempt_started_at,
+        let events = if gate.attempts.iter().any(|a| a.id != attempt.id) {
+            self.db.events(run).await?
+        } else {
+            Vec::new()
         };
+        let wait = deployment_gate_wait(gate, attempt, &request.step, steps, &events);
         match oracle
             .deployment_gate_verdict(run, &gate.step, &request, wait, now)
             .await

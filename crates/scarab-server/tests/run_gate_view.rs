@@ -34,7 +34,7 @@ use scarab_deployment::{
 };
 use scarab_engine::ports::ExecState;
 use scarab_engine::{
-    AttemptOutcome, Clock, Db, DeployContext, RunDeploymentRequest, RunId, RunStatus, Scheduler,
+    retry_step, AttemptOutcome, Clock, Db, DeployContext, RunDeploymentRequest, RunId, RunStatus, Scheduler,
     StepId, StepRun, StepSpec, StepStatus,
 };
 use scarab_project::{
@@ -67,6 +67,7 @@ fn spec() -> StepSpec {
 struct World {
     db: Arc<dyn Db>,
     store: Arc<dyn DeploymentStore>,
+    governance: Arc<dyn EnvironmentGovernanceStore>,
     oracle: ServerDeploymentGates,
     clock: Arc<FakeClock>,
     exec: FakeExecutor,
@@ -153,11 +154,12 @@ impl World {
         let app = router(
             AppState::new(db.clone(), clock.clone(), logs)
                 .with_deployments(store.clone())
-                .with_environment_governance(governance),
+                .with_environment_governance(governance.clone()),
         );
         World {
             db,
             store,
+            governance,
             oracle,
             clock,
             exec,
@@ -241,6 +243,12 @@ impl World {
             .await
             .unwrap();
         assert!(isolated.is_empty(), "{isolated:?}");
+    }
+
+    async fn ticks(&self, n: usize) {
+        for _ in 0..n {
+            self.tick().await;
+        }
     }
 
     async fn step(&self, run: &str, step: &str) -> StepRun {
@@ -418,6 +426,85 @@ async fn a_resolved_deployment_gate_shows_its_verdict_and_reason(w: World) {
 }
 both!(
     a_resolved_deployment_gate_shows_its_verdict_and_reason,
+    None
+);
+
+/// git-bug `ec84c5d`: a waiting DeploymentGate's `fails_at` is the ENGINE's
+/// clock — its wait's window plus its Project's effective gate deadline —
+/// not the Deployment's status clock (the Environment's baseline over the
+/// Deployment's lifetime). The Project's overlay tightens the gate deadline
+/// to 2 min. A first wait fails at the deploy Step's start + 2 min; after it
+/// stalls and is Retried long after, the Deployment reads `stalled` while the
+/// Retry validly waits afresh, and `fails_at` is the Retry's start + 2 min —
+/// the very instant the engine fails it.
+async fn a_retried_gate_fails_at_its_own_deadline_not_the_deployments(w: World) {
+    const GATE_DEADLINE: i64 = 2 * 60_000;
+    w.governance
+        .put_environment_project_overlay(
+            &EnvironmentProjectOverlay {
+                org: ORG.into(),
+                environment: ENV.into(),
+                project: PROJECT.into(),
+                rules: EnvironmentProtectionRules::default(),
+                deployment_gate_deadline: Some(
+                    EnvironmentDeploymentDeadline::new(GATE_DEADLINE).unwrap(),
+                ),
+            },
+            "amy",
+            2,
+        )
+        .await
+        .unwrap();
+    w.seed("ra").await;
+    w.deploying("ra").await;
+    let deploy_started = w.step("ra", "bump").await.attempts[0].started_at.0;
+    w.gate_waiting("ra").await;
+
+    let live = w.step_dto("ra", "live").await;
+    assert_eq!(
+        live["deployment_gate"]["fails_at"],
+        deploy_started + GATE_DEADLINE,
+        "a first wait runs from the deploy Step's start: {live}"
+    );
+
+    // Silence well past every baseline (5 min on pg, 1 h in memory): the
+    // gate stalls on its own 2 min; the Deployment itself stalls too.
+    w.clock.advance(2 * 60 * 60_000);
+    w.ticks(3).await;
+    assert_eq!(w.step("ra", "live").await.status, StepStatus::Failed);
+
+    let retried_at = w.clock.now().await.0;
+    retry_step(&*w.db, &*w.clock, &rid("ra"), &id("live"), None)
+        .await
+        .unwrap();
+    w.ticks(3).await;
+    let gate = w.step("ra", "live").await;
+    assert_eq!(gate.status, StepStatus::Pending, "the Retry waits afresh");
+    assert_eq!(gate.attempts.last().unwrap().outcome, AttemptOutcome::Running);
+
+    let live = w.step_dto("ra", "live").await;
+    let waiting = &live["deployment_gate"];
+    assert_eq!(
+        waiting["deployment_status"], "stalled",
+        "the Deployment's own status is kept: {live}"
+    );
+    assert_eq!(
+        waiting["fails_at"],
+        retried_at + GATE_DEADLINE,
+        "the gate fails on its own clock: {live}"
+    );
+
+    // And the engine agrees: still waiting a millisecond before, failed at it.
+    w.clock.advance(GATE_DEADLINE - 1);
+    w.ticks(2).await;
+    assert_eq!(w.step("ra", "live").await.status, StepStatus::Pending);
+    w.clock.advance(1);
+    w.ticks(2).await;
+    assert_eq!(w.step("ra", "live").await.status, StepStatus::Failed);
+    w.finish().await;
+}
+both!(
+    a_retried_gate_fails_at_its_own_deadline_not_the_deployments,
     None
 );
 

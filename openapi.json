@@ -7058,12 +7058,21 @@
                 "type": "null"
               },
               {
-                "$ref": "#/components/schemas/DeploymentStatusDto"
+                "$ref": "#/components/schemas/DeploymentStatusDto",
+                "description": "The Deployment's own status — on its Environment's **baseline**\ndeadline, over the Deployment's lifetime, as the Deployments page\nshows it. Not the gate's clock: a Retry waits afresh while this can\nalready read `stalled` (see `fails_at`)."
               }
             ]
           },
           "environment": {
             "type": "string"
+          },
+          "fails_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When this gate fails `stalled` if nothing decisive is reported first\n(epoch millis): its wait's window opening plus its Project's effective\ngate deadline — the engine's own computation (git-bug `ec84c5d`).\nAbsent when unknown (no Deployment, or the deadline could not be read)."
           },
           "latest_label": {
             "type": [

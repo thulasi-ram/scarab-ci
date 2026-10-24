@@ -1321,8 +1321,18 @@ pub struct DeploymentGateDto {
     /// The Deployment the requester's current request landed on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deployment_id: Option<u64>,
+    /// The Deployment's own status — on its Environment's **baseline**
+    /// deadline, over the Deployment's lifetime, as the Deployments page
+    /// shows it. Not the gate's clock: a Retry waits afresh while this can
+    /// already read `stalled` (see `fails_at`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deployment_status: Option<DeploymentStatusDto>,
+    /// When this gate fails `stalled` if nothing decisive is reported first
+    /// (epoch millis): its wait's window opening plus its Project's effective
+    /// gate deadline — the engine's own computation (git-bug `ec84c5d`).
+    /// Absent when unknown (no Deployment, or the deadline could not be read).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fails_at: Option<i64>,
     /// The DeploymentVersion asked for.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,

@@ -2478,6 +2478,14 @@ export interface components {
             deployment_id?: number | null;
             deployment_status?: null | components["schemas"]["DeploymentStatusDto"];
             environment: string;
+            /**
+             * Format: int64
+             * @description When this gate fails `stalled` if nothing decisive is reported first
+             *     (epoch millis): its wait's window opening plus its Project's effective
+             *     gate deadline — the engine's own computation (git-bug `ec84c5d`).
+             *     Absent when unknown (no Deployment, or the deadline could not be read).
+             */
+            fails_at?: number | null;
             /** @description The latest source report's label, when it has one. */
             latest_label?: string | null;
             /**

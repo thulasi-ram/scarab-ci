@@ -150,6 +150,40 @@ describe("gateStatus", () => {
     expect(gateStatusText(s)).toBe("waiting on argocd/web (requested)");
   });
 
+  // git-bug ec84c5d: the Deployment's status runs on its Environment's baseline
+  // over its lifetime; a retried gate waits afresh on its own deadline. With
+  // `fails_at`, the line says whose status "stalled" is and when the GATE fails.
+  it("names the Deployment's status apart from when the gate itself fails", () => {
+    const s = waitingDeploy({
+      deployment_gate: {
+        target_source: "argocd",
+        target_id: "web",
+        deployment_status: "stalled",
+        fails_at: 7_320_000,
+      },
+    });
+    const at = (ms: number) => `T+${ms / 1000}s`;
+    expect(gateStatus(s, at)).toEqual({
+      tone: "waiting",
+      text: "waiting on argocd/web (Deployment: stalled · gate fails at T+7320s)",
+    });
+  });
+
+  it("keeps the source's label beside the Deployment's status", () => {
+    const s = waitingDeploy({
+      deployment_gate: {
+        target_source: "argocd",
+        target_id: "web",
+        deployment_status: "in_progress",
+        latest_label: "sync wave 3",
+        fails_at: 60_000,
+      },
+    });
+    expect(gateStatusText(s, (ms) => `@${ms}`)).toBe(
+      'waiting on argocd/web (Deployment: in progress, "sync wave 3" · gate fails at @60000)',
+    );
+  });
+
   it("says so when the requester's Deployment is not in the record yet", () => {
     const s = waitingDeploy({ deployment_gate: { target_source: "argocd", target_id: "web" } });
     expect(gateStatusText(s)).toBe("waiting on argocd/web (no Deployment recorded yet)");
