@@ -442,7 +442,7 @@ impl ServerDeploymentGates {
         // the request's effective time (a retried deploy Step) — a wait that
         // waits afresh at its own Attempt's start. `request_of` found the
         // requester here, so its mark is present.
-        let floor = GateWindow::of(deployment, &requester, &wait).and_then(|w| w.floor);
+        let floor = DeploymentGateWindow::verdict_floor(deployment, &requester, &wait);
         let decision = match floor {
             Some(floor) => deployment.gate_decision_from(&requester, floor.0, now, deadline),
             None => deployment.gate_decision(&requester, now, deadline),
@@ -515,7 +515,7 @@ impl ServerDeploymentGates {
 /// one computation the verdict and the run view's `fails_at` share
 /// (git-bug `ec84c5d`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GateWindow {
+pub struct DeploymentGateWindow {
     /// The window floor, when the wait has one
     /// ([`DeploymentGateWait::window_floor`]).
     pub floor: Option<Timestamp>,
@@ -524,9 +524,11 @@ pub struct GateWindow {
     pub opens_at: Millis,
 }
 
-impl GateWindow {
+impl DeploymentGateWindow {
     /// The window of `wait` on `deployment`'s request from `requester`;
-    /// `None` when that requester's request did not land on `deployment`.
+    /// `None` when that requester's request did not land on `deployment` —
+    /// then there is no mark to measure a `fails_at` from, and none is shown
+    /// (the verdict floors itself at [`verdict_floor`](Self::verdict_floor)).
     pub fn of(
         deployment: &Deployment,
         requester: &DeploymentRequester,
@@ -538,6 +540,24 @@ impl GateWindow {
             floor,
             opens_at: floor.map_or(effective_at, |f| f.0.max(effective_at)),
         })
+    }
+
+    /// The floor the verdict decides from: the window's
+    /// ([`DeploymentGateWait::window_floor`]) — or, should the requester's
+    /// mark be absent from `deployment` (an invariant `request_of` is meant
+    /// to guarantee), the gate Attempt's own start (review safety S10). That
+    /// fails CLOSED: the narrowest window there is, so pre-retry evidence can
+    /// never decide an afresh wait, and an unknown mark never widens a window
+    /// a known one would have floored.
+    pub fn verdict_floor(
+        deployment: &Deployment,
+        requester: &DeploymentRequester,
+        wait: &DeploymentGateWait,
+    ) -> Option<Timestamp> {
+        match Self::of(deployment, requester, wait) {
+            Some(window) => window.floor,
+            None => Some(wait.started_at),
+        }
     }
 
     /// When the gate fails `stalled` if nothing decisive arrives first: the
@@ -635,6 +655,60 @@ impl DeploymentGates for ServerDeploymentGates {
 #[cfg(test)]
 mod tests {
     use super::deadline_text;
+    use super::DeploymentGateWindow;
+    use scarab_deployment::{
+        DeploymentInput, DeploymentLedger, DeploymentRequester, DeploymentTarget, DeploymentVersion,
+    };
+    use scarab_engine::ports::DeploymentGateWait;
+    use scarab_engine::Timestamp;
+
+    /// Review safety S10: with the requester's mark absent from the
+    /// Deployment (an invariant `request_of` is meant to guarantee), the
+    /// window must fail CLOSED — a wait that waits afresh keeps its own
+    /// Attempt's start as the floor, so pre-retry evidence can never decide
+    /// it — and no `fails_at` is claimed (there is no mark to measure from).
+    #[test]
+    fn a_window_without_the_requester_mark_fails_closed() {
+        let target = DeploymentTarget {
+            environment: "prod".into(),
+            source: "argocd".into(),
+            id: "web".into(),
+        };
+        let mut ledger = DeploymentLedger::new();
+        ledger.apply(DeploymentInput::Request {
+            target,
+            version: DeploymentVersion("v1".into()),
+            requester: DeploymentRequester {
+                run: "other".into(),
+                step: "bump".into(),
+            },
+            effective_at: 1_000,
+            at: 2_000,
+            evidence: Vec::new(),
+        });
+        let deployment = &ledger.deployments()[0];
+        let absent = DeploymentRequester {
+            run: "r1".into(),
+            step: "bump".into(),
+        };
+        for (afresh, deploy_attempt) in [(true, None), (false, Some(Timestamp(3_000)))] {
+            let wait = DeploymentGateWait {
+                started_at: Timestamp(5_000),
+                afresh,
+                deploy_attempt_started_at: deploy_attempt,
+            };
+            assert_eq!(
+                DeploymentGateWindow::verdict_floor(deployment, &absent, &wait),
+                Some(Timestamp(5_000)),
+                "afresh {afresh}: no evidence before this gate Attempt counts"
+            );
+            assert_eq!(
+                DeploymentGateWindow::of(deployment, &absent, &wait),
+                None,
+                "no fails_at"
+            );
+        }
+    }
 
     #[test]
     fn a_deadline_reads_in_seconds_when_whole() {

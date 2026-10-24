@@ -35,7 +35,7 @@ use scarab_engine::{
     RunId, RunStatus, StepRun, StepStatus,
 };
 
-use crate::deployment_gates::{GateWindow, ServerDeploymentGates};
+use crate::deployment_gates::{DeploymentGateWindow, ServerDeploymentGates};
 use crate::{org_environments, ApiError, AppState, DeploymentGateDto, GateResolutionDto};
 
 /// The gate/hold facts of one step. Every field is `None` for a step with
@@ -284,7 +284,7 @@ async fn deployment_gate_dto(
     if let (Some(oracle), Some(wait)) = (clock.oracle, clock.wait) {
         match oracle.run_gate_deadline(run, request).await {
             Ok(gate_deadline) => {
-                dto.fails_at = GateWindow::of(deployment, &requester, &wait)
+                dto.fails_at = DeploymentGateWindow::of(deployment, &requester, &wait)
                     .map(|w| w.fails_at(gate_deadline));
             }
             Err(e) => tracing::warn!(run = %run.0, error = %e,
