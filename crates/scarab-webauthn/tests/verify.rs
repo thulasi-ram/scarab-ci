@@ -413,6 +413,115 @@ fn stored_algorithm_inconsistent_with_key_is_refused() {
 }
 
 // ---------------------------------------------------------------------------
+// Point validation (SEC1 §3.2.2.1, RFC 8032 §5.1.3)
+// ---------------------------------------------------------------------------
+
+fn register_with_tampered_key(
+    alg: SoftAlg,
+    tamper: fn(&mut Vec<u8>, &mut Vec<u8>),
+) -> Result<NewCredential, WebauthnError> {
+    let mut pk = SoftPasskey::new(alg);
+    pk.tamper_public_key = Some(tamper);
+    register(&mut pk)
+}
+
+#[test]
+fn p256_point_off_the_curve_is_refused() {
+    // One bit of a real key's y flipped.
+    let r = register_with_tampered_key(SoftAlg::Es256, |_, y| y[31] ^= 1);
+    assert_eq!(r, Err(WebauthnError::CoseKeyInvalidPoint));
+}
+
+#[test]
+fn p256_coordinate_not_below_p_is_refused() {
+    let r = register_with_tampered_key(SoftAlg::Es256, |x, _| *x = vec![0xff; 32]);
+    assert_eq!(r, Err(WebauthnError::CoseKeyInvalidPoint));
+}
+
+#[test]
+fn p256_all_zero_point_is_refused() {
+    let r = register_with_tampered_key(SoftAlg::Es256, |x, y| {
+        *x = vec![0; 32];
+        *y = vec![0; 32];
+    });
+    assert_eq!(r, Err(WebauthnError::CoseKeyInvalidPoint));
+}
+
+/// The first y (from 2 up) for which (y² − 1)/(d·y² + 1) is a non-zero
+/// quadratic non-residue mod p, found by Euler's criterion with d derived
+/// here from −121665/121666 — independently of the verifier's square-root
+/// candidate and its stored constant.
+fn ed25519_encoding_that_does_not_decode() -> Vec<u8> {
+    use num_bigint::BigUint;
+    let p: BigUint = (BigUint::from(1u8) << 255u32) - 19u8;
+    let inv = |z: &BigUint| z.modpow(&(&p - 2u8), &p);
+    let d = (&p - BigUint::from(121_665u32)) * inv(&BigUint::from(121_666u32)) % &p;
+    let one = BigUint::from(1u8);
+    let half = (&p - &one) >> 1u32;
+    for candidate in 2u32.. {
+        let y = BigUint::from(candidate);
+        let y2 = &y * &y % &p;
+        let u = (&y2 + &p - &one) % &p;
+        let v = (&d * &y2 + &one) % &p;
+        let x2 = u * inv(&v) % &p;
+        if x2 != BigUint::ZERO && x2.modpow(&half, &p) != one {
+            let mut le = y.to_bytes_le();
+            le.resize(32, 0);
+            return le;
+        }
+    }
+    unreachable!("half of all y are non-residues")
+}
+
+#[test]
+fn ed25519_encoding_that_does_not_decompress_is_refused() {
+    let r = register_with_tampered_key(SoftAlg::Ed25519, |x, _| {
+        *x = ed25519_encoding_that_does_not_decode()
+    });
+    assert_eq!(r, Err(WebauthnError::CoseKeyInvalidPoint));
+}
+
+#[test]
+fn ed25519_y_not_below_p_is_refused() {
+    // y = p = 2^255 − 19, little-endian, sign bit clear.
+    let r = register_with_tampered_key(SoftAlg::Ed25519, |x, _| {
+        *x = vec![0xff; 32];
+        x[0] = 0xed;
+        x[31] = 0x7f;
+    });
+    assert_eq!(r, Err(WebauthnError::CoseKeyInvalidPoint));
+}
+
+#[test]
+fn ed25519_small_order_and_negative_zero_are_refused() {
+    // The identity (0, 1): decodes, but is of small order.
+    let r = register_with_tampered_key(SoftAlg::Ed25519, |x, _| {
+        *x = vec![0; 32];
+        x[0] = 1;
+    });
+    assert_eq!(r, Err(WebauthnError::CoseKeyInvalidPoint));
+    // y = 1 with the x sign bit set: x = 0 cannot be negative.
+    let r = register_with_tampered_key(SoftAlg::Ed25519, |x, _| {
+        *x = vec![0; 32];
+        x[0] = 1;
+        x[31] = 0x80;
+    });
+    assert_eq!(r, Err(WebauthnError::CoseKeyInvalidPoint));
+}
+
+#[test]
+fn generated_keys_are_valid_points() {
+    // Many fresh keys, not one: a point check that rejects a fraction of
+    // honest keys would lock real users out.
+    for _ in 0..32 {
+        for alg in [SoftAlg::Es256, SoftAlg::Ed25519] {
+            let mut pk = SoftPasskey::new(alg);
+            assert!(register(&mut pk).is_ok(), "{alg:?}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Assertion
 // ---------------------------------------------------------------------------
 
