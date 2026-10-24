@@ -869,6 +869,19 @@ async fn ceremony_refusals_are_recorded() {
     assert!(probes.iter().all(|e| e.detail
         == json!({"mode": "ceremony", "reason": "request_not_found"})
         && e.org.is_none()));
+    // The probes of the request that exists are also amy's evidence, in
+    // acme's log, naming bob (redteam auth-2) — the one of a request that
+    // never was has nobody else to tell.
+    let told: Vec<_> = h
+        .events("step_up.refused")
+        .await
+        .into_iter()
+        .filter(|e| e.subject == "amy" && e.detail["probed_by"] == "bob")
+        .collect();
+    assert_eq!(told.len(), 2, "{told:?}");
+    assert!(told.iter().all(|e| e.org.as_deref() == Some("acme")
+        && e.request_id.as_deref() == Some(id.as_str())
+        && e.detail["reason"] == "request_not_found"));
 }
 
 /// A machine caller never raises a request it could never execute

@@ -597,16 +597,46 @@ async fn load_as_human(
     let found = svc.confirmations.get_request(id).await.map_err(store_err)?;
     match found {
         Some(r) if is_for_human(st, &caller.principal.subject, &r.for_human).await => Ok(r),
-        _ => Err(probe_refused(st, svc, id, caller).await),
+        other => Err(probe_refused(st, svc, id, caller, other.as_ref()).await),
     }
 }
 
 /// The 404 for a request that does not exist or is not the caller's —
 /// recorded (git-bug 69e06b5; ADR-0073 §6's confused deputy) as one reason
 /// for both, so the caller's own event log is no oracle for existence.
-async fn probe_refused(st: &AppState, svc: &StepUpService, id: &str, caller: &Caller) -> ApiError {
+///
+/// A probe of a request that exists is ALSO recorded where its owner and
+/// its Org can see it (redteam auth-2): as the request's human's event,
+/// in the request's Org, naming the prober. That row is never the
+/// prober's (another subject), so the prober's own log reads the same for
+/// a request that exists and one that does not; an admin of that Org
+/// already sees the request's `request.raised` there.
+async fn probe_refused(
+    st: &AppState,
+    svc: &StepUpService,
+    id: &str,
+    caller: &Caller,
+    found: Option<&StepUpRequest>,
+) -> ApiError {
     let now = st.clock.now().await.0;
     super::ceremony::record_ceremony_refusal(svc, caller, "request_not_found", Some(id), now).await;
+    if let Some(r) = found {
+        let mut ev = event(
+            kind::STEP_UP_REFUSED,
+            &r.for_human,
+            caller.event_label(),
+            r.org.clone(),
+            now,
+        );
+        ev.op = Some(r.op.clone());
+        ev.request_id = Some(id.to_string());
+        ev.detail = serde_json::json!({
+            "mode": "ceremony",
+            "reason": "request_not_found",
+            "probed_by": caller.principal.subject,
+        });
+        svc.record_refusal(ev).await;
+    }
     ApiError::NotFound
 }
 
@@ -654,13 +684,13 @@ pub(crate) async fn get_request(
         .await
         .map_err(store_err)?
     else {
-        return Err(probe_refused(&st, &svc, &id, &caller).await);
+        return Err(probe_refused(&st, &svc, &id, &caller, None).await);
     };
     let is_human = caller.is_browser_session()
         && is_for_human(&st, &caller.principal.subject, &r.for_human).await;
     let is_requester = requester_of(&caller).is_some_and(|me| me == r.requester);
     if !(is_human || is_requester) {
-        return Err(probe_refused(&st, &svc, &id, &caller).await);
+        return Err(probe_refused(&st, &svc, &id, &caller, Some(&r)).await);
     }
     let now = st.clock.now().await.0;
     Ok(Json(StepUpRequestDto::new(&r, now)))

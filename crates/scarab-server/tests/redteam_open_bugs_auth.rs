@@ -555,7 +555,6 @@ async fn rt_a_clock_step_back_mutes_refusals_until_it_catches_up() {
 /// Org's log shows. So the only person who can ever read the evidence is
 /// the prober; the victim and every Org admin see nothing.
 #[tokio::test]
-#[ignore = "redteam: BROKE a probe of another human's request is recorded only in the prober's own log; victim and Org admins never see it"]
 async fn rt_a_request_probe_is_visible_only_to_the_prober() {
     let h = harness();
     let (amy, _soft) = amy_in_browser(&h).await;
