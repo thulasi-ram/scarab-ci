@@ -126,6 +126,17 @@ reflink-copy = "0.1"
 # call site; the crate itself is unconditional here.
 xattr = "1"
 rsa = { version = "0.9", features = ["pem"] }
+# ADR-0073 step-up: the WebAuthn relying party (`crates/scarab-webauthn`)
+# verifies ES256 / EdDSA / RS256 assertion signatures with ring. Not a new
+# crate: ring 0.17 is already in the tree as the rustls/sqlx provider, and
+# webauthn-rs was rejected because it needs OpenSSL.
+ring = "0.17"
+# The one new external dep of ADR-0073: CBOR, to decode a WebAuthn
+# attestationObject and the COSE public key inside authenticatorData. There is
+# no CBOR crate in the tree. It is only ever used through the strict wrapper in
+# `crates/scarab-webauthn/src/cbor.rs` (definite lengths only, no tags, no
+# trailing bytes, depth and length limits). 2.x, not the superseded 0.x line.
+minicbor = { version = "2.3", features = ["alloc"] }
 kube = { version = "4", default-features = false, features = ["client", "ws", "rustls-tls"] }
 k8s-openapi = { version = "0.28", features = ["latest"] }
 
