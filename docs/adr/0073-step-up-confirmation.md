@@ -284,6 +284,8 @@ is still open. None of these reverses a decision.
   classification, in `crates/scarab-server/src/routes.rs`. The classifications live in
   `step_up/ops.rs`. One middleware enforces them. Every `GET`/`HEAD`/`OPTIONS` is a read.
   A mutating request the table does not know is refused (500, fail-closed).
+  A governed request whose non-empty body is not parseable JSON is refused (400
+  `unreadable_body`), so nothing runs on a body the guard could not summarize.
   `tests/step_up_routes.rs` holds the whole classification as a literal table, so a new
   route or a reclassification is a visible diff. It also checks the table against the
   router and the OpenAPI spec.
@@ -337,14 +339,16 @@ is still open. None of these reverses a decision.
     carries userinfo. Other long values show head and tail. Control and bidi
     characters are escaped. The page cannot be framed.
 - **Identity links.** A link flow's state cookie carries `HMAC(K_link, state,
-  session_hash)`, which only the guarded `POST /v1/me/identities/link` can mint. Without
-  it, the unguarded OAuth callback could be promoted into a link by anyone holding a
-  stolen cookie (a review HIGH).
+  session_hash, provider, expires_at)`, which only the guarded `POST
+  /v1/me/identities/link` can mint. Without it, the unguarded OAuth callback could be
+  promoted into a link by anyone holding a stolen cookie (a review HIGH). The flow
+  expires one window (5 minutes) after the POST, and cannot be moved to another provider.
 - **Who sees which events (§7).**
   - The Org log shows the Org's own events, plus a fixed allow-list of Org-less kinds
     about its members: confirmations and the passkey lifecycle.
   - An Org-less confirmation shown there carries no operation or target. A confirmation
-    for an Org-scoped operation is recorded under that Org.
+    for an Org-scoped operation is recorded under that Org when the caller holds a role
+    there, and Org-less otherwise.
   - The personal log shows everything about you. `GET /v1/security/events` shows the
     whole install, for global admins.
   - `step_up.confirmed`, `passkey.enrolled`, `op.authorised` and the break-glass record
