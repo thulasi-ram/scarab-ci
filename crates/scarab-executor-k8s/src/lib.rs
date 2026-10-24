@@ -2184,7 +2184,7 @@ fn pod_results_delivery_failure(pod: &Pod, now_secs: i64) -> Option<String> {
             let bound = results_drain_bound_secs(pod);
             return Some(format!(
                 "the results sidecar `{RESULTS_EGRESS_CONTAINER}` never reported \
-                 terminating within {bound}s of the step's exit (its node may be \
+                 terminating within {bound}s of its drain beginning (its node may be \
                  lost), so the delivery is unconfirmed"
             ));
         }
@@ -2212,13 +2212,18 @@ const K8S_DEFAULT_TERMINATION_GRACE_SECS: i64 = 30;
 
 /// Slack past the termination grace before a results drain that never
 /// reported finishing stops withholding the verdict (git-bug `f02588d`): the
-/// kubelet's status sync lag plus a margin. A drain the kubelet is alive to
-/// manage is SIGKILLed at the grace and reported well inside this.
-const RESULTS_DRAIN_SLACK_SECS: i64 = 60;
+/// kubelet's status sync lag plus a margin — mostly a margin for **clock
+/// skew**, since the bound compares the control plane's wall clock with a
+/// `finishedAt` stamped by the node's (review safety S1): Kubernetes does not
+/// keep the two in step, and a node running behind would otherwise release a
+/// healthy drain's verdict early. A drain the kubelet is alive to manage is
+/// SIGKILLed at the grace and reported well inside this.
+const RESULTS_DRAIN_SLACK_SECS: i64 = 300;
 
-/// How long after the step container's exit a results drain may withhold the
-/// verdict: the Pod's `terminationGracePeriodSeconds` (the kubelet SIGKILLs
-/// the sidecar at it) plus [`RESULTS_DRAIN_SLACK_SECS`].
+/// How long after its drain could begin ([`results_drain_began_at`]) a
+/// results drain may withhold the verdict: the Pod's
+/// `terminationGracePeriodSeconds` (the kubelet SIGKILLs the sidecar at it)
+/// plus [`RESULTS_DRAIN_SLACK_SECS`].
 fn results_drain_bound_secs(pod: &Pod) -> i64 {
     let grace = pod
         .spec
@@ -2243,10 +2248,53 @@ fn results_drain_bound_secs(pod: &Pod) -> i64 {
 /// bound: there is no exit to measure from, and the engine's step timeout
 /// remains the backstop.
 fn results_drain_overdue(pod: &Pod, now_secs: i64) -> bool {
-    let Some(finished) = step_terminated_finished_at(pod) else {
+    let Some(began) = results_drain_began_at(pod) else {
         return false;
     };
-    now_secs >= finished.saturating_add(results_drain_bound_secs(pod))
+    now_secs >= began.saturating_add(results_drain_bound_secs(pod))
+}
+
+/// When the results sidecar's drain could begin (unix seconds), or `None`
+/// when that is not known yet — no bound applies then (review correctness
+/// F5). The kubelet stops a finished Pod's native sidecars in REVERSE
+/// declaration order, and the results egress is declared FIRST: every
+/// sidecar declared after it — the workspace egress, whose settle may run its
+/// own long grace, and any service sidecar — stops before the results sidecar
+/// is even signalled. So the drain begins at the later of the step
+/// container's exit and those sidecars' terminations; measured from the
+/// step's exit alone, a long workspace settle used up the results drain's
+/// bound and a workspace Pod was released mid-drain.
+///
+/// `None` while the step's exit is unreported, or while a later-declared
+/// sidecar has not terminated (or terminated without a `finishedAt`): the
+/// results sidecar has not started draining, so there is nothing to bound
+/// yet, and the engine's step timeout stays the backstop.
+fn results_drain_began_at(pod: &Pod) -> Option<i64> {
+    let mut began = step_terminated_finished_at(pod)?;
+    let declared = pod.spec.as_ref()?.init_containers.as_deref().unwrap_or(&[]);
+    let after_results = declared
+        .iter()
+        .skip_while(|c| c.name != RESULTS_EGRESS_CONTAINER)
+        .skip(1)
+        .filter(|c| c.restart_policy.as_deref() == Some("Always"));
+    let statuses = pod
+        .status
+        .as_ref()
+        .and_then(|s| s.init_container_statuses.as_deref())
+        .unwrap_or(&[]);
+    for sidecar in after_results {
+        let status = statuses.iter().find(|st| st.name == sidecar.name)?;
+        let terminated = match status.state.as_ref() {
+            Some(st) if st.terminated.is_some() => st.terminated.as_ref(),
+            Some(st) if st.waiting.is_some() => status
+                .last_state
+                .as_ref()
+                .and_then(|l| l.terminated.as_ref()),
+            _ => None,
+        }?;
+        began = began.max(terminated.finished_at.as_ref()?.0.as_second());
+    }
+    Some(began)
 }
 
 /// The step container's `finishedAt` (unix seconds), once terminated.
@@ -2298,10 +2346,19 @@ fn results_settled_state(pod: &Pod, now_secs: i64) -> ExecState {
 
 /// Wall-clock unix seconds, the `now` the pure verdict functions take.
 fn unix_now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    unix_secs(std::time::SystemTime::now())
+}
+
+/// `t` as unix seconds — failing CLOSED (review safety S5): a clock before
+/// the epoch is broken, and reads as the earliest possible instant, so no
+/// time-based bound ([`results_drain_overdue`]) is ever past on it and the
+/// verdict stays withheld (the engine's step timeout remains the backstop).
+/// `i64::MAX` here made every drain "overdue" and released `Succeeded` while
+/// results were still in flight.
+fn unix_secs(t: std::time::SystemTime) -> i64 {
+    t.duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
-        .unwrap_or(i64::MAX)
+        .unwrap_or(i64::MIN)
 }
 
 /// Is this a Pod on the workspace flow?
@@ -7436,7 +7493,7 @@ mod tests {
                     pod_results_delivery_failure(&pod, at).as_deref(),
                     Some(
                         "the results sidecar `scarab-results-egress` never reported \
-                         terminating within 90s of the step's exit (its node may be \
+                         terminating within 330s of its drain beginning (its node may be \
                          lost), so the delivery is unconfirmed"
                     ),
                     "{why}"
@@ -7444,7 +7501,7 @@ mod tests {
             }
         }
 
-        // The Pod's own grace is honoured: a 600 s grace is not cut at 90 s.
+        // The Pod's own grace is honoured: a 600 s grace is not cut at 330 s.
         let long = with_results_sidecar(
             step_finished_at(plain_pod("Running", 0), finished),
             Some(results_status(results_running(), false)),
@@ -7519,6 +7576,131 @@ mod tests {
             Some(results_status(results_terminated(0), false)),
         );
         assert_eq!(settled_state(&done, true, NOW), ExecState::Succeeded);
+    }
+
+    /// Review safety S1: the bound compares the control plane's clock with
+    /// the node's `finishedAt`, which Kubernetes does not keep in step. A node
+    /// a couple of minutes behind must not release a healthy drain: the slack
+    /// past the grace absorbs a skew of minutes, not of one.
+    #[test]
+    fn a_results_drain_bound_absorbs_minutes_of_node_clock_skew() {
+        let finished = NOW - 10_000;
+        let mut pod = with_results_sidecar(
+            step_finished_at(plain_pod("Running", 0), finished),
+            Some(results_status(results_running(), false)),
+        );
+        pod.spec.as_mut().unwrap().termination_grace_period_seconds = Some(30);
+        // The node's clock runs 4 minutes behind: the control plane sees the
+        // exit as 30 s grace + 240 s skew old while the drain is healthy.
+        assert_eq!(
+            results_settled_state(&pod, finished + 30 + 240),
+            ExecState::Running,
+            "a skewed node clock must not release a draining verdict"
+        );
+    }
+
+    /// Review safety S5: a broken (pre-epoch) wall clock fails CLOSED — no
+    /// drain is ever overdue on it, so `Succeeded` stays withheld while the
+    /// results are in flight (it used to read as the far future, releasing
+    /// every drain at once).
+    #[test]
+    fn a_broken_clock_never_makes_a_results_drain_overdue() {
+        let broken = std::time::UNIX_EPOCH - std::time::Duration::from_secs(1);
+        let now = unix_secs(broken);
+        let pod = with_results_sidecar(
+            step_finished_at(plain_pod("Running", 0), NOW - 100_000),
+            Some(results_status(results_running(), false)),
+        );
+        assert_eq!(results_settled_state(&pod, now), ExecState::Running);
+        assert_eq!(pod_results_delivery_failure(&pod, now), None);
+        let succeeded = with_results_sidecar(
+            step_finished_at(plain_pod("Succeeded", 0), NOW - 100_000),
+            Some(results_status(results_running(), false)),
+        );
+        assert_eq!(results_settled_state(&succeeded, now), ExecState::Running);
+    }
+
+    /// Review correctness F5: the kubelet stops a finished Pod's native
+    /// sidecars in reverse declaration order, and the results egress is
+    /// declared before the workspace egress — so the results sidecar only
+    /// starts draining once the workspace settle has ended, which may take
+    /// most of its long grace. The bound runs from THAT, not from the step's
+    /// exit, so a long settle cannot use up the results drain's bound.
+    #[test]
+    fn a_long_workspace_settle_does_not_use_up_the_results_drain_bound() {
+        use k8s_openapi::api::core::v1::ContainerState;
+        let finished = NOW - 10_000;
+        let grace = 600;
+        let settled_at = finished + 500;
+        let pod = || {
+            // Declared order as `build_pod` makes it: results egress, then the
+            // workspace egress.
+            let mut pod = step_finished_at(settling_pod("Running", 0, false, true), finished);
+            let spec = pod.spec.as_mut().unwrap();
+            spec.termination_grace_period_seconds = Some(grace);
+            spec.init_containers.as_mut().unwrap().insert(
+                0,
+                Container {
+                    name: RESULTS_EGRESS_CONTAINER.to_string(),
+                    restart_policy: Some("Always".to_string()),
+                    ..Default::default()
+                },
+            );
+            let statuses = pod
+                .status
+                .as_mut()
+                .unwrap()
+                .init_container_statuses
+                .as_mut()
+                .unwrap();
+            let egress = statuses
+                .iter_mut()
+                .find(|c| c.name == WORKSPACE_EGRESS_CONTAINER)
+                .unwrap();
+            egress.state = Some(ContainerState {
+                terminated: Some(k8s_openapi::api::core::v1::ContainerStateTerminated {
+                    exit_code: 0,
+                    finished_at: Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                        k8s_openapi::jiff::Timestamp::from_second(settled_at).unwrap(),
+                    )),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            statuses.push(results_status(results_running(), false));
+            pod
+        };
+        let bound = grace + RESULTS_DRAIN_SLACK_SECS;
+        // Past the step's exit + bound, but the drain began only when the
+        // workspace settle ended: still withheld.
+        assert_eq!(
+            settled_state(&pod(), true, finished + bound),
+            ExecState::Running,
+            "the results drain's bound runs from the settle's end"
+        );
+        assert_eq!(
+            settled_state(&pod(), true, settled_at + bound - 1),
+            ExecState::Running
+        );
+        assert_eq!(
+            settled_state(&pod(), true, settled_at + bound),
+            ExecState::Succeeded
+        );
+        // While the workspace egress has not stopped, the results sidecar has
+        // not begun to drain: no bound at all.
+        let mut settling = pod();
+        settling
+            .status
+            .as_mut()
+            .unwrap()
+            .init_container_statuses
+            .as_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|c| c.name == WORKSPACE_EGRESS_CONTAINER)
+            .unwrap()
+            .state = Some(results_running());
+        assert_eq!(results_settled_state(&settling, i64::MAX - 1), ExecState::Running);
     }
 
     // ------------------------------------------------------------------
