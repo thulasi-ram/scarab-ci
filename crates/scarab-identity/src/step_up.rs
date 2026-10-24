@@ -220,6 +220,11 @@ pub trait ChallengeStore: Send + Sync {
     /// Record a freshly minted challenge.
     async fn put(&self, challenge: &WebauthnChallenge) -> Result<(), IdentityError>;
 
+    /// Delete every challenge past its expiry (`expires_at <= now`), used or
+    /// not (retention: an expired challenge can never be answered). Returns
+    /// how many.
+    async fn reap_expired(&self, now_ms: i64) -> Result<u64, IdentityError>;
+
     /// Consume challenge `id`, atomically and at most once: only an
     /// unconsumed, unexpired (`expires_at > now`) challenge minted for
     /// `session_hash` is returned (and marked consumed). Anything else —
@@ -494,6 +499,21 @@ pub trait StepUpStore: Send + Sync {
         requester: &StepUpRequester,
         now_ms: i64,
     ) -> Result<u64, IdentityError>;
+
+    /// How many live (pending, unexpired) requests target Org `org`.
+    async fn pending_in_org(&self, org: &str, now_ms: i64) -> Result<u64, IdentityError>;
+
+    /// Retention (never the event log, which is the evidence):
+    /// - delete every confirmation past its expiry (`expires_at <= now`);
+    /// - clear the sealed body of every expired pending request, and of
+    ///   every request still `executing` [`STEP_UP_REQUEST_TTL_MS`] after it
+    ///   was confirmed (its replay opened the body long ago; a crash left it)
+    ///   — the body (a secret value, perhaps) is never kept past its use;
+    /// - delete every request that settled (executed / failed), expired, or
+    ///   was left executing, before `older_than_ms`.
+    ///
+    /// Returns how many rows were deleted.
+    async fn reap(&self, now_ms: i64, older_than_ms: i64) -> Result<u64, IdentityError>;
 }
 
 // ---------------------------------------------------------------------------

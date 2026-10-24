@@ -3785,6 +3785,18 @@ impl scarab_identity::RbacStore for PostgresDb {
             .collect())
     }
 
+    async fn orgs_of(&self, subject: &str) -> Result<Vec<String>, scarab_identity::IdentityError> {
+        // Tombstones (role NULL) are no membership.
+        sqlx::query_scalar(
+            "SELECT DISTINCT org FROM rbac_bindings
+             WHERE subject = $1 AND role IS NOT NULL ORDER BY org",
+        )
+        .bind(subject)
+        .fetch_all(self.pool())
+        .await
+        .map_err(identity_err)
+    }
+
     async fn import_seeds(
         &self,
         scope: &scarab_identity::Scope,

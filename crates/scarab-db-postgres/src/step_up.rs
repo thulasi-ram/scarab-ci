@@ -30,6 +30,24 @@ fn unreadable(what: &str) -> IdentityError {
 }
 
 impl PostgresDb {
+    /// The highest migration applied successfully, read from sqlx's
+    /// `_sqlx_migrations` — `None` on a database never migrated. Read-only:
+    /// the operator break-glass (ADR-0073 §10) refuses an old schema rather
+    /// than migrating one.
+    pub async fn schema_version(&self) -> Result<Option<i64>, IdentityError> {
+        let exists: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
+            .fetch_one(self.pool())
+            .await
+            .map_err(identity_err)?;
+        if !exists {
+            return Ok(None);
+        }
+        sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations WHERE success")
+            .fetch_one(self.pool())
+            .await
+            .map_err(identity_err)
+    }
+
     /// Every subject holding a live Admin or Owner binding anywhere — the
     /// install-wide admins the boot line "step-up enforced; N admins have no
     /// passkey" counts (ADR-0073 §8). Bootstrap owners come from config and
@@ -334,6 +352,17 @@ impl ChallengeStore for PostgresDb {
         .as_ref()
         .map(challenge_from_row)
         .transpose()
+    }
+
+    async fn reap_expired(&self, now_ms: i64) -> Result<u64, IdentityError> {
+        Ok(
+            sqlx::query("DELETE FROM webauthn_challenges WHERE expires_at <= $1")
+                .bind(now_ms)
+                .execute(self.pool())
+                .await
+                .map_err(identity_err)?
+                .rows_affected(),
+        )
     }
 }
 
@@ -668,6 +697,55 @@ impl StepUpStore for PostgresDb {
         .await
         .map_err(identity_err)?;
         Ok(n.max(0) as u64)
+    }
+
+    async fn pending_in_org(&self, org: &str, now_ms: i64) -> Result<u64, IdentityError> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM step_up_requests
+             WHERE org = $1 AND state = 'pending' AND expires_at > $2",
+        )
+        .bind(org)
+        .bind(now_ms)
+        .fetch_one(self.pool())
+        .await
+        .map_err(identity_err)?;
+        Ok(n.max(0) as u64)
+    }
+
+    async fn reap(&self, now_ms: i64, older_than_ms: i64) -> Result<u64, IdentityError> {
+        let mut tx = self.pool().begin().await.map_err(identity_err)?;
+        let confirmations = sqlx::query("DELETE FROM step_up_confirmations WHERE expires_at <= $1")
+            .bind(now_ms)
+            .execute(&mut *tx)
+            .await
+            .map_err(identity_err)?
+            .rows_affected();
+        // An expired request can never run: its sealed body goes now, not
+        // with the row 30 days later.
+        sqlx::query(
+            "UPDATE step_up_requests SET sealed = NULL
+             WHERE sealed IS NOT NULL
+               AND ((state = 'pending' AND expires_at <= $1)
+                    OR (state = 'executing' AND confirmed_at <= $2))",
+        )
+        .bind(now_ms)
+        .bind(now_ms - scarab_identity::STEP_UP_REQUEST_TTL_MS)
+        .execute(&mut *tx)
+        .await
+        .map_err(identity_err)?;
+        let requests = sqlx::query(
+            "DELETE FROM step_up_requests
+             WHERE (state IN ('executed', 'failed') AND executed_at < $1)
+                OR (state = 'pending' AND expires_at < $1)
+                OR (state = 'executing' AND confirmed_at < $1)",
+        )
+        .bind(older_than_ms)
+        .execute(&mut *tx)
+        .await
+        .map_err(identity_err)?
+        .rows_affected();
+        tx.commit().await.map_err(identity_err)?;
+        Ok(confirmations + requests)
     }
 }
 
