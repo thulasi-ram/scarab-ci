@@ -935,13 +935,6 @@ async fn the_credential_is_never_readable_back_and_never_outlives_its_binding() 
         .await,
         admin(&h.public, "GET", "/v1/orgs/acme/plugins/argo", None).await,
         admin(&h.public, "GET", "/v1/orgs/acme/plugins", None).await,
-        admin(
-            &h.public,
-            "GET",
-            &format!("/v1/secrets?org={PLUGIN_CONNECTION_CREDENTIALS_ORG}"),
-            None,
-        )
-        .await,
     ];
     for (status, body) in &reads {
         assert_eq!(*status, StatusCode::OK, "{body}");
@@ -950,6 +943,17 @@ async fn the_credential_is_never_readable_back_and_never_outlives_its_binding() 
             "the credential was read back: {body}"
         );
     }
+    // The credential scope is reserved: the generic secrets API does not
+    // reach it at all (git-bug 97223c7).
+    let (status, body) = admin(
+        &h.public,
+        "GET",
+        &format!("/v1/secrets?org={PLUGIN_CONNECTION_CREDENTIALS_ORG}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(!body.contains(ARGO_TOKEN));
     let whoami = Request::builder()
         .uri("/_scarab/plugin/v1/whoami")
         .header("authorization", format!("Bearer {token}"))
