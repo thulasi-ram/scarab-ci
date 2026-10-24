@@ -621,19 +621,17 @@ impl Default for InMemoryDb {
 }
 
 /// Deterministic attempt ordering — mirrors the postgres `attempts()`
-/// `ORDER BY started_at, CAST(substring(attempt_id FROM 2) AS INTEGER)`: start
-/// time first, then mint order by the numeric id suffix (attempt ids are minted
-/// `a{n}` — `a1`,`a2`,…). Numeric, not lexical, so `a2` precedes `a10`. Every
-/// read path that returns attempts sorts by this key so `.last()` (the frontier
-/// / latest attempt) is stable and IDENTICAL to the postgres adapter, even when
-/// `started_at` ties (the `FakeClock` case, and same-millisecond real minting).
-fn attempt_order_key(a: &Attempt) -> (i64, u64) {
-    let seq =
-        a.id.0
-            .strip_prefix('a')
-            .and_then(|n| n.parse::<u64>().ok())
-            .unwrap_or(u64::MAX);
-    (a.started_at.0, seq)
+/// `ORDER BY CAST(substring(attempt_id FROM 2) AS INTEGER)`: mint order by the
+/// numeric id suffix ALONE (attempt ids are minted `a{n}` — `a1`,`a2`,…).
+/// Numeric, not lexical, so `a2` precedes `a10`. Every read path that returns
+/// attempts sorts by this key so `.last()` (the frontier / latest attempt) is
+/// stable and IDENTICAL to the postgres adapter. Never `started_at` (git-bug
+/// 90d767d): it ties, and it can run backwards across a leader failover.
+fn attempt_order_key(a: &Attempt) -> u64 {
+    a.id.0
+        .strip_prefix('a')
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(u64::MAX)
 }
 
 #[async_trait]

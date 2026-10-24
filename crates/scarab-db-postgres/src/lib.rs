@@ -120,16 +120,17 @@ impl PostgresDb {
             .transpose()
     }
 
-    /// All attempts of a step, in start order.
+    /// All attempts of a step, in mint order.
     ///
-    /// Deterministic tiebreak on the attempt id: `started_at` alone is not
-    /// unique (the test `FakeClock` ties, and fast real execution can mint two
-    /// attempts in the same millisecond), which would make attempt order — and
-    /// therefore `.last()`, the frontier that anchors `?attempt=` reads and the
-    /// settle-path frontier guard — nondeterministic. Attempt ids are minted
-    /// `a{n}` (`a1`,`a2`,…; monotonic — see the scheduler), so ties break on the
-    /// numeric suffix. It must be numeric, not lexical: lexical order puts `a10`
-    /// before `a2`. The in-memory `Db` (scarab-testkit) mirrors this exact order.
+    /// Ordered by the numeric `a{n}` id suffix ALONE (`a1`,`a2`,…; minted
+    /// monotonic under the step — see the scheduler), so `.last()` is the
+    /// frontier that anchors `?attempt=` reads and the settle-path frontier
+    /// guard. Never by `started_at` (git-bug 90d767d): it is not unique (the
+    /// test `FakeClock` ties, same-millisecond real minting), it can run
+    /// BACKWARDS across a leader failover (a retried `a2` stamped before
+    /// `a1`), and a gate-wait Attempt is minted with a frozen, earlier start by
+    /// design. It must be numeric, not lexical: lexical order puts `a10` before
+    /// `a2`. The in-memory `Db` (scarab-testkit) mirrors this exact order.
     pub async fn attempts(&self, run: &RunId, step: &StepId) -> Result<Vec<Attempt>, DbError> {
         attempts_on(self.pool(), run, step).await
     }
@@ -1719,7 +1720,7 @@ impl Db for PostgresDb {
         }
         // The attempt's outcome, as `set_attempt_outcome(Succeeded)` — AND
         // only while `attempt` is still the step's latest (the
-        // `attempts_on` order). The step row is `running` for a successor
+        // `attempts_on` order: the highest `a{n}`, never the latest clock). The step row is `running` for a successor
         // `a2` too, so the transition guard alone would let a superseded or
         // merely non-latest `a1`'s exit 0 succeed the step and record a
         // DeploymentRequest. The scheduler checks the frontier before calling;
@@ -1735,8 +1736,7 @@ impl Db for PostgresDb {
                AND attempt_id = (
                    SELECT latest.attempt_id FROM attempts latest
                    WHERE latest.run_id = $1 AND latest.step_id = $2
-                   ORDER BY latest.started_at DESC,
-                            CAST(substring(latest.attempt_id FROM 2) AS INTEGER) DESC
+                   ORDER BY CAST(substring(latest.attempt_id FROM 2) AS INTEGER) DESC
                    LIMIT 1)",
         )
         .bind(&run.0)
@@ -3379,7 +3379,7 @@ fn failure_from_str(s: &str) -> Result<FailureKind, DbError> {
 
 /// [`PostgresDb::attempts`] on any executor — the pool, or an open
 /// transaction (the gate-wait writes read a step's Attempts under its row
-/// lock). Same order: start time, then the numeric id suffix.
+/// lock). Same order: the numeric id suffix alone.
 async fn attempts_on<'e, E: sqlx::PgExecutor<'e>>(
     exec: E,
     run: &RunId,
@@ -3389,7 +3389,7 @@ async fn attempts_on<'e, E: sqlx::PgExecutor<'e>>(
         "SELECT attempt_id, started_at, failure, failure_detail, outcome
          FROM attempts
          WHERE run_id = $1 AND step_id = $2
-         ORDER BY started_at, CAST(substring(attempt_id FROM 2) AS INTEGER)",
+         ORDER BY CAST(substring(attempt_id FROM 2) AS INTEGER)",
     )
     .bind(&run.0)
     .bind(&step.0)

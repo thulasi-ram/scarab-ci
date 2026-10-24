@@ -634,6 +634,56 @@ async fn a_non_latest_attempt_cannot_finish_the_step() {
     tdb.cleanup().await;
 }
 
+/// The frontier is the highest `a{n}`, never the latest `started_at`
+/// (git-bug 90d767d): across a leader failover with a backwards clock skew,
+/// the retried `a2` is stamped EARLIER than `a1`. Its exit 0 must still
+/// finish the step, and `a1`'s must not.
+#[tokio::test]
+async fn the_frontier_is_the_attempt_number_not_its_clock() {
+    let Some((tdb, db)) = migrated().await else {
+        return;
+    };
+    seed_running(&db, &["bump"]).await; // a1 started at 1_000
+    let step = StepId("bump".into());
+    let (a1, a2) = (AttemptId("a1".into()), AttemptId("a2".into()));
+    db.record_attempt(
+        &run_id(),
+        &step,
+        &Attempt {
+            id: a2.clone(),
+            started_at: Timestamp(400), // the new leader's clock lags
+            failure: None,
+            failure_detail: None,
+            outcome: AttemptOutcome::Running,
+        },
+    )
+    .await
+    .unwrap();
+    let input = [request_input("bump", "web", 1_000)];
+
+    let stale = db
+        .finish_step_with_deployment_requests(&run_id(), &step, &a1, ORG, &input, Timestamp(3_000))
+        .await;
+    assert!(
+        matches!(stale, Err(DbError::Conflict)),
+        "a1 is not the frontier: got {stale:?}"
+    );
+    db.finish_step_with_deployment_requests(&run_id(), &step, &a2, ORG, &input, Timestamp(3_100))
+        .await
+        .expect("a2 is the frontier despite its earlier clock");
+    assert_eq!(step_status(&db, "bump").await, StepStatus::Succeeded);
+    assert_eq!(db.inputs(ORG, ENV).await.unwrap().len(), 1);
+    let ids: Vec<String> = db
+        .attempts_of_step(&run_id(), &step)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|a| a.id.0)
+        .collect();
+    assert_eq!(ids, vec!["a1", "a2"], "attempts read in mint order");
+    tdb.cleanup().await;
+}
+
 /// A one-step Deploy Run whose `bump` requests `argocd`/`web`, opted into
 /// `retry: { max: 3 }`.
 async fn seed_retrying_deploy(db: &PostgresDb) {

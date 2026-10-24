@@ -402,11 +402,14 @@ async fn outbox_claim_and_poison_semantics(db: &dyn Db) {
 contract_test!(outbox_poison, outbox_claim_and_poison_semantics);
 
 // ---------------------------------------------------------------------------
-// 6. Attempt-ordering determinism: attempts list back ordered by started_at,
-//    tie-broken NUMERICALLY on the `a{n}` id suffix (so `a2` < `a10`), no
-//    matter the insertion order — the frontier (`.last()`) that anchors
+// 6. Attempt-ordering determinism: attempts list back ordered by the
+//    NUMERIC `a{n}` id suffix alone (so `a2` < `a10`), no matter the insertion
+//    order or the `started_at` stamps — the frontier (`.last()`) that anchors
 //    `?attempt=` reads and the settle-path guard must be stable and identical
-//    across stores.
+//    across stores. `started_at` is NOT an order key (git-bug 90d767d): a
+//    backwards clock skew across a leader failover stamps a retried `a2`
+//    earlier than `a1`, and a gate-wait Attempt is minted with a frozen,
+//    earlier `started_at` by design; either would make `a1` the frontier.
 // ---------------------------------------------------------------------------
 
 async fn attempts_list_in_stable_defined_order(db: &dyn Db) {
@@ -414,12 +417,13 @@ async fn attempts_list_in_stable_defined_order(db: &dyn Db) {
     let step = StepId("s".into());
     seed_run_and_step(db, &run, &step).await;
 
-    // Insert out of order; a1/a2/a10 tie on started_at (the FakeClock case).
+    // Insert out of order; a1/a2/a10 tie on started_at (the FakeClock case),
+    // a7 and a2 are stamped by a clock that went backwards.
     for a in [
         attempt("a10", 500),
         attempt("a1", 500),
-        attempt("a7", 100), // earlier start: must sort first despite the id
-        attempt("a2", 500),
+        attempt("a7", 100), // skewed-early start: still sorts by its id
+        attempt("a2", 400), // a retried a2 on a lagging leader's clock
     ] {
         db.record_attempt(&run, &step, &a).await.unwrap();
     }
@@ -433,14 +437,14 @@ async fn attempts_list_in_stable_defined_order(db: &dyn Db) {
         .collect();
     assert_eq!(
         ids,
-        vec!["a7", "a1", "a2", "a10"],
-        "attempts must order by started_at, then numeric id suffix"
+        vec!["a1", "a2", "a7", "a10"],
+        "attempts must order by the numeric id suffix alone"
     );
 
     // The same order must come back through the DAG snapshot read.
     let steps = db.steps_of_run(&run).await.unwrap();
     let snapshot_ids: Vec<String> = steps[0].attempts.iter().map(|a| a.id.0.clone()).collect();
-    assert_eq!(snapshot_ids, vec!["a7", "a1", "a2", "a10"]);
+    assert_eq!(snapshot_ids, vec!["a1", "a2", "a7", "a10"]);
 }
 
 contract_test!(attempt_ordering, attempts_list_in_stable_defined_order);
