@@ -753,6 +753,16 @@ pub static PASSKEY_REMOVE: Op = op(
     &[],
     &["path:id"],
 );
+pub static PASSKEY_RESET: Op = op(
+    "passkey.reset",
+    "Reset a member's passkeys",
+    Class::CrownJewel(A),
+    "§2/§4 passkey reset (an Owner's; the operator break-glass has no route)",
+    Some(Role::Owner),
+    OrgOf::Path("org"),
+    &[],
+    &["path:org", "path:subject"],
+);
 
 // --- conditional (the handler decides) ---------------------------------------
 
@@ -875,6 +885,26 @@ pub static STEP_UP_CONFIRM: Op = op(
     "Confirm a step-up",
     Class::Ceremony,
     "§4",
+    ANYONE,
+    OrgOf::None,
+    &[],
+    &[],
+);
+pub static STEP_UP_REQUEST_OPTIONS: Op = op(
+    "step_up.request_options",
+    "Begin confirming a step-up request",
+    Class::Ceremony,
+    "§6 (only the request's own human, in a browser)",
+    ANYONE,
+    OrgOf::None,
+    &[],
+    &[],
+);
+pub static STEP_UP_REQUEST_CONFIRM: Op = op(
+    "step_up.request_confirm",
+    "Confirm a step-up request",
+    Class::Ceremony,
+    "§6 (only the request's own human, in a browser; the replay is guarded as the op itself)",
     ANYONE,
     OrgOf::None,
     &[],

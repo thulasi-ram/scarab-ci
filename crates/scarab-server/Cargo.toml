@@ -86,6 +86,9 @@ scarab-webauthn = { workspace = true }
 # ADR-0073: the action digest is HMAC-SHA256 under a KEK-derived key. Already
 # in the tree (scarab-secrets-postgres, the forge webhook verifiers).
 hmac = { workspace = true }
+# ADR-0073 §6: a confirmed StepUpConfirmationRequest is replayed through the
+# real router (`ServiceExt::oneshot`). Already in the tree via axum.
+tower = { workspace = true, features = ["util"] }
 
 # ADR-0062 overlay change-set (`changeset.rs`): reading `trusted.overlay.*` off a
 # Step's upper layer. Target-gated to match the `#[cfg(target_os = "linux")]` on
@@ -104,5 +107,4 @@ libc = "0.2"
 # ADR-0073 tests: a software passkey (a true external — the authenticator).
 scarab-webauthn = { workspace = true, features = ["soft-authenticator"] }
 regex-lite = { workspace = true }
-tower = { workspace = true, features = ["util"] }
 tempfile = { workspace = true }

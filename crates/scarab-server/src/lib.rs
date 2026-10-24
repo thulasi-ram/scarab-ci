@@ -1430,6 +1430,9 @@ pub enum ApiError {
         code: &'static str,
         message: String,
     },
+    /// Too many of something pending (429) — a requester's live
+    /// StepUpConfirmationRequests (ADR-0073 §6). The text says what.
+    TooManyRequests(String),
     /// A dependency that must work for the request to be safe is down (503):
     /// a crown jewel whose authorisation cannot be recorded does not run.
     Unavailable(String),
@@ -1518,6 +1521,7 @@ impl IntoResponse for ApiError {
             )
                 .into_response(),
             ApiError::Unavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m).into_response(),
+            ApiError::TooManyRequests(m) => (StatusCode::TOO_MANY_REQUESTS, m).into_response(),
         }
     }
 }
@@ -7074,6 +7078,10 @@ struct Caller {
 /// What ADR-0073 needs to know about the session a request rode on.
 #[derive(Debug, Clone)]
 struct SessionFacts {
+    /// The session id itself — the bearer credential. Kept only so a
+    /// StepUpConfirmationRequest raised over a Bearer session can seal it and
+    /// re-check, at replay, that the session is still live. Never logged.
+    id: step_up::requests::SessionSecret,
     /// Hex SHA-256 of the session id: confirmations are keyed by it, never
     /// by the id itself.
     id_hash: String,
@@ -7215,6 +7223,15 @@ async fn authenticate(
     headers: &HeaderMap,
     action: Action,
 ) -> Result<Caller, ApiError> {
+    // A StepUpConfirmationRequest being replayed (ADR-0073 §6): the request
+    // carries no credential at all. The caller is rebuilt from what raised
+    // it — the token by id, or the Bearer session — re-checked as live NOW
+    // and narrowed to the human's live authority; headers are ignored, and
+    // CSRF has nothing to defend (no browser sent this request). The
+    // task-local is set only by the confirm endpoint around its replay.
+    if let Some(authority) = step_up::requests::replay_authority() {
+        return step_up::requests::replay_caller(st, &authority).await;
+    }
     let Some(sessions) = st.sessions.as_ref() else {
         return Ok(Caller::session(Principal {
             subject: "anonymous".into(),
@@ -7248,6 +7265,7 @@ async fn authenticate(
         }
     }
     let facts = SessionFacts {
+        id: step_up::requests::SessionSecret(session.id.clone()),
         id_hash: session_hash(&session.id),
         created_at: session.created_at,
         login_kind: session.login_kind.clone(),
@@ -10330,6 +10348,10 @@ fn tag_for_path(path: &str) -> Option<&'static str> {
         || path.starts_with("/v1/auth/")
         || path == "/v1/me"
         || path.starts_with("/v1/me/")
+        || path.starts_with("/v1/step-up/")
+        || path.starts_with("/v1/security/")
+        || path.contains("/security/")
+        || path.contains("/passkeys/")
         || path.contains("bindings")
         || path.contains("/principals")
         || path.contains("/tokens")
@@ -10490,10 +10512,81 @@ impl utoipa::Modify for SecuritySchemes {
     }
 }
 
+/// Documents the step-up guard (ADR-0073) on every operation it governs,
+/// from the route table itself — so the spec cannot drift from what the
+/// guard enforces: each crown jewel (and each conditional one) can answer
+/// `403 step_up_required` with a [`step_up::StepUpRefusal`] body, a machine
+/// caller `429` when it has too many requests waiting, and a conditional
+/// Environment write `409` when the state changed under it.
+struct StepUpResponses;
+
+impl utoipa::Modify for StepUpResponses {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        use axum::http::Method;
+        use utoipa::openapi::{ContentBuilder, Ref, RefOr, ResponseBuilder};
+        const STEP_UP: &str = "`step_up_required` (ADR-0073): a crown-jewel operation needs a \
+             fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` \
+             or `action`; `enroll` when there is no passkey yet). An API token or a Bearer \
+             session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its \
+             human confirms.";
+        const TOO_MANY: &str = "an API token or Bearer session already has 10 step-up \
+             confirmation requests waiting (ADR-0073 §6)";
+        const CHANGED: &str = "the governed state changed between this request's read and its \
+             write (reload and retry), or the request conflicts with the current state";
+        let plain = |d: &str| RefOr::T(ResponseBuilder::new().description(d).build());
+        for entry in route_table() {
+            let conditional = matches!(entry.op.class, step_up::Class::Conditional { .. });
+            if !(conditional || matches!(entry.op.class, step_up::Class::CrownJewel(_))) {
+                continue;
+            }
+            let Some(item) = openapi.paths.paths.get_mut(entry.path) else {
+                continue;
+            };
+            let op = match entry.method {
+                Method::POST => item.post.as_mut(),
+                Method::PUT => item.put.as_mut(),
+                Method::DELETE => item.delete.as_mut(),
+                _ => None,
+            };
+            let Some(op) = op else { continue };
+            let refusal = ContentBuilder::new()
+                .schema(Some(Ref::from_schema_name("StepUpRefusal")))
+                .build();
+            let responses = &mut op.responses.responses;
+            match responses.get_mut("403") {
+                Some(RefOr::T(resp)) => {
+                    if !resp.description.contains("step_up_required") {
+                        resp.description = format!("{} — or {STEP_UP}", resp.description);
+                    }
+                    resp.content
+                        .entry("application/json".to_string())
+                        .or_insert(refusal);
+                }
+                Some(RefOr::Ref(_)) => {}
+                None => {
+                    let resp = ResponseBuilder::new()
+                        .description(format!("{STEP_UP} Or the caller's role is insufficient."))
+                        .content("application/json", refusal)
+                        .build();
+                    responses.insert("403".to_string(), RefOr::T(resp));
+                }
+            }
+            responses
+                .entry("429".to_string())
+                .or_insert_with(|| plain(TOO_MANY));
+            if conditional {
+                responses
+                    .entry("409".to_string())
+                    .or_insert_with(|| plain(CHANGED));
+            }
+        }
+    }
+}
+
 /// The generated OpenAPI document. The pipeline request schema is the IR subset.
 #[derive(OpenApi)]
 #[openapi(
-    modifiers(&TagGroups, &SecuritySchemes),
+    modifiers(&TagGroups, &SecuritySchemes, &StepUpResponses),
     paths(
         healthz,
         readyz,
@@ -10607,7 +10700,15 @@ impl utoipa::Modify for SecuritySchemes {
         step_up::ceremony::passkey_registration,
         step_up::ceremony::remove_passkey,
         step_up::ceremony::step_up_options,
-        step_up::ceremony::step_up_confirm
+        step_up::ceremony::step_up_confirm,
+        step_up::requests::get_request,
+        step_up::requests::request_options,
+        step_up::requests::confirm_request,
+        step_up::events::my_security_events,
+        step_up::events::security_events,
+        step_up::events::org_security_events,
+        step_up::events::org_security_summary,
+        step_up::admin::reset_member_passkeys
     ),
     components(schemas(
         CreateRunRequest,
@@ -10716,7 +10817,13 @@ impl utoipa::Modify for SecuritySchemes {
         step_up::ceremony::PasskeyRegistrationOptionsRequest,
         step_up::ceremony::PasskeyRegistrationRequest,
         step_up::ceremony::StepUpConfirmRequest,
-        step_up::ceremony::StepUpConfirmResponse
+        step_up::ceremony::StepUpConfirmResponse,
+        step_up::requests::StepUpRequestDto,
+        step_up::requests::StepUpRequestResultDto,
+        step_up::events::SecurityEventDto,
+        step_up::events::SecurityEventsResponse,
+        step_up::events::OrgSecuritySummary,
+        step_up::admin::PasskeyResetDto
     ))
 )]
 pub struct ApiDoc;

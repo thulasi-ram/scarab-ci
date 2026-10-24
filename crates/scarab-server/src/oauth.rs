@@ -569,6 +569,12 @@ impl OAuthAuthenticator {
         }
     }
 
+    /// The configured bootstrap owners entries (ids, or matchers by verified
+    /// email) — counted as admins by the ADR-0073 Org security summary.
+    pub fn owners(&self) -> &[String] {
+        &self.cfg.owners
+    }
+
     /// The C1 global bootstrap role `subject` holds **right now**, decided by
     /// subject match against the configured owners (ADR-0049 amendment).
     ///

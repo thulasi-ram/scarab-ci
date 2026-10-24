@@ -1,7 +1,10 @@
 //! Step-up confirmation (ADR-0073): the route classification ([`ops`]), the
 //! guard that enforces it ([`guard`]), the one decision both the guard and
 //! the conditional handlers use ([`GuardCtx::require`]), and the passkey
-//! ceremony endpoints ([`ceremony`]).
+//! ceremony endpoints ([`ceremony`]); the StepUpConfirmationRequest a
+//! machine raises and its replay ([`requests`]); the OrgSecurityEventLog API
+//! ([`events`]); and the passkey resets — an Owner's, and the operator's
+//! break-glass that no route reaches ([`admin`]).
 //!
 //! A StepUpConfirmation is a WebAuthn assertion a human makes in a browser
 //! session. A **window** confirmation covers that cookie session's
@@ -10,9 +13,12 @@
 //! operation, identified by its digest, once. An API token or a session
 //! presented as `Bearer` never satisfies either.
 
+pub mod admin;
 pub mod ceremony;
+pub mod events;
 pub mod guard;
 pub mod ops;
+pub mod requests;
 
 use std::sync::{Arc, Mutex};
 
@@ -140,6 +146,7 @@ impl StepUpService {
         session_hash: &str,
         purpose: ChallengePurpose,
         digest: Option<[u8; 32]>,
+        request_id: Option<String>,
         label: Option<String>,
         summary: Option<serde_json::Value>,
         now: i64,
@@ -152,7 +159,7 @@ impl StepUpService {
             purpose,
             nonce: nonce.to_vec(),
             action_digest: digest.map(|d| d.to_vec()),
-            request_id: None,
+            request_id,
             label,
             summary,
             created_at: now,
@@ -213,7 +220,9 @@ pub(crate) fn store_err(e: scarab_identity::IdentityError) -> ApiError {
     ApiError::Db(scarab_engine::DbError::Other(format!("step-up store: {e}")))
 }
 
-/// A fresh event row; the caller fills in the links it has.
+/// A fresh event row; the caller fills in the links it has. An event made
+/// while a StepUpConfirmationRequest is being replayed is linked to that
+/// request here, so no replayed operation's event can miss the link.
 pub(crate) fn event(
     kind: &str,
     subject: &str,
@@ -232,7 +241,7 @@ pub(crate) fn event(
         op: None,
         target: None,
         confirmation_id: None,
-        request_id: None,
+        request_id: requests::replay_authority().map(|a| a.request_id.clone()),
         passkey_id: None,
         session_hash: None,
         detail: serde_json::json!({}),
@@ -295,6 +304,8 @@ const MSG_ENROLL: &str = "This needs a step-up confirmation, and you have no pas
      enroll one first (from a browser login made in the last 5 minutes).";
 const MSG_MACHINE: &str = "This needs a step-up confirmation by a human with a passkey. An API \
      token or a session presented as Bearer can never give one.";
+const MSG_REPLAY_MISMATCH: &str = "This is not the operation that was confirmed: a confirmed \
+     request runs exactly once, exactly as it was raised.";
 const MSG_PLUGIN: &str = "This needs a step-up confirmation by a human with a passkey; a plugin \
      has no human and cannot raise one.";
 
@@ -319,14 +330,12 @@ pub(crate) struct Prepared {
     pub(crate) org: Option<String>,
     pub(crate) summary: OpSummary,
     pub(crate) digest: [u8; 32],
-    // The raw request, kept for a StepUpConfirmationRequest (ADR-0073 C5).
-    #[allow(dead_code)]
+    // The raw request, kept for a StepUpConfirmationRequest (ADR-0073 §6):
+    // the concrete path, the raw query and the body bytes exactly as sent,
+    // so a replay rebuilds a request with the same digest.
     pub(crate) method: String,
-    #[allow(dead_code)]
     pub(crate) path: String,
-    #[allow(dead_code)]
     pub(crate) query: String,
-    #[allow(dead_code)]
     pub(crate) body: Bytes,
 }
 
@@ -354,6 +363,15 @@ impl GuardCtx {
 
     pub(crate) fn ticket(&self) -> Ticket {
         self.ticket.lock().unwrap().clone()
+    }
+
+    /// The StepUpConfirmation that authorised this operation, once it has —
+    /// what a handler links its own event to.
+    pub(crate) fn confirmation_id(&self) -> Option<String> {
+        match self.ticket() {
+            Ticket::Authorised(id) => id,
+            _ => None,
+        }
     }
 
     /// The change is a crown jewel: demand a step-up, failing closed.
@@ -443,6 +461,25 @@ pub(crate) async fn require(
         expires_at: None,
     };
 
+    // A StepUpConfirmationRequest being replayed (ADR-0073 §6): its human
+    // confirmed exactly one operation and one digest. Nothing else — another
+    // operation, or the same one with any byte changed — is satisfied, so a
+    // request can never be widened. (The task-local is set only by the
+    // confirm endpoint, around its own replay; no request can set it.)
+    if let Some(authority) = requests::replay_authority() {
+        if authority.op_id == op.id && authority.digest.as_slice() == p.digest.as_slice() {
+            return Ok(Some(authority.confirmation_id.clone()));
+        }
+        return refuse(
+            st,
+            op,
+            p,
+            refusal(MSG_REPLAY_MISMATCH, mode.as_str()),
+            "replay does not match the confirmed request",
+        )
+        .await;
+    }
+
     // An API token, a session presented as Bearer, or (fail-closed) a
     // caller with no session at all: a window or action confirmation never
     // stands for it (ADR-0073 §5, §7).
@@ -451,11 +488,12 @@ pub(crate) async fn require(
             // A PluginPrincipal has no human: no request, ever.
             return refuse(st, op, p, refusal(MSG_PLUGIN, mode.as_str()), "plugin").await;
         }
-        // SEAM (ADR-0073 C5): an API token or a Bearer session raises a
-        // StepUpConfirmationRequest here — sealed body, digest, redacted
-        // summary, for its human — and the refusal carries
-        // `confirmation_url`, `request_id` and `expires_at`. Until then it is
-        // a plain refusal, which is fail-closed.
+        // An API token or a Bearer session raises a StepUpConfirmationRequest
+        // for its human, and the refusal carries the one-time link.
+        if let Some(requester) = requests::requester_of(caller) {
+            let r = refusal(MSG_MACHINE, mode.as_str());
+            return requests::raise(st, op, p, summary, requester, r).await;
+        }
         return refuse(st, op, p, refusal(MSG_MACHINE, mode.as_str()), "machine").await;
     }
     let session = caller
@@ -508,6 +546,7 @@ pub(crate) async fn require(
             purpose,
             digest,
             None,
+            None,
             Some(serde_json::json!({ "op": op.id, "summary": summary })),
             now,
         )
@@ -530,6 +569,18 @@ async fn refuse<T>(
     refusal: StepUpRefusal,
     reason: &str,
 ) -> Result<T, ApiError> {
+    refuse_with(st, op, p, refusal, reason, None).await
+}
+
+/// [`refuse`], linked to the StepUpConfirmationRequest it raised.
+pub(crate) async fn refuse_with<T>(
+    st: &AppState,
+    op: &'static Op,
+    p: &Prepared,
+    refusal: StepUpRefusal,
+    reason: &str,
+    request_id: Option<String>,
+) -> Result<T, ApiError> {
     let now = st.clock.now().await.0;
     let mut ev = event(
         kind::STEP_UP_REFUSED,
@@ -542,6 +593,9 @@ async fn refuse<T>(
     ev.target = Some(refusal.summary.target.clone());
     ev.session_hash = p.caller.session.as_ref().map(|s| s.id_hash.clone());
     ev.detail = serde_json::json!({ "mode": refusal.mode, "reason": reason });
+    if request_id.is_some() {
+        ev.request_id = request_id;
+    }
     p.svc.record(ev).await;
     Err(ApiError::StepUpRequired(Box::new(refusal)))
 }

@@ -83,7 +83,7 @@
 //! `SCARAB_SERVER`/`SCARAB_TOKEN` belong to `scarab` (the CLI client).
 
 use base64::Engine;
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
 
 /// Which slice(s) of Scarab this process should run.
@@ -178,7 +178,7 @@ pub struct Cli {
     /// Postgres connection URL. Mandatory for every serving role (ADR-0048):
     /// Postgres is the durable core and the coordination bus — there is no
     /// API-only mode. `--emit-openapi` is the only DB-free path.
-    #[arg(long, env = "SCARAB_DATABASE_URL")]
+    #[arg(long, env = "SCARAB_DATABASE_URL", global = true)]
     pub database_url: Option<String>,
 
     /// Local directory backing the object store (logs/artifacts) — a bucket
@@ -201,6 +201,43 @@ pub struct Cli {
     /// codegen / CI spec check). Never connects to Postgres or serves.
     #[arg(long, value_name = "PATH")]
     pub emit_openapi: Option<String>,
+
+    /// An operator command instead of serving. Each runs against the
+    /// database directly and exits; none is reachable over HTTP or from the
+    /// `scarab` CLI.
+    #[command(subcommand)]
+    pub command: Option<ServerCommand>,
+}
+
+/// `scarab-server <command>`: operator tooling that needs the server's own
+/// database credentials.
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum ServerCommand {
+    /// Operator break-glass commands (ADR-0073 §10).
+    Admin {
+        #[command(subcommand)]
+        command: AdminCommand,
+    },
+}
+
+/// `scarab-server admin <command>`.
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum AdminCommand {
+    /// Remove EVERY passkey of a principal and revoke its standing
+    /// step-ups, for when no Owner can step up to reset them. Needs only
+    /// `--database-url` / `SCARAB_DATABASE_URL`; never migrates (refuses a
+    /// schema older than the security event log). Recorded in the
+    /// OrgSecurityEventLog as `passkey.break_glass_reset` with this host,
+    /// OS user and reason. The principal's next passkey needs a fresh
+    /// browser login.
+    ResetPasskeys {
+        /// The principal id (a merged id is followed to its Principal).
+        #[arg(long)]
+        principal: String,
+        /// Why — recorded with the reset.
+        #[arg(long)]
+        reason: Option<String>,
+    },
 }
 
 /// S3/MinIO object-store settings (selected by `SCARAB_S3_BUCKET`).
@@ -2131,6 +2168,7 @@ mod tests {
             namespace: "scarab".into(),
             executor: ExecutorKind::K8s,
             emit_openapi: None,
+            command: None,
         }
     }
 
@@ -3567,5 +3605,37 @@ connections:
     fn no_login_provider_may_mint_plugin_principal_ids() {
         assert!(!is_provider_id("plugin"));
         assert!(is_provider_id("plugins"));
+    }
+
+    /// ADR-0073 §10: the break-glass is a server-binary subcommand that
+    /// needs only the database URL — given before or after the subcommand.
+    #[test]
+    fn the_break_glass_parses_with_only_a_database_url() {
+        let cli = Cli::try_parse_from([
+            "scarab-server",
+            "admin",
+            "reset-passkeys",
+            "--principal",
+            "github:42",
+            "--reason",
+            "lost laptop",
+            "--database-url",
+            "postgres://db/scarab",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.command,
+            Some(ServerCommand::Admin {
+                command: AdminCommand::ResetPasskeys {
+                    principal: "github:42".into(),
+                    reason: Some("lost laptop".into()),
+                }
+            })
+        );
+        assert_eq!(cli.database_url.as_deref(), Some("postgres://db/scarab"));
+        // A principal is mandatory.
+        assert!(Cli::try_parse_from(["scarab-server", "admin", "reset-passkeys"]).is_err());
+        // No subcommand: serve, as before.
+        assert_eq!(Cli::try_parse_from(["scarab-server"]).unwrap().command, None);
     }
 }

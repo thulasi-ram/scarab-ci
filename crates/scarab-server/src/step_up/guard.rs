@@ -181,12 +181,14 @@ pub async fn guard_with(table: &[RouteEntry], st: AppState, req: Request, next: 
         return resp;
     }
 
-    // A crown jewel: confirmed before the handler runs.
+    // A crown jewel: confirmed before the handler runs. The handler may
+    // read the GuardCtx to link its own event to the confirmation.
     let confirmation = match super::authorise(&st, op, &prepared, &summary).await {
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
     *ctx.ticket.lock().unwrap() = Ticket::Authorised(confirmation.clone());
+    req.extensions_mut().insert(ctx.clone());
     let resp = next.run(req).await;
     completed(&st, op, &prepared, confirmation, resp.status()).await;
     resp
