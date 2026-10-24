@@ -128,6 +128,7 @@ export default function ConfirmRequest() {
                 <dt>request</dt>
                 <dd class="mono">
                   {r().method} {r().path}
+                  {r().query ? `?${r().query}` : ""}
                 </dd>
                 <dt>requested by</dt>
                 <dd>{r().requested_by}</dd>

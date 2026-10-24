@@ -282,12 +282,12 @@ fn path_params(pattern: &str, path: &str) -> Vec<(String, String)> {
     for p in pattern.trim_start_matches('/').split('/') {
         if let Some(name) = p.strip_prefix("{*").and_then(|n| n.strip_suffix('}')) {
             let rest: Vec<&str> = segs.by_ref().collect();
-            out.push((name.to_string(), percent_decode(&rest.join("/"))));
+            out.push((name.to_string(), percent_decode(&rest.join("/"), false)));
             break;
         }
         let seg = segs.next().unwrap_or_default();
         if let Some(name) = p.strip_prefix('{').and_then(|n| n.strip_suffix('}')) {
-            out.push((name.to_string(), percent_decode(seg)));
+            out.push((name.to_string(), percent_decode(seg, false)));
         }
     }
     out
@@ -301,32 +301,32 @@ fn sorted_query(raw: &str) -> Vec<(String, String)> {
         .filter(|p| !p.is_empty())
         .map(|p| {
             let (k, v) = p.split_once('=').unwrap_or((p, ""));
-            (percent_decode(k), percent_decode(v))
+            (percent_decode(k, true), percent_decode(v, true))
         })
         .collect();
     pairs.sort();
     pairs
 }
 
-/// `application/x-www-form-urlencoded` decoding (`+` is a space). Invalid
-/// escapes are kept literally.
-fn percent_decode(s: &str) -> String {
+/// Percent-decoding: a `%` followed by exactly two hex digits is a byte;
+/// any other `%` is kept literally. `plus_is_space` is the query's
+/// `application/x-www-form-urlencoded` rule; a path segment (RFC 3986, as
+/// axum's `Path` decodes it) keeps its `+`.
+fn percent_decode(s: &str, plus_is_space: bool) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'+' => out.push(b' '),
-            b'%' if i + 2 < bytes.len() => {
-                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
-                match hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
-                    Some(b) => {
-                        out.push(b);
-                        i += 3;
-                        continue;
-                    }
-                    None => out.push(b'%'),
-                }
+            b'+' if plus_is_space => out.push(b' '),
+            b'%' if i + 2 < bytes.len()
+                && bytes[i + 1].is_ascii_hexdigit()
+                && bytes[i + 2].is_ascii_hexdigit() =>
+            {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("00");
+                out.push(u8::from_str_radix(hex, 16).unwrap_or(0));
+                i += 3;
+                continue;
             }
             b => out.push(b),
         }
@@ -438,8 +438,27 @@ mod tests {
 
     #[test]
     fn percent_decoding_keeps_a_bad_escape_literally() {
-        assert_eq!(percent_decode("a%2Fb+c"), "a/b c");
-        assert_eq!(percent_decode("100%"), "100%");
-        assert_eq!(percent_decode("%zz"), "%zz");
+        assert_eq!(percent_decode("a%2Fb+c", true), "a/b c");
+        assert_eq!(percent_decode("100%", true), "100%");
+        assert_eq!(percent_decode("%zz", true), "%zz");
+        assert_eq!(percent_decode("%+1", true), "% 1");
+    }
+
+    #[test]
+    fn a_signed_escape_is_not_a_byte() {
+        // `u8::from_str_radix` accepts a leading `+`: `%+1` must not decode
+        // to 0x01, or two different queries share one digest.
+        assert_ne!(sorted_query("a=%+1"), sorted_query("a=%01"));
+    }
+
+    #[test]
+    fn a_path_parameter_keeps_its_plus() {
+        assert_eq!(
+            path_params("/v1/orgs/{org}/plugins/{name}", "/v1/orgs/acme/plugins/argo+cd"),
+            vec![
+                ("org".to_string(), "acme".to_string()),
+                ("name".to_string(), "argo+cd".to_string())
+            ]
+        );
     }
 }

@@ -1384,6 +1384,7 @@ const stepUpRequest: components["schemas"]["StepUpRequestDto"] = {
   org: "acme",
   method: "POST",
   path: "/v1/orgs/acme/tokens",
+  query: "",
   summary: {
     operation: "Create an API token",
     target: "acme",

@@ -374,6 +374,9 @@ pub struct StepUpRequestDto {
     pub org: Option<String>,
     pub method: String,
     pub path: String,
+    /// The raw query string the operation runs with (empty = none) — part
+    /// of what runs, so the confirm page shows it.
+    pub query: String,
     /// `pending`, `executing`, `executed`, `failed` or `expired`.
     pub state: String,
     pub created_at: i64,
@@ -419,6 +422,7 @@ impl StepUpRequestDto {
             org: r.org.clone(),
             method: r.method.clone(),
             path: r.path.clone(),
+            query: r.query.clone(),
             state: r.state_label(now).to_string(),
             created_at: r.created_at,
             expires_at: r.expires_at,

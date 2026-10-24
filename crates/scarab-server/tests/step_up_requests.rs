@@ -861,6 +861,33 @@ async fn a_replay_within_the_confirmed_loosenings_still_runs() {
     assert!(protection(&gov).await.allowed_refs.is_empty());
 }
 
+/// A request shows its query: `DELETE …?unbind_repos=true` cascades to the
+/// connection's Projects, so its human must see the flag, not just "Delete
+/// a forge connection `gh`".
+#[tokio::test]
+async fn a_request_shows_the_query_it_runs_with() {
+    let (h, _secrets) = world(Backend::Memory).await;
+    let (amy, _soft) = amy_in_browser(&h).await;
+    let token = pat(&h, "t1", Scope::Org("acme".into()), Role::Admin).await;
+    let (st, b) = h
+        .bearer("DELETE", "/v1/connections/gh?unbind_repos=true", None, &token)
+        .await;
+    assert!(is_step_up(st, &b), "{st} {b}");
+    let id = b["request_id"].as_str().expect("a request").to_string();
+    let (st, seen) = h
+        .cookie("GET", &format!("/v1/step-up/requests/{id}"), None, &amy)
+        .await;
+    assert_eq!(st, StatusCode::OK, "{seen}");
+    assert_eq!(seen["query"], "unbind_repos=true", "{seen}");
+    assert!(
+        seen["summary"]["changes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("?unbind_repos = true")),
+        "{seen}"
+    );
+}
+
 /// Retention: expired challenges and confirmations go, an expired request's
 /// sealed body goes at once, a settled request goes after 30 days — and the
 /// event log is never touched.

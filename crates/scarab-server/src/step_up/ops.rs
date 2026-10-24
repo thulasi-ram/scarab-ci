@@ -206,40 +206,128 @@ impl Op {
     }
 }
 
-/// How long one rendered value may be in a summary line.
+/// How long one rendered value may be in a summary line before it is shown
+/// as head…tail.
 const MAX_CHANGE_VALUE: usize = 200;
+/// How much of each end of a long value is shown.
+const CHANGE_VALUE_END: usize = 96;
 
 /// The default description: the label; the target from [`Op::target`]; one
-/// `field = value` line per top-level body field (sorted, redacted fields
-/// already `(hidden)`).
+/// `field = value` line per body leaf (nested objects flattened to
+/// `a.b = c`, sorted, redacted fields already `(hidden)`); for a URL value
+/// a `field host = …` line too; and one `?key = value` line per query
+/// parameter the target does not already name. Every value is escaped so no
+/// control or bidi character reaches the human, and a long value keeps its
+/// end visible (a URL is never cut).
 pub fn describe_generic(op: &Op, input: &OpInput) -> OpSummary {
     let target: Vec<String> = op.target.iter().filter_map(|s| input.source(s)).collect();
     let mut changes = Vec::new();
     if let Value::Object(map) = &input.body {
-        let mut keys: Vec<&String> = map.keys().collect();
-        keys.sort();
-        for k in keys {
-            let v = &map[k];
-            let mut rendered = match v {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-            if rendered.len() > MAX_CHANGE_VALUE {
-                let mut cut = MAX_CHANGE_VALUE;
-                while !rendered.is_char_boundary(cut) {
-                    cut -= 1;
-                }
-                rendered.truncate(cut);
-                rendered.push('…');
-            }
-            changes.push(format!("{k} = {rendered}"));
+        flatten(map, "", &mut changes);
+    }
+    let named: Vec<&str> = op
+        .target
+        .iter()
+        .filter_map(|s| s.strip_prefix("query:"))
+        .collect();
+    for (k, v) in &input.query {
+        if !named.contains(&k.as_str()) {
+            leaf_lines(&format!("?{}", escape_invisible(k)), v, &mut changes);
         }
     }
     OpSummary {
         operation: op.label.to_string(),
-        target: target.join("/"),
+        target: escape_invisible(&target.join("/")),
         changes,
     }
+}
+
+/// One line per leaf of `map`, keys sorted, under `prefix`.
+fn flatten(map: &serde_json::Map<String, Value>, prefix: &str, out: &mut Vec<String>) {
+    let mut keys: Vec<&String> = map.keys().collect();
+    keys.sort();
+    for k in keys {
+        let key = format!("{prefix}{}", escape_invisible(k));
+        match &map[k] {
+            Value::Object(inner) if !inner.is_empty() => flatten(inner, &format!("{key}."), out),
+            Value::String(s) => leaf_lines(&key, s, out),
+            other => out.push(format!("{key} = {}", long_value(&other.to_string()))),
+        }
+    }
+}
+
+/// The line(s) for one string value: a URL in full plus its host, anything
+/// else head…tail when long.
+fn leaf_lines(key: &str, v: &str, out: &mut Vec<String>) {
+    if v.starts_with("http://") || v.starts_with("https://") {
+        out.push(format!("{key} = {}", escape_invisible(v)));
+        let (host, userinfo) = url_host(v);
+        let note = if userinfo { " (URL carries userinfo)" } else { "" };
+        out.push(format!("{key} host = {}{note}", escape_invisible(host)));
+    } else {
+        out.push(format!("{key} = {}", long_value(v)));
+    }
+}
+
+/// The host of an `http(s)://` URL (the authority after its last `@`, port
+/// stripped) and whether the authority carries userinfo. Parsed by hand: no
+/// URL crate for one line of a summary.
+pub(crate) fn url_host(url: &str) -> (&str, bool) {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let (host_port, userinfo) = match authority.rsplit_once('@') {
+        Some((_, h)) => (h, true),
+        None => (authority, false),
+    };
+    let host = if host_port.starts_with('[') {
+        host_port
+            .find(']')
+            .map_or(host_port, |i| &host_port[..=i])
+    } else {
+        host_port.split(':').next().unwrap_or_default()
+    };
+    (host, userinfo)
+}
+
+/// `v` escaped; over [`MAX_CHANGE_VALUE`] characters, its first and last
+/// [`CHANGE_VALUE_END`] characters and its length — the end of a value is
+/// where a padded host or a swapped suffix would hide.
+fn long_value(v: &str) -> String {
+    let n = v.chars().count();
+    if n <= MAX_CHANGE_VALUE {
+        return escape_invisible(v);
+    }
+    let head: String = v.chars().take(CHANGE_VALUE_END).collect();
+    let tail: String = v.chars().skip(n - CHANGE_VALUE_END).collect();
+    format!(
+        "{}…{} ({} bytes)",
+        escape_invisible(&head),
+        escape_invisible(&tail),
+        v.len()
+    )
+}
+
+/// `s` with every control character and every invisible / bidi-override
+/// character written as `\u{XXXX}`, so what the human reads is what runs.
+pub fn escape_invisible(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let invisible = c.is_control()
+            || matches!(
+                c,
+                '\u{200B}'..='\u{200F}'
+                    | '\u{202A}'..='\u{202E}'
+                    | '\u{2060}'..='\u{2064}'
+                    | '\u{2066}'..='\u{2069}'
+                    | '\u{FEFF}'
+            );
+        if invisible {
+            out.push_str(&format!("\\u{{{:04X}}}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// The marker a redacted field reads as.
@@ -944,6 +1032,70 @@ mod tests {
     fn long_values_are_cut_on_a_char_boundary() {
         let body = json!({"x": "é".repeat(300)});
         let s = describe_generic(&READ, &input(body));
-        assert!(s.changes[0].ends_with('…'));
+        assert!(s.changes[0].contains('…'), "{:?}", s.changes);
+        assert!(s.changes[0].ends_with("(600 bytes)"), "{:?}", s.changes);
+    }
+
+    fn changes(body: Value) -> Vec<String> {
+        describe_generic(&READ, &input(body)).changes
+    }
+
+    #[test]
+    fn a_long_url_is_shown_in_full_with_its_host() {
+        let url = format!("https://{}attacker.net/", "a".repeat(300));
+        let c = changes(json!({ "base_url": url }));
+        assert!(c[0].contains("attacker.net"), "{c:?}");
+        assert!(c.iter().any(|l| l == &format!("base_url host = {}attacker.net", "a".repeat(300))));
+    }
+
+    #[test]
+    fn a_long_plain_value_keeps_its_end_visible() {
+        let v = format!("{}TAIL", "x".repeat(300));
+        let c = changes(json!({ "name": v }));
+        assert!(c[0].contains("TAIL"), "{c:?}");
+    }
+
+    #[test]
+    fn a_bidi_override_is_escaped() {
+        let c = changes(json!({ "name": "evil\u{202E}txt.exe" }));
+        assert!(c[0].contains("\\u{202E}"), "{c:?}");
+        assert!(!c[0].contains('\u{202E}'), "{c:?}");
+        let mut op_input = input(Value::Null);
+        op_input.params = vec![("org".into(), "a\u{1b}[31mb".into())];
+        let s = describe_generic(&BINDING_PUT, &op_input);
+        assert!(!s.target.contains('\u{1b}'), "{}", s.target);
+        assert!(s.target.contains("\\u{001B}"), "{}", s.target);
+    }
+
+    #[test]
+    fn userinfo_cannot_disguise_a_url_s_host() {
+        let url = format!(
+            "https://hooks.acme.example{}@evil.example/x",
+            "z".repeat(190)
+        );
+        let c = changes(json!({ "base_url": url }));
+        assert!(
+            c.iter()
+                .any(|l| l == "base_url host = evil.example (URL carries userinfo)"),
+            "{c:?}"
+        );
+    }
+
+    #[test]
+    fn a_nested_body_is_flattened_to_its_leaves() {
+        assert_eq!(changes(json!({"a": {"b": "c"}})), vec!["a.b = c"]);
+    }
+
+    #[test]
+    fn query_parameters_are_shown_unless_the_target_names_them() {
+        let mut i = input(Value::Null);
+        i.query = vec![
+            ("org".into(), "acme".into()),
+            ("unbind_repos".into(), "true".into()),
+        ];
+        let c = describe_generic(&CONNECTION_DELETE, &i).changes;
+        assert_eq!(c, vec!["?org = acme", "?unbind_repos = true"]);
+        let c = describe_generic(&SECRET_DELETE, &i).changes;
+        assert_eq!(c, vec!["?unbind_repos = true"], "org is a target source");
     }
 }
