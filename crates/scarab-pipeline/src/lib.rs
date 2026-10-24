@@ -1596,6 +1596,36 @@ fn inline_level(
         let resolved = inline_level(&lib.steps, libs, stack, diagnostics);
         stack.pop();
 
+        // Inside the library, `${{ inputs.<n> }}` in a DeploymentTarget names
+        // one of the LIBRARY's inputs (bound below). One the library does not
+        // declare would survive inlining and bind silently to the caller's
+        // launch input of that name — refused instead (git-bug bbbf618). A
+        // nested library's targets were bound at its own level, so what is
+        // left here is this library's to answer for.
+        for ls in &resolved {
+            let gate_target = ls.deployment.as_ref().and_then(|r| r.target.as_ref());
+            for target in ls
+                .deployment_requests
+                .iter()
+                .map(|req| &req.target)
+                .chain(gate_target)
+            {
+                for (part, text) in [("source", &target.source), ("id", &target.id)] {
+                    if let Some(name) = deployment_target_input(text) {
+                        if !lib.interface.inputs.iter().any(|p| p.name == name) {
+                            diagnostics.push(format!(
+                                "step `{}`: library `{key}` step `{}` deployment request target \
+                                 `{part}` reads `inputs.{name}`, which the library does not \
+                                 declare (declare it under the library's `interface.inputs` \
+                                 and pass it with `with:`)",
+                                step.id, ls.id
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
         // `matrix` × `invoke` (ADR-0038): a matrix on the invoke step fans out N
         // copies of the whole subgraph, once per coordinate. `expand_step` gives
         // the coordinate instances (id `deploy[svc=api]`, `matrix_values` set,
@@ -5472,6 +5502,49 @@ mod tests {
         let bump = ir.steps.iter().find(|s| s.id == "deploy/bump").unwrap();
         assert_eq!(bump.deployment_requests.len(), 1);
         assert_eq!(bump.deployment_requests[0].target.id, "web");
+    }
+
+    /// git-bug bbbf618: inside a library, `${{ inputs.<n> }}` names one of
+    /// the LIBRARY's inputs. One it does not declare is refused while
+    /// inlining — never left to bind silently to the caller's launch input of
+    /// the same name. A caller's `with:` that passes its own launch input
+    /// through still binds.
+    #[test]
+    fn a_library_target_naming_no_library_input_is_refused() {
+        let lib = r#"
+            interface:
+              inputs: [app]
+            steps:
+              - id: bump
+                image: busybox
+                results: [version]
+                deployment_requests:
+                  - { target: { source: argocd-prod, id: "${{ inputs.region }}" }, version: version }
+        "#;
+        let caller = r#"
+            environment: prod
+            interface:
+              inputs: [region]
+            steps:
+              - { id: deploy, invoke: .scarab/lib/deploy.yaml, with: { app: web } }
+            "#;
+        let ds = errors_with(caller, &libs(&[(".scarab/lib/deploy.yaml", lib)]));
+        assert!(
+            ds.iter().any(|d| d.contains("`deploy`")
+                && d.contains("inputs.region")
+                && d.contains(".scarab/lib/deploy.yaml")),
+            "{ds:?}"
+        );
+
+        // Passing the caller's launch input through the library's own input
+        // is the way to reach it.
+        let through = lib.replace("inputs.region", "inputs.app");
+        let ir = compile_with(
+            &caller.replace("with: { app: web }", r#"with: { app: "${{ inputs.region }}" }"#),
+            &libs(&[(".scarab/lib/deploy.yaml", &through)]),
+        );
+        let bump = ir.steps.iter().find(|s| s.id == "deploy/bump").unwrap();
+        assert_eq!(bump.deployment_requests[0].target.id, "${{ inputs.region }}");
     }
 
     // --- DeploymentGate (ADR-0070 §8, slice b criterion 2) -------------------
