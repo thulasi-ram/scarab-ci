@@ -559,7 +559,11 @@ pub(crate) async fn require(
     // caller with no session at all: a window or action confirmation never
     // stands for it (ADR-0073 §5, §7).
     if !caller.is_browser_session() {
-        if caller.principal.subject.starts_with("plugin:") {
+        if caller
+            .principal
+            .subject
+            .starts_with(scarab_plugin::PLUGIN_PRINCIPAL_PREFIX)
+        {
             // A PluginPrincipal has no human: no request, ever.
             return refuse(st, op, p, refusal(MSG_PLUGIN, mode.as_str()), "plugin").await;
         }

@@ -246,6 +246,7 @@ async fn tripwire(st: &AppState, ctx: &GuardCtx, p: Option<&Prepared>, status: S
         );
         ev.op = Some(ctx.op.id.to_string());
         ev.target = Some(p.summary.target.clone());
+        ev.session_hash = p.caller.session.as_ref().map(|s| s.id_hash.clone());
         ev.detail = serde_json::json!({ "status": status.as_u16() });
         p.svc.record(ev).await;
     }

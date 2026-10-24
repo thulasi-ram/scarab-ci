@@ -343,8 +343,6 @@ pub(crate) async fn replay_caller(st: &AppState, a: &ReplayAuthority) -> Result<
                 session: Some(SessionFacts {
                     id: sid.clone(),
                     id_hash: crate::session_hash(&session.id),
-                    created_at: session.created_at,
-                    login_kind: session.login_kind.clone(),
                     fresh_login_until: None,
                 }),
             })

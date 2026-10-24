@@ -106,5 +106,4 @@ libc = "0.2"
 [dev-dependencies]
 # ADR-0073 tests: a software passkey (a true external — the authenticator).
 scarab-webauthn = { workspace = true, features = ["soft-authenticator"] }
-regex-lite = { workspace = true }
 tempfile = { workspace = true }
