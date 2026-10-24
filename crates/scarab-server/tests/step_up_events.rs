@@ -610,6 +610,34 @@ async fn bootstrap_owners_are_counted_only_for_a_global_caller() {
     assert_eq!(sum["admins_without_passkey"], json!(["root"]), "{sum}");
 }
 
+/// git-bug 08d676d: an owners entry that only matches a verified email
+/// names no Principal, so no passkey is ever stored under it: it is not
+/// counted as an admin without a passkey (for good), but reported apart.
+#[tokio::test]
+async fn an_email_owners_entry_is_reported_apart_not_counted() {
+    let ids = Arc::new(scarab_testkit::InMemoryIdentities::new());
+    for handle in ["root", "bob"] {
+        ids.sign_in(&identity("default", handle, handle), handle, T0)
+            .await
+            .unwrap();
+    }
+    let wired = ids.clone();
+    let h = harness_with(move |st| {
+        st.with_oauth_login(provider_with_owners(&["root", "boss@acme.test", "bob"]))
+            .with_identities(wired as Arc<dyn IdentityStore>)
+    });
+    let bob = h.browser_session(scoped("bob")).await;
+    h.enroll(&bob, &mut passkey(), "bob's key").await;
+    let amy = h.browser_session(owner("amy")).await;
+    let (st, sum) = h
+        .cookie("GET", "/v1/orgs/acme/security/summary", None, &amy)
+        .await;
+    assert_eq!(st, StatusCode::OK, "{sum}");
+    assert_eq!(sum["admins_total"], 2, "root and bob: {sum}");
+    assert_eq!(sum["admins_without_passkey"], json!(["root"]), "{sum}");
+    assert_eq!(sum["unresolved_owner_entries"], 1, "{sum}");
+}
+
 /// mallory, Owner of `evil`, binds the install owner `root` as a Viewer of
 /// `evil` and resets root's passkeys with her own always-ask confirmation.
 /// Returns the status and body of the confirmed reset.

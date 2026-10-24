@@ -962,15 +962,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 rp,
             ));
             // "step-up enforced; N admins have no passkey" (ADR-0073 §8):
-            // every Admin/Owner binding holder plus the bootstrap owners,
-            // minus those holding a usable passkey.
+            // every Admin/Owner binding holder plus the Principals the
+            // bootstrap owners entries name, minus those holding a usable
+            // passkey. An entry that only matches a verified email is
+            // reported on its own line, never counted (git-bug 08d676d).
             let mut admins = pg.admin_subjects().await.unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "step-up: could not list admins for the boot count");
                 Default::default()
             });
-            for provider in &config.oauth {
-                admins.extend(provider.owners.iter().cloned());
-            }
+            let entries: Vec<String> = config
+                .oauth
+                .iter()
+                .flat_map(|p| p.owners.iter().cloned())
+                .collect();
+            let owners = scarab_server::step_up::resolve_owner_entries(
+                Some(pg.as_ref() as &dyn scarab_identity::IdentityStore),
+                &entries,
+            )
+            .await;
+            admins.extend(owners.principals);
             let admins: Vec<String> = admins.into_iter().collect();
             let without =
                 scarab_server::step_up::admins_without_passkey(pg.as_ref(), &admins)
@@ -983,6 +993,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let line = scarab_server::step_up::step_up_boot_line(without);
             tracing::info!("startup: {line}");
             println!("startup: {line}");
+            if let Some(line) =
+                scarab_server::step_up::step_up_owner_matchers_line(owners.email_matchers.len())
+            {
+                tracing::info!("startup: {line}");
+                println!("startup: {line}");
+            }
         }
     }
     // Fail-closed composition (ADR-0073 §8): outside the dev escape hatch,

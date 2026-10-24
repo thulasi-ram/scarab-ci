@@ -8259,6 +8259,7 @@
           "enforced",
           "admins_without_passkey",
           "admins_total",
+          "unresolved_owner_entries",
           "recent_refusals",
           "pending_requests"
         ],
@@ -8298,6 +8299,12 @@
               "$ref": "#/components/schemas/SecurityEventDto"
             },
             "description": "The last 20 refusals in the Org, from the last 24 hours."
+          },
+          "unresolved_owner_entries": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bootstrap owners entries that match only a verified email at login\nand name no Principal: not counted above, since no passkey is ever\nstored under one (a global administrator's view; 0 otherwise).",
+            "minimum": 0
           }
         }
       },

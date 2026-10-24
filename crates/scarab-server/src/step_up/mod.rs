@@ -331,6 +331,62 @@ pub async fn admins_without_passkey(
         .collect())
 }
 
+/// The bootstrap owners entries, as admins a passkey can be counted for
+/// (git-bug 08d676d).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct OwnerEntries {
+    /// The Principals the entries name — a merged id followed to the live
+    /// Principal, under which its passkeys are stored; an id nobody has
+    /// signed in as yet kept as is (it holds no passkey, and will need one).
+    pub principals: std::collections::BTreeSet<String>,
+    /// Entries that match only a verified email at login (`a@b`,
+    /// `<provider>:a@b`) and name no Principal: no passkey is ever stored
+    /// under one, so counting them as admins without a passkey would count
+    /// them for good. Reported separately.
+    pub email_matchers: Vec<String>,
+}
+
+/// Split `entries` into [`OwnerEntries`]. A store error keeps the entry as
+/// is (the old, conservative count) rather than dropping it.
+pub async fn resolve_owner_entries(
+    identities: Option<&dyn scarab_identity::IdentityStore>,
+    entries: &[String],
+) -> OwnerEntries {
+    let mut out = OwnerEntries::default();
+    for entry in entries {
+        let resolved = match identities {
+            Some(store) => match scarab_identity::resolve_principal(store, entry).await {
+                Ok(found) => found,
+                Err(e) => {
+                    tracing::warn!(error = %e, entry = %entry, "step-up: could not resolve an owners entry");
+                    Some(entry.clone())
+                }
+            },
+            None => None,
+        };
+        match resolved {
+            Some(principal) => {
+                out.principals.insert(principal);
+            }
+            None if entry.contains('@') => out.email_matchers.push(entry.clone()),
+            None => {
+                out.principals.insert(entry.clone());
+            }
+        }
+    }
+    out
+}
+
+/// The boot log line for owners entries that only match by email, if any.
+pub fn step_up_owner_matchers_line(email_matchers: usize) -> Option<String> {
+    (email_matchers > 0).then(|| {
+        format!(
+            "step-up: {email_matchers} owners entries match by verified email only and are not \
+             counted above (a passkey is held by the Principal the human signs in as)"
+        )
+    })
+}
+
 /// The boot log line (ADR-0073 §8).
 pub fn step_up_boot_line(admins_without_passkey: usize) -> String {
     format!("step-up enforced; {admins_without_passkey} admins have no passkey")
@@ -864,6 +920,38 @@ mod tests {
         // The next window: the first recorded carries the two dropped.
         assert_eq!(l.admit(k, REFUSAL_WINDOW_MS), Some(2));
         assert_eq!(l.admit(k, REFUSAL_WINDOW_MS), Some(0));
+    }
+
+    #[tokio::test]
+    async fn owners_entries_resolve_to_principals_or_are_email_matchers() {
+        use scarab_identity::{IdentityStore, ProviderIdentity};
+        let ids = scarab_testkit::InMemoryIdentities::new();
+        let ident = |p: &str, x: &str, h: &str| ProviderIdentity {
+            provider: p.into(),
+            external_id: x.into(),
+            handle: h.into(),
+            email: None,
+            email_verified: false,
+            display_name: None,
+        };
+        // A Principal id may itself hold an `@`: it names the Principal.
+        ids.sign_in(&ident("gh", "1", "bob@home"), "bob@home", 0)
+            .await
+            .unwrap();
+        let entries: Vec<String> = ["bob@home", "boss@acme.test", "gh:x@y.z", "nobody-yet"]
+            .map(String::from)
+            .to_vec();
+        let got = resolve_owner_entries(Some(&ids), &entries).await;
+        assert_eq!(
+            got.principals.into_iter().collect::<Vec<_>>(),
+            vec!["bob@home".to_string(), "nobody-yet".to_string()]
+        );
+        assert_eq!(got.email_matchers, vec!["boss@acme.test", "gh:x@y.z"]);
+        // With no identity store, only the shape decides.
+        let got = resolve_owner_entries(None, &entries).await;
+        assert_eq!(got.email_matchers.len(), 3);
+        assert_eq!(got.principals.len(), 1);
+        assert_eq!(step_up_owner_matchers_line(0), None);
     }
 
     #[tokio::test]

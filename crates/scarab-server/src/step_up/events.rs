@@ -126,6 +126,10 @@ pub struct OrgSecuritySummary {
     /// passkey: every crown jewel is refused for them until they enroll one.
     pub admins_without_passkey: Vec<String>,
     pub admins_total: u64,
+    /// Bootstrap owners entries that match only a verified email at login
+    /// and name no Principal: not counted above, since no passkey is ever
+    /// stored under one (a global administrator's view; 0 otherwise).
+    pub unresolved_owner_entries: u64,
     /// The last 20 refusals in the Org, from the last 24 hours.
     pub recent_refusals: Vec<SecurityEventDto>,
     /// StepUpConfirmationRequests waiting for a human in this Org.
@@ -293,11 +297,14 @@ fn role_name(r: Role) -> String {
 /// global caller only, the bootstrap owners entries. Who the install's
 /// owners are, and which of them hold no passkey, is install posture: an Org
 /// admin must not learn it from their Org's summary.
+///
+/// Returns the admins and how many owners entries match only by email
+/// (not counted: no passkey is ever stored under one — git-bug 08d676d).
 async fn org_admins(
     st: &AppState,
     org: &str,
     include_owners: bool,
-) -> Result<BTreeSet<String>, ApiError> {
+) -> Result<(BTreeSet<String>, u64), ApiError> {
     let mut admins = BTreeSet::new();
     if let Some(rbac) = st.rbac.as_ref() {
         for b in rbac.bindings(org).await.map_err(store_err)? {
@@ -306,12 +313,18 @@ async fn org_admins(
             }
         }
     }
+    let mut email_matchers = 0;
     if include_owners {
-        for provider in &st.oauth_providers {
-            admins.extend(provider.owners().iter().cloned());
-        }
+        let entries: Vec<String> = st
+            .oauth_providers
+            .iter()
+            .flat_map(|p| p.owners().iter().cloned())
+            .collect();
+        let owners = super::resolve_owner_entries(st.identities.as_deref(), &entries).await;
+        admins.extend(owners.principals);
+        email_matchers = owners.email_matchers.len() as u64;
     }
-    Ok(admins)
+    Ok((admins, email_matchers))
 }
 
 /// What an Org's Security page shows.
@@ -338,7 +351,7 @@ pub(crate) async fn org_security_summary(
     if !(global || role.is_some_and(|r| r.allows(Action::Administer))) {
         return Err(ApiError::Forbidden);
     }
-    let admins = org_admins(&st, &org, global).await?;
+    let (admins, unresolved_owner_entries) = org_admins(&st, &org, global).await?;
     let admins_total = admins.len() as u64;
     let Some(svc) = st.step_up.service() else {
         return Ok(Json(OrgSecuritySummary {
@@ -346,6 +359,7 @@ pub(crate) async fn org_security_summary(
             caller_role: role.map(role_name),
             admins_without_passkey: vec![],
             admins_total,
+            unresolved_owner_entries,
             recent_refusals: vec![],
             pending_requests: 0,
         }));
@@ -380,6 +394,7 @@ pub(crate) async fn org_security_summary(
         caller_role: role.map(role_name),
         admins_without_passkey,
         admins_total,
+        unresolved_owner_entries,
         recent_refusals,
         pending_requests,
     }))

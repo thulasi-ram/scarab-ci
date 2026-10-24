@@ -3109,6 +3109,13 @@ export interface components {
             pending_requests: number;
             /** @description The last 20 refusals in the Org, from the last 24 hours. */
             recent_refusals: components["schemas"]["SecurityEventDto"][];
+            /**
+             * Format: int64
+             * @description Bootstrap owners entries that match only a verified email at login
+             *     and name no Principal: not counted above, since no passkey is ever
+             *     stored under one (a global administrator's view; 0 otherwise).
+             */
+            unresolved_owner_entries: number;
         };
         /** @description One of the caller's passkeys. */
         PasskeyDto: {
