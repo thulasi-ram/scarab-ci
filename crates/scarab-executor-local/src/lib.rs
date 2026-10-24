@@ -314,6 +314,14 @@ impl Executor for LocalExecutor {
         Ok(())
     }
 
+    /// `cancel` SIGKILLs the process (`start_kill`) — there is no termination
+    /// grace in which it could go on acting — and drops its slot, whose
+    /// `kill_on_drop` reaps it. So once `cancel` returned, nothing of the
+    /// unit runs on; an unknown handle has nothing running either.
+    async fn torn_down(&self, _handle: &ExecHandle) -> Result<bool, ExecError> {
+        Ok(true)
+    }
+
     // `output` uses the port default (`None`): no workspace CAS locally (ADR-0036).
 
 

@@ -175,6 +175,9 @@ impl Executor for GatedExec {
     async fn cancel(&self, _h: &ExecHandle) -> Result<(), ExecError> {
         Ok(())
     }
+    async fn torn_down(&self, _h: &ExecHandle) -> Result<bool, ExecError> {
+        Ok(true) // nothing runs behind this stub's handles
+    }
     // ADR-0064 s2: required (never defaulted) so the compiler makes every impl —
     // wrappers included — decide; this stub snapshots nothing, so no stamp.
     async fn log_stream(&self, _step: &StepRun) -> Result<Option<Box<dyn LogChunks>>, ExecError> {

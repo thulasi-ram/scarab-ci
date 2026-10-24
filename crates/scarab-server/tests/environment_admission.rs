@@ -680,6 +680,9 @@ impl Executor for RecordingExec {
     async fn cancel(&self, _h: &ExecHandle) -> Result<(), ExecError> {
         Ok(())
     }
+    async fn torn_down(&self, _h: &ExecHandle) -> Result<bool, ExecError> {
+        Ok(true) // nothing runs behind this stub's handles
+    }
 }
 
 fn secret_step() -> (StepRun, StepSpec) {

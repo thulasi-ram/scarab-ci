@@ -1275,13 +1275,12 @@ pub trait Executor: Send + Sync {
     /// the target (on Kubernetes a deleted Pod runs on through its
     /// termination grace). A missing unit is `true`.
     ///
-    /// Default `true`: a backend whose `cancel` returns only once the unit is
-    /// gone. Every decorator must forward it — a decorator falling back to
-    /// the default would retire teardowns early and silently reopen the
-    /// overlap.
-    async fn torn_down(&self, _handle: &ExecHandle) -> Result<bool, ExecError> {
-        Ok(true)
-    }
+    /// Required, never defaulted: a default answer would be `true` for every
+    /// backend that did not think about it, and a decorator falling back to
+    /// it would retire teardowns early and silently reopen the overlap (the
+    /// defaulted-method-on-decorators evidence drop). Decorators forward it;
+    /// a backend whose `cancel` leaves nothing running answers `true`.
+    async fn torn_down(&self, handle: &ExecHandle) -> Result<bool, ExecError>;
 
     /// The content-addressed output workspace snapshot the (successfully
     /// finished) unit produced — the CAS merkle-root hash the orchestrator

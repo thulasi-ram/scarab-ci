@@ -159,6 +159,12 @@ impl scarab_engine::Executor for RefusingExec {
     ) -> Result<(), scarab_engine::ExecError> {
         Ok(())
     }
+    async fn torn_down(
+        &self,
+        _handle: &scarab_engine::ports::ExecHandle,
+    ) -> Result<bool, scarab_engine::ExecError> {
+        Ok(true) // a refused launch left nothing running
+    }
 }
 
 /// A launch REFUSED by policy is a step verdict, not a scheduler error: the
