@@ -2743,7 +2743,7 @@
             }
           },
           "403": {
-            "description": "`step_up_required` (mode `action`); not an Owner of the Org; or the member also belongs to an Org you do not own (the text names it)",
+            "description": "`step_up_required` (mode `action`); not an Owner of the Org; or the member also belongs to an Org you do not own (not named)",
             "content": {
               "application/json": {
                 "schema": {
@@ -8273,7 +8273,7 @@
             "items": {
               "type": "string"
             },
-            "description": "Admins of the Org (Admin/Owner bindings on the Org, and the bootstrap\nowners) who hold no usable passkey — every crown jewel is refused\nfor them until they enroll one."
+            "description": "Admins of the Org (Admin/Owner bindings on the Org, and — for a\nglobal administrator only — the bootstrap owners) who hold no usable\npasskey: every crown jewel is refused for them until they enroll one."
           },
           "caller_role": {
             "type": [

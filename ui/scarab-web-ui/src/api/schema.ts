@@ -3093,9 +3093,9 @@ export interface components {
             /** Format: int64 */
             admins_total: number;
             /**
-             * @description Admins of the Org (Admin/Owner bindings on the Org, and the bootstrap
-             *     owners) who hold no usable passkey — every crown jewel is refused
-             *     for them until they enroll one.
+             * @description Admins of the Org (Admin/Owner bindings on the Org, and — for a
+             *     global administrator only — the bootstrap owners) who hold no usable
+             *     passkey: every crown jewel is refused for them until they enroll one.
              */
             admins_without_passkey: string[];
             /** @description Your role in the Org (`owner`, `admin`, …). */
@@ -6476,7 +6476,7 @@ export interface operations {
                     "application/json": components["schemas"]["PasskeyResetDto"];
                 };
             };
-            /** @description `step_up_required` (mode `action`); not an Owner of the Org; or the member also belongs to an Org you do not own (the text names it) */
+            /** @description `step_up_required` (mode `action`); not an Owner of the Org; or the member also belongs to an Org you do not own (not named) */
             403: {
                 headers: {
                     [name: string]: unknown;

@@ -487,8 +487,8 @@ async fn an_owner_resets_a_member_s_passkeys() {
 }
 
 /// A member who also belongs to an Org the caller does not own cannot be
-/// reset by them (403 naming that Org); an Admin is no Owner; a non-member
-/// is 404.
+/// reset by them (403 — without naming that Org, git-bug 061450a); an
+/// Admin is no Owner; a non-member is 404.
 #[tokio::test]
 async fn an_owner_cannot_reset_a_member_of_an_org_they_do_not_own() {
     let h = harness();
@@ -504,19 +504,28 @@ async fn an_owner_cannot_reset_a_member_of_an_org_they_do_not_own() {
     assert_eq!(st, StatusCode::FORBIDDEN, "{b}");
     let text = b.as_str().unwrap();
     assert!(
-        text.contains("beta") && text.contains("Owner of every Org"),
+        text.contains("an Org you do not own") && text.contains("Owner of every Org"),
         "{text}"
     );
+    assert!(!text.contains("beta"), "a foreign Org is not named: {text}");
     assert_eq!(h.passkey_store.list("bob").await.unwrap().len(), 1);
     assert!(h.events("passkey.reset").await.is_empty());
 
-    // Owner of beta too: now it goes through.
+    // Owner of beta too: now it goes through — and acme's event names no
+    // other Org bob belongs to.
     h.grant("amy", Scope::Org("beta".into()), Role::Owner).await;
     let (st, b) = h.cookie("POST", uri, None, &amy).await;
     assert_step_up(st, &b, "action");
     h.answer(&amy, &mut soft, &b["challenge"]).await;
     let (st, b) = h.cookie("POST", uri, None, &amy).await;
     assert_eq!(st, StatusCode::OK, "{b}");
+    let reset = h.events("passkey.reset").await;
+    assert_eq!(reset[0].org.as_deref(), Some("acme"));
+    assert!(
+        !reset[0].detail.to_string().contains("beta"),
+        "{}",
+        reset[0].detail
+    );
 
     // An Admin is not an Owner (refused for the role, before any step-up).
     let (st, b) = h
@@ -576,6 +585,29 @@ fn provider_with_owners(owners: &[&str]) -> Arc<scarab_server::oauth::OAuthAuthe
             forge_url: None,
         },
     ))
+}
+
+/// git-bug 061450a: which install owners hold no passkey is install
+/// posture. An Org's Owner reads their Org's admins only; a global
+/// administrator also sees the bootstrap owners.
+#[tokio::test]
+async fn bootstrap_owners_are_counted_only_for_a_global_caller() {
+    let h = harness_with(|st| st.with_oauth_login(provider_with_owners(&["root"])));
+    let (olga, _) = member(&h, "olga", "acme", Role::Owner).await;
+    let (st, sum) = h
+        .cookie("GET", "/v1/orgs/acme/security/summary", None, &olga)
+        .await;
+    assert_eq!(st, StatusCode::OK, "{sum}");
+    assert_eq!(sum["admins_total"], 1, "{sum}");
+    assert_eq!(sum["admins_without_passkey"], json!([]), "{sum}");
+
+    let amy = h.browser_session(owner("amy")).await;
+    let (st, sum) = h
+        .cookie("GET", "/v1/orgs/acme/security/summary", None, &amy)
+        .await;
+    assert_eq!(st, StatusCode::OK, "{sum}");
+    assert_eq!(sum["admins_total"], 2, "{sum}");
+    assert_eq!(sum["admins_without_passkey"], json!(["root"]), "{sum}");
 }
 
 /// mallory, Owner of `evil`, binds the install owner `root` as a Viewer of
@@ -759,7 +791,12 @@ async fn a_request_for_a_merged_id_is_confirmed_by_its_live_principal() {
     assert_step_up(st, &b, "window");
     let id = b["request_id"].as_str().expect("a request").to_string();
     assert_eq!(
-        h.requests.get_request(&id).await.unwrap().unwrap().for_human,
+        h.requests
+            .get_request(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .for_human,
         "bobby"
     );
     fold_bobby_into_bob(&pg).await;

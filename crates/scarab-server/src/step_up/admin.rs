@@ -59,7 +59,7 @@ pub struct PasskeyResetDto {
     summary = "Reset a member's passkeys (ADR-0073 §10; Owner, always-ask step-up)",
     responses(
         (status = 200, body = PasskeyResetDto),
-        (status = 403, description = "`step_up_required` (mode `action`); not an Owner of the Org; or the member also belongs to an Org you do not own (the text names it)"),
+        (status = 403, description = "`step_up_required` (mode `action`); not an Owner of the Org; or the member also belongs to an Org you do not own (not named)"),
         (status = 404, description = "not a member of the Org, or step-up is off")
     )
 )]
@@ -101,19 +101,16 @@ pub(crate) async fn reset_member_passkeys(
         )));
     }
     if !bootstrap {
-        let mut not_owned = Vec::new();
         for o in &orgs {
             if caller.role_in(&st, &Scope::Org(o.clone())).await? != Some(Role::Owner) {
-                not_owned.push(o.clone());
+                // Which other Orgs the member is in is those Orgs' business:
+                // the refusal does not name them.
+                return Err(ApiError::Denied(format!(
+                    "`{subject}` also belongs to an Org you do not own: a passkey is not \
+                     Org-scoped, so only an Owner of every Org they belong to (or a bootstrap \
+                     owner) can reset theirs"
+                )));
             }
-        }
-        if !not_owned.is_empty() {
-            return Err(ApiError::Denied(format!(
-                "`{subject}` also belongs to {}, which you do not own: a passkey is not \
-                 Org-scoped, so only an Owner of every Org they belong to (or a bootstrap \
-                 owner) can reset theirs",
-                not_owned.join(", ")
-            )));
         }
     }
     let removed = svc.passkeys.remove_all(&subject).await.map_err(store_err)?;
@@ -134,11 +131,12 @@ pub(crate) async fn reset_member_passkeys(
     ev.target = Some(format!("{org}/{subject}"));
     ev.confirmation_id = ctx.and_then(|Extension(c)| c.confirmation_id());
     ev.session_hash = caller.session.as_ref().map(|s| s.id_hash.clone());
+    // The event lands in this Org's log: it names no other Org the member
+    // belongs to.
     ev.detail = serde_json::json!({
         "reset_by": caller.principal.subject,
         "removed": removed,
         "windows_revoked": windows_revoked,
-        "orgs": orgs,
     });
     svc.record(ev).await;
     Ok(Json(PasskeyResetDto {

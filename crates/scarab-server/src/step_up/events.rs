@@ -121,9 +121,9 @@ pub struct OrgSecuritySummary {
     pub enforced: bool,
     /// Your role in the Org (`owner`, `admin`, …).
     pub caller_role: Option<String>,
-    /// Admins of the Org (Admin/Owner bindings on the Org, and the bootstrap
-    /// owners) who hold no usable passkey — every crown jewel is refused
-    /// for them until they enroll one.
+    /// Admins of the Org (Admin/Owner bindings on the Org, and — for a
+    /// global administrator only — the bootstrap owners) who hold no usable
+    /// passkey: every crown jewel is refused for them until they enroll one.
     pub admins_without_passkey: Vec<String>,
     pub admins_total: u64,
     /// The last 20 refusals in the Org, from the last 24 hours.
@@ -289,9 +289,15 @@ fn role_name(r: Role) -> String {
     format!("{r:?}").to_lowercase()
 }
 
-/// The Org's admins: Admin/Owner bindings on the Org scope, plus the
-/// bootstrap owners entries.
-async fn org_admins(st: &AppState, org: &str) -> Result<BTreeSet<String>, ApiError> {
+/// The Org's admins: Admin/Owner bindings on the Org scope — plus, for a
+/// global caller only, the bootstrap owners entries. Who the install's
+/// owners are, and which of them hold no passkey, is install posture: an Org
+/// admin must not learn it from their Org's summary.
+async fn org_admins(
+    st: &AppState,
+    org: &str,
+    include_owners: bool,
+) -> Result<BTreeSet<String>, ApiError> {
     let mut admins = BTreeSet::new();
     if let Some(rbac) = st.rbac.as_ref() {
         for b in rbac.bindings(org).await.map_err(store_err)? {
@@ -300,8 +306,10 @@ async fn org_admins(st: &AppState, org: &str) -> Result<BTreeSet<String>, ApiErr
             }
         }
     }
-    for provider in &st.oauth_providers {
-        admins.extend(provider.owners().iter().cloned());
+    if include_owners {
+        for provider in &st.oauth_providers {
+            admins.extend(provider.owners().iter().cloned());
+        }
     }
     Ok(admins)
 }
@@ -326,12 +334,11 @@ pub(crate) async fn org_security_summary(
     let scope = Scope::Org(org.clone());
     let caller = authenticate(&st, &headers, Action::Read).await?;
     let role = caller.role_in(&st, &scope).await?;
-    if !(caller.may_globally(Action::Administer)
-        || role.is_some_and(|r| r.allows(Action::Administer)))
-    {
+    let global = caller.may_globally(Action::Administer);
+    if !(global || role.is_some_and(|r| r.allows(Action::Administer))) {
         return Err(ApiError::Forbidden);
     }
-    let admins = org_admins(&st, &org).await?;
+    let admins = org_admins(&st, &org, global).await?;
     let admins_total = admins.len() as u64;
     let Some(svc) = st.step_up.service() else {
         return Ok(Json(OrgSecuritySummary {
