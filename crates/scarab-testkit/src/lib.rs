@@ -1898,10 +1898,11 @@ impl Db for InMemoryDb {
                 .unwrap_or_else(|| st.run_created.get(run).copied().unwrap_or(Timestamp(0)))
         };
         // A teardown of the requesting Step's unit still pending (git-bug
-        // f22056d), whatever the Run's status: a `cancel_run` intent for a
-        // Run whose requesting Step was cancelled with a launched latest
-        // Attempt, or a `supersede_teardown` naming the Step. Pending =
-        // neither dispatched nor dead-lettered. The PG twin's `EXISTS`.
+        // f22056d), whatever the Run's status: a `cancel_run` intent for the
+        // Run while the requesting Step's latest Attempt was launched,
+        // whatever the Step's status (red team A5), or a `supersede_teardown`
+        // naming the Step. Pending = neither dispatched nor dead-lettered.
+        // The PG twin's `EXISTS`.
         let tearing_down = |run: &RunId, step: &StepId| {
             let launched = || {
                 st.steps
@@ -1916,9 +1917,7 @@ impl Db for InMemoryDb {
                 e.msg.run == *run
                     && !e.dispatched
                     && !e.dead_lettered
-                    && ((e.msg.kind == scarab_engine::CANCEL_RUN
-                        && status(run, step) == Some(StepStatus::Cancelled)
-                        && launched())
+                    && ((e.msg.kind == scarab_engine::CANCEL_RUN && launched())
                         || (e.msg.kind == scarab_engine::SUPERSEDE_TEARDOWN
                             && e.msg.payload["attempts"].as_array().is_some_and(|a| {
                                 a.iter()

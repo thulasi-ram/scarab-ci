@@ -584,7 +584,6 @@ async fn a_cancel_interrupted_before_its_run_commit_still_ends_cancelled() {
 // teardown is pending.
 // ---------------------------------------------------------------------------
 #[tokio::test]
-#[ignore = "redteam: BROKE step claimed mid-cancel stays Running in a Cancelled Run; leg 2 requires status=cancelled so its live Pod holds nothing"]
 async fn a_step_claimed_mid_cancel_still_holds_its_target() {
     let w = World::inmemory(Some(1)).await;
     w.seed_deploy("ra", None).await;

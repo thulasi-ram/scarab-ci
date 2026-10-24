@@ -1823,10 +1823,13 @@ impl Db for PostgresDb {
         //
         // OR — whatever the Run's status — a teardown of the requesting
         // Step's unit is still pending (git-bug f22056d): a `cancel_run`
-        // intent for a Run whose requesting Step was cancelled with a
-        // launched latest Attempt, or a `supersede_teardown` naming the Step.
-        // Pending = neither dispatched (the unit is gone) nor dead-lettered
-        // (abandoned, with a diagnostic).
+        // intent for the Run while the requesting Step's latest Attempt was
+        // launched — whatever the Step's status (red team A5: a Step claimed
+        // mid-cancel, or launched after it, is not `cancelled` yet its unit
+        // is alive and the intent will tear it down) — or a
+        // `supersede_teardown` naming the Step. Pending = neither dispatched
+        // (the unit is gone) nor dead-lettered (abandoned, with a
+        // diagnostic).
         let n: i64 = sqlx::query_scalar(
             "SELECT COUNT(DISTINCT r.run_id)
              FROM run_deployment_requests r
@@ -1856,7 +1859,7 @@ impl Db for PostgresDb {
                         SELECT 1 FROM outbox o
                         WHERE o.run_id = r.run_id
                           AND o.dispatched_at IS NULL AND o.dead_lettered_at IS NULL
-                          AND ((o.kind = $7 AND s.status = 'cancelled'
+                          AND ((o.kind = $7
                                 AND (SELECT a.handle FROM attempts a
                                      WHERE a.run_id = r.run_id AND a.step_id = r.step_id
                                      ORDER BY CAST(substring(a.attempt_id FROM 2) AS INTEGER) DESC

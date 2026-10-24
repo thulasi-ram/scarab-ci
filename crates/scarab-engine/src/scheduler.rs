@@ -1714,53 +1714,7 @@ pub async fn cancel_run_request(
     })
     .await?;
     for step in db.steps_of_run(run).await? {
-        if step.status.is_terminal() {
-            continue;
-        }
-        // Stamp the in-flight attempt `Cancelled` (mirrors the superseded
-        // fix). Only a `Running` step has a live Pod / frontier attempt;
-        // cancelling tears that Pod down, and the backend then reports the
-        // dying Pod `Lost`. Without a recorded terminal outcome that
-        // self-inflicted `Lost` would settle onto the attempt row as
-        // `failed`/`lost` and render an intentionally-cancelled attempt as
-        // a failure. No extra event: the `StepTransitioned`→Cancelled and the
-        // `RunTransitioned`→Cancelled below already record the boundary in
-        // the immutable log. The CAS, the stamp and the event are one commit
-        // (git-bug 586187a).
-        let cancelled = AttemptStamp::Outcome(AttemptOutcome::Cancelled);
-        let stamp = match step.status {
-            StepStatus::Running => step.attempts.last().map(|a| (&a.id, &cancelled)),
-            _ => None,
-        };
-        let transitioned = EventKind {
-            version: EVENT_VERSION,
-            run: run.clone(),
-            kind: EventPayload::StepTransitioned {
-                step: step.step.clone(),
-                from: step.status,
-                to: StepStatus::Cancelled,
-            },
-            at: now,
-        };
-        match db
-            .commit_step_transition(
-                run,
-                &step.step,
-                step.status,
-                StepStatus::Cancelled,
-                stamp,
-                std::slice::from_ref(&transitioned),
-                std::slice::from_ref(&intent),
-            )
-            .await
-        {
-            Ok(()) => {
-                // A gate cancelled mid-wait: its open Attempt is cancelled too.
-                cancel_open_gate_attempt(db, run, &step).await?;
-            }
-            Err(DbError::Conflict) => {}
-            Err(e) => return Err(e.into()),
-        }
+        cancel_step(db, run, step, &intent, now).await?;
     }
     match commit_run_transition(
         db,
@@ -1809,6 +1763,80 @@ async fn cancel_teardown_intent(
         idempotency_key: format!("cancel:{}:g{generation}", run.0),
         at: now,
     })
+}
+
+/// Drive one step of a Run being cancelled to `Cancelled`, its teardown
+/// `intent` in the same commit. A step already terminal is left alone.
+///
+/// Stamps the in-flight attempt `Cancelled` (mirrors the superseded fix).
+/// Only a `Running` step has a live Pod / frontier attempt; cancelling tears
+/// that Pod down, and the backend then reports the dying Pod `Lost`. Without
+/// a recorded terminal outcome that self-inflicted `Lost` would settle onto
+/// the attempt row as `failed`/`lost` and render an intentionally-cancelled
+/// attempt as a failure. No extra event: the `StepTransitioned`→Cancelled and
+/// the Run's `RunTransitioned`→Cancelled record the boundary in the immutable
+/// log. The CAS, the stamp, the event and the intent are one commit (git-bug
+/// 586187a).
+///
+/// A CAS that conflicts is re-read and retried from the step's LIVE status
+/// until the step is terminal (red team A5): a step claimed between the
+/// snapshot and the CAS (`Pending`/`Ready` → `Running`) was skipped before,
+/// left `Running` inside a `Cancelled` Run — half-cancelled limbo, its Pod
+/// alive and nothing holding its DeploymentTarget. Each competing write moves
+/// the step forward toward a terminal sink, so this converges in a couple of
+/// passes; the bound only guards a pathological write storm.
+async fn cancel_step(
+    db: &dyn Db,
+    run: &RunId,
+    mut step: StepRun,
+    intent: &OutboxMessage,
+    now: Timestamp,
+) -> Result<(), DbError> {
+    for _ in 0..8 {
+        if step.status.is_terminal() {
+            return Ok(());
+        }
+        let cancelled = AttemptStamp::Outcome(AttemptOutcome::Cancelled);
+        let stamp = match step.status {
+            StepStatus::Running => step.attempts.last().map(|a| (&a.id, &cancelled)),
+            _ => None,
+        };
+        let transitioned = event(
+            run,
+            EventPayload::StepTransitioned {
+                step: step.step.clone(),
+                from: step.status,
+                to: StepStatus::Cancelled,
+            },
+            now,
+        );
+        match db
+            .commit_step_transition(
+                run,
+                &step.step,
+                step.status,
+                StepStatus::Cancelled,
+                stamp,
+                std::slice::from_ref(&transitioned),
+                std::slice::from_ref(intent),
+            )
+            .await
+        {
+            Ok(()) => {
+                // A gate cancelled mid-wait: its open Attempt is cancelled too.
+                return cancel_open_gate_attempt(db, run, &step).await;
+            }
+            Err(DbError::Conflict) => {
+                let live = db.steps_of_run(run).await?;
+                match live.into_iter().find(|s| s.step == step.step) {
+                    Some(s) => step = s,
+                    None => return Ok(()),
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 async fn reopen(
@@ -3662,32 +3690,7 @@ impl<'a> Scheduler<'a> {
                         let _ = self.executor.cancel(&ExecHandle(h)).await;
                     }
                 }
-                let transitioned = event(
-                    run,
-                    EventPayload::StepTransitioned {
-                        step: step.step.clone(),
-                        from: step.status,
-                        to: StepStatus::Cancelled,
-                    },
-                    now,
-                );
-                match self
-                    .db
-                    .commit_step_transition(
-                        run,
-                        &step.step,
-                        step.status,
-                        StepStatus::Cancelled,
-                        None,
-                        std::slice::from_ref(&transitioned),
-                        std::slice::from_ref(&intent),
-                    )
-                    .await
-                {
-                    Ok(()) | Err(DbError::Conflict) => {}
-                    Err(e) => return Err(e.into()),
-                }
-                cancel_open_gate_attempt(self.db, run, &step).await?;
+                cancel_step(self.db, run, step, &intent, now).await?;
             }
         }
         if let Some(current) = self.db.run_status(run).await? {

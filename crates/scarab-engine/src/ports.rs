@@ -1037,8 +1037,10 @@ pub trait Db: Send + Sync {
     ///
     /// R is also in flight — **whatever its status** — while a teardown of
     /// the requesting Step's unit is pending (git-bug f22056d): a
-    /// [`CANCEL_RUN`](crate::CANCEL_RUN) intent for R while the Step is
-    /// `Cancelled` with a launched latest Attempt (a recorded handle), or a
+    /// [`CANCEL_RUN`](crate::CANCEL_RUN) intent for R while the Step's
+    /// latest Attempt was launched (a recorded handle) — whatever the Step's
+    /// status: a Step claimed mid-cancel, or launched after it, is not
+    /// `Cancelled` yet its unit is alive and the intent tears it down — or a
     /// [`SUPERSEDE_TEARDOWN`](crate::SUPERSEDE_TEARDOWN) naming the Step. A
     /// cancel or a rerun makes the Step terminal or `Pending` at once, while
     /// its unit (a Pod in its termination grace) may still be acting on the
