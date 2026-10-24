@@ -364,7 +364,7 @@ async fn webhook_skips_and_names_a_pipeline_requesting_a_target_homed_elsewhere(
     assert!(outcome.runs.is_empty(), "{outcome:?}");
     assert_eq!(outcome.refused.len(), 1, "{outcome:?}");
     assert_eq!(outcome.refused[0].pipeline, ".scarab/deploy.yaml");
-    assert_eq!(outcome.refused[0].environment, "staging");
+    assert_eq!(outcome.refused[0].environment.as_deref(), Some("staging"));
     assert!(
         outcome.refused[0].reason.contains(
             "requests DeploymentTarget `argocd`/`web`, which belongs to environment `prod`"

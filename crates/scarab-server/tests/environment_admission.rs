@@ -150,7 +150,7 @@ async fn webhook_skips_a_deploy_into_an_unknown_environment_and_runs_the_rest() 
     assert_eq!(outcome.refused.len(), 1, "{:?}", outcome.refused);
     let refused = &outcome.refused[0];
     assert_eq!(refused.pipeline, ".scarab/deploy.yaml");
-    assert_eq!(refused.environment, "prod");
+    assert_eq!(refused.environment.as_deref(), Some("prod"));
     assert!(
         refused.reason.contains("does not exist in org `acme`"),
         "{}",
@@ -265,6 +265,66 @@ async fn webhook_deploys_once_the_project_is_eligible() {
     .await
     .unwrap();
     assert_eq!(runs.len(), 2, "CI and the deploy both ran");
+}
+
+/// git-bug 66171a0: one pipeline's own defect is that pipeline's refusal,
+/// never the delivery's. A deploy whose target names a required,
+/// default-less input cannot bind on a push (a webhook supplies no
+/// parameters), and a file that does not compile cannot run at all — both
+/// are reported in `refused`, and the repo's ordinary CI still runs.
+#[tokio::test]
+async fn a_pipeline_that_cannot_run_is_refused_alone_and_the_rest_still_run() {
+    const UNBINDABLE: &str = r#"
+on:
+  push: {}
+environment: prod
+interface:
+  inputs:
+    - { name: app, type: string, required: true }
+steps:
+  - id: bump
+    image: busybox
+    command: ["true"]
+    results: [version]
+    deployment_requests:
+      - target: { source: argocd, id: "${{ inputs.app }}" }
+        version: version
+"#;
+    // Path-sorted before `ci.yaml`, so the loop must get past both.
+    let forge = forge()
+        .with_file(".scarab/a-deploy.yaml", UNBINDABLE)
+        .with_file(".scarab/broken.yaml", "steps: [ { id: x, image");
+    let db = InMemoryDb::new();
+    let governance = prod_for_everyone();
+    let outcome = trigger_runs_from_event(
+        &forge,
+        &db,
+        &FakeClock::new(1_000),
+        Some(&governance),
+        &push(),
+    )
+    .await
+    .expect("a broken pipeline never aborts the delivery");
+    let pipelines: Vec<&str> = outcome
+        .refused
+        .iter()
+        .map(|r| r.pipeline.as_str())
+        .collect();
+    assert_eq!(
+        pipelines,
+        [".scarab/a-deploy.yaml", ".scarab/broken.yaml"],
+        "{:?}",
+        outcome.refused
+    );
+    assert_eq!(outcome.refused[0].environment.as_deref(), Some("prod"));
+    assert!(
+        outcome.refused[0].reason.contains("app"),
+        "names the input: {:?}",
+        outcome.refused[0]
+    );
+    assert_eq!(outcome.refused[1].environment, None, "it never compiled");
+    // ci.yaml and deploy.yaml both ran.
+    assert_eq!(outcome.runs.len(), 2, "{outcome:?}");
 }
 
 // --- Run creation: dispatch ----------------------------------------------------

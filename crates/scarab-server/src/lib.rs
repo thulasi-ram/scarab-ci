@@ -4108,12 +4108,14 @@ fn origin_pr_base(event: &scarab_forge::Event) -> Option<String> {
 /// (empty when there is no config, or no pipeline's trigger matches).
 ///
 /// Pipelines are evaluated independently and in a deterministic (path-sorted)
-/// order; a file that fails to compile fails the whole trigger (a broken
-/// pipeline is a submit-time error, ADR-0009), so a repo's CI is all-or-nothing
-/// per delivery rather than silently partial. A pipeline that admission
-/// **refuses** (a disallowed ref, an unknown Environment, an ineligible
-/// Project — ADR-0037, ADR-0071) is skipped on its own and never aborts the
-/// delivery: the other pipelines still run.
+/// order. A pipeline that admission **refuses** (a disallowed ref, an unknown
+/// Environment, an ineligible Project — ADR-0037, ADR-0071) is skipped on its
+/// own and never aborts the delivery: the other pipelines still run. So is a
+/// pipeline that cannot run at all — not UTF-8, does not compile, a trigger or
+/// `when:` it cannot evaluate, a launch it cannot bind: it is reported in
+/// [`TriggerOutcome::refused`], not silently dropped, and one broken file no
+/// longer stops every other pipeline of the repo (git-bug 66171a0). Only a
+/// forge or Db failure — not the pipeline's — fails the delivery.
 ///
 /// `governance` is the org-level Environment governance store (ADR-0071);
 /// `None` only in a hand-built state, where a deploy is admitted as an
@@ -4133,17 +4135,21 @@ pub async fn trigger_run_from_event(
         .runs)
 }
 
-/// A deploy pipeline a delivery did not run because its Environment does not
-/// exist in the Org or does not admit the Project (ADR-0071 §2, §10). Reported
-/// in the webhook delivery body: for a pipeline whose name the ADR-0071
-/// migration could never see (it had never run), this is the only place the
-/// refusal surfaces besides the server log.
+/// A pipeline a delivery did not run: a deploy whose Environment does not
+/// exist in the Org or does not admit the Project (ADR-0071 §2, §10), or any
+/// pipeline that could not run at all — it does not compile, or its launch
+/// cannot bind (git-bug 66171a0). Reported in the webhook delivery body: for
+/// a pipeline whose name the ADR-0071 migration could never see (it had
+/// never run), this is the only place the refusal surfaces besides the
+/// server log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RefusedPipeline {
     /// The pipeline file, e.g. `.scarab/deploy.yaml`.
     pub pipeline: String,
-    /// The Environment it named.
-    pub environment: String,
+    /// The Environment it named — absent when it named none, or never
+    /// compiled far enough to say.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
     /// What is missing and who can fix it.
     pub reason: String,
 }
@@ -4195,15 +4201,33 @@ pub async fn trigger_runs_from_event(
             Err(scarab_forge::ForgeError::Api(_)) => continue,
             Err(e) => return Err(TriggerError::Forge(e)),
         };
-        let yaml = String::from_utf8(bytes).map_err(|_| TriggerError::NotUtf8)?;
+        // A pipeline's own defect is its refusal, not the delivery's: see
+        // `pipeline_cannot_run`.
+        let Ok(yaml) = String::from_utf8(bytes) else {
+            pipeline_cannot_run(&mut outcome, event, path, None, TriggerError::NotUtf8)?;
+            continue;
+        };
 
         // Pre-fetch transitive `invoke:` libraries at this ref and compile
         // (ADR-0038) — the shared read-at-ref → compile primitive also used by
         // the manual/api dispatch path.
-        let ir = prefetch_libs_and_compile(forge, repo, &git_ref, &yaml).await?;
+        let ir = match prefetch_libs_and_compile(forge, repo, &git_ref, &yaml).await {
+            Ok(ir) => ir,
+            Err(e) => {
+                pipeline_cannot_run(&mut outcome, event, path, None, e)?;
+                continue;
+            }
+        };
+        let environment = ir.environment.as_deref();
 
-        let matched = scarab_pipeline::matches_trigger(&ir, kind.as_str(), &ctx)
-            .map_err(|e| TriggerError::Pipeline(e.to_string()))?;
+        let matched = match scarab_pipeline::matches_trigger(&ir, kind.as_str(), &ctx) {
+            Ok(matched) => matched,
+            Err(e) => {
+                let e = TriggerError::Pipeline(e.to_string());
+                pipeline_cannot_run(&mut outcome, event, path, environment, e)?;
+                continue;
+            }
+        };
         if !matched {
             continue;
         }
@@ -4212,8 +4236,14 @@ pub async fn trigger_runs_from_event(
         // guarded-off steps are kept in the DAG but marked Skipped, so the engine
         // transitively skips their descendants. A pipeline whose every step is
         // excluded starts no run.
-        let excluded = scarab_pipeline::excluded_steps(&ir, &ctx)
-            .map_err(|e| TriggerError::Pipeline(e.to_string()))?;
+        let excluded = match scarab_pipeline::excluded_steps(&ir, &ctx) {
+            Ok(excluded) => excluded,
+            Err(e) => {
+                let e = TriggerError::Pipeline(e.to_string());
+                pipeline_cannot_run(&mut outcome, event, path, environment, e)?;
+                continue;
+            }
+        };
         if excluded.len() == ir.steps.len() {
             continue;
         }
@@ -4224,8 +4254,17 @@ pub async fn trigger_runs_from_event(
         // skips this pipeline only (the dispatch path turns the same refusal
         // into a fail-closed error). Webhook-triggered runs supply no launch
         // parameters.
-        match admit_and_create_run(db, clock, governance, event, &ir, path, &excluded, None).await?
-        {
+        let admission =
+            match admit_and_create_run(db, clock, governance, event, &ir, path, &excluded, None)
+                .await
+            {
+                Ok(admission) => admission,
+                Err(e) => {
+                    pipeline_cannot_run(&mut outcome, event, path, environment, e)?;
+                    continue;
+                }
+            };
+        match admission {
             Admission::Created(run) => outcome.runs.push(run),
             // A branch-scoped Environment ignoring every other branch is the
             // rule working, not news: silent, as it always was.
@@ -4252,13 +4291,44 @@ pub async fn trigger_runs_from_event(
                 );
                 outcome.refused.push(RefusedPipeline {
                     pipeline: path.clone(),
-                    environment: environment.clone(),
+                    environment: Some(environment.clone()),
                     reason,
                 });
             }
         }
     }
     Ok(outcome)
+}
+
+/// One pipeline of a delivery failed with `e`. A forge or Db failure is not
+/// the pipeline's — it fails the delivery, so the forge can redeliver. Any
+/// other failure is the pipeline's own defect (it does not compile, a
+/// trigger or `when:` it cannot evaluate, a launch it cannot bind): logged
+/// and reported as that pipeline's refusal, and the delivery goes on to the
+/// rest (git-bug 66171a0).
+fn pipeline_cannot_run(
+    outcome: &mut TriggerOutcome,
+    event: &scarab_forge::Event,
+    path: &str,
+    environment: Option<&str>,
+    e: TriggerError,
+) -> Result<(), TriggerError> {
+    if matches!(e, TriggerError::Forge(_) | TriggerError::Db(_)) {
+        return Err(e);
+    }
+    let reason = e.to_string();
+    tracing::warn!(
+        repo = ?event.repo(),
+        pipeline = %path,
+        trigger = event.trigger_kind().as_str(),
+        "pipeline not run: {reason}"
+    );
+    outcome.refused.push(RefusedPipeline {
+        pipeline: path.to_string(),
+        environment: environment.map(str::to_string),
+        reason,
+    });
+    Ok(())
 }
 
 /// Pre-fetch a pipeline's transitive `invoke:` library sources at `read_ref`
