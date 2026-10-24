@@ -2824,6 +2824,27 @@ impl<'a> Scheduler<'a> {
                                 explicit_inputs.as_deref(),
                                 &output_of,
                             );
+                            // The steps behind those roots, in root order —
+                            // stamped so settle resolves a collision sample
+                            // against what was LAUNCHED (git-bug b6b8510):
+                            // an upstream gaining or losing an output before
+                            // settle would shift a re-derived index space.
+                            // Same function, same `output_of` as the roots.
+                            let input_steps = crate::workspace_input_steps(
+                                &me.needs,
+                                explicit_inputs.as_deref(),
+                                &output_of,
+                            );
+                            if !input_steps.is_empty() {
+                                self.db
+                                    .set_attempt_workspace_input_steps(
+                                        &run,
+                                        &step,
+                                        &attempt,
+                                        &input_steps,
+                                    )
+                                    .await?;
+                            }
 
                             // Consumption provenance (ADR-0056): stamp which
                             // upstream ATTEMPT this attempt builds on — the
@@ -3151,11 +3172,14 @@ impl<'a> Scheduler<'a> {
     /// Fan-in collision evidence (ticket 2e1a458), read at settle: the
     /// backend's [`crate::ProvisioningReport`] (on k8s, the fetch init
     /// container's bounded termination summary) carries declared-order root
-    /// indices; this resolves them back to step ids through
+    /// indices; this resolves them back to step ids through the list
     /// [`crate::workspace_input_steps`] — THE one consumption function
     /// (consumed needs that produced an output, in order; ADR-0007's
-    /// one-function rule) — and appends
-    /// [`EventPayload::WorkspaceInputCollisions`].
+    /// one-function rule) — produced at LAUNCH and stamped on the attempt
+    /// (git-bug b6b8510), and appends
+    /// [`EventPayload::WorkspaceInputCollisions`]. Only an attempt with no
+    /// stamp (launched before the column existed) re-derives the list from
+    /// settle-time outputs, the pre-b6b8510 behaviour.
     ///
     /// Best-effort THROUGHOUT, mirroring `record_cache_saves`: every failure
     /// path is a silent return, because collision evidence must never fail a
@@ -3173,27 +3197,36 @@ impl<'a> Scheduler<'a> {
             Ok(Some(r)) if r.collisions > 0 => r,
             _ => return,
         };
-        let Ok(all) = self.db.steps_of_run(run).await else {
-            return;
-        };
-        let Some(me) = all.iter().find(|s| s.step == *step) else {
-            return;
-        };
-        let Ok(explicit_inputs) = self.db.step_inputs(run, step).await else {
-            return;
-        };
-        let mut output_of = HashMap::new();
-        for s in &all {
-            match self.db.step_output(run, &s.step).await {
-                Ok(Some(o)) => {
-                    output_of.insert(s.step.clone(), o);
+        let ordered = match self
+            .db
+            .attempt_workspace_input_steps(run, step, attempt)
+            .await
+        {
+            Ok(Some(launched)) => launched,
+            Ok(None) => {
+                let Ok(all) = self.db.steps_of_run(run).await else {
+                    return;
+                };
+                let Some(me) = all.iter().find(|s| s.step == *step) else {
+                    return;
+                };
+                let Ok(explicit_inputs) = self.db.step_inputs(run, step).await else {
+                    return;
+                };
+                let mut output_of = HashMap::new();
+                for s in &all {
+                    match self.db.step_output(run, &s.step).await {
+                        Ok(Some(o)) => {
+                            output_of.insert(s.step.clone(), o);
+                        }
+                        Ok(None) => {}
+                        Err(_) => return,
+                    }
                 }
-                Ok(None) => {}
-                Err(_) => return,
+                crate::workspace_input_steps(&me.needs, explicit_inputs.as_deref(), &output_of)
             }
-        }
-        let ordered =
-            crate::workspace_input_steps(&me.needs, explicit_inputs.as_deref(), &output_of);
+            Err(_) => return,
+        };
         let sample: Vec<crate::WorkspaceCollision> = report
             .sample
             .iter()

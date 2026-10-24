@@ -449,3 +449,46 @@ async fn attempts_list_in_stable_defined_order(db: &dyn Db) {
 
 contract_test!(attempt_ordering, attempts_list_in_stable_defined_order);
 
+
+// ---------------------------------------------------------------------------
+// 7. Launch-time workspace input steps (git-bug b6b8510): an attempt's
+//    ordered root→step list round-trips in order, is absent (`None`) until
+//    stamped, and a re-driven launch's write replaces the earlier one.
+// ---------------------------------------------------------------------------
+
+async fn attempt_workspace_input_steps_round_trip(db: &dyn Db) {
+    let run = RunId("wis-run".into());
+    let step = StepId("e".into());
+    seed_run_and_step(db, &run, &step).await;
+    let a1 = AttemptId("a1".into());
+    db.record_attempt(&run, &step, &attempt("a1", 100))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        db.attempt_workspace_input_steps(&run, &step, &a1)
+            .await
+            .unwrap(),
+        None,
+        "nothing stamped yet"
+    );
+    let ids = |v: &[&str]| v.iter().map(|s| StepId((*s).into())).collect::<Vec<_>>();
+    db.set_attempt_workspace_input_steps(&run, &step, &a1, &ids(&["c", "b"]))
+        .await
+        .unwrap();
+    db.set_attempt_workspace_input_steps(&run, &step, &a1, &ids(&["c", "a", "b"]))
+        .await
+        .unwrap();
+    assert_eq!(
+        db.attempt_workspace_input_steps(&run, &step, &a1)
+            .await
+            .unwrap(),
+        Some(ids(&["c", "a", "b"])),
+        "declared order kept; the last launch's write wins"
+    );
+}
+
+contract_test!(
+    attempt_workspace_input_steps,
+    attempt_workspace_input_steps_round_trip
+);

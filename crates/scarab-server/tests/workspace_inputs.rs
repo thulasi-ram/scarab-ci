@@ -361,3 +361,101 @@ async fn a_reported_collision_becomes_an_event_with_step_ids_resolved() {
         "only the colliding step's settle appends the event"
     );
 }
+
+/// The sample resolves against the roots the step was LAUNCHED with, not a
+/// settle-time re-derivation (git-bug b6b8510, residual of 2e1a458). `e`
+/// launches with `a` output-less, so its fetcher's roots are [B, C]; `a`
+/// then gains an output (a concurrent rerun) before `e` settles. Re-deriving
+/// at settle would give [A, B, C] and blame B over A; the launch-time list
+/// still says C overwrote B.
+#[tokio::test]
+async fn a_collision_sample_resolves_against_the_launch_time_roots() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    let clock: Arc<FakeClock> = Arc::new(FakeClock::new(1_000));
+    let exec = Arc::new(FakeExecutor::new());
+    let app = app(db.clone(), clock.clone());
+
+    let resp = post_run(
+        &app,
+        json!({
+            "pipeline": {
+                "ir_version": 1,
+                "steps": [
+                    { "id": "a", "image": "busybox", "command": ["true"] },
+                    { "id": "b", "image": "busybox", "command": ["true"] },
+                    { "id": "c", "image": "busybox", "command": ["true"] },
+                    {
+                        "id": "e",
+                        "image": "busybox",
+                        "command": ["true"],
+                        "needs": ["a", "b", "c"]
+                    }
+                ]
+            }
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let run = RunId(body_json(resp).await["id"].as_str().unwrap().to_string());
+
+    exec.set_output("b", "snap-b");
+    exec.set_output("c", "snap-c");
+    exec.set_provisioning(
+        "e",
+        scarab_engine::ProvisioningReport {
+            collisions: 1,
+            sample: vec![scarab_engine::ProvisioningCollision {
+                path: "shared.txt".into(),
+                winner: 1,
+                loser: 0,
+            }],
+        },
+    );
+    // a, b, c succeed; `e` launches and then polls Running (unscripted).
+    for _ in 0..3 {
+        exec.script_outcome(ExecState::Succeeded);
+    }
+    let sched = Scheduler::new(&*db as &dyn Db, &*clock as &dyn Clock, &*exec, "sched")
+        .with_outbox_visibility_ms(0);
+    for _ in 0..8 {
+        sched.tick_all().await.unwrap();
+    }
+    let e = StepId("e".into());
+    let launched = db.attempts_of_step(&run, &e).await.unwrap();
+    assert_eq!(launched.len(), 1, "e is in flight");
+    let steps = db.steps_of_run(&run).await.unwrap();
+    assert_eq!(
+        launched_workspace_inputs(&exec, &steps, "e"),
+        vec!["snap-b".to_string(), "snap-c".to_string()],
+        "e launched over [B, C]"
+    );
+
+    // Between e's launch and its settle, `a` gains an output.
+    let a = StepId("a".into());
+    let a_attempt = db.attempts_of_step(&run, &a).await.unwrap()[0].id.clone();
+    db.set_step_output(&run, &a, &a_attempt, "snap-a", None)
+        .await
+        .unwrap();
+
+    exec.script_outcome(ExecState::Succeeded);
+    for _ in 0..4 {
+        sched.tick_all().await.unwrap();
+    }
+
+    let sample = db
+        .events(&run)
+        .await
+        .unwrap()
+        .into_iter()
+        .find_map(|e| match e.kind {
+            scarab_engine::EventPayload::WorkspaceInputCollisions { sample, .. } => Some(sample),
+            _ => None,
+        })
+        .expect("a WorkspaceInputCollisions event lands at settle");
+    assert_eq!(sample.len(), 1);
+    assert_eq!(
+        (sample[0].winner.clone(), sample[0].loser.clone()),
+        (StepId("c".into()), StepId("b".into())),
+        "the fetcher's root 1 was C and root 0 was B at launch"
+    );
+}

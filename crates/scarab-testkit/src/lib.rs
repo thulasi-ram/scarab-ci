@@ -125,6 +125,8 @@ struct AttemptEvidenceRec {
     output: Option<String>,
     results: std::collections::BTreeMap<String, serde_json::Value>,
     consumed: std::collections::BTreeMap<String, String>,
+    /// The launch-time workspace input steps (git-bug b6b8510).
+    workspace_input_steps: Option<Vec<StepId>>,
 }
 
 /// Build a [`RunSummary`] from the in-memory state, projecting the stored
@@ -853,6 +855,38 @@ impl Db for InMemoryDb {
             .get(&(run.clone(), step.clone(), attempt.clone()))
             .map(|e| e.consumed.clone())
             .unwrap_or_default())
+    }
+
+    async fn set_attempt_workspace_input_steps(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        steps: &[StepId],
+    ) -> Result<(), DbError> {
+        self.state
+            .lock()
+            .unwrap()
+            .attempt_evidence
+            .entry((run.clone(), step.clone(), attempt.clone()))
+            .or_default()
+            .workspace_input_steps = Some(steps.to_vec());
+        Ok(())
+    }
+
+    async fn attempt_workspace_input_steps(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<Option<Vec<StepId>>, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .attempt_evidence
+            .get(&(run.clone(), step.clone(), attempt.clone()))
+            .and_then(|e| e.workspace_input_steps.clone()))
     }
 
     async fn step_results(

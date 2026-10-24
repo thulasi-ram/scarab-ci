@@ -600,6 +600,53 @@ impl Db for PostgresDb {
         }
     }
 
+    async fn set_attempt_workspace_input_steps(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        steps: &[StepId],
+    ) -> Result<(), DbError> {
+        let ids: Vec<&str> = steps.iter().map(|s| s.0.as_str()).collect();
+        let json = serde_json::to_value(ids).map_err(|e| DbError::Other(e.to_string()))?;
+        sqlx::query(
+            "UPDATE attempts SET workspace_input_steps = $4
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(&attempt.0)
+        .bind(json)
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn attempt_workspace_input_steps(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<Option<Vec<StepId>>, DbError> {
+        let row = sqlx::query(
+            "SELECT workspace_input_steps FROM attempts
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(&attempt.0)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(db_err)?;
+        match row.and_then(|r| r.get::<Option<Value>, _>("workspace_input_steps")) {
+            Some(v) => serde_json::from_value::<Vec<String>>(v)
+                .map(|ids| Some(ids.into_iter().map(StepId).collect()))
+                .map_err(|e| DbError::Other(e.to_string())),
+            None => Ok(None),
+        }
+    }
+
     async fn set_step_input(
         &self,
         run: &RunId,

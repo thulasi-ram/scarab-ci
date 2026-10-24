@@ -505,6 +505,30 @@ pub trait Db: Send + Sync {
         attempt: &AttemptId,
     ) -> Result<std::collections::BTreeMap<String, String>, DbError>;
 
+    /// Record the ordered upstream steps behind this attempt's workspace
+    /// input roots, as resolved at LAUNCH ([`crate::workspace_input_steps`]
+    /// — the index space of the fetcher's root list). Overwrites: a
+    /// re-driven launch re-resolves, and the last write is what launched.
+    /// Settle resolves a collision sample's root indices against it (git-bug
+    /// b6b8510), never against a settle-time re-derivation.
+    async fn set_attempt_workspace_input_steps(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        steps: &[StepId],
+    ) -> Result<(), DbError>;
+
+    /// The list [`set_attempt_workspace_input_steps`](Db::set_attempt_workspace_input_steps)
+    /// recorded, or `None` if none was (no workspace inputs, or an attempt
+    /// launched before the column existed).
+    async fn attempt_workspace_input_steps(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<Option<Vec<StepId>>, DbError>;
+
     /// Record (or clear, with `None`) the **input signature** a step consumed on
     /// the attempt that is about to run — a deterministic digest of its `needs`'
     /// output snapshots (see `input_signature`). On a restart, comparing a
