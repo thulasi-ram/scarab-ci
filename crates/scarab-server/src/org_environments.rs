@@ -284,6 +284,8 @@ pub(crate) fn org_environment_api_error(e: OrgEnvironmentError) -> ApiError {
         OrgEnvironmentError::NotFound { .. } => ApiError::NotFound,
         // ADR-0071 §3, §8: a Project's overlay or grant pins the Environment.
         in_use @ OrgEnvironmentError::InUse(_) => ApiError::Conflict(in_use.to_string()),
+        // ADR-0073 §3: an `…_expecting` write lost to a concurrent change.
+        OrgEnvironmentError::Conflict(m) => ApiError::Conflict(m),
         OrgEnvironmentError::Store(m) => ApiError::Db(DbError::Other(m)),
     }
 }
