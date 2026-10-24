@@ -21,7 +21,6 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures::stream::{self, BoxStream, Stream, StreamExt};
 use futures::SinkExt;
@@ -82,6 +81,9 @@ pub mod plugin_runtime;
 /// concurrency-hold facts per step.
 mod run_gate_view;
 pub mod retention;
+mod routes;
+pub use routes::{route_table, RouteEntry};
+pub mod step_up;
 pub mod secret_executor;
 /// `--role workspace`: the ADR-0061 workspace service. Its own router, its own
 /// `/readyz`, and NO durable core — see the module docs.
@@ -10550,229 +10552,10 @@ pub fn router(state: AppState) -> Router {
 }
 
 fn router_inner(state: AppState) -> Router {
-    Router::new()
-        .route("/healthz", get(healthz))
-        .route("/readyz", get(readyz))
-        .route("/metrics", get(metrics))
-        .route("/openapi.json", get(openapi))
-        .route("/.well-known/jwks.json", get(jwks))
-        .route(
-            "/.well-known/openid-configuration",
-            get(openid_configuration),
-        )
-        .route("/v1/auth/login", post(login).get(oauth_login_redirect))
-        .route("/v1/auth/callback", get(oauth_callback))
-        .route("/v1/auth/providers", get(auth_providers))
-        .route("/v1/auth/logout", post(logout))
-        .route("/v1/me", get(me))
-        .route("/v1/me/identities/link", post(begin_link_identity))
-        .route("/v1/me/identities/{provider}", delete(unlink_identity))
-        .route(
-            "/v1/orgs/{org}/bindings",
-            get(list_bindings).put(put_binding).delete(delete_binding),
-        )
-        .route("/v1/orgs/{org}/principals", get(search_principals))
-        .route(
-            "/v1/orgs/{org}/tokens",
-            get(list_api_tokens).post(mint_api_token),
-        )
-        .route("/v1/orgs/{org}/tokens/{id}", delete(revoke_api_token))
-        .route(
-            "/v1/repos/{org}/{repo}/bindings/import",
-            post(import_bindings),
-        )
-        .route("/v1/repos", get(list_projects))
-        .route("/v1/repos/{org}/{repo}/runs", get(list_repo_runs))
-        .route("/v1/runs", post(create_run).get(list_runs))
-        .route("/v1/runs/{id}", get(get_run))
-        .route("/v1/runs/{id}/events", get(get_events))
-        .route("/v1/runs/{id}/logs", get(get_logs))
-        .route("/v1/runs/{id}/steps/{step}/rerun", post(rerun_step))
-        // Deprecated alias for pre-rename callers (restart→rerun, 2026-07-23):
-        // same handler, intentionally NOT in the OpenAPI surface.
-        .route("/v1/runs/{id}/steps/{step}/restart", post(rerun_step))
-        .route("/v1/runs/{id}/steps/{step}/retry", post(retry_step))
-        // The rerun PREVIEW (ADR-0061 s5): what the rerun would actually execute,
-        // read before the button is pressed so a widened scope is never a surprise.
-        .route("/v1/runs/{id}/steps/{step}/rerun-plan", get(rerun_plan))
-        // The manual Workspace-Snapshot pin (ADR-0061 s5) — one resource, two
-        // verbs, because pin and unpin are the same fact in two states.
-        .route(
-            "/v1/runs/{id}/snapshots-pin",
-            post(pin_run_snapshots).delete(unpin_run_snapshots),
-        )
-        .route("/v1/runs/{id}/cancel", post(cancel_run))
-        .route("/v1/runs/{id}/artifacts", get(list_artifacts))
-        .route("/v1/runs/{id}/artifacts/{*name}", get(download_artifact))
-        .route("/v1/runs/{id}/steps/{step}/logs", get(get_step_logs))
-        .route("/v1/runs/{id}/services", get(get_services))
-        .route(
-            "/v1/runs/{id}/services/{service}/logs",
-            get(get_service_logs),
-        )
-        .route("/v1/runs/{id}/steps/{step}/attach", get(attach_step))
-        .route("/v1/runs/{id}/steps/{step}/debug-pod", get(debug_pod_step))
-        .route("/v1/runs/{id}/steps/{step}/workspace", get(list_workspace))
-        .route(
-            "/v1/runs/{id}/steps/{step}/workspace/file",
-            get(get_workspace_file),
-        )
-        .route("/v1/runs/{id}/gates/{step}/approve", post(approve_gate))
-        .route("/v1/runs/{id}/gates/{step}/reject", post(reject_gate))
-        .route(
-            "/v1/runs/{id}/gates/{step}/release",
-            post(release_gate_external),
-        )
-        .route(
-            "/v1/runs/{id}/steps/{step}/results",
-            get(get_step_results).post(ingest_step_results),
-        )
-        .route(
-            "/v1/runs/{id}/steps/{step}/consumed",
-            get(get_attempt_consumed),
-        )
-        .route(
-            "/v1/secrets",
-            post(put_secret).get(list_secrets).delete(delete_secret),
-        )
-        .route(
-            "/v1/repos/{org}/{repo}/environments",
-            get(list_environments),
-        )
-        .route(
-            "/v1/repos/{org}/{repo}/environments/{name}",
-            axum::routing::put(put_environment)
-                .get(get_environment)
-                .delete(delete_environment),
-        )
-        .route(
-            "/v1/repos/{org}/{repo}/environments/{name}/deployments",
-            get(list_deployments),
-        )
-        .route(
-            "/v1/orgs/{org}/environments",
-            get(org_environments::list_org_environments),
-        )
-        .route(
-            "/v1/orgs/{org}/environments/{env}",
-            axum::routing::put(org_environments::put_org_environment)
-                .get(org_environments::get_org_environment)
-                .delete(org_environments::delete_org_environment),
-        )
-        .route(
-            "/v1/orgs/{org}/environments/{env}/eligibility",
-            axum::routing::put(org_environments::put_environment_eligibility)
-                .get(org_environments::get_environment_eligibility),
-        )
-        .route(
-            "/v1/orgs/{org}/environments/{env}/protection",
-            axum::routing::put(org_environments::put_environment_protection)
-                .get(org_environments::get_environment_protection),
-        )
-        .route(
-            "/v1/orgs/{org}/environments/{env}/projects",
-            get(org_environments::list_environment_projects),
-        )
-        .route(
-            "/v1/orgs/{org}/environments/{env}/projects/{project}/overlay",
-            axum::routing::put(org_environments::put_environment_project_overlay)
-                .get(org_environments::get_environment_project_overlay)
-                .delete(org_environments::delete_environment_project_overlay),
-        )
-        .route(
-            "/v1/orgs/{org}/environments/{env}/projects/{project}/privilege-grant",
-            axum::routing::put(org_environments::put_environment_project_privilege_grant)
-                .get(org_environments::get_environment_project_privilege_grant)
-                .delete(org_environments::delete_environment_project_privilege_grant),
-        )
-        .route(
-            "/v1/orgs/{org}/environment-migration-report",
-            get(org_environments::get_environment_migration_report),
-        )
-        .route(
-            "/v1/orgs/{org}/environment-migration-report/{env}/acknowledge",
-            post(org_environments::acknowledge_environment_migration_report),
-        )
-        .route(
-            "/v1/orgs/{org}/environments/{env}/deployment-targets",
-            get(plugins::environment_deployment_targets),
-        )
-        .route(
-            "/v1/orgs/{org}/plugin-catalog",
-            get(plugins::plugin_catalog),
-        )
-        .route(
-            "/v1/orgs/{org}/plugins",
-            get(plugins::list_plugins).post(plugins::install_plugin),
-        )
-        .route(
-            "/v1/orgs/{org}/plugins/{name}",
-            get(plugins::get_plugin).delete(plugins::uninstall_plugin),
-        )
-        .route(
-            "/v1/orgs/{org}/plugins/{name}/kill",
-            post(plugins::kill_plugin),
-        )
-        .route(
-            "/v1/orgs/{org}/plugins/{name}/enable",
-            post(plugins::enable_plugin),
-        )
-        .route(
-            "/v1/orgs/{org}/plugins/{name}/unmapped-groupings",
-            get(plugins::unmapped_groupings),
-        )
-        .route(
-            "/v1/orgs/{org}/plugins/{name}/connections",
-            get(plugins::list_plugin_connections),
-        )
-        .route(
-            "/v1/orgs/{org}/plugins/{name}/connections/{slot}",
-            axum::routing::put(plugins::put_plugin_connection)
-                .delete(plugins::delete_plugin_connection),
-        )
-        .route("/v1/orgs/{org}/board", get(get_environment_board))
-        .route(
-            "/v1/orgs/{org}/environments/{env}/deployments",
-            get(list_environment_deployments),
-        )
-        .route(
-            "/v1/orgs/{org}/environments/{env}/deployments/{id}",
-            get(get_deployment),
-        )
-        .route(
-            "/v1/connections",
-            get(list_connections).post(create_connection),
-        )
-        .route(
-            "/v1/connections/{id}",
-            axum::routing::delete(delete_connection),
-        )
-        .route("/v1/connections/{id}/resync", post(resync_connection))
-        .route("/v1/connections/{id}/preflight", get(connection_preflight))
-        .route("/v1/connections/{id}/available-repos", get(available_repos))
-        .route("/v1/connections/{id}/repos", post(bind_repo))
-        .route(
-            "/v1/connections/{id}/repos/{owner}/{name}",
-            axum::routing::delete(unbind_repo),
-        )
-        .route(
-            "/v1/connections/{id}/repos/{owner}/{name}/webhook",
-            post(register_repo_webhook),
-        )
-        .route("/v1/repos/{org}/{repo}/secrets/matrix", get(secret_matrix))
-        .route(
-            "/v1/repos/{org}/{repo}/secrets/matrix/silenced",
-            axum::routing::put(silence_secret_cell).delete(unsilence_secret_cell),
-        )
-        .route("/v1/repos/{org}/{repo}/refs", get(list_refs))
-        .route("/v1/repos/{org}/{repo}/pipelines", get(list_pipelines))
-        .route(
-            "/v1/repos/{org}/{repo}/pipelines/{name}/interface",
-            get(pipeline_interface),
-        )
-        .route("/v1/repos/{org}/{repo}/dispatch", post(dispatch))
-        .route("/webhooks/github", post(github_webhook))
-        .route("/webhooks/forgejo", post(forgejo_webhook))
+    // The single route list lives in `routes.rs`, each route registered with
+    // its ADR-0073 classification.
+    routes::governed_routes()
+        .router
         // The embedded web UI (ADR-0054): everything no API route claimed
         // falls through here — a real file from dist/, else index.html (SPA
         // client routing). Same-origin by construction: no CORS anywhere.
