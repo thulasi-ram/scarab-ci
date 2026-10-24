@@ -537,6 +537,19 @@ pub mod security_event_kind {
     pub const PASSKEY_BREAK_GLASS_RESET: &str = "passkey.break_glass_reset";
     pub const PASSKEY_CLONE_SUSPECTED: &str = "passkey.clone_suspected";
     pub const GUARD_NOT_CONSULTED: &str = "guard.not_consulted";
+
+    /// The Org-less kinds an Org's log shows about its members: the human's
+    /// own confirmations and passkey lifecycle. Org-less operations,
+    /// refusals and requests (identity links, passkey adds, forge
+    /// connections) belong to no Org and stay out of every Org's view.
+    pub const ORG_VISIBLE_ORGLESS: &[&str] = &[
+        STEP_UP_CONFIRMED,
+        PASSKEY_ENROLLED,
+        PASSKEY_REMOVED,
+        PASSKEY_RESET,
+        PASSKEY_BREAK_GLASS_RESET,
+        PASSKEY_CLONE_SUSPECTED,
+    ];
 }
 
 /// One row of the append-only OrgSecurityEventLog (ADR-0073 §7).

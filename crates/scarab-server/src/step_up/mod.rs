@@ -580,7 +580,7 @@ pub(crate) async fn require(
             digest,
             None,
             None,
-            Some(serde_json::json!({ "op": op.id, "summary": summary })),
+            Some(serde_json::json!({ "op": op.id, "org": p.org, "summary": summary })),
             now,
         )
         .await?;

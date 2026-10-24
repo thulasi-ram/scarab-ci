@@ -593,11 +593,19 @@ pub(crate) async fn step_up_confirm(
         .and_then(|s| s.pointer("/summary/target"))
         .and_then(|o| o.as_str())
         .map(str::to_string);
+    // The Org the guard resolved for the operation it was confirmed for, so
+    // the confirmation lands in that Org's log and no other.
+    let org = row
+        .summary
+        .as_ref()
+        .and_then(|s| s.get("org"))
+        .and_then(|o| o.as_str())
+        .map(str::to_string);
     let mut ev = event(
         kind::STEP_UP_CONFIRMED,
         &subject,
         caller.event_label(),
-        None,
+        org,
         now,
     );
     ev.op = op;

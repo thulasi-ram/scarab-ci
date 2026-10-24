@@ -805,13 +805,18 @@ impl SecurityEventLog for PostgresDb {
 
     async fn list(&self, f: &SecurityEventFilter) -> Result<Vec<SecurityEvent>, IdentityError> {
         // The Org log (ADR-0073 §7): the Org's own events, plus Org-less
-        // events (passkeys, confirmations) about anyone holding a live
-        // binding anywhere in the Org — membership read now, not at append.
+        // events of the allowed kinds (confirmations, passkeys) about anyone
+        // holding a live binding anywhere in the Org — membership read now,
+        // not at append.
+        let orgless: Vec<String> = scarab_identity::security_event_kind::ORG_VISIBLE_ORGLESS
+            .iter()
+            .map(|k| k.to_string())
+            .collect();
         let rows = sqlx::query(&format!(
             "SELECT {EVENT_COLUMNS} FROM org_security_events e
              WHERE ($1::text IS NULL
                     OR e.org = $1
-                    OR (e.org IS NULL AND e.subject IN (
+                    OR (e.org IS NULL AND e.kind = ANY($6) AND e.subject IN (
                         SELECT subject FROM rbac_bindings WHERE org = $1 AND role IS NOT NULL)))
                AND ($2::text IS NULL OR e.subject = $2)
                AND (cardinality($3::text[]) = 0 OR e.kind = ANY($3))
@@ -824,6 +829,7 @@ impl SecurityEventLog for PostgresDb {
         .bind(&f.kinds)
         .bind(f.before_seq)
         .bind(i64::from(f.limit.max(1)))
+        .bind(&orgless)
         .fetch_all(self.pool())
         .await
         .map_err(identity_err)?;

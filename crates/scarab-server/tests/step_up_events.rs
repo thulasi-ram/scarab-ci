@@ -283,6 +283,83 @@ async fn the_org_log_shows_its_org_and_members_only_on_postgres() {
     tdb.cleanup().await;
 }
 
+/// A confirmation made for one Org's operation never shows in another Org's
+/// log, even when its human is a member there: amy (Admin of `big`, Viewer
+/// of `tiny`) confirms an always-ask token mint in `big`; `tiny`'s admin
+/// sees nothing of it, `big`'s log carries it with its Org and target, and
+/// amy's own log keeps the full summary.
+async fn a_confirmation_stays_in_its_own_org(backend: Backend) {
+    let h = harness_on(backend, |st| st);
+    let (amy, mut soft) = member(&h, "amy", "big", Role::Admin).await;
+    h.grant("amy", Scope::Org("tiny".into()), Role::Viewer).await;
+    h.grant("tom", Scope::Org("tiny".into()), Role::Admin).await;
+    let tom = h.browser_session(scoped("tom")).await;
+
+    let uri = "/v1/orgs/big/tokens";
+    let mint = json!({"name": "ci-bot", "role": "member", "expires_in_days": 7});
+    let (st, b) = h.cookie("POST", uri, Some(mint.clone()), &amy).await;
+    assert_step_up(st, &b, "action");
+    let (st, conf) = h.answer(&amy, &mut soft, &b["challenge"]).await;
+    assert_eq!(st, StatusCode::OK, "{conf}");
+    let (st, b) = h.cookie("POST", uri, Some(mint), &amy).await;
+    assert!(st.is_success(), "{st} {b}");
+
+    let (st, tiny) = h
+        .cookie("GET", "/v1/orgs/tiny/security/events?limit=200", None, &tom)
+        .await;
+    assert_eq!(st, StatusCode::OK, "{tiny}");
+    for e in tiny["events"].as_array().unwrap() {
+        // The fields that say what an event was about (not its random ids).
+        let text = format!("{} {} {} {}", e["org"], e["target"], e["op"], e["detail"]);
+        assert!(
+            !text.contains("big") && !text.contains("token.mint"),
+            "tiny's log leaked big's confirmation: {e}"
+        );
+    }
+
+    let (st, big) = h
+        .cookie("GET", "/v1/orgs/big/security/events?limit=200", None, &amy)
+        .await;
+    assert_eq!(st, StatusCode::OK, "{big}");
+    let confirmed: Vec<&Value> = big["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "step_up.confirmed" && e["op"] == "token.mint")
+        .collect();
+    assert_eq!(confirmed.len(), 1, "{big}");
+    assert_eq!(confirmed[0]["org"], "big");
+    assert!(
+        confirmed[0]["target"].as_str().unwrap().contains("big"),
+        "{}",
+        confirmed[0]
+    );
+
+    let (st, mine) = h
+        .cookie("GET", "/v1/me/security/events?limit=200", None, &amy)
+        .await;
+    assert_eq!(st, StatusCode::OK, "{mine}");
+    let own = mine["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "step_up.confirmed" && e["op"] == "token.mint")
+        .expect("amy's own confirmation");
+    assert!(own["detail"]["summary"]["target"].is_string(), "{own}");
+}
+
+#[tokio::test]
+async fn a_confirmation_stays_in_its_own_org_in_memory() {
+    a_confirmation_stays_in_its_own_org(Backend::Memory).await;
+}
+
+#[tokio::test]
+async fn a_confirmation_stays_in_its_own_org_on_postgres() {
+    let Some((tdb, pg)) = pg().await else { return };
+    a_confirmation_stays_in_its_own_org(Backend::Pg(pg)).await;
+    tdb.cleanup().await;
+}
+
 /// The Org summary: who among its admins has no passkey, recent refusals
 /// (24 hours), waiting requests — what the banner reads.
 #[tokio::test]
