@@ -989,12 +989,23 @@ pub trait Db: Send + Sync {
     ///   clock) or fails → an error, and the step stays `Running`: no success
     ///   without its request, no request without its success.
     ///
+    /// - a request's DeploymentTarget is homed in another Environment, read
+    ///   under the Org's Deployment counter lock (current routing, else the
+    ///   Environment of its newest input — the recorded facts only) →
+    ///   `Ok(TargetHomedElsewhere)`
+    ///   ([`crate::DeployStepFinish::TargetHomedElsewhere`]), nothing lands
+    ///   and the step stays `Running` for the caller to fail (git-bug
+    ///   9e66f2c: two Runs in different Environments admitted before either
+    ///   recorded a never-seen target — the first to record it homes it).
+    ///
     /// `events` (the finalization's `AttemptFinished` + `StepTransitioned`)
     /// are appended in the same commit (git-bug 586187a): a success never
     /// lands without its journal entry.
     ///
     /// Postgres runs it in ONE READ COMMITTED transaction, taking the Org's
-    /// Deployment counter row last (see `append_deployment_input`).
+    /// Deployment counter row last (see `append_deployment_input`) — and
+    /// re-reading each target's home only once it holds it, so no other
+    /// append can land between the check and its own.
     #[allow(clippy::too_many_arguments)]
     async fn finish_step_with_deployment_requests(
         &self,
@@ -1005,7 +1016,7 @@ pub trait Db: Send + Sync {
         inputs: &[scarab_deployment::DeploymentInput],
         received_at: Timestamp,
         events: &[EventKind],
-    ) -> Result<(), DbError>;
+    ) -> Result<crate::DeployStepFinish, DbError>;
 
     /// Append one entry to the run's append-only event log.
     async fn append_event(&self, event: &EventKind) -> Result<(), DbError>;

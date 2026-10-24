@@ -1019,6 +1019,52 @@ pub struct RunDeploymentRequest {
     pub gate_steps: Vec<StepId>,
 }
 
+/// What [`Db::finish_step_with_deployment_requests`] did, when it did not
+/// conflict.
+///
+/// [`Db::finish_step_with_deployment_requests`]: crate::ports::Db::finish_step_with_deployment_requests
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeployStepFinish {
+    /// The success transition, the attempt outcome, the events and every
+    /// request landed, in one commit.
+    Recorded,
+    /// **Nothing** landed (git-bug 9e66f2c): re-checked under the Org's
+    /// Deployment counter lock, a request's DeploymentTarget is homed in
+    /// another Environment — another Run, admitted concurrently, recorded it
+    /// first (or its routing moved since admission). A DeploymentTarget
+    /// belongs to exactly one Environment, so this request is never recorded;
+    /// the caller fails the Step. The first such request, in input order.
+    TargetHomedElsewhere(DeploymentTargetHomedElsewhere),
+}
+
+/// A DeploymentRequest whose DeploymentTarget is homed in an Environment other
+/// than the requesting Run's ([`DeployStepFinish::TargetHomedElsewhere`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentTargetHomedElsewhere {
+    /// The requesting Run's Environment.
+    pub environment: String,
+    pub target_source: String,
+    pub target_id: String,
+    /// The Environment the target is homed in.
+    pub home: String,
+}
+
+impl DeploymentTargetHomedElsewhere {
+    /// The Step's failure detail. Worded as a DeploymentRequest that cannot
+    /// be completed — the class the Step fails with
+    /// ([`FailureKind::DeploymentRequestIncomplete`]): the Step ran, nothing
+    /// is recorded, and it is never auto-retried.
+    pub fn reason(&self) -> String {
+        format!(
+            "DeploymentRequest incomplete: DeploymentTarget `{}`/`{}` is homed in Environment \
+             `{}`, not this Run's `{}` (another Run recorded it there first, after this Run was \
+             admitted); a DeploymentTarget belongs to exactly one Environment, so nothing was \
+             recorded for this step",
+            self.target_source, self.target_id, self.home, self.environment
+        )
+    }
+}
+
 /// Complete a succeeding Step's DeploymentRequests from its own `results`
 /// (slice b, criterion 1; plan Q10): each request's DeploymentVersion is its
 /// version result, which must be a **non-empty JSON string** with no

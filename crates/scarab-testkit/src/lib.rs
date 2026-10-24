@@ -1863,7 +1863,7 @@ impl Db for InMemoryDb {
         inputs: &[scarab_deployment::DeploymentInput],
         received_at: Timestamp,
         events: &[EventKind],
-    ) -> Result<(), DbError> {
+    ) -> Result<scarab_engine::DeployStepFinish, DbError> {
         // One lock = one transaction: the guard, the appends, the events and
         // the transition all land or none does.
         // Mirrors Postgres: the step must be `running` AND `attempt` its
@@ -1890,6 +1890,31 @@ impl Db for InMemoryDb {
         if !finishable {
             return Err(DbError::Conflict);
         }
+        // The home re-check under the lock (git-bug 9e66f2c), as Postgres
+        // makes it under the Org's counter: the fake knows no routing, so a
+        // target's home is the Environment of its newest input.
+        if let Some(elsewhere) = inputs.iter().find_map(|input| {
+            let target = input.target();
+            let home = st
+                .deployment_inputs
+                .get(org)?
+                .iter()
+                .rev()
+                .map(|l| l.input.target())
+                .find(|t| t.source == target.source && t.id == target.id)?;
+            (home.environment != target.environment).then(|| {
+                scarab_engine::DeploymentTargetHomedElsewhere {
+                    environment: target.environment.clone(),
+                    target_source: target.source.clone(),
+                    target_id: target.id.clone(),
+                    home: home.environment.clone(),
+                }
+            })
+        }) {
+            return Ok(scarab_engine::DeployStepFinish::TargetHomedElsewhere(
+                elsewhere,
+            ));
+        }
         take_event_append_failure(&mut st, events)?;
         append_deployment_inputs_locked(&mut st, org, inputs, received_at.0)
             .map_err(|e| DbError::Other(e.to_string()))?;
@@ -1902,7 +1927,7 @@ impl Db for InMemoryDb {
             a.outcome = AttemptOutcome::Succeeded;
         }
         st.events.extend(events.iter().cloned());
-        Ok(())
+        Ok(scarab_engine::DeployStepFinish::Recorded)
     }
 
     async fn set_attempt_outcome(

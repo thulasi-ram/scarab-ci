@@ -876,8 +876,11 @@ pub trait EnvironmentGovernanceStore: Send + Sync {
     /// homed now ([`DeploymentTargetHome`]): the Environment its source's
     /// grouping routes to, when the source has reported the target and an
     /// Environment lists that grouping; otherwise the Environment of the
-    /// target's newest input in the Deployment record. A target neither knows
-    /// is absent — nothing claims it, so any Environment may request it first.
+    /// target's newest input in the Deployment record; otherwise the
+    /// Environment of the oldest non-terminal Run that already requests it
+    /// (git-bug 9e66f2c: an admitted Run's request claims the target before it
+    /// records anything). A target none of them knows is absent — nothing
+    /// claims it, so any Environment may request it first.
     ///
     /// Read at Run creation, never folded: a home is a routing fact, not a
     /// Deployment's status. Not an ownership check — admission never reads

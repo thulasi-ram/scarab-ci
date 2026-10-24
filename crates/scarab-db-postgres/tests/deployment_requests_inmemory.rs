@@ -352,6 +352,80 @@ async fn a_non_latest_attempt_cannot_finish_the_step() {
     assert_eq!(db.inputs("acme", "prod").await.unwrap().len(), 1);
 }
 
+/// The twin of Postgres' home re-check (git-bug 9e66f2c): a staging Run
+/// recorded `argocd`/`web` after this prod Run was admitted, so finishing the
+/// prod Step lands nothing and answers `TargetHomedElsewhere` naming staging.
+#[tokio::test]
+async fn a_target_another_environment_recorded_first_is_refused_at_success() {
+    use scarab_deployment::{DeploymentRequester, DeploymentTarget, DeploymentVersion};
+    use scarab_engine::{Attempt, AttemptId, AttemptOutcome, DeployStepFinish};
+
+    let db = InMemoryDb::new();
+    seed(&db).await;
+    db.record_step_transition(
+        &run_id(),
+        &step_id(),
+        StepStatus::Pending,
+        StepStatus::Running,
+    )
+    .await
+    .unwrap();
+    db.record_attempt(
+        &run_id(),
+        &step_id(),
+        &Attempt {
+            id: AttemptId("a1".into()),
+            started_at: Timestamp(1_000),
+            failure: None,
+            failure_detail: None,
+            outcome: AttemptOutcome::Running,
+        },
+    )
+    .await
+    .unwrap();
+    let request = |environment: &str, run: &str| DeploymentInput::Request {
+        target: DeploymentTarget {
+            environment: environment.into(),
+            source: "argocd".into(),
+            id: "web".into(),
+        },
+        version: DeploymentVersion("v42".into()),
+        requester: DeploymentRequester {
+            run: run.into(),
+            step: "bump".into(),
+        },
+        effective_at: 1_000,
+        at: 1_000,
+        evidence: Vec::new(),
+    };
+    db.append("acme", &request("staging", "r-staging"), 2_000)
+        .await
+        .unwrap();
+
+    let finished = db
+        .finish_step_with_deployment_requests(
+            &run_id(),
+            &step_id(),
+            &AttemptId("a1".into()),
+            "acme",
+            &[request("prod", "r1")],
+            Timestamp(3_000),
+            &[],
+        )
+        .await
+        .unwrap();
+    let DeployStepFinish::TargetHomedElsewhere(elsewhere) = finished else {
+        panic!("staging recorded `web` first: got {finished:?}");
+    };
+    assert_eq!(
+        (elsewhere.environment.as_str(), elsewhere.home.as_str()),
+        ("prod", "staging")
+    );
+    assert!(db.inputs("acme", "prod").await.unwrap().is_empty());
+    let step = db.steps_of_run(&run_id()).await.unwrap().remove(0);
+    assert_eq!(step.status, StepStatus::Running, "nothing landed");
+}
+
 /// A Report of `version` on `argocd`/`web` as a plugin's ingest appends it.
 fn report(status: scarab_deployment::SourceAssertedStatus, at: i64) -> DeploymentInput {
     DeploymentInput::Report {

@@ -1739,7 +1739,7 @@ impl Db for PostgresDb {
         inputs: &[scarab_deployment::DeploymentInput],
         received_at: Timestamp,
         events: &[EventKind],
-    ) -> Result<(), DbError> {
+    ) -> Result<scarab_engine::DeployStepFinish, DbError> {
         // ONE transaction, READ COMMITTED (stated, not assumed: the counter
         // upsert in `append_deployment_input` waits-then-rereads only there;
         // under REPEATABLE READ it would fail 40001 instead). Lock order:
@@ -1813,12 +1813,63 @@ impl Db for PostgresDb {
         for event in events {
             insert_event(&mut *tx, event).await?;
         }
+        // The Org's counter, taken NOW and held to commit (git-bug 9e66f2c):
+        // a no-op upsert locks the row (inserting it, at seq 0, for a fresh
+        // Org — the append below still gets seq 1). Every other append in the
+        // Org takes this row first, so once we hold it no input can land
+        // between the home re-check and our own appends: READ COMMITTED
+        // re-reads per statement, so the check sees every append that
+        // committed while we waited. Still LAST in the lock order.
+        if !inputs.is_empty() {
+            sqlx::query(
+                "INSERT INTO deployment_input_counters (org, last_seq, last_at)
+                 VALUES ($1, 0, 0)
+                 ON CONFLICT (org) DO UPDATE SET last_seq = deployment_input_counters.last_seq",
+            )
+            .bind(org)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
+        // Run creation refused a target homed elsewhere, but two Runs in
+        // different Environments admitted before either recorded a
+        // never-seen target both pass that check. Re-read each target's home
+        // from the recorded facts (routing, else newest input): the first Run
+        // to record a target homes it; a rival is refused here, nothing lands.
+        let targets: Vec<(String, String)> = inputs
+            .iter()
+            .map(|i| (i.target().source.clone(), i.target().id.clone()))
+            .collect();
+        let homes = crate::environment_governance::target_homes_on(&mut tx, org, &targets, false)
+            .await
+            .map_err(db_err)?;
+        let elsewhere = inputs.iter().find_map(|input| {
+            let target = input.target();
+            let home = homes
+                .iter()
+                .find(|h| h.source == target.source && h.id == target.id)?;
+            (home.environment != target.environment).then(|| {
+                scarab_engine::DeploymentTargetHomedElsewhere {
+                    environment: target.environment.clone(),
+                    target_source: target.source.clone(),
+                    target_id: target.id.clone(),
+                    home: home.environment.clone(),
+                }
+            })
+        });
+        if let Some(elsewhere) = elsewhere {
+            tx.rollback().await.map_err(db_err)?;
+            return Ok(scarab_engine::DeployStepFinish::TargetHomedElsewhere(
+                elsewhere,
+            ));
+        }
         for input in inputs {
             append_deployment_input(&mut tx, org, input, received_at.0)
                 .await
                 .map_err(|e| DbError::Other(e.to_string()))?;
         }
-        tx.commit().await.map_err(db_err)
+        tx.commit().await.map_err(db_err)?;
+        Ok(scarab_engine::DeployStepFinish::Recorded)
     }
 
     async fn set_attempt_outcome(

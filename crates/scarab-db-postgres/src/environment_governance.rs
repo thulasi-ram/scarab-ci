@@ -120,6 +120,85 @@ fn grant_from_row(
     })
 }
 
+/// Where each of `targets` is homed in `org` — the one read behind both Run
+/// creation's refusal ([`EnvironmentGovernanceStore::deployment_target_homes`])
+/// and the re-check a Deploy Step's success makes under the Org's counter
+/// lock (`finish_step_with_deployment_requests`; git-bug 9e66f2c). In order:
+///
+/// 1. current routing (the same join `PluginStore::target_routings` makes:
+///    installation → its reported target → the Environment listing that
+///    target's grouping NOW);
+/// 2. else the Environment of the target's newest input
+///    (`deployment_inputs_target_idx`, migration 0058);
+/// 3. else — only with `with_admitted_runs` — the Environment of the oldest
+///    non-terminal Run that requests it (`run_deployment_requests`). Without
+///    this leg a target nobody has recorded yet was admitted into two
+///    Environments, and both then recorded it (git-bug 9e66f2c). The success
+///    re-check leaves it out: there the recorded facts decide, so the first
+///    Run to RECORD a target homes it and a concurrently admitted rival in
+///    another Environment is refused at its own commit.
+///
+/// A target none of them knows is absent.
+pub(crate) async fn target_homes_on(
+    conn: &mut sqlx::PgConnection,
+    org: &str,
+    targets: &[(String, String)],
+    with_admitted_runs: bool,
+) -> Result<Vec<DeploymentTargetHome>, sqlx::Error> {
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (sources, ids): (Vec<&str>, Vec<&str>) = targets
+        .iter()
+        .map(|(source, id)| (source.as_str(), id.as_str()))
+        .unzip();
+    let rows = sqlx::query(
+        "SELECT q.source, q.target_id,
+                COALESCE(
+                    (SELECT routed.environment
+                     FROM plugin_installations i
+                     JOIN deployment_source_targets t
+                       ON t.installation_id = i.id AND t.target_id = q.target_id
+                     JOIN environment_deployment_sources routed
+                       ON routed.org = i.org AND routed.installation = i.name
+                      AND routed.vendor_grouping = t.vendor_grouping
+                     WHERE i.org = $1 AND i.name = q.source
+                     LIMIT 1),
+                    (SELECT d.environment
+                     FROM deployment_inputs d
+                     WHERE d.org = $1 AND d.target_source = q.source
+                       AND d.target_id = q.target_id
+                     ORDER BY d.seq DESC
+                     LIMIT 1),
+                    (SELECT r.environment
+                     FROM run_deployment_requests r
+                     JOIN runs ON runs.id = r.run_id
+                     WHERE $4 AND r.org = $1 AND r.target_source = q.source
+                       AND r.target_id = q.target_id
+                       AND runs.status IN ('pending', 'running', 'suspended')
+                     ORDER BY runs.created_at, r.run_id
+                     LIMIT 1)
+                ) AS environment
+         FROM UNNEST($2::text[], $3::text[]) AS q(source, target_id)",
+    )
+    .bind(org)
+    .bind(&sources)
+    .bind(&ids)
+    .bind(with_admitted_runs)
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            Some(DeploymentTargetHome {
+                source: r.get("source"),
+                id: r.get("target_id"),
+                environment: r.get::<Option<String>, _>("environment")?,
+            })
+        })
+        .collect())
+}
+
 /// Begin a read-only transaction that sees **one snapshot** for every
 /// statement. Under the default READ COMMITTED each statement gets its own,
 /// so a governance read racing an admin's eligibility-then-overlay edit could
@@ -878,54 +957,14 @@ impl EnvironmentGovernanceStore for PostgresDb {
         org: &str,
         targets: &[(String, String)],
     ) -> Result<Vec<DeploymentTargetHome>, OrgEnvironmentError> {
-        if targets.is_empty() {
-            return Ok(Vec::new());
-        }
-        let (sources, ids): (Vec<&str>, Vec<&str>) = targets
-            .iter()
-            .map(|(source, id)| (source.as_str(), id.as_str()))
-            .unzip();
-        // Current routing first (the same join `PluginStore::target_routings`
-        // makes: installation → its reported target → the Environment listing
-        // that target's grouping NOW), else the newest recorded input's
-        // Environment (`deployment_inputs_target_idx`, migration 0058).
-        let rows = sqlx::query(
-            "SELECT q.source, q.target_id,
-                    COALESCE(
-                        (SELECT routed.environment
-                         FROM plugin_installations i
-                         JOIN deployment_source_targets t
-                           ON t.installation_id = i.id AND t.target_id = q.target_id
-                         JOIN environment_deployment_sources routed
-                           ON routed.org = i.org AND routed.installation = i.name
-                          AND routed.vendor_grouping = t.vendor_grouping
-                         WHERE i.org = $1 AND i.name = q.source
-                         LIMIT 1),
-                        (SELECT d.environment
-                         FROM deployment_inputs d
-                         WHERE d.org = $1 AND d.target_source = q.source
-                           AND d.target_id = q.target_id
-                         ORDER BY d.seq DESC
-                         LIMIT 1)
-                    ) AS environment
-             FROM UNNEST($2::text[], $3::text[]) AS q(source, target_id)",
-        )
-        .bind(org)
-        .bind(&sources)
-        .bind(&ids)
-        .fetch_all(self.pool())
-        .await
-        .map_err(org_environment_store_err)?;
-        Ok(rows
-            .iter()
-            .filter_map(|r| {
-                Some(DeploymentTargetHome {
-                    source: r.get("source"),
-                    id: r.get("target_id"),
-                    environment: r.get::<Option<String>, _>("environment")?,
-                })
-            })
-            .collect())
+        let mut conn = self
+            .pool()
+            .acquire()
+            .await
+            .map_err(org_environment_store_err)?;
+        target_homes_on(&mut conn, org, targets, true)
+            .await
+            .map_err(org_environment_store_err)
     }
 
     async fn acknowledge_environment_migration_report(

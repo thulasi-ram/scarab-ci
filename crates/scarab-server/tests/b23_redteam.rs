@@ -498,15 +498,14 @@ steps:
 }
 
 /// "A DeploymentTarget belongs to exactly one Environment." The home check
-/// reads only current routing and the Deployment input log — not the
-/// resolved requests of Runs already admitted (`run_deployment_requests`,
-/// which even has an `(org, environment, source, id)` index). So a target
-/// nobody has recorded yet is admitted into `staging` AND into `prod`, before
-/// either deploy step runs; both then record it, and the target is homed in
-/// two Environments (its "home" flips with whichever input is newest). The
-/// second Run creation already knows the target is staging's.
+/// used to read only current routing and the Deployment input log — not the
+/// resolved requests of Runs already admitted (`run_deployment_requests`).
+/// So a target nobody had recorded yet was admitted into `staging` AND into
+/// `prod`, before either deploy step ran; both then recorded it, and the
+/// target was homed in two Environments (git-bug 9e66f2c). The second Run
+/// creation already knows the target is staging's: a non-terminal Run's
+/// request homes it.
 #[tokio::test]
-#[ignore = "git-bug 9e66f2c: DeploymentTarget recorded in two Environments (admission TOCTOU) — admitted-Run requests are not yet 'known' (ADR-0070 §7)"]
 async fn pg_a_target_one_admitted_run_requested_is_refused_to_another_environment() {
     let Some((tdb, pg)) = migrated().await else {
         return;

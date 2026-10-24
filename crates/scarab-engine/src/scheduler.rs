@@ -4373,7 +4373,11 @@ impl<'a> Scheduler<'a> {
     ///   `2b5d9d9`) — when the change was first being made, on the
     ///   control-plane clock — and received at `now`. A `Conflict` (a peer
     ///   finalized the step) appends nothing and no events; any other error
-    ///   leaves the step `Running` for the next re-drive.
+    ///   leaves the step `Running` for the next re-drive;
+    /// - a request whose DeploymentTarget the commit finds homed in another
+    ///   Environment ([`crate::DeployStepFinish::TargetHomedElsewhere`];
+    ///   git-bug 9e66f2c) records nothing and fails the step
+    ///   [`FailureKind::DeploymentRequestIncomplete`], naming the home.
     ///
     /// With the usual `AttemptFinished` + `StepTransitioned` events, exactly as
     /// `finalize_step` writes them — in the same commit (git-bug 586187a).
@@ -4468,7 +4472,22 @@ impl<'a> Scheduler<'a> {
             )
             .await
         {
-            Ok(()) => Ok(()),
+            Ok(crate::DeployStepFinish::Recorded) => Ok(()),
+            // Another Environment's Run recorded the target first (git-bug
+            // 9e66f2c): nothing of ours landed, so fail the Step — the same
+            // class as a request its results cannot complete (the Step ran,
+            // nothing is recorded, never auto-retried).
+            Ok(crate::DeployStepFinish::TargetHomedElsewhere(elsewhere)) => {
+                self.finalize_step(
+                    run,
+                    step,
+                    attempt,
+                    StepStatus::Failed,
+                    Some(FailureKind::DeploymentRequestIncomplete),
+                    Some(elsewhere.reason()),
+                )
+                .await
+            }
             Err(DbError::Conflict) => Ok(()),
             Err(e) => Err(e.into()),
         }
