@@ -1120,6 +1120,65 @@ async fn supersede_teardown_dead_letters_after_max_delivery_attempts() {
     );
 }
 
+/// The TeardownAbandoned reasons of `run`'s event log.
+async fn abandoned_reasons(db: &InMemoryDb, run: &RunId) -> Vec<String> {
+    db.events(run)
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventPayload::Raw(v)
+                if v.get("event").and_then(|x| x.as_str()) == Some("TeardownAbandoned") =>
+            {
+                v.get("reason").and_then(|r| r.as_str()).map(str::to_string)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A unit that is merely STILL TERMINATING (every cancel accepted, the Pod
+/// just never gone) is abandoned at the same bound — but its diagnostic says
+/// so, rather than reporting a teardown that "failed" when every delivery
+/// succeeded (review correctness LOW `cancel_until_gone`). A cancel the
+/// backend genuinely refused keeps the failure wording.
+#[tokio::test]
+async fn a_unit_still_terminating_at_the_bound_is_not_reported_as_failed() {
+    let db = InMemoryDb::new();
+    let (run, _handle) = seed_supersede_teardown(&db, "run-lingering").await;
+    let clock = FakeClock::new(1_000);
+    let exec = FakeExecutor::new();
+    exec.linger_after_cancel(u32::MAX); // every cancel lands; the unit never goes
+    let sched = Scheduler::new(&db, &clock, &exec, "drv").with_outbox_visibility_ms(0);
+    for _ in 0..MAX_DELIVERY_ATTEMPTS {
+        sched.reconcile_supersessions().await.expect("reconcile");
+    }
+    assert_eq!(db.outbox_depth().await.unwrap(), 0, "abandoned at the bound");
+    let reasons = abandoned_reasons(&db, &run).await;
+    assert_eq!(reasons.len(), 1, "{reasons:?}");
+    assert!(
+        reasons[0].contains("still terminating") && !reasons[0].contains("failed"),
+        "a lingering unit is not a failed teardown: {}",
+        reasons[0]
+    );
+
+    let db = InMemoryDb::new();
+    let (run, _handle) = seed_supersede_teardown(&db, "run-refused").await;
+    let exec = FakeExecutor::new();
+    exec.fail_cancels(u32::MAX);
+    let sched = Scheduler::new(&db, &clock, &exec, "drv").with_outbox_visibility_ms(0);
+    for _ in 0..MAX_DELIVERY_ATTEMPTS {
+        sched.reconcile_supersessions().await.expect("reconcile");
+    }
+    let reasons = abandoned_reasons(&db, &run).await;
+    assert_eq!(reasons.len(), 1, "{reasons:?}");
+    assert!(
+        reasons[0].contains("failed"),
+        "a refused cancel keeps the failure wording: {}",
+        reasons[0]
+    );
+}
+
 /// The desired end state is "no live Pod", so a cancel that returns `Ok` —
 /// whether it tore the Pod down or found it already gone (the adapters fold a
 /// missing Pod into `Ok`) — retires the teardown on the FIRST pass, with no

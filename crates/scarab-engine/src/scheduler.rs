@@ -90,6 +90,34 @@ pub struct SupersededAttempt {
     pub attempt: String,
 }
 
+/// What one pass of a teardown message over its units reached (git-bug
+/// f22056d; review correctness LOW `cancel_until_gone`). A genuine failure
+/// outranks a unit still terminating, which outranks every unit gone.
+enum TeardownPass {
+    /// Every unit is gone: the message is retired.
+    Gone,
+    /// Every cancel was delivered, but the unit behind this handle is still
+    /// terminating (a k8s Pod in its grace): retried, not a failure.
+    StillTerminating(String),
+    /// A cancel (or a shared-service teardown) the backend refused.
+    Failed(ExecError),
+}
+
+impl TeardownPass {
+    /// Fold one unit's [`Scheduler::cancel_until_gone`] answer in.
+    fn absorb(&mut self, unit: Result<bool, ExecError>, handle: &ExecHandle) {
+        match unit {
+            Ok(true) => {}
+            Ok(false) => {
+                if matches!(self, Self::Gone) {
+                    *self = Self::StillTerminating(handle.0.clone());
+                }
+            }
+            Err(e) => *self = Self::Failed(e),
+        }
+    }
+}
+
 /// The payload of a [`LAUNCH_STEP`] outbox message — the step's fence.
 #[derive(Debug, Serialize, Deserialize)]
 struct LaunchIntent {
@@ -2605,7 +2633,7 @@ impl<'a> Scheduler<'a> {
                 // cancel genuinely failed (an already-gone Pod is `Ok`). Keep going
                 // past a failure so the reachable Pods still die this tick; the whole
                 // message is retried idempotently if any cancel failed.
-                let mut outcome: Result<(), ExecError> = Ok(());
+                let mut outcome = TeardownPass::Gone;
                 for step in self.db.steps_of_run(&msg.run).await? {
                     if let Some(attempt) = step.attempts.last() {
                         if let Some(h) = self
@@ -2613,9 +2641,9 @@ impl<'a> Scheduler<'a> {
                             .attempt_handle(&msg.run, &step.step, &attempt.id)
                             .await?
                         {
-                            if let Err(e) = self.cancel_until_gone(&ExecHandle(h)).await {
-                                outcome = Err(e);
-                            }
+                            let h = ExecHandle(h);
+                            let gone = self.cancel_until_gone(&h).await;
+                            outcome.absorb(gone, &h);
                         }
                     }
                 }
@@ -2646,7 +2674,7 @@ impl<'a> Scheduler<'a> {
                             // re-attempts it. Marking `TornDown` optimistically
                             // would lose the Pod permanently — the very bug this
                             // closes, just moved.
-                            outcome = Err(e);
+                            outcome.absorb(Err(e), &ExecHandle(h.clone()));
                             continue;
                         }
                     }
@@ -2695,16 +2723,16 @@ impl<'a> Scheduler<'a> {
                 // Cancel every named Pod, remembering whether any cancel genuinely
                 // failed (an already-gone Pod is `Ok`). A later reconcile re-cancels
                 // the already-gone ones harmlessly and retries only those still up.
-                let mut outcome: Result<(), ExecError> = Ok(());
+                let mut outcome = TeardownPass::Gone;
                 for item in payload.attempts {
                     if let Some(h) = self
                         .db
                         .attempt_handle(&msg.run, &StepId(item.step), &AttemptId(item.attempt))
                         .await?
                     {
-                        if let Err(e) = self.cancel_until_gone(&ExecHandle(h)).await {
-                            outcome = Err(e);
-                        }
+                        let h = ExecHandle(h);
+                        let gone = self.cancel_until_gone(&h).await;
+                        outcome.absorb(gone, &h);
                     }
                 }
                 self.settle_teardown(&msg, outcome).await
@@ -2717,24 +2745,18 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
-    /// Cancel the unit behind `handle` and answer `Ok` only once it is
-    /// **gone** ([`Executor::torn_down`]), so a teardown message is retired
-    /// only then (git-bug f22056d). While it is still terminating (a k8s Pod
-    /// in its grace) the message stays pending — and its Step keeps holding
-    /// its DeploymentTarget ([`Db::deployment_requesting_runs`]) — through
-    /// the same retry and poison ceiling as a failed cancel: a unit that
-    /// never goes is abandoned with a `TeardownAbandoned` diagnostic after
-    /// [`MAX_DELIVERY_ATTEMPTS`], which also ends its hold.
-    async fn cancel_until_gone(&self, handle: &ExecHandle) -> Result<(), ExecError> {
+    /// Cancel the unit behind `handle` and answer whether it is **gone**
+    /// ([`Executor::torn_down`]), so a teardown message is retired only then
+    /// (git-bug f22056d). While it is still terminating (`Ok(false)`: a k8s
+    /// Pod in its grace) the message stays pending — and its Step keeps
+    /// holding its DeploymentTarget ([`Db::deployment_requesting_runs`]) —
+    /// through the same retry and poison ceiling as a failed cancel: a unit
+    /// that never goes is abandoned with a `TeardownAbandoned` diagnostic
+    /// after [`MAX_DELIVERY_ATTEMPTS`], which also ends its hold. `Err` is a
+    /// cancel (or check) the backend genuinely refused.
+    async fn cancel_until_gone(&self, handle: &ExecHandle) -> Result<bool, ExecError> {
         self.executor.cancel(handle).await?;
-        if self.executor.torn_down(handle).await? {
-            Ok(())
-        } else {
-            Err(ExecError::Other(format!(
-                "`{}` is still terminating after its cancel",
-                handle.0
-            )))
-        }
+        self.executor.torn_down(handle).await
     }
 
     /// Count one failed *processing* attempt of a teardown message and, at
@@ -2792,39 +2814,53 @@ impl<'a> Scheduler<'a> {
     /// ceiling as launch intents (ADR-0047): at [`MAX_DELIVERY_ATTEMPTS`] the
     /// message dead-letters (stops redelivering) and a diagnostic lands on the
     /// run's event log, so an unreachable backend can't spin teardown forever.
-    /// Teardown is idempotent, so a redelivery after a partial success re-cancels
+    /// A unit that is merely still terminating ([`TeardownPass::StillTerminating`])
+    /// is retried the same way, and its diagnostic says so rather than calling
+    /// it a failed teardown. Teardown is idempotent, so a redelivery after a partial success re-cancels
     /// the already-gone Pods harmlessly. The run's own state is never touched —
     /// this is pure resource hygiene; fencing already keeps the durable state
     /// correct whether or not the stale Pod dies.
     async fn settle_teardown(
         &self,
         msg: &OutboxMessage,
-        outcome: Result<(), ExecError>,
+        outcome: TeardownPass,
     ) -> Result<(), SchedulerError> {
-        match outcome {
-            Ok(()) => self.db.mark_dispatched(msg.id).await?,
-            Err(e) => {
-                let failures = self.db.record_outbox_failure(msg.id).await?;
-                if failures >= MAX_DELIVERY_ATTEMPTS {
-                    self.db.dead_letter_outbox(msg.id).await?;
-                    let now = self.clock.now().await;
-                    self.append(
-                        &msg.run,
-                        EventPayload::Raw(serde_json::json!({
-                            "event": "TeardownAbandoned",
-                            "outbox_kind": msg.kind,
-                            "outbox_id": msg.id.0,
-                            "reason": format!(
-                                "Pod teardown failed {MAX_DELIVERY_ATTEMPTS} times and \
-                                 was abandoned; the backend unit may be orphaned \
-                                 (fencing keeps run state correct): {e}"
-                            ),
-                        })),
-                        now,
-                    )
-                    .await?;
-                }
+        let why = match outcome {
+            TeardownPass::Gone => {
+                self.db.mark_dispatched(msg.id).await?;
+                return Ok(());
             }
+            // Every cancel was delivered; the unit is just not gone yet. Not
+            // a failed teardown, but it rides the same ceiling so that its
+            // hold on a DeploymentTarget stays bounded — and if it never
+            // goes, the diagnostic says what was actually observed.
+            TeardownPass::StillTerminating(handle) => format!(
+                "`{handle}` was still terminating after {MAX_DELIVERY_ATTEMPTS} checks — every \
+                 cancel was accepted, but the backend never reported the unit gone (a \
+                 termination grace longer than the retry window, or an unreachable node); \
+                 the teardown is abandoned and its DeploymentTarget hold ends, so the unit \
+                 may still be running (fencing keeps run state correct)"
+            ),
+            TeardownPass::Failed(e) => format!(
+                "Pod teardown failed {MAX_DELIVERY_ATTEMPTS} times and was abandoned; the \
+                 backend unit may be orphaned (fencing keeps run state correct): {e}"
+            ),
+        };
+        let failures = self.db.record_outbox_failure(msg.id).await?;
+        if failures >= MAX_DELIVERY_ATTEMPTS {
+            self.db.dead_letter_outbox(msg.id).await?;
+            let now = self.clock.now().await;
+            self.append(
+                &msg.run,
+                EventPayload::Raw(serde_json::json!({
+                    "event": "TeardownAbandoned",
+                    "outbox_kind": msg.kind,
+                    "outbox_id": msg.id.0,
+                    "reason": why,
+                })),
+                now,
+            )
+            .await?;
         }
         Ok(())
     }
