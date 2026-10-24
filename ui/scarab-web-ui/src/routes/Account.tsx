@@ -6,7 +6,11 @@
 // provider to prove you control that account), so the Link button POSTs for
 // an authorize URL and then NAVIGATES; the callback lands back here with the
 // outcome in the query string, which is read once and shown as a notice.
-import { For, Show, createResource, createSignal } from "solid-js";
+//
+// Below them, Security (ADR-0073): passkeys and your security events. It has
+// its own address, `/account/security`, because that is where every "enroll a
+// passkey" link and the fresh-login redirect land.
+import { For, Show, createResource, createSignal, onMount } from "solid-js";
 import { useLocation } from "@solidjs/router";
 import {
   beginLinkIdentity,
@@ -15,6 +19,7 @@ import {
   unlinkIdentity,
 } from "../api/client";
 import Icon from "../components/Icon";
+import SecuritySettings from "../components/SecuritySettings";
 import { canUnlink, linkNotice, linkable, providerName } from "../identities";
 
 export default function Account() {
@@ -25,6 +30,11 @@ export default function Account() {
   const [error, setError] = createSignal<string | null>(null);
 
   const notice = () => linkNotice(location.search, providers() ?? []);
+  onMount(() => {
+    if (location.pathname.endsWith("/security")) {
+      queueMicrotask(() => document.getElementById("security")?.scrollIntoView({ block: "start" }));
+    }
+  });
   const identities = () => me()?.identities ?? [];
 
   const link = async (provider: string) => {
@@ -149,6 +159,8 @@ export default function Account() {
           </p>
         </div>
       </div>
+
+      <SecuritySettings />
     </section>
   );
 }
