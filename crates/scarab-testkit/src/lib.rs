@@ -161,6 +161,8 @@ struct InMemoryState {
     events: Vec<EventKind>,
     /// Current run statuses — the "state table" the real store keeps.
     runs: HashMap<RunId, RunStatus>,
+    /// Per-run reopen generation ([`Db::run_reopen_generation`]); absent = 0.
+    run_reopen_generations: HashMap<RunId, u64>,
     /// Compiled IR stored per run (self-describing runs, ADR-0022).
     run_ir: HashMap<RunId, serde_json::Value>,
     /// Resolved launch parameters per run (ADR-0043).
@@ -583,6 +585,14 @@ fn take_event_append_failure(st: &mut InMemoryState, events: &[EventKind]) -> Re
 
 /// [`Db::enqueue_outbox`] under the caller's lock. Idempotent on the key: a
 /// duplicate enqueue is a no-op.
+/// The run-status CAS's reopen bump (mirrors the Postgres `cas_run_status`):
+/// moving `run` out of a terminal `from` opens its next generation.
+fn bump_reopen_generation_locked(st: &mut InMemoryState, run: &RunId, from: RunStatus) {
+    if from.is_terminal() {
+        *st.run_reopen_generations.entry(run.clone()).or_default() += 1;
+    }
+}
+
 fn enqueue_outbox_locked(st: &mut InMemoryState, msg: &OutboxMessage) {
     if st
         .outbox
@@ -1529,6 +1539,11 @@ impl Db for InMemoryDb {
         Ok(self.state.lock().unwrap().runs.get(run).copied())
     }
 
+    async fn run_reopen_generation(&self, run: &RunId) -> Result<u64, DbError> {
+        let st = self.state.lock().unwrap();
+        Ok(st.run_reopen_generations.get(run).copied().unwrap_or(0))
+    }
+
     async fn active_runs(&self) -> Result<Vec<RunId>, DbError> {
         let st = self.state.lock().unwrap();
         let mut out: Vec<RunId> = st
@@ -2059,6 +2074,7 @@ impl Db for InMemoryDb {
             return Err(DbError::Conflict);
         }
         st.runs.insert(run.clone(), to);
+        bump_reopen_generation_locked(&mut st, run, from);
         Ok(())
     }
 
@@ -2079,6 +2095,7 @@ impl Db for InMemoryDb {
         }
         take_event_append_failure(&mut st, events)?;
         st.runs.insert(run.clone(), to);
+        bump_reopen_generation_locked(&mut st, run, from);
         st.events.extend(events.iter().cloned());
         for msg in outbox {
             enqueue_outbox_locked(&mut st, msg);

@@ -409,11 +409,7 @@ async fn second_cancel_after_rerun_tears_down_and_holds(w: World) {
     w.assert_held("rb").await;
     w.finish().await;
 }
-both!(
-    second_cancel_after_rerun_tears_down_and_holds,
-    Some(1),
-    ignore = "redteam: BROKE second cancel after a rerun writes no teardown intent (cancel:{run} key dedups forever) — rerun Pod orphaned, target hold lost"
-);
+both!(second_cancel_after_rerun_tears_down_and_holds, Some(1));
 
 // ---------------------------------------------------------------------------
 // A2 — the cancel's teardown runs BEFORE the claimed step's launch.
@@ -733,11 +729,7 @@ async fn the_last_status_post_matches_a_rerun_runs_final_status(w: World) {
     );
     w.finish().await;
 }
-both!(
-    the_last_status_post_matches_a_rerun_runs_final_status,
-    None,
-    ignore = "redteam: BROKE status:{run}:{to} key dedups a repeated state — Succeeded->rerun->Failed->rerun->Succeeded leaves the forge on Failed"
-);
+both!(the_last_status_post_matches_a_rerun_runs_final_status, None);
 
 // ---------------------------------------------------------------------------
 // A8 — attempt order a9 / a10 / a100 under a clock running BACKWARDS

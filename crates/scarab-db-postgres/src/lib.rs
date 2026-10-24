@@ -1332,6 +1332,15 @@ impl Db for PostgresDb {
             .transpose()
     }
 
+    async fn run_reopen_generation(&self, run: &RunId) -> Result<u64, DbError> {
+        let row = sqlx::query("SELECT reopen_generation FROM runs WHERE id = $1")
+            .bind(&run.0)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(row.map_or(0, |r| r.get::<i64, _>("reopen_generation") as u64))
+    }
+
     async fn active_runs(&self) -> Result<Vec<RunId>, DbError> {
         // Priority order (higher first, then oldest) so the admission pass hands
         // scarce capacity to higher-priority work before lower (ADR-0011, 0032).
@@ -3669,7 +3678,8 @@ const ATTEMPT_IS_RUNNING: &str = "(outcome = 'running' OR (outcome IS NULL AND f
 
 /// The guarded run-status CAS on any executor: `true` iff the row was in
 /// `from` and is now `to`. Zero rows means a concurrent/duplicate writer
-/// already moved it.
+/// already moved it. Moving a run OUT of a terminal status (a reopen) bumps
+/// its `reopen_generation` in the same write ([`Db::run_reopen_generation`]).
 async fn cas_run_status<'e, E: sqlx::PgExecutor<'e>>(
     exec: E,
     run: &RunId,
@@ -3678,12 +3688,14 @@ async fn cas_run_status<'e, E: sqlx::PgExecutor<'e>>(
 ) -> Result<bool, DbError> {
     let affected = sqlx::query(
         "UPDATE runs
-         SET status = $3, updated_at = (extract(epoch from now()) * 1000)::bigint
+         SET status = $3, updated_at = (extract(epoch from now()) * 1000)::bigint,
+             reopen_generation = reopen_generation + CASE WHEN $4 THEN 1 ELSE 0 END
          WHERE id = $1 AND status = $2",
     )
     .bind(&run.0)
     .bind(run_status_str(from))
     .bind(run_status_str(to))
+    .bind(from.is_terminal())
     .execute(exec)
     .await
     .map_err(db_err)?

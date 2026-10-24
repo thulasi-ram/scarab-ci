@@ -1788,17 +1788,25 @@ pub async fn cancel_run_request(
 /// ([`cancel_run_request`]) and the inline concurrency auto-cancel
 /// ([`Scheduler::cancel_run`]); both write it in the same commit as each
 /// transition of the cancel, never on its own (red team A3).
+///
+/// Keyed to the run's reopen generation ([`Db::run_reopen_generation`]):
+/// the several commits of one cancel converge on one intent, while a cancel
+/// of the same Run after a rerun — a new generation — writes its own. Keyed
+/// `cancel:{run}` alone, that second cancel collapsed onto the first one's
+/// dispatched row (red team A1): the rerun's Pod was never torn down, and its
+/// DeploymentTarget never held.
 async fn cancel_teardown_intent(
-    _db: &dyn Db,
+    db: &dyn Db,
     run: &RunId,
     now: Timestamp,
 ) -> Result<OutboxMessage, DbError> {
+    let generation = db.run_reopen_generation(run).await?;
     Ok(OutboxMessage {
         id: crate::OutboxId(0),
         run: run.clone(),
         kind: CANCEL_RUN.to_string(),
         payload: serde_json::Value::Null,
-        idempotency_key: format!("cancel:{}", run.0),
+        idempotency_key: format!("cancel:{}:g{generation}", run.0),
         at: now,
     })
 }
@@ -1811,7 +1819,12 @@ async fn reopen(
     to: RunStatus,
 ) -> Result<(), RerunError> {
     let now = clock.now().await;
-    match commit_run_transition(db, run, from, to, now, false, &[]).await {
+    // A reopen out of a terminal status tells the forge the run is going
+    // again (red team A7): left at the settled run's verdict, a required
+    // check read green — or red — for the whole rerun. Suspended → Running
+    // (a gate released) is not news to the forge: both are `pending`.
+    let notify = from.is_terminal();
+    match commit_run_transition(db, run, from, to, now, notify, &[]).await {
         Ok(()) | Err(DbError::Conflict) => Ok(()),
         Err(e) => Err(e.into()),
     }
@@ -1819,7 +1832,7 @@ async fn reopen(
 
 /// Move `run` `from → to` with its `RunTransitioned` — and, when `notify`,
 /// the exactly-once [`RUN_STATUS_CHANGED`] post for external observers (e.g.
-/// forge commit statuses; the key is unique per (run, state)) — as ONE commit
+/// forge commit statuses) — as ONE commit
 /// ([`Db::commit_run_transition`]), with any `intents` the transition owes
 /// (a cancel's teardown). `Conflict` = a peer already moved it, nothing
 /// written.
@@ -1833,17 +1846,25 @@ async fn commit_run_transition(
     intents: &[OutboxMessage],
 ) -> Result<(), DbError> {
     let events = [event(run, EventPayload::RunTransitioned { from, to }, now)];
-    let post = OutboxMessage {
-        id: crate::OutboxId(0),
-        run: run.clone(),
-        kind: RUN_STATUS_CHANGED.to_string(),
-        payload: serde_json::json!({ "to": to }),
-        idempotency_key: format!("status:{}:{to:?}", run.0),
-        at: now,
-    };
     let mut outbox: Vec<OutboxMessage> = intents.to_vec();
     if notify {
-        outbox.push(post);
+        // Exactly once per transition: the post rides the CAS's commit, so
+        // only the winner's lands. The key is unique per (run, generation,
+        // state) — the generation this transition leaves the run in (a reopen
+        // out of a terminal status opens the next one). Keyed per (run,
+        // state) alone, a state the run reached again after a rerun
+        // (Succeeded → Failed → Succeeded) collapsed onto its first post and
+        // the forge's last word was the stale one (red team A7).
+        let generation =
+            db.run_reopen_generation(run).await? + u64::from(from.is_terminal());
+        outbox.push(OutboxMessage {
+            id: crate::OutboxId(0),
+            run: run.clone(),
+            kind: RUN_STATUS_CHANGED.to_string(),
+            payload: serde_json::json!({ "to": to }),
+            idempotency_key: format!("status:{}:g{generation}:{to:?}", run.0),
+            at: now,
+        });
     }
     db.commit_run_transition(run, from, to, &events, &outbox)
         .await

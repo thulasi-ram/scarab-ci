@@ -437,7 +437,7 @@ async fn run_transition_converges(db: &dyn Db, clock: &FakeClock) {
         .await
         .unwrap()
         .into_iter()
-        .filter(|m| m.idempotency_key == format!("status:{}:Cancelled", run_id().0))
+        .filter(|m| m.run == run_id() && m.payload["to"] == json!(RunStatus::Cancelled))
         .count();
     assert_eq!(posts, 1, "the forge status post rides the same commit");
 }

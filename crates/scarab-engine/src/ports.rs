@@ -788,6 +788,21 @@ pub trait Db: Send + Sync {
     /// Current status of a run, or `None` if it does not exist.
     async fn run_status(&self, run: &RunId) -> Result<Option<RunStatus>, DbError>;
 
+    /// How many times `run` has been reopened out of a terminal status (a
+    /// rerun or retry of a settled run); `0` for a run never reopened, or
+    /// unknown. The guarded run-status CAS bumps it in the same write that
+    /// moves the run out of a terminal status
+    /// ([`record_transition`](Db::record_transition),
+    /// [`commit_run_transition`](Db::commit_run_transition)).
+    ///
+    /// Outbox idempotency keys are unique forever, so an intent that may
+    /// recur on one run — its cancel teardown, its status post for a given
+    /// state — is keyed to this generation (red team A1/A7): keyed per run,
+    /// the second cancel after a rerun, or the second `Succeeded` after a
+    /// `Failed` rerun, collapsed onto the first one's dispatched row and was
+    /// never written.
+    async fn run_reopen_generation(&self, run: &RunId) -> Result<u64, DbError>;
+
     /// Ids of all non-terminal runs — the work list a converged scheduler drives.
     async fn active_runs(&self) -> Result<Vec<RunId>, DbError>;
 
