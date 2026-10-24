@@ -356,3 +356,71 @@ async fn a_clone_flag_revokes_the_window_the_passkey_opened() {
     let flagged = h.events_of("passkey.clone_suspected");
     assert_eq!(flagged[0].detail["confirmations_revoked"], 1);
 }
+
+/// Review F17/S7: a removal whose revoke fails leaves the passkey in place
+/// (the revoke runs FIRST), so a retry finishes the job — the window goes,
+/// the passkey goes, and `passkey.removed` is recorded. Removing first left
+/// the passkey gone, its window live and every retry a 404.
+#[tokio::test]
+async fn a_passkey_removal_whose_revoke_fails_can_be_retried_to_completion() {
+    let h = harness();
+    let (s, mut k1, mut k2, k1_id) = amy_with_two_passkeys(&h).await;
+    h.open_window(&s, &mut k1).await;
+
+    let uri = format!("/v1/me/passkeys/{k1_id}");
+    let (st, b) = h.cookie("DELETE", &uri, None, &s).await;
+    assert_step_up(st, &b, "action");
+    h.answer(&s, &mut k2, &b["challenge"]).await;
+    h.step_up.fail_passkey_revokes(true);
+    let (st, b) = h.cookie("DELETE", &uri, None, &s).await;
+    assert!(st.is_server_error(), "{st} {b}");
+    let ids =
+        |list: Vec<scarab_identity::Passkey>| list.into_iter().map(|p| p.id).collect::<Vec<_>>();
+    assert!(
+        ids(h.passkeys.list("amy").await.unwrap()).contains(&k1_id),
+        "a failed revoke leaves the passkey for a retry"
+    );
+
+    h.step_up.fail_passkey_revokes(false);
+    let (st, b) = h.cookie("DELETE", &uri, None, &s).await;
+    assert_step_up(st, &b, "action");
+    h.answer(&s, &mut k2, &b["challenge"]).await;
+    let (st, b) = h.cookie("DELETE", &uri, None, &s).await;
+    assert_eq!(st, StatusCode::NO_CONTENT, "the retry finishes: {b}");
+    assert!(!ids(h.passkeys.list("amy").await.unwrap()).contains(&k1_id));
+    let (st, b) = h.cookie("POST", "/v1/secrets", Some(secret(1)), &s).await;
+    assert_step_up(st, &b, "window");
+    let removed = h.events_of("passkey.removed");
+    assert_eq!(removed.len(), 1);
+    assert_eq!(removed[0].detail["confirmations_revoked"], 1);
+}
+
+/// Review S6: a passkey removed after its assertion verified but before its
+/// window is stored opens nothing — the window is never left standing for
+/// a passkey that is gone.
+#[tokio::test]
+async fn a_passkey_removed_mid_assertion_opens_no_window() {
+    let h = harness();
+    let (s, mut k1, _k2, k1_id) = amy_with_two_passkeys(&h).await;
+    let passkeys = h.passkeys.clone();
+    h.step_up.before_next_put_confirmation(move || {
+        let removed = futures::executor::block_on(passkeys.remove("amy", &k1_id)).unwrap();
+        assert!(removed);
+    });
+    let (_, ch) = h.cookie("POST", "/v1/me/step-up/options", None, &s).await;
+    let (st, b) = h.answer(&s, &mut k1, &ch).await;
+    assert_eq!(
+        (st, b["code"].clone()),
+        (StatusCode::FORBIDDEN, json!("passkey_unusable")),
+        "{b}"
+    );
+    let (st, b) = h.cookie("POST", "/v1/secrets", Some(secret(1)), &s).await;
+    assert_step_up(st, &b, "window");
+    assert!(
+        h.step_up
+            .confirmations()
+            .iter()
+            .all(|c| c.kind != scarab_identity::ConfirmationKind::Window),
+        "no window stored"
+    );
+}

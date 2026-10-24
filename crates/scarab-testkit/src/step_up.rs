@@ -237,15 +237,33 @@ struct StepUpState {
     requests: HashMap<String, StepUpRequest>,
 }
 
+/// A test's hook run as the next [`StepUpStore::put_confirmation`] starts.
+type PutConfirmationHook = Box<dyn FnOnce() + Send>;
+
 /// An in-memory [`StepUpStore`].
 #[derive(Default)]
 pub struct InMemoryStepUp {
     state: Mutex<StepUpState>,
+    failing_passkey_revokes: AtomicBool,
+    before_put_confirmation: Mutex<Option<PutConfirmationHook>>,
 }
 
 impl InMemoryStepUp {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Fault injection: while `on`, every `delete_for_passkey` fails, so a
+    /// test can prove a half-done passkey removal can be finished by a retry.
+    pub fn fail_passkey_revokes(&self, on: bool) {
+        self.failing_passkey_revokes.store(on, Ordering::SeqCst);
+    }
+
+    /// Run `hook` as the next `put_confirmation` starts — after the
+    /// assertion was verified, before the confirmation is stored — so a test
+    /// can construct a removal or clone flag landing in exactly that gap.
+    pub fn before_next_put_confirmation(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.before_put_confirmation.lock().unwrap() = Some(Box::new(hook));
     }
 
     /// Every confirmation recorded, in insert order (a test's view).
@@ -275,6 +293,10 @@ impl StepUpStore for InMemoryStepUp {
         &self,
         confirmation: &StepUpConfirmation,
     ) -> Result<(), IdentityError> {
+        let hook = self.before_put_confirmation.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
         let mut state = self.state.lock().unwrap();
         if state.confirmations.iter().any(|c| c.id == confirmation.id) {
             return Err(IdentityError::Conflict(format!(
@@ -380,6 +402,11 @@ impl StepUpStore for InMemoryStepUp {
     }
 
     async fn delete_for_passkey(&self, passkey_id: &str) -> Result<u64, IdentityError> {
+        if self.failing_passkey_revokes.load(Ordering::SeqCst) {
+            return Err(IdentityError::Conflict(
+                "the step-up store is unreachable (injected)".into(),
+            ));
+        }
         let mut state = self.state.lock().unwrap();
         let before = state.confirmations.len();
         state.confirmations.retain(|c| {

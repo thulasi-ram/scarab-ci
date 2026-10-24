@@ -521,6 +521,24 @@ pub(crate) async fn remove_passkey(
     let svc = service(&st)?;
     let caller = authenticate(&st, &headers, Action::Write).await?;
     let subject = caller.principal.subject.clone();
+    let owned = svc
+        .passkeys
+        .list(&subject)
+        .await
+        .map_err(store_err)?
+        .iter()
+        .any(|p| p.id == id);
+    if !owned {
+        return Err(ApiError::NotFound);
+    }
+    // Every step-up it signed goes with it: a removed passkey leaves no
+    // window or unconsumed action confirmation standing. Revoked FIRST, so
+    // a failure leaves the passkey in place and a retry finishes the job.
+    let mut revoked = svc
+        .confirmations
+        .delete_for_passkey(&id)
+        .await
+        .map_err(store_err)?;
     if !svc
         .passkeys
         .remove(&subject, &id)
@@ -529,13 +547,11 @@ pub(crate) async fn remove_passkey(
     {
         return Err(ApiError::NotFound);
     }
-    // Every step-up it signed goes with it: a removed passkey leaves no
-    // window or unconsumed action confirmation standing.
-    let revoked = svc
-        .confirmations
-        .delete_for_passkey(&id)
-        .await
-        .map_err(store_err)?;
+    // And again: a confirmation an assertion inserted between the revoke and
+    // the removal goes too (an insert after the removal revokes itself — see
+    // `put_confirmation_while_usable`).
+    let late = svc.confirmations.delete_for_passkey(&id).await;
+    revoked += late.as_ref().copied().unwrap_or(0);
     let now = st.clock.now().await.0;
     let mut ev = event(
         kind::PASSKEY_REMOVED,
@@ -551,6 +567,7 @@ pub(crate) async fn remove_passkey(
     // that authorised it.
     ev.confirmation_id = ctx.and_then(|Extension(c)| c.confirmation_id());
     svc.record(ev).await;
+    late.map_err(store_err)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -695,10 +712,7 @@ pub(crate) async fn step_up_confirm(
             "the security event log is unavailable, so the step-up was not recorded".into(),
         ));
     }
-    svc.confirmations
-        .put_confirmation(&confirmation)
-        .await
-        .map_err(store_err)?;
+    put_confirmation_while_usable(&svc, &confirmation, &passkey).await?;
     Ok(Json(StepUpConfirmResponse {
         confirmation_id: confirmation.id,
         kind: kind_.as_str().to_string(),
@@ -805,7 +819,11 @@ async fn verify_assertion_once(
                 .mark_clone(&passkey.id, now)
                 .await
                 .map_err(store_err)?;
-            let revoked = revoke_for_clone(svc, &passkey.id).await?;
+            let revoked = svc
+                .confirmations
+                .delete_for_passkey(&passkey.id)
+                .await
+                .map_err(store_err)?;
             svc.record(clone_event(serde_json::json!({
                 "stored_count": passkey.sign_count,
                 "confirmations_revoked": revoked,
@@ -825,7 +843,11 @@ async fn verify_assertion_once(
     {
         PasskeyUse::Recorded => {}
         PasskeyUse::CloneSuspected => {
-            let revoked = revoke_for_clone(svc, &passkey.id).await?;
+            let revoked = svc
+                .confirmations
+                .delete_for_passkey(&passkey.id)
+                .await
+                .map_err(store_err)?;
             svc.record(clone_event(serde_json::json!({
                 "stored_count": passkey.sign_count,
                 "presented_count": ok.new_count,
@@ -839,13 +861,44 @@ async fn verify_assertion_once(
     Ok(passkey)
 }
 
-/// A passkey flagged as a suspected clone: every step-up it signed is
-/// revoked — whoever holds the copy must not keep a window it opened.
-async fn revoke_for_clone(svc: &StepUpService, passkey_id: &str) -> Result<u64, ApiError> {
+/// Store a window or action confirmation `passkey` just signed — only while
+/// that passkey is still the caller's and unflagged. Removal and the clone
+/// flag each revoke (`delete_for_passkey`) AFTER they change the passkey, so
+/// re-reading it after the insert closes the race with a concurrent removal
+/// or flag: either their revoke sees this row, or this re-read sees their
+/// change and revokes it here. Never a standing window for a passkey that
+/// is gone or flagged.
+async fn put_confirmation_while_usable(
+    svc: &StepUpService,
+    confirmation: &StepUpConfirmation,
+    passkey: &Passkey,
+) -> Result<(), ApiError> {
     svc.confirmations
-        .delete_for_passkey(passkey_id)
+        .put_confirmation(confirmation)
         .await
-        .map_err(store_err)
+        .map_err(store_err)?;
+    let usable = svc
+        .passkeys
+        .get_by_credential(&passkey.credential_id)
+        .await
+        .map_err(store_err)?
+        .is_some_and(|p| {
+            p.id == passkey.id
+                && p.principal == confirmation.principal
+                && p.clone_suspected_at.is_none()
+        });
+    if usable {
+        return Ok(());
+    }
+    svc.confirmations
+        .delete_for_passkey(&passkey.id)
+        .await
+        .map_err(store_err)?;
+    Err(ceremony(
+        StatusCode::FORBIDDEN,
+        "passkey_unusable",
+        "that passkey was removed or flagged while it was being used; nothing was confirmed",
+    ))
 }
 
 impl IntoResponse for super::StepUpRefusal {
