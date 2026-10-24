@@ -11,6 +11,18 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+/// Step-up confirmation ports (ADR-0073): passkeys, challenges,
+/// confirmations, requests and the OrgSecurityEventLog.
+mod step_up;
+pub use step_up::{
+    security_event_kind, BeginExecution, ChallengePurpose, ChallengeStore, ConfirmationKind,
+    Passkey, PasskeyStore, PasskeyUse, RequestState, SecurityEvent, SecurityEventFilter,
+    SecurityEventLog, StepUpConfirmation, StepUpRequest, StepUpRequester, StepUpStore,
+    WebauthnChallenge, FRESH_LOGIN_MS, LOGIN_KIND_API, LOGIN_KIND_BROWSER,
+    MAX_PENDING_STEP_UP_REQUESTS, STEP_UP_REQUEST_TTL_MS, STEP_UP_WINDOW_MS,
+    WEBAUTHN_CHALLENGE_TTL_MS,
+};
+
 /// An authenticated principal (a human user or a machine identity).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Principal {
@@ -145,6 +157,11 @@ pub trait RbacStore: Send + Sync {
     async fn revoke(&self, subject: &str, scope: &Scope) -> Result<(), IdentityError>;
     /// The highest role `subject` holds in `scope`, Org inheritance applied.
     async fn role_of(&self, subject: &str, scope: &Scope) -> Result<Option<Role>, IdentityError>;
+    /// The highest role `subject` holds **anywhere** — any Org, any Project
+    /// (ADR-0073's coarse role skip: a caller who holds no role at or above
+    /// an operation's minimum anywhere is refused for the role, not asked
+    /// for a step-up). Tombstones grant nothing.
+    async fn max_role(&self, subject: &str) -> Result<Option<Role>, IdentityError>;
     /// All live bindings within `org` (org- and project-scoped).
     async fn bindings(&self, org: &str) -> Result<Vec<Binding>, IdentityError>;
     /// A forge import at `scope` through login provider `via` (ADR-0069 §5),
@@ -181,12 +198,30 @@ pub struct Session {
     /// on every mutation. Bearer (API/CLI) requests never need it.
     #[serde(default)]
     pub csrf: String,
+    /// Unix-ms the login that minted this session completed (ADR-0073 §2).
+    /// `0` = a session from before this was recorded, which is never
+    /// "fresh".
+    #[serde(default)]
+    pub created_at: i64,
+    /// How the login happened: [`LOGIN_KIND_BROWSER`] (the OAuth callback)
+    /// or [`LOGIN_KIND_API`] (the API/CLI exchange). `""` = from before this
+    /// was recorded, never fresh.
+    #[serde(default)]
+    pub login_kind: String,
 }
 
 impl Session {
     /// Is the session still valid at `now_ms`?
     pub fn is_valid(&self, now_ms: i64) -> bool {
         now_ms < self.expires_at
+    }
+
+    /// Until when this session counts as a **fresh browser login** — the one
+    /// thing that may enroll a first passkey (ADR-0073 §2). `None` for an
+    /// API-exchange login and for a session from before logins were stamped.
+    pub fn fresh_login_until(&self) -> Option<i64> {
+        (self.login_kind == LOGIN_KIND_BROWSER && self.created_at > 0)
+            .then(|| self.created_at + FRESH_LOGIN_MS)
     }
 }
 
@@ -343,6 +378,10 @@ pub trait ApiTokenStore: Send + Sync {
     /// "this token is revoked" stays distinguishable from "no such token" in
     /// the code, even though both answer 401 on the wire.
     async fn by_hash(&self, hash: &str) -> Result<Option<ApiToken>, IdentityError>;
+    /// The token record with row id `id`, live or not (ADR-0073: a
+    /// StepUpConfirmationRequest's replay re-checks its requesting token by
+    /// id, never by plaintext).
+    async fn by_id(&self, id: &str) -> Result<Option<ApiToken>, IdentityError>;
     /// Every token issued within `org` — org- and project-scoped alike —
     /// newest first. Records only; there is no plaintext to return.
     async fn list(&self, org: &str) -> Result<Vec<ApiToken>, IdentityError>;
@@ -724,10 +763,48 @@ mod tests {
             },
             expires_at: 1_000,
             csrf: String::new(),
+            created_at: 0,
+            login_kind: String::new(),
         };
         assert!(s.is_valid(999));
         assert!(!s.is_valid(1_000));
         assert!(!s.is_valid(1_001));
+    }
+
+    #[test]
+    fn only_a_stamped_browser_login_is_ever_fresh() {
+        let s = |created_at: i64, kind: &str| Session {
+            id: "sid".into(),
+            principal: Principal {
+                subject: "alice".into(),
+                display_name: None,
+                roles: vec![],
+            },
+            expires_at: i64::MAX,
+            csrf: String::new(),
+            created_at,
+            login_kind: kind.into(),
+        };
+        assert_eq!(
+            s(1_000, LOGIN_KIND_BROWSER).fresh_login_until(),
+            Some(1_000 + FRESH_LOGIN_MS)
+        );
+        assert_eq!(s(1_000, LOGIN_KIND_API).fresh_login_until(), None);
+        assert_eq!(s(1_000, "").fresh_login_until(), None, "pre-upgrade");
+        assert_eq!(s(0, LOGIN_KIND_BROWSER).fresh_login_until(), None);
+    }
+
+    #[test]
+    fn a_pre_upgrade_session_reads_as_never_fresh() {
+        let old: Session = serde_json::from_value(serde_json::json!({
+            "id": "sid",
+            "principal": {"subject": "alice", "display_name": null, "roles": []},
+            "expires_at": 5
+        }))
+        .unwrap();
+        assert_eq!(old.created_at, 0);
+        assert_eq!(old.login_kind, "");
+        assert_eq!(old.fresh_login_until(), None);
     }
 
     fn ident(provider: &str, external_id: &str, handle: &str) -> ProviderIdentity {

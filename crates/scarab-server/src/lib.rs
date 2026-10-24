@@ -5906,6 +5906,10 @@ fn mint_session(principal: Principal, now_ms: i64) -> Session {
         principal,
         expires_at: now_ms + SESSION_TTL_MS,
         csrf: Uuid::new_v4().to_string(),
+        created_at: now_ms,
+        // ADR-0073 C3 stamps "browser" / "api" here; until then no login
+        // counts as fresh.
+        login_kind: String::new(),
     }
 }
 

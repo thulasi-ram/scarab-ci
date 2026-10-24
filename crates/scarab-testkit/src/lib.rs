@@ -28,6 +28,13 @@ use scarab_storage::{ObjectStore, StorageError};
 mod environment_governance;
 pub use environment_governance::InMemoryEnvironmentGovernance;
 
+/// In-memory step-up stores (ADR-0073) and a real-AEAD test `Sealer`, with
+/// the Postgres adapter's single-use, expiry and compare-and-swap semantics.
+mod step_up;
+pub use step_up::{
+    InMemoryChallenges, InMemoryPasskeys, InMemorySealer, InMemorySecurityEvents, InMemoryStepUp,
+};
+
 // ---------------------------------------------------------------------------
 // FakeClock — manually-advanced virtual time
 // ---------------------------------------------------------------------------
@@ -3539,6 +3546,16 @@ impl scarab_identity::ApiTokenStore for InMemoryApiTokens {
         Ok(self.tokens.lock().unwrap().get(hash).cloned())
     }
 
+    async fn by_id(&self, id: &str) -> Result<Option<scarab_identity::ApiToken>, IdentityError> {
+        Ok(self
+            .tokens
+            .lock()
+            .unwrap()
+            .values()
+            .find(|t| t.id == id)
+            .cloned())
+    }
+
     async fn list(&self, org: &str) -> Result<Vec<scarab_identity::ApiToken>, IdentityError> {
         let mut out: Vec<scarab_identity::ApiToken> = self
             .tokens
@@ -3904,6 +3921,20 @@ impl scarab_identity::RbacStore for InMemoryRbac {
             ))
             .and_then(|(r, _)| *r);
         Ok(exact.max(org))
+    }
+
+    async fn max_role(
+        &self,
+        subject: &str,
+    ) -> Result<Option<scarab_identity::Role>, IdentityError> {
+        Ok(self
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((s, _, _), _)| s == subject)
+            .filter_map(|(_, (role, _))| *role)
+            .max())
     }
 
     async fn bindings(&self, org: &str) -> Result<Vec<scarab_identity::Binding>, IdentityError> {
