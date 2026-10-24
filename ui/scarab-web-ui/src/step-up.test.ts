@@ -244,6 +244,25 @@ describe("the API client retries a refused request after the confirmation", () =
     expect(calls[1]!.headers.get("x-csrf-token")).toBe("tok-123");
   });
 
+  it("through the `api` middleware: a typed POST is retried with its body", async () => {
+    const { client, stepUp, calls } = await fresh([
+      res403(refusalBody("action")),
+      new Response(JSON.stringify({ id: "c1", public_key: {}, expires_at: 1 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    ]);
+    const done = client.beginPasskeyRegistration("x");
+    await vi.waitFor(() => expect(stepUp.stepUpPrompt()).not.toBeNull());
+    stepUp.stepUpPrompt()!.settle(true);
+    await done;
+    expect(calls).toHaveLength(2);
+    const first = await calls[0]!.text();
+    expect(first).toBe(JSON.stringify({ label: "x" }));
+    expect(await calls[1]!.text()).toBe(first);
+    expect(calls[1]!.headers.get("x-csrf-token")).toBe("tok-123");
+  });
+
   it("through the `api` middleware: a cancel surfaces the server's message", async () => {
     const { client, stepUp } = await fresh([res403(refusalBody("action"))]);
     const done = client.removePasskey("pk-1");

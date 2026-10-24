@@ -20,6 +20,7 @@ import {
 import { absTime, relTime } from "../fmt";
 import {
   requestConfirmable,
+  requestErrorLink,
   requestErrorText,
   requestStateText,
   resultSecret,
@@ -33,6 +34,7 @@ export default function ConfirmRequest() {
   const [req, { refetch }] = createResource(() => params.id, getStepUpRequest);
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
+  const [errorLink, setErrorLink] = createSignal<{ text: string; href: string } | null>(null);
   const [result, setResult] = createSignal<StepUpRequestResult | null>(null);
   const [copied, setCopied] = createSignal(false);
 
@@ -45,6 +47,7 @@ export default function ConfirmRequest() {
   const confirm = async () => {
     setBusy(true);
     setError(null);
+    setErrorLink(null);
     try {
       if (!webauthnAvailable()) {
         throw new Error("This browser cannot use passkeys here (passkeys need https, or localhost).");
@@ -54,8 +57,10 @@ export default function ConfirmRequest() {
       setResult(await confirmStepUpRequest(params.id, options.id, credential));
       await refetch();
     } catch (e) {
-      if (e instanceof HttpError) setError(requestErrorText(e.status, e.body));
-      else setError(webauthnErrorText(e));
+      if (e instanceof HttpError) {
+        setError(requestErrorText(e.status, e.body));
+        setErrorLink(requestErrorLink(e.status, e.body));
+      } else setError(webauthnErrorText(e));
       // A 409/410 means the request moved on under us: show its new state.
       if (e instanceof HttpError && (e.status === 409 || e.status === 410)) await refetch();
     } finally {
@@ -149,6 +154,13 @@ export default function ConfirmRequest() {
 
               <Show when={error()}>
                 <p class="error">{error()}</p>
+              </Show>
+              <Show when={errorLink()}>
+                {(l) => (
+                  <p>
+                    <A href={l().href}>{l().text}</A>
+                  </p>
+                )}
               </Show>
 
               <Show when={requestConfirmable(r(), Date.now()) && !result()}>

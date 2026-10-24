@@ -38,6 +38,11 @@ describe("loginChoices", () => {
     expect(loginChoices([], "/")[0]!.href).toBe("/v1/auth/login");
     // Never an absolute or protocol-relative target: the server would 400 it.
     expect(loginChoices([], "//evil.example/x")[0]!.href).toBe("/v1/auth/login");
+    // What the server's `safe_next` refuses (400) is dropped, not sent: the
+    // sign-in must still work.
+    expect(loginChoices([], `/${"a".repeat(600)}`)[0]!.href).toBe("/v1/auth/login");
+    expect(loginChoices([], "/a\\b")[0]!.href).toBe("/v1/auth/login");
+    expect(loginChoices([], "/a\nb")[0]!.href).toBe("/v1/auth/login");
   });
 });
 
