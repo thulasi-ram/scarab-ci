@@ -2767,6 +2767,18 @@ impl Executor for K8sExecutor {
         }
     }
 
+    /// Gone = the Pod object no longer exists. A deleted Pod keeps running
+    /// through its termination grace (up to `CANCEL_GRACE_SECS`) with a
+    /// `deletionTimestamp` set — still acting on whatever it deploys to — so
+    /// "delete accepted" is not "torn down" (git-bug f22056d).
+    async fn torn_down(&self, handle: &ExecHandle) -> Result<bool, ExecError> {
+        let pods = self.pods()?;
+        pods.get_opt(&handle.0)
+            .await
+            .map(|pod| pod.is_none())
+            .map_err(|e| ExecError::Other(e.to_string()))
+    }
+
     // `results` intentionally uses the port default (empty): on k8s the egress
     // **sidecar** (see `build_pod`/`egress_sidecar`, ADR-0042) writes results
     // straight to Postgres via the fence-scoped results API, so the orchestrator

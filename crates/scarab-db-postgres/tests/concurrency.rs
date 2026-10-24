@@ -142,6 +142,66 @@ async fn cancel_in_progress_group_cancels_the_older() {
     tdb.cleanup().await;
 }
 
+/// A `cancel-in-progress` auto-cancel only ASKS the holder's unit to stop
+/// (best-effort, inline). It also leaves a teardown intent scoped to that
+/// unit, which re-cancels until the backend says the unit is GONE — so a
+/// Pod still in its termination grace is neither forgotten nor, for a deploy
+/// Step, released from its DeploymentTarget's hold early (git-bug f22056d).
+#[tokio::test]
+async fn an_auto_cancel_tears_the_holder_down_until_it_is_gone() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+
+    let a = seed_run(&db, "run-a", "deploy", ConcurrencyPolicy::CancelInProgress).await;
+    let b = seed_run(&db, "run-b", "deploy", ConcurrencyPolicy::CancelInProgress).await;
+    let clock = FakeClock::new(1_000);
+    let exec = FakeExecutor::new();
+    let sched = Scheduler::new(&db, &clock, &exec, "sched-1").with_outbox_visibility_ms(0);
+
+    // A starts and its Pod launches.
+    sched.admit(&a).await.unwrap();
+    sched.reconcile().await.unwrap();
+    let build = &db.steps_of_run(&a).await.unwrap()[0];
+    let a1 = build
+        .attempts
+        .last()
+        .expect("A's build launched")
+        .id
+        .clone();
+    assert!(db
+        .attempt_handle(&a, &build.step, &a1)
+        .await
+        .unwrap()
+        .is_some());
+
+    // B arrives and auto-cancels A; A's Pod lingers through one check.
+    exec.linger_after_cancel(1);
+    sched.admit(&b).await.unwrap();
+    assert_eq!(db.run_status(&a).await.unwrap(), Some(RunStatus::Cancelled));
+    assert_eq!(exec.cancelled_handles().len(), 1, "the inline cancel");
+
+    sched.reconcile_supersessions().await.unwrap();
+    assert_eq!(
+        exec.cancelled_handles().len(),
+        2,
+        "the teardown intent re-cancels; the Pod is still terminating"
+    );
+    sched.reconcile_supersessions().await.unwrap();
+    assert_eq!(exec.cancelled_handles().len(), 3, "gone now: retired");
+    sched.reconcile_supersessions().await.unwrap();
+    assert_eq!(
+        exec.cancelled_handles().len(),
+        3,
+        "a retired intent is never redelivered"
+    );
+
+    tdb.cleanup().await;
+}
+
 /// A cancel request drives the run and its in-flight step to a durable terminal
 /// state — no half-cancelled limbo.
 #[tokio::test]

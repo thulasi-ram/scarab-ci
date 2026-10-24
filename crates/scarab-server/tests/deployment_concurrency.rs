@@ -12,6 +12,8 @@
 //! counting once the Environment's baseline deadline has elapsed since the
 //! requesting Step's latest Attempt started (the one that succeeded, where
 //! the gate's first wait opens); a reached one counts until its verdict (R3).
+//! A cancelled holder counts until its unit is gone (its teardown intent
+//! retired), not merely until its Step is terminal (git-bug f22056d).
 //!
 //! No kind: steps run on the `FakeExecutor`, reports go through
 //! `DeploymentStore::append`, the scheduler is ticked by hand with the
@@ -536,8 +538,13 @@ async fn no_limit_holds_nothing(w: World) {
 }
 both!(no_limit_holds_nothing, None);
 
-/// Cancelling the holder ends its interval: a terminal Run is never in
-/// flight.
+/// Cancelling the holder ends its interval — but only once its deploy
+/// Step's unit is GONE, not when the Step goes terminal (git-bug f22056d).
+/// The cancel makes `ra`'s Step `Cancelled` at once, while its Pod runs on
+/// through its termination grace, still acting on the target; releasing
+/// `rb` then would overlap two Pods on one target. So `ra` counts until its
+/// teardown intent is retired, and the intent is retired only when the
+/// backend says the unit is gone.
 async fn cancelling_the_holder_frees_the_held_run(w: World) {
     w.seed("ra", GATED).await;
     w.deploying("ra").await;
@@ -545,6 +552,8 @@ async fn cancelling_the_holder_frees_the_held_run(w: World) {
     w.ticks(3).await;
     w.assert_held("rb").await;
 
+    // `ra`'s Pod lingers through two teardown checks after the cancel.
+    w.exec.linger_after_cancel(2);
     assert!(
         cancel_run_request(&*w.db, &w.clock, &rid("ra"), Some("amy".into()))
             .await
@@ -552,6 +561,12 @@ async fn cancelling_the_holder_frees_the_held_run(w: World) {
     );
     w.ticks(3).await;
     assert_eq!(w.run_status("ra").await, RunStatus::Cancelled);
+    assert_eq!(w.step("ra", "bump").await.status, StepStatus::Cancelled);
+    w.assert_held("rb").await;
+
+    // The third check finds it gone: the intent is retired this tick, and
+    // the next one releases `rb`.
+    w.ticks(2).await;
     w.assert_released("rb").await;
     w.finish().await;
 }

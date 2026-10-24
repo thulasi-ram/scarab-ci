@@ -965,6 +965,17 @@ pub trait Db: Send + Sync {
     ///
     /// A Step that is still `Pending` (itself held, or not reached) does not
     /// count; one that failed made no request.
+    ///
+    /// R is also in flight — **whatever its status** — while a teardown of
+    /// the requesting Step's unit is pending (git-bug f22056d): a
+    /// [`CANCEL_RUN`](crate::CANCEL_RUN) intent for R while the Step is
+    /// `Cancelled` with a launched latest Attempt (a recorded handle), or a
+    /// [`SUPERSEDE_TEARDOWN`](crate::SUPERSEDE_TEARDOWN) naming the Step. A
+    /// cancel or a rerun makes the Step terminal or `Pending` at once, while
+    /// its unit (a Pod in its termination grace) may still be acting on the
+    /// target. Pending = neither dispatched (the scheduler retires it only
+    /// once [`Executor::torn_down`] says the unit is gone) nor dead-lettered
+    /// (abandoned after the delivery ceiling, with a diagnostic).
     async fn deployment_requesting_runs(
         &self,
         org: &str,
@@ -1255,6 +1266,22 @@ pub trait Executor: Send + Sync {
     async fn launch(&self, step: &StepRun, spec: &StepSpec) -> Result<ExecHandle, ExecError>;
     async fn poll(&self, handle: &ExecHandle) -> Result<ExecState, ExecError>;
     async fn cancel(&self, handle: &ExecHandle) -> Result<(), ExecError>;
+
+    /// Whether the unit behind `handle` is **gone** after a
+    /// [`cancel`](Self::cancel) — not merely told to stop. A teardown intent
+    /// is retired only once this is `true` (git-bug f22056d): until then the
+    /// cancelled or superseded Step still holds its DeploymentTarget for the
+    /// per-target concurrency limit, because its unit may still be acting on
+    /// the target (on Kubernetes a deleted Pod runs on through its
+    /// termination grace). A missing unit is `true`.
+    ///
+    /// Default `true`: a backend whose `cancel` returns only once the unit is
+    /// gone. Every decorator must forward it — a decorator falling back to
+    /// the default would retire teardowns early and silently reopen the
+    /// overlap.
+    async fn torn_down(&self, _handle: &ExecHandle) -> Result<bool, ExecError> {
+        Ok(true)
+    }
 
     /// The content-addressed output workspace snapshot the (successfully
     /// finished) unit produced — the CAS merkle-root hash the orchestrator

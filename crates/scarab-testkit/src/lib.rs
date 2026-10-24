@@ -1819,11 +1819,41 @@ impl Db for InMemoryDb {
                 .and_then(|rec| rec.attempts.iter().map(|a| a.started_at).max())
                 .unwrap_or_else(|| st.run_created.get(run).copied().unwrap_or(Timestamp(0)))
         };
+        // A teardown of the requesting Step's unit still pending (git-bug
+        // f22056d), whatever the Run's status: a `cancel_run` intent for a
+        // Run whose requesting Step was cancelled with a launched latest
+        // Attempt, or a `supersede_teardown` naming the Step. Pending =
+        // neither dispatched nor dead-lettered. The PG twin's `EXISTS`.
+        let tearing_down = |run: &RunId, step: &StepId| {
+            let launched = || {
+                st.steps
+                    .get(&(run.clone(), step.clone()))
+                    .and_then(|rec| rec.attempts.iter().max_by_key(|a| attempt_order_key(a)))
+                    .is_some_and(|a| {
+                        st.attempt_handles
+                            .contains_key(&(run.clone(), step.clone(), a.id.clone()))
+                    })
+            };
+            st.outbox.iter().any(|e| {
+                e.msg.run == *run
+                    && !e.dispatched
+                    && !e.dead_lettered
+                    && ((e.msg.kind == scarab_engine::CANCEL_RUN
+                        && status(run, step) == Some(StepStatus::Cancelled)
+                        && launched())
+                        || (e.msg.kind == scarab_engine::SUPERSEDE_TEARDOWN
+                            && e.msg.payload["attempts"].as_array().is_some_and(|a| {
+                                a.iter()
+                                    .any(|x| x["step"].as_str() == Some(step.0.as_str()))
+                            })))
+            })
+        };
         let mut runs: std::collections::HashSet<&RunId> = std::collections::HashSet::new();
         for ((run, step), rows) in &st.run_deployment_requests {
-            if run == excluding || !st.runs.get(run).is_some_and(|s| !s.is_terminal()) {
+            if run == excluding {
                 continue;
             }
+            let active = st.runs.get(run).is_some_and(|s| !s.is_terminal());
             for r in rows {
                 if r.org != org
                     || r.environment != environment
@@ -1846,7 +1876,7 @@ impl Db for InMemoryDb {
                     }
                     _ => false,
                 };
-                if in_flight {
+                if (active && in_flight) || tearing_down(run, step) {
                     runs.insert(run);
                 }
             }
@@ -2515,6 +2545,9 @@ struct FakeExecState {
     /// a Pod the backend can never reach (persistent failure → dead-letter); a
     /// small N models a transient API blip that clears on a later reconcile.
     cancel_failures: u32,
+    /// Remaining number of `torn_down` checks that answer `false` — a
+    /// cancelled unit still in its termination grace (git-bug f22056d).
+    lingering_checks: u32,
     /// The same budget for `teardown_service` — the shared-service half of the
     /// cancel teardown, which must retry rather than mark the row torn down over
     /// a Pod that is still up.
@@ -2767,6 +2800,13 @@ impl FakeExecutor {
         self.inner.lock().unwrap().cancel_failures = n;
     }
 
+    /// Make the next `n` `torn_down` checks answer `false` — the cancelled
+    /// unit is still terminating (a k8s Pod in its grace period; git-bug
+    /// f22056d) — before any answers `true`.
+    pub fn linger_after_cancel(&self, n: u32) {
+        self.inner.lock().unwrap().lingering_checks = n;
+    }
+
     /// Make the next `n` `teardown_service` calls return `Err` before any
     /// succeeds — the shared-service counterpart of [`fail_cancels`](Self::fail_cancels).
     pub fn fail_service_teardowns(&self, n: u32) {
@@ -2829,6 +2869,15 @@ impl Executor for FakeExecutor {
             )));
         }
         Ok(())
+    }
+
+    async fn torn_down(&self, _handle: &ExecHandle) -> Result<bool, ExecError> {
+        let mut st = self.inner.lock().unwrap();
+        if st.lingering_checks > 0 {
+            st.lingering_checks -= 1;
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     async fn output(&self, handle: &ExecHandle) -> Result<Option<String>, ExecError> {

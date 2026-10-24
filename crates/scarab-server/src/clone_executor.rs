@@ -210,6 +210,10 @@ impl Executor for CloneEnrichingExecutor {
         self.inner.cancel(handle).await
     }
 
+    async fn torn_down(&self, handle: &ExecHandle) -> Result<bool, ExecError> {
+        self.inner.torn_down(handle).await
+    }
+
     async fn output(&self, handle: &ExecHandle) -> Result<Option<String>, ExecError> {
         self.inner.output(handle).await
     }

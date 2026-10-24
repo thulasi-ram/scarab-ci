@@ -1692,6 +1692,13 @@ impl Db for PostgresDb {
         // request's effective time, which is its first Attempt in the Take),
         // else the Run's creation, is after the cutoff — see the port. Uses
         // run_deployment_requests_target_idx.
+        //
+        // OR — whatever the Run's status — a teardown of the requesting
+        // Step's unit is still pending (git-bug f22056d): a `cancel_run`
+        // intent for a Run whose requesting Step was cancelled with a
+        // launched latest Attempt, or a `supersede_teardown` naming the Step.
+        // Pending = neither dispatched (the unit is gone) nor dead-lettered
+        // (abandoned, with a diagnostic).
         let n: i64 = sqlx::query_scalar(
             "SELECT COUNT(DISTINCT r.run_id)
              FROM run_deployment_requests r
@@ -1700,7 +1707,7 @@ impl Db for PostgresDb {
              WHERE r.org = $1 AND r.environment = $2
                AND r.target_source = $3 AND r.target_id = $4
                AND r.run_id <> $5
-               AND runs.status IN ('pending', 'running', 'suspended')
+               AND ((runs.status IN ('pending', 'running', 'suspended')
                AND (s.status IN ('ready', 'running')
                     OR (s.status = 'succeeded' AND EXISTS (
                         SELECT 1 FROM step_runs g
@@ -1716,7 +1723,19 @@ impl Db for PostgresDb {
                                OR COALESCE(
                                    (SELECT MAX(a.started_at) FROM attempts a
                                     WHERE a.run_id = r.run_id AND a.step_id = r.step_id),
-                                   runs.created_at) > $6))))",
+                                   runs.created_at) > $6)))))
+                    OR EXISTS (
+                        SELECT 1 FROM outbox o
+                        WHERE o.run_id = r.run_id
+                          AND o.dispatched_at IS NULL AND o.dead_lettered_at IS NULL
+                          AND ((o.kind = $7 AND s.status = 'cancelled'
+                                AND (SELECT a.handle FROM attempts a
+                                     WHERE a.run_id = r.run_id AND a.step_id = r.step_id
+                                     ORDER BY CAST(substring(a.attempt_id FROM 2) AS INTEGER) DESC
+                                     LIMIT 1) IS NOT NULL)
+                               OR (o.kind = $8
+                                   AND o.payload -> 'attempts'
+                                       @> jsonb_build_array(jsonb_build_object('step', r.step_id))))))",
         )
         .bind(org)
         .bind(environment)
@@ -1724,6 +1743,8 @@ impl Db for PostgresDb {
         .bind(id)
         .bind(&excluding.0)
         .bind(unreached_gate_cutoff.0)
+        .bind(scarab_engine::CANCEL_RUN)
+        .bind(scarab_engine::SUPERSEDE_TEARDOWN)
         .fetch_one(self.pool())
         .await
         .map_err(db_err)?;

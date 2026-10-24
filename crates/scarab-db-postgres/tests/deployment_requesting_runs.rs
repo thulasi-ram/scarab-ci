@@ -6,7 +6,9 @@
 //! is `Ready`/`Running`, or `Succeeded` with a DeploymentGate on that request
 //! not yet terminal — reached (every need of it Succeeded), or not reached
 //! and its requesting Step's latest Attempt start after the caller's cutoff. Distinct Runs,
-//! scoped to (org, environment, source, id).
+//! scoped to (org, environment, source, id). Also in flight, whatever the
+//! Run's status: a requester whose unit's teardown (a cancel or a rerun's
+//! supersession) is not yet retired (git-bug f22056d).
 //! One scenario, run against real Postgres (skipped when
 //! `SCARAB_TEST_DATABASE_URL` is unset) and the in-memory twin, so the two
 //! stay equivalent.
@@ -299,6 +301,130 @@ async fn pg_in_flight_runs_are_counted_once_each() {
 #[tokio::test]
 async fn inmemory_in_flight_runs_are_counted_once_each() {
     in_flight_runs_are_counted_once_each(&InMemoryDb::new()).await;
+}
+
+/// A launched requester `bump` (prod/web) in Run `run`: `Running` on `a1`,
+/// whose Pod handle is recorded.
+async fn seed_launched(db: &dyn Db, run: &str) {
+    seed(
+        db,
+        run,
+        RunStatus::Running,
+        &[("bump", "prod", "web", StepStatus::Running, &[])],
+        &[],
+    )
+    .await;
+    let (run, bump, a1) = (
+        RunId(run.into()),
+        StepId("bump".into()),
+        AttemptId("a1".into()),
+    );
+    db.record_attempt(
+        &run,
+        &bump,
+        &Attempt {
+            id: a1.clone(),
+            started_at: Timestamp(2),
+            failure: None,
+            failure_detail: None,
+            outcome: AttemptOutcome::Running,
+        },
+    )
+    .await
+    .unwrap();
+    db.set_attempt_handle(&run, &bump, &a1, &format!("pod-{}", run.0))
+        .await
+        .unwrap();
+}
+
+/// The one pending teardown message of `kind` for `run`.
+async fn teardown_of(db: &dyn Db, run: &str, kind: &str) -> scarab_engine::OutboxId {
+    let mine: Vec<_> = db
+        .claim_outbox("test", Some(kind), 100, 0)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|m| m.run.0 == run)
+        .collect();
+    assert_eq!(mine.len(), 1, "one {kind} intent for {run}: {mine:?}");
+    mine[0].id
+}
+
+/// A cancelled or superseded requester's deploy Step stops being in flight
+/// at once, but its unit runs on through its termination grace, still acting
+/// on the target (git-bug f22056d). So it counts — whatever its Run's status
+/// — until its teardown intent is retired: dispatched (the unit is gone) or
+/// dead-lettered (abandoned, with a diagnostic). A cancel that caught the
+/// Step before anything launched holds nothing.
+async fn a_requester_counts_until_its_teardown_is_retired(db: &dyn Db) {
+    use scarab_engine::{cancel_run_request, rerun_step, CANCEL_RUN, SUPERSEDE_TEARDOWN};
+    let clock = scarab_testkit::FakeClock::new(10);
+    let web = || count(db, "prod", "web", "nobody");
+
+    seed_launched(db, "t-cancel").await;
+    seed_launched(db, "t-abandoned").await;
+    seed_launched(db, "t-rerun").await;
+    seed(
+        db,
+        "t-unlaunched",
+        RunStatus::Running,
+        &[("bump", "prod", "web", StepStatus::Ready, &[])],
+        &[],
+    )
+    .await;
+    assert_eq!(web().await, 4, "all four in flight before any teardown");
+
+    for run in ["t-cancel", "t-abandoned", "t-unlaunched"] {
+        assert!(cancel_run_request(db, &clock, &RunId(run.into()), None)
+            .await
+            .unwrap());
+    }
+    rerun_step(
+        db,
+        &clock,
+        &RunId("t-rerun".into()),
+        &StepId("bump".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.run_status(&RunId("t-cancel".into())).await.unwrap(),
+        Some(RunStatus::Cancelled)
+    );
+    assert_eq!(
+        web().await,
+        3,
+        "the cancelled and the superseded requesters hold until their teardown is retired; \
+         the unlaunched one never had a unit"
+    );
+
+    let cancel = teardown_of(db, "t-cancel", CANCEL_RUN).await;
+    db.mark_dispatched(cancel).await.unwrap();
+    assert_eq!(web().await, 2, "t-cancel's unit is gone");
+    let abandoned = teardown_of(db, "t-abandoned", CANCEL_RUN).await;
+    db.dead_letter_outbox(abandoned).await.unwrap();
+    assert_eq!(web().await, 1, "an abandoned teardown holds no longer");
+    let rerun = teardown_of(db, "t-rerun", SUPERSEDE_TEARDOWN).await;
+    db.mark_dispatched(rerun).await.unwrap();
+    assert_eq!(web().await, 0, "t-rerun's superseded unit is gone");
+}
+
+#[tokio::test]
+async fn pg_a_requester_counts_until_its_teardown_is_retired() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+    a_requester_counts_until_its_teardown_is_retired(&db).await;
+    tdb.cleanup().await;
+}
+
+#[tokio::test]
+async fn inmemory_a_requester_counts_until_its_teardown_is_retired() {
+    a_requester_counts_until_its_teardown_is_retired(&InMemoryDb::new()).await;
 }
 
 /// Run `run` (created at `created_at`, Running): `bump` Succeeded with
