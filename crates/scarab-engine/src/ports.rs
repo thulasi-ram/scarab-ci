@@ -96,7 +96,17 @@ pub struct DeploymentGateDecision {
     pub deployment: Option<u64>,
 }
 
-/// The gate Attempt a DeploymentGate verdict is asked for (ADR-0070 §8).
+/// The gate Attempt a DeploymentGate verdict is asked for (ADR-0070 §8), and
+/// where its window opens.
+///
+/// Two instants of the deploy Step are kept apart. Its request's **effective
+/// time** — the start of its FIRST Attempt in the current Take — is
+/// attribution: what explains a Deployment (INV-DEP-11). The gate's **first
+/// wait** opens later when the deploy Step was retried: at the start of the
+/// Attempt that **succeeded** and recorded the request
+/// ([`deploy_attempt_started_at`](Self::deploy_attempt_started_at)), so a
+/// report received while an earlier, failed Attempt ran does not decide the
+/// gate, and its stall deadline runs from the Attempt that did the deploy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeploymentGateWait {
     /// The Attempt's frozen `started_at`. No verdict is reached for an
@@ -109,16 +119,35 @@ pub struct DeploymentGateWait {
     /// the later of the request's effective time and `started_at` (the
     /// floor), so the verdict the earlier wait reached is history to it.
     /// `false` — the gate's first wait on this request, including one after
-    /// an upstream Rerun made a new request — opens at the request's
-    /// effective time (the deploy Step's start), so a report received while
-    /// the deploy Step still ran counts.
+    /// an upstream Rerun made a new request — opens at the deploy Step's
+    /// succeeding Attempt (see [`window_floor`](Self::window_floor)), so a
+    /// report received while that Attempt still ran counts.
     pub afresh: bool,
+    /// The `started_at` of the deploy Step's Attempt that **succeeded** and
+    /// recorded the request — its latest `Succeeded` Attempt, read from the
+    /// step's durable Attempt rows. `None` when it has none (a hand-seeded
+    /// run): the first wait then opens at the request's effective time.
+    pub deploy_attempt_started_at: Option<Timestamp>,
 }
 
 impl DeploymentGateWait {
-    /// The window floor, when this wait has one.
-    pub fn window_floor(&self) -> Option<Timestamp> {
-        self.afresh.then_some(self.started_at)
+    /// The window floor of this wait on a request effective at
+    /// `effective_at`, when it has one:
+    ///
+    /// - waits afresh: the gate Attempt's own `started_at`;
+    /// - a first wait: the deploy Step's succeeding Attempt's start, **only
+    ///   when it is later than `effective_at`** (the deploy Step was retried
+    ///   in its Take). A single-Attempt deploy Step has no floor — its window
+    ///   is the request's own mark, exactly as before the split.
+    ///
+    /// A floor only ever narrows the window (INV-DEP-13): it never makes a
+    /// verdict arrive sooner or land earlier than the floor-free one.
+    pub fn window_floor(&self, effective_at: Timestamp) -> Option<Timestamp> {
+        if self.afresh {
+            return Some(self.started_at);
+        }
+        self.deploy_attempt_started_at
+            .filter(|s| s.0 > effective_at.0)
     }
 }
 
@@ -130,9 +159,11 @@ impl DeploymentGateWait {
 /// through this port.
 ///
 /// The engine asks only for a gate that is **waiting** (Pending, reached, an
-/// open Attempt), passing that Attempt as a [`DeploymentGateWait`]: the
-/// window opens at the request's effective time, or — for a wait that waits
-/// afresh — at the later of that and the Attempt's start. Whatever the
+/// open Attempt), passing that Attempt as a [`DeploymentGateWait`]: a first
+/// wait opens at the start of the deploy Step's Attempt that succeeded (the
+/// request's effective time for a deploy Step that was not retried); a wait
+/// that waits afresh at the later of the request's effective time and its
+/// own Attempt's start ([`DeploymentGateWait::window_floor`]). Whatever the
 /// oracle answers is journalled once, per Attempt, and never asked again
 /// (INV-DEP-10): a terminal gate is never re-evaluated, and a Retry is a new
 /// Attempt that waits afresh from its own start.
@@ -174,9 +205,10 @@ pub trait DeploymentGates: Send + Sync {
     ///
     /// `now` is the control plane's clock: a Run whose only outstanding
     /// DeploymentGates on the request are **not reached** stops counting once
-    /// the Environment's baseline deadline has elapsed since the request's
-    /// effective time (see [`Db::deployment_requesting_runs`]'s
-    /// `unreached_gate_cutoff`), so two Runs holding targets in opposite
+    /// the Environment's baseline deadline has elapsed since the requesting
+    /// Step's latest Attempt started — the Attempt that succeeded, where a
+    /// first wait of its gates opens (see [`Db::deployment_requesting_runs`]'s
+    /// `unreached_gate_cutoff`) — so two Runs holding targets in opposite
     /// orders cannot hold each other forever.
     ///
     /// `Err` = the oracle could not decide: the engine **holds** the step this
@@ -871,14 +903,18 @@ pub trait Db: Send + Sync {
     ///
     /// - some such gate is **reached** (every one of its `needs` Succeeded):
     ///   it counts until its verdict, which the gate's deadline bounds; or
-    /// - the request's **effective time** — the requesting Step's latest
-    ///   Attempt `started_at`, or the Run's `created_at` if it has none — is
-    ///   after `unreached_gate_cutoff` (the caller passes `now − the
-    ///   Environment's baseline deadline`). A gate that is not reached has no
-    ///   clock of its own, so without this bound two Runs that acquired two
-    ///   targets in opposite orders, each gate needing both deploys, would
-    ///   hold each other forever (R3). Past it the Deployment reads `stalled`
-    ///   on the record, and the Run stops counting.
+    /// - the requesting Step's **latest Attempt** `started_at` — the Attempt
+    ///   that succeeded and recorded the request, where a first wait of its
+    ///   DeploymentGates opens; NOT the request's effective time, which is
+    ///   the Step's first Attempt in its Take and can be earlier — or the
+    ///   Run's `created_at` if it has none, is after `unreached_gate_cutoff`
+    ///   (the caller passes `now − the Environment's baseline deadline`). A
+    ///   gate that is not reached has no clock of its own, so without this
+    ///   bound two Runs that acquired two targets in opposite orders, each
+    ///   gate needing both deploys, would hold each other forever (R3). A
+    ///   gate's first wait has its deadline (never longer than the baseline)
+    ///   run from that same start, so once reached it is decided no later
+    ///   than this cutoff; past it an unreached gate stops the Run counting.
     ///
     /// A Step that is still `Pending` (itself held, or not reached) does not
     /// count; one that failed made no request.
@@ -1210,7 +1246,10 @@ pub trait Executor: Send + Sync {
     /// DeploymentRequest incomplete and is never auto-retried, but the reason
     /// then says the results were lost in delivery — the author's step may
     /// be fine — instead of telling them to write `/scarab/results/<name>.json`.
-    /// Best-effort: an `Err` is dropped and the author-facing reason stands.
+    /// `Err` = it **could not be checked** (a backend error, or the
+    /// execution's unit is already gone): the reason then says so and blames
+    /// neither the author nor the delivery. Never answer `Ok(None)` for "I
+    /// could not look" — that reads as "delivered", and blames the author.
     ///
     /// **Deliberately REQUIRED — no default**, for the reason spelled out on
     /// [`workspace_provisioning`](Self::workspace_provisioning): a defaulted

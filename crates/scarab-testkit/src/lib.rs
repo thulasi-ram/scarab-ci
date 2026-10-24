@@ -1660,9 +1660,12 @@ impl Db for InMemoryDb {
                         .all(|n| status(run, n) == Some(StepStatus::Succeeded))
                 })
         };
-        // The request's effective time: the requesting Step's latest Attempt
-        // start, else the Run's creation.
-        let effective_at = |run: &RunId, step: &StepId| {
+        // Where the unreached-gate cutoff runs from: the requesting Step's
+        // LATEST Attempt start (the Attempt that succeeded, where a first
+        // wait of its gates opens — not the request's effective time, its
+        // first Attempt in the Take), else the Run's creation. The PG twin's
+        // `MAX(a.started_at)`.
+        let latest_attempt_start = |run: &RunId, step: &StepId| {
             st.steps
                 .get(&(run.clone(), step.clone()))
                 .and_then(|rec| rec.attempts.iter().map(|a| a.started_at).max())
@@ -1691,7 +1694,7 @@ impl Db for InMemoryDb {
                             .collect();
                         !open.is_empty()
                             && (open.iter().any(|g| reached(run, g))
-                                || effective_at(run, step) > unreached_gate_cutoff)
+                                || latest_attempt_start(run, step) > unreached_gate_cutoff)
                     }
                     _ => false,
                 };
@@ -2296,9 +2299,10 @@ struct FakeExecState {
     /// Named results (ADR-0041) each *step* emits on success, keyed by step id.
     results: HashMap<String, std::collections::BTreeMap<String, serde_json::Value>>,
     /// How each *step*'s results delivery failed, keyed by step id — what
-    /// `Executor::results_delivery_failure` answers (git-bug 0cb5895). Absent
-    /// = delivered (the in-process default).
-    delivery_failures: HashMap<String, String>,
+    /// `Executor::results_delivery_failure` answers (git-bug 0cb5895):
+    /// `Ok(how)` = it failed, `Err(why)` = it could not be checked. Absent =
+    /// delivered (the in-process default).
+    delivery_failures: HashMap<String, Result<String, String>>,
     /// Artifacts of record (ADR-0052) each *step* published, keyed by step id —
     /// the harvest the backend reports back once the blobs are in the object
     /// store, which the orchestrator must durably index.
@@ -2484,7 +2488,17 @@ impl FakeExecutor {
             .lock()
             .unwrap()
             .delivery_failures
-            .insert(step.to_string(), how.to_string());
+            .insert(step.to_string(), Ok(how.to_string()));
+    }
+
+    /// Script that whether `step`'s results were delivered **could not be
+    /// checked** — the backend errors with `why` (on k8s: the Pod is gone).
+    pub fn set_results_delivery_unchecked(&self, step: &str, why: &str) {
+        self.inner
+            .lock()
+            .unwrap()
+            .delivery_failures
+            .insert(step.to_string(), Err(why.to_string()));
     }
 
     /// Set the artifacts of record `step` (by id) published (ADR-0052) — what a
@@ -2722,13 +2736,11 @@ impl Executor for FakeExecutor {
         let Some((step, _)) = Self::step_and_attempt(handle) else {
             return Ok(None);
         };
-        Ok(self
-            .inner
-            .lock()
-            .unwrap()
-            .delivery_failures
-            .get(&step)
-            .cloned())
+        match self.inner.lock().unwrap().delivery_failures.get(&step) {
+            None => Ok(None),
+            Some(Ok(how)) => Ok(Some(how.clone())),
+            Some(Err(why)) => Err(ExecError::Other(why.clone())),
+        }
     }
 
     async fn artifacts(

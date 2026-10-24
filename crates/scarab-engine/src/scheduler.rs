@@ -1205,7 +1205,8 @@ fn is_gate_rearm(kind: &EventPayload, step: &StepId) -> bool {
 /// while this same request stood: this wait is a Retry (or a Rerun of the gate
 /// alone) and waits afresh from its own start. None after it: the first wait
 /// on this request — including the one after a Rerun of the deploy Step made
-/// a new request — which opens at the request's effective time.
+/// a new request — which opens at the start of the deploy Step's succeeding
+/// Attempt ([`DeploymentGateWait::window_floor`]).
 ///
 /// A re-arm of `requester` is not a boundary, and neither is a
 /// skip-if-unchanged (`Pending → Succeeded`, no Attempt): neither records a
@@ -3655,7 +3656,7 @@ impl<'a> Scheduler<'a> {
                 .unwrap_or_default();
             let now = self.clock.now().await;
             if let Some(verdict) = self
-                .gate_verdict(run, gate, &attempt, &gate_settings, now)
+                .gate_verdict(run, gate, &attempt, &gate_settings, &steps, now)
                 .await?
             {
                 // Fenced on THIS wait: a wait superseded or cancelled since the
@@ -3692,6 +3693,7 @@ impl<'a> Scheduler<'a> {
         gate: &StepRun,
         attempt: &Attempt,
         settings: &GateSettings,
+        steps: &[StepRun],
         now: Timestamp,
     ) -> Result<Option<GateVerdict>, SchedulerError> {
         let started = attempt.started_at.0;
@@ -3712,7 +3714,7 @@ impl<'a> Scheduler<'a> {
             }
             Some("deployment") => {
                 if let Some(verdict) = self
-                    .deployment_gate_verdict(run, gate, attempt, settings, now)
+                    .deployment_gate_verdict(run, gate, attempt, settings, steps, now)
                     .await?
                 {
                     return Ok(Some(verdict));
@@ -3745,18 +3747,23 @@ impl<'a> Scheduler<'a> {
     /// its expiry or forever.
     ///
     /// Otherwise the [`DeploymentGates`] oracle is asked about this Attempt:
-    /// its first wait on the request opens at the request's effective time
-    /// (the deploy Step's start); a wait after an earlier one already
-    /// resolved on that same request waits afresh, its `started_at` the
-    /// window floor ([`deployment_gate_waits_afresh`]; the journal is read
-    /// only when the gate has an earlier Attempt). No oracle wired, or an
-    /// oracle error, is **no decision** this tick (see [`DeploymentGates`]).
+    /// its first wait on the request opens at the start of the deploy Step's
+    /// Attempt that **succeeded** and recorded it — its latest `Succeeded`
+    /// Attempt in `steps` (the pass's snapshot; durable rows, so a restart
+    /// reads the same start) — which is the request's effective time unless
+    /// the deploy Step was retried (attribution stays at its first Attempt in
+    /// the Take; ADR-0070 §8). A wait after an earlier one already resolved
+    /// on that same request waits afresh, its `started_at` the window floor
+    /// ([`deployment_gate_waits_afresh`]; the journal is read only when the
+    /// gate has an earlier Attempt). No oracle wired, or an oracle error, is
+    /// **no decision** this tick (see [`DeploymentGates`]).
     async fn deployment_gate_verdict(
         &self,
         run: &RunId,
         gate: &StepRun,
         attempt: &Attempt,
         settings: &GateSettings,
+        steps: &[StepRun],
         now: Timestamp,
     ) -> Result<Option<GateVerdict>, SchedulerError> {
         let Some(oracle) = self.deployments else {
@@ -3773,7 +3780,7 @@ impl<'a> Scheduler<'a> {
             // step's requests for the one recorded for this gate.
             None => {
                 let mut found = None;
-                for step in self.db.steps_of_run(run).await? {
+                for step in steps {
                     if step.is_gate() {
                         continue;
                     }
@@ -3810,9 +3817,23 @@ impl<'a> Scheduler<'a> {
                 &attempt.id,
                 &request.step,
             );
+        // The Attempt that succeeded and recorded the request: where the
+        // first wait opens (and its stall clock starts) — not the deploy
+        // Step's first Attempt, whose start is the request's effective time.
+        let deploy_attempt_started_at = steps
+            .iter()
+            .find(|s| s.step == request.step)
+            .and_then(|s| {
+                s.attempts
+                    .iter()
+                    .rev()
+                    .find(|a| a.outcome == AttemptOutcome::Succeeded)
+            })
+            .map(|a| a.started_at);
         let wait = DeploymentGateWait {
             started_at: attempt.started_at,
             afresh,
+            deploy_attempt_started_at,
         };
         match oracle
             .deployment_gate_verdict(run, &gate.step, &request, wait, now)
@@ -4299,7 +4320,9 @@ impl<'a> Scheduler<'a> {
     ///   results ([`Executor::results_delivery_failure`] — on Kubernetes the
     ///   results-egress sidecar exited non-zero), the reason says so instead
     ///   of telling the author to write `/scarab/results/<name>.json`
-    ///   (git-bug `0cb5895`); the class and the no-retry rule are unchanged;
+    ///   (git-bug `0cb5895`), and when the backend cannot say, the reason says
+    ///   delivery could not be checked; every wording names the missing
+    ///   results; the class and the no-retry rule are unchanged;
     /// - otherwise the success transition, the attempt outcome and one
     ///   Deployment input per request land in ONE commit
     ///   ([`Db::finish_step_with_deployment_requests`]), each request
@@ -4366,22 +4389,23 @@ impl<'a> Scheduler<'a> {
         let effective_at = deployment_request_first_attempt(&self.db.events(run).await?, step)
             .and_then(|first| attempts.iter().find(|a| a.id == first))
             .map_or(started_at, |a| a.started_at.min(started_at));
-        let inputs = match crate::deployment_inputs(run, step, &requests, results, effective_at) {
-            Ok(inputs) => inputs,
-            Err(reason) => {
-                let reason = self.undelivered_reason(handle).await.unwrap_or(reason);
-                return self
-                    .finalize_step(
-                        run,
-                        step,
-                        attempt,
-                        StepStatus::Failed,
-                        Some(FailureKind::DeploymentRequestIncomplete),
-                        Some(reason),
-                    )
-                    .await;
-            }
-        };
+        let inputs =
+            match crate::complete_deployment_inputs(run, step, &requests, results, effective_at) {
+                Ok(inputs) => inputs,
+                Err(incomplete) => {
+                    let reason = self.incomplete_reason(handle, &incomplete).await;
+                    return self
+                        .finalize_step(
+                            run,
+                            step,
+                            attempt,
+                            StepStatus::Failed,
+                            Some(FailureKind::DeploymentRequestIncomplete),
+                            Some(reason),
+                        )
+                        .await;
+                }
+            };
         // The receipt time is read right before the commit (see
         // `append_deployment_input`): an early reading is monotone through the
         // store's GREATEST, but needlessly early.
@@ -4400,20 +4424,24 @@ impl<'a> Scheduler<'a> {
         }
     }
 
-    /// The DeploymentRequest-incomplete reason when the backend failed to
-    /// deliver the Attempt's results (git-bug `0cb5895`), or `None` — then the
-    /// author-facing reason stands. Best-effort, like the other settle-time
-    /// evidence reads (`record_cache_saves`): a backend error here is dropped
-    /// (the author-facing reason stands), since the verdict — incomplete,
-    /// never auto-retried — is the same either way; only its wording depends
-    /// on this.
-    async fn undelivered_reason(&self, handle: &ExecHandle) -> Option<String> {
+    /// The DeploymentRequest-incomplete reason, worded for what the backend
+    /// says about delivering the Attempt's results (git-bug `0cb5895`):
+    /// failed → the delivery is blamed; delivered (or nothing to deliver) →
+    /// the author-facing reason; **could not be checked** (a backend error,
+    /// or the execution's unit already gone) → it says so, blaming neither.
+    /// Every wording names the missing results. Best-effort, like the other
+    /// settle-time evidence reads: the verdict — incomplete, never
+    /// auto-retried — is the same either way; only its wording depends on
+    /// this.
+    async fn incomplete_reason(
+        &self,
+        handle: &ExecHandle,
+        incomplete: &crate::DeploymentRequestIncomplete,
+    ) -> String {
         match self.executor.results_delivery_failure(handle).await {
-            Ok(Some(how)) => Some(format!(
-                "DeploymentRequest incomplete: {how}, so this step's results were not \
-                 delivered; the step's own output may be fine — retry the step"
-            )),
-            Ok(None) | Err(_) => None,
+            Ok(Some(how)) => incomplete.undelivered_reason(&how),
+            Ok(None) => incomplete.author_reason(),
+            Err(e) => incomplete.unchecked_reason(&e.to_string()),
         }
     }
 

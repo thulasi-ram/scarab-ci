@@ -556,14 +556,62 @@ async fn a_failed_results_delivery_fails_incomplete_with_an_honest_reason() {
     let detail = attempts[0].failure_detail.as_deref().unwrap_or_default();
     assert_eq!(
         detail,
-        "DeploymentRequest incomplete: the results sidecar `scarab-results-egress` exited 1, \
-         so this step's results were not delivered; the step's own output may be fine — \
-         retry the step"
+        "DeploymentRequest incomplete: result `version` (the version for `argocd`/`web`) is \
+         missing; result `images` (evidence for `argocd`/`web`) is missing — the results \
+         sidecar `scarab-results-egress` exited 1, so this step's results were not \
+         delivered; the step's own output may be fine — retry the step",
+        "the delivery is blamed, and the missing results still named"
     );
     assert!(!detail.contains("/scarab/results"), "{detail}");
     assert_eq!(
         db.run_status(&run_id()).await.unwrap(),
         Some(RunStatus::Failed)
+    );
+    assert!(db.inputs("acme", "prod").await.unwrap().is_empty());
+}
+
+/// The same exit 0 with nothing delivered, but the backend cannot say
+/// whether delivery failed (an API error; on k8s, the Pod already gone).
+/// "Could not check" must not read as "delivered": the reason blames
+/// neither the author nor the delivery, says it could not be checked, and
+/// still names the missing results.
+#[tokio::test]
+async fn an_unchecked_results_delivery_fails_incomplete_saying_it_could_not_be_checked() {
+    let db = InMemoryDb::new();
+    seed(&db).await;
+    let clock = FakeClock::new(1_000);
+    let exec = FakeExecutor::new();
+    exec.set_results_delivery_unchecked("bump", "the step's Pod `bump-a1` is already gone");
+    for _ in 0..4 {
+        exec.script_outcome(ExecState::Succeeded);
+    }
+    for _ in 0..8 {
+        tick(&db, &clock, &exec).await;
+        clock.advance(1_000);
+    }
+
+    let attempts = db.attempts_of_step(&run_id(), &step_id()).await.unwrap();
+    assert_eq!(attempts.len(), 1, "never auto-retried, even with `retry:`");
+    assert_eq!(
+        attempts[0].failure,
+        Some(FailureKind::DeploymentRequestIncomplete)
+    );
+    let detail = attempts[0].failure_detail.as_deref().unwrap_or_default();
+    assert!(
+        detail.starts_with(
+            "DeploymentRequest incomplete: result `version` (the version for `argocd`/`web`) \
+             is missing; result `images` (evidence for `argocd`/`web`) is missing"
+        ),
+        "the missing results are named: {detail}"
+    );
+    assert!(
+        detail.contains("whether its results were delivered could not be checked")
+            && detail.contains("is already gone"),
+        "it says delivery could not be checked, and why: {detail}"
+    );
+    assert!(
+        !detail.contains("write them to"),
+        "not the author-blaming wording: {detail}"
     );
     assert!(db.inputs("acme", "prod").await.unwrap().is_empty());
 }

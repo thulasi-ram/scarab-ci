@@ -53,15 +53,21 @@
 //!   EnvironmentDeploymentDeadline has elapsed on the Deployment's stall
 //!   clock — started at creation and **restarted by every request that
 //!   joins it**; a later `live` or `failed` report still recovers it.
-//! - **DeploymentGate.** A gate on a request looks **forward from the
-//!   request's effective time** — the deploy Step's start (its first
-//!   Attempt in the current Take), so a report received while that Step
-//!   still ran, an earlier failed Attempt of it included, counts: it passes if the Deployment
-//!   was live at that time or is reported live after it; it fails on a
-//!   `failed` report after it, on supersession, or once the deadline has
-//!   elapsed since it. Whatever happens first decides, and the verdict never
-//!   changes. Only a Retry of a gate that already reached a verdict on the
-//!   same request waits afresh, from its new Attempt's start (a floor).
+//! - **DeploymentGate.** A gate on a request looks **forward from its window
+//!   start**. Its first wait opens at the start of the deploy Step's Attempt
+//!   that **succeeded** and recorded the request, so a report received while
+//!   that Attempt still ran counts: it passes if the Deployment was live at
+//!   that time or is reported live after it; it fails on a `failed` report
+//!   after it, on supersession, or once the deadline has elapsed since it.
+//!   Whatever happens first decides, and the verdict never changes. For a
+//!   deploy Step that was not retried that start IS the request's effective
+//!   time (the request's own mark, no floor); for a retried one it is a
+//!   floor later than it, so a report received while an earlier, failed
+//!   Attempt ran is history to the gate. Attribution and the gate window
+//!   are split: the effective time (the first Attempt in the Take) explains
+//!   the Deployment; the succeeding Attempt opens the gate. A Retry of a
+//!   gate that already reached a verdict on the same request waits afresh,
+//!   from its new Attempt's start (a floor).
 //! - **Order.** "Before" and "after" are judged on [`DeploymentInstant`] —
 //!   time, then the order inputs arrived in — never on time alone: two
 //!   inputs can share a millisecond. A deadline sorts before every input
@@ -96,11 +102,12 @@
 //!   report is a report, on exactly one Deployment with the input's key.
 //! - **INV-DEP-9** A DeploymentGate looks forward: it fails on `failed` only
 //!   for a `failed` report at or after its window start — its request's
-//!   effective time, or, for a wait that waits afresh (a Retry after a
-//!   verdict on the same request), the later of that and its gate Attempt's
-//!   start — passes only if the Deployment was live then or is reported live
-//!   after, and fails on `stalled` only once the deadline has elapsed since
-//!   then. A failure that predates the window never fails it.
+//!   effective time, or a floor later than it (the start of a retried
+//!   deploy Step's succeeding Attempt; for a wait that waits afresh, a Retry
+//!   after a verdict on the same request, its gate Attempt's start) —
+//!   passes only if the Deployment was live then or is reported live after,
+//!   and fails on `stalled` only once the deadline has elapsed since then. A
+//!   failure that predates the window never fails it.
 //! - **INV-DEP-10** A DeploymentGate verdict, once reached, never changes.
 //! - **INV-DEP-11** A request never creates a Deployment when its key's
 //!   newest Deployment was first seen at or after the request's effective
@@ -110,7 +117,8 @@
 //!   request whose effective time is at or before its creation, and once
 //!   explained it stays explained.
 //! - **INV-DEP-13** A floor — the start of a gate Attempt that waits
-//!   afresh — only ever narrows its window: an input received at or before
+//!   afresh, or of a retried deploy Step's succeeding Attempt — only ever
+//!   narrows its window: an input received at or before
 //!   the Attempt started never fails the gate, and a floor never makes a
 //!   verdict arrive sooner or land earlier than the floor-free one
 //!   ([`Deployment::gate_verdict_from`]; the retry of a failed
@@ -445,11 +453,13 @@ impl Deployment {
     /// The window opens at the request itself — its effective time, the
     /// deploy Step's start — so a report received while that Step was still
     /// running counts. This is a DeploymentGate's **first** wait on the
-    /// request (ADR-0070 §8): [`gate_verdict_from`](Self::gate_verdict_from)
-    /// with no floor. Its stall deadline runs from that effective time too,
-    /// so a deploy Step that itself ran past the deadline, with nothing
+    /// request of a deploy Step that was not retried (ADR-0070 §8):
+    /// [`gate_verdict_from`](Self::gate_verdict_from) with no floor. (A
+    /// retried deploy Step's first wait is floored at its succeeding
+    /// Attempt's start.) Its stall deadline runs from that start too, so a
+    /// deploy Attempt that itself ran past the deadline, with nothing
     /// decisive reported, fails its gate `stalled` the first time it is
-    /// asked — a deadline shorter than the deploy is a misconfiguration.
+    /// asked — a deadline shorter than one deploy is a misconfiguration.
     pub fn gate_verdict(
         &self,
         requester: &DeploymentRequester,
@@ -477,9 +487,11 @@ impl Deployment {
 
     /// The verdict, as of `now`, of a DeploymentGate whose window may open
     /// no earlier than `window_floor` — the start of a gate Attempt that
-    /// **waits afresh**: the Retry of a gate whose earlier wait already
-    /// reached a verdict on this same request (ADR-0070 §8). The window opens
-    /// at the later of the request and the floor. A first wait has no floor
+    /// **waits afresh** (the Retry of a gate whose earlier wait already
+    /// reached a verdict on this same request), or the start of a retried
+    /// deploy Step's succeeding Attempt for a first wait (ADR-0070 §8). The
+    /// window opens at the later of the request and the floor. A first wait
+    /// on a deploy Step that was not retried has no floor
     /// ([`gate_verdict`](Self::gate_verdict)).
     ///
     /// The floor is the instant `(window_floor, u64::MAX)`: an input received

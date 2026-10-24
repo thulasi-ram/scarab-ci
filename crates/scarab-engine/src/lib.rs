@@ -1013,7 +1013,8 @@ pub struct RunDeploymentRequest {
 /// store ignores it and stamps its own receipt time.
 ///
 /// `Err` is the whole failure detail, starting "DeploymentRequest incomplete:"
-/// and naming every problem, so the author fixes them in one round.
+/// and naming every problem, so the author fixes them in one round
+/// ([`DeploymentRequestIncomplete::author_reason`]).
 pub fn deployment_inputs(
     run: &RunId,
     step: &StepId,
@@ -1021,6 +1022,63 @@ pub fn deployment_inputs(
     results: &std::collections::BTreeMap<String, serde_json::Value>,
     effective_at: Timestamp,
 ) -> Result<Vec<scarab_deployment::DeploymentInput>, String> {
+    complete_deployment_inputs(run, step, requests, results, effective_at)
+        .map_err(|incomplete| incomplete.author_reason())
+}
+
+/// Why a succeeding Step's DeploymentRequests could not be completed from
+/// its results: every problem, each naming the result and the target it was
+/// for. How it is worded depends on whether the results were lost in
+/// delivery (git-bug `0cb5895`) — which only the backend can say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentRequestIncomplete {
+    pub problems: Vec<String>,
+}
+
+impl DeploymentRequestIncomplete {
+    /// The backend delivered the results (or has none to deliver): the
+    /// author's step did not write them.
+    pub fn author_reason(&self) -> String {
+        format!(
+            "DeploymentRequest incomplete: {} (the step exited 0, but a DeploymentRequest it \
+             declares is read from these results — write them to /scarab/results/<name>.json)",
+            self.problems.join("; ")
+        )
+    }
+
+    /// The backend failed to deliver the results — `how`, e.g. "the results
+    /// sidecar `scarab-results-egress` exited 1": the step's own output may
+    /// be fine.
+    pub fn undelivered_reason(&self, how: &str) -> String {
+        format!(
+            "DeploymentRequest incomplete: {} — {how}, so this step's results were not \
+             delivered; the step's own output may be fine — retry the step",
+            self.problems.join("; ")
+        )
+    }
+
+    /// Whether the backend delivered the results could not be checked
+    /// (`why`: a backend error, or the execution's unit is already gone):
+    /// neither the author nor the delivery is blamed.
+    pub fn unchecked_reason(&self, why: &str) -> String {
+        format!(
+            "DeploymentRequest incomplete: {} (the step exited 0; whether its results were \
+             delivered could not be checked: {why}. If the step writes them to \
+             /scarab/results/<name>.json, retry the step)",
+            self.problems.join("; ")
+        )
+    }
+}
+
+/// [`deployment_inputs`], its `Err` the problems themselves, so the caller
+/// can word them for what the backend says about delivery.
+pub fn complete_deployment_inputs(
+    run: &RunId,
+    step: &StepId,
+    requests: &[RunDeploymentRequest],
+    results: &std::collections::BTreeMap<String, serde_json::Value>,
+    effective_at: Timestamp,
+) -> Result<Vec<scarab_deployment::DeploymentInput>, DeploymentRequestIncomplete> {
     use scarab_deployment::{
         DeploymentInput, DeploymentRequester, DeploymentTarget, DeploymentVersion,
     };
@@ -1086,11 +1144,7 @@ pub fn deployment_inputs(
     if problems.is_empty() {
         Ok(inputs)
     } else {
-        Err(format!(
-            "DeploymentRequest incomplete: {} (the step exited 0, but a DeploymentRequest it \
-             declares is read from these results — write them to /scarab/results/<name>.json)",
-            problems.join("; ")
-        ))
+        Err(DeploymentRequestIncomplete { problems })
     }
 }
 

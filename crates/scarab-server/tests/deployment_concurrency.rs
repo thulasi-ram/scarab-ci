@@ -10,7 +10,8 @@
 //! `Pending` with no Attempt, and its Run suspends (no budget billed) when
 //! nothing else is runnable. A DeploymentGate that is not yet reached stops
 //! counting once the Environment's baseline deadline has elapsed since the
-//! request's effective time; a reached one counts until its verdict (R3).
+//! requesting Step's latest Attempt started (the one that succeeded, where
+//! the gate's first wait opens); a reached one counts until its verdict (R3).
 //!
 //! No kind: steps run on the `FakeExecutor`, reports go through
 //! `DeploymentStore::append`, the scheduler is ticked by hand with the

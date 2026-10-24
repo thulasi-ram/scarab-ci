@@ -13,15 +13,26 @@
 //! 2. the Environment's log, folded ([`scarab_deployment::fold_ledger`]);
 //! 3. the Deployment the requester's current request landed on
 //!    ([`DeploymentLedger::request_of`](scarab_deployment::DeploymentLedger::request_of)),
-//!    and its verdict: for the gate's first wait on the request, a window
-//!    opening at the request's effective time — the deploy Step's start, so a
-//!    report received while that Step still ran counts
-//!    ([`Deployment::gate_decision`](scarab_deployment::Deployment::gate_decision));
-//!    for a wait that waits afresh (a Retry after a verdict on the same
-//!    request), the gate Attempt's start as the window floor
-//!    ([`Deployment::gate_decision_from`](scarab_deployment::Deployment::gate_decision_from)).
+//!    and its verdict over a window that opens
+//!    ([`DeploymentGateWait::window_floor`]):
+//!    - for the gate's **first wait** on the request, at the start of the
+//!      deploy Step's Attempt that **succeeded** and recorded the request, so
+//!      a report received while that Attempt still ran counts. For a deploy
+//!      Step that was not retried that is the request's own mark — its
+//!      effective time — and the window is unfloored
+//!      ([`Deployment::gate_decision`](scarab_deployment::Deployment::gate_decision));
+//!      for a retried one it is a floor later than the effective time
+//!      ([`Deployment::gate_decision_from`](scarab_deployment::Deployment::gate_decision_from)),
+//!      so neither a report received while an earlier, failed Attempt ran nor
+//!      the time the operator took to Retry decides the gate. The effective
+//!      time itself — the first Attempt in the Take — is attribution only
+//!      (INV-DEP-11): it explains the Deployment, it does not open the gate;
+//!    - for a wait that waits afresh (a Retry after a verdict on the same
+//!      request), at the gate Attempt's own start (a floor).
+//!
 //!    Either way no verdict is reached for an instant before the gate
-//!    Attempt's own start.
+//!    Attempt's own start, and a `stalled` reason names the start its
+//!    deadline ran from.
 //!
 //! **Per tick.** Both reads are cached per tick ([`ServerDeploymentGates::for_tick`]):
 //! every waiting gate on one Environment shares one fold, instead of each
@@ -57,8 +68,12 @@
 //! same tick must be counted. An error holds the Step (fail closed). A Run
 //! counted only through DeploymentGates that are not yet reached stops
 //! counting once the Environment's baseline deadline has elapsed since its
-//! request's effective time — the moment its Deployment reads `stalled` on
-//! the record — so opposite-order holds cannot deadlock two Runs (R3).
+//! requesting Step's **latest Attempt** started (`MAX(started_at)`: the
+//! Attempt that succeeded, where a first wait of its gates opens — not the
+//! request's effective time, which can be earlier after a retry), so
+//! opposite-order holds cannot deadlock two Runs (R3). A first wait's
+//! deadline, never longer than the baseline, runs from that same start, so a
+//! reached gate is decided no later than the cutoff.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -245,7 +260,7 @@ impl ServerDeploymentGates {
     /// The first target at its limit, in request order. A Run counted
     /// through only unreached DeploymentGates stops counting once the
     /// Environment's baseline deadline has elapsed by `now` since its
-    /// request's effective time (the cutoff `now − baseline`).
+    /// requesting Step's latest Attempt started (the cutoff `now − baseline`).
     async fn concurrency_hold(
         &self,
         run: &RunId,
@@ -409,11 +424,27 @@ impl ServerDeploymentGates {
         };
         let now = tick_now.0.min(cached.read_now);
         let ledger = cached.folded.ledger();
-        // The first wait on this request opens at the request's effective
-        // time; only a wait that waits afresh has a floor (ADR-0070 §8).
-        let decision = match wait.window_floor() {
+        // Where the window opens (ADR-0070 §8): a first wait at the deploy
+        // Step's succeeding Attempt — a floor only when that is later than
+        // the request's effective time (a retried deploy Step) — a wait that
+        // waits afresh at its own Attempt's start. `request_of` found the
+        // requester here, so its mark is present.
+        let effective_at = deployment
+            .requesters
+            .get(&requester)
+            .map_or(Timestamp(0), |m| Timestamp(m.effective_at));
+        let floor = wait.window_floor(effective_at);
+        let decision = match floor {
             Some(floor) => deployment.gate_decision_from(&requester, floor.0, now, deadline),
             None => deployment.gate_decision(&requester, now, deadline),
+        };
+        // What a `stalled` deadline ran from, named in its reason.
+        let window_from = if wait.afresh {
+            "this gate attempt starting".to_string()
+        } else if floor.is_some() {
+            format!("step `{}`'s succeeding attempt starting", request.step.0)
+        } else {
+            format!("step `{}` starting", request.step.0)
         };
         let Some(decision) = decision else {
             return Ok(None);
@@ -457,7 +488,10 @@ impl ServerDeploymentGates {
                 ..
             } => (
                 false,
-                format!("stalled: not live within {}", deadline_text(deadline)),
+                format!(
+                    "stalled: not live within {} of {window_from}",
+                    deadline_text(deadline)
+                ),
             ),
         };
         Ok(Some(DeploymentGateDecision {
@@ -479,7 +513,8 @@ impl ServerDeploymentGates {
 /// a wait that waits afresh (max(request effective_at, Attempt start), and the
 /// effective_at — the deploy Step's first Attempt start in its Take — precedes that Step's
 /// success, which is at or before the gate Attempt's start). A first wait's
-/// window opens earlier, at the effective_at itself, so measured from the
+/// window opens earlier, at the start of the deploy Step's succeeding
+/// Attempt (itself before that success), so measured from the gate
 /// Attempt's start this stall comes no sooner than the record's would: an
 /// unreadable record never fails a gate earlier than a readable one.
 fn unreadable_record(
@@ -492,7 +527,8 @@ fn unreadable_record(
         return Ok(Some(DeploymentGateDecision {
             passed: false,
             reason: format!(
-                "stalled: not live within {} (the Deployment record could not be read: {error})",
+                "stalled: not live within {} of this gate attempt starting (the Deployment \
+                 record could not be read: {error})",
                 deadline_text(deadline)
             ),
             deployment: None,
