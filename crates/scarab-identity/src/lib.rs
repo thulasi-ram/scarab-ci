@@ -252,6 +252,11 @@ pub fn csrf_hash(token: &str) -> String {
     api_token_hash(token)
 }
 
+/// Constant-time equality of two byte strings (the length is not secret).
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 impl Session {
     /// Does `presented` (the `x-csrf-token` header) carry this session's CSRF
     /// token? Fails closed: a session with no token matches nothing. The
@@ -263,9 +268,7 @@ impl Session {
         if self.csrf_hash.is_empty() {
             return false;
         }
-        let a = csrf_hash(presented);
-        let (a, b) = (a.as_bytes(), self.csrf_hash.as_bytes());
-        a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+        ct_eq(csrf_hash(presented).as_bytes(), self.csrf_hash.as_bytes())
     }
 
     /// Is the session still valid at `now_ms`?

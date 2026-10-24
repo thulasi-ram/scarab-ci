@@ -365,11 +365,6 @@ impl StepUpService {
     }
 }
 
-/// Constant-time equality of two byte strings (the length is not secret).
-pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
 /// Which of `admins` hold no usable passkey — every crown jewel is refused
 /// for them until they enroll one. The one count behind the boot line and
 /// the Org summary.

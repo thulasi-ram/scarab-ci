@@ -6384,7 +6384,7 @@ async fn link_callback(
         ),
         None => session_hash(&sid),
     };
-    if now > expires_at || !step_up::ct_eq(expected.as_bytes(), flow.link.as_bytes()) {
+    if now > expires_at || !scarab_identity::ct_eq(expected.as_bytes(), flow.link.as_bytes()) {
         if let Some(svc) = st.step_up.service() {
             let mut ev = step_up::event(
                 scarab_identity::security_event_kind::STEP_UP_REFUSED,
