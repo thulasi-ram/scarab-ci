@@ -947,9 +947,10 @@ impl Db for InMemoryDb {
             .steps
             .get_mut(&(run.clone(), step.clone()))
             .ok_or(DbError::Conflict)?;
-        if rec.status != Some(StepStatus::Running)
-            || rec.attempts.last().map(|a| &a.id) != Some(attempt)
-        {
+        // The frontier is the highest `a{n}`, as Postgres orders it — not the
+        // insertion-order last (red team A8': twin drift).
+        let frontier = rec.attempts.iter().max_by_key(|a| attempt_order_key(a));
+        if rec.status != Some(StepStatus::Running) || frontier.map(|a| &a.id) != Some(attempt) {
             return Err(DbError::Conflict);
         }
         rec.results = results.clone();

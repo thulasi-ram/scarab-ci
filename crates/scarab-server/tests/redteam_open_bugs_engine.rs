@@ -875,12 +875,10 @@ mod attempts_order_by_number_alone_everywhere {
         }
     }
 
-    /// The twin's `ingest_attempt_results` takes `attempts.last()` in
-    /// INSERTION order (testkit lib.rs `ingest_attempt_results`), not the
-    /// `a{n}` order every other twin read sorts by. Harmless in production
-    /// (minting is monotonic), but the twin no longer mirrors PG.
+    /// The twin's `ingest_attempt_results` took `attempts.last()` in
+    /// INSERTION order, not the `a{n}` order every other twin read sorts by
+    /// (fixed in round 2).
     #[tokio::test]
-    #[ignore = "redteam: BROKE (twin drift, LOW) in-memory ingest frontier = insertion-order last(), not a{n} order"]
     async fn inmemory() {
         super::attempts_order_by_number_alone_everywhere(super::World::inmemory(None).await).await
     }
