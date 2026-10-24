@@ -7419,18 +7419,59 @@ fn gate_approvers(events: &[EventKind], step: &StepId) -> Vec<String> {
 )]
 async fn approve_gate(
     State(st): State<AppState>,
-    Extension(ctx): Extension<crate::step_up::GuardCtx>,
+    Extension(guard): Extension<crate::step_up::GuardCtx>,
     headers: HeaderMap,
     Path((id, step)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
     let run = RunId(id);
     let scope = run_scope(&st, &run).await;
     let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
-    // ADR-0073 SEAM (C4): a conditional crown jewel — the step-up is needed
-    // only when this change loosens (rule: the run's Environment has approvers). Until the loosening
-    // rules are wired, ask unconditionally: fail-closed.
-    ctx.require(&st, Vec::new()).await?;
     let step = StepId(step);
+
+    // 0. The governing Environment's effective rules for this Project
+    //    (ADR-0071 §3), resolved NOW — before the approval is recorded,
+    //    because they decide whether recording it needs a step-up (ADR-0073
+    //    §3): an approval on a gate of an Environment with approvers is a
+    //    crown jewel. So is one whose Environment cannot be resolved (gone,
+    //    no longer admitting the Project, or a store error) while governance
+    //    is wired — fail-closed: the approval would count if it came back.
+    //    A plain gate, or an Environment with no approvers, is exempt. The
+    //    same snapshot then governs the release below, so the approval is
+    //    judged and released under one set of rules.
+    let ctx = st.db.run_deploy_context(&run).await.map_err(ApiError::Db)?;
+    // The approval stays recorded when the gate is held; it counts if the
+    // Environment is restored.
+    let governance = gate_release_governance(
+        &st,
+        ctx.as_ref(),
+        "approval recorded, but the gate cannot release",
+    )
+    .await;
+    match (&ctx, &governance) {
+        (Some(c), Ok(Some(p))) if !p.approvers.is_empty() => {
+            guard
+                .require(
+                    &st,
+                    vec![format!(
+                        "approves a deploy of `{}` into `{}`, which requires approvers",
+                        c.project, c.environment
+                    )],
+                )
+                .await?
+        }
+        (Some(c), Err(_)) => {
+            guard
+                .require(
+                    &st,
+                    vec![format!(
+                        "approves a deploy of `{}` into `{}`, whose rules cannot be resolved",
+                        c.project, c.environment
+                    )],
+                )
+                .await?
+        }
+        _ => guard.exempt("no approvers required"),
+    }
 
     // 1. Record this principal's approval — append-only, no resume, idempotent
     //    per (step, subject).
@@ -7477,20 +7518,12 @@ async fn approve_gate(
             .into_response());
     }
 
-    // 2. Gather the accumulated approvers and the governing Environment's
-    //    effective rules for this Project (ADR-0071 §3), resolved NOW rather
-    //    than at Run creation: an admin's change since — tightened rules, a
-    //    withdrawn eligibility, a deleted Environment — governs the release.
+    // 2. Gather the accumulated approvers; the governing Environment's rules
+    //    were resolved at 0., NOW rather than at Run creation: an admin's
+    //    change since — tightened rules, a withdrawn eligibility, a deleted
+    //    Environment — governs the release.
     let approvers = gate_approvers(&st.db.events(&run).await.map_err(ApiError::Db)?, &step);
-    let ctx = st.db.run_deploy_context(&run).await.map_err(ApiError::Db)?;
-    // The approval above stays recorded when the gate is held; it counts if
-    // the Environment is restored.
-    let protection = gate_release_governance(
-        &st,
-        ctx.as_ref(),
-        "approval recorded, but the gate cannot release",
-    )
-    .await?;
+    let protection = governance?;
 
     // 3. A protected deploy releases only when admits() passes over the
     //    accumulated approvers (every required approver, and the ref still
