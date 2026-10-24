@@ -17,10 +17,12 @@
 //! we never let the declared algorithm pick a verifier for a key of a
 //! different shape.
 //!
-//! Known gap: an EC2 point is not checked to lie on P-256 at registration
-//! (ring exposes no point validation outside `verify`). An off-curve point
-//! makes every later assertion fail with `SignatureInvalid`; it cannot make
-//! one succeed.
+//! Points are validated here, not left to ring's `verify` (which reports a
+//! bad key exactly like a bad signature): an EC2 key must be a P-256 point
+//! per SEC1 §3.2.2.1 and an OKP key must decode per RFC 8032 §5.1.3 and not
+//! be of small order, else [`WebauthnError::CoseKeyInvalidPoint`]. A stored
+//! key that can never verify would lock its owner out of step-up. See
+//! `curve.rs`.
 
 use ring::signature::{
     RsaPublicKeyComponents, UnparsedPublicKey, ECDSA_P256_SHA256_ASN1, ED25519,
@@ -28,6 +30,7 @@ use ring::signature::{
 };
 
 use crate::cbor::{Kind, Strict};
+use crate::curve;
 use crate::WebauthnError;
 
 const KTY_OKP: i64 = 1;
@@ -244,6 +247,10 @@ pub(crate) fn parse(s: &mut Strict<'_>) -> Result<CoseKey, WebauthnError> {
             }
             let x: [u8; 32] = bytes_of_len(p2)?;
             let y: [u8; 32] = bytes_of_len(p3)?;
+            // SEC1 §3.2.2.1: x, y < p and y² = x³ − 3x + b (mod p).
+            if !curve::p256_point_is_valid(&x, &y) {
+                return Err(WebauthnError::CoseKeyInvalidPoint);
+            }
             let mut point = [0u8; 65];
             point[0] = 0x04;
             point[1..33].copy_from_slice(&x);
@@ -259,7 +266,12 @@ pub(crate) fn parse(s: &mut Strict<'_>) -> Result<CoseKey, WebauthnError> {
             if p3.is_some() {
                 return Err(WebauthnError::CoseKeyMalformed);
             }
-            PublicKey::Ed25519(bytes_of_len(p2)?)
+            let x: [u8; 32] = bytes_of_len(p2)?;
+            // RFC 8032 §5.1.3: the encoding decodes to a point (+ not small order).
+            if !curve::ed25519_point_is_valid(&x) {
+                return Err(WebauthnError::CoseKeyInvalidPoint);
+            }
+            PublicKey::Ed25519(x)
         }
         CoseAlgorithm::Rs256 => {
             let (Some(Param::Bytes(n)), Some(Param::Bytes(e)), None) = (p1, p2, p3) else {

@@ -34,6 +34,7 @@ mod authdata;
 mod cbor;
 mod client_data;
 mod cose;
+mod curve;
 
 #[cfg(feature = "soft-authenticator")]
 pub mod soft;
@@ -153,6 +154,8 @@ pub enum WebauthnError {
     UnsupportedAlgorithm,
     #[error("credential key type does not match its algorithm")]
     CoseKeyTypeMismatch,
+    #[error("credential public key is not a valid curve point")]
+    CoseKeyInvalidPoint,
     #[error("RSA key is shorter than 2048 bits")]
     RsaModulusTooSmall,
     #[error("RSA key is longer than 8192 bits")]
@@ -205,6 +208,7 @@ impl WebauthnError {
             CoseKeyMalformed => "cose_key_malformed",
             UnsupportedAlgorithm => "unsupported_algorithm",
             CoseKeyTypeMismatch => "cose_key_type_mismatch",
+            CoseKeyInvalidPoint => "cose_key_invalid_point",
             RsaModulusTooSmall => "rsa_modulus_too_small",
             RsaModulusTooLarge => "rsa_modulus_too_large",
             RsaExponentInvalid => "rsa_exponent_invalid",

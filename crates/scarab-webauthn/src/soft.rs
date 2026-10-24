@@ -41,6 +41,10 @@ impl SoftAlg {
     }
 }
 
+/// Rewrites public-key components before COSE encoding; see
+/// [`SoftPasskey::tamper_public_key`].
+pub type KeyTamper = fn(&mut Vec<u8>, &mut Vec<u8>);
+
 /// How the signature counter behaves across assertions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Counter {
@@ -121,6 +125,10 @@ pub struct SoftPasskey {
     pub cose_alg_override: Option<i64>,
     /// Assertion: include `userHandle` in the response.
     pub return_user_handle: bool,
+    /// Registration: rewrite the public key's components before they are
+    /// COSE-encoded — EC2 `(x, y)`, OKP `(x, unused)`, RSA `(n, e)`. The
+    /// private key is unchanged.
+    pub tamper_public_key: Option<KeyTamper>,
     rng: SystemRandom,
     cred: Option<Credential>,
 }
@@ -178,6 +186,7 @@ impl SoftPasskey {
             credential_id_len: 16,
             cose_alg_override: None,
             return_user_handle: true,
+            tamper_public_key: None,
             rng: SystemRandom::new(),
             cred: None,
         }
@@ -237,45 +246,49 @@ impl SoftPasskey {
     }
 
     /// The COSE_Key (RFC 9052 §7) for `key`, with `alg` as written.
-    fn cose_key(key: &Key, alg: i64) -> Result<Vec<u8>, SoftError> {
+    fn cose_key(
+        key: &Key,
+        alg: i64,
+        tamper: Option<KeyTamper>,
+    ) -> Result<Vec<u8>, SoftError> {
+        let tamper = |mut a: Vec<u8>, mut b: Vec<u8>| {
+            if let Some(f) = tamper {
+                f(&mut a, &mut b);
+            }
+            (a, b)
+        };
         let enc = |e: minicbor::encode::Error<core::convert::Infallible>| err(format!("cbor: {e}"));
         let mut e = Encoder::new(Vec::new());
         match key {
             Key::Ec(k) => {
                 let pt = k.public_key().as_ref();
+                let (x, y) = tamper(pt[1..33].to_vec(), pt[33..65].to_vec());
                 // kty EC2, alg, crv P-256, x, y.
                 e.map(5).map_err(enc)?;
                 e.i64(1).map_err(enc)?.i64(2).map_err(enc)?;
                 e.i64(3).map_err(enc)?.i64(alg).map_err(enc)?;
                 e.i64(-1).map_err(enc)?.i64(1).map_err(enc)?;
-                e.i64(-2).map_err(enc)?.bytes(&pt[1..33]).map_err(enc)?;
-                e.i64(-3).map_err(enc)?.bytes(&pt[33..65]).map_err(enc)?;
+                e.i64(-2).map_err(enc)?.bytes(&x).map_err(enc)?;
+                e.i64(-3).map_err(enc)?.bytes(&y).map_err(enc)?;
             }
             Key::Ed(k) => {
+                let (x, _) = tamper(k.public_key().as_ref().to_vec(), Vec::new());
                 // kty OKP, alg, crv Ed25519, x.
                 e.map(4).map_err(enc)?;
                 e.i64(1).map_err(enc)?.i64(1).map_err(enc)?;
                 e.i64(3).map_err(enc)?.i64(alg).map_err(enc)?;
                 e.i64(-1).map_err(enc)?.i64(6).map_err(enc)?;
-                e.i64(-2)
-                    .map_err(enc)?
-                    .bytes(k.public_key().as_ref())
-                    .map_err(enc)?;
+                e.i64(-2).map_err(enc)?.bytes(&x).map_err(enc)?;
             }
             Key::Rsa(k) => {
                 use rsa::traits::PublicKeyParts;
+                let (n, pe) = tamper(k.n().to_bytes_be(), k.e().to_bytes_be());
                 // kty RSA, alg, n, e.
                 e.map(4).map_err(enc)?;
                 e.i64(1).map_err(enc)?.i64(3).map_err(enc)?;
                 e.i64(3).map_err(enc)?.i64(alg).map_err(enc)?;
-                e.i64(-1)
-                    .map_err(enc)?
-                    .bytes(&k.n().to_bytes_be())
-                    .map_err(enc)?;
-                e.i64(-2)
-                    .map_err(enc)?
-                    .bytes(&k.e().to_bytes_be())
-                    .map_err(enc)?;
+                e.i64(-1).map_err(enc)?.bytes(&n).map_err(enc)?;
+                e.i64(-2).map_err(enc)?.bytes(&pe).map_err(enc)?;
             }
         }
         Ok(e.into_writer())
@@ -347,7 +360,7 @@ impl SoftPasskey {
             auth_data.extend_from_slice(&len.to_be_bytes());
             auth_data.extend_from_slice(&id);
             let alg = self.cose_alg_override.unwrap_or(self.alg.cose_id());
-            auth_data.extend_from_slice(&Self::cose_key(&key, alg)?);
+            auth_data.extend_from_slice(&Self::cose_key(&key, alg, self.tamper_public_key)?);
         }
 
         let enc = |e: minicbor::encode::Error<core::convert::Infallible>| err(format!("cbor: {e}"));
