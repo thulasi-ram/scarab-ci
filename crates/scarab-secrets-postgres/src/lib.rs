@@ -874,7 +874,9 @@ mod tests {
     #[tokio::test]
     async fn a_seal_opens_only_under_its_aad_and_survives_rotation() {
         let old = sealer(vec![[1u8; 32]]);
-        let sealed = old.seal(b"{\"value\":\"s3cr3t\"}", b"step-up-request:r1").unwrap();
+        let sealed = old
+            .seal(b"{\"value\":\"s3cr3t\"}", b"step-up-request:r1")
+            .unwrap();
         assert_eq!(sealed[0], SEAL_VERSION);
         assert_eq!(
             &sealed[1..1 + FINGERPRINT_LEN],
@@ -888,7 +890,10 @@ mod tests {
             old.open(&sealed, b"step-up-request:r1").unwrap(),
             b"{\"value\":\"s3cr3t\"}"
         );
-        assert!(old.open(&sealed, b"step-up-request:r2").is_err(), "AAD binds");
+        assert!(
+            old.open(&sealed, b"step-up-request:r2").is_err(),
+            "AAD binds"
+        );
         assert!(old.open(&sealed, b"").is_err());
 
         let mut tampered = sealed.clone();

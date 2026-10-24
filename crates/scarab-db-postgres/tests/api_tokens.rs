@@ -131,8 +131,15 @@ async fn a_token_is_found_by_its_row_id_revoked_or_not() {
     let t = token("t-1", Scope::Org("acme".into()), 1_000);
     db.put(&t, &api_token_hash("scarab_pat_one")).await.unwrap();
     assert_eq!(db.by_id("t-1").await.unwrap(), Some(t.clone()));
-    assert_eq!(db.by_id("scarab_pat_one").await.unwrap(), None, "not by plaintext");
-    assert_eq!(db.by_id(&api_token_hash("scarab_pat_one")).await.unwrap(), None);
+    assert_eq!(
+        db.by_id("scarab_pat_one").await.unwrap(),
+        None,
+        "not by plaintext"
+    );
+    assert_eq!(
+        db.by_id(&api_token_hash("scarab_pat_one")).await.unwrap(),
+        None
+    );
 
     assert!(db.revoke("t-1", 2_000).await.unwrap());
     let revoked = db.by_id("t-1").await.unwrap().expect("still found");
