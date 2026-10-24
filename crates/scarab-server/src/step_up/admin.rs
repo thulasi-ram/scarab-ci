@@ -75,6 +75,11 @@ pub(crate) async fn reset_member_passkeys(
     if caller.role_in(&st, &org_scope).await? != Some(Role::Owner) {
         return Err(ApiError::Forbidden);
     }
+    // The live Principal the path names — a merged (folded) id followed to
+    // its target, exactly as the break-glass resolves it — used for every
+    // check and every removal below: bindings, tokens and passkeys live
+    // under it, not under an alias.
+    let subject = live_subject(&st, &subject).await?;
     let rbac = st.rbac.as_ref().ok_or(ApiError::NotFound)?;
     let orgs = rbac.orgs_of(&subject).await.map_err(store_err)?;
     if !orgs.iter().any(|o| o == &org) {
@@ -141,6 +146,25 @@ pub(crate) async fn reset_member_passkeys(
         removed,
         windows_revoked,
     }))
+}
+
+/// `subject` followed through merges to the live Principal
+/// ([`scarab_identity::resolve_principal`]). An id no Principal was ever
+/// minted for (a binding made before anyone signed in) is kept as is; with
+/// no identity store there is nothing to follow. Fails closed: a store
+/// error refuses.
+async fn live_subject(st: &AppState, subject: &str) -> Result<String, ApiError> {
+    let Some(store) = st.identities.as_ref() else {
+        return Ok(subject.to_string());
+    };
+    Ok(scarab_identity::resolve_principal(store.as_ref(), subject)
+        .await
+        .map_err(|e| {
+            ApiError::Unavailable(format!(
+                "could not resolve `{subject}` to its Principal, so nothing was reset: {e}"
+            ))
+        })?
+        .unwrap_or_else(|| subject.to_string()))
 }
 
 /// Is `subject` an install-wide (bootstrap) owner — by id (aliases

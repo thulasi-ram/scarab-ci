@@ -899,7 +899,10 @@ pub(crate) async fn confirm_request(
                     })
                     .unwrap_or_default(),
                 requester,
-                for_human: r.for_human.clone(),
+                // The confirmer: proven (above) to be the request's human
+                // or the live Principal it was merged into — whom a merge
+                // moved the requesting token to.
+                for_human: human.clone(),
                 role_cap: r.session_role_cap,
             };
             let (status, bytes) = replay(&st, authority, &r, body).await;

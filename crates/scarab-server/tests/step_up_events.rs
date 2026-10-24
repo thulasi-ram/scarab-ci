@@ -651,6 +651,155 @@ async fn a_bootstrap_owner_can_reset_an_install_owner() {
     assert!(h.passkey_store.list("root").await.unwrap().is_empty());
 }
 
+/// A login identity on `provider`.
+fn identity(provider: &str, external_id: &str, handle: &str) -> ProviderIdentity {
+    ProviderIdentity {
+        provider: provider.into(),
+        external_id: external_id.into(),
+        handle: handle.into(),
+        email: None,
+        email_verified: false,
+        display_name: None,
+    }
+}
+
+/// On Postgres: `bob` (github) and `bobby` (forgejo) are minted as two
+/// Principals; `bobby` is an Admin of acme and holds an acme API token;
+/// then bob proves the forgejo account and `bobby` is folded into `bob`
+/// (ADR-0069 §6) — the binding and the token move to bob. Returns the
+/// harness (identities, tokens and step-up stores on Postgres) and the
+/// token's plaintext.
+async fn merged_bob(pg: &Arc<PostgresDb>) -> (Harness, String) {
+    let ids = pg.clone();
+    let toks = pg.clone();
+    let h = harness_on(Backend::Pg(pg.clone()), move |st| {
+        st.with_identities(ids as Arc<dyn IdentityStore>)
+            .with_api_tokens(toks as Arc<dyn ApiTokenStore>)
+    });
+    for (provider, ext, handle) in [("github", "b1", "bob"), ("forgejo", "f1", "bobby")] {
+        let id = IdentityStore::sign_in(pg.as_ref(), &identity(provider, ext, handle), handle, T0)
+            .await
+            .unwrap();
+        assert_eq!(id, handle);
+    }
+    h.grant("bobby", Scope::Org("acme".into()), Role::Admin)
+        .await;
+    let plaintext = "scarab_pat_tb_0123456789abcdef0123456789abcdef".to_string();
+    ApiTokenStore::put(
+        pg.as_ref(),
+        &ApiToken {
+            id: "tb".into(),
+            name: "ci".into(),
+            owner_subject: "bobby".into(),
+            scope: Scope::Org("acme".into()),
+            role: Role::Admin,
+            expires_at: T0 + 24 * HOUR,
+            created_by: "bobby".into(),
+            created_at: T0,
+            last_used_at: None,
+            revoked_at: None,
+        },
+        &api_token_hash(&plaintext),
+    )
+    .await
+    .unwrap();
+    (h, plaintext)
+}
+
+async fn fold_bobby_into_bob(pg: &PostgresDb) {
+    let outcome = IdentityStore::link(pg, "bob", &identity("forgejo", "f1", "bobby"), T0)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        scarab_identity::LinkOutcome::Merged {
+            from: "bobby".into()
+        }
+    );
+}
+
+/// git-bug 0314275: an Owner's reset naming a merged (folded) id resets the
+/// live Principal it was folded into — the one whose bindings and passkeys
+/// those are — exactly as the break-glass resolves it. (Before, the path id
+/// was used verbatim: the alias belongs to no Org any more, so 404.)
+#[tokio::test]
+async fn an_owner_s_reset_of_a_merged_id_resets_the_live_principal() {
+    let Some((tdb, pg)) = pg().await else { return };
+    let (h, _) = merged_bob(&pg).await;
+    fold_bobby_into_bob(&pg).await;
+    let (amy, mut soft) = member(&h, "amy", "acme", Role::Owner).await;
+    let bob = h.browser_session(scoped("bob")).await;
+    h.enroll(&bob, &mut passkey(), "bob's key").await;
+
+    let uri = "/v1/orgs/acme/members/bobby/passkeys/reset";
+    let (st, b) = h.cookie("POST", uri, None, &amy).await;
+    assert_step_up(st, &b, "action");
+    h.answer(&amy, &mut soft, &b["challenge"]).await;
+    let (st, done) = h.cookie("POST", uri, None, &amy).await;
+    assert_eq!(st, StatusCode::OK, "{done}");
+    assert_eq!(done["subject"], "bob");
+    assert_eq!(done["removed"], 1);
+    assert!(h.passkey_store.list("bob").await.unwrap().is_empty());
+    let reset = h.events("passkey.reset").await;
+    assert_eq!(reset.len(), 1);
+    assert_eq!(reset[0].subject, "bob");
+    tdb.cleanup().await;
+}
+
+/// git-bug 0314275: a request a token raised for `bobby` before bobby was
+/// folded into bob is bob's to confirm (404 to anyone else) — and it RUNS:
+/// the merge moved the token to bob, and the replay acts for the confirmer.
+#[tokio::test]
+async fn a_request_for_a_merged_id_is_confirmed_by_its_live_principal() {
+    let Some((tdb, pg)) = pg().await else { return };
+    let (h, token) = merged_bob(&pg).await;
+    let (st, b) = h
+        .bearer("POST", "/v1/secrets", Some(secret("acme", "v")), &token)
+        .await;
+    assert_step_up(st, &b, "window");
+    let id = b["request_id"].as_str().expect("a request").to_string();
+    assert_eq!(
+        h.requests.get_request(&id).await.unwrap().unwrap().for_human,
+        "bobby"
+    );
+    fold_bobby_into_bob(&pg).await;
+
+    let (amy, _) = member(&h, "amy", "acme", Role::Owner).await;
+    let (st, _) = h
+        .cookie("GET", &format!("/v1/step-up/requests/{id}"), None, &amy)
+        .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "another Owner learns nothing");
+
+    let bob = h.browser_session(scoped("bob")).await;
+    let mut key = passkey();
+    h.enroll(&bob, &mut key, "bob's key").await;
+    let (st, seen) = h
+        .cookie("GET", &format!("/v1/step-up/requests/{id}"), None, &bob)
+        .await;
+    assert_eq!(st, StatusCode::OK, "{seen}");
+    let (st, ch) = h
+        .cookie(
+            "POST",
+            &format!("/v1/step-up/requests/{id}/options"),
+            None,
+            &bob,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{ch}");
+    let cred = key.assert(&ch["public_key"], ORIGIN).unwrap();
+    let (st, done) = h
+        .cookie(
+            "POST",
+            &format!("/v1/step-up/requests/{id}/confirm"),
+            Some(json!({ "challenge_id": ch["id"], "credential": cred })),
+            &bob,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{done}");
+    assert_eq!(done["state"], "executed", "{done}");
+    tdb.cleanup().await;
+}
+
 /// How the server keys a session's confirmations: the session id's hash.
 fn session_hash(id: &str) -> String {
     api_token_hash(id)
