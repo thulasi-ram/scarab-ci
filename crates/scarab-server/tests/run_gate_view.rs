@@ -38,8 +38,8 @@ use scarab_deployment::{
 };
 use scarab_engine::ports::ExecState;
 use scarab_engine::{
-    retry_step, AttemptOutcome, Clock, Db, DeployContext, RunDeploymentRequest, RunId, RunStatus, Scheduler,
-    StepId, StepRun, StepSpec, StepStatus,
+    retry_step, AttemptOutcome, Clock, Db, DeployContext, RunDeploymentRequest, RunId, RunStatus,
+    Scheduler, StepId, StepRun, StepSpec, StepStatus,
 };
 use scarab_project::{
     EnvironmentDeploymentDeadline, EnvironmentGovernanceStore, EnvironmentProjectEligibility,
@@ -321,7 +321,12 @@ impl World {
         let resp = self
             .app
             .clone()
-            .oneshot(Request::builder().uri("/v1/runs").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/runs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -506,7 +511,10 @@ async fn a_retried_gate_fails_at_its_own_deadline_not_the_deployments(w: World) 
     w.ticks(3).await;
     let gate = w.step("ra", "live").await;
     assert_eq!(gate.status, StepStatus::Pending, "the Retry waits afresh");
-    assert_eq!(gate.attempts.last().unwrap().outcome, AttemptOutcome::Running);
+    assert_eq!(
+        gate.attempts.last().unwrap().outcome,
+        AttemptOutcome::Running
+    );
 
     let live = w.step_dto("ra", "live").await;
     let waiting = &live["deployment_gate"];
@@ -557,7 +565,10 @@ async fn a_running_run_lists_the_gate_it_waits_on(w: World) {
     assert_eq!(w.step("rm", "slow").await.status, StepStatus::Running);
     let gate = w.step("rm", "approve").await;
     assert_eq!(gate.status, StepStatus::Pending);
-    let opened = gate.attempts.last().expect("the reached gate has an Attempt");
+    let opened = gate
+        .attempts
+        .last()
+        .expect("the reached gate has an Attempt");
     assert_eq!(opened.outcome, AttemptOutcome::Running);
     assert_eq!(
         w.db.run_status(&run).await.unwrap(),

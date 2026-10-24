@@ -25,7 +25,8 @@ pub use ports::{
     DeploymentGates, Executor, LogChunks, SnapshotRetention, WorkspaceSnapshots,
 };
 pub use scheduler::{
-    cancel_run_request, deployment_gate_wait, deployment_gate_waits_afresh, deployment_request_first_attempt,
+    cancel_run_request, deployment_gate_wait, deployment_gate_waits_afresh,
+    deployment_request_first_attempt,
     gate_approvers, pin_run_snapshots, plan_rerun, record_gate_approval,
     reject_gate, release_gate, wait_began_at,
     rerun_step, rerun_step_widened, retry_step, retry_step_widened, unpin_run_snapshots,
