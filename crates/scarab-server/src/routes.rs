@@ -1,4 +1,5 @@
-//! The one route list of the main API router (ADR-0073 §2).
+//! The one route list of the main API router (ADR-0073 §3; "The guard" in
+//! its Implementation notes).
 //!
 //! Every route is registered through [`Routes`], which takes the route's
 //! [`Op`] classification as an argument: a GET is [`ops::READ`]; a POST, PUT
