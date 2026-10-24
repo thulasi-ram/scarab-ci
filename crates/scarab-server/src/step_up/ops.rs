@@ -427,7 +427,10 @@ pub static MIGRATION_ACK: Op = op(
 pub static CONNECTION_RESYNC: Op = op(
     "connection.resync",
     "Resync a forge connection",
-    Class::NotGoverned("re-applies what the credential and installation already cover"),
+    // Binds every reported-but-unbound repo through the same store call as
+    // `connection.bind_repo`, so it is governed the same way (else it is a
+    // bulk bypass of that crown jewel).
+    Class::CrownJewel(W),
     "§3 ForgeConnection edits (AMBIG)",
     ADMIN,
     OrgOf::None,
