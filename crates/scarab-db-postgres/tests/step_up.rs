@@ -902,3 +902,41 @@ async fn raise_request_counts_and_inserts_under_the_human_s_lock() {
     assert!(db.get_request("racer").await.unwrap().is_none());
     tdb.cleanup().await;
 }
+
+/// git-bug 6856659: `delete_for_passkey` revokes exactly the standing
+/// step-ups that passkey signed — windows and unconsumed action
+/// confirmations, in every session — and nothing another passkey signed.
+#[tokio::test]
+async fn delete_for_passkey_revokes_only_what_it_signed() {
+    let Some((tdb, db)) = db().await else { return };
+    let mine = |id: &str, session: &str, kind, consumed: bool| {
+        let mut c = confirmation(id, session, kind, Some(&[1; 32]), 10);
+        c.passkey_id = "pk-gone".into();
+        if consumed {
+            c.consumed_at = Some(11);
+        }
+        c
+    };
+    for c in [
+        mine("w1", "s1", ConfirmationKind::Window, false),
+        mine("w2", "s2", ConfirmationKind::Window, false),
+        mine("a1", "s1", ConfirmationKind::Action, false),
+        mine("a2", "s1", ConfirmationKind::Action, true),
+        confirmation("other", "s1", ConfirmationKind::Window, None, 10),
+    ] {
+        db.put_confirmation(&c).await.unwrap();
+    }
+    assert_eq!(db.delete_for_passkey("pk-gone").await.unwrap(), 3);
+    assert_eq!(
+        db.live_window("s1", "amy", 20).await.unwrap().map(|w| w.0),
+        Some("other".to_string())
+    );
+    assert!(db.window_expiry("s2", "amy", 20).await.unwrap().is_none());
+    assert!(db
+        .consume_action("s1", "amy", &[1; 32], 20)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(db.delete_for_passkey("pk-gone").await.unwrap(), 0);
+    tdb.cleanup().await;
+}

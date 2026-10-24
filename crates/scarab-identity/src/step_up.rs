@@ -499,6 +499,12 @@ pub trait StepUpStore: Send + Sync {
     /// reset). Returns how many.
     async fn delete_windows_for(&self, principal: &str) -> Result<u64, IdentityError>;
 
+    /// Delete the standing step-up authority made with passkey `passkey_id`
+    /// — every window and every unconsumed action confirmation it signed,
+    /// in every session (the passkey was removed, or flagged as a suspected
+    /// clone). Returns how many.
+    async fn delete_for_passkey(&self, passkey_id: &str) -> Result<u64, IdentityError>;
+
     /// Record a new request (state `Pending`), uncapped. The server raises
     /// through [`raise_request`](Self::raise_request).
     async fn put_request(&self, request: &StepUpRequest) -> Result<(), IdentityError>;

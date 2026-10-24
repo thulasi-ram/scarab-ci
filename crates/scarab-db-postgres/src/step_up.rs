@@ -599,6 +599,19 @@ impl StepUpStore for PostgresDb {
         .rows_affected())
     }
 
+    async fn delete_for_passkey(&self, passkey_id: &str) -> Result<u64, IdentityError> {
+        Ok(sqlx::query(
+            "DELETE FROM step_up_confirmations
+             WHERE passkey_id = $1
+               AND (kind = 'window' OR (kind = 'action' AND consumed_at IS NULL))",
+        )
+        .bind(passkey_id)
+        .execute(self.pool())
+        .await
+        .map_err(identity_err)?
+        .rows_affected())
+    }
+
     async fn put_request(&self, r: &StepUpRequest) -> Result<(), IdentityError> {
         insert_request(self.pool(), r).await
     }

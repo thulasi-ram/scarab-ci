@@ -267,3 +267,92 @@ async fn a_passkey_is_stored_with_its_label_and_last_use() {
     assert_eq!(enrolled.len(), 1);
     assert_eq!(enrolled[0].detail["first"], true);
 }
+
+/// amy in her browser with two passkeys: `k1` (enrolled first) and `k2`
+/// (a later passkey: always-ask, confirmed with k1). Returns the session,
+/// both authenticators and k1's id.
+async fn amy_with_two_passkeys(
+    h: &Harness,
+) -> (
+    Sess,
+    scarab_webauthn::soft::SoftPasskey,
+    scarab_webauthn::soft::SoftPasskey,
+    String,
+) {
+    let s = h.browser_session(owner("amy")).await;
+    let mut k1 = passkey();
+    let dto = h.enroll(&s, &mut k1, "k1").await;
+    let k1_id = dto["id"].as_str().unwrap().to_string();
+    let add = json!({"label": "k2"});
+    let (st, b) = h
+        .cookie(
+            "POST",
+            "/v1/me/passkeys/registration/options",
+            Some(add.clone()),
+            &s,
+        )
+        .await;
+    assert_step_up(st, &b, "action");
+    h.answer(&s, &mut k1, &b["challenge"]).await;
+    let (st, opts) = h
+        .cookie(
+            "POST",
+            "/v1/me/passkeys/registration/options",
+            Some(add),
+            &s,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{opts}");
+    let mut k2 = passkey();
+    h.finish_enroll(&s, &mut k2, &opts).await;
+    (s, k1, k2, k1_id)
+}
+
+/// git-bug 6856659: removing a passkey revokes the window it opened — a
+/// crown jewel in that session is asked again at once, not for up to 5
+/// minutes more.
+#[tokio::test]
+async fn removing_a_passkey_revokes_the_window_it_opened() {
+    let h = harness();
+    let (s, mut k1, mut k2, k1_id) = amy_with_two_passkeys(&h).await;
+    h.open_window(&s, &mut k1).await;
+    let (st, _) = h.cookie("POST", "/v1/secrets", Some(secret(1)), &s).await;
+    assert_eq!(st, StatusCode::NO_CONTENT, "the window is open");
+
+    let uri = format!("/v1/me/passkeys/{k1_id}");
+    let (st, b) = h.cookie("DELETE", &uri, None, &s).await;
+    assert_step_up(st, &b, "action");
+    h.answer(&s, &mut k2, &b["challenge"]).await;
+    let (st, b) = h.cookie("DELETE", &uri, None, &s).await;
+    assert_eq!(st, StatusCode::NO_CONTENT, "{b}");
+
+    let (st, b) = h.cookie("POST", "/v1/secrets", Some(secret(2)), &s).await;
+    assert_step_up(st, &b, "window");
+    let removed = h.events_of("passkey.removed");
+    assert_eq!(removed[0].detail["confirmations_revoked"], 1);
+}
+
+/// git-bug 6856659: a passkey flagged as a suspected clone loses the window
+/// it opened (and any unconsumed action confirmation): whoever holds the
+/// copy keeps nothing it signed.
+#[tokio::test]
+async fn a_clone_flag_revokes_the_window_the_passkey_opened() {
+    let h = harness();
+    let (s, mut k1, _k2, _) = amy_with_two_passkeys(&h).await;
+    h.open_window(&s, &mut k1).await;
+    let (st, _) = h.cookie("POST", "/v1/secrets", Some(secret(1)), &s).await;
+    assert_eq!(st, StatusCode::NO_CONTENT, "the window is open");
+
+    k1.counter = Counter::Fixed(1);
+    let (_, ch) = h.cookie("POST", "/v1/me/step-up/options", None, &s).await;
+    let (st, b) = h.answer(&s, &mut k1, &ch).await;
+    assert_eq!(
+        (st, b["code"].clone()),
+        (StatusCode::FORBIDDEN, json!("clone_suspected"))
+    );
+
+    let (st, b) = h.cookie("POST", "/v1/secrets", Some(secret(2)), &s).await;
+    assert_step_up(st, &b, "window");
+    let flagged = h.events_of("passkey.clone_suspected");
+    assert_eq!(flagged[0].detail["confirmations_revoked"], 1);
+}

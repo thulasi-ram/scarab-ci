@@ -379,6 +379,17 @@ impl StepUpStore for InMemoryStepUp {
         Ok((before - state.confirmations.len()) as u64)
     }
 
+    async fn delete_for_passkey(&self, passkey_id: &str) -> Result<u64, IdentityError> {
+        let mut state = self.state.lock().unwrap();
+        let before = state.confirmations.len();
+        state.confirmations.retain(|c| {
+            !(c.passkey_id == passkey_id
+                && (c.kind == ConfirmationKind::Window
+                    || (c.kind == ConfirmationKind::Action && c.consumed_at.is_none())))
+        });
+        Ok((before - state.confirmations.len()) as u64)
+    }
+
     async fn put_request(&self, request: &StepUpRequest) -> Result<(), IdentityError> {
         let mut state = self.state.lock().unwrap();
         if state.requests.contains_key(&request.id) {

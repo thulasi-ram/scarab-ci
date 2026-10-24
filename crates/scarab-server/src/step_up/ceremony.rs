@@ -473,6 +473,13 @@ pub(crate) async fn remove_passkey(
     {
         return Err(ApiError::NotFound);
     }
+    // Every step-up it signed goes with it: a removed passkey leaves no
+    // window or unconsumed action confirmation standing.
+    let revoked = svc
+        .confirmations
+        .delete_for_passkey(&id)
+        .await
+        .map_err(store_err)?;
     let now = st.clock.now().await.0;
     let mut ev = event(
         kind::PASSKEY_REMOVED,
@@ -483,6 +490,7 @@ pub(crate) async fn remove_passkey(
     );
     ev.passkey_id = Some(id);
     ev.session_hash = caller.session.as_ref().map(|s| s.id_hash.clone());
+    ev.detail = serde_json::json!({ "confirmations_revoked": revoked });
     // Linked to the always-ask confirmation (or, replayed, the request)
     // that authorised it.
     ev.confirmation_id = ctx.and_then(|Extension(c)| c.confirmation_id());
@@ -721,8 +729,10 @@ pub(crate) async fn verify_assertion(
                 .mark_clone(&passkey.id, now)
                 .await
                 .map_err(store_err)?;
+            let revoked = revoke_for_clone(svc, &passkey.id).await?;
             svc.record(clone_event(serde_json::json!({
                 "stored_count": passkey.sign_count,
+                "confirmations_revoked": revoked,
             })))
             .await;
             return Err(clone_refused());
@@ -739,9 +749,11 @@ pub(crate) async fn verify_assertion(
     {
         PasskeyUse::Recorded => {}
         PasskeyUse::CloneSuspected => {
+            let revoked = revoke_for_clone(svc, &passkey.id).await?;
             svc.record(clone_event(serde_json::json!({
                 "stored_count": passkey.sign_count,
                 "presented_count": ok.new_count,
+                "confirmations_revoked": revoked,
             })))
             .await;
             return Err(clone_refused());
@@ -749,6 +761,15 @@ pub(crate) async fn verify_assertion(
         PasskeyUse::NotFound => return Err(unknown()),
     }
     Ok(passkey)
+}
+
+/// A passkey flagged as a suspected clone: every step-up it signed is
+/// revoked — whoever holds the copy must not keep a window it opened.
+async fn revoke_for_clone(svc: &StepUpService, passkey_id: &str) -> Result<u64, ApiError> {
+    svc.confirmations
+        .delete_for_passkey(passkey_id)
+        .await
+        .map_err(store_err)
 }
 
 impl IntoResponse for super::StepUpRefusal {
