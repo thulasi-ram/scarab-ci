@@ -841,6 +841,7 @@ pub(crate) async fn install_plugin(
     Json(body): Json<InstallPluginRequest>,
 ) -> Result<(StatusCode, Json<PluginInstallationDto>), ApiError> {
     let approved_by = org_admin(&st, &headers, &org).await?;
+    super::refuse_reserved_org(&org, "have a plugin installed")?;
     let store = store(&st)?;
     if !st.plugin_policy.enabled {
         return Err(ApiError::Conflict(

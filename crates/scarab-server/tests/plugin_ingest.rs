@@ -516,6 +516,38 @@ async fn only_a_first_party_plugin_pinned_by_digest_installs() {
     tdb.cleanup().await;
 }
 
+/// git-bug 97223c7: no plugin is installed into a `_`-prefixed org —
+/// those are Scarab's own credential scopes, not Orgs.
+#[tokio::test]
+async fn a_plugin_is_not_installed_into_a_reserved_org() {
+    let Some((tdb, pg)) = migrated().await else {
+        return;
+    };
+    let apps = apps(pg);
+    for org in ["_plugin_connections", "_forge"] {
+        let (status, body) = call(
+            &apps.public,
+            "POST",
+            &format!("/v1/orgs/{org}/plugins"),
+            None,
+            Some(json!({ "name": "argocd", "plugin": "argocd", "image": image() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{org}: {body}");
+        assert!(body.to_string().contains("reserved"), "{body}");
+        let (_, list) = call(
+            &apps.public,
+            "GET",
+            &format!("/v1/orgs/{org}/plugins"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(list, json!([]), "{org}");
+    }
+    tdb.cleanup().await;
+}
+
 /// F1 (c-min audit): an Environment source must name an installation in the
 /// same org; an uninstall takes its sources and retires its name.
 #[tokio::test]

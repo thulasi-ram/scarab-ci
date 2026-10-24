@@ -8133,6 +8133,7 @@ async fn put_secret(
 ) -> Result<StatusCode, ApiError> {
     let scope = rbac_scope(&req.org, req.repo.as_deref());
     authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
+    refuse_reserved_secret_org(&req.org)?;
     let secrets = st.secrets.as_ref().ok_or(ApiError::NotFound)?;
     if req.name.is_empty() {
         return Err(ApiError::BadRequest("name is required".into()));
@@ -8172,6 +8173,7 @@ async fn list_secrets(
 ) -> Result<Json<SecretListResponse>, ApiError> {
     let rscope = rbac_scope(&q.org, q.repo.as_deref());
     authorize_scoped(&st, &headers, Action::Administer, Some(&rscope)).await?;
+    refuse_reserved_secret_org(&q.org)?;
     let secrets = st.secrets.as_ref().ok_or(ApiError::NotFound)?;
     let scope = secret_scope(q.org, q.repo, q.environment)?;
     let names = secrets.list_scoped(&scope).await.map_err(secret_err)?;
@@ -8200,6 +8202,7 @@ async fn delete_secret(
 ) -> Result<StatusCode, ApiError> {
     let rscope = rbac_scope(&q.org, q.repo.as_deref());
     authorize_scoped(&st, &headers, Action::Administer, Some(&rscope)).await?;
+    refuse_reserved_secret_org(&q.org)?;
     let secrets = st.secrets.as_ref().ok_or(ApiError::NotFound)?;
     let name = q
         .name
@@ -9095,6 +9098,38 @@ pub struct ResyncResultDto {
 /// within this scope; the material (GitHub App PEM / Forgejo token) is fetched
 /// here at use-time and never persisted on the connection.
 pub const FORGE_CREDENTIALS_ORG: &str = "_forge";
+
+/// Org names Scarab keeps for itself: every `_`-prefixed name. Its own
+/// credential scopes live there — [`FORGE_CREDENTIALS_ORG`] and
+/// [`plugins::PLUGIN_CONNECTION_CREDENTIALS_ORG`] — so no Project is homed in
+/// one (it would inherit those secrets), no plugin is installed into one, and
+/// `/v1/secrets` reaches only `_forge` among them (git-bug 97223c7).
+pub fn is_reserved_org(org: &str) -> bool {
+    org.starts_with('_')
+}
+
+/// `400` when `org` is reserved ([`is_reserved_org`]); `use_` names what it
+/// was refused for.
+pub(crate) fn refuse_reserved_org(org: &str, use_: &str) -> Result<(), ApiError> {
+    if is_reserved_org(org) {
+        return Err(ApiError::BadRequest(format!(
+            "`{org}` is a reserved org name (`_`-prefixed names are Scarab's own): \
+             it cannot {use_}"
+        )));
+    }
+    Ok(())
+}
+
+/// The orgs `/v1/secrets` may address: every real one and, of the reserved
+/// ones, only [`FORGE_CREDENTIALS_ORG`] — the forge App key is documented to
+/// be written there through this endpoint. Plugin connection credentials
+/// have their own API.
+fn refuse_reserved_secret_org(org: &str) -> Result<(), ApiError> {
+    if org == FORGE_CREDENTIALS_ORG {
+        return Ok(());
+    }
+    refuse_reserved_org(org, "hold secrets written through /v1/secrets")
+}
 
 /// The gate every `/v1/connections*` endpoint shares: `Administer` on the Org.
 ///
@@ -9992,6 +10027,7 @@ async fn bind_repo(
     if repo.owner.is_empty() || repo.name.is_empty() {
         return Err(ApiError::BadRequest("owner and name are required".into()));
     }
+    refuse_reserved_org(&repo.owner, "own a bound repo")?;
 
     // `bind_repo` upserts, so re-binding a repo owned by ANOTHER connection would
     // silently re-home a live Project onto a different forge account. A v1

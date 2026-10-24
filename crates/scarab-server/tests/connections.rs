@@ -1357,6 +1357,41 @@ async fn unbinding_removes_the_project() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+/// git-bug 97223c7: `_`-prefixed orgs are Scarab's own credential scopes. A
+/// repo whose owner is one would home a Project there and inherit those
+/// secrets, so binding it is refused and nothing is bound.
+#[tokio::test]
+async fn binding_a_repo_owned_by_a_reserved_org_is_refused() {
+    let h = harness(
+        &[],
+        Arc::new(FakeForge::new().with_accessible_repos(&[("_forge", "web")])),
+        true,
+    )
+    .await;
+    let root = login(&h.app, "root-code").await;
+    let (id, _) = add_forgejo(&h, &root, "https://git.acme.test").await;
+    for owner in ["_forge", "_plugin_connections", " _anything"] {
+        let resp = bind(
+            &h,
+            &root,
+            &id,
+            serde_json::json!({ "owner": owner, "name": "web" }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{owner}");
+        assert!(body_bytes(resp).await.contains("reserved"), "{owner}");
+    }
+    let repos = body_bytes(
+        h.app
+            .clone()
+            .oneshot(authed("GET", "/v1/repos", &root))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(!repos.contains("\"project\":\"web\""), "{repos}");
+}
+
 /// A hook the forge refuses does NOT undo the binding — and the failure is
 /// reported, not swallowed. Rolling back would delete a Project an admin just
 /// asked for because a remote system was briefly unreachable; hiding the error

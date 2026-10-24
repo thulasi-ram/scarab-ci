@@ -120,3 +120,54 @@ async fn secrets_disabled_without_a_provider_is_404() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+/// git-bug 97223c7: `_plugin_connections` is Scarab's own scope for plugin
+/// connection credentials, which have their own API — `/v1/secrets` neither
+/// writes, lists nor deletes there. `_forge` stays reachable: the forge App
+/// key is documented to be written through this endpoint.
+#[tokio::test]
+async fn the_plugin_connection_scope_is_not_reachable_through_the_secrets_api() {
+    let secrets = Arc::new(FakeSecrets::new());
+    let app = router(state(Some(secrets.clone())));
+    let send = |req: Request<Body>| {
+        let app = app.clone();
+        async move { app.oneshot(req).await.unwrap() }
+    };
+    let get = |uri: &str, method: &str| {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    let resp = send(put(
+        r#"{"org":"_plugin_connections","name":"pc-1","value":"hijack"}"#,
+    ))
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        body_string(resp).await.contains("reserved"),
+        "the refusal says why"
+    );
+    let resp = send(get("/v1/secrets?org=_plugin_connections", "GET")).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let resp = send(get(
+        "/v1/secrets?org=_plugin_connections&name=pc-1",
+        "DELETE",
+    ))
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let resp = send(put(
+        r#"{"org":"_plugin_connections","repo":"x","name":"pc-1","value":"v"}"#,
+    ))
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "nor under it");
+
+    // The documented `_forge` path still works.
+    let resp = send(put(r#"{"org":"_forge","name":"github-app","value":"pem"}"#)).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let resp = send(get("/v1/secrets?org=_forge", "GET")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(body_string(resp).await.contains("github-app"));
+}
