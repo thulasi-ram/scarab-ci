@@ -43,6 +43,7 @@
 //! | `SCARAB_MASTER_KEYS` | env | comma-separated base64 32-byte KEKs for envelope encryption; **first = active writer**, the rest decrypt-only (rotation, git-bug f37463a). Authoritative when set |
 //! | `SCARAB_MASTER_KEY` | env | legacy single KEK ≡ a one-key list (ADR-0014) — one of the two is **required** unless `SCARAB_DEV_INSECURE=1`. When both are set the list wins; a legacy key that is not a list member refuses to boot |
 //! | `SCARAB_DEV_INSECURE` | env | `1`/`true`: downgrade the **security** hard-fails (KEK, auth) to loud boot warnings — dev only, never relaxes the Postgres requirement |
+//! | `SCARAB_STEP_UP` | env | step-up confirmation (ADR-0073). Unset/blank or `enforce` = **enforce** (production: crown-jewel operations need a passkey confirmation); any other value refuses boot — there is no `off` or `log` mode. Under `SCARAB_DEV_INSECURE=1` it is off unless explicitly `enforce` (local passkey testing). Enforce with OAuth login needs an `https` (or loopback) `SCARAB_PUBLIC_URL` |
 //! | `SCARAB_STEP_TIMEOUT_SECS` | env | global default step deadline (ADR-0047); default 3600 (1h), per-step overridable via `timeout:` |
 //! | `SCARAB_PUBLIC_URL` | env | Scarab's public base URL — the run deep-link every forge status carries (ADR-0046); default `http://localhost:8080` (dev) |
 //! | `SCARAB_CLONE_IMAGE` | env | the canonical scarab-clone image a `clone` step runs (ADR-0045); default `ghcr.io/thulasi-ram/scarab-clone:edge` — digest-pin in production |
@@ -571,6 +572,46 @@ pub struct Config {
     pub connections: Vec<ConnectionSpec>,
     /// The plugin runtime and its CredentialBroker (ADR-0072).
     pub plugins: PluginsConfig,
+    /// Step-up confirmation (ADR-0073, `SCARAB_STEP_UP`).
+    pub step_up: StepUpMode,
+}
+
+/// Whether crown-jewel operations need a passkey StepUpConfirmation
+/// (ADR-0073 §8). There is no `log` mode and no production `off`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepUpMode {
+    /// Production, and the default.
+    Enforce,
+    /// Only under `SCARAB_DEV_INSECURE`.
+    Off,
+}
+
+impl StepUpMode {
+    /// Resolve `SCARAB_STEP_UP`. Unset, blank or `enforce` is
+    /// [`Enforce`](StepUpMode::Enforce); any other value refuses the boot,
+    /// unless `dev_insecure`, which means off unless the value is
+    /// explicitly `enforce`.
+    pub fn resolve(raw: Option<&str>, dev_insecure: bool) -> Result<Self, ConfigError> {
+        let raw = raw.map(str::trim).filter(|v| !v.is_empty());
+        let enforce = raw.is_some_and(|v| v.eq_ignore_ascii_case("enforce"));
+        match (dev_insecure, raw) {
+            (true, _) if enforce => Ok(StepUpMode::Enforce),
+            (true, _) => Ok(StepUpMode::Off),
+            (false, None) => Ok(StepUpMode::Enforce),
+            (false, Some(_)) if enforce => Ok(StepUpMode::Enforce),
+            (false, Some(other)) => Err(ConfigError::InvalidStepUpMode(other.to_string())),
+        }
+    }
+}
+
+/// Is `public_url` acceptable as the WebAuthn relying party when step-up is
+/// enforced: `https`, or plain `http` only on a loopback host.
+fn step_up_public_url_ok(public_url: &str) -> bool {
+    let Ok(rp) = scarab_webauthn::RelyingParty::from_public_url(public_url, "Scarab") else {
+        return false;
+    };
+    rp.origin().starts_with("https://")
+        || matches!(rp.rp_id(), "localhost" | "127.0.0.1" | "::1")
 }
 
 /// The broker listener's default address (ADR-0072 §11).
@@ -1101,6 +1142,20 @@ pub enum ConfigError {
     InvalidOAuthProviders(String),
 
     #[error(
+        "SCARAB_STEP_UP=`{0}` is not a mode (ADR-0073). Step-up confirmation is always \
+         enforced in production: unset it, or set it to `enforce`. There is no `off` or \
+         `log` mode — only SCARAB_DEV_INSECURE=1 (dev only) turns it off."
+    )]
+    InvalidStepUpMode(String),
+
+    #[error(
+        "step-up is enforced (ADR-0073) but SCARAB_PUBLIC_URL `{0}` cannot be a WebAuthn \
+         relying party: passkeys need an https origin (plain http only on localhost / \
+         127.0.0.1 / ::1). Set SCARAB_PUBLIC_URL to the https URL browsers reach Scarab at."
+    )]
+    StepUpNeedsHttpsPublicUrl(String),
+
+    #[error(
         "SCARAB_RETENTION_LOG_DAYS is set but invalid — want a positive integer number \
          of days (terminal runs' log TTL, ADR-0050)."
     )]
@@ -1503,6 +1558,23 @@ impl Config {
 
         let plugins = PluginsConfig::resolve(&env, dev_insecure, &cli.addr, &cli.namespace)?;
 
+        let public_url = env("SCARAB_PUBLIC_URL")
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "http://localhost:8080".into());
+        // Step-up (ADR-0073 §8): enforce unless the dev escape hatch says
+        // otherwise; a typo or an `off` refuses the boot.
+        let step_up = StepUpMode::resolve(env("SCARAB_STEP_UP").as_deref(), dev_insecure)?;
+        // Passkeys are bound to the public URL's origin: with login wired,
+        // an origin browsers will not run WebAuthn on would make every
+        // crown jewel unconfirmable.
+        if step_up == StepUpMode::Enforce
+            && !oauth.is_empty()
+            && !matches!(cli.role, Role::Workspace)
+            && !step_up_public_url_ok(&public_url)
+        {
+            return Err(ConfigError::StepUpNeedsHttpsPublicUrl(public_url));
+        }
+
         Ok(Config {
             role: cli.role,
             addr: cli.addr.clone(),
@@ -1520,9 +1592,7 @@ impl Config {
             master_key_warnings,
             dev_insecure,
             step_timeout_secs,
-            public_url: env("SCARAB_PUBLIC_URL")
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| "http://localhost:8080".into()),
+            public_url,
             github_app_id: env("SCARAB_GITHUB_APP_ID").filter(|v| !v.is_empty()),
             github_app_pem: env("SCARAB_GITHUB_APP_PEM").filter(|v| !v.is_empty()),
             github_app_pem_file: env("SCARAB_GITHUB_APP_PEM_FILE").filter(|v| !v.is_empty()),
@@ -1565,6 +1635,7 @@ impl Config {
             cas_concurrency,
             connections,
             plugins,
+            step_up,
         })
     }
 
@@ -1588,6 +1659,23 @@ impl Config {
                     .to_string(),
             );
         }
+        if self.dev_insecure && self.step_up == StepUpMode::Off {
+            warnings.push(
+                "⚠ STEP-UP OFF — crown-jewel operations need no passkey confirmation \
+                 (SCARAB_DEV_INSECURE=1, dev only; SCARAB_STEP_UP=enforce opts back in)"
+                    .to_string(),
+            );
+        }
+        if self.step_up == StepUpMode::Enforce
+            && self.oauth.is_empty()
+            && !matches!(self.role, Role::Workspace)
+        {
+            warnings.push(
+                "⚠ STEP-UP INACTIVE — SCARAB_STEP_UP=enforce but no login is configured, so \
+                 there is no human to confirm anything (SCARAB_DEV_INSECURE=1, dev only)"
+                    .to_string(),
+            );
+        }
         if self.dev_insecure {
             warnings.push(
                 "⚠ AUTH DISABLED — no authenticator; ALL callers are treated as Owner \
@@ -1603,6 +1691,29 @@ impl Config {
             }
         }
         warnings
+    }
+
+    /// The startup report's step-up line (ADR-0073 §8).
+    pub fn step_up_report(&self) -> String {
+        match (self.role, self.step_up) {
+            (Role::Workspace, _) => "step-up: n/a (workspace role)".to_string(),
+            (_, StepUpMode::Off) => "step-up: OFF — SCARAB_DEV_INSECURE".to_string(),
+            (_, StepUpMode::Enforce) if self.oauth.is_empty() => {
+                "step-up: INACTIVE — SCARAB_STEP_UP=enforce but no login is configured \
+                 (SCARAB_DEV_INSECURE)"
+                    .to_string()
+            }
+            (_, StepUpMode::Enforce) => {
+                match scarab_webauthn::RelyingParty::from_public_url(&self.public_url, "Scarab") {
+                    Ok(rp) => format!(
+                        "step-up: enforced (ADR-0073; rpId={}, origin={})",
+                        rp.rp_id(),
+                        rp.origin()
+                    ),
+                    Err(e) => format!("step-up: enforced (ADR-0073; {e})"),
+                }
+            }
+        }
     }
 
     /// The startup report (ADR-0048): one line per subsystem, enabled/disabled,
@@ -1659,6 +1770,7 @@ impl Config {
                 self.step_timeout_secs,
             ),
             format!("public url: {} (run deep-links, ADR-0046)", self.public_url),
+            self.step_up_report(),
             format!("clone image: {} (ADR-0045)", self.clone_image),
             format!(
                 "forge: registry-routed; github auth {} (ADR-0046)",
@@ -3066,6 +3178,132 @@ connections:
                 .to_string();
             assert!(err.contains(needle), "want `{needle}` in: {err}");
         }
+    }
+
+    /// A production env: OAuth login + a master key, no dev escape hatch,
+    /// plus `extra` (which wins).
+    fn prod_env(extra: Vec<(&'static str, String)>) -> impl Fn(&str) -> Option<String> {
+        move |k: &str| {
+            if let Some((_, v)) = extra.iter().find(|(key, _)| *key == k) {
+                return Some(v.clone());
+            }
+            Some(
+                match k {
+                    "SCARAB_MASTER_KEY" => key_b64(),
+                    "SCARAB_OAUTH_CLIENT_ID" => "cid".into(),
+                    "SCARAB_OAUTH_CLIENT_SECRET" => "sekret".into(),
+                    "SCARAB_OAUTH_AUTHORIZE_URL" => "https://idp.example/authorize".into(),
+                    "SCARAB_OAUTH_TOKEN_URL" => "https://idp.example/token".into(),
+                    "SCARAB_OAUTH_USERINFO_URL" => "https://idp.example/userinfo".into(),
+                    "SCARAB_PUBLIC_URL" => "https://ci.example.com".into(),
+                    _ => return None,
+                }
+                .to_string(),
+            )
+        }
+    }
+
+    /// ADR-0073 §8: production is `enforce`; there is no other mode.
+    #[test]
+    fn step_up_is_enforced_unless_dev_insecure_and_nothing_else_boots() {
+        let cli = cli(Some("postgres://l/scarab"));
+        let resolve = |extra| Config::resolve_from(&cli, prod_env(extra));
+
+        let unset = resolve(vec![]).expect("a production config boots");
+        assert_eq!(unset.step_up, StepUpMode::Enforce, "unset = enforce");
+        assert_eq!(
+            resolve(vec![("SCARAB_STEP_UP", "  ".into())]).unwrap().step_up,
+            StepUpMode::Enforce,
+            "blank = enforce"
+        );
+        assert_eq!(
+            resolve(vec![("SCARAB_STEP_UP", "enforce".into())])
+                .unwrap()
+                .step_up,
+            StepUpMode::Enforce
+        );
+        for bad in ["off", "log", "false", "0", "enforced"] {
+            assert_eq!(
+                resolve(vec![("SCARAB_STEP_UP", bad.into())]).unwrap_err(),
+                ConfigError::InvalidStepUpMode(bad.into()),
+                "{bad}"
+            );
+        }
+        let msg = ConfigError::InvalidStepUpMode("off".into()).to_string();
+        assert!(msg.contains("no `off` or `log` mode"), "{msg}");
+
+        // The dev escape hatch implies off — with an explicit opt back in.
+        let dev = |v: Option<&str>| StepUpMode::resolve(v, true).unwrap();
+        assert_eq!(dev(None), StepUpMode::Off);
+        assert_eq!(dev(Some("off")), StepUpMode::Off);
+        assert_eq!(dev(Some("log")), StepUpMode::Off);
+        assert_eq!(dev(Some("enforce")), StepUpMode::Enforce);
+        let devcfg = Config::resolve_from(&cli, dev_env(&[])).unwrap();
+        assert_eq!(devcfg.step_up, StepUpMode::Off);
+        assert!(devcfg
+            .startup_report()
+            .contains(&"step-up: OFF — SCARAB_DEV_INSECURE".to_string()));
+        assert!(devcfg
+            .boot_warnings()
+            .iter()
+            .any(|w| w.contains("STEP-UP OFF")));
+    }
+
+    /// Passkeys are bound to the public URL's origin, which must be https —
+    /// or plain http on a loopback host (a dev box opting in).
+    #[test]
+    fn enforced_step_up_needs_an_https_or_loopback_public_url() {
+        let cli = cli(Some("postgres://l/scarab"));
+        let with_url = |url: &str| {
+            Config::resolve_from(&cli, prod_env(vec![("SCARAB_PUBLIC_URL", url.to_string())]))
+        };
+        assert_eq!(
+            with_url("http://ci.example.com").unwrap_err(),
+            ConfigError::StepUpNeedsHttpsPublicUrl("http://ci.example.com".into())
+        );
+        assert!(matches!(
+            with_url("ftp://ci.example.com").unwrap_err(),
+            ConfigError::StepUpNeedsHttpsPublicUrl(_)
+        ));
+        for ok in [
+            "https://ci.example.com",
+            "https://ci.example.com:8443/scarab",
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+            "http://[::1]:8080",
+        ] {
+            assert!(with_url(ok).is_ok(), "{ok}");
+        }
+        let cfg = with_url("https://ci.example.com:8443").unwrap();
+        assert!(
+            cfg.startup_report().contains(
+                &"step-up: enforced (ADR-0073; rpId=ci.example.com, origin=https://ci.example.com:8443)"
+                    .to_string()
+            ),
+            "{:?}",
+            cfg.startup_report()
+        );
+        assert!(!cfg.boot_warnings().iter().any(|w| w.contains("STEP-UP")));
+    }
+
+    /// Without OAuth and without the dev escape hatch there is no boot at all
+    /// (ADR-0048 auth default-deny), so production never reaches the
+    /// dev-insecure synthetic Owner with step-up silently unwired.
+    #[test]
+    fn no_login_means_no_production_boot_so_step_up_cannot_be_bypassed_that_way() {
+        let cli = cli(Some("postgres://l/scarab"));
+        let env = |k: &str| (k == "SCARAB_MASTER_KEY").then(key_b64);
+        assert_eq!(
+            Config::resolve_from(&cli, env).unwrap_err(),
+            ConfigError::NoAuthenticator
+        );
+        // A dev box that asked for enforce without login is told it is inert.
+        let cfg = Config::resolve_from(&cli, dev_env(&[("SCARAB_STEP_UP", "enforce")])).unwrap();
+        assert_eq!(cfg.step_up, StepUpMode::Enforce);
+        assert!(cfg
+            .boot_warnings()
+            .iter()
+            .any(|w| w.contains("STEP-UP INACTIVE")));
     }
 
     #[test]

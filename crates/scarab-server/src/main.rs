@@ -19,7 +19,7 @@ use scarab_db_postgres::PostgresDb;
 use scarab_engine::{Clock, Db, Executor};
 use scarab_executor_k8s::{K8sExecutor, PlacementConfig, ResultsEgress, WorkspaceFetch};
 use scarab_executor_local::LocalExecutor;
-use scarab_server::config::{Cli, Config, ExecutorKind, Role, StoreConfig};
+use scarab_server::config::{Cli, Config, ExecutorKind, Role, StepUpMode, StoreConfig};
 use scarab_server::{
     converged, router, AppState, LogService, SecretInjectingExecutor, SystemClock,
 };
@@ -329,7 +329,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             scarab_secrets_postgres::MasterKeySet::single(key)
         }
     };
-    let secrets: Arc<dyn scarab_secrets::SecretProvider> = {
+    // Kept concrete as well: the same KEK envelope seals pending step-up
+    // requests and derives the step-up digest key (ADR-0073 §5).
+    let pg_secrets: Arc<scarab_secrets_postgres::PostgresSecrets> = {
         let s = scarab_secrets_postgres::PostgresSecrets::connect(&database_url, master_keys)
             .await?;
         s.migrate().await?;
@@ -357,6 +359,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Arc::new(s)
     };
+    let secrets: Arc<dyn scarab_secrets::SecretProvider> = pg_secrets.clone();
 
     // Retention sweeper (ADR-0050): leader-gated, prunes terminal runs' log
     // blobs + index past the class TTL. Non-terminal (incl. gate-suspended)
@@ -890,6 +893,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_api_tokens(pg.clone());
         tracing::info!(
             "authn: OAuth/OIDC login + PG sessions + scoped RBAC + issued API tokens wired (ADR-0049)"
+        );
+        // Step-up confirmation (ADR-0073): with a human to confirm (login
+        // wired) and the mode enforce, every crown jewel needs a passkey.
+        if config.step_up == StepUpMode::Enforce {
+            let rp = scarab_webauthn::RelyingParty::from_public_url(&config.public_url, "Scarab")
+                .map_err(|e| format!("SCARAB_PUBLIC_URL: {e}"))?;
+            state = state.with_step_up(scarab_server::step_up::StepUpService::new(
+                pg.clone(),
+                pg.clone(),
+                pg.clone(),
+                pg.clone(),
+                pg_secrets.clone(),
+                rp,
+            ));
+            // "step-up enforced; N admins have no passkey" (ADR-0073 §8):
+            // every Admin/Owner binding holder plus the bootstrap owners,
+            // minus those holding a usable passkey.
+            let mut admins = pg.admin_subjects().await.unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "step-up: could not list admins for the boot count");
+                Default::default()
+            });
+            for provider in &config.oauth {
+                admins.extend(provider.owners.iter().cloned());
+            }
+            let admins: Vec<String> = admins.into_iter().collect();
+            let with_passkey = scarab_identity::PasskeyStore::principals_with_passkeys(
+                pg.as_ref(),
+                &admins,
+            )
+            .await
+            .unwrap_or_default();
+            let without = admins.iter().filter(|a| !with_passkey.contains(*a)).count();
+            let line = format!("step-up enforced; {without} admins have no passkey");
+            tracing::info!("startup: {line}");
+            println!("startup: {line}");
+        }
+    }
+    // Fail-closed composition (ADR-0073 §8): outside the dev escape hatch,
+    // login wired means step-up wired. Config already refuses every other
+    // mode; this catches a future wiring slip.
+    debug_assert!(
+        config.dev_insecure || config.oauth.is_empty() || state.step_up.is_enforced(),
+        "OAuth login is wired without step-up outside SCARAB_DEV_INSECURE"
+    );
+    if config.step_up == StepUpMode::Enforce && !state.step_up.is_enforced() {
+        tracing::warn!(
+            "step-up: SCARAB_STEP_UP=enforce but no login is configured; nothing is enforced"
         );
     }
     // OIDC issuer for keyless federation (ADR-0014): serve JWKS + discovery so a
