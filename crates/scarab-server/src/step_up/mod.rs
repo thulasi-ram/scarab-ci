@@ -47,6 +47,12 @@ use crate::{ApiError, AppState, Caller};
 /// credential cannot be brute-forced from the database.
 pub const DIGEST_KEY_LABEL: &str = "scarab-step-up-digest/v1";
 
+/// The label the identity-link binding key is derived under: a link flow's
+/// state cookie carries `HMAC(K_link, state, session_hash)`, which only the
+/// guarded `POST /v1/me/identities/link` can mint (the cookie is unsigned, so
+/// a bare session hash would let any cookie holder forge a link flow).
+pub const LINK_KEY_LABEL: &str = "scarab-identity-link/v1";
+
 /// Where a refusal with no passkey sends the human.
 pub const ENROLL_URL: &str = "/account/security?enroll=1";
 
@@ -84,6 +90,7 @@ pub struct StepUpService {
     /// Seals a StepUpConfirmationRequest's body at rest (ADR-0073 C5).
     pub sealer: Arc<dyn Sealer>,
     digest_key: [u8; 32],
+    link_key: [u8; 32],
     rp: RelyingParty,
 }
 
@@ -97,6 +104,7 @@ impl StepUpService {
         rp: RelyingParty,
     ) -> Self {
         let digest_key = sealer.derive_key(DIGEST_KEY_LABEL);
+        let link_key = sealer.derive_key(LINK_KEY_LABEL);
         Self {
             passkeys,
             challenges,
@@ -104,6 +112,7 @@ impl StepUpService {
             events,
             sealer,
             digest_key,
+            link_key,
             rp,
         }
     }
@@ -119,6 +128,25 @@ impl StepUpService {
             .expect("HMAC accepts any key length");
         mac.update(canonical);
         mac.finalize().into_bytes().into()
+    }
+
+    /// The link component of an identity-link flow's state cookie: hex
+    /// `HMAC-SHA256(K_link, len(state)‖state‖len(session_hash)‖session_hash)`
+    /// (u32 big-endian lengths). Bound to the server key, the flow's `state`
+    /// and the session, so it can be minted only by the guarded link POST
+    /// and cannot be moved to another flow or session.
+    pub(crate) fn link_binding(&self, state: &str, session_hash: &str) -> String {
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.link_key)
+            .expect("HMAC accepts any key length");
+        for part in [state, session_hash] {
+            mac.update(&(part.len() as u32).to_be_bytes());
+            mac.update(part.as_bytes());
+        }
+        mac.finalize()
+            .into_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
     }
 
     /// The principal's passkeys that may still be used (not flagged as
@@ -179,6 +207,11 @@ impl StepUpService {
             tracing::error!(error = %e, kind = %event.kind, "OrgSecurityEventLog append failed");
         }
     }
+}
+
+/// Constant-time equality of two byte strings (the length is not secret).
+pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// The challenge that was actually sent for a stored challenge row, or
