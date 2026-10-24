@@ -370,6 +370,23 @@ impl AttemptOutcome {
     }
 }
 
+/// What a won step transition stamps on one of the step's Attempts, in the
+/// SAME commit as the CAS and its events ([`Db::commit_step_transition`],
+/// git-bug 586187a). Both keep the terminal-by-intent guard of the
+/// standalone writes: a `Superseded`/`Cancelled` outcome is never
+/// overwritten.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttemptStamp {
+    /// As [`Db::set_attempt_outcome`].
+    Outcome(AttemptOutcome),
+    /// As [`Db::set_attempt_failure`]: the classification, its cause, and
+    /// the `Failed` outcome together.
+    Failure {
+        kind: FailureKind,
+        detail: Option<String>,
+    },
+}
+
 /// How one gate wait ends — the verdict a [`Db::resolve_gate_wait`] writes in
 /// ONE transaction: the open Attempt closed, the gate step's `Pending →
 /// Succeeded|Failed` CAS, and the events of [`gate_resolution_events`].

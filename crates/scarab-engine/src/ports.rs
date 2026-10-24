@@ -834,6 +834,29 @@ pub trait Db: Send + Sync {
         to: StepStatus,
     ) -> Result<(), DbError>;
 
+    /// One step transition as ONE commit (git-bug 586187a): the guarded
+    /// `from → to` CAS (exactly [`record_step_transition`](Db::record_step_transition)),
+    /// then — only if it won — `stamp` on its Attempt and every one of
+    /// `events`, in order. All of it lands or none of it does:
+    ///
+    /// - the step is no longer in `from` → [`DbError::Conflict`], nothing
+    ///   written (the duplicate/stale finalizer writes no events);
+    /// - any later write fails → an error, and the CAS rolls back with it: the
+    ///   step stays in `from` for the caller's re-drive.
+    ///
+    /// The separate CAS-then-append it replaces could crash in between and
+    /// leave a terminal step with no journal entry — and no re-drive could
+    /// ever write one, because its CAS now conflicts.
+    async fn commit_step_transition(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        from: StepStatus,
+        to: StepStatus,
+        stamp: Option<(&AttemptId, &crate::AttemptStamp)>,
+        events: &[EventKind],
+    ) -> Result<(), DbError>;
+
     /// Persist an attempt (idempotent on its id — restart-safe).
     async fn record_attempt(
         &self,
@@ -966,8 +989,13 @@ pub trait Db: Send + Sync {
     ///   clock) or fails → an error, and the step stays `Running`: no success
     ///   without its request, no request without its success.
     ///
+    /// `events` (the finalization's `AttemptFinished` + `StepTransitioned`)
+    /// are appended in the same commit (git-bug 586187a): a success never
+    /// lands without its journal entry.
+    ///
     /// Postgres runs it in ONE READ COMMITTED transaction, taking the Org's
     /// Deployment counter row last (see `append_deployment_input`).
+    #[allow(clippy::too_many_arguments)]
     async fn finish_step_with_deployment_requests(
         &self,
         run: &RunId,
@@ -976,6 +1004,7 @@ pub trait Db: Send + Sync {
         org: &str,
         inputs: &[scarab_deployment::DeploymentInput],
         received_at: Timestamp,
+        events: &[EventKind],
     ) -> Result<(), DbError>;
 
     /// Append one entry to the run's append-only event log.

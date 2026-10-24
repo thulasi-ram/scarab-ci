@@ -1459,23 +1459,44 @@ impl Db for PostgresDb {
     ) -> Result<(), DbError> {
         // Optimistic guard, like record_transition: the UPDATE fires only if the
         // step is still in `from`, so a stale/duplicate finalize is a Conflict.
-        let affected = sqlx::query(
-            "UPDATE step_runs
-             SET status = $4, updated_at = (extract(epoch from now()) * 1000)::bigint
-             WHERE run_id = $1 AND step_id = $2 AND status = $3",
-        )
-        .bind(&run.0)
-        .bind(&step.0)
-        .bind(step_status_str(from))
-        .bind(step_status_str(to))
-        .execute(self.pool())
-        .await
-        .map_err(db_err)?
-        .rows_affected();
-        if affected == 0 {
+        if !cas_step_status(self.pool(), run, step, from, to).await? {
             return Err(DbError::Conflict);
         }
         Ok(())
+    }
+
+    async fn commit_step_transition(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        from: StepStatus,
+        to: StepStatus,
+        stamp: Option<(&AttemptId, &scarab_engine::AttemptStamp)>,
+        events: &[EventKind],
+    ) -> Result<(), DbError> {
+        // ONE transaction (git-bug 586187a): the CAS takes the step row's
+        // lock first, so a peer's competing CAS waits and then sees the
+        // committed status (Conflict) — or, if we roll back, the old one. An
+        // early return drops `tx`, which rolls everything back.
+        let mut tx = self.pool().begin().await.map_err(db_err)?;
+        if !cas_step_status(&mut *tx, run, step, from, to).await? {
+            tx.rollback().await.map_err(db_err)?;
+            return Err(DbError::Conflict);
+        }
+        match stamp {
+            Some((attempt, scarab_engine::AttemptStamp::Outcome(outcome))) => {
+                update_attempt_outcome(&mut *tx, run, step, attempt, *outcome).await?;
+            }
+            Some((attempt, scarab_engine::AttemptStamp::Failure { kind, detail })) => {
+                update_attempt_failure(&mut *tx, run, step, attempt, *kind, detail.as_deref())
+                    .await?;
+            }
+            None => {}
+        }
+        for event in events {
+            insert_event(&mut *tx, event).await?;
+        }
+        tx.commit().await.map_err(db_err)
     }
 
     async fn record_attempt(
@@ -1575,22 +1596,7 @@ impl Db for PostgresDb {
         // verdict. Two `IS DISTINCT FROM` clauses (not `NOT IN`) keep NULL/other
         // outcomes writable — `outcome` is nullable and `NULL NOT IN (…)` is NULL,
         // which would wrongly refuse the legitimate write to a pre-outcome row.
-        sqlx::query(
-            "UPDATE attempts SET failure = $4, failure_detail = $5, outcome = $6
-             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3
-               AND outcome IS DISTINCT FROM 'superseded'
-               AND outcome IS DISTINCT FROM 'cancelled'",
-        )
-        .bind(&run.0)
-        .bind(&step.0)
-        .bind(&attempt.0)
-        .bind(failure_str(failure))
-        .bind(detail)
-        .bind(AttemptOutcome::Failed.as_str())
-        .execute(self.pool())
-        .await
-        .map_err(db_err)?;
-        Ok(())
+        update_attempt_failure(self.pool(), run, step, attempt, failure, detail).await
     }
 
     async fn set_run_deployment_requests(
@@ -1732,6 +1738,7 @@ impl Db for PostgresDb {
         org: &str,
         inputs: &[scarab_deployment::DeploymentInput],
         received_at: Timestamp,
+        events: &[EventKind],
     ) -> Result<(), DbError> {
         // ONE transaction, READ COMMITTED (stated, not assumed: the counter
         // upsert in `append_deployment_input` waits-then-rereads only there;
@@ -1800,6 +1807,12 @@ impl Db for PostgresDb {
         }
         // The requests, LAST (the counter lock). A refusal or failure here
         // rolls the transition back with it: no success without its request.
+        // The finalization's events, in the same commit (git-bug 586187a):
+        // no success without its journal entry. Before the requests, so the
+        // Org's counter is still taken LAST.
+        for event in events {
+            insert_event(&mut *tx, event).await?;
+        }
         for input in inputs {
             append_deployment_input(&mut tx, org, input, received_at.0)
                 .await
@@ -1821,20 +1834,7 @@ impl Db for PostgresDb {
         // observation. Setting `Superseded`/`Cancelled` itself is still fine (the
         // row is `running` at that point). `IS DISTINCT FROM` (not `NOT IN`) keeps
         // the nullable pre-outcome rows writable.
-        sqlx::query(
-            "UPDATE attempts SET outcome = $4
-             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3
-               AND outcome IS DISTINCT FROM 'superseded'
-               AND outcome IS DISTINCT FROM 'cancelled'",
-        )
-        .bind(&run.0)
-        .bind(&step.0)
-        .bind(&attempt.0)
-        .bind(outcome.as_str())
-        .execute(self.pool())
-        .await
-        .map_err(db_err)?;
-        Ok(())
+        update_attempt_outcome(self.pool(), run, step, attempt, outcome).await
     }
 
     async fn record_transition(
@@ -3477,6 +3477,84 @@ async fn attempts_on<'e, E: sqlx::PgExecutor<'e>>(
 const ATTEMPT_IS_RUNNING: &str = "(outcome = 'running' OR (outcome IS NULL AND failure IS NULL))";
 
 /// Append one event on any executor (the pool, or an open transaction).
+/// The guarded step-status CAS on any executor: `true` iff the row was in
+/// `from` and is now `to`.
+async fn cas_step_status<'e, E: sqlx::PgExecutor<'e>>(
+    exec: E,
+    run: &RunId,
+    step: &StepId,
+    from: StepStatus,
+    to: StepStatus,
+) -> Result<bool, DbError> {
+    let affected = sqlx::query(
+        "UPDATE step_runs
+         SET status = $4, updated_at = (extract(epoch from now()) * 1000)::bigint
+         WHERE run_id = $1 AND step_id = $2 AND status = $3",
+    )
+    .bind(&run.0)
+    .bind(&step.0)
+    .bind(step_status_str(from))
+    .bind(step_status_str(to))
+    .execute(exec)
+    .await
+    .map_err(db_err)?
+    .rows_affected();
+    Ok(affected > 0)
+}
+
+/// [`Db::set_attempt_outcome`] on any executor (see it for the
+/// terminal-by-intent guard).
+async fn update_attempt_outcome<'e, E: sqlx::PgExecutor<'e>>(
+    exec: E,
+    run: &RunId,
+    step: &StepId,
+    attempt: &AttemptId,
+    outcome: AttemptOutcome,
+) -> Result<(), DbError> {
+    sqlx::query(
+        "UPDATE attempts SET outcome = $4
+         WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3
+           AND outcome IS DISTINCT FROM 'superseded'
+           AND outcome IS DISTINCT FROM 'cancelled'",
+    )
+    .bind(&run.0)
+    .bind(&step.0)
+    .bind(&attempt.0)
+    .bind(outcome.as_str())
+    .execute(exec)
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
+/// [`Db::set_attempt_failure`] on any executor (see it for the guard and
+/// why failure, cause and outcome move together).
+async fn update_attempt_failure<'e, E: sqlx::PgExecutor<'e>>(
+    exec: E,
+    run: &RunId,
+    step: &StepId,
+    attempt: &AttemptId,
+    failure: FailureKind,
+    detail: Option<&str>,
+) -> Result<(), DbError> {
+    sqlx::query(
+        "UPDATE attempts SET failure = $4, failure_detail = $5, outcome = $6
+         WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3
+           AND outcome IS DISTINCT FROM 'superseded'
+           AND outcome IS DISTINCT FROM 'cancelled'",
+    )
+    .bind(&run.0)
+    .bind(&step.0)
+    .bind(&attempt.0)
+    .bind(failure_str(failure))
+    .bind(detail)
+    .bind(AttemptOutcome::Failed.as_str())
+    .execute(exec)
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
 async fn insert_event<'e, E: sqlx::PgExecutor<'e>>(
     exec: E,
     event: &EventKind,

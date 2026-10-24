@@ -247,6 +247,14 @@ struct InMemoryState {
     /// reads fail with a backend error, modelling a "poison run" — one whose
     /// tick work cannot complete. See [`InMemoryDb::poison_run`].
     poisoned_runs: std::collections::HashSet<RunId>,
+    /// Test-only one-shot crash injector (git-bug 586187a): the next event
+    /// write whose payload matches fails with a backend error. A standalone
+    /// [`append_event`](Db::append_event) fails alone; inside an atomic unit
+    /// ([`commit_step_transition`](Db::commit_step_transition),
+    /// [`finish_step_with_deployment_requests`](Db::finish_step_with_deployment_requests))
+    /// the whole unit fails with nothing landed — the Postgres rollback. See
+    /// [`InMemoryDb::fail_next_event_append`].
+    event_append_failure: Option<fn(&scarab_engine::EventPayload) -> bool>,
     /// Test-only one-shot interleaving (slice b1-fix): when armed for a gate,
     /// the next [`close_running_attempt`](Db::close_running_attempt) on it
     /// first resolves the gate (pass, unfenced, at the armed instant) — a
@@ -519,6 +527,21 @@ impl InMemoryDb {
         self.state.lock().unwrap().poisoned_runs.insert(run.clone());
     }
 
+    /// Arm a one-shot crash between a step's CAS and its journal (test seam
+    /// for git-bug 586187a): the next event write whose payload satisfies
+    /// `matches` fails. A store that writes the CAS and its events as one
+    /// unit loses both; one that writes them separately keeps the CAS and
+    /// loses the event — the crash-between window, constructed.
+    pub fn fail_next_event_append(&self, matches: fn(&scarab_engine::EventPayload) -> bool) {
+        self.state.lock().unwrap().event_append_failure = Some(matches);
+    }
+
+    /// Whether a [`fail_next_event_append`](Self::fail_next_event_append)
+    /// is still armed — `false` once it fired.
+    pub fn event_append_failure_armed(&self) -> bool {
+        self.state.lock().unwrap().event_append_failure.is_some()
+    }
+
     /// Clear a [`poison_run`](Self::poison_run) injection — the transient case,
     /// where a later tick simply succeeds.
     pub fn heal_run(&self, run: &RunId) {
@@ -542,6 +565,92 @@ fn attempt_number(a: &Attempt) -> u64 {
         .strip_prefix('a')
         .and_then(|n| n.parse::<u64>().ok())
         .unwrap_or(0)
+}
+
+/// Consume an armed [`InMemoryDb::fail_next_event_append`] if any of
+/// `events` matches it: `Err` = the write fails (nothing may land).
+fn take_event_append_failure(st: &mut InMemoryState, events: &[EventKind]) -> Result<(), DbError> {
+    if let Some(matches) = st.event_append_failure {
+        if events.iter().any(|e| matches(&e.kind)) {
+            st.event_append_failure = None;
+            return Err(DbError::Other(
+                "injected: event append failed (crash between CAS and journal)".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// [`Db::set_attempt_outcome`] / [`Db::set_attempt_failure`] under the
+/// caller's lock, with their terminal-by-intent guard.
+fn stamp_attempt_locked(
+    st: &mut InMemoryState,
+    run: &RunId,
+    step: &StepId,
+    attempt: &AttemptId,
+    stamp: &scarab_engine::AttemptStamp,
+) {
+    let Some(rec) = st.steps.get_mut(&(run.clone(), step.clone())) else {
+        return;
+    };
+    let Some(a) = rec.attempts.iter_mut().find(|a| &a.id == attempt) else {
+        return;
+    };
+    // Defense in depth: never downgrade a terminal-by-intent outcome
+    // (`Superseded` from a rerun, `Cancelled` from a run cancel) — mirrors
+    // the postgres `IS DISTINCT FROM` guards.
+    if matches!(
+        a.outcome,
+        AttemptOutcome::Superseded | AttemptOutcome::Cancelled
+    ) {
+        return;
+    }
+    match stamp {
+        scarab_engine::AttemptStamp::Outcome(outcome) => a.outcome = *outcome,
+        scarab_engine::AttemptStamp::Failure { kind, detail } => {
+            // Failure, cause and outcome move together (ADR-0056
+            // amendment; 4cf03d7) — mirrors the single postgres UPDATE.
+            a.failure = Some(*kind);
+            a.failure_detail = detail.clone();
+            a.outcome = AttemptOutcome::Failed;
+        }
+    }
+}
+
+/// [`Db::record_step_transition`]'s guard under the caller's lock, with the
+/// [`InMemoryDb::arm_toctou_race`] seam: `Err(Conflict)` = the step is not in
+/// `from`; `Ok` = it is, and NOTHING has been written yet.
+fn check_step_transition_locked(
+    st: &mut InMemoryState,
+    run: &RunId,
+    step: &StepId,
+    from: StepStatus,
+) -> Result<(), DbError> {
+    // Test-only one-shot TOCTOU injector (see `arm_toctou_race`): fire before
+    // the guard so the caller sees a `Conflict` against a step that has just
+    // (as far as it can tell, concurrently) raced into `Running`.
+    if matches!(&st.toctou_race, Some((s, _)) if s == step) {
+        let (_, attempt) = st.toctou_race.take().unwrap();
+        if let Some(rec) = st.steps.get_mut(&(run.clone(), step.clone())) {
+            rec.status = Some(StepStatus::Running);
+            rec.attempts.push(Attempt {
+                id: attempt,
+                started_at: Timestamp(0),
+                failure: None,
+                failure_detail: None,
+                outcome: AttemptOutcome::Running,
+            });
+        }
+        return Err(DbError::Conflict);
+    }
+    let rec = st
+        .steps
+        .get(&(run.clone(), step.clone()))
+        .ok_or(DbError::Conflict)?;
+    if rec.status != Some(from) {
+        return Err(DbError::Conflict);
+    }
+    Ok(())
 }
 
 /// [`Db::resolve_gate_wait`] under the caller's lock — shared by the port and
@@ -1521,31 +1630,37 @@ impl Db for InMemoryDb {
         to: StepStatus,
     ) -> Result<(), DbError> {
         let mut st = self.state.lock().unwrap();
-        // Test-only one-shot TOCTOU injector (see `arm_toctou_race`): fire before
-        // the guard so the caller sees a `Conflict` against a step that has just
-        // (as far as it can tell, concurrently) raced into `Running`.
-        if matches!(&st.toctou_race, Some((s, _)) if s == step) {
-            let (_, attempt) = st.toctou_race.take().unwrap();
-            if let Some(rec) = st.steps.get_mut(&(run.clone(), step.clone())) {
-                rec.status = Some(StepStatus::Running);
-                rec.attempts.push(Attempt {
-                    id: attempt,
-                    started_at: Timestamp(0),
-                    failure: None,
-                    failure_detail: None,
-                    outcome: AttemptOutcome::Running,
-                });
-            }
-            return Err(DbError::Conflict);
-        }
-        let rec = st
-            .steps
+        check_step_transition_locked(&mut st, run, step, from)?;
+        st.steps
             .get_mut(&(run.clone(), step.clone()))
-            .ok_or(DbError::Conflict)?;
-        if rec.status != Some(from) {
-            return Err(DbError::Conflict);
+            .expect("checked above")
+            .status = Some(to);
+        Ok(())
+    }
+
+    async fn commit_step_transition(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        from: StepStatus,
+        to: StepStatus,
+        stamp: Option<(&AttemptId, &scarab_engine::AttemptStamp)>,
+        events: &[EventKind],
+    ) -> Result<(), DbError> {
+        // One lock = the Postgres transaction: every check (including the
+        // crash injector) runs before the first mutation, so a failure leaves
+        // nothing behind.
+        let mut st = self.state.lock().unwrap();
+        check_step_transition_locked(&mut st, run, step, from)?;
+        take_event_append_failure(&mut st, events)?;
+        st.steps
+            .get_mut(&(run.clone(), step.clone()))
+            .expect("checked above")
+            .status = Some(to);
+        if let Some((attempt, stamp)) = stamp {
+            stamp_attempt_locked(&mut st, run, step, attempt, stamp);
         }
-        rec.status = Some(to);
+        st.events.extend(events.iter().cloned());
         Ok(())
     }
 
@@ -1618,25 +1733,19 @@ impl Db for InMemoryDb {
         failure: FailureKind,
         detail: Option<&str>,
     ) -> Result<(), DbError> {
+        // A self-inflicted teardown `Lost` must not clobber a terminal-by-
+        // intent outcome — the guard lives in `stamp_attempt_locked`.
         let mut st = self.state.lock().unwrap();
-        if let Some(rec) = st.steps.get_mut(&(run.clone(), step.clone())) {
-            if let Some(a) = rec.attempts.iter_mut().find(|a| &a.id == attempt) {
-                // Defense in depth: never downgrade a terminal-by-intent outcome
-                // (`Superseded` from a rerun, `Cancelled` from a run cancel) — a
-                // self-inflicted teardown `Lost` must not clobber it (mirrors the
-                // postgres `IS DISTINCT FROM` guards).
-                if !matches!(
-                    a.outcome,
-                    AttemptOutcome::Superseded | AttemptOutcome::Cancelled
-                ) {
-                    // Failure, cause and outcome move together (ADR-0056
-                    // amendment; 4cf03d7) — mirrors the single postgres UPDATE.
-                    a.failure = Some(failure);
-                    a.failure_detail = detail.map(str::to_string);
-                    a.outcome = AttemptOutcome::Failed;
-                }
-            }
-        }
+        stamp_attempt_locked(
+            &mut st,
+            run,
+            step,
+            attempt,
+            &scarab_engine::AttemptStamp::Failure {
+                kind: failure,
+                detail: detail.map(str::to_string),
+            },
+        );
         Ok(())
     }
 
@@ -1753,9 +1862,10 @@ impl Db for InMemoryDb {
         org: &str,
         inputs: &[scarab_deployment::DeploymentInput],
         received_at: Timestamp,
+        events: &[EventKind],
     ) -> Result<(), DbError> {
-        // One lock = one transaction: the guard, the appends and the
-        // transition all land or none does.
+        // One lock = one transaction: the guard, the appends, the events and
+        // the transition all land or none does.
         // Mirrors Postgres: the step must be `running` AND `attempt` its
         // latest (the `attempts_of_step` order) and not torn down by intent
         // (`Superseded`/`Cancelled`) — otherwise `Conflict`, nothing lands.
@@ -1780,6 +1890,7 @@ impl Db for InMemoryDb {
         if !finishable {
             return Err(DbError::Conflict);
         }
+        take_event_append_failure(&mut st, events)?;
         append_deployment_inputs_locked(&mut st, org, inputs, received_at.0)
             .map_err(|e| DbError::Other(e.to_string()))?;
         let rec = st
@@ -1790,6 +1901,7 @@ impl Db for InMemoryDb {
         if let Some(a) = rec.attempts.iter_mut().find(|a| &a.id == attempt) {
             a.outcome = AttemptOutcome::Succeeded;
         }
+        st.events.extend(events.iter().cloned());
         Ok(())
     }
 
@@ -1800,20 +1912,17 @@ impl Db for InMemoryDb {
         attempt: &AttemptId,
         outcome: AttemptOutcome,
     ) -> Result<(), DbError> {
+        // Defense in depth (mirrors `set_attempt_failure`): a terminal-by-
+        // intent outcome (`Superseded`/`Cancelled`) is never overwritten by a
+        // later observation — the guard lives in `stamp_attempt_locked`.
         let mut st = self.state.lock().unwrap();
-        if let Some(rec) = st.steps.get_mut(&(run.clone(), step.clone())) {
-            if let Some(a) = rec.attempts.iter_mut().find(|a| &a.id == attempt) {
-                // Defense in depth (mirrors `set_attempt_failure`): a terminal-by-
-                // intent outcome (`Superseded`/`Cancelled`) is never overwritten by
-                // a later observation.
-                if !matches!(
-                    a.outcome,
-                    AttemptOutcome::Superseded | AttemptOutcome::Cancelled
-                ) {
-                    a.outcome = outcome;
-                }
-            }
-        }
+        stamp_attempt_locked(
+            &mut st,
+            run,
+            step,
+            attempt,
+            &scarab_engine::AttemptStamp::Outcome(outcome),
+        );
         Ok(())
     }
 
@@ -1836,7 +1945,9 @@ impl Db for InMemoryDb {
     }
 
     async fn append_event(&self, event: &EventKind) -> Result<(), DbError> {
-        self.state.lock().unwrap().events.push(event.clone());
+        let mut st = self.state.lock().unwrap();
+        take_event_append_failure(&mut st, std::slice::from_ref(event))?;
+        st.events.push(event.clone());
         Ok(())
     }
 

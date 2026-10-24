@@ -301,11 +301,11 @@ async fn a_conflict_appends_nothing() {
     let a1 = AttemptId("a1".into());
     let input = [request_input("bump", "web", 1_000)];
 
-    db.finish_step_with_deployment_requests(&run_id(), &step, &a1, ORG, &input, Timestamp(2_000))
+    db.finish_step_with_deployment_requests(&run_id(), &step, &a1, ORG, &input, Timestamp(2_000), &[])
         .await
         .unwrap();
     let again = db
-        .finish_step_with_deployment_requests(&run_id(), &step, &a1, ORG, &input, Timestamp(2_100))
+        .finish_step_with_deployment_requests(&run_id(), &step, &a1, ORG, &input, Timestamp(2_100), &[])
         .await;
     assert!(matches!(again, Err(DbError::Conflict)), "got {again:?}");
     assert_eq!(db.inputs(ORG, ENV).await.unwrap().len(), 1);
@@ -323,6 +323,7 @@ async fn a_conflict_appends_nothing() {
             ORG,
             &[request_input("later", "api", 1_000)],
             Timestamp(2_200),
+            &[],
         )
         .await;
     assert!(matches!(not_running, Err(DbError::Conflict)));
@@ -354,6 +355,7 @@ async fn a_refused_append_rolls_the_step_transition_back() {
             ORG,
             &input,
             Timestamp(wall_ms() + 10 * 60_000),
+            &[],
         )
         .await;
     assert!(
@@ -373,7 +375,7 @@ async fn a_refused_append_rolls_the_step_transition_back() {
         "the counter row never landed"
     );
 
-    db.finish_step_with_deployment_requests(&run_id(), &step, &a1, ORG, &input, Timestamp(2_000))
+    db.finish_step_with_deployment_requests(&run_id(), &step, &a1, ORG, &input, Timestamp(2_000), &[])
         .await
         .unwrap();
     assert_eq!(step_status(&db, "bump").await, StepStatus::Succeeded);
@@ -500,6 +502,7 @@ async fn concurrent_ingest_and_step_success_do_not_deadlock() {
                     ORG,
                     &[request_input(&step, &format!("web{i}"), 1_000)],
                     Timestamp(2_000),
+                    &[],
                 )
                 .await
                 .unwrap();
@@ -600,7 +603,7 @@ async fn a_non_latest_attempt_cannot_finish_the_step() {
     let input = [request_input("bump", "web", 1_000)];
 
     let stale = db
-        .finish_step_with_deployment_requests(&run_id(), &step, &a1, ORG, &input, Timestamp(3_000))
+        .finish_step_with_deployment_requests(&run_id(), &step, &a1, ORG, &input, Timestamp(3_000), &[])
         .await;
     assert!(
         matches!(stale, Err(DbError::Conflict)),
@@ -610,7 +613,7 @@ async fn a_non_latest_attempt_cannot_finish_the_step() {
         .await
         .unwrap();
     let superseded = db
-        .finish_step_with_deployment_requests(&run_id(), &step, &a1, ORG, &input, Timestamp(3_100))
+        .finish_step_with_deployment_requests(&run_id(), &step, &a1, ORG, &input, Timestamp(3_100), &[])
         .await;
     assert!(
         matches!(superseded, Err(DbError::Conflict)),
@@ -626,7 +629,7 @@ async fn a_non_latest_attempt_cannot_finish_the_step() {
     assert_eq!(attempts[0].outcome, AttemptOutcome::Superseded);
     assert_eq!(attempts[1].outcome, AttemptOutcome::Running);
 
-    db.finish_step_with_deployment_requests(&run_id(), &step, &a2, ORG, &input, Timestamp(3_200))
+    db.finish_step_with_deployment_requests(&run_id(), &step, &a2, ORG, &input, Timestamp(3_200), &[])
         .await
         .unwrap();
     assert_eq!(step_status(&db, "bump").await, StepStatus::Succeeded);
@@ -662,13 +665,13 @@ async fn the_frontier_is_the_attempt_number_not_its_clock() {
     let input = [request_input("bump", "web", 1_000)];
 
     let stale = db
-        .finish_step_with_deployment_requests(&run_id(), &step, &a1, ORG, &input, Timestamp(3_000))
+        .finish_step_with_deployment_requests(&run_id(), &step, &a1, ORG, &input, Timestamp(3_000), &[])
         .await;
     assert!(
         matches!(stale, Err(DbError::Conflict)),
         "a1 is not the frontier: got {stale:?}"
     );
-    db.finish_step_with_deployment_requests(&run_id(), &step, &a2, ORG, &input, Timestamp(3_100))
+    db.finish_step_with_deployment_requests(&run_id(), &step, &a2, ORG, &input, Timestamp(3_100), &[])
         .await
         .expect("a2 is the frontier despite its earlier clock");
     assert_eq!(step_status(&db, "bump").await, StepStatus::Succeeded);

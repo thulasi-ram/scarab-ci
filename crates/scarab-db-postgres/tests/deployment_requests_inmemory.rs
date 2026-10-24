@@ -304,6 +304,7 @@ async fn a_non_latest_attempt_cannot_finish_the_step() {
             "acme",
             &input,
             Timestamp(3_000),
+            &[],
         )
         .await;
     assert!(
@@ -321,6 +322,7 @@ async fn a_non_latest_attempt_cannot_finish_the_step() {
             "acme",
             &input,
             Timestamp(3_100),
+            &[],
         )
         .await;
     assert!(
@@ -341,6 +343,7 @@ async fn a_non_latest_attempt_cannot_finish_the_step() {
         "acme",
         &input,
         Timestamp(3_200),
+        &[],
     )
     .await
     .unwrap();
@@ -746,7 +749,13 @@ async fn a_deploy_step_is_never_skipped_as_unchanged() {
         for _ in 0..10 {
             tick(&db, &clock, &exec).await;
             clock.advance(1_000);
-            if db.run_status(&run_id()).await.unwrap().unwrap().is_terminal() {
+            if db
+                .run_status(&run_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .is_terminal()
+            {
                 return;
             }
         }

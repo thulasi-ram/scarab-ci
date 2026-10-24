@@ -46,9 +46,10 @@ pub const MAX_DELIVERY_ATTEMPTS: u32 = 10;
 const TIMEOUT_BACKSTOP_GRACE_MS: i64 = 60_000;
 use crate::{
     ports::{DeploymentGateWait, DeploymentGates, WorkspaceSnapshots},
-    Attempt, AttemptId, AttemptOutcome, Clock, ConcurrencyPolicy, Db, DbError, EventKind,
-    EventPayload, ExecError, Executor, FailureKind, GateResolution, OutboxMessage, RunId,
-    RunStatus, StepId, StepRun, StepSpec, StepStatus, Timestamp, TransitionError, EVENT_VERSION,
+    Attempt, AttemptId, AttemptOutcome, AttemptStamp, Clock, ConcurrencyPolicy, Db, DbError,
+    EventKind, EventPayload, ExecError, Executor, FailureKind, GateResolution, OutboxMessage,
+    RunId, RunStatus, StepId, StepRun, StepSpec, StepStatus, Timestamp, TransitionError,
+    EVENT_VERSION,
 };
 
 /// Outbox `kind` for "launch this step".
@@ -1653,37 +1654,43 @@ pub async fn cancel_run_request(
         if step.status.is_terminal() {
             continue;
         }
+        // Stamp the in-flight attempt `Cancelled` (mirrors the superseded
+        // fix). Only a `Running` step has a live Pod / frontier attempt;
+        // cancelling tears that Pod down, and the backend then reports the
+        // dying Pod `Lost`. Without a recorded terminal outcome that
+        // self-inflicted `Lost` would settle onto the attempt row as
+        // `failed`/`lost` and render an intentionally-cancelled attempt as
+        // a failure. No extra event: the `StepTransitioned`→Cancelled and the
+        // `RunTransitioned`→Cancelled below already record the boundary in
+        // the immutable log. The CAS, the stamp and the event are one commit
+        // (git-bug 586187a).
+        let cancelled = AttemptStamp::Outcome(AttemptOutcome::Cancelled);
+        let stamp = match step.status {
+            StepStatus::Running => step.attempts.last().map(|a| (&a.id, &cancelled)),
+            _ => None,
+        };
+        let transitioned = EventKind {
+            version: EVENT_VERSION,
+            run: run.clone(),
+            kind: EventPayload::StepTransitioned {
+                step: step.step.clone(),
+                from: step.status,
+                to: StepStatus::Cancelled,
+            },
+            at: now,
+        };
         match db
-            .record_step_transition(run, &step.step, step.status, StepStatus::Cancelled)
+            .commit_step_transition(
+                run,
+                &step.step,
+                step.status,
+                StepStatus::Cancelled,
+                stamp,
+                std::slice::from_ref(&transitioned),
+            )
             .await
         {
             Ok(()) => {
-                db.append_event(&EventKind {
-                    version: EVENT_VERSION,
-                    run: run.clone(),
-                    kind: EventPayload::StepTransitioned {
-                        step: step.step.clone(),
-                        from: step.status,
-                        to: StepStatus::Cancelled,
-                    },
-                    at: now,
-                })
-                .await?;
-                // Stamp the in-flight attempt `Cancelled` (mirrors the superseded
-                // fix). Only a `Running` step has a live Pod / frontier attempt;
-                // cancelling tears that Pod down, and the backend then reports the
-                // dying Pod `Lost`. Without a recorded terminal outcome that
-                // self-inflicted `Lost` would settle onto the attempt row as
-                // `failed`/`lost` and render an intentionally-cancelled attempt as
-                // a failure. No extra event: the `StepTransitioned`→Cancelled above
-                // and the `RunTransitioned`→Cancelled below already record the
-                // boundary in the immutable log.
-                if step.status == StepStatus::Running {
-                    if let Some(a) = step.attempts.last() {
-                        db.set_attempt_outcome(run, &step.step, &a.id, AttemptOutcome::Cancelled)
-                            .await?;
-                    }
-                }
                 // A gate cancelled mid-wait: its open Attempt is cancelled too.
                 cancel_open_gate_attempt(db, run, &step).await?;
             }
@@ -2312,7 +2319,6 @@ impl<'a> Scheduler<'a> {
                         .map(String::as_str)
                         .collect();
                     if !failed.is_empty() {
-                        let now = self.clock.now().await;
                         let reason = format!(
                             "unbound dependency: shared service(s) {} never became ready",
                             failed
@@ -2321,20 +2327,15 @@ impl<'a> Scheduler<'a> {
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         );
-                        self.append(
-                            run,
-                            EventPayload::StepServicesUnready {
-                                step: step.step.clone(),
-                                reason,
-                            },
-                            now,
-                        )
-                        .await?;
-                        self.transition_step(
+                        self.transition_step_with(
                             run,
                             &step.step,
                             StepStatus::Pending,
                             StepStatus::Failed,
+                            vec![EventPayload::StepServicesUnready {
+                                step: step.step.clone(),
+                                reason,
+                            }],
                         )
                         .await?;
                         continue;
@@ -4044,34 +4045,34 @@ impl<'a> Scheduler<'a> {
     /// surface the skip on the event log, minting no attempt. A peer that already
     /// moved it is a benign `Conflict`.
     async fn skip_unchanged(&self, run: &RunId, step: &StepId) -> Result<(), SchedulerError> {
+        // The CAS and its events are one commit (git-bug 586187a): a failure
+        // leaves the step re-armed (`Pending`) for the next pass to skip.
+        let now = self.clock.now().await;
+        let events = [
+            EventPayload::StepSkipped {
+                step: step.clone(),
+                reason: "inputs unchanged".to_string(),
+            },
+            EventPayload::StepTransitioned {
+                step: step.clone(),
+                from: StepStatus::Pending,
+                to: StepStatus::Succeeded,
+            },
+        ]
+        .map(|kind| event(run, kind, now));
         match self
             .db
-            .record_step_transition(run, step, StepStatus::Pending, StepStatus::Succeeded)
+            .commit_step_transition(
+                run,
+                step,
+                StepStatus::Pending,
+                StepStatus::Succeeded,
+                None,
+                &events,
+            )
             .await
         {
-            Ok(()) => {
-                let now = self.clock.now().await;
-                self.append(
-                    run,
-                    EventPayload::StepSkipped {
-                        step: step.clone(),
-                        reason: "inputs unchanged".to_string(),
-                    },
-                    now,
-                )
-                .await?;
-                self.append(
-                    run,
-                    EventPayload::StepTransitioned {
-                        step: step.clone(),
-                        from: StepStatus::Pending,
-                        to: StepStatus::Succeeded,
-                    },
-                    now,
-                )
-                .await?;
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(DbError::Conflict) => Ok(()),
             Err(e) => Err(e.into()),
         }
@@ -4274,36 +4275,35 @@ impl<'a> Scheduler<'a> {
         kind: FailureKind,
         cause: Option<String>,
     ) -> Result<(), SchedulerError> {
+        // The CAS and its events are one commit (git-bug 586187a).
+        let now = self.clock.now().await;
+        let events = [
+            EventPayload::AttemptFinished {
+                step: step.clone(),
+                attempt: attempt.clone(),
+                failure: Some(kind),
+                cause,
+            },
+            EventPayload::StepTransitioned {
+                step: step.clone(),
+                from: StepStatus::Running,
+                to: StepStatus::Ready,
+            },
+        ]
+        .map(|k| event(run, k, now));
         match self
             .db
-            .record_step_transition(run, step, StepStatus::Running, StepStatus::Ready)
+            .commit_step_transition(
+                run,
+                step,
+                StepStatus::Running,
+                StepStatus::Ready,
+                None,
+                &events,
+            )
             .await
         {
-            Ok(()) => {
-                let now = self.clock.now().await;
-                self.append(
-                    run,
-                    EventPayload::AttemptFinished {
-                        step: step.clone(),
-                        attempt: attempt.clone(),
-                        failure: Some(kind),
-                        cause,
-                    },
-                    now,
-                )
-                .await?;
-                self.append(
-                    run,
-                    EventPayload::StepTransitioned {
-                        step: step.clone(),
-                        from: StepStatus::Running,
-                        to: StepStatus::Ready,
-                    },
-                    now,
-                )
-                .await?;
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(DbError::Conflict) => Ok(()),
             Err(e) => Err(e.into()),
         }
@@ -4375,8 +4375,8 @@ impl<'a> Scheduler<'a> {
     ///   finalized the step) appends nothing and no events; any other error
     ///   leaves the step `Running` for the next re-drive.
     ///
-    /// Then the usual `AttemptFinished` + `StepTransitioned` events, exactly as
-    /// `finalize_step` appends them.
+    /// With the usual `AttemptFinished` + `StepTransitioned` events, exactly as
+    /// `finalize_step` writes them — in the same commit (git-bug 586187a).
     async fn succeed_step(
         &self,
         run: &RunId,
@@ -4452,15 +4452,23 @@ impl<'a> Scheduler<'a> {
         // `append_deployment_input`): an early reading is monotone through the
         // store's GREATEST, but needlessly early.
         let received_at = self.clock.now().await;
+        let events = self
+            .finalize_events(run, step, attempt, StepStatus::Succeeded, None, None)
+            .await;
         match self
             .db
-            .finish_step_with_deployment_requests(run, step, attempt, &org, &inputs, received_at)
+            .finish_step_with_deployment_requests(
+                run,
+                step,
+                attempt,
+                &org,
+                &inputs,
+                received_at,
+                &events,
+            )
             .await
         {
-            Ok(()) => {
-                self.append_finalize_events(run, step, attempt, StepStatus::Succeeded, None, None)
-                    .await
-            }
+            Ok(()) => Ok(()),
             Err(DbError::Conflict) => Ok(()),
             Err(e) => Err(e.into()),
         }
@@ -4497,50 +4505,54 @@ impl<'a> Scheduler<'a> {
         cause: Option<String>,
     ) -> Result<(), SchedulerError> {
         // Optimistic guard: if a peer already finalized this step, our UPDATE
-        // matches zero rows (Conflict) — we skip the duplicate events but still
+        // matches zero rows (Conflict) — we write no duplicate events but still
         // let the caller retire the outbox message. Exactly-once step terminus.
+        //
+        // The CAS, the attempt's terminal stamp and the events are ONE commit
+        // (git-bug 586187a): a crash can no longer leave a terminal step with
+        // no journal entry (which no re-drive could ever write — its CAS would
+        // conflict). A failure leaves the step `Running` for the re-drive.
+        //
+        // Stamp the attempt's terminal outcome (ADR-0056 amendment) so it never
+        // renders as a green `failed:false` attempt. `Succeeded` here; on the
+        // Failed terminus record the classified failure — which also stamps
+        // `Failed` — covering the direct-finalize paths (e.g. a launch-time
+        // interpolation failure) that never routed through
+        // `settle_failed_attempt`. Idempotent when they did.
+        let stamp = match (to, failure) {
+            (StepStatus::Succeeded, _) => Some(AttemptStamp::Outcome(AttemptOutcome::Succeeded)),
+            (StepStatus::Failed, Some(kind)) => Some(AttemptStamp::Failure {
+                kind,
+                detail: cause.clone(),
+            }),
+            (StepStatus::Failed, None) => Some(AttemptStamp::Outcome(AttemptOutcome::Failed)),
+            _ => None,
+        };
+        let events = self
+            .finalize_events(run, step, attempt, to, failure, cause)
+            .await;
         match self
             .db
-            .record_step_transition(run, step, StepStatus::Running, to)
+            .commit_step_transition(
+                run,
+                step,
+                StepStatus::Running,
+                to,
+                stamp.as_ref().map(|s| (attempt, s)),
+                &events,
+            )
             .await
         {
-            Ok(()) => {
-                // Stamp the attempt's terminal outcome (ADR-0056 amendment) so it
-                // never renders as a green `failed:false` attempt. `Succeeded`
-                // here; on the Failed terminus record the classified failure —
-                // which also stamps `Failed` — covering the direct-finalize paths
-                // (e.g. a launch-time interpolation failure) that never routed
-                // through `settle_failed_attempt`. Idempotent when they did.
-                match to {
-                    StepStatus::Succeeded => {
-                        self.db
-                            .set_attempt_outcome(run, step, attempt, AttemptOutcome::Succeeded)
-                            .await?;
-                    }
-                    StepStatus::Failed => {
-                        if let Some(kind) = failure {
-                            self.db
-                                .set_attempt_failure(run, step, attempt, kind, cause.as_deref())
-                                .await?;
-                        } else {
-                            self.db
-                                .set_attempt_outcome(run, step, attempt, AttemptOutcome::Failed)
-                                .await?;
-                        }
-                    }
-                    _ => {}
-                }
-                self.append_finalize_events(run, step, attempt, to, failure, cause)
-                    .await
-            }
+            Ok(()) => Ok(()),
             Err(DbError::Conflict) => Ok(()),
             Err(e) => Err(e.into()),
         }
     }
 
-    /// The events of a won `Running → to` step finalization: `AttemptFinished`
-    /// then `StepTransitioned`, at one instant. Only the CAS winner calls it.
-    async fn append_finalize_events(
+    /// The events of a `Running → to` step finalization: `AttemptFinished`
+    /// then `StepTransitioned`, at one instant — written in the same commit
+    /// as the transition itself, so only the CAS winner's land.
+    async fn finalize_events(
         &self,
         run: &RunId,
         step: &StepId,
@@ -4548,30 +4560,24 @@ impl<'a> Scheduler<'a> {
         to: StepStatus,
         failure: Option<FailureKind>,
         cause: Option<String>,
-    ) -> Result<(), SchedulerError> {
-        let now = self.clock.now().await;
-        self.append(
-            run,
+    ) -> Vec<EventKind> {
+        let at = self.clock.now().await;
+        [
             EventPayload::AttemptFinished {
                 step: step.clone(),
                 attempt: attempt.clone(),
                 failure,
                 cause,
             },
-            now,
-        )
-        .await?;
-        self.append(
-            run,
             EventPayload::StepTransitioned {
                 step: step.clone(),
                 from: StepStatus::Running,
                 to,
             },
-            now,
-        )
-        .await?;
-        Ok(())
+        ]
+        .into_iter()
+        .map(|kind| event(run, kind, at))
+        .collect()
     }
 
     /// The pipeline-level shared services declared in the run's stored IR
@@ -4859,6 +4865,8 @@ impl<'a> Scheduler<'a> {
         }
     }
 
+    /// A guarded step transition and its `StepTransitioned` as one commit
+    /// (git-bug 586187a). A lost CAS is benign (`Ok`, nothing written).
     async fn transition_step(
         &self,
         run: &RunId,
@@ -4866,20 +4874,37 @@ impl<'a> Scheduler<'a> {
         from: StepStatus,
         to: StepStatus,
     ) -> Result<(), SchedulerError> {
-        match self.db.record_step_transition(run, step, from, to).await {
-            Ok(()) => {
-                let now = self.clock.now().await;
-                self.append(
-                    run,
-                    EventPayload::StepTransitioned {
-                        step: step.clone(),
-                        from,
-                        to,
-                    },
-                    now,
-                )
-                .await
-            }
+        self.transition_step_with(run, step, from, to, Vec::new())
+            .await
+    }
+
+    /// [`transition_step`](Self::transition_step), with `preceding` events
+    /// (e.g. the reason for the transition) journaled in the same commit,
+    /// before the `StepTransitioned`.
+    async fn transition_step_with(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        from: StepStatus,
+        to: StepStatus,
+        preceding: Vec<EventPayload>,
+    ) -> Result<(), SchedulerError> {
+        let now = self.clock.now().await;
+        let events: Vec<EventKind> = preceding
+            .into_iter()
+            .chain([EventPayload::StepTransitioned {
+                step: step.clone(),
+                from,
+                to,
+            }])
+            .map(|kind| event(run, kind, now))
+            .collect();
+        match self
+            .db
+            .commit_step_transition(run, step, from, to, None, &events)
+            .await
+        {
+            Ok(()) => Ok(()),
             Err(DbError::Conflict) => Ok(()),
             Err(e) => Err(e.into()),
         }
@@ -4900,5 +4925,15 @@ impl<'a> Scheduler<'a> {
             })
             .await?;
         Ok(())
+    }
+}
+
+/// An [`EventKind`] of this build's schema version.
+fn event(run: &RunId, kind: EventPayload, at: Timestamp) -> EventKind {
+    EventKind {
+        version: EVENT_VERSION,
+        run: run.clone(),
+        kind,
+        at,
     }
 }
