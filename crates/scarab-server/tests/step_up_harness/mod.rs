@@ -35,6 +35,8 @@ pub const T0: i64 = 1_000_000_000;
 
 pub struct Harness {
     pub app: axum::Router,
+    /// The engine `Db` the app serves: a test drives Runs on it.
+    pub db: Arc<InMemoryDb>,
     pub clock: Arc<FakeClock>,
     pub sessions: Arc<InMemorySessions>,
     pub rbac: Arc<InMemoryRbac>,
@@ -87,7 +89,7 @@ pub fn harness_with(extra: impl FnOnce(AppState) -> AppState) -> Harness {
     let step_up = Arc::new(InMemoryStepUp::new());
     let events = Arc::new(InMemorySecurityEvents::new().with_rbac(rbac.clone()));
     let rp = RelyingParty::from_public_url(PUBLIC_URL, "Scarab").unwrap();
-    let st = AppState::new(db, clock.clone(), logs)
+    let st = AppState::new(db.clone(), clock.clone(), logs)
         .with_auth(auth, sessions.clone())
         .with_rbac(rbac.clone())
         .with_api_tokens(tokens.clone())
@@ -103,6 +105,7 @@ pub fn harness_with(extra: impl FnOnce(AppState) -> AppState) -> Harness {
     ));
     Harness {
         app: router(st),
+        db,
         clock,
         sessions,
         rbac,
