@@ -1705,6 +1705,7 @@ impl Db for InMemoryDb {
         to: StepStatus,
         stamp: Option<(&AttemptId, &scarab_engine::AttemptStamp)>,
         events: &[EventKind],
+        outbox: &[OutboxMessage],
     ) -> Result<(), DbError> {
         // One lock = the Postgres transaction: every check (including the
         // crash injector) runs before the first mutation, so a failure leaves
@@ -1720,6 +1721,9 @@ impl Db for InMemoryDb {
             stamp_attempt_locked(&mut st, run, step, attempt, stamp);
         }
         st.events.extend(events.iter().cloned());
+        for msg in outbox {
+            enqueue_outbox_locked(&mut st, msg);
+        }
         Ok(())
     }
 

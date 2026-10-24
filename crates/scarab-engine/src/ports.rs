@@ -883,8 +883,14 @@ pub trait Db: Send + Sync {
 
     /// One step transition as ONE commit (git-bug 586187a): the guarded
     /// `from → to` CAS (exactly [`record_step_transition`](Db::record_step_transition)),
-    /// then — only if it won — `stamp` on its Attempt and every one of
-    /// `events`, in order. All of it lands or none of it does:
+    /// then — only if it won — `stamp` on its Attempt, every one of
+    /// `events`, in order, and every one of `outbox` (each idempotent on its
+    /// key, as [`enqueue_outbox`](Db::enqueue_outbox)). The outbox carries
+    /// the teardown intent a cancel or a supersession owes the unit this
+    /// transition abandons (red team A3/A6): written in a separate, earlier
+    /// commit, an intent could outlive a transition that then failed — and
+    /// kill a live attempt of a Run nobody cancelled. All of it lands or none
+    /// of it does:
     ///
     /// - the step is no longer in `from` → [`DbError::Conflict`], nothing
     ///   written (the duplicate/stale finalizer writes no events);
@@ -902,6 +908,7 @@ pub trait Db: Send + Sync {
         to: StepStatus,
         stamp: Option<(&AttemptId, &crate::AttemptStamp)>,
         events: &[EventKind],
+        outbox: &[OutboxMessage],
     ) -> Result<(), DbError>;
 
     /// Persist an attempt (idempotent on its id — restart-safe).

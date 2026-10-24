@@ -840,36 +840,13 @@ async fn rearm_invalidation_set(
         }
     }
 
-    // The teardown intent for every in-flight attempt this re-arm supersedes,
-    // FIRST — before any of them leaves `Running` (review correctness MED2).
-    // It is what keeps a superseded deploy Step holding its DeploymentTarget
-    // until its Pod is gone (`Db::deployment_requesting_runs`, git-bug
-    // f22056d); written after the re-arm, a Step already `Pending` with no
-    // intent yet counted for nothing — a held Run could be promoted beside
-    // the still-running Pod — and a crash in between left no teardown and no
-    // hold at all. A step that raced into `Running` past this snapshot gets
-    // its own intent, also before its re-arm ([`rearm_raced_step`]). Should a
-    // listed step's re-arm then conflict (it finished meanwhile), cancelling
-    // its gone unit is a harmless no-op.
-    let superseded: Vec<SupersededAttempt> = steps
-        .iter()
-        .filter(|s| invalid.contains(&s.step) && s.status == StepStatus::Running)
-        .filter_map(|s| {
-            s.attempts.last().map(|a| SupersededAttempt {
-                step: s.step.0.clone(),
-                attempt: a.id.0.clone(),
-            })
-        })
-        .collect();
-    enqueue_supersede_teardown(db, clock, run, target, superseded).await?;
-
     // Re-arm each invalidated step (terminal or in-flight) to Pending. A peer
     // that already moved it is a benign Conflict. An in-flight step re-armed
-    // here has its running attempt SUPERSEDED (ADR-0056 amendment): its Pod is
-    // torn down by the intent above so it does not orphan, its attempt is
-    // stamped `Superseded` (never a green `failed:false`), and an
-    // `AttemptSuperseded` event records the fact — in the same commit as the
-    // re-arm and its `StepTransitioned` (git-bug 586187a).
+    // here has its running attempt SUPERSEDED (ADR-0056 amendment): its Pod's
+    // teardown intent, its attempt stamped `Superseded` (never a green
+    // `failed:false`), and an `AttemptSuperseded` event all land in the same
+    // commit as the re-arm and its `StepTransitioned` (git-bug 586187a,
+    // [`commit_rearm`]).
     for s in steps {
         // A gate still WAITING (Pending, open Attempt) is not re-armed by the
         // status loop below — it is already Pending — but its wait's premise
@@ -891,7 +868,7 @@ async fn rearm_invalidation_set(
             }
         }
         if invalid.contains(&s.step) && s.status != StepStatus::Pending {
-            match commit_rearm(db, clock, run, s, by.as_deref()).await {
+            match commit_rearm(db, clock, run, target, s, by.as_deref()).await {
                 Ok(()) => {}
                 // TOCTOU (orphan fix): the optimistic `from` came from a stale
                 // snapshot. A descendant may have raced Pending/Ready→Running
@@ -910,56 +887,56 @@ async fn rearm_invalidation_set(
     Ok(())
 }
 
-/// Enqueue one [`SUPERSEDE_TEARDOWN`] intent for `superseded` (nothing when
-/// it is empty). The driver (which owns the executor) SIGTERMs their Pods;
-/// the run itself stays alive.
-async fn enqueue_supersede_teardown(
-    db: &dyn Db,
-    clock: &dyn Clock,
+/// The [`SUPERSEDE_TEARDOWN`] intent for one superseded attempt. The driver
+/// (which owns the executor) SIGTERMs its Pod; the run itself stays alive.
+fn supersede_teardown_intent(
     run: &RunId,
     target: &StepId,
-    superseded: Vec<SupersededAttempt>,
-) -> Result<(), DbError> {
-    if superseded.is_empty() {
-        return Ok(());
-    }
-    let now = clock.now().await;
+    superseded: SupersededAttempt,
+    now: Timestamp,
+) -> OutboxMessage {
     // The idempotency key must be distinct per distinct supersession
     // (collision fix): the old `supersede:{run}:{tick}` collided for two
     // reruns landing in the same clock tick, deduping one teardown away and
-    // orphaning its Pod. Key on the rerun target plus the specific
-    // superseded (step, attempt) handles, so distinct supersessions never
-    // collapse while an identical re-enqueue still dedups exactly-once.
-    let mut disc: Vec<String> = superseded
-        .iter()
-        .map(|a| format!("{}/{}", a.step, a.attempt))
-        .collect();
-    disc.sort();
-    db.enqueue_outbox(&OutboxMessage {
+    // orphaning its Pod. An attempt is superseded at most once (its re-arm
+    // CAS out of `Running` wins once), so keying on the specific (step,
+    // attempt) never collapses two supersessions, while an identical
+    // re-enqueue still dedups exactly-once.
+    let key = format!(
+        "supersede:{}:{}:{}/{}",
+        run.0, target.0, superseded.step, superseded.attempt
+    );
+    OutboxMessage {
         id: crate::OutboxId(0),
         run: run.clone(),
         kind: SUPERSEDE_TEARDOWN.to_string(),
         payload: serde_json::to_value(SupersedeTeardown {
-            attempts: superseded,
+            attempts: vec![superseded],
         })
         .unwrap_or(serde_json::Value::Null),
-        idempotency_key: format!("supersede:{}:{}:{}", run.0, target.0, disc.join(",")),
+        idempotency_key: key,
         at: now,
-    })
-    .await
+    }
 }
 
 /// Re-arm `s` from the status it was read in to `Pending`, as ONE commit
 /// (git-bug 586187a): the guarded CAS, its `StepTransitioned`, and — when it
 /// was `Running` — its latest attempt stamped `Superseded` with an
 /// [`AttemptSuperseded`](EventPayload::AttemptSuperseded) fact (ADR-0056
-/// amendment). `Conflict` when `s` is no longer in that status, nothing
-/// written. The caller has already enqueued the superseded attempt's
-/// teardown.
+/// amendment) and that attempt's [`SUPERSEDE_TEARDOWN`] intent. `Conflict`
+/// when `s` is no longer in that status, nothing written.
+///
+/// The intent rides this commit (red team A6), not one before it: it is what
+/// keeps a superseded deploy Step holding its DeploymentTarget until its Pod
+/// is gone (`Db::deployment_requesting_runs`, git-bug f22056d), so the Step
+/// may not leave `Running` without it (review MED2); and written on its own
+/// ahead of a re-arm that then failed, it killed the still-current attempt
+/// and that self-inflicted `Lost` settled as a real failure.
 async fn commit_rearm(
     db: &dyn Db,
     clock: &dyn Clock,
     run: &RunId,
+    target: &StepId,
     s: &StepRun,
     by: Option<&str>,
 ) -> Result<(), DbError> {
@@ -975,9 +952,19 @@ async fn commit_rearm(
     )];
     let superseded = AttemptStamp::Outcome(AttemptOutcome::Superseded);
     let mut stamp = None;
+    let mut intent = Vec::new();
     if s.status == StepStatus::Running {
         if let Some(a) = s.attempts.last() {
             stamp = Some((&a.id, &superseded));
+            intent.push(supersede_teardown_intent(
+                run,
+                target,
+                SupersededAttempt {
+                    step: s.step.0.clone(),
+                    attempt: a.id.0.clone(),
+                },
+                now,
+            ));
             events.push(event(
                 run,
                 EventPayload::AttemptSuperseded {
@@ -989,14 +976,22 @@ async fn commit_rearm(
             ));
         }
     }
-    db.commit_step_transition(run, &s.step, s.status, StepStatus::Pending, stamp, &events)
-        .await
+    db.commit_step_transition(
+        run,
+        &s.step,
+        s.status,
+        StepStatus::Pending,
+        stamp,
+        &events,
+        &intent,
+    )
+    .await
 }
 
 /// Recover a re-arm that hit [`DbError::Conflict`] because the invalidation-set
 /// snapshot was stale (the TOCTOU orphan fix). Re-read the live row and re-arm
-/// from its ACTUAL status; if the step raced into `Running` (an in-flight Pod
-/// the snapshot missed) enqueue its teardown, then re-arm it
+/// from its ACTUAL status; a step that raced into `Running` (an in-flight Pod
+/// the snapshot missed) is re-armed with its teardown in the same commit
 /// ([`commit_rearm`]), so it is torn down rather than orphaned. A step a peer already re-armed to `Pending`, or one now
 /// terminal with no live attempt, is genuinely benign. Bounded re-read/retry:
 /// each competing transition moves the step toward `Pending` or a terminal sink,
@@ -1018,18 +1013,7 @@ async fn rearm_raced_step(
         if s.status == StepStatus::Pending {
             return Ok(());
         }
-        // A step that raced into `Running`: its teardown intent first, as
-        // for the snapshot's in-flight steps (review correctness MED2).
-        if s.status == StepStatus::Running {
-            if let Some(a) = s.attempts.last() {
-                let raced = vec![SupersededAttempt {
-                    step: step.0.clone(),
-                    attempt: a.id.0.clone(),
-                }];
-                enqueue_supersede_teardown(db, clock, run, target, raced).await?;
-            }
-        }
-        match commit_rearm(db, clock, run, s, by).await {
+        match commit_rearm(db, clock, run, target, s, by).await {
             Ok(()) => return Ok(()),
             Err(DbError::Conflict) => continue,
             Err(e) => return Err(e.into()),
@@ -1708,16 +1692,16 @@ pub async fn cancel_run_request(
     }
     let now = clock.now().await;
     // The teardown intent — processed by the driver, which owns the executor —
-    // is written BEFORE anything goes terminal (review correctness MED1). It
-    // is what keeps a cancelled deploy Step holding its DeploymentTarget
-    // until its unit is gone (`Db::deployment_requesting_runs`, git-bug
-    // f22056d): written last, a Step already `Cancelled` with no intent yet
-    // counted for nothing, so a held Run could be promoted beside the
-    // holder's still-terminating Pod; and a crash before it lost the intent
-    // for good — a re-sent cancel finds the Run terminal and stops above —
-    // so the Pod was never torn down and never held. The idempotency key
-    // makes the re-sent cancel's enqueue a no-op.
-    enqueue_cancel_teardown(db, run, now).await?;
+    // rides IN THE SAME COMMIT as every transition it guards: each Step's
+    // `→ Cancelled` and the Run's (red team A3). It is what keeps a cancelled
+    // deploy Step holding its DeploymentTarget until its unit is gone
+    // (`Db::deployment_requesting_runs`, git-bug f22056d), so no Step may go
+    // `Cancelled` without it (review MED1: a Step already `Cancelled` with no
+    // intent yet held nothing). Nor may it exist without a transition: the
+    // earlier "intent first, in its own commit" order let a cancel that then
+    // failed tear down a live attempt of a Run that was never cancelled. The
+    // idempotency key collapses the several commits onto one intent.
+    let intent = cancel_teardown_intent(db, run, now).await?;
     // Attribution (ADR-0054): record the operator's cancel request FIRST, so an
     // operator cancel carries the acting principal and is distinguishable in the
     // durable log from the system's concurrency auto-cancel (which drives the
@@ -1766,6 +1750,7 @@ pub async fn cancel_run_request(
                 StepStatus::Cancelled,
                 stamp,
                 std::slice::from_ref(&transitioned),
+                std::slice::from_ref(&intent),
             )
             .await
         {
@@ -1777,7 +1762,17 @@ pub async fn cancel_run_request(
             Err(e) => return Err(e.into()),
         }
     }
-    match commit_run_transition(db, run, current, RunStatus::Cancelled, now, true).await {
+    match commit_run_transition(
+        db,
+        run,
+        current,
+        RunStatus::Cancelled,
+        now,
+        true,
+        std::slice::from_ref(&intent),
+    )
+    .await
+    {
         Ok(()) | Err(DbError::Conflict) => {}
         Err(e) => return Err(e.into()),
     }
@@ -1787,14 +1782,18 @@ pub async fn cancel_run_request(
     Ok(true)
 }
 
-/// Enqueue the [`CANCEL_RUN`] teardown intent for `run` (idempotent on
-/// `cancel:{run}`): the driver deletes every recorded in-flight unit until it
-/// is gone, and tears down the Run's shared services (ADR-0058). Shared by
-/// the operator cancel ([`cancel_run_request`]) and the inline concurrency
-/// auto-cancel ([`Scheduler::cancel_run`]); both write it before any Step
-/// goes terminal.
-async fn enqueue_cancel_teardown(db: &dyn Db, run: &RunId, now: Timestamp) -> Result<(), DbError> {
-    db.enqueue_outbox(&OutboxMessage {
+/// The [`CANCEL_RUN`] teardown intent for `run`: the driver deletes every
+/// recorded in-flight unit until it is gone, and tears down the Run's shared
+/// services (ADR-0058). Shared by the operator cancel
+/// ([`cancel_run_request`]) and the inline concurrency auto-cancel
+/// ([`Scheduler::cancel_run`]); both write it in the same commit as each
+/// transition of the cancel, never on its own (red team A3).
+async fn cancel_teardown_intent(
+    _db: &dyn Db,
+    run: &RunId,
+    now: Timestamp,
+) -> Result<OutboxMessage, DbError> {
+    Ok(OutboxMessage {
         id: crate::OutboxId(0),
         run: run.clone(),
         kind: CANCEL_RUN.to_string(),
@@ -1802,7 +1801,6 @@ async fn enqueue_cancel_teardown(db: &dyn Db, run: &RunId, now: Timestamp) -> Re
         idempotency_key: format!("cancel:{}", run.0),
         at: now,
     })
-    .await
 }
 
 async fn reopen(
@@ -1813,7 +1811,7 @@ async fn reopen(
     to: RunStatus,
 ) -> Result<(), RerunError> {
     let now = clock.now().await;
-    match commit_run_transition(db, run, from, to, now, false).await {
+    match commit_run_transition(db, run, from, to, now, false, &[]).await {
         Ok(()) | Err(DbError::Conflict) => Ok(()),
         Err(e) => Err(e.into()),
     }
@@ -1822,8 +1820,9 @@ async fn reopen(
 /// Move `run` `from → to` with its `RunTransitioned` — and, when `notify`,
 /// the exactly-once [`RUN_STATUS_CHANGED`] post for external observers (e.g.
 /// forge commit statuses; the key is unique per (run, state)) — as ONE commit
-/// ([`Db::commit_run_transition`]). `Conflict` = a peer already moved it,
-/// nothing written.
+/// ([`Db::commit_run_transition`]), with any `intents` the transition owes
+/// (a cancel's teardown). `Conflict` = a peer already moved it, nothing
+/// written.
 async fn commit_run_transition(
     db: &dyn Db,
     run: &RunId,
@@ -1831,6 +1830,7 @@ async fn commit_run_transition(
     to: RunStatus,
     now: Timestamp,
     notify: bool,
+    intents: &[OutboxMessage],
 ) -> Result<(), DbError> {
     let events = [event(run, EventPayload::RunTransitioned { from, to }, now)];
     let post = OutboxMessage {
@@ -1841,12 +1841,11 @@ async fn commit_run_transition(
         idempotency_key: format!("status:{}:{to:?}", run.0),
         at: now,
     };
-    let outbox: &[OutboxMessage] = if notify {
-        std::slice::from_ref(&post)
-    } else {
-        &[]
-    };
-    db.commit_run_transition(run, from, to, &events, outbox)
+    let mut outbox: Vec<OutboxMessage> = intents.to_vec();
+    if notify {
+        outbox.push(post);
+    }
+    db.commit_run_transition(run, from, to, &events, &outbox)
         .await
 }
 
@@ -3621,16 +3620,18 @@ impl<'a> Scheduler<'a> {
     /// kill) is the executor's job on the k8s-live path; the durable terminal
     /// state recorded here is the guarantee the control plane owns.
     pub async fn cancel_run(&self, run: &RunId) -> Result<(), SchedulerError> {
-        // The Run's cancel teardown intent, FIRST — the same `cancel_run` an
+        // The Run's cancel teardown intent — the same `cancel_run` an
         // operator cancel writes (review fit-F3), never a supersession: a
         // cancel is not a Superseded attempt (CONTEXT.md). The best-effort
         // cancel below only ASKS each unit to stop; the intent re-cancels
         // until each unit is GONE, and until then keeps a deploy Step's
         // DeploymentTarget held (git-bug f22056d). It also tears down the
         // Run's shared services with retry (ADR-0058), which the inline
-        // `teardown_services` below does only once. Written before any Step
-        // goes terminal, for the reason `cancel_run_request` gives.
-        enqueue_cancel_teardown(self.db, run, self.clock.now().await).await?;
+        // `teardown_services` below does only once. It rides in the same
+        // commit as every transition below, for the reason
+        // `cancel_run_request` gives.
+        let now = self.clock.now().await;
+        let intent = cancel_teardown_intent(self.db, run, now).await?;
         for step in self.db.steps_of_run(run).await? {
             if !step.status.is_terminal() {
                 // Tear down the in-flight execution first (best-effort —
@@ -3640,15 +3641,50 @@ impl<'a> Scheduler<'a> {
                         let _ = self.executor.cancel(&ExecHandle(h)).await;
                     }
                 }
-                self.transition_step(run, &step.step, step.status, StepStatus::Cancelled)
-                    .await?;
+                let transitioned = event(
+                    run,
+                    EventPayload::StepTransitioned {
+                        step: step.step.clone(),
+                        from: step.status,
+                        to: StepStatus::Cancelled,
+                    },
+                    now,
+                );
+                match self
+                    .db
+                    .commit_step_transition(
+                        run,
+                        &step.step,
+                        step.status,
+                        StepStatus::Cancelled,
+                        None,
+                        std::slice::from_ref(&transitioned),
+                        std::slice::from_ref(&intent),
+                    )
+                    .await
+                {
+                    Ok(()) | Err(DbError::Conflict) => {}
+                    Err(e) => return Err(e.into()),
+                }
                 cancel_open_gate_attempt(self.db, run, &step).await?;
             }
         }
         if let Some(current) = self.db.run_status(run).await? {
             if !current.is_terminal() {
-                self.transition_run(run, current, RunStatus::Cancelled)
-                    .await?;
+                match commit_run_transition(
+                    self.db,
+                    run,
+                    current,
+                    RunStatus::Cancelled,
+                    now,
+                    true,
+                    std::slice::from_ref(&intent),
+                )
+                .await
+                {
+                    Ok(()) | Err(DbError::Conflict) => {}
+                    Err(e) => return Err(e.into()),
+                }
             }
         }
         // Tear down shared services (ADR-0058) on cancel too.
@@ -4172,6 +4208,7 @@ impl<'a> Scheduler<'a> {
                 StepStatus::Succeeded,
                 None,
                 &events,
+                &[],
             )
             .await
         {
@@ -4403,6 +4440,7 @@ impl<'a> Scheduler<'a> {
                 StepStatus::Ready,
                 None,
                 &events,
+                &[],
             )
             .await
         {
@@ -4662,6 +4700,7 @@ impl<'a> Scheduler<'a> {
                 to,
                 stamp.as_ref().map(|s| (attempt, s)),
                 &events,
+                &[],
             )
             .await
         {
@@ -4965,7 +5004,7 @@ impl<'a> Scheduler<'a> {
         // The CAS, its journal entry and the exactly-once notification of
         // external observers (forge commit statuses) are one commit.
         let now = self.clock.now().await;
-        match commit_run_transition(self.db, run, from, to, now, true).await {
+        match commit_run_transition(self.db, run, from, to, now, true, &[]).await {
             Ok(()) | Err(DbError::Conflict) => Ok(()),
             Err(e) => Err(e.into()),
         }
@@ -5007,7 +5046,7 @@ impl<'a> Scheduler<'a> {
             .collect();
         match self
             .db
-            .commit_step_transition(run, step, from, to, None, &events)
+            .commit_step_transition(run, step, from, to, None, &events, &[])
             .await
         {
             Ok(()) => Ok(()),

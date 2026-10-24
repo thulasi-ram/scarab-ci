@@ -5671,6 +5671,7 @@ async fn persist_run_from_ir(
                 StepStatus::Skipped,
                 None,
                 std::slice::from_ref(&transitioned),
+                &[],
             )
             .await?;
         }

@@ -1588,6 +1588,7 @@ impl Db for PostgresDb {
         to: StepStatus,
         stamp: Option<(&AttemptId, &scarab_engine::AttemptStamp)>,
         events: &[EventKind],
+        outbox: &[OutboxMessage],
     ) -> Result<(), DbError> {
         // ONE transaction (git-bug 586187a): the CAS takes the step row's
         // lock first, so a peer's competing CAS waits and then sees the
@@ -1610,6 +1611,9 @@ impl Db for PostgresDb {
         }
         for event in events {
             insert_event(&mut *tx, event).await?;
+        }
+        for msg in outbox {
+            insert_outbox(&mut *tx, msg).await?;
         }
         tx.commit().await.map_err(db_err)
     }

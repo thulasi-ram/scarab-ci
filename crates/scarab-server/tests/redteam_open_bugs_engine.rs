@@ -528,7 +528,6 @@ async fn a_cancel_failing_after_its_intent_neither_kills_a_live_run_nor_orphans(
 }
 
 #[tokio::test]
-#[ignore = "redteam: BROKE failed cancel's pre-written intent kills the live attempt; Lost->retry a2; re-sent cancel dedups — a2 orphaned + unheld"]
 async fn a_cancel_failing_after_its_intent_neither_kills_a_live_run_nor_orphans_inmemory() {
     a_cancel_failing_after_its_intent_neither_kills_a_live_run_nor_orphans(
         World::inmemory(Some(1)).await,
@@ -636,7 +635,6 @@ async fn a_step_claimed_mid_cancel_still_holds_its_target() {
 // then re-armed by the retry path: the "failed" rerun half-happens.
 // ---------------------------------------------------------------------------
 #[tokio::test]
-#[ignore = "redteam: BROKE rerun failing after its supersede intent: the intent kills live a1 and its self-inflicted Lost is recorded as a real failure"]
 async fn a_rerun_failing_after_its_teardown_intent_does_not_fail_the_run() {
     let w = World::inmemory(None).await;
     w.seed_deploy("ra", None).await;
@@ -662,7 +660,12 @@ async fn a_rerun_failing_after_its_teardown_intent_does_not_fail_the_run() {
     assert_eq!(w.step("ra", "bump").await.status, StepStatus::Running);
     w.ticks(1).await;
     let killed = w.torn_down(&handle("ra", "bump", "a1"));
-    w.exec.kill(ExecHandle(handle("ra", "bump", "a1")));
+    // On k8s a torn-down Pod is then reported Lost. Only a torn-down one: a
+    // Pod nobody deleted keeps running (fix round 2 — the unconditional kill
+    // modelled an independent node loss, which IS a real failure).
+    if killed {
+        w.exec.kill(ExecHandle(handle("ra", "bump", "a1")));
+    }
     w.ticks(2).await;
     let bump = w.step("ra", "bump").await;
     let a1 = bump.attempts.iter().find(|a| a.id.0 == "a1").unwrap();
