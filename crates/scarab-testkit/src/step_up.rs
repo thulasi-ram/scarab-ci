@@ -8,7 +8,7 @@
 //! Each store is one lock, so every "atomic" here is trivially so.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aes_gcm::aead::{Aead, Payload};
@@ -521,6 +521,7 @@ impl StepUpStore for InMemoryStepUp {
 pub struct InMemorySecurityEvents {
     events: Mutex<Vec<SecurityEvent>>,
     rbac: Option<Arc<dyn RbacStore>>,
+    failing: AtomicBool,
 }
 
 impl InMemorySecurityEvents {
@@ -534,6 +535,12 @@ impl InMemorySecurityEvents {
         self
     }
 
+    /// Fault injection: while `on`, every append fails (an unreachable log),
+    /// so a test can prove what must not happen unlogged does not.
+    pub fn fail_appends(&self, on: bool) {
+        self.failing.store(on, Ordering::SeqCst);
+    }
+
     /// Every event, oldest first (a test's view).
     pub fn all(&self) -> Vec<SecurityEvent> {
         self.events.lock().unwrap().clone()
@@ -543,6 +550,11 @@ impl InMemorySecurityEvents {
 #[async_trait]
 impl SecurityEventLog for InMemorySecurityEvents {
     async fn append(&self, event: &SecurityEvent) -> Result<i64, IdentityError> {
+        if self.failing.load(Ordering::SeqCst) {
+            return Err(IdentityError::Conflict(
+                "the security event log is unreachable (injected)".into(),
+            ));
+        }
         let mut events = self.events.lock().unwrap();
         if events.iter().any(|e| e.id == event.id) {
             return Err(IdentityError::Conflict(format!(

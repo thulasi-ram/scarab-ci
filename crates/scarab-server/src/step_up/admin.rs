@@ -243,12 +243,12 @@ pub async fn reset_passkeys(
         .await
         .map_err(|e| format!("could not resolve `{principal}`: {e}"))?
         .ok_or_else(|| format!("no principal `{principal}` exists"))?;
-    let removed = PasskeyStore::remove_all(db, &subject)
+    // Logged first, or not done: the reset is recorded with what it is
+    // about to remove, and nothing is removed if it cannot be recorded.
+    let held = PasskeyStore::list(db, &subject)
         .await
-        .map_err(|e| format!("could not remove the passkeys of `{subject}`: {e}"))?;
-    let windows_revoked = StepUpStore::delete_windows_for(db, &subject)
-        .await
-        .map_err(|e| format!("could not revoke the step-ups of `{subject}`: {e}"))?;
+        .map_err(|e| format!("could not list the passkeys of `{subject}`: {e}"))?
+        .len() as u64;
     let mut ev = event(
         kind::PASSKEY_BREAK_GLASS_RESET,
         &subject,
@@ -263,15 +263,20 @@ pub async fn reset_passkeys(
         "reason": reason,
         "host": operator.host,
         "os_user": operator.os_user,
-        "removed": removed,
-        "windows_revoked": windows_revoked,
+        "removed": held,
     });
     SecurityEventLog::append(db, &ev).await.map_err(|e| {
         format!(
-            "removed {removed} passkey(s) of `{subject}`, but the reset could NOT be recorded \
-             in the security event log: {e}"
+            "the reset could not be recorded in the security event log, so nothing was \
+             removed: {e}"
         )
     })?;
+    let removed = PasskeyStore::remove_all(db, &subject)
+        .await
+        .map_err(|e| format!("could not remove the passkeys of `{subject}`: {e}"))?;
+    let windows_revoked = StepUpStore::delete_windows_for(db, &subject)
+        .await
+        .map_err(|e| format!("could not revoke the step-ups of `{subject}`: {e}"))?;
     Ok(PasskeyResetDto {
         subject,
         removed,
