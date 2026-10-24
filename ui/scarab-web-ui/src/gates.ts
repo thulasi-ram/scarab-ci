@@ -247,3 +247,41 @@ export function gateWaitHint(s: GateStatusLike, statusOf: (step: string) => stri
       return "waiting for a decision";
   }
 }
+
+// --- The dashboard's action inbox (git-bug c489346) --------------------------
+// A waiting gate holds only its dependents (ADR-0070 §9): a Run whose gate is
+// reached while an independent sibling still runs stays `running`. So "this
+// run waits on a gate" is the server's `waiting_gates` (gate steps Pending,
+// reached, with an open Attempt), never `status === "suspended"`.
+
+/** A run's waiting gate as the run list sends it (`WaitingGateDto`). */
+export type WaitingGateLike = { step: string; kind: string; since: number };
+
+/** The run-list shape the inbox needs (`RunSummaryDto`). */
+export type InboxRunLike = { status: string; waiting_gates?: WaitingGateLike[] | null };
+
+/** The runs that wait on a gate, in list order. A `suspended` run counts too —
+ * suspension means only gate waits remain, and an older server sends no
+ * `waiting_gates`. */
+export function inboxRuns<T extends InboxRunLike>(runs: readonly T[]): T[] {
+  return runs.filter((r) => (r.waiting_gates?.length ?? 0) > 0 || r.status === "suspended");
+}
+
+/** The inbox row's verb: `approve` when a manual gate waits (the one kind a
+ * human approves), else `review` (a rejectable timer/external/deployment
+ * wait). */
+export function inboxVerb(r: InboxRunLike): "approve" | "review" {
+  const gates = r.waiting_gates ?? [];
+  if (gates.length === 0) return "approve"; // suspended, gates unknown: as before
+  return gates.some((g) => g.kind === "manual") ? "approve" : "review";
+}
+
+/** The inbox row's detail line: which gates wait, and whether the run is
+ * still running beside them. */
+export function inboxDetail(r: InboxRunLike): string {
+  const gates = r.waiting_gates ?? [];
+  if (gates.length === 0) return "suspended on a gate · waiting for a decision";
+  const names = gates.map((g) => `${g.step} (${g.kind})`).join(", ");
+  const what = `${gates.length === 1 ? "gate" : "gates"} ${names} waiting`;
+  return r.status === "running" ? `${what} · other steps still running` : what;
+}

@@ -1124,6 +1124,55 @@ pub struct RunSummaryDto {
     /// deploy run, whose pipeline declared `environment:`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub environment: Option<String>,
+    /// The run's **waiting gates** (git-bug `c489346`): gate steps that are
+    /// `Pending`, reached (every need `Succeeded`) and have an open Attempt —
+    /// the engine's "waiting gate". Since a waiting gate holds only its
+    /// dependents (ADR-0070 §9), a Run with one can still be `running` while
+    /// independent steps run, so this — not `status == suspended` — is what
+    /// says a Run waits on a gate. Omitted when empty (and always for a
+    /// terminal or queued Run).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waiting_gates: Vec<WaitingGateDto>,
+}
+
+/// One waiting gate of a run in the list view ([`RunSummaryDto::waiting_gates`]).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct WaitingGateDto {
+    /// The gate step's id.
+    pub step: String,
+    /// The gate kind: `manual` / `timer` / `external` / `deployment`.
+    pub kind: String,
+    /// When its wait opened (epoch millis): its open Attempt's start.
+    pub since: i64,
+}
+
+/// The list view's runs, each with its waiting gates. Steps are read only for
+/// a `Running` or `Suspended` run — the only ones that can have a waiting gate.
+async fn run_summaries(
+    st: &AppState,
+    runs: Vec<scarab_engine::RunSummary>,
+) -> Result<Vec<RunSummaryDto>, ApiError> {
+    let mut out = Vec::with_capacity(runs.len());
+    for r in runs {
+        let active = matches!(r.status, RunStatus::Running | RunStatus::Suspended);
+        let run = r.run.clone();
+        let mut dto = RunSummaryDto::from(r);
+        if active {
+            let steps = st.db.steps_of_run(&run).await?;
+            dto.waiting_gates = run_gate_view::waiting_gates(&steps)
+                .into_iter()
+                .filter_map(|s| {
+                    Some(WaitingGateDto {
+                        step: s.step.0.clone(),
+                        kind: s.gate_kind.clone()?,
+                        since: s.attempts.last()?.started_at.0,
+                    })
+                })
+                .collect();
+        }
+        out.push(dto);
+    }
+    Ok(out)
 }
 
 impl From<scarab_engine::RunSummary> for RunSummaryDto {
@@ -1148,6 +1197,7 @@ impl From<scarab_engine::RunSummary> for RunSummaryDto {
             pipeline: s.pipeline,
             trigger_title: s.trigger_title,
             environment: s.environment,
+            waiting_gates: Vec::new(),
         }
     }
 }
@@ -2141,7 +2191,7 @@ async fn list_runs(
         runs = visible;
     }
     Ok(Json(RunListResponse {
-        runs: runs.into_iter().map(RunSummaryDto::from).collect(),
+        runs: run_summaries(&st, runs).await?,
     }))
 }
 
@@ -3326,7 +3376,7 @@ async fn list_repo_runs(
     let limit = q.limit.unwrap_or(DEFAULT_RUNS_LIMIT).min(MAX_RUNS_LIMIT);
     let runs = st.db.list_runs_for_tenant(&org, &repo, limit).await?;
     Ok(Json(RunListResponse {
-        runs: runs.into_iter().map(RunSummaryDto::from).collect(),
+        runs: run_summaries(&st, runs).await?,
     }))
 }
 
@@ -10940,6 +10990,7 @@ impl utoipa::Modify for StepUpResponses {
         CreateRunResponse,
         RunListResponse,
         RunSummaryDto,
+        WaitingGateDto,
         RunStatusResponse,
         SnapshotRetentionDto,
         RerunPlanResponse,

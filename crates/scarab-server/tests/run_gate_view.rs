@@ -7,7 +7,11 @@
 //! - a deploy Step held by per-DeploymentTarget concurrency carries `held`,
 //!   the oracle's reason — never while its Run is still queued (`Pending`);
 //! - a Deployment record that cannot be read is said so
-//!   (`record_unreadable`), never shown as "no Deployment recorded yet".
+//!   (`record_unreadable`), never shown as "no Deployment recorded yet";
+//! - a waiting DeploymentGate says when it fails (`fails_at`), on the
+//!   engine's clock;
+//! - `GET /v1/runs` lists each Run's waiting gates (`waiting_gates`), even
+//!   while the Run is `running`.
 //!
 //! No kind: steps run on the `FakeExecutor`, reports go through
 //! `DeploymentStore::append`, the scheduler is ticked by hand with the
@@ -312,6 +316,28 @@ impl World {
             .unwrap();
     }
 
+    /// `run`'s row in `GET /v1/runs`.
+    async fn run_summary(&self, run: &str) -> Value {
+        let resp = self
+            .app
+            .clone()
+            .oneshot(Request::builder().uri("/v1/runs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        body["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == run)
+            .unwrap_or_else(|| panic!("no run {run} in {body}"))
+            .clone()
+    }
+
     /// `GET /v1/runs/{run}`'s DTO of `step`.
     async fn step_dto(&self, run: &str, step: &str) -> Value {
         let resp = self
@@ -507,6 +533,48 @@ both!(
     a_retried_gate_fails_at_its_own_deadline_not_the_deployments,
     None
 );
+
+/// git-bug `c489346`: a waiting gate holds only its dependents (ADR-0070 §9),
+/// so a manual gate reached while an independent sibling still runs leaves
+/// the Run `running`. The run list says it waits on that gate anyway —
+/// `waiting_gates` — which is what the dashboard's "waiting on you" inbox
+/// filters on, not `status == suspended`.
+async fn a_running_run_lists_the_gate_it_waits_on(w: World) {
+    let run = rid("rm");
+    let now = w.clock.now().await;
+    w.db.create_run(&run, 2, 1, now).await.unwrap();
+    w.db.create_step_run(&run, &id("slow"), Some(&spec()), &[], now)
+        .await
+        .unwrap();
+    w.db.create_step_run(&run, &id("approve"), None, &[], now)
+        .await
+        .unwrap();
+    w.db.set_step_gate(&run, &id("approve"), "manual", None)
+        .await
+        .unwrap();
+    // The unscripted FakeExecutor keeps `slow` Running.
+    w.ticks(3).await;
+    assert_eq!(w.step("rm", "slow").await.status, StepStatus::Running);
+    let gate = w.step("rm", "approve").await;
+    assert_eq!(gate.status, StepStatus::Pending);
+    let opened = gate.attempts.last().expect("the reached gate has an Attempt");
+    assert_eq!(opened.outcome, AttemptOutcome::Running);
+    assert_eq!(
+        w.db.run_status(&run).await.unwrap(),
+        Some(RunStatus::Running),
+        "the gate holds only its dependents; the run is not suspended"
+    );
+
+    let listed = w.run_summary("rm").await;
+    assert_eq!(listed["status"], "running", "{listed}");
+    assert_eq!(
+        listed["waiting_gates"],
+        json!([{ "step": "approve", "kind": "manual", "since": opened.started_at.0 }]),
+        "{listed}"
+    );
+    w.finish().await;
+}
+both!(a_running_run_lists_the_gate_it_waits_on, None);
 
 /// Limit 1: while A deploys to `argocd`/`web`, B's deploy step is held, and
 /// its DTO says why with the oracle's reason; A's is not held.

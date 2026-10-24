@@ -3796,6 +3796,16 @@ export interface components {
              *     trigger carried no headline and on runs created before headline-stamping.
              */
             trigger_title?: string | null;
+            /**
+             * @description The run's **waiting gates** (git-bug `c489346`): gate steps that are
+             *     `Pending`, reached (every need `Succeeded`) and have an open Attempt —
+             *     the engine's "waiting gate". Since a waiting gate holds only its
+             *     dependents (ADR-0070 §9), a Run with one can still be `running` while
+             *     independent steps run, so this — not `status == suspended` — is what
+             *     says a Run waits on a gate. Omitted when empty (and always for a
+             *     terminal or queued Run).
+             */
+            waiting_gates?: components["schemas"]["WaitingGateDto"][];
         };
         /**
          * @description What the plugin runtime last observed of the workload.
@@ -4262,6 +4272,18 @@ export interface components {
              */
             reports: number;
             vendor_grouping: string;
+        };
+        /** @description One waiting gate of a run in the list view ([`RunSummaryDto::waiting_gates`]). */
+        WaitingGateDto: {
+            /** @description The gate kind: `manual` / `timer` / `external` / `deployment`. */
+            kind: string;
+            /**
+             * Format: int64
+             * @description When its wait opened (epoch millis): its open Attempt's start.
+             */
+            since: number;
+            /** @description The gate step's id. */
+            step: string;
         };
         /** @description A WebAuthn challenge ready for `navigator.credentials.*`. */
         WebauthnChallengeDto: {

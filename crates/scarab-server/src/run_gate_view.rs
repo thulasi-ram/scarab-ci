@@ -56,6 +56,19 @@ fn is_waiting_gate(s: &StepRun, status_of: &HashMap<&str, StepStatus>) -> bool {
         && s.attempts.last().map(|a| a.outcome) == Some(AttemptOutcome::Running)
 }
 
+/// The waiting gates of a run's `steps` ([`is_waiting_gate`]), in step order
+/// — what the run list says a Run waits on (git-bug `c489346`).
+pub(crate) fn waiting_gates(steps: &[StepRun]) -> Vec<&StepRun> {
+    let status_of: HashMap<&str, StepStatus> = steps
+        .iter()
+        .map(|s| (s.step.0.as_str(), s.status))
+        .collect();
+    steps
+        .iter()
+        .filter(|s| is_waiting_gate(s, &status_of))
+        .collect()
+}
+
 fn needs_met(s: &StepRun, status_of: &HashMap<&str, StepStatus>) -> bool {
     s.needs
         .iter()

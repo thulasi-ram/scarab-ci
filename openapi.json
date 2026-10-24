@@ -9546,6 +9546,13 @@
               "null"
             ],
             "description": "The run **Headline** (ADR-0057) — the one human line saying what this run\nis about (a push's commit subject; later a PR title / dispatch reason),\ndisambiguated by the trigger kind. Display/audit only; absent when the\ntrigger carried no headline and on runs created before headline-stamping."
+          },
+          "waiting_gates": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WaitingGateDto"
+            },
+            "description": "The run's **waiting gates** (git-bug `c489346`): gate steps that are\n`Pending`, reached (every need `Succeeded`) and have an open Attempt —\nthe engine's \"waiting gate\". Since a waiting gate holds only its\ndependents (ADR-0070 §9), a Run with one can still be `running` while\nindependent steps run, so this — not `status == suspended` — is what\nsays a Run waits on a gate. Omitted when empty (and always for a\nterminal or queued Run)."
           }
         }
       },
@@ -10401,6 +10408,30 @@
           },
           "vendor_grouping": {
             "type": "string"
+          }
+        }
+      },
+      "WaitingGateDto": {
+        "type": "object",
+        "description": "One waiting gate of a run in the list view ([`RunSummaryDto::waiting_gates`]).",
+        "required": [
+          "step",
+          "kind",
+          "since"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "The gate kind: `manual` / `timer` / `external` / `deployment`."
+          },
+          "since": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When its wait opened (epoch millis): its open Attempt's start."
+          },
+          "step": {
+            "type": "string",
+            "description": "The gate step's id."
           }
         }
       },

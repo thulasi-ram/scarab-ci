@@ -17,6 +17,7 @@
 import type { components } from "./api/schema";
 
 type RunStatusDto = components["schemas"]["RunStatusResponse"];
+type RunSummaryDto = components["schemas"]["RunSummaryDto"];
 type ArtifactDto = components["schemas"]["ArtifactDto"];
 type ServiceStatusDto = components["schemas"]["ServiceStatusDto"];
 type DeploymentDto = components["schemas"]["DeploymentDto"];
@@ -122,8 +123,10 @@ const projects = [
   proj("scarab-infra", null),
 ];
 
-// ── /v1/runs (dashboard inbox = 2 suspended) ────────────────────────────────
-const summary = (o: Record<string, unknown>) => ({
+// ── /v1/runs (dashboard inbox = 2 suspended + 1 running with a reached gate) ─
+const summary = (
+  o: Partial<RunSummaryDto> & Pick<RunSummaryDto, "id" | "status">,
+): RunSummaryDto => ({
   duration_ms: 0,
   created_at: ago(60000),
   ...o,
@@ -135,6 +138,7 @@ const runs = [
     org: "acme",
     project: "scarab",
     created_at: ago(12 * 60000),
+    waiting_gates: [{ step: "approve", kind: "manual", since: ago(10 * 60000) }],
   }),
   summary({
     id: "01984f22bb334d8e9a1122cd44ef6600",
@@ -142,8 +146,29 @@ const runs = [
     org: "acme",
     project: "billing",
     created_at: ago(27 * 60000),
+    waiting_gates: [{ step: "release", kind: "manual", since: ago(20 * 60000) }],
+  }),
+  // git-bug c489346: a gate holds only its dependents, so this run is still
+  // `running` (its `version` sibling runs) while its `approve` gate waits.
+  summary({
+    id: "01984f35cc445e9fab2233de55f07711",
+    status: "running",
+    org: "acme",
+    project: "orders-api",
+    created_at: ago(6 * 60000),
+    waiting_gates: [{ step: "approve", kind: "manual", since: ago(4 * 60000) }],
+  }),
+  // A running run with no reached gate: not in the inbox.
+  summary({
+    id: "01984f40dd556fa0bc3344ef66018822",
+    status: "running",
+    org: "acme",
+    project: "inventory-svc",
+    created_at: ago(2 * 60000),
   }),
 ];
+/** The `/v1/runs` fixture, for no-DOM tests of what the dashboard derives. */
+export { runs as mockRuns };
 
 // ── per-repo run strips (dashboard cards) — status+duration_ms drive bars ────
 // Tune succeeded/failed ratios to the "N% pass" shown per card.
