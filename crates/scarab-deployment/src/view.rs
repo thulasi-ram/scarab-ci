@@ -15,7 +15,7 @@
 //! same whether the whole Environment, one DeploymentTarget, or (later) the
 //! whole Org is folded.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     DeploymentInput, DeploymentLedger, DeploymentRequester, DeploymentStatus,
@@ -32,6 +32,9 @@ pub struct DeploymentRequesterView {
     /// started after core first saw that Deployment, so it did not make it
     /// live and does not explain it (see "Explanation" in the crate docs).
     pub claim: bool,
+    /// The evidence its latest request carried (image digests, typically) —
+    /// display only; the fold never reads it.
+    pub evidence: Vec<String>,
 }
 
 /// One stage of a Deployment as reported: the report as the fold holds it
@@ -103,6 +106,55 @@ impl EnvironmentDeployments {
     }
 }
 
+/// One Environment's log folded into a [`DeploymentLedger`], with each
+/// Deployment's **public id** (the seq of the input that created it — see the
+/// module docs). What a DeploymentGate's verdict is read from
+/// ([`Deployment::gate_decision_from`](crate::Deployment::gate_decision_from)):
+/// unlike [`EnvironmentDeployments`] it keeps the ledger, so a gate can ask
+/// about a requester's own request window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoldedLedger {
+    ledger: DeploymentLedger,
+    /// Indexed by ledger position: the seq of the input that created it.
+    created_by: Vec<u64>,
+}
+
+impl FoldedLedger {
+    pub fn ledger(&self) -> &DeploymentLedger {
+        &self.ledger
+    }
+
+    /// The public id of `d`, a Deployment of this ledger.
+    pub fn public_id(&self, d: &crate::Deployment) -> u64 {
+        self.created_by[d.id.0 as usize]
+    }
+
+    /// The Deployment of this ledger with ledger id `id`.
+    pub fn get(&self, id: crate::DeploymentId) -> Option<&crate::Deployment> {
+        self.ledger.get(id)
+    }
+}
+
+/// Fold `inputs` — one Environment's log, in seq order — into a
+/// [`FoldedLedger`]. Time-independent: the fold never reads `now`; a
+/// verdict or a status is asked of the result.
+pub fn fold_ledger(inputs: &[LoggedDeploymentInput]) -> FoldedLedger {
+    debug_assert!(
+        inputs.windows(2).all(|w| w[0].seq < w[1].seq),
+        "inputs must be in strictly increasing seq order"
+    );
+    let mut ledger = DeploymentLedger::new();
+    let mut created_by = Vec::new();
+    for logged in inputs {
+        let before = ledger.deployments().len();
+        ledger.apply(logged.input.clone());
+        if ledger.deployments().len() > before {
+            created_by.push(logged.seq);
+        }
+    }
+    FoldedLedger { ledger, created_by }
+}
+
 /// Fold `inputs` — one Environment's log, in seq order — into its
 /// Deployments and board as of `now`, under `deadline` (the
 /// EnvironmentDeploymentDeadline).
@@ -132,6 +184,11 @@ pub fn fold_environment(
     // reports landed — i.e. index for index with that Deployment's `reports`.
     let mut report_source_ats: Vec<Vec<Option<Millis>>> = Vec::new();
     let mut reported_targets: BTreeSet<&DeploymentTarget> = BTreeSet::new();
+    // Indexed the same way: each requester's latest evidence. The fold keeps
+    // only a requester's latest mark (a retried Step replaces its own), and
+    // the evidence follows the same rule — but it is kept beside the fold, not
+    // in it, so it can never influence a Deployment's identity or status.
+    let mut evidence: Vec<BTreeMap<&DeploymentRequester, &[String]>> = Vec::new();
     for logged in inputs {
         if let DeploymentInput::Report { target, .. } = &logged.input {
             reported_targets.insert(target);
@@ -141,6 +198,15 @@ pub fn fold_environment(
         if ledger.deployments().len() > before {
             created_by.push(logged.seq);
             report_source_ats.push(Vec::new());
+            evidence.push(BTreeMap::new());
+        }
+        if let DeploymentInput::Request {
+            requester,
+            evidence: e,
+            ..
+        } = &logged.input
+        {
+            evidence[landed.0 as usize].insert(requester, e);
         }
         if matches!(logged.input, DeploymentInput::Report { .. }) {
             report_source_ats[landed.0 as usize].push(logged.report_source_at);
@@ -150,8 +216,8 @@ pub fn fold_environment(
     let views: Vec<DeploymentView> = ledger
         .deployments()
         .iter()
-        .zip(created_by.iter().zip(&report_source_ats))
-        .map(|(d, (&id, source_ats))| {
+        .zip(created_by.iter().zip(&report_source_ats).zip(&evidence))
+        .map(|(d, ((&id, source_ats), evidence))| {
             let mut requesters: Vec<_> = d.requesters.iter().collect();
             requesters.sort_by_key(|(_, mark)| mark.seq);
             DeploymentView {
@@ -165,6 +231,7 @@ pub fn fold_environment(
                         requester: r.clone(),
                         effective_at: mark.effective_at,
                         claim: mark.claim,
+                        evidence: evidence.get(r).map(|e| e.to_vec()).unwrap_or_default(),
                     })
                     .collect(),
                 reports: d

@@ -115,6 +115,7 @@ fn request(environment: &str, id: &str, version: &str) -> DeploymentInput {
         },
         effective_at: 0,
         at: 0,
+        evidence: Vec::new(),
     }
 }
 
@@ -747,6 +748,20 @@ impl DeploymentStore for OneEmptyEnvironment {
         scarab_deployment::DeploymentStoreError,
     > {
         Ok(vec![])
+    }
+    async fn inputs_as_of(
+        &self,
+        _: &str,
+        _: &str,
+        now: scarab_deployment::Millis,
+    ) -> Result<
+        (
+            Vec<scarab_deployment::LoggedDeploymentInput>,
+            scarab_deployment::Millis,
+        ),
+        scarab_deployment::DeploymentStoreError,
+    > {
+        Ok((vec![], now + 1))
     }
     async fn environments(
         &self,

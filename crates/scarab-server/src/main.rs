@@ -714,6 +714,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(Arc::new(scarab_server::retention::CasSnapshots(
                     widening_cas.clone().unwrap_or_else(|| workspace_cas.clone()),
                 ))),
+                // DeploymentGates (ADR-0070 §8): core resolves them from the
+                // Deployment input log, with the deadline the run's Project
+                // has in its Environment (ADR-0071 §3).
+                Some(scarab_server::deployment_gates::ServerDeploymentGates::new(
+                    db.clone(),
+                    pg.clone(),
+                    Some(pg.clone()),
+                )),
                 Some(forge.clone()),
                 // Feed the log pipeline from the executor's live tail (ADR-0013).
                 Some(logs.clone()),

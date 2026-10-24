@@ -12,6 +12,7 @@ import {
   tryTitle,
   tryOutcome,
   tryTone,
+  failureLabel,
   type AttemptLike,
   type FilmstripTry,
 } from "./attempts";
@@ -160,6 +161,14 @@ describe("try mappers (AttemptsDropdown copy)", () => {
     expect(tryOutcome(t({ outcome: "failed" }))).toBe("✗ failed");
     expect(tryOutcome(t({ outcome: "superseded" }))).toBe("⊘ superseded");
     expect(tryOutcome(t({ outcome: "cancelled" }))).toBe("⊘ cancelled");
+  });
+
+  it("tryOutcome spells out a DeploymentRequest that its results could not complete", () => {
+    expect(tryOutcome(t({ outcome: "failed", failure: "deployment-request-incomplete" }))).toBe(
+      "✗ failed · DeploymentRequest incomplete",
+    );
+    // An unknown class (a newer server's) still shows, as its token.
+    expect(failureLabel("brand-new-class")).toBe("brand-new-class");
   });
 
   it("tryOutcome falls back to derived flags on old servers (no outcome)", () => {

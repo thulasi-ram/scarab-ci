@@ -30,6 +30,7 @@ fn request(seq: u64, t: &str, v: &str, run: &str, at: Millis) -> LoggedDeploymen
             },
             effective_at: at,
             at,
+            evidence: Vec::new(),
         },
         report_source_at: None,
     }
@@ -282,4 +283,61 @@ fn an_empty_log_folds_to_nothing() {
     assert!(env.deployments.is_empty());
     assert!(env.board.is_empty());
     assert_eq!(env.get(1), None);
+}
+
+/// Evidence (slice b, criterion 1) rides with a request and is shown, never
+/// folded: two requests that differ only in their evidence land exactly
+/// alike, and the view shows each requester's latest evidence.
+#[test]
+fn evidence_is_shown_per_requester_and_never_changes_the_fold() {
+    let with_evidence = |mut logged: LoggedDeploymentInput, e: &[&str]| {
+        if let DeploymentInput::Request { evidence, .. } = &mut logged.input {
+            *evidence = e.iter().map(|s| s.to_string()).collect();
+        }
+        logged
+    };
+    let bare = vec![
+        request(1, "web", "v1", "r1", 10),
+        request(2, "web", "v1", "r1", 12),
+        request(3, "web", "v1", "r2", 13),
+    ];
+    let evidenced = vec![
+        with_evidence(request(1, "web", "v1", "r1", 10), &["sha256:old"]),
+        with_evidence(
+            request(2, "web", "v1", "r1", 12),
+            &["sha256:aaa", "sha256:bbb"],
+        ),
+        request(3, "web", "v1", "r2", 13),
+    ];
+    let a = fold_environment(&bare, 20, DEADLINE);
+    let b = fold_environment(&evidenced, 20, DEADLINE);
+    let strip = |mut e: EnvironmentDeployments| {
+        for d in &mut e.deployments {
+            for r in &mut d.requesters {
+                r.evidence.clear();
+            }
+        }
+        for row in &mut e.board {
+            for d in row.live.iter_mut().chain(row.newest.iter_mut()) {
+                for r in &mut d.requesters {
+                    r.evidence.clear();
+                }
+            }
+        }
+        e
+    };
+    assert_eq!(
+        strip(b.clone()),
+        a,
+        "evidence never changes identity or status"
+    );
+
+    let d = &b.deployments[0];
+    assert_eq!(d.requesters.len(), 2);
+    assert_eq!(
+        d.requesters[0].evidence,
+        vec!["sha256:aaa".to_string(), "sha256:bbb".to_string()],
+        "a retried requester shows its latest request's evidence"
+    );
+    assert!(d.requesters[1].evidence.is_empty());
 }

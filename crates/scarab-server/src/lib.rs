@@ -60,6 +60,7 @@ pub mod clone_executor;
 pub mod config;
 pub mod connections_config;
 pub mod converged;
+pub mod deployment_gates;
 pub mod depot_expiry;
 pub mod forge_router;
 pub mod infra_observer;
@@ -77,6 +78,9 @@ pub mod plugins;
 /// ADR-0072 §9: the plugin runtime's leased reconcile loop — namespace
 /// baseline, isolation probe, one workload per installation.
 pub mod plugin_runtime;
+/// Slice b, criterion 5: the Run page's gate resolution, DeploymentGate and
+/// concurrency-hold facts per step.
+mod run_gate_view;
 pub mod retention;
 pub mod secret_executor;
 /// `--role workspace`: the ADR-0061 workspace service. Its own router, its own
@@ -740,6 +744,20 @@ pub struct StepDto {
     /// this step reaches over the network (DNS `<name>:<port>` + readiness gate).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub uses: Vec<String>,
+    /// NOT part of the inline IR subset: read only so [`create_run`] can
+    /// refuse a step that declares DeploymentRequests (slice b) instead of
+    /// silently dropping them — they need a Deploy Run (a repo pipeline with
+    /// `environment:`). Never serialized into the stored IR; not in the schema.
+    #[serde(default, skip_serializing)]
+    #[schema(ignore)]
+    pub deployment_requests: Option<serde_json::Value>,
+    /// NOT part of the inline IR subset: read only so [`create_run`] can
+    /// refuse a `gate: deployment` step (a DeploymentGate needs a Deploy
+    /// Run's DeploymentRequest to wait on). Never serialized; not in the
+    /// schema.
+    #[serde(default, skip_serializing)]
+    #[schema(ignore)]
+    pub gate: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1164,10 +1182,29 @@ pub struct StepStatusDto {
     /// UI folds these into the run's graph view.
     #[serde(default)]
     pub needs: Vec<String>,
-    /// `manual`/`timer`/`external` if this step is a gate (ADR-0008), else absent.
-    /// Gates launch no pod and suspend the run until released.
+    /// `manual`/`timer`/`external`/`deployment` if this step is a gate
+    /// (ADR-0008, ADR-0070 §8), else absent. Gates launch no pod; a waiting
+    /// gate holds only the steps that need it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gate: Option<String>,
+    /// How this gate's latest wait resolved — its latest `GateResolved` in
+    /// the run's journal, never re-derived. Absent for a step that is not a
+    /// gate or a gate that has never resolved. A gate re-armed since (a
+    /// retry or rerun) keeps showing the old verdict here; compare `attempt`
+    /// with the latest of `attempt_list` to tell.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate_resolution: Option<GateResolutionDto>,
+    /// For a `deployment` gate that is waiting right now: the
+    /// DeploymentTarget it waits on and where its Deployment stands. Display
+    /// only — the verdict is core's (ADR-0070 §8). Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment_gate: Option<DeploymentGateDto>,
+    /// Why this deploy Step is held `pending` by per-DeploymentTarget
+    /// concurrency (ADR-0071 §9), e.g. "held: waiting for deployment
+    /// concurrency on `argocd`/`web` (1/1 in flight)". Derived each read
+    /// (nothing is journalled per scheduler pass). Absent when not held.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub held: Option<String>,
     /// Co-located sidecar services (ADR-0058) this step declares — rendered as
     /// sidecar nodes attached to the step, each with its own log stream (fetched
     /// via `?sidecar=<index>` on the step-logs endpoint). Empty for a step with
@@ -1178,6 +1215,56 @@ pub struct StepStatusDto {
     /// (ADR-0058) — the DAG's service edges. Empty for a step that uses none.
     #[serde(default)]
     pub uses: Vec<String>,
+}
+
+/// How a gate's wait resolved: its `GateResolved` journal entry.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GateResolutionDto {
+    /// `true`: the gate passed and its dependents may run.
+    pub passed: bool,
+    /// Why — a timer elapsing, a DeploymentGate's "v1 live on …", the
+    /// source's failure label, a rejection's reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Unix-ms the verdict was journalled.
+    pub at: i64,
+    /// The gate Attempt the verdict closed (`a1`, `a2`, …).
+    pub attempt: String,
+    /// Who rejected it, for a rejection by request (`external:{step}` for an
+    /// external gate's token). Absent for a verdict the engine reached.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+    /// The Deployment a DeploymentGate's verdict was read from (its
+    /// Org-scoped id, as the Deployments view shows it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment_id: Option<u64>,
+}
+
+/// A waiting DeploymentGate: the DeploymentTarget it waits on and, once its
+/// requester's DeploymentRequest is in the record, where that Deployment
+/// stands (as the Deployments view folds it).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DeploymentGateDto {
+    pub environment: String,
+    pub target_source: String,
+    pub target_id: String,
+    /// The Deployment the requester's current request landed on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment_status: Option<DeploymentStatusDto>,
+    /// The DeploymentVersion asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// The latest source report's label, when it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_label: Option<String>,
+    /// `true` when the Deployment record could not be read for this view (a
+    /// store error, logged): the Deployment fields are then absent because
+    /// they are unknown, not because no Deployment is recorded. Omitted when
+    /// `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub record_unreadable: bool,
 }
 
 /// One of a step's co-located **sidecar services** (ADR-0058) — a throwaway
@@ -1211,7 +1298,12 @@ pub struct AttemptDto {
     pub failed: bool,
     /// Coarse failure kind when `failed`: `infra` | `step` | `timeout` | `lost`
     /// | `config` | `missing-inputs` (an input snapshot gone from every tier —
-    /// Rerun/Retry regenerates it; ticket e140121).
+    /// Rerun/Retry regenerates it; ticket e140121) | `gate` (a gate's wait
+    /// resolved failed — e.g. not released within `gate_expires_after`; the
+    /// reason is in `failure_detail`) | `deployment-request-incomplete` (the
+    /// step exited 0 but its results could not complete a DeploymentRequest
+    /// it declares; never auto-retried; what is missing is in
+    /// `failure_detail`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure: Option<String>,
     /// The executor's human-readable cause for a failed attempt (ticket
@@ -1238,6 +1330,10 @@ fn attempt_dto(a: &scarab_engine::Attempt) -> AttemptDto {
             scarab_engine::FailureKind::Lost => "lost",
             scarab_engine::FailureKind::Config => "config",
             scarab_engine::FailureKind::MissingInputs => "missing-inputs",
+            scarab_engine::FailureKind::Gate => "gate",
+            scarab_engine::FailureKind::DeploymentRequestIncomplete => {
+                "deployment-request-incomplete"
+            }
         }
         .to_string()
     });
@@ -1335,7 +1431,10 @@ impl From<DispatchError> for ApiError {
             // does not let this Project deploy — a policy refusal (403) with
             // the actionable text, not a malformed request.
             refused @ (DispatchError::UnknownEnvironment { .. }
-            | DispatchError::NotEligible { .. }) => ApiError::Denied(refused.to_string()),
+            | DispatchError::NotEligible { .. }
+            | DispatchError::DeploymentTargetElsewhere { .. }) => {
+                ApiError::Denied(refused.to_string())
+            }
             other => ApiError::BadRequest(other.to_string()),
         }
     }
@@ -1390,6 +1489,26 @@ async fn create_run(
     // per-parameter message and creates **no** run.
     let resolved = scarab_pipeline::params::resolve_params(&req.pipeline.interface, &req.params)
         .map_err(|e| ApiError::BadRequest(format!("invalid launch parameters: {e}")))?;
+
+    // Slice b: DeploymentRequests and DeploymentGates need a Deploy Run — a
+    // repo pipeline with `environment:`, whose Run creation resolves and
+    // records the requests. The inline IR has neither the Environment nor the
+    // recording, so accepting them would report success for a deployment that
+    // can never be recorded or waited on: refuse, before any run exists.
+    for step in &req.pipeline.steps {
+        let requests = step
+            .deployment_requests
+            .as_ref()
+            .is_some_and(|v| !(v.is_null() || v.as_array().is_some_and(Vec::is_empty)));
+        let deployment_gate = step.gate.as_ref().and_then(|g| g.as_str()) == Some("deployment");
+        if requests || deployment_gate {
+            return Err(ApiError::BadRequest(format!(
+                "step `{}`: deployment requests need a Deploy Run (a repo pipeline with \
+                 `environment:`)",
+                step.id
+            )));
+        }
+    }
 
     // Same retry bound the YAML compiler enforces (ADR-0047): a liveness bound,
     // rejected before any run exists.
@@ -1937,8 +2056,10 @@ async fn get_run(
     // 0058) from the stored spec, so the FE can render sidecar nodes and `uses`
     // edges and address per-sidecar logs by index. A step with no stored spec
     // (e.g. a gate) carries empty vecs.
+    let mut gate_views = run_gate_view::step_gate_views(&st, &run, status, &steps).await?;
     let mut step_dtos = Vec::with_capacity(steps.len());
     for s in steps {
+        let view = gate_views.remove(&s.step.0).unwrap_or_default();
         let (services, uses) = match st.db.step_spec(&run, &s.step).await? {
             Some(spec) => (
                 spec.services
@@ -1961,6 +2082,9 @@ async fn get_run(
             attempt_list: s.attempts.iter().map(attempt_dto).collect(),
             needs: s.needs.into_iter().map(|n| n.0).collect(),
             gate: s.gate_kind,
+            gate_resolution: view.gate_resolution,
+            deployment_gate: view.deployment_gate,
+            held: view.held,
             services,
             uses,
         });
@@ -2416,9 +2540,13 @@ fn rerun_outcome<T>(res: Result<T, RerunError>) -> Result<T, ApiError> {
         Err(e @ RerunError::NotFailed { .. }) => Err(ApiError::Conflict(e.to_string())),
         // Gate-approval-only variants (never produced by rerun/retry); mapped to
         // 409 for exhaustiveness.
-        Err(e @ (RerunError::NotAManualGate(_) | RerunError::GateNotPending { .. })) => {
-            Err(ApiError::Conflict(e.to_string()))
-        }
+        Err(
+            e @ (RerunError::NotAManualGate(_)
+            | RerunError::GateNotPending { .. }
+            | RerunError::GateNotReached { .. }
+            | RerunError::NotARejectableGate(_)
+            | RerunError::NotAReleasableGate(_)),
+        ) => Err(ApiError::Conflict(e.to_string())),
         Err(RerunError::Db(e)) => Err(ApiError::Db(e)),
     }
 }
@@ -3910,7 +4038,7 @@ pub struct TriggerOutcome {
 }
 
 /// [`trigger_run_from_event`], also reporting every deploy pipeline refused
-/// as `UnknownEnvironment` / `NotEligible`.
+/// as `UnknownEnvironment` / `NotEligible` / `DeploymentTargetElsewhere`.
 pub async fn trigger_runs_from_event(
     forge: &dyn scarab_forge::ForgePort,
     db: &dyn Db,
@@ -3989,7 +4117,10 @@ pub async fn trigger_runs_from_event(
             // could not see (never run before ADR-0071) it is the first sign.
             Admission::Refused(
                 ref refusal @ (AdmissionRefusal::UnknownEnvironment { ref environment }
-                | AdmissionRefusal::NotEligible { ref environment }),
+                | AdmissionRefusal::NotEligible { ref environment }
+                | AdmissionRefusal::DeploymentTargetElsewhere {
+                    ref environment, ..
+                }),
             ) => {
                 let reason = admission_refusal_message(refusal, &repo.owner, &repo.name);
                 tracing::warn!(
@@ -4070,6 +4201,16 @@ enum AdmissionRefusal {
     /// The Environment exists but its EnvironmentProjectEligibility does not
     /// admit this Project (ADR-0071 §2).
     NotEligible { environment: String },
+    /// A Step requests a DeploymentTarget that is homed in another
+    /// Environment (slice b, criterion 1; ADR-0070 §7): a target belongs to
+    /// exactly one Environment, so a Run of `environment` may not request it.
+    DeploymentTargetElsewhere {
+        environment: String,
+        step: String,
+        target_source: String,
+        target_id: String,
+        home: String,
+    },
 }
 
 /// The outcome of admitting one compiled pipeline (ADR-0037, ADR-0071 §2):
@@ -4306,9 +4447,25 @@ async fn admit_and_create_run(
         }
     }
 
+    // Slice b, criterion 1 (ADR-0070 §7): resolve each Step's static
+    // DeploymentTargets against the launch parameters, and refuse a Run that
+    // requests a target homed in another Environment — before anything is
+    // persisted, like every other refusal here.
+    let requests = resolve_deployment_requests(ir, repo, params)?;
+    if let (Some(store), RunGovernance::Governed { environment, .. }) = (governance, &gov) {
+        if let Some(refusal) =
+            deployment_target_elsewhere(store, &repo.owner, environment, &requests).await?
+        {
+            return Ok(Admission::Refused(refusal));
+        }
+    }
+
     let now = clock.now().await;
     let run = new_run_id();
-    persist_run_from_ir(db, &run, ir, event, path, &gov, excluded, params, now).await?;
+    persist_run_from_ir(
+        db, &run, ir, event, path, &gov, excluded, params, &requests, now,
+    )
+    .await?;
     // Freeze the resolved launch parameters on the run so every step's
     // interpolation (`${{ inputs.… }}`) and `SCARAB_PARAM_*` env re-derive
     // deterministically (ADR-0043 §5).
@@ -4316,6 +4473,149 @@ async fn admit_and_create_run(
         db.set_run_params(&run, params).await?;
     }
     Ok(Admission::Created(run))
+}
+
+/// Every Step's DeploymentRequests (slice b, criterion 1; ADR-0070 §7),
+/// resolved for one Run: the Environment is the pipeline's own, each target
+/// part a literal or its `${{ inputs.<name> }}` bound to the launch parameters
+/// (`params`; for a webhook Run, which supplies none, the interface's
+/// defaults), and each carrying the DeploymentGates that wait on it
+/// (`gate_steps`, criterion 2). Fails closed: a target that does not resolve to a non-empty
+/// value is a pipeline error and no Run is created — the same rule the
+/// concurrency group follows.
+fn resolve_deployment_requests(
+    ir: &scarab_pipeline::PipelineIr,
+    repo: &scarab_forge::RepoRef,
+    params: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
+) -> Result<Vec<scarab_engine::RunDeploymentRequest>, TriggerError> {
+    let Some(environment) = &ir.environment else {
+        // Validation refuses `deployment_requests` without an `environment:`.
+        return Ok(Vec::new());
+    };
+    let defaults;
+    let inputs = match params {
+        Some(p) => p,
+        None => {
+            defaults = scarab_pipeline::params::resolve_params(
+                &ir.interface,
+                &std::collections::BTreeMap::new(),
+            )
+            .unwrap_or_default();
+            &defaults
+        }
+    };
+    let mut out = Vec::new();
+    for step in &ir.steps {
+        for (ordinal, req) in step.deployment_requests.iter().enumerate() {
+            let bind = |part: &str, text: &str| -> Result<String, TriggerError> {
+                let value = match scarab_pipeline::deployment_target_input(text) {
+                    Some(name) => inputs
+                        .get(name)
+                        .map(scarab_pipeline::params::stringify)
+                        .ok_or_else(|| {
+                            TriggerError::Pipeline(format!(
+                                "step `{}`: deployment request target `{part}` reads \
+                                 `inputs.{name}`, which this launch does not supply",
+                                step.id
+                            ))
+                        })?,
+                    None => text.to_string(),
+                };
+                if value.trim().is_empty() {
+                    return Err(TriggerError::Pipeline(format!(
+                        "step `{}`: deployment request target `{part}` resolved empty",
+                        step.id
+                    )));
+                }
+                Ok(value)
+            };
+            out.push(scarab_engine::RunDeploymentRequest {
+                step: StepId(step.id.clone()),
+                ordinal: ordinal as u32,
+                org: repo.owner.clone(),
+                environment: environment.clone(),
+                target_source: bind("source", &req.target.source)?,
+                target_id: bind("id", &req.target.id)?,
+                version_result: req.version.clone(),
+                evidence_results: req.evidence.clone(),
+                gate_steps: Vec::new(),
+            });
+        }
+    }
+    // Validation's "one request per target per step" compares the AUTHORED
+    // text, so a literal `web` beside `${{ inputs.app }}` with `app=web`
+    // passes it and resolves twice to one target. Refuse that here, before
+    // anything is persisted — never de-duplicate: the two requests may name
+    // different version results, and which one the author meant is theirs to
+    // say. (The store's UNIQUE (run, step, source, id) would otherwise fail
+    // AFTER the run row exists, leaving a stepless Run; the in-memory store
+    // has no such constraint at all.)
+    let mut seen = std::collections::BTreeSet::new();
+    for r in &out {
+        if !seen.insert((
+            r.step.0.as_str(),
+            r.target_source.as_str(),
+            r.target_id.as_str(),
+        )) {
+            return Err(TriggerError::Pipeline(format!(
+                "step `{}`: two deployment requests resolve to `{}`/`{}`",
+                r.step.0, r.target_source, r.target_id
+            )));
+        }
+    }
+    // Each DeploymentGate onto the request it waits on (ADR-0070 §8), so the
+    // engine finds it by the gate's id. Validation has resolved every
+    // reference; one that does not resolve stays unattached, and that gate
+    // fails with the reason when it is reached.
+    for gate in &ir.steps {
+        if let Some((requester, ordinal)) = scarab_pipeline::deployment_gate_request(ir, gate) {
+            if let Some(req) = out
+                .iter_mut()
+                .find(|r| r.step.0 == requester.id && r.ordinal as usize == ordinal)
+            {
+                req.gate_steps.push(StepId(gate.id.clone()));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The first of `requests` whose DeploymentTarget is homed in an Environment
+/// other than the Run's `environment`
+/// ([`EnvironmentGovernanceStore::deployment_target_homes`]), as a refusal.
+/// A target with no home yet is free: the first Environment to request it
+/// records it.
+///
+/// [`EnvironmentGovernanceStore::deployment_target_homes`]: scarab_project::EnvironmentGovernanceStore::deployment_target_homes
+async fn deployment_target_elsewhere(
+    store: &dyn scarab_project::EnvironmentGovernanceStore,
+    org: &str,
+    environment: &str,
+    requests: &[scarab_engine::RunDeploymentRequest],
+) -> Result<Option<AdmissionRefusal>, TriggerError> {
+    if requests.is_empty() {
+        return Ok(None);
+    }
+    let targets: Vec<(String, String)> = requests
+        .iter()
+        .map(|r| (r.target_source.clone(), r.target_id.clone()))
+        .collect();
+    let homes = store
+        .deployment_target_homes(org, &targets)
+        .await
+        .map_err(governance_store_err)?;
+    Ok(requests.iter().find_map(|r| {
+        let home = homes
+            .iter()
+            .find(|h| h.source == r.target_source && h.id == r.target_id)?;
+        (home.environment != environment).then(|| AdmissionRefusal::DeploymentTargetElsewhere {
+            environment: environment.to_string(),
+            step: r.step.0.clone(),
+            target_source: r.target_source.clone(),
+            target_id: r.target_id.clone(),
+            home: home.environment.clone(),
+        })
+    }))
 }
 
 /// Which trigger a dispatch opts into: a human [`Manual`](DispatchKind::Manual)
@@ -4420,6 +4720,19 @@ pub enum DispatchError {
         project: String,
         environment: String,
     },
+    /// A Step requests a DeploymentTarget homed in another Environment (slice
+    /// b, criterion 1) — fail-closed, no run; the message names the home.
+    #[error(
+        "{}",
+        deployment_target_elsewhere_message(.environment, .step, .target_source, .target_id, .home)
+    )]
+    DeploymentTargetElsewhere {
+        environment: String,
+        step: String,
+        target_source: String,
+        target_id: String,
+        home: String,
+    },
     #[error(transparent)]
     Db(DbError),
 }
@@ -4438,7 +4751,29 @@ fn admission_refusal_message(refusal: &AdmissionRefusal, org: &str, project: &st
         AdmissionRefusal::RefNotAllowed => {
             "the ref is not allowed to deploy to this environment".to_string()
         }
+        AdmissionRefusal::DeploymentTargetElsewhere {
+            environment,
+            step,
+            target_source,
+            target_id,
+            home,
+        } => deployment_target_elsewhere_message(environment, step, target_source, target_id, home),
     }
+}
+
+fn deployment_target_elsewhere_message(
+    environment: &str,
+    step: &str,
+    target_source: &str,
+    target_id: &str,
+    home: &str,
+) -> String {
+    format!(
+        "step `{step}` requests DeploymentTarget `{target_source}`/`{target_id}`, which belongs to \
+         environment `{home}`, not `{environment}`: a DeploymentTarget belongs to exactly one \
+         Environment — deploy it from a pipeline whose `environment:` is `{home}`, or an org \
+         admin must route its source to `{environment}` (ADR-0070 §7)"
+    )
 }
 
 fn unknown_environment_message(org: &str, project: &str, environment: &str) -> String {
@@ -4652,6 +4987,19 @@ pub async fn dispatch_run(
             project: repo.name.clone(),
             environment,
         },
+        AdmissionRefusal::DeploymentTargetElsewhere {
+            environment,
+            step,
+            target_source,
+            target_id,
+            home,
+        } => DispatchError::DeploymentTargetElsewhere {
+            environment,
+            step,
+            target_source,
+            target_id,
+            home,
+        },
     })
 }
 
@@ -4769,6 +5117,7 @@ async fn persist_run_from_ir(
     gov: &RunGovernance,
     excluded: &[String],
     params: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
+    deployment_requests: &[scarab_engine::RunDeploymentRequest],
     now: Timestamp,
 ) -> Result<(), TriggerError> {
     let locked_out = gov.locked_out();
@@ -4894,6 +5243,13 @@ async fn persist_run_from_ir(
         if let Some(key) = supersede_key(event, pipeline) {
             db.set_supersede_key(run, &key).await?;
         }
+    }
+    // The resolved DeploymentRequests (slice b, criterion 1) travel with the
+    // run — written before any step row exists, so no step can be claimed,
+    // run and succeed without the requests its success must record.
+    if !deployment_requests.is_empty() {
+        db.set_run_deployment_requests(run, deployment_requests)
+            .await?;
     }
     db.append_event(&EventKind {
         version: EVENT_VERSION,
@@ -6895,18 +7251,12 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
         .next()
 }
 
-/// The distinct principals who have approved a `manual` gate `step`, in approval
-/// order — the accumulated `GateApproved` events (ADR-0037).
+/// The distinct principals who have approved a `manual` gate `step` in its
+/// CURRENT wait, in approval order (ADR-0037) — approvals given before the
+/// gate's latest re-arm (an expired wait that was retried) do not count. One
+/// definition, shared with the engine's dedup: [`scarab_engine::gate_approvers`].
 fn gate_approvers(events: &[EventKind], step: &StepId) -> Vec<String> {
-    let mut seen: Vec<String> = Vec::new();
-    for e in events {
-        if let EventPayload::GateApproved { step: s, by } = &e.kind {
-            if s == step && !seen.contains(by) {
-                seen.push(by.clone());
-            }
-        }
-    }
-    seen
+    scarab_engine::gate_approvers(events, step)
 }
 
 /// Approve a `manual` gate (ADR-0008, 0037). The authenticated principal's
@@ -6927,7 +7277,7 @@ fn gate_approvers(events: &[EventKind], step: &StepId) -> Vec<String> {
     responses(
         (status = 202, description = "approval recorded (released or awaiting more approvals)"),
         (status = 404, description = "no such run or gate"),
-        (status = 409, description = "not an approvable gate, or the run's Environment no longer exists or no longer admits its project")
+        (status = 409, description = "not an approvable gate (not a manual gate, not pending, or not reached yet), or the run's Environment no longer exists or no longer admits its project")
     )
 )]
 async fn approve_gate(
@@ -6960,7 +7310,10 @@ async fn approve_gate(
             e @ (RerunError::DependencyNotSatisfied { .. }
             | RerunError::NotFailed { .. }
             | RerunError::NotAManualGate(_)
-            | RerunError::GateNotPending { .. }),
+            | RerunError::GateNotPending { .. }
+            | RerunError::GateNotReached { .. }
+            | RerunError::NotARejectableGate(_)
+            | RerunError::NotAReleasableGate(_)),
         ) => return Err(ApiError::Conflict(e.to_string())),
         Err(RerunError::Db(e)) => return Err(ApiError::Db(e)),
     }
@@ -7020,7 +7373,10 @@ async fn approve_gate(
             e @ (RerunError::DependencyNotSatisfied { .. }
             | RerunError::NotFailed { .. }
             | RerunError::NotAManualGate(_)
-            | RerunError::GateNotPending { .. }),
+            | RerunError::GateNotPending { .. }
+            | RerunError::GateNotReached { .. }
+            | RerunError::NotARejectableGate(_)
+            | RerunError::NotAReleasableGate(_)),
         ) => return Err(ApiError::Conflict(e.to_string())),
         Err(RerunError::Db(e)) => return Err(ApiError::Db(e)),
     }
@@ -7066,6 +7422,97 @@ async fn approve_gate(
         .into_response())
 }
 
+/// `POST /v1/runs/{id}/gates/{step}/reject` body: why the gate is failed.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct RejectGateRequest {
+    /// The human reason, journalled on the gate's verdict and its Attempt.
+    /// Required: 1 to 1024 bytes once trimmed.
+    pub reason: String,
+}
+
+/// The longest gate-reject reason accepted, in bytes (after trimming).
+const GATE_REJECT_REASON_MAX_BYTES: usize = 1024;
+
+/// A reject reason, trimmed and bounded (1..=1024 bytes), or a 400.
+fn gate_reject_reason(reason: &str) -> Result<&str, ApiError> {
+    let reason = reason.trim();
+    if reason.is_empty() || reason.len() > GATE_REJECT_REASON_MAX_BYTES {
+        return Err(ApiError::BadRequest(format!(
+            "reason is required: 1 to {GATE_REJECT_REASON_MAX_BYTES} bytes"
+        )));
+    }
+    Ok(reason)
+}
+
+/// Reject a waiting gate: fail it with a reason (ADR-0070 §9).
+///
+/// For any gate — `manual`, `timer`, `external` or `deployment` — that is
+/// pending and reached (every step it needs has succeeded; slice b, criteria 2
+/// and 3). A deployment gate can only be rejected, never approved or
+/// released: core passes it from the Deployment record. The gate's Attempt fails with
+/// the reason and the rejecting principal, its dependents are skipped, and the
+/// run ends `failed`; retrying the gate opens a new wait that asks again.
+///
+/// Authz'd as a run write, the same as approve. A reject only ever stops a
+/// deploy — any writer can already cancel the run — so it does NOT consult the
+/// Environment's approver rules, and it works when the Environment is gone or
+/// no longer admits the project: the clean way out of a held gate.
+#[utoipa::path(
+    post,
+    path = "/v1/runs/{id}/gates/{step}/reject",
+    params(
+        ("id" = String, Path, description = "run id"),
+        ("step" = String, Path, description = "gate step id")
+    ),
+    request_body = RejectGateRequest,
+    responses(
+        (status = 202, description = "this call rejected the gate: `{\"rejected\": true}`"),
+        (status = 400, description = "missing, empty or over-long reason"),
+        (status = 404, description = "no such run or step"),
+        (status = 409, description = "not a rejectable gate, not pending, or not reached yet")
+    )
+)]
+async fn reject_gate(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((id, step)): Path<(String, String)>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let run = RunId(id);
+    let scope = run_scope(&st, &run).await;
+    let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
+    let req: RejectGateRequest = serde_json::from_slice(&body)
+        .map_err(|e| ApiError::BadRequest(format!("bad reject body: {e}")))?;
+    let reason = gate_reject_reason(&req.reason)?;
+    gate_reject_outcome(
+        scarab_engine::reject_gate(
+            st.db.as_ref(),
+            st.clock.as_ref(),
+            &run,
+            &StepId(step),
+            &principal.subject,
+            reason,
+        )
+        .await,
+    )?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "rejected": true })),
+    )
+        .into_response())
+}
+
+/// Map a [`scarab_engine::reject_gate`] outcome: `Ok(false)` (a racing
+/// resolver got there first) is a 409 like any other not-pending gate.
+fn gate_reject_outcome(res: Result<bool, RerunError>) -> Result<(), ApiError> {
+    match rerun_outcome(res)? {
+        true => Ok(()),
+        false => Err(ApiError::Conflict(
+            "the gate is no longer awaiting a verdict".into(),
+        )),
+    }
+}
+
 /// The governing Environment's effective rules for releasing a Deploy Run's
 /// gate, resolved NOW (ADR-0071 §2-3) — shared by every path that releases a
 /// gate by request (`approve_gate`, `release_gate_external`) so neither can
@@ -7108,6 +7555,29 @@ async fn gate_release_governance(
 /// HTTP header carrying an external-gate release token (`sha256=<hex>`).
 const GATE_TOKEN_HEADER: &str = "x-scarab-gate-token";
 
+/// Optional `POST /v1/runs/{id}/gates/{step}/release` body: an external gate's
+/// verdict. Absent (or `passed: true`) releases the gate; `passed: false`
+/// fails it with `reason`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ExternalGateVerdict {
+    /// `false` fails the gate; `true` (the default) releases it.
+    #[serde(default = "default_true")]
+    pub passed: bool,
+    /// Why the gate failed — required (1 to 1024 bytes, trimmed) with
+    /// `passed: false`; ignored on a release.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+impl Default for ExternalGateVerdict {
+    fn default() -> Self {
+        Self {
+            passed: true,
+            reason: None,
+        }
+    }
+}
+
 /// Release an **external** gate by presenting its token (ADR-0034) — the path an
 /// outside system (a deploy webhook, a change-management tool) uses instead of an
 /// interactive approval. The token is `HMAC-SHA256(secret, "{run}:{step}")`
@@ -7117,6 +7587,11 @@ const GATE_TOKEN_HEADER: &str = "x-scarab-gate-token";
 /// held (409) when the run's Environment no longer exists or no longer admits
 /// its Project (ADR-0071 §2) — the same check `approve_gate` makes. The token
 /// proves who is releasing, not that the deploy is still allowed.
+///
+/// The same token can instead **fail** the gate with a reason: a body of
+/// `{"passed": false, "reason": "…"}` rejects it (journalled `by
+/// external:{step}`). A fail is never held — it only stops the deploy — so it
+/// skips the Environment check. No body, or `"passed": true`, is a release.
 #[utoipa::path(
     post,
     path = "/v1/runs/{id}/gates/{step}/release",
@@ -7124,17 +7599,20 @@ const GATE_TOKEN_HEADER: &str = "x-scarab-gate-token";
         ("id" = String, Path, description = "run id"),
         ("step" = String, Path, description = "gate step id")
     ),
+    request_body(content = Option<ExternalGateVerdict>, description = "optional: `{\"passed\": false, \"reason\": \"…\"}` fails the gate instead of releasing it"),
     responses(
-        (status = 202, description = "gate released"),
+        (status = 202, description = "gate released (or, with a fail body, failed)"),
+        (status = 400, description = "malformed body, or a fail without a 1..1024-byte reason"),
         (status = 401, description = "bad or missing token"),
         (status = 404, description = "no such external gate, or token release disabled"),
-        (status = 409, description = "the gate is not pending, or the run's Environment no longer exists or no longer admits its project")
+        (status = 409, description = "the gate is not pending or not reached yet, or (a release) the run's Environment no longer exists or no longer admits its project")
     )
 )]
 async fn release_gate_external(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((id, step)): Path<(String, String)>,
+    body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     // Token release is opt-in: without a configured secret the endpoint 404s.
     let Some(secret) = st.gate_token_secret.as_ref() else {
@@ -7160,6 +7638,30 @@ async fn release_gate_external(
     scarab_forge_github::verify_signature(secret, message.as_bytes(), token)
         .map_err(|_| ApiError::Unauthorized)?;
 
+    // A fail verdict (only read once the token verifies): reject with the
+    // reason. Never held by the Environment — it only stops the deploy.
+    let verdict: ExternalGateVerdict = if body.iter().all(u8::is_ascii_whitespace) {
+        ExternalGateVerdict::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| ApiError::BadRequest(format!("bad gate verdict body: {e}")))?
+    };
+    if !verdict.passed {
+        let reason = gate_reject_reason(verdict.reason.as_deref().unwrap_or_default())?;
+        gate_reject_outcome(
+            scarab_engine::reject_gate(
+                st.db.as_ref(),
+                st.clock.as_ref(),
+                &run,
+                &step,
+                &format!("external:{}", step.0),
+                reason,
+            )
+            .await,
+        )?;
+        return Ok(StatusCode::ACCEPTED);
+    }
+
     // Only after the token verifies: an unauthenticated caller learns nothing
     // about the Environment. The rules themselves are not evaluated — the
     // token IS this gate's approval (ADR-0034) — only whether the deploy may
@@ -7174,7 +7676,10 @@ async fn release_gate_external(
             e @ (RerunError::DependencyNotSatisfied { .. }
             | RerunError::NotFailed { .. }
             | RerunError::NotAManualGate(_)
-            | RerunError::GateNotPending { .. }),
+            | RerunError::GateNotPending { .. }
+            | RerunError::GateNotReached { .. }
+            | RerunError::NotARejectableGate(_)
+            | RerunError::NotAReleasableGate(_)),
         ) => Err(ApiError::Conflict(e.to_string())),
         Err(RerunError::Db(e)) => Err(ApiError::Db(e)),
     }
@@ -7616,6 +8121,10 @@ pub struct DeploymentRequesterDto {
     /// and its Step started after Scarab first saw that Deployment — so it
     /// did not make it live and does not explain it (ADR-0070 §2).
     pub claim: bool,
+    /// What the Step offered as evidence for the change — image digests,
+    /// typically — read from its results (ADR-0070 §7). Shown, never used to
+    /// correlate; empty when it declared none.
+    pub evidence: Vec<String>,
 }
 
 /// One stage of a Deployment as its source reported it.
@@ -7793,6 +8302,7 @@ fn deployment_dto(
                 effective_at: r.effective_at,
                 project: projects.get(&r.requester.run).cloned(),
                 claim: r.claim,
+                evidence: r.evidence.clone(),
             })
             .collect(),
         reports: view
@@ -9912,6 +10422,7 @@ impl utoipa::Modify for SecuritySchemes {
         list_workspace,
         get_workspace_file,
         approve_gate,
+        reject_gate,
         release_gate_external,
         put_secret,
         list_secrets,
@@ -9938,6 +10449,8 @@ impl utoipa::Modify for SecuritySchemes {
         PlanReasonDto,
         ExpiredInputDto,
         StepStatusDto,
+        GateResolutionDto,
+        DeploymentGateDto,
         StepServiceDto,
         AttemptDto,
         ServiceStatusDto,
@@ -9947,6 +10460,8 @@ impl utoipa::Modify for SecuritySchemes {
         WorkspaceEntryDto,
         WorkspaceListing,
         PutSecretRequest,
+        RejectGateRequest,
+        ExternalGateVerdict,
         SecretListResponse,
         SecretMatrix,
         SecretMatrixRow,
@@ -10099,6 +10614,7 @@ fn router_inner(state: AppState) -> Router {
             get(get_workspace_file),
         )
         .route("/v1/runs/{id}/gates/{step}/approve", post(approve_gate))
+        .route("/v1/runs/{id}/gates/{step}/reject", post(reject_gate))
         .route(
             "/v1/runs/{id}/gates/{step}/release",
             post(release_gate_external),

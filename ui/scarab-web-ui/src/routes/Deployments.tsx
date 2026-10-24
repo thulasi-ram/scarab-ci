@@ -40,7 +40,7 @@ import {
   inFlight,
   madeLiveBy,
   pickOrg,
-  requesterHref,
+  requesterRow,
   safeHref,
   targetLabel,
 } from "../deployments";
@@ -427,15 +427,14 @@ function Requesters(props: { org: string; requesters: DeploymentRequester[] }) {
       <span class="dep-cell">
         <For each={props.requesters}>
           {(r) => {
-            const href = requesterHref(props.org, r);
-            const text = `${r.run.slice(0, 8)} · ${r.step}`;
-            const run = href ? (
-              <A class="dep-run mono" href={href} onClick={stop} title={`run ${r.run} in ${r.project}`}>
-                {text}
+            const row = requesterRow(props.org, r);
+            const run = row.href ? (
+              <A class="dep-run mono" href={row.href} onClick={stop} title={row.title}>
+                {row.text}
               </A>
             ) : (
-              <span class="dep-run mono" title={`run ${r.run} (project unknown)`}>
-                {text}
+              <span class="dep-run mono" title={row.title}>
+                {row.text}
               </span>
             );
             return r.claim ? (

@@ -238,6 +238,185 @@ struct InMemoryState {
     /// reads fail with a backend error, modelling a "poison run" — one whose
     /// tick work cannot complete. See [`InMemoryDb::poison_run`].
     poisoned_runs: std::collections::HashSet<RunId>,
+    /// Test-only one-shot interleaving (slice b1-fix): when armed for a gate,
+    /// the next [`close_running_attempt`](Db::close_running_attempt) on it
+    /// first resolves the gate (pass, unfenced, at the armed instant) — a
+    /// concurrent release that committed between a caller's snapshot and its
+    /// close. See [`InMemoryDb::arm_gate_resolve_race`].
+    gate_resolve_race: Option<(StepId, Timestamp)>,
+    /// Each Run's resolved DeploymentRequests (slice b; mirrors
+    /// `run_deployment_requests`), keyed (run, step), by ordinal.
+    run_deployment_requests: HashMap<(RunId, StepId), Vec<scarab_engine::RunDeploymentRequest>>,
+    /// The Deployment record's input log per Org (mirrors `deployment_inputs`),
+    /// in seq order, and each Org's `(last_seq, last_at)` counter.
+    deployment_inputs: HashMap<String, Vec<scarab_deployment::LoggedDeploymentInput>>,
+    deployment_counters: HashMap<String, (u64, i64)>,
+}
+
+/// Stamp `inputs` onto `org`'s in-memory log the way `append_deployment_input`
+/// stamps them in Postgres — seq +1 each, `at` = GREATEST(`received_at`, the
+/// Org's last `at`), a request's `effective_at` clamped to it, a report's own
+/// time kept as `report_source_at` — refusing a `received_at` more than
+/// `RECEIVED_AT_MAX_LEAD_MS` ahead of the wall clock (the fake's stand-in for
+/// the database clock). All or nothing: on a refusal nothing is appended.
+fn append_deployment_inputs_locked(
+    st: &mut InMemoryState,
+    org: &str,
+    inputs: &[scarab_deployment::DeploymentInput],
+    received_at: i64,
+) -> Result<Vec<scarab_deployment::LoggedDeploymentInput>, scarab_deployment::DeploymentStoreError>
+{
+    use scarab_deployment::{DeploymentInput, DeploymentStoreError, LoggedDeploymentInput};
+    let store_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(i64::MAX);
+    if received_at > store_now.saturating_add(scarab_deployment::RECEIVED_AT_MAX_LEAD_MS) {
+        return Err(DeploymentStoreError::ReceivedAtAhead {
+            received_at,
+            store_now: Some(store_now),
+        });
+    }
+    let (mut seq, mut last_at) = st
+        .deployment_counters
+        .get(org)
+        .copied()
+        .unwrap_or((0, i64::MIN));
+    let mut logged = Vec::new();
+    for input in inputs {
+        seq += 1;
+        last_at = last_at.max(received_at);
+        let mut input = input.clone();
+        let report_source_at = match &mut input {
+            DeploymentInput::Request {
+                at, effective_at, ..
+            } => {
+                *at = last_at;
+                *effective_at = (*effective_at).min(last_at);
+                None
+            }
+            DeploymentInput::Report { report, .. } => {
+                let source_at = report.at;
+                report.at = last_at;
+                Some(source_at)
+            }
+        };
+        logged.push(LoggedDeploymentInput {
+            seq,
+            input,
+            report_source_at,
+        });
+    }
+    st.deployment_counters
+        .insert(org.to_string(), (seq, last_at));
+    st.deployment_inputs
+        .entry(org.to_string())
+        .or_default()
+        .extend(logged.iter().cloned());
+    Ok(logged)
+}
+
+/// The in-memory Deployment record (slice b): the same log the fake's
+/// [`Db::finish_step_with_deployment_requests`] appends to, so an in-memory
+/// server test can fold what a Step success recorded.
+#[async_trait]
+impl scarab_deployment::DeploymentStore for InMemoryDb {
+    async fn append(
+        &self,
+        org: &str,
+        input: &scarab_deployment::DeploymentInput,
+        received_at: scarab_deployment::Millis,
+    ) -> Result<scarab_deployment::LoggedDeploymentInput, scarab_deployment::DeploymentStoreError>
+    {
+        let mut st = self.state.lock().unwrap();
+        let mut logged = append_deployment_inputs_locked(
+            &mut st,
+            org,
+            std::slice::from_ref(input),
+            received_at,
+        )?;
+        Ok(logged.remove(0))
+    }
+
+    async fn inputs(
+        &self,
+        org: &str,
+        environment: &str,
+    ) -> Result<
+        Vec<scarab_deployment::LoggedDeploymentInput>,
+        scarab_deployment::DeploymentStoreError,
+    > {
+        let st = self.state.lock().unwrap();
+        Ok(st
+            .deployment_inputs
+            .get(org)
+            .into_iter()
+            .flatten()
+            .filter(|l| l.input.target().environment == environment)
+            .cloned()
+            .collect())
+    }
+
+    async fn inputs_as_of(
+        &self,
+        org: &str,
+        environment: &str,
+        now: scarab_deployment::Millis,
+    ) -> Result<
+        (
+            Vec<scarab_deployment::LoggedDeploymentInput>,
+            scarab_deployment::Millis,
+        ),
+        scarab_deployment::DeploymentStoreError,
+    > {
+        // The Postgres fence, under the one mutex every append also takes:
+        // raise the Org's `last_at` to `now + 1` (seq untouched), refusing a
+        // `now` too far ahead of the wall clock as the append does, then read.
+        let fence = now.saturating_add(1);
+        let mut st = self.state.lock().unwrap();
+        let store_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(i64::MAX);
+        if fence > store_now.saturating_add(scarab_deployment::RECEIVED_AT_MAX_LEAD_MS) {
+            return Err(scarab_deployment::DeploymentStoreError::ReceivedAtAhead {
+                received_at: fence,
+                store_now: Some(store_now),
+            });
+        }
+        let (seq, last_at) = st
+            .deployment_counters
+            .get(org)
+            .copied()
+            .unwrap_or((0, i64::MIN));
+        let horizon = last_at.max(fence);
+        st.deployment_counters
+            .insert(org.to_string(), (seq, horizon));
+        let inputs = st
+            .deployment_inputs
+            .get(org)
+            .into_iter()
+            .flatten()
+            .filter(|l| l.input.target().environment == environment)
+            .cloned()
+            .collect();
+        Ok((inputs, horizon))
+    }
+
+    async fn environments(
+        &self,
+        org: &str,
+    ) -> Result<Vec<String>, scarab_deployment::DeploymentStoreError> {
+        let st = self.state.lock().unwrap();
+        let envs: std::collections::BTreeSet<String> = st
+            .deployment_inputs
+            .get(org)
+            .into_iter()
+            .flatten()
+            .map(|l| l.input.target().environment.clone())
+            .collect();
+        Ok(envs.into_iter().collect())
+    }
 }
 
 /// An in-memory [`Db`] for tests: an append-only event log, run/step state
@@ -336,6 +515,96 @@ impl InMemoryDb {
     pub fn heal_run(&self, run: &RunId) {
         self.state.lock().unwrap().poisoned_runs.remove(run);
     }
+
+    /// Arm a one-shot gate-resolve race (test seam for the b1-fix re-arm
+    /// ordering): the next [`close_running_attempt`](Db::close_running_attempt)
+    /// targeting gate `step` is preceded, under the same lock, by a passing
+    /// unfenced [`resolve_gate_wait`](Db::resolve_gate_wait) at `at` — a
+    /// release that landed between a rerun's snapshot (gate waiting) and its
+    /// supersede of that wait.
+    pub fn arm_gate_resolve_race(&self, step: &StepId, at: Timestamp) {
+        self.state.lock().unwrap().gate_resolve_race = Some((step.clone(), at));
+    }
+}
+
+/// The numeric suffix of an attempt id `a{n}` (0 for any other shape).
+fn attempt_number(a: &Attempt) -> u64 {
+    a.id.0
+        .strip_prefix('a')
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// [`Db::resolve_gate_wait`] under the caller's lock — shared by the port and
+/// the [`InMemoryDb::arm_gate_resolve_race`] seam.
+fn resolve_gate_wait_locked(
+    st: &mut InMemoryState,
+    run: &RunId,
+    step: &StepId,
+    res: &scarab_engine::GateResolution,
+) -> Option<AttemptId> {
+    let rec = st.steps.get_mut(&(run.clone(), step.clone()))?;
+    if rec.status != Some(StepStatus::Pending) {
+        return None;
+    }
+    rec.attempts.sort_by_key(attempt_order_key);
+    let (failure, outcome) = if res.passed {
+        (None, AttemptOutcome::Succeeded)
+    } else {
+        (Some(FailureKind::Gate), AttemptOutcome::Failed)
+    };
+    let detail = res.attempt_detail();
+    let close = |a: &mut Attempt| {
+        a.failure = failure;
+        a.failure_detail = detail.clone();
+        a.outcome = outcome;
+    };
+    let (attempt, minted) = match &res.fence {
+        Some(f) => {
+            let a = rec
+                .attempts
+                .iter_mut()
+                .find(|a| &a.id == f && a.outcome == AttemptOutcome::Running)?;
+            close(a);
+            (f.clone(), false)
+        }
+        None => match rec
+            .attempts
+            .last_mut()
+            .filter(|a| a.outcome == AttemptOutcome::Running)
+        {
+            Some(a) => {
+                close(a);
+                (a.id.clone(), false)
+            }
+            None => {
+                let n = rec.attempts.iter().map(attempt_number).max().unwrap_or(0) + 1;
+                let id = AttemptId(format!("a{n}"));
+                rec.attempts.push(Attempt {
+                    id: id.clone(),
+                    started_at: Timestamp(res.legacy_started_at.0.min(res.at.0)),
+                    failure,
+                    failure_detail: detail.clone(),
+                    outcome,
+                });
+                (id, true)
+            }
+        },
+    };
+    rec.status = Some(if res.passed {
+        StepStatus::Succeeded
+    } else {
+        StepStatus::Failed
+    });
+    for kind in scarab_engine::gate_resolution_events(step, &attempt, minted, res) {
+        st.events.push(EventKind {
+            version: scarab_engine::EVENT_VERSION,
+            run: run.clone(),
+            kind,
+            at: res.at,
+        });
+    }
+    Some(attempt)
 }
 
 impl Default for InMemoryDb {
@@ -1332,6 +1601,159 @@ impl Db for InMemoryDb {
         Ok(())
     }
 
+    async fn set_run_deployment_requests(
+        &self,
+        run: &RunId,
+        requests: &[scarab_engine::RunDeploymentRequest],
+    ) -> Result<(), DbError> {
+        let mut st = self.state.lock().unwrap();
+        for r in requests {
+            let rows = st
+                .run_deployment_requests
+                .entry((run.clone(), r.step.clone()))
+                .or_default();
+            // Idempotent on (run, step, ordinal), like the Postgres insert.
+            if !rows.iter().any(|x| x.ordinal == r.ordinal) {
+                rows.push(r.clone());
+                rows.sort_by_key(|x| x.ordinal);
+            }
+        }
+        Ok(())
+    }
+
+    async fn run_deployment_requests(
+        &self,
+        run: &RunId,
+        step: &StepId,
+    ) -> Result<Vec<scarab_engine::RunDeploymentRequest>, DbError> {
+        let st = self.state.lock().unwrap();
+        Ok(st
+            .run_deployment_requests
+            .get(&(run.clone(), step.clone()))
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn deployment_requesting_runs(
+        &self,
+        org: &str,
+        environment: &str,
+        source: &str,
+        id: &str,
+        excluding: &RunId,
+        unreached_gate_cutoff: Timestamp,
+    ) -> Result<u32, DbError> {
+        // Mirrors the Postgres COUNT(DISTINCT run_id) — see the port.
+        let st = self.state.lock().unwrap();
+        let status = |run: &RunId, step: &StepId| {
+            st.steps
+                .get(&(run.clone(), step.clone()))
+                .and_then(|rec| rec.status)
+        };
+        // A gate is reached when every need of it has Succeeded.
+        let reached = |run: &RunId, gate: &StepId| {
+            st.steps
+                .get(&(run.clone(), gate.clone()))
+                .is_some_and(|rec| {
+                    rec.needs
+                        .iter()
+                        .all(|n| status(run, n) == Some(StepStatus::Succeeded))
+                })
+        };
+        // Where the unreached-gate cutoff runs from: the requesting Step's
+        // LATEST Attempt start (the Attempt that succeeded, where a first
+        // wait of its gates opens — not the request's effective time, its
+        // first Attempt in the Take), else the Run's creation. The PG twin's
+        // `MAX(a.started_at)`.
+        let latest_attempt_start = |run: &RunId, step: &StepId| {
+            st.steps
+                .get(&(run.clone(), step.clone()))
+                .and_then(|rec| rec.attempts.iter().map(|a| a.started_at).max())
+                .unwrap_or_else(|| st.run_created.get(run).copied().unwrap_or(Timestamp(0)))
+        };
+        let mut runs: std::collections::HashSet<&RunId> = std::collections::HashSet::new();
+        for ((run, step), rows) in &st.run_deployment_requests {
+            if run == excluding || !st.runs.get(run).is_some_and(|s| !s.is_terminal()) {
+                continue;
+            }
+            for r in rows {
+                if r.org != org
+                    || r.environment != environment
+                    || r.target_source != source
+                    || r.target_id != id
+                {
+                    continue;
+                }
+                let in_flight = match status(run, step) {
+                    Some(StepStatus::Ready | StepStatus::Running) => true,
+                    Some(StepStatus::Succeeded) => {
+                        let open: Vec<&StepId> = r
+                            .gate_steps
+                            .iter()
+                            .filter(|g| status(run, g).is_some_and(|s| !s.is_terminal()))
+                            .collect();
+                        !open.is_empty()
+                            && (open.iter().any(|g| reached(run, g))
+                                || latest_attempt_start(run, step) > unreached_gate_cutoff)
+                    }
+                    _ => false,
+                };
+                if in_flight {
+                    runs.insert(run);
+                }
+            }
+        }
+        Ok(u32::try_from(runs.len()).unwrap_or(u32::MAX))
+    }
+
+    async fn finish_step_with_deployment_requests(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        org: &str,
+        inputs: &[scarab_deployment::DeploymentInput],
+        received_at: Timestamp,
+    ) -> Result<(), DbError> {
+        // One lock = one transaction: the guard, the appends and the
+        // transition all land or none does.
+        // Mirrors Postgres: the step must be `running` AND `attempt` its
+        // latest (the `attempts_of_step` order) and not torn down by intent
+        // (`Superseded`/`Cancelled`) — otherwise `Conflict`, nothing lands.
+        let mut st = self.state.lock().unwrap();
+        let finishable = st
+            .steps
+            .get(&(run.clone(), step.clone()))
+            .is_some_and(|rec| {
+                rec.status == Some(StepStatus::Running)
+                    && rec
+                        .attempts
+                        .iter()
+                        .max_by_key(|a| attempt_order_key(a))
+                        .is_some_and(|latest| {
+                            &latest.id == attempt
+                                && !matches!(
+                                    latest.outcome,
+                                    AttemptOutcome::Superseded | AttemptOutcome::Cancelled
+                                )
+                        })
+            });
+        if !finishable {
+            return Err(DbError::Conflict);
+        }
+        append_deployment_inputs_locked(&mut st, org, inputs, received_at.0)
+            .map_err(|e| DbError::Other(e.to_string()))?;
+        let rec = st
+            .steps
+            .get_mut(&(run.clone(), step.clone()))
+            .expect("checked above");
+        rec.status = Some(StepStatus::Succeeded);
+        if let Some(a) = rec.attempts.iter_mut().find(|a| &a.id == attempt) {
+            a.outcome = AttemptOutcome::Succeeded;
+        }
+        Ok(())
+    }
+
     async fn set_attempt_outcome(
         &self,
         run: &RunId,
@@ -1377,6 +1799,98 @@ impl Db for InMemoryDb {
     async fn append_event(&self, event: &EventKind) -> Result<(), DbError> {
         self.state.lock().unwrap().events.push(event.clone());
         Ok(())
+    }
+
+    async fn open_gate_wait(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        started_at: Timestamp,
+        at: Timestamp,
+    ) -> Result<Option<Attempt>, DbError> {
+        // One lock = the Postgres transaction with the step row locked.
+        let mut st = self.state.lock().unwrap();
+        let Some(rec) = st.steps.get_mut(&(run.clone(), step.clone())) else {
+            return Ok(None);
+        };
+        if rec.status != Some(StepStatus::Pending) {
+            return Ok(None);
+        }
+        rec.attempts.sort_by_key(attempt_order_key);
+        if let Some(open) = rec
+            .attempts
+            .last()
+            .filter(|a| a.outcome == AttemptOutcome::Running)
+        {
+            return Ok(Some(open.clone()));
+        }
+        let n = rec.attempts.iter().map(attempt_number).max().unwrap_or(0) + 1;
+        let attempt = Attempt {
+            id: AttemptId(format!("a{n}")),
+            started_at: Timestamp(started_at.0.min(at.0)),
+            failure: None,
+            failure_detail: None,
+            outcome: AttemptOutcome::Running,
+        };
+        rec.attempts.push(attempt.clone());
+        st.events.push(EventKind {
+            version: scarab_engine::EVENT_VERSION,
+            run: run.clone(),
+            kind: scarab_engine::EventPayload::AttemptStarted {
+                step: step.clone(),
+                attempt: attempt.id.clone(),
+            },
+            at,
+        });
+        Ok(Some(attempt))
+    }
+
+    async fn resolve_gate_wait(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        res: &scarab_engine::GateResolution,
+    ) -> Result<Option<AttemptId>, DbError> {
+        let mut st = self.state.lock().unwrap();
+        Ok(resolve_gate_wait_locked(&mut st, run, step, res))
+    }
+
+    async fn close_running_attempt(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        outcome: AttemptOutcome,
+        event: Option<&EventKind>,
+    ) -> Result<bool, DbError> {
+        let mut st = self.state.lock().unwrap();
+        if matches!(&st.gate_resolve_race, Some((s, _)) if s == step) {
+            let (_, at) = st.gate_resolve_race.take().unwrap();
+            let release = scarab_engine::GateResolution {
+                passed: true,
+                reason: "released".to_string(),
+                expired: false,
+                by: None,
+                deployment: None,
+                fence: None,
+                legacy_started_at: at,
+                at,
+            };
+            resolve_gate_wait_locked(&mut st, run, step, &release);
+        }
+        let Some(a) = st
+            .steps
+            .get_mut(&(run.clone(), step.clone()))
+            .and_then(|rec| rec.attempts.iter_mut().find(|a| &a.id == attempt))
+            .filter(|a| a.outcome == AttemptOutcome::Running)
+        else {
+            return Ok(false);
+        };
+        a.outcome = outcome;
+        if let Some(e) = event {
+            st.events.push(e.clone());
+        }
+        Ok(true)
     }
 
     async fn enqueue_outbox(&self, msg: &OutboxMessage) -> Result<(), DbError> {
@@ -1784,6 +2298,11 @@ struct FakeExecState {
     churning_roots: std::collections::HashSet<String>,
     /// Named results (ADR-0041) each *step* emits on success, keyed by step id.
     results: HashMap<String, std::collections::BTreeMap<String, serde_json::Value>>,
+    /// How each *step*'s results delivery failed, keyed by step id — what
+    /// `Executor::results_delivery_failure` answers (git-bug 0cb5895):
+    /// `Ok(how)` = it failed, `Err(why)` = it could not be checked. Absent =
+    /// delivered (the in-process default).
+    delivery_failures: HashMap<String, Result<String, String>>,
     /// Artifacts of record (ADR-0052) each *step* published, keyed by step id —
     /// the harvest the backend reports back once the blobs are in the object
     /// store, which the orchestrator must durably index.
@@ -1960,6 +2479,26 @@ impl FakeExecutor {
             .unwrap()
             .results
             .insert(step.to_string(), results);
+    }
+
+    /// Script that `step`'s results delivery failed, `how` being the clause
+    /// a backend reports (on k8s: "the results sidecar … exited 1 (Error)").
+    pub fn set_results_delivery_failure(&self, step: &str, how: &str) {
+        self.inner
+            .lock()
+            .unwrap()
+            .delivery_failures
+            .insert(step.to_string(), Ok(how.to_string()));
+    }
+
+    /// Script that whether `step`'s results were delivered **could not be
+    /// checked** — the backend errors with `why` (on k8s: the Pod is gone).
+    pub fn set_results_delivery_unchecked(&self, step: &str, why: &str) {
+        self.inner
+            .lock()
+            .unwrap()
+            .delivery_failures
+            .insert(step.to_string(), Err(why.to_string()));
     }
 
     /// Set the artifacts of record `step` (by id) published (ADR-0052) — what a
@@ -2188,6 +2727,20 @@ impl Executor for FakeExecutor {
         Ok(step
             .and_then(|s| self.inner.lock().unwrap().results.get(s).cloned())
             .unwrap_or_default())
+    }
+
+    async fn results_delivery_failure(
+        &self,
+        handle: &ExecHandle,
+    ) -> Result<Option<String>, ExecError> {
+        let Some((step, _)) = Self::step_and_attempt(handle) else {
+            return Ok(None);
+        };
+        match self.inner.lock().unwrap().delivery_failures.get(&step) {
+            None => Ok(None),
+            Some(Ok(how)) => Ok(Some(how.clone())),
+            Some(Err(why)) => Err(ExecError::Other(why.clone())),
+        }
     }
 
     async fn artifacts(

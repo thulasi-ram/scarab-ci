@@ -72,6 +72,7 @@ fn request_started(
         // started at the epoch is simply "long before".
         effective_at,
         at: 0,
+        evidence: Vec::new(),
     }
 }
 
@@ -250,7 +251,9 @@ async fn the_board_shows_what_is_live_and_what_is_on_its_way() {
             "step": "bump-gitops",
             "effective_at": CLOCK_START_MS + 8 * SEED_STEP_MS,
             "project": "web",
-            "claim": true
+            "claim": true,
+            // Slice b: requests now carry evidence; these seeded ones have none.
+            "evidence": []
         }])
     );
     let web = &board[2];
@@ -264,7 +267,9 @@ async fn the_board_shows_what_is_live_and_what_is_on_its_way() {
             "step": "bump-gitops",
             "effective_at": 0,
             "project": "web",
-            "claim": false
+            "claim": false,
+            // Slice b: requests now carry evidence; these seeded ones have none.
+            "evidence": []
         }])
     );
 

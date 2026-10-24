@@ -1327,6 +1327,36 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/runs/{id}/gates/{step}/reject": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Reject a waiting gate: fail it with a reason (ADR-0070 §9).
+         * @description For any gate — `manual`, `timer`, `external` or `deployment` — that is
+         *     pending and reached (every step it needs has succeeded; slice b, criteria 2
+         *     and 3). A deployment gate can only be rejected, never approved or
+         *     released: core passes it from the Deployment record. The gate's Attempt fails with
+         *     the reason and the rejecting principal, its dependents are skipped, and the
+         *     run ends `failed`; retrying the gate opens a new wait that asks again.
+         *
+         *     Authz'd as a run write, the same as approve. A reject only ever stops a
+         *     deploy — any writer can already cancel the run — so it does NOT consult the
+         *     Environment's approver rules, and it works when the Environment is gone or
+         *     no longer admits the project: the clean way out of a held gate.
+         */
+        post: operations["reject_gate"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/runs/{id}/gates/{step}/release": {
         parameters: {
             query?: never;
@@ -1346,6 +1376,10 @@ export interface paths {
          *     held (409) when the run's Environment no longer exists or no longer admits
          *     its Project (ADR-0071 §2) — the same check `approve_gate` makes. The token
          *     proves who is releasing, not that the deploy is still allowed.
+         * @description The same token can instead **fail** the gate with a reason: a body of
+         *     `{"passed": false, "reason": "…"}` rejects it (journalled `by
+         *     external:{step}`). A fail is never held — it only stops the deploy — so it
+         *     skips the Environment check. No body, or `"passed": true`, is a release.
          */
         post: operations["release_gate_external"];
         delete?: never;
@@ -1813,7 +1847,12 @@ export interface components {
             /**
              * @description Coarse failure kind when `failed`: `infra` | `step` | `timeout` | `lost`
              *     | `config` | `missing-inputs` (an input snapshot gone from every tier —
-             *     Rerun/Retry regenerates it; ticket e140121).
+             *     Rerun/Retry regenerates it; ticket e140121) | `gate` (a gate's wait
+             *     resolved failed — e.g. not released within `gate_expires_after`; the
+             *     reason is in `failure_detail`) | `deployment-request-incomplete` (the
+             *     step exited 0 but its results could not complete a DeploymentRequest
+             *     it declares; never auto-retried; what is missing is in
+             *     `failure_detail`).
              */
             failure?: string | null;
             /**
@@ -2188,6 +2227,33 @@ export interface components {
             /** @description Whether it was ever reported live. */
             was_ever_live: boolean;
         };
+        /**
+         * @description A waiting DeploymentGate: the DeploymentTarget it waits on and, once its
+         *     requester's DeploymentRequest is in the record, where that Deployment
+         *     stands (as the Deployments view folds it).
+         */
+        DeploymentGateDto: {
+            /**
+             * Format: int64
+             * @description The Deployment the requester's current request landed on.
+             */
+            deployment_id?: number | null;
+            deployment_status?: null | components["schemas"]["DeploymentStatusDto"];
+            environment: string;
+            /** @description The latest source report's label, when it has one. */
+            latest_label?: string | null;
+            /**
+             * @description `true` when the Deployment record could not be read for this view (a
+             *     store error, logged): the Deployment fields are then absent because
+             *     they are unknown, not because no Deployment is recorded. Omitted when
+             *     `false`.
+             */
+            record_unreadable?: boolean;
+            target_id: string;
+            target_source: string;
+            /** @description The DeploymentVersion asked for. */
+            version?: string | null;
+        };
         /** @description A Deploy Run step that requested a Deployment. */
         DeploymentRequesterDto: {
             /**
@@ -2201,6 +2267,12 @@ export interface components {
              * @description Unix-ms the requesting Step started.
              */
             effective_at: number;
+            /**
+             * @description What the Step offered as evidence for the change — image digests,
+             *     typically — read from its results (ADR-0070 §7). Shown, never used to
+             *     correlate; empty when it declared none.
+             */
+            evidence: string[];
             /**
              * @description The Project the run belongs to, when it is stamped and in this Org —
              *     what a link to the run (`/{org}/{project}/runs/{run}`) needs.
@@ -2497,6 +2569,48 @@ export interface components {
             produced_by: string;
             /** @description The CAS merkle root the store no longer holds. */
             root: string;
+        };
+        /**
+         * @description Optional `POST /v1/runs/{id}/gates/{step}/release` body: an external gate's
+         *     verdict. Absent (or `passed: true`) releases the gate; `passed: false`
+         *     fails it with `reason`.
+         */
+        ExternalGateVerdict: {
+            /** @description `false` fails the gate; `true` (the default) releases it. */
+            passed?: boolean;
+            /**
+             * @description Why the gate failed — required (1 to 1024 bytes, trimmed) with
+             *     `passed: false`; ignored on a release.
+             */
+            reason?: string | null;
+        };
+        /** @description How a gate's wait resolved: its `GateResolved` journal entry. */
+        GateResolutionDto: {
+            /**
+             * Format: int64
+             * @description Unix-ms the verdict was journalled.
+             */
+            at: number;
+            /** @description The gate Attempt the verdict closed (`a1`, `a2`, …). */
+            attempt: string;
+            /**
+             * @description Who rejected it, for a rejection by request (`external:{step}` for an
+             *     external gate's token). Absent for a verdict the engine reached.
+             */
+            by?: string | null;
+            /**
+             * Format: int64
+             * @description The Deployment a DeploymentGate's verdict was read from (its
+             *     Org-scoped id, as the Deployments view shows it).
+             */
+            deployment_id?: number | null;
+            /** @description `true`: the gate passed and its dependents may run. */
+            passed: boolean;
+            /**
+             * @description Why — a timer elapsing, a DeploymentGate's "v1 live on …", the
+             *     source's failure label, a rejection's reason.
+             */
+            reason?: string | null;
         };
         /** @description A permission the forge reports as granted. */
         GrantedPermissionDto: {
@@ -3126,6 +3240,14 @@ export interface components {
             /** @description Branches first, then tags; each group name-sorted. */
             refs: components["schemas"]["RefDto"][];
         };
+        /** @description `POST /v1/runs/{id}/gates/{step}/reject` body: why the gate is failed. */
+        RejectGateRequest: {
+            /**
+             * @description The human reason, journalled on the gate's verdict and its Attempt.
+             *     Required: 1 to 1024 bytes once trimmed.
+             */
+            reason: string;
+        };
         /**
          * @description An allowed read on a connection: method + path pattern (`*` = one
          *     segment) + the query keys it may carry.
@@ -3554,11 +3676,21 @@ export interface components {
              */
             attempt_list?: components["schemas"]["AttemptDto"][];
             attempts: number;
+            deployment_gate?: null | components["schemas"]["DeploymentGateDto"];
             /**
-             * @description `manual`/`timer`/`external` if this step is a gate (ADR-0008), else absent.
-             *     Gates launch no pod and suspend the run until released.
+             * @description `manual`/`timer`/`external`/`deployment` if this step is a gate
+             *     (ADR-0008, ADR-0070 §8), else absent. Gates launch no pod; a waiting
+             *     gate holds only the steps that need it.
              */
             gate?: string | null;
+            gate_resolution?: null | components["schemas"]["GateResolutionDto"];
+            /**
+             * @description Why this deploy Step is held `pending` by per-DeploymentTarget
+             *     concurrency (ADR-0071 §9), e.g. "held: waiting for deployment
+             *     concurrency on `argocd`/`web` (1/1 in flight)". Derived each read
+             *     (nothing is journalled per scheduler pass). Absent when not held.
+             */
+            held?: string | null;
             id: string;
             /**
              * @description Upstream step ids this step depends on — the DAG in-edges (ADR-0006). The
@@ -6580,7 +6712,55 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description not an approvable gate, or the run's Environment no longer exists or no longer admits its project */
+            /** @description not an approvable gate (not a manual gate, not pending, or not reached yet), or the run's Environment no longer exists or no longer admits its project */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    reject_gate: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description run id */
+                id: string;
+                /** @description gate step id */
+                step: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RejectGateRequest"];
+            };
+        };
+        responses: {
+            /** @description this call rejected the gate: `{"rejected": true}` */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description missing, empty or over-long reason */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such run or step */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a rejectable gate, not pending, or not reached yet */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -6601,10 +6781,22 @@ export interface operations {
             };
             cookie?: never;
         };
-        requestBody?: never;
+        /** @description optional: `{"passed": false, "reason": "…"}` fails the gate instead of releasing it */
+        requestBody?: {
+            content: {
+                "application/json": null | components["schemas"]["ExternalGateVerdict"];
+            };
+        };
         responses: {
-            /** @description gate released */
+            /** @description gate released (or, with a fail body, failed) */
             202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description malformed body, or a fail without a 1..1024-byte reason */
+            400: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -6624,7 +6816,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description the gate is not pending, or the run's Environment no longer exists or no longer admits its project */
+            /** @description the gate is not pending or not reached yet, or (a release) the run's Environment no longer exists or no longer admits its project */
             409: {
                 headers: {
                     [name: string]: unknown;

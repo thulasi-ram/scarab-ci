@@ -36,6 +36,7 @@ fn request_started(
         },
         effective_at,
         at,
+        evidence: Vec::new(),
     }
 }
 

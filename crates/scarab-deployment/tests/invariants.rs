@@ -42,6 +42,7 @@ fn request_started(
         },
         effective_at,
         at,
+        evidence: Vec::new(),
     }
 }
 
@@ -297,21 +298,49 @@ fn check_inv_dep_8(inputs: &[DeploymentInput]) {
     assert_eq!(reports, expected);
 }
 
+/// One DeploymentGate under test: the Deployment its request landed on, the
+/// requester, the request's effective time, the gate Attempt's start (its
+/// window floor; `None` = no floor, [`Deployment::gate_verdict`]) and the
+/// first verdict seen.
+type Gate = (
+    DeploymentId,
+    DeploymentRequester,
+    Millis,
+    Option<Millis>,
+    Option<DeploymentGateVerdict>,
+);
+
+/// The gate's verdict at `now`, through the floored entry point when it has a
+/// floor.
+fn verdict_of(
+    d: &Deployment,
+    requester: &DeploymentRequester,
+    floor: Option<Millis>,
+    now: Millis,
+) -> Option<DeploymentGateVerdict> {
+    match floor {
+        Some(f) => d.gate_verdict_from(requester, f, now, DEADLINE),
+        None => d.gate_verdict(requester, now, DEADLINE),
+    }
+}
+
 /// INV-DEP-9 and INV-DEP-10: every DeploymentGate looks only forward from its
-/// request's effective time, and its verdict never changes once reached.
-fn check_inv_dep_9_10(inputs: &[DeploymentInput], probe: Millis) {
+/// window start — the later of its request's effective time and, when the
+/// gate has one, its Attempt's start (`floors[i]` after the request at index
+/// `i` was received, the gap a gate waits for its needs to finish) — and its
+/// verdict never changes once reached.
+///
+/// Precondition (the pure fold cannot know a reader's `now`): every input
+/// appended after a decision stamps later than the decider's `now`. The store
+/// guarantees it for the deciding reader — `DeploymentStore::inputs_as_of`
+/// fences the Org's stamp clock past `now` before the read (ADR-0070 §8, R3)
+/// — so the inputs here only ever arrive after the instants they are judged at.
+fn check_inv_dep_9_10(inputs: &[DeploymentInput], floors: &[Option<i64>], probe: Millis) {
     let mut ledger = DeploymentLedger::new();
-    // (deployment, requester, effective_at, first verdict seen). A step that
-    // requests again is a new attempt with a new gate, so it replaces its own
-    // earlier entry.
-    type Gate = (
-        DeploymentId,
-        DeploymentRequester,
-        Millis,
-        Option<DeploymentGateVerdict>,
-    );
+    // A step that requests again is a new attempt with a new gate, so it
+    // replaces its own earlier entry.
     let mut gates: Vec<Gate> = Vec::new();
-    for (input, now) in inputs.iter().zip(core_now(inputs)) {
+    for (idx, (input, now)) in inputs.iter().zip(core_now(inputs)).enumerate() {
         let id = ledger.apply(input.clone());
         if let DeploymentInput::Request {
             requester,
@@ -319,12 +348,13 @@ fn check_inv_dep_9_10(inputs: &[DeploymentInput], probe: Millis) {
             ..
         } = input
         {
-            gates.retain(|(_, r, _, _)| r != requester);
-            gates.push((id, requester.clone(), *effective_at, None));
+            let floor = floors.get(idx).copied().flatten().map(|lag| now + lag);
+            gates.retain(|(_, r, _, _, _)| r != requester);
+            gates.push((id, requester.clone(), *effective_at, floor, None));
         }
-        for (id, requester, effective_at, seen) in gates.iter_mut() {
+        for (id, requester, effective_at, floor, seen) in gates.iter_mut() {
             let d = ledger.get(*id).unwrap();
-            let Some(v) = d.gate_verdict(requester, now, DEADLINE) else {
+            let Some(v) = verdict_of(d, requester, *floor, now) else {
                 assert!(seen.is_none(), "a verdict was withdrawn");
                 continue;
             };
@@ -332,9 +362,18 @@ fn check_inv_dep_9_10(inputs: &[DeploymentInput], probe: Millis) {
                 assert_eq!(*first, v, "a gate verdict changed");
             }
             *seen = Some(v);
+            // Where the window opened, and whether an input stamped exactly
+            // then counts as inside it: the floor sorts after every input of
+            // its millisecond, a request's own mark only after earlier ones.
+            let (start, floor_wins) = match *floor {
+                Some(f) if f >= *effective_at => (f, true),
+                _ => (*effective_at, false),
+            };
+            let after_start = |at: Millis| if floor_wins { at > start } else { at >= start };
+            assert!(now >= start, "a verdict before its window opened");
             match v {
                 DeploymentGateVerdict::Passed { at } => {
-                    assert!(at >= *effective_at);
+                    assert!(at >= start);
                     assert!(d
                         .reports
                         .iter()
@@ -349,33 +388,86 @@ fn check_inv_dep_9_10(inputs: &[DeploymentInput], probe: Millis) {
                         .iter()
                         .any(|r| r.status == SourceAssertedStatus::Failed
                             && r.at == at
-                            && r.at >= *effective_at));
+                            && after_start(r.at)));
                 }
                 DeploymentGateVerdict::Failed {
                     reason: DeploymentGateFailure::Stalled,
                     at,
                 } => {
-                    assert_eq!(at, *effective_at + DEADLINE);
+                    assert_eq!(at, start + DEADLINE);
                     assert!(now >= at);
                 }
                 DeploymentGateVerdict::Failed {
                     reason: DeploymentGateFailure::Superseded,
-                    ..
+                    at,
                 } => {
                     assert!(d.superseded_at.is_some());
+                    assert!(d.superseded_by().is_some());
+                    assert!(at >= start);
                 }
             }
         }
     }
     // Looking further into the future never withdraws or changes one.
     let end = core_now(inputs).last().copied().unwrap_or(0);
-    for (id, requester, _, seen) in &gates {
-        let later = ledger
-            .get(*id)
-            .unwrap()
-            .gate_verdict(requester, end + probe, DEADLINE);
+    for (id, requester, _, floor, seen) in &gates {
+        let later = verdict_of(ledger.get(*id).unwrap(), requester, *floor, end + probe);
         if let Some(first) = seen {
             assert_eq!(later, Some(*first));
+        }
+    }
+}
+
+fn verdict_at(v: DeploymentGateVerdict) -> Millis {
+    match v {
+        DeploymentGateVerdict::Passed { at } | DeploymentGateVerdict::Failed { at, .. } => at,
+    }
+}
+
+/// INV-DEP-13: a gate Attempt's start only narrows the window. For every
+/// requester and every floor, at every `now`: a `failed` report received at
+/// or before the floor never fails the gate; whenever the floored verdict is
+/// reached the floor-free one already is (a floor never makes a verdict
+/// arrive sooner); and the floored verdict lands no earlier than the floor or
+/// the floor-free verdict. A floor at or before the request changes nothing.
+fn check_inv_dep_13(inputs: &[DeploymentInput], floor_lags: &[i64], probe: Millis) {
+    let mut ledger = DeploymentLedger::new();
+    let nows = core_now(inputs);
+    let end = nows.last().copied().unwrap_or(0) + probe;
+    for (input, now) in inputs.iter().zip(&nows) {
+        ledger.apply(input.clone());
+        for now in [*now, end] {
+            for d in ledger.deployments() {
+                for (requester, mark) in &d.requesters {
+                    for lag in floor_lags {
+                        let floor = mark.effective_at + lag;
+                        let floored = d.gate_verdict_from(requester, floor, now, DEADLINE);
+                        let free = d.gate_verdict(requester, now, DEADLINE);
+                        if *lag < 0 {
+                            assert_eq!(floored, free, "a floor before the request moved it");
+                        }
+                        let Some(vf) = floored else { continue };
+                        let v0 = free.expect("a floor made a verdict arrive sooner");
+                        assert!(
+                            verdict_at(vf) >= verdict_at(v0),
+                            "a floor moved a verdict earlier"
+                        );
+                        if let DeploymentGateVerdict::Failed {
+                            reason: DeploymentGateFailure::Failed,
+                            at,
+                        } = vf
+                        {
+                            assert!(
+                                *lag < 0 || at > floor,
+                                "a failure received by the Attempt's start failed it"
+                            );
+                        }
+                        if *lag >= 0 {
+                            assert!(verdict_at(vf) >= floor);
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -520,7 +612,27 @@ proptest! {
 
     #[test]
     fn inv_dep_9_10_gates_look_forward_and_freeze(inputs in inputs(), probe in 0i64..300) {
-        check_inv_dep_9_10(&inputs, probe);
+        check_inv_dep_9_10(&inputs, &[], probe);
+    }
+
+    /// INV-DEP-9/10 again, each gate's window floored at its Attempt's start
+    /// some time after its request was received (or not floored at all).
+    #[test]
+    fn inv_dep_9_10_hold_with_an_attempt_start_floor(
+        inputs in inputs(),
+        floors in prop::collection::vec(prop::option::of(0i64..150), 40),
+        probe in 0i64..300,
+    ) {
+        check_inv_dep_9_10(&inputs, &floors, probe);
+    }
+
+    #[test]
+    fn inv_dep_13_an_attempt_start_only_narrows_the_window(
+        inputs in inputs(),
+        floor_lags in prop::collection::vec(-20i64..150, 1..4),
+        probe in 0i64..300,
+    ) {
+        check_inv_dep_13(&inputs, &floor_lags, probe);
     }
 
     #[test]
@@ -534,13 +646,16 @@ proptest! {
     }
 
     /// The fold's clamp, end to end: inputs whose times go backwards still
-    /// keep every invariant, judged at core's "now" (the latest time seen).
-    /// INV-DEP-6 is the type system's.
+    /// keep every invariant, judged at core's "now" (the latest time seen),
+    /// INV-DEP-9/10 with and without an Attempt-start floor. INV-DEP-6 is the
+    /// type system's.
     #[test]
     fn backdated_inputs_keep_every_invariant_after_the_clamp(
         inputs in backdated_inputs(),
         later in 0i64..1000,
         probe in 0i64..300,
+        floors in prop::collection::vec(prop::option::of(0i64..150), 40),
+        floor_lags in prop::collection::vec(-20i64..150, 1..4),
     ) {
         check_inv_dep_1(&inputs);
         check_inv_dep_2(&inputs, later);
@@ -549,9 +664,11 @@ proptest! {
         check_inv_dep_5(&inputs);
         check_inv_dep_7(&inputs, probe);
         check_inv_dep_8(&inputs);
-        check_inv_dep_9_10(&inputs, probe);
+        check_inv_dep_9_10(&inputs, &[], probe);
+        check_inv_dep_9_10(&inputs, &floors, probe);
         check_inv_dep_11(&inputs);
         check_inv_dep_12(&inputs);
+        check_inv_dep_13(&inputs, &floor_lags, probe);
     }
 
     /// A Deployment's public id is the seq of the input that created it, so
@@ -891,5 +1008,351 @@ fn with_a_gitops_commit_scheme_an_unrelated_commit_supersedes_the_request() {
             reason: DeploymentGateFailure::Superseded,
             at: 30
         })
+    );
+}
+
+// ---- a first wait opens at the request's effective time (ADR-0070 §8) -----
+
+#[test]
+fn a_first_wait_counts_a_report_received_while_its_deploy_step_ran() {
+    // The deploy step started at 10 and succeeded at 30; the source reported
+    // in between, at 20 — before the request was even recorded, and before
+    // any gate Attempt could start. The first wait opens at the effective
+    // time (10), so that report decides it: a `failed` fails the gate with
+    // the source's label, a `live` passes it on that report. A Retry's floor
+    // (here 30) puts the report before its window: the `failed` is history
+    // to it, the `live` only an earlier live state — the gap the owner
+    // closed for first waits (2026-10-24).
+    for (status, verdict, floored) in [
+        (
+            Failed,
+            DeploymentGateVerdict::Failed {
+                reason: DeploymentGateFailure::Failed,
+                at: 20,
+            },
+            None,
+        ),
+        (
+            Live,
+            DeploymentGateVerdict::Passed { at: 20 },
+            Some(DeploymentGateVerdict::Passed { at: 30 }),
+        ),
+    ] {
+        let mut l = DeploymentLedger::new();
+        let d = l.apply(report("api", "c1", status, 20));
+        assert_eq!(l.apply(request_started("api", "c1", "r1", 10, 30)), d);
+        let deployment = l.get(d).unwrap();
+        let first = deployment
+            .gate_decision(&requester("r1"), 30, DEADLINE)
+            .expect("decided at once");
+        assert_eq!(first.verdict, verdict);
+        assert_eq!(
+            first.report.map(|r| (r.status, r.label.as_str())),
+            Some((status, format!("{status:?}").as_str())),
+            "the report that came in while the step ran decided it"
+        );
+        assert_eq!(
+            deployment.gate_verdict(&requester("r1"), 30, DEADLINE),
+            Some(verdict)
+        );
+        assert_eq!(
+            deployment.gate_verdict_from(&requester("r1"), 30, 31, DEADLINE),
+            floored,
+            "a floored (retried) wait sees the report as before its window"
+        );
+    }
+}
+
+#[test]
+fn a_first_wait_ignores_a_report_from_before_its_deploy_step_started() {
+    // The `failed` at 5 predates the step's start (10): history, whatever
+    // the step then did. The gate waits; a later `live` passes it.
+    let mut l = DeploymentLedger::new();
+    let d = l.apply(report("api", "c1", Failed, 5));
+    assert_eq!(l.apply(request_started("api", "c1", "r1", 10, 30)), d);
+    let deployment = l.get(d).unwrap();
+    assert_eq!(
+        deployment.gate_decision(&requester("r1"), 30, DEADLINE),
+        None
+    );
+    // Left alone, it stalls a deadline after the step's start.
+    let quiet = l.clone();
+    assert_eq!(
+        quiet
+            .get(d)
+            .unwrap()
+            .gate_verdict(&requester("r1"), 10 + DEADLINE, DEADLINE),
+        Some(DeploymentGateVerdict::Failed {
+            reason: DeploymentGateFailure::Stalled,
+            at: 10 + DEADLINE
+        })
+    );
+    l.apply(report("api", "c1", Live, 40));
+    assert_eq!(
+        l.get(d)
+            .unwrap()
+            .gate_verdict(&requester("r1"), 40, DEADLINE),
+        Some(DeploymentGateVerdict::Passed { at: 40 })
+    );
+}
+
+#[test]
+fn a_deploy_step_longer_than_the_deadline_stalls_its_first_wait_when_asked() {
+    // The window and its stall deadline run from the step's start (0). A
+    // step that itself ran past the deadline (succeeding at DEADLINE + 20)
+    // with nothing decisive reported fails its gate `stalled` the first time
+    // it is asked — at the deadline instant, which precedes the ask. A
+    // decisive report before the deadline still wins.
+    let mut l = DeploymentLedger::new();
+    let d = l.apply(report("api", "c1", InProgress, 5));
+    l.apply(request_started("api", "c1", "r1", 0, DEADLINE + 20));
+    assert_eq!(
+        l.get(d)
+            .unwrap()
+            .gate_verdict(&requester("r1"), DEADLINE + 20, DEADLINE),
+        Some(DeploymentGateVerdict::Failed {
+            reason: DeploymentGateFailure::Stalled,
+            at: DEADLINE
+        })
+    );
+    let mut m = DeploymentLedger::new();
+    let e = m.apply(report("api", "c1", Live, DEADLINE - 1));
+    m.apply(request_started("api", "c1", "r1", 0, DEADLINE + 20));
+    assert_eq!(
+        m.get(e)
+            .unwrap()
+            .gate_verdict(&requester("r1"), DEADLINE + 20, DEADLINE),
+        Some(DeploymentGateVerdict::Passed { at: DEADLINE - 1 })
+    );
+}
+
+// ---- the gate Attempt's window floor (ADR-0070 §8, INV-DEP-13) -------------
+
+#[test]
+fn a_retried_gate_waits_afresh_past_the_failure_that_failed_it() {
+    // a1 opened with the request (0) and failed on the source's `failed` at
+    // 10, with the source's label as the reason. The Retry is a2, starting at
+    // 20: the same failure is history to it, and it passes on the next live.
+    let mut l = DeploymentLedger::new();
+    let d = l.apply(request("api", "c1", "r1", 0));
+    l.apply(report("api", "c1", Failed, 10));
+    let first = l.get(d).unwrap();
+    let a1 = first
+        .gate_decision_from(&requester("r1"), 0, 10, DEADLINE)
+        .unwrap();
+    assert_eq!(
+        a1.verdict,
+        DeploymentGateVerdict::Failed {
+            reason: DeploymentGateFailure::Failed,
+            at: 10
+        }
+    );
+    assert_eq!(a1.report.map(|r| r.label.as_str()), Some("Failed"));
+    assert_eq!(
+        first.gate_verdict_from(&requester("r1"), 20, 20, DEADLINE),
+        None
+    );
+    l.apply(report("api", "c1", Live, 30));
+    let a2 = l
+        .get(d)
+        .unwrap()
+        .gate_decision_from(&requester("r1"), 20, 30, DEADLINE)
+        .unwrap();
+    assert_eq!(a2.verdict, DeploymentGateVerdict::Passed { at: 30 });
+    assert_eq!(a2.report.map(|r| r.status), Some(Live));
+}
+
+#[test]
+fn an_input_in_the_attempt_starts_millisecond_counts_as_before_it() {
+    // Plan Q3: the floor sorts after every input stamped in its millisecond.
+    // A `failed` received then does not fail the gate; a `live` received
+    // then passes it at the floor — once that millisecond is over (see
+    // `a_floored_gate_waits_out_its_own_millisecond`).
+    let mut l = DeploymentLedger::new();
+    let d = l.apply(request("api", "c1", "r1", 0));
+    l.apply(report("api", "c1", Failed, 20));
+    assert_eq!(
+        l.get(d)
+            .unwrap()
+            .gate_verdict_from(&requester("r1"), 20, 50, DEADLINE),
+        None
+    );
+    let mut m = DeploymentLedger::new();
+    let e = m.apply(request("api", "c1", "r1", 0));
+    m.apply(report("api", "c1", Live, 20));
+    assert_eq!(
+        m.get(e)
+            .unwrap()
+            .gate_decision_from(&requester("r1"), 20, 20, DEADLINE),
+        None,
+        "more inputs stamped 20 can still arrive"
+    );
+    let at_once = m
+        .get(e)
+        .unwrap()
+        .gate_decision_from(&requester("r1"), 20, 21, DEADLINE)
+        .unwrap();
+    assert_eq!(at_once.verdict, DeploymentGateVerdict::Passed { at: 20 });
+    assert_eq!(at_once.report, None, "an earlier live state decided it");
+}
+
+#[test]
+fn a_floored_gate_waits_out_its_own_millisecond() {
+    // Found by proptest (`backdated_inputs_keep_every_invariant_after_the_clamp`,
+    // regression `cc 6929c13…`). The floor is `(20, u64::MAX)`: it sorts after
+    // every input stamped 20 — including ones that have not arrived yet when
+    // core asks at `now` = 20. Deciding then passed the gate on the `live` at
+    // 20; a `failed` (or a supersession) arriving next, also stamped 20, then
+    // sat "before" the window, and the verdict was withdrawn (or flipped to
+    // superseded). The window stays closed until `now` is past the floor.
+    let superseded = Some(DeploymentGateVerdict::Failed {
+        reason: DeploymentGateFailure::Superseded,
+        at: 20,
+    });
+    for (late, then) in [
+        (report("api", "c1", Failed, 20), None),
+        (report("api", "c2", Live, 20), superseded),
+    ] {
+        let mut l = DeploymentLedger::new();
+        let d = l.apply(request("api", "c1", "r1", 0));
+        l.apply(report("api", "c1", Live, 20));
+        let gate = |l: &DeploymentLedger, now| {
+            l.get(d)
+                .unwrap()
+                .gate_verdict_from(&requester("r1"), 20, now, DEADLINE)
+        };
+        assert_eq!(gate(&l, 20), None, "the floor's millisecond is not over");
+        l.apply(late);
+        assert_eq!(gate(&l, 20), None);
+        assert_eq!(gate(&l, 21), then);
+        if then.is_some() {
+            assert_eq!(gate(&l, 21 + 2 * DEADLINE), then, "and it never changes");
+        }
+    }
+}
+
+#[test]
+fn a_floored_gate_stalls_a_deadline_after_its_own_start() {
+    let mut l = DeploymentLedger::new();
+    let d = l.apply(request("api", "c1", "r1", 0));
+    let deployment = l.get(d).unwrap();
+    assert_eq!(
+        deployment.gate_verdict_from(&requester("r1"), 40, 40 + DEADLINE - 1, DEADLINE),
+        None
+    );
+    assert_eq!(
+        deployment.gate_verdict_from(&requester("r1"), 40, 40 + DEADLINE, DEADLINE),
+        Some(DeploymentGateVerdict::Failed {
+            reason: DeploymentGateFailure::Stalled,
+            at: 40 + DEADLINE
+        })
+    );
+}
+
+#[test]
+fn a_window_that_has_not_opened_has_no_verdict() {
+    let mut l = DeploymentLedger::new();
+    let d = l.apply(report("api", "c1", Live, 0));
+    l.apply(request("api", "c1", "r1", 5));
+    assert_eq!(
+        l.get(d)
+            .unwrap()
+            .gate_verdict_from(&requester("r1"), 30, 29, DEADLINE),
+        None
+    );
+}
+
+#[test]
+fn a_gate_retried_after_its_deployment_was_superseded_fails_at_its_start() {
+    // c1 was replaced by c2 before the Retry: superseded is absorbing, so a2
+    // fails at once rather than waiting out the deadline — and the newer
+    // Deployment is named.
+    let mut l = DeploymentLedger::new();
+    let c1 = l.apply(request("api", "c1", "r1", 0));
+    let c2 = l.apply(request("api", "c2", "r2", 10));
+    let d = l.get(c1).unwrap();
+    assert_eq!(d.superseded_by(), Some(c2));
+    // Decided as soon as the Attempt's start millisecond is over, at that
+    // start.
+    assert_eq!(
+        d.gate_verdict_from(&requester("r1"), 50, 51, DEADLINE),
+        Some(DeploymentGateVerdict::Failed {
+            reason: DeploymentGateFailure::Superseded,
+            at: 50
+        })
+    );
+}
+
+#[test]
+fn superseded_by_names_the_deployment_reported_live_in_its_place() {
+    let mut l = DeploymentLedger::new();
+    let c1 = l.apply(report("api", "c1", Live, 0));
+    let c2 = l.apply(request("api", "c2", "r1", 5));
+    assert_eq!(
+        l.get(c1).unwrap().superseded_by(),
+        None,
+        "still the live one"
+    );
+    l.apply(report("api", "c2", Live, 9));
+    assert_eq!(l.get(c1).unwrap().superseded_by(), Some(c2));
+    // An older live one that stops being live is replaced by the newest.
+    let mut m = DeploymentLedger::new();
+    let old = m.apply(report("api", "c1", Live, 0));
+    let new = m.apply(request("api", "c2", "r1", 5));
+    m.apply(report("api", "c1", Failed, 7));
+    assert_eq!(m.get(old).unwrap().superseded_by(), Some(new));
+}
+
+#[test]
+fn request_of_follows_a_requesters_latest_request() {
+    // r1's step requested c1, then (rerun) c2: the gate asks about c2. Other
+    // targets and other requesters are not confused with it.
+    let mut l = DeploymentLedger::new();
+    l.apply(request("api", "c1", "r1", 0));
+    l.apply(request("worker", "c9", "r1", 1));
+    l.apply(request("api", "c3", "r2", 2));
+    let c2 = l.apply(request("api", "c2", "r1", 3));
+    assert_eq!(
+        l.request_of(&requester("r1"), &target("api")).unwrap().id,
+        c2
+    );
+    assert_eq!(
+        l.request_of(&requester("r1"), &target("worker"))
+            .unwrap()
+            .version,
+        version("c9")
+    );
+    assert!(l.request_of(&requester("r3"), &target("api")).is_none());
+}
+
+#[test]
+fn fold_ledger_gives_the_public_ids_the_view_shows() {
+    let log: Vec<LoggedDeploymentInput> = [
+        request("api", "c1", "r1", 0),
+        report("api", "c1", Live, 5),
+        request("api", "c2", "r2", 9),
+    ]
+    .into_iter()
+    .zip([3u64, 7, 12])
+    .map(|(input, seq)| LoggedDeploymentInput {
+        seq,
+        input,
+        report_source_at: None,
+    })
+    .collect();
+    let folded = fold_ledger(&log);
+    let view = fold_environment(&log, 20, DEADLINE);
+    for d in folded.ledger().deployments() {
+        let id = folded.public_id(d);
+        assert_eq!(view.get(id).map(|v| &v.version), Some(&d.version));
+    }
+    assert_eq!(
+        folded
+            .ledger()
+            .deployments()
+            .iter()
+            .map(|d| folded.public_id(d))
+            .collect::<Vec<_>>(),
+        vec![3, 12]
     );
 }

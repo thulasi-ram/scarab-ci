@@ -4,6 +4,7 @@ import {
   deploymentTags,
   targetLabel,
   requesterHref,
+  requesterRow,
   inFlight,
   groupBoard,
   madeLiveBy,
@@ -64,7 +65,7 @@ describe("targetLabel", () => {
 });
 
 describe("madeLiveBy", () => {
-  const r = (run: string, claim: boolean) => ({ run, step: "deploy", effective_at: 0, project: "web", claim });
+  const r = (run: string, claim: boolean) => ({ run, step: "deploy", effective_at: 0, project: "web", claim, evidence: [] });
 
   it("leaves out claims, which did not make the change", () => {
     // An Unexplained hotfix a later run named: nobody made it live.
@@ -101,6 +102,57 @@ describe("requesterHref", () => {
   it("is null when the project is unknown, rather than guessing a repo", () => {
     expect(requesterHref("acme", { run: "0190f8", project: null })).toBeNull();
     expect(requesterHref("acme", { run: "0190f8" })).toBeNull();
+  });
+});
+
+describe("requesterRow", () => {
+  it("links a real requester row of a Deployment to its run page", () => {
+    // A DeploymentDto as the server sends it: the requester names its run,
+    // step and (stamped, in this org) project.
+    const d = dep({
+      requesters: [
+        {
+          run: "0190f8a2000071fb8c0011223344aabb",
+          step: "deploy",
+          effective_at: 1,
+          project: "orders-api",
+          claim: false,
+          evidence: [],
+        },
+      ],
+    });
+    const [row] = madeLiveBy(d).map((r) => requesterRow("acme", r));
+    expect(row).toEqual({
+      href: "/acme/orders-api/runs/0190f8a2000071fb8c0011223344aabb",
+      text: "3344aabb · deploy",
+      title: "run 0190f8a2000071fb8c0011223344aabb in orders-api",
+    });
+  });
+
+  it("tells apart two runs created close together (a UUIDv7 shares its time prefix)", () => {
+    // The two Deploy Runs of a live plugin-verify run (gate-v2): the same
+    // leading 8 characters, so the text must come from the random tail.
+    const a = requesterRow("acme", {
+      run: "01a1682f-899f-7da1-ace8-fa18a1299cc0",
+      step: "bump",
+      project: "web",
+    });
+    const b = requesterRow("acme", {
+      run: "01a1682f-a858-7881-9f4a-c54c914047c6",
+      step: "bump",
+      project: "web",
+    });
+    expect(a.text).toBe("a1299cc0 · bump");
+    expect(b.text).toBe("914047c6 · bump");
+    expect(a.text).not.toBe(b.text);
+  });
+
+  it("shows, but does not link, a requester whose project is unknown", () => {
+    expect(requesterRow("acme", { run: "0190f8", step: "deploy", project: null })).toEqual({
+      href: null,
+      text: "0190f8 · deploy",
+      title: "run 0190f8 (project unknown)",
+    });
   });
 });
 
