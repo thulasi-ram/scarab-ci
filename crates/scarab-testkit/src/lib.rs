@@ -925,6 +925,32 @@ impl Db for InMemoryDb {
         Ok(())
     }
 
+    async fn ingest_attempt_results(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        results: &std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> Result<(), DbError> {
+        let mut st = self.state.lock().unwrap();
+        let rec = st
+            .steps
+            .get_mut(&(run.clone(), step.clone()))
+            .ok_or(DbError::Conflict)?;
+        if rec.status != Some(StepStatus::Running)
+            || rec.attempts.last().map(|a| &a.id) != Some(attempt)
+        {
+            return Err(DbError::Conflict);
+        }
+        rec.results = results.clone();
+        rec.evidence_attempt = Some(attempt.clone());
+        st.attempt_evidence
+            .entry((run.clone(), step.clone(), attempt.clone()))
+            .or_default()
+            .results = results.clone();
+        Ok(())
+    }
+
     async fn attempt_results(
         &self,
         run: &RunId,

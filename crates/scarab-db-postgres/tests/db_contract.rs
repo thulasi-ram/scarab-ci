@@ -492,3 +492,71 @@ contract_test!(
     attempt_workspace_input_steps,
     attempt_workspace_input_steps_round_trip
 );
+
+// ---------------------------------------------------------------------------
+// Results ingest (ADR-0042; review safety S1): externally POSTed results land
+// only on the step's RUNNING FRONTIER attempt; a superseded attempt's, or a
+// late one after the step settled, is a Conflict that writes nothing.
+// ---------------------------------------------------------------------------
+
+async fn ingested_results_land_only_on_the_running_frontier(db: &dyn Db) {
+    let (run, step) = (RunId("r-ingest".into()), StepId("s".into()));
+    seed_run_and_step(db, &run, &step).await;
+    let results =
+        |v: &str| std::collections::BTreeMap::from([("v".to_string(), serde_json::json!(v))]);
+    let (a1, a2) = (AttemptId("a1".into()), AttemptId("a2".into()));
+    db.record_attempt(&run, &step, &attempt("a1", 1))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            db.ingest_attempt_results(&run, &step, &a1, &results("pending"))
+                .await,
+            Err(DbError::Conflict)
+        ),
+        "not running yet"
+    );
+    db.record_step_transition(&run, &step, StepStatus::Pending, StepStatus::Running)
+        .await
+        .unwrap();
+    db.record_attempt(&run, &step, &attempt("a2", 2))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            db.ingest_attempt_results(&run, &step, &a1, &results("stale"))
+                .await,
+            Err(DbError::Conflict)
+        ),
+        "a1 is not the frontier"
+    );
+    db.ingest_attempt_results(&run, &step, &a2, &results("a2"))
+        .await
+        .unwrap();
+    assert_eq!(
+        db.attempt_results(&run, &step, &a2).await.unwrap(),
+        results("a2")
+    );
+    db.record_step_transition(&run, &step, StepStatus::Running, StepStatus::Succeeded)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            db.ingest_attempt_results(&run, &step, &a2, &results("late"))
+                .await,
+            Err(DbError::Conflict)
+        ),
+        "the step settled"
+    );
+    assert_eq!(db.step_results(&run, &step).await.unwrap(), results("a2"));
+    assert!(db
+        .attempt_results(&run, &step, &a1)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+contract_test!(
+    ingest_attempt_results_frontier,
+    ingested_results_land_only_on_the_running_frontier
+);

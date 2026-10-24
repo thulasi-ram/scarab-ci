@@ -5653,7 +5653,7 @@
           "Runs"
         ],
         "summary": "Ingest a step's named results (ADR-0040/0042): the trusted per-Pod egress\nsidecar POSTs `{ name: value, … }` here, authenticated by a fence-scoped\ntoken, and the control plane persists them to `step_runs.results`. The\nuntrusted step never calls this — only the sidecar holds the token.",
-        "description": "404 when no token secret is configured; 401 on a bad/missing token; 404 for\nan unknown step; 413 for an over-large body. The write is idempotent on the\nfence (a re-drive overwrites deterministically, ADR-0021).",
+        "description": "404 when no token secret is configured; 401 on a bad/missing token; 404 for\nan unknown step; 413 for an over-large body; 409 when the attempt is no\nlonger the step's running frontier. The write is idempotent on the fence\n(a re-drive overwrites deterministically, ADR-0021).",
         "operationId": "ingest_step_results",
         "parameters": [
           {
@@ -5684,6 +5684,9 @@
           },
           "404": {
             "description": "no such step, or results ingest disabled"
+          },
+          "409": {
+            "description": "the attempt is not the step's running frontier"
           }
         },
         "security": [

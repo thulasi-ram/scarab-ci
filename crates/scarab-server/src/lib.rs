@@ -8093,8 +8093,9 @@ pub fn results_token_message(run: &str, step: &str, attempt: &str) -> String {
 /// untrusted step never calls this — only the sidecar holds the token.
 ///
 /// 404 when no token secret is configured; 401 on a bad/missing token; 404 for
-/// an unknown step; 413 for an over-large body. The write is idempotent on the
-/// fence (a re-drive overwrites deterministically, ADR-0021).
+/// an unknown step; 413 for an over-large body; 409 when the attempt is no
+/// longer the step's running frontier. The write is idempotent on the fence
+/// (a re-drive overwrites deterministically, ADR-0021).
 #[utoipa::path(
     post,
     path = "/v1/runs/{id}/steps/{step}/results",
@@ -8105,7 +8106,8 @@ pub fn results_token_message(run: &str, step: &str, attempt: &str) -> String {
     responses(
         (status = 202, description = "results recorded"),
         (status = 401, description = "bad or missing token"),
-        (status = 404, description = "no such step, or results ingest disabled")
+        (status = 404, description = "no such step, or results ingest disabled"),
+        (status = 409, description = "the attempt is not the step's running frontier")
     )
 )]
 async fn ingest_step_results(
@@ -8155,11 +8157,24 @@ async fn ingest_step_results(
 
     // The fence the token authenticated names the attempt — the ingested
     // results land on that attempt's immutable evidence row as well as the
-    // step's latest-evidence denormalization (ADR-0056).
-    st.db
-        .set_step_results(&run, &step, &AttemptId(attempt.to_string()), &results)
-        .await?;
-    Ok(StatusCode::ACCEPTED)
+    // step's latest-evidence denormalization (ADR-0056) — but only while that
+    // attempt is the step's frontier and the step still runs (review safety
+    // S1). A late POST after the verdict was released (the bounded drain,
+    // git-bug f02588d), or from a superseded attempt, would overwrite results
+    // dependents already consumed: 409, nothing written.
+    match st
+        .db
+        .ingest_attempt_results(&run, &step, &AttemptId(attempt.to_string()), &results)
+        .await
+    {
+        Ok(()) => Ok(StatusCode::ACCEPTED),
+        Err(DbError::Conflict) => Err(ApiError::Conflict(format!(
+            "attempt `{attempt}` of step `{}` is no longer running: its results were \
+             already settled",
+            step.0
+        ))),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Build a [`SecretScope`] from the flat org/repo/environment selector,

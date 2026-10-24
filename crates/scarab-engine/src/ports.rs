@@ -456,6 +456,24 @@ pub trait Db: Send + Sync {
         results: &std::collections::BTreeMap<String, serde_json::Value>,
     ) -> Result<(), DbError>;
 
+    /// [`set_step_results`](Db::set_step_results) for results that arrive
+    /// from OUTSIDE the engine — the k8s results-egress sidecar's POST
+    /// (ADR-0042) — written only while `attempt` is the step's **frontier**
+    /// (its latest Attempt) and the step is still `Running`: the window in
+    /// which the engine has not yet read them. Otherwise
+    /// [`DbError::Conflict`], nothing written (review safety S1): a POST that
+    /// lands after the verdict was released — the drain bound of git-bug
+    /// f02588d can release it while the sidecar still retries — or from a
+    /// superseded attempt would overwrite results dependents already
+    /// consumed. The check and the write are one commit.
+    async fn ingest_attempt_results(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        results: &std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> Result<(), DbError>;
+
     /// A step's named results, or an empty map if it emitted none (or is unknown).
     /// Latest-evidence read; per-attempt history is [`attempt_results`](Db::attempt_results).
     async fn step_results(

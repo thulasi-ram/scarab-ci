@@ -1813,8 +1813,9 @@ export interface paths {
          *     token, and the control plane persists them to `step_runs.results`. The
          *     untrusted step never calls this — only the sidecar holds the token.
          * @description 404 when no token secret is configured; 401 on a bad/missing token; 404 for
-         *     an unknown step; 413 for an over-large body. The write is idempotent on the
-         *     fence (a re-drive overwrites deterministically, ADR-0021).
+         *     an unknown step; 413 for an over-large body; 409 when the attempt is no
+         *     longer the step's running frontier. The write is idempotent on the fence
+         *     (a re-drive overwrites deterministically, ADR-0021).
          */
         post: operations["ingest_step_results"];
         delete?: never;
@@ -8487,6 +8488,13 @@ export interface operations {
             };
             /** @description no such step, or results ingest disabled */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the attempt is not the step's running frontier */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

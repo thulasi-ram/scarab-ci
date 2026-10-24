@@ -499,6 +499,62 @@ impl Db for PostgresDb {
         Ok(())
     }
 
+    async fn ingest_attempt_results(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        results: &std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> Result<(), DbError> {
+        let json = serde_json::to_value(results).map_err(|e| DbError::Other(e.to_string()))?;
+        // One transaction with the step row locked: a finalize's status CAS
+        // (which locks the same row) either committed first — the step is no
+        // longer `running` here — or waits for this write. An early return
+        // drops `tx`, which rolls it back.
+        let mut tx = self.pool().begin().await.map_err(db_err)?;
+        let status: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM step_runs WHERE run_id = $1 AND step_id = $2 FOR UPDATE",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        if status.as_deref() != Some(step_status_str(StepStatus::Running)) {
+            return Err(DbError::Conflict);
+        }
+        let frontier = attempts_on(&mut *tx, run, step).await?;
+        if frontier.last().map(|a| &a.id) != Some(attempt) {
+            return Err(DbError::Conflict);
+        }
+        sqlx::query(
+            "UPDATE step_runs
+             SET results = $3,
+                 evidence_attempt = $4,
+                 updated_at = (extract(epoch from now()) * 1000)::bigint
+             WHERE run_id = $1 AND step_id = $2",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(&json)
+        .bind(&attempt.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        sqlx::query(
+            "UPDATE attempts SET results = $4
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(&attempt.0)
+        .bind(&json)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)
+    }
+
     async fn step_results(
         &self,
         run: &RunId,
