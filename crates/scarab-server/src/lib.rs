@@ -7113,12 +7113,6 @@ struct SessionFacts {
     /// Hex SHA-256 of the session id: confirmations are keyed by it, never
     /// by the id itself.
     id_hash: String,
-    /// When the login that minted it completed (0 = before this was stamped).
-    #[allow(dead_code)] // read by the StepUpConfirmationRequest path (ADR-0073 C5)
-    created_at: i64,
-    /// `browser` (OAuth callback) or `api` (the API/CLI exchange).
-    #[allow(dead_code)] // read by the StepUpConfirmationRequest path (ADR-0073 C5)
-    login_kind: String,
     /// Until when it counts as a fresh browser login (first-passkey rule).
     fresh_login_until: Option<i64>,
 }
@@ -7126,7 +7120,7 @@ struct SessionFacts {
 impl Caller {
     /// A caller with no token narrowing and no session behind it — the
     /// dev-insecure synthetic Owner.
-    fn session(principal: Principal) -> Self {
+    fn dev_insecure_owner(principal: Principal) -> Self {
         Self {
             principal,
             grant: None,
@@ -7261,7 +7255,7 @@ async fn authenticate(
         return step_up::requests::replay_caller(st, &authority).await;
     }
     let Some(sessions) = st.sessions.as_ref() else {
-        return Ok(Caller::session(Principal {
+        return Ok(Caller::dev_insecure_owner(Principal {
             subject: "anonymous".into(),
             display_name: None,
             roles: vec![scarab_identity::Role::Owner],
@@ -7295,8 +7289,6 @@ async fn authenticate(
     let facts = SessionFacts {
         id: step_up::requests::SessionSecret(session.id.clone()),
         id_hash: session_hash(&session.id),
-        created_at: session.created_at,
-        login_kind: session.login_kind.clone(),
         fresh_login_until: session.fresh_login_until(),
     };
     Ok(Caller {
