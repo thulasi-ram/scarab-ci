@@ -611,6 +611,10 @@ impl OAuthAuthenticator {
     ///   mint a global Owner;
     /// - a bare email matches any provider, which boot permits only when there
     ///   is exactly one.
+    pub(crate) fn matches_owner(&self, subject: &str, verified_email: Option<&str>) -> bool {
+        self.is_owner(subject, verified_email)
+    }
+
     fn is_owner(&self, subject: &str, verified_email: Option<&str>) -> bool {
         self.cfg.owners.iter().any(|o| {
             o == subject

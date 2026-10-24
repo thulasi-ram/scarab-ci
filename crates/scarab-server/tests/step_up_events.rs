@@ -557,6 +557,100 @@ async fn an_owner_cannot_reset_a_member_of_an_org_they_do_not_own() {
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
 
+/// A login provider `default` whose install-wide owners are `owners` (never
+/// called: only its owners rules are consulted).
+fn provider_with_owners(owners: &[&str]) -> Arc<scarab_server::oauth::OAuthAuthenticator> {
+    Arc::new(scarab_server::oauth::OAuthAuthenticator::new(
+        scarab_server::config::OAuthConfig {
+            client_id: "cid".into(),
+            client_secret: "sekret".into(),
+            authorize_url: "http://127.0.0.1:9/authorize".into(),
+            token_url: "http://127.0.0.1:9/token".into(),
+            userinfo_url: "http://127.0.0.1:9/user".into(),
+            oidc_issuer: None,
+            scopes: String::new(),
+            owners: owners.iter().map(|o| o.to_string()).collect(),
+            provider_id: "default".into(),
+            unqualified_ids: true,
+            name: "default".into(),
+            forge_url: None,
+        },
+    ))
+}
+
+/// mallory, Owner of `evil`, binds the install owner `root` as a Viewer of
+/// `evil` and resets root's passkeys with her own always-ask confirmation.
+/// Returns the status and body of the confirmed reset.
+async fn mallory_resets_root(h: &Harness) -> (StatusCode, Value) {
+    let (mallory, mut soft) = member(h, "mallory", "evil", Role::Owner).await;
+    let _root = member(h, "root", "evil", Role::Viewer).await;
+    assert_eq!(h.passkey_store.list("root").await.unwrap().len(), 1);
+    let uri = "/v1/orgs/evil/members/root/passkeys/reset";
+    let (st, b) = h.cookie("POST", uri, None, &mallory).await;
+    assert_step_up(st, &b, "action");
+    let (st, conf) = h.answer(&mallory, &mut soft, &b["challenge"]).await;
+    assert_eq!(st, StatusCode::OK, "{conf}");
+    h.cookie("POST", uri, None, &mallory).await
+}
+
+/// (a) An Org Owner cannot strip an id-matched install owner's passkeys.
+#[tokio::test]
+async fn an_org_owner_cannot_reset_an_install_owner_by_id() {
+    let h = harness_with(|st| st.with_oauth_login(provider_with_owners(&["root"])));
+    let (st, b) = mallory_resets_root(&h).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{b}");
+    assert!(
+        b.as_str().unwrap().contains("install-wide owner"),
+        "{b}"
+    );
+    assert_eq!(h.passkey_store.list("root").await.unwrap().len(), 1);
+    assert!(h.events("passkey.reset").await.is_empty());
+}
+
+/// (b) … nor one matched by a verified email of a linked identity.
+#[tokio::test]
+async fn an_org_owner_cannot_reset_an_install_owner_by_verified_email() {
+    let ids = Arc::new(scarab_testkit::InMemoryIdentities::new());
+    ids.sign_in(
+        &ProviderIdentity {
+            provider: "default".into(),
+            external_id: "root-sub".into(),
+            handle: "root".into(),
+            email: Some("root@acme.test".into()),
+            email_verified: true,
+            display_name: None,
+        },
+        "root",
+        T0,
+    )
+    .await
+    .unwrap();
+    let wired = ids.clone();
+    let h = harness_with(move |st| {
+        st.with_oauth_login(provider_with_owners(&["root@acme.test"]))
+            .with_identities(wired as Arc<dyn IdentityStore>)
+    });
+    let (st, b) = mallory_resets_root(&h).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{b}");
+    assert_eq!(h.passkey_store.list("root").await.unwrap().len(), 1);
+}
+
+/// (c) A bootstrap owner can reset another install owner.
+#[tokio::test]
+async fn a_bootstrap_owner_can_reset_an_install_owner() {
+    let h = harness_with(|st| st.with_oauth_login(provider_with_owners(&["root", "boss"])));
+    let (boss, mut soft) = member(&h, "boss", "evil", Role::Owner).await;
+    let _root = member(&h, "root", "evil", Role::Viewer).await;
+    let uri = "/v1/orgs/evil/members/root/passkeys/reset";
+    let (st, b) = h.cookie("POST", uri, None, &boss).await;
+    assert_step_up(st, &b, "action");
+    h.answer(&boss, &mut soft, &b["challenge"]).await;
+    let (st, b) = h.cookie("POST", uri, None, &boss).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["removed"], 1);
+    assert!(h.passkey_store.list("root").await.unwrap().is_empty());
+}
+
 /// How the server keys a session's confirmations: the session id's hash.
 fn session_hash(id: &str) -> String {
     api_token_hash(id)
