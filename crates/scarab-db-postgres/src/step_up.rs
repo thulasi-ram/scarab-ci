@@ -16,9 +16,9 @@ use sqlx::Row;
 
 use scarab_identity::{
     BeginExecution, ChallengePurpose, ChallengeStore, ConfirmationKind, IdentityError, Passkey,
-    PasskeyStore, PasskeyUse, PendingCaps, RaiseRequest, RequestState, SecurityEvent,
-    SecurityEventFilter, SecurityEventLog, StepUpConfirmation, StepUpRequest, StepUpRequester,
-    StepUpStore, WebauthnChallenge,
+    PasskeyStore, PasskeyUse, RequestState, SecurityEvent, SecurityEventFilter, SecurityEventLog,
+    StepUpConfirmation, StepUpRequest, StepUpRequestPendingCaps, StepUpRequestRaiseOutcome,
+    StepUpRequester, StepUpStore, WebauthnChallenge,
 };
 
 use crate::{identity_err, role_from_str, role_str, PostgresDb};
@@ -615,9 +615,9 @@ impl StepUpStore for PostgresDb {
     async fn raise_request(
         &self,
         r: &StepUpRequest,
-        caps: PendingCaps,
+        caps: StepUpRequestPendingCaps,
         now_ms: i64,
-    ) -> Result<RaiseRequest, IdentityError> {
+    ) -> Result<StepUpRequestRaiseOutcome, IdentityError> {
         let mut tx = self.pool().begin().await.map_err(identity_err)?;
         // Every raise for one human runs its count-then-insert under one
         // transaction-scoped advisory lock, so concurrent raises (from any
@@ -643,7 +643,7 @@ impl StepUpStore for PostgresDb {
         .map_err(identity_err)?;
         let by_requester = by_requester.max(0) as u64;
         if by_requester >= caps.per_requester {
-            return Ok(RaiseRequest::RequesterFull {
+            return Ok(StepUpRequestRaiseOutcome::RequesterFull {
                 pending: by_requester,
             });
         }
@@ -658,11 +658,11 @@ impl StepUpStore for PostgresDb {
         .map_err(identity_err)?;
         let for_human = for_human.max(0) as u64;
         if for_human >= caps.per_human {
-            return Ok(RaiseRequest::HumanFull { pending: for_human });
+            return Ok(StepUpRequestRaiseOutcome::HumanFull { pending: for_human });
         }
         insert_request(&mut *tx, r).await?;
         tx.commit().await.map_err(identity_err)?;
-        Ok(RaiseRequest::Raised)
+        Ok(StepUpRequestRaiseOutcome::Raised)
     }
 
     async fn get_request(&self, id: &str) -> Result<Option<StepUpRequest>, IdentityError> {

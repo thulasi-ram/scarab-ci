@@ -16,11 +16,12 @@ use serde::{Deserialize, Serialize};
 mod step_up;
 pub use step_up::{
     security_event_kind, BeginExecution, ChallengePurpose, ChallengeStore, ConfirmationKind,
-    Passkey, PasskeyStore, PasskeyUse, PendingCaps, RaiseRequest, RequestState, SecurityEvent,
-    SecurityEventFilter, SecurityEventLog, StepUpConfirmation, StepUpRequest, StepUpRequester,
-    StepUpStore, WebauthnChallenge, FRESH_LOGIN_MS, LOGIN_KIND_API, LOGIN_KIND_BROWSER,
-    MAX_PENDING_STEP_UP_REQUESTS, MAX_PENDING_STEP_UP_REQUESTS_PER_HUMAN, STEP_UP_REQUEST_TTL_MS,
-    STEP_UP_WINDOW_MS, WEBAUTHN_CHALLENGE_TTL_MS,
+    Passkey, PasskeyStore, PasskeyUse, RequestState, SecurityEvent, SecurityEventFilter,
+    SecurityEventLog, StepUpConfirmation, StepUpRequest, StepUpRequestPendingCaps,
+    StepUpRequestRaiseOutcome, StepUpRequester, StepUpStore, WebauthnChallenge, FRESH_LOGIN_MS,
+    LOGIN_KIND_API, LOGIN_KIND_BROWSER, MAX_PENDING_STEP_UP_REQUESTS,
+    MAX_PENDING_STEP_UP_REQUESTS_PER_HUMAN, STEP_UP_REQUEST_TTL_MS, STEP_UP_WINDOW_MS,
+    WEBAUTHN_CHALLENGE_TTL_MS,
 };
 
 /// An authenticated principal (a human user or a machine identity).

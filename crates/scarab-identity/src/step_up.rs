@@ -41,17 +41,17 @@ pub const MAX_PENDING_STEP_UP_REQUESTS_PER_HUMAN: u64 = 20;
 /// The caps [`StepUpStore::raise_request`] enforces, counted atomically with
 /// the insert.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PendingCaps {
+pub struct StepUpRequestPendingCaps {
     /// Live requests one requester (a token, a Bearer session) may hold.
     pub per_requester: u64,
     /// Live requests one human (`for_human`) may have waiting.
     pub per_human: u64,
 }
 
-impl PendingCaps {
+impl StepUpRequestPendingCaps {
     /// [`MAX_PENDING_STEP_UP_REQUESTS`] and
     /// [`MAX_PENDING_STEP_UP_REQUESTS_PER_HUMAN`].
-    pub const DEFAULT: PendingCaps = PendingCaps {
+    pub const DEFAULT: StepUpRequestPendingCaps = StepUpRequestPendingCaps {
         per_requester: MAX_PENDING_STEP_UP_REQUESTS,
         per_human: MAX_PENDING_STEP_UP_REQUESTS_PER_HUMAN,
     };
@@ -59,7 +59,7 @@ impl PendingCaps {
 
 /// What [`StepUpStore::raise_request`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RaiseRequest {
+pub enum StepUpRequestRaiseOutcome {
     /// Recorded, pending.
     Raised,
     /// Not recorded: the requester already holds `pending` live requests.
@@ -513,9 +513,9 @@ pub trait StepUpStore: Send + Sync {
     async fn raise_request(
         &self,
         request: &StepUpRequest,
-        caps: PendingCaps,
+        caps: StepUpRequestPendingCaps,
         now_ms: i64,
-    ) -> Result<RaiseRequest, IdentityError>;
+    ) -> Result<StepUpRequestRaiseOutcome, IdentityError>;
 
     async fn get_request(&self, id: &str) -> Result<Option<StepUpRequest>, IdentityError>;
 

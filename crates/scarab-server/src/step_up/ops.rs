@@ -178,7 +178,7 @@ pub struct OpSummary {
 /// only ever end `failed`, and would hand a compromised machine a plausible
 /// prompt to send its human.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MachineUse {
+pub enum StepUpMachineUse {
     /// An API token or a Bearer session may perform it (once confirmed).
     Requestable,
     /// Only a cookie session: the handler refuses every token and Bearer
@@ -216,7 +216,7 @@ pub struct Op {
     pub target: &'static [&'static str],
     pub describe: fn(&Op, &OpInput) -> OpSummary,
     /// Whether a machine caller may raise a request for it.
-    pub machine: MachineUse,
+    pub machine: StepUpMachineUse,
     /// The largest body a StepUpConfirmationRequest for it may seal (bytes);
     /// a bigger one raises none (413). Well under the guard's 2 MiB: a
     /// request parks its body, sealed, until it settles or is reaped.
@@ -234,7 +234,7 @@ impl Op {
     /// Only a human in a browser can ever perform it.
     const fn browser_only(self) -> Op {
         Op {
-            machine: MachineUse::BrowserOnly,
+            machine: StepUpMachineUse::BrowserOnly,
             ..self
         }
     }
@@ -242,7 +242,7 @@ impl Op {
     /// An API token can never perform it.
     const fn not_by_token(self) -> Op {
         Op {
-            machine: MachineUse::NotByToken,
+            machine: StepUpMachineUse::NotByToken,
             ..self
         }
     }
@@ -495,7 +495,7 @@ const fn op(
         redact,
         target,
         describe: describe_generic,
-        machine: MachineUse::Requestable,
+        machine: StepUpMachineUse::Requestable,
         max_request_body: DEFAULT_MAX_REQUEST_BODY,
     }
 }
@@ -1163,9 +1163,9 @@ mod tests {
         let mut not_by_token = Vec::new();
         for e in crate::route_table() {
             match e.op.machine {
-                MachineUse::BrowserOnly => browser_only.push(e.op.id),
-                MachineUse::NotByToken => not_by_token.push(e.op.id),
-                MachineUse::Requestable => {}
+                StepUpMachineUse::BrowserOnly => browser_only.push(e.op.id),
+                StepUpMachineUse::NotByToken => not_by_token.push(e.op.id),
+                StepUpMachineUse::Requestable => {}
             }
         }
         browser_only.sort_unstable();

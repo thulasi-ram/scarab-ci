@@ -47,15 +47,15 @@ use utoipa::ToSchema;
 
 use scarab_identity::{
     security_event_kind as kind, Action, BeginExecution, ChallengePurpose, ConfirmationKind,
-    PendingCaps, Principal, RaiseRequest, RequestState, Role, StepUpConfirmation, StepUpRequest,
-    StepUpRequester, STEP_UP_REQUEST_TTL_MS, STEP_UP_WINDOW_MS,
+    Principal, RequestState, Role, StepUpConfirmation, StepUpRequest, StepUpRequestPendingCaps,
+    StepUpRequestRaiseOutcome, StepUpRequester, STEP_UP_REQUEST_TTL_MS, STEP_UP_WINDOW_MS,
 };
 
 use super::ceremony::{
     browser_session, challenge_invalid, consume, service, verify_assertion, StepUpConfirmRequest,
 };
 use super::{
-    descriptors, event, random_id, store_err, MachineUse, Op, OpSummary, OrgOf, Prepared,
+    descriptors, event, random_id, store_err, Op, OpSummary, OrgOf, Prepared, StepUpMachineUse,
     StepUpRefusal, StepUpService, WebauthnChallengeDto,
 };
 use crate::{authenticate, ApiError, AppState, AuthVia, Caller, SessionFacts};
@@ -147,9 +147,9 @@ pub(crate) fn requester_of(caller: &Caller) -> Option<StepUpRequester> {
 /// send its human.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Unrequestable {
-    /// Only a human in a browser can perform it ([`MachineUse::BrowserOnly`]).
+    /// Only a human in a browser can perform it ([`StepUpMachineUse::BrowserOnly`]).
     BrowserOnly,
-    /// An API token can never perform it ([`MachineUse::NotByToken`]).
+    /// An API token can never perform it ([`StepUpMachineUse::NotByToken`]).
     NotByToken,
     /// It acts on an Org the API token's scope does not reach.
     OutsideTokenScope,
@@ -188,11 +188,11 @@ impl Unrequestable {
 /// the authority on what runs; this only refuses what it is certain to
 /// refuse.
 pub(crate) fn requestable(op: &Op, p: &Prepared) -> Result<(), Unrequestable> {
-    if op.machine == MachineUse::BrowserOnly {
+    if op.machine == StepUpMachineUse::BrowserOnly {
         return Err(Unrequestable::BrowserOnly);
     }
     if let Some(token) = &p.caller.grant {
-        if op.machine == MachineUse::NotByToken {
+        if op.machine == StepUpMachineUse::NotByToken {
             return Err(Unrequestable::NotByToken);
         }
         // An Org-bound operation on an Org the token does not cover (or
@@ -327,12 +327,12 @@ pub(crate) async fn raise<T>(
     // per human across every credential acting for them.
     let full = match svc
         .confirmations
-        .raise_request(&row, PendingCaps::DEFAULT, now)
+        .raise_request(&row, StepUpRequestPendingCaps::DEFAULT, now)
         .await
         .map_err(store_err)?
     {
-        RaiseRequest::Raised => None,
-        RaiseRequest::RequesterFull { pending } => Some((
+        StepUpRequestRaiseOutcome::Raised => None,
+        StepUpRequestRaiseOutcome::RequesterFull { pending } => Some((
             pending,
             "too many pending confirmation requests",
             format!(
@@ -340,7 +340,7 @@ pub(crate) async fn raise<T>(
                  waiting for {human}; confirm them, or let them expire (5 minutes), first"
             ),
         )),
-        RaiseRequest::HumanFull { pending } => Some((
+        StepUpRequestRaiseOutcome::HumanFull { pending } => Some((
             pending,
             "too many pending confirmation requests for this human",
             format!(

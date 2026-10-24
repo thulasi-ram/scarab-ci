@@ -14,9 +14,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use scarab_identity::{
     BeginExecution, ChallengeStore, ConfirmationKind, IdentityError, Passkey, PasskeyStore,
-    PasskeyUse, PendingCaps, RaiseRequest, RbacStore, RequestState, SecurityEvent,
-    SecurityEventFilter, SecurityEventLog, StepUpConfirmation, StepUpRequest, StepUpRequester,
-    StepUpStore, WebauthnChallenge,
+    PasskeyUse, RbacStore, RequestState, SecurityEvent, SecurityEventFilter, SecurityEventLog,
+    StepUpConfirmation, StepUpRequest, StepUpRequestPendingCaps, StepUpRequestRaiseOutcome,
+    StepUpRequester, StepUpStore, WebauthnChallenge,
 };
 
 // ---------------------------------------------------------------------------
@@ -420,9 +420,9 @@ impl StepUpStore for InMemoryStepUp {
     async fn raise_request(
         &self,
         request: &StepUpRequest,
-        caps: PendingCaps,
+        caps: StepUpRequestPendingCaps,
         now_ms: i64,
-    ) -> Result<RaiseRequest, IdentityError> {
+    ) -> Result<StepUpRequestRaiseOutcome, IdentityError> {
         let mut state = self.state.lock().unwrap();
         let live = |r: &&StepUpRequest| r.state == RequestState::Pending && r.expires_at > now_ms;
         let by_requester = state
@@ -432,7 +432,7 @@ impl StepUpStore for InMemoryStepUp {
             .filter(|r| requester_matches(r, &request.requester))
             .count() as u64;
         if by_requester >= caps.per_requester {
-            return Ok(RaiseRequest::RequesterFull {
+            return Ok(StepUpRequestRaiseOutcome::RequesterFull {
                 pending: by_requester,
             });
         }
@@ -443,7 +443,7 @@ impl StepUpStore for InMemoryStepUp {
             .filter(|r| r.for_human == request.for_human)
             .count() as u64;
         if for_human >= caps.per_human {
-            return Ok(RaiseRequest::HumanFull { pending: for_human });
+            return Ok(StepUpRequestRaiseOutcome::HumanFull { pending: for_human });
         }
         if state.requests.contains_key(&request.id) {
             return Err(IdentityError::Conflict(format!(
@@ -452,7 +452,7 @@ impl StepUpStore for InMemoryStepUp {
             )));
         }
         state.requests.insert(request.id.clone(), request.clone());
-        Ok(RaiseRequest::Raised)
+        Ok(StepUpRequestRaiseOutcome::Raised)
     }
 
     async fn get_request(&self, id: &str) -> Result<Option<StepUpRequest>, IdentityError> {

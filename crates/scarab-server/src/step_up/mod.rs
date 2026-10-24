@@ -38,7 +38,7 @@ use scarab_identity::{
 use scarab_secrets::Sealer;
 use scarab_webauthn::{CredentialDescriptor, RelyingParty};
 
-pub use ops::{Class, MachineUse, Mode, Op, OpInput, OpSummary, OrgOf};
+pub use ops::{Class, Mode, Op, OpInput, OpSummary, OrgOf, StepUpMachineUse};
 
 use crate::{ApiError, AppState, Caller};
 
@@ -93,7 +93,7 @@ pub struct StepUpService {
     digest_key: [u8; 32],
     link_key: [u8; 32],
     rp: RelyingParty,
-    refusals: RefusalLimiter,
+    refusals: StepUpRefusalLimiter,
 }
 
 /// How long one refusal-coalescing window lasts.
@@ -112,9 +112,9 @@ const MAX_REFUSAL_KEYS: usize = 10_000;
 /// or carry the count of — another's. The target is not: it is free text
 /// the caller picks (a secret's name), so keying on it would let one caller
 /// write unbounded refusals by varying it.
-type RefusalKey = [String; 5];
+type StepUpRefusalKey = [String; 5];
 
-fn refusal_key(event: &SecurityEvent) -> RefusalKey {
+fn refusal_key(event: &SecurityEvent) -> StepUpRefusalKey {
     let reason = event
         .detail
         .get("reason")
@@ -135,18 +135,18 @@ fn refusal_key(event: &SecurityEvent) -> RefusalKey {
 /// It fails toward recording: a refusal it cannot coalesce is written, and
 /// a closed window's suppressed count is written to its own Org's log.
 #[derive(Default)]
-pub(crate) struct RefusalLimiter {
-    state: Mutex<RefusalLimiterState>,
+pub(crate) struct StepUpRefusalLimiter {
+    state: Mutex<StepUpRefusalLimiterState>,
 }
 
 #[derive(Default)]
-struct RefusalLimiterState {
-    buckets: std::collections::HashMap<RefusalKey, RefusalBucket>,
+struct StepUpRefusalLimiterState {
+    buckets: std::collections::HashMap<StepUpRefusalKey, StepUpRefusalBucket>,
     /// When closed windows were last swept (at most once a window).
     last_sweep: i64,
 }
 
-struct RefusalBucket {
+struct StepUpRefusalBucket {
     window_start: i64,
     recorded: u32,
     suppressed: u64,
@@ -156,7 +156,7 @@ struct RefusalBucket {
     last_suppressed: Option<SecurityEvent>,
 }
 
-impl RefusalBucket {
+impl StepUpRefusalBucket {
     /// The closed window's suppressed refusals as one event: the newest of
     /// them, carrying how many others it stands for.
     fn flush(&mut self) -> Option<SecurityEvent> {
@@ -171,7 +171,7 @@ impl RefusalBucket {
     }
 }
 
-impl RefusalLimiter {
+impl StepUpRefusalLimiter {
     /// The events to append for refusal `event`: none (suppressed, counted),
     /// the refusal itself (carrying `detail.suppressed_before` when its key
     /// dropped some since its last recorded one), and every other key's
@@ -200,7 +200,7 @@ impl RefusalLimiter {
             out.push(event);
             return out;
         }
-        let b = st.buckets.entry(key).or_insert(RefusalBucket {
+        let b = st.buckets.entry(key).or_insert(StepUpRefusalBucket {
             window_start: now,
             recorded: 0,
             suppressed: 0,
@@ -248,7 +248,7 @@ impl StepUpService {
             digest_key,
             link_key,
             rp,
-            refusals: RefusalLimiter::default(),
+            refusals: StepUpRefusalLimiter::default(),
         }
     }
 
@@ -383,7 +383,7 @@ pub async fn admins_without_passkey(
 /// The bootstrap owners entries, as admins a passkey can be counted for
 /// (git-bug 08d676d).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct OwnerEntries {
+pub struct BootstrapOwnerEntries {
     /// The Principals the entries name — a merged id followed to the live
     /// Principal, under which its passkeys are stored; an id nobody has
     /// signed in as yet kept as is (it holds no passkey, and will need one).
@@ -395,13 +395,13 @@ pub struct OwnerEntries {
     pub email_matchers: Vec<String>,
 }
 
-/// Split `entries` into [`OwnerEntries`]. A store error keeps the entry as
+/// Split `entries` into [`BootstrapOwnerEntries`]. A store error keeps the entry as
 /// is (the old, conservative count) rather than dropping it.
 pub async fn resolve_owner_entries(
     identities: Option<&dyn scarab_identity::IdentityStore>,
     entries: &[String],
-) -> OwnerEntries {
-    let mut out = OwnerEntries::default();
+) -> BootstrapOwnerEntries {
+    let mut out = BootstrapOwnerEntries::default();
     for entry in entries {
         let resolved = match identities {
             Some(store) => match scarab_identity::resolve_principal(store, entry).await {
@@ -976,7 +976,7 @@ mod tests {
 
     /// `Some(n)` = recorded alone, carrying `n` suppressed (0 = none);
     /// `None` = suppressed. Panics if anything else was flushed with it.
-    fn admit_one(l: &RefusalLimiter, e: SecurityEvent) -> Option<u64> {
+    fn admit_one(l: &StepUpRefusalLimiter, e: SecurityEvent) -> Option<u64> {
         let mut out = l.admit(e);
         assert!(out.len() <= 1, "unexpected flush: {out:?}");
         out.pop()
@@ -985,7 +985,7 @@ mod tests {
 
     #[test]
     fn the_refusal_limiter_admits_five_a_window_per_key_and_carries_the_rest() {
-        let l = RefusalLimiter::default();
+        let l = StepUpRefusalLimiter::default();
         let k = |org: &str, s: &str, c: &str, op: &str, r: &str, at| refusal(org, s, c, op, r, at);
         let amy = |at| {
             k(
@@ -1032,7 +1032,7 @@ mod tests {
     /// the suppressed count lands in the Org it was suppressed in.
     #[test]
     fn the_refusal_limiter_keys_by_org() {
-        let l = RefusalLimiter::default();
+        let l = StepUpRefusalLimiter::default();
         let r =
             |org: &str, at| refusal(org, "amy", "session:cookie", "secret.put", "no_window", at);
         for _ in 0..REFUSALS_PER_WINDOW + 3 {
@@ -1051,7 +1051,7 @@ mod tests {
     /// own Org's log, the next time any refusal reaches the limiter.
     #[test]
     fn a_closed_windows_suppressed_count_is_flushed_without_its_key_returning() {
-        let l = RefusalLimiter::default();
+        let l = StepUpRefusalLimiter::default();
         let r =
             |org: &str, op: &str, at| refusal(org, "amy", "session:cookie", op, "no_window", at);
         for i in 0..REFUSALS_PER_WINDOW + 4 {
@@ -1081,7 +1081,7 @@ mod tests {
     /// (uncoalesced), never dropped.
     #[test]
     fn a_full_refusal_limiter_records_rather_than_drops() {
-        let l = RefusalLimiter::default();
+        let l = StepUpRefusalLimiter::default();
         for i in 0..MAX_REFUSAL_KEYS {
             l.admit(refusal(
                 "acme",
