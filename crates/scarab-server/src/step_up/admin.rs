@@ -86,6 +86,15 @@ pub(crate) async fn reset_member_passkeys(
         && crate::token_owner_roles(&st, &caller.principal.subject)
             .await
             .contains(&Role::Owner);
+    // An install-wide owner's passkeys are reset only by a bootstrap owner:
+    // binding them into a small Org must not hand that Org's Owner the
+    // power to reopen their first-passkey path.
+    if !bootstrap && is_install_owner(&st, &subject).await? {
+        return Err(ApiError::Denied(format!(
+            "`{subject}` is an install-wide owner: only a bootstrap owner can reset their \
+             passkeys"
+        )));
+    }
     if !bootstrap {
         let mut not_owned = Vec::new();
         for o in &orgs {
@@ -131,6 +140,34 @@ pub(crate) async fn reset_member_passkeys(
         subject,
         removed,
         windows_revoked,
+    }))
+}
+
+/// Is `subject` an install-wide (bootstrap) owner — by id (aliases
+/// included), or by a verified email of one of its linked identities under
+/// that provider's owners rules? Fails closed: an identity store error
+/// refuses rather than answering "no".
+async fn is_install_owner(st: &AppState, subject: &str) -> Result<bool, ApiError> {
+    if !crate::token_owner_roles(st, subject).await.is_empty() {
+        return Ok(true);
+    }
+    let Some(store) = st.identities.as_ref() else {
+        return Ok(false);
+    };
+    let identities = store.identities_of(subject).await.map_err(|e| {
+        ApiError::Unavailable(format!(
+            "could not read `{subject}`'s identities to tell whether they are an install-wide \
+             owner, so nothing was reset: {e}"
+        ))
+    })?;
+    Ok(identities.iter().any(|i| {
+        let email = i.email.as_deref().filter(|_| i.email_verified);
+        email.is_some()
+            && st
+                .oauth_providers
+                .iter()
+                .filter(|p| p.provider_id() == i.provider)
+                .any(|p| p.matches_owner(subject, email))
     }))
 }
 
