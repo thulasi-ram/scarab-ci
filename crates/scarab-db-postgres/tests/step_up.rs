@@ -661,10 +661,8 @@ async fn a_request_row_must_name_its_requester() {
     )
     .execute(&tdb.pool)
     .await;
-    assert!(
-        err.is_err(),
-        "an api_token request with no token id is refused"
-    );
+    let err = err.expect_err("an api_token request with no token id is refused");
+    assert!(err.to_string().contains("check constraint"), "{err}");
     drop(db);
     tdb.cleanup().await;
 }
