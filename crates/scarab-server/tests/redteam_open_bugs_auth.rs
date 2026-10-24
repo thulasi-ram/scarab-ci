@@ -525,7 +525,6 @@ async fn rt_the_refusal_limiter_hides_the_target_actually_probed() {
 /// suppressed until the clock catches up with the old window — here ten
 /// minutes of refusals vanish.
 #[tokio::test]
-#[ignore = "redteam: BROKE after a wall-clock step back the refusal limiter suppresses a key until the clock catches up (10 min here)"]
 async fn rt_a_clock_step_back_mutes_refusals_until_it_catches_up() {
     let h = harness();
     let (s, _soft) = amy_in_browser(&h).await;

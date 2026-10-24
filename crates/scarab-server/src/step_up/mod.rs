@@ -233,6 +233,16 @@ impl StepUpRefusalBucket {
     }
 }
 
+/// Has the window that opened at `start` closed by `now`? Also when the
+/// wall clock stepped back past its start (an NTP step, a VM resume): the
+/// window is then over, not merely longer, else every refusal of a key
+/// that used its budget is suppressed until the clock catches up (redteam
+/// auth-7). The limiter keeps the event's clock rather than a monotonic
+/// one so its windows line up with the times the log records.
+fn window_closed(start: i64, now: i64) -> bool {
+    now < start || now - start >= REFUSAL_WINDOW_MS
+}
+
 fn insert_detail(event: &mut SecurityEvent, key: &str, n: u64) {
     if let Some(d) = event.detail.as_object_mut() {
         d.insert(key.into(), n.into());
@@ -253,11 +263,11 @@ impl StepUpRefusalLimiter {
         let mut st = self.state.lock().unwrap();
         let mut out = Vec::new();
         let full = !st.buckets.contains_key(&key) && st.buckets.len() >= MAX_REFUSAL_KEYS;
-        if full || now - st.last_sweep >= REFUSAL_WINDOW_MS {
+        if full || window_closed(st.last_sweep, now) {
             st.last_sweep = now;
             // This key's own count rides on this refusal instead (below).
             st.buckets.retain(|k, b| {
-                if *k == key || now - b.window_start < REFUSAL_WINDOW_MS {
+                if *k == key || !window_closed(b.window_start, now) {
                     return true;
                 }
                 out.extend(b.drain(None));
@@ -273,7 +283,7 @@ impl StepUpRefusalLimiter {
             .buckets
             .entry(key)
             .or_insert_with(|| StepUpRefusalBucket::new(now));
-        if now - b.window_start >= REFUSAL_WINDOW_MS {
+        if window_closed(b.window_start, now) {
             b.window_start = now;
             b.recorded = 0;
         }
@@ -1167,6 +1177,23 @@ mod tests {
         assert_eq!(out.last().unwrap().detail["suppressed_before"], 2);
         // T3..T6 (four) are past the cap.
         assert_eq!(out[3].detail["suppressed_other_targets"], 4);
+    }
+
+    /// Redteam auth-7: after the wall clock steps back, a key that used its
+    /// budget is recorded again at once (a new window), not muted until the
+    /// clock passes the old window.
+    #[test]
+    fn a_clock_step_back_opens_a_new_window() {
+        let l = StepUpRefusalLimiter::default();
+        let r = |at| refusal("acme", "amy", "session:cookie", "secret.put", "no_window", at);
+        let t = 10 * REFUSAL_WINDOW_MS;
+        for _ in 0..REFUSALS_PER_WINDOW {
+            assert_eq!(admit_one(&l, r(t)), Some(0));
+        }
+        assert_eq!(admit_one(&l, r(t)), None);
+        // Ten minutes back: recorded, carrying the one suppressed.
+        assert_eq!(admit_one(&l, r(t - 10 * 60 * 1000)), Some(1));
+        assert_eq!(admit_one(&l, r(t - 10 * 60 * 1000)), Some(0));
     }
 
     /// Review F9/S3: with every key live, a new key's refusal is recorded
