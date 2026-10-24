@@ -7,6 +7,11 @@
 //! validator to drift. `lint` and `validate` are offline compile/semantic
 //! checks over a pipeline file; `logs` replays + tails a run's logs over SSE;
 //! `rerun` reruns a step and its dependents — all wired, not stubs.
+//! `security setup|status` enroll and inspect passkeys (ADR-0073 §10); `api`
+//! calls any endpoint. Every command reports a `403 step_up_required` as the
+//! one-time browser link its human confirms the operation at.
+
+mod security;
 
 use clap::{Args, Parser, Subcommand};
 
@@ -29,6 +34,29 @@ enum Command {
     Logs(LogsArgs),
     /// Rerun a step (and its dependents) of a run.
     Rerun(RerunArgs),
+    /// Passkeys and step-up confirmation (ADR-0073).
+    #[command(subcommand)]
+    Security(security::SecurityCommand),
+    /// Call any API endpoint (`scarab api /v1/me`), printing the answer.
+    ///
+    /// A crown-jewel operation answers with a one-time link its human
+    /// confirms it at in a browser (ADR-0073 §6).
+    Api(ApiArgs),
+}
+
+/// `scarab api <path> [-X method] [-d json|@file|@-]`.
+#[derive(Debug, Args)]
+struct ApiArgs {
+    /// The API path, e.g. `/v1/me` (query string included).
+    path: String,
+    /// The HTTP method. Default `GET`, or `POST` when `--data` is given.
+    #[arg(long, short = 'X')]
+    method: Option<String>,
+    /// A JSON request body; `@file` reads it from a file, `@-` from stdin.
+    #[arg(long, short = 'd')]
+    data: Option<String>,
+    #[command(flatten)]
+    conn: security::Conn,
 }
 
 /// A local pipeline file (offline — no server needed).
@@ -162,6 +190,8 @@ async fn main() {
         Command::Validate(args) => validate(&args),
         Command::Logs(args) => logs(args).await,
         Command::Rerun(args) => rerun(args).await,
+        Command::Security(cmd) => security::run(cmd).await,
+        Command::Api(args) => api(args).await,
     };
     std::process::exit(code);
 }
@@ -237,7 +267,9 @@ async fn logs(args: LogsArgs) -> i32 {
         }
     };
     if !resp.status().is_success() {
-        eprintln!("logs failed ({})", resp.status().as_u16());
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        security::print_failure("logs", base, status, &text);
         return 1;
     }
     let mut resp = resp;
@@ -281,11 +313,9 @@ async fn rerun(args: RerunArgs) -> i32 {
         println!("rerun accepted: {}/{}", args.run, args.step);
         0
     } else {
-        eprintln!(
-            "rerun failed ({}): {}",
-            resp.status().as_u16(),
-            resp.text().await.unwrap_or_default().trim()
-        );
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        security::print_failure("rerun", base, status, &text);
         1
     }
 }
@@ -339,7 +369,7 @@ async fn run(args: RunArgs) -> i32 {
     } else {
         // The server's structured per-parameter / fail-closed message (unknown,
         // invalid, missing param, not-dispatchable, disallowed ref).
-        eprintln!("dispatch failed ({}): {}", status.as_u16(), text.trim());
+        security::print_failure("dispatch", base, status.as_u16(), &text);
         1
     }
 }
@@ -369,7 +399,7 @@ async fn describe(
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        eprintln!("describe failed ({}): {}", status.as_u16(), text.trim());
+        security::print_failure("describe", base, status.as_u16(), &text);
         return 1;
     }
     let doc: serde_json::Value = match serde_json::from_str(&text) {
@@ -408,6 +438,80 @@ async fn describe(
         _ => println!("parameters: (none)"),
     }
     0
+}
+
+/// `scarab api`: one raw API call. The answer's body goes to stdout (pretty
+/// JSON when it is JSON); a failure is reported like every other command's.
+async fn api(args: ApiArgs) -> i32 {
+    let path = if args.path.starts_with('/') {
+        args.path.clone()
+    } else {
+        format!("/{}", args.path)
+    };
+    let body = match args.data.as_deref() {
+        None => None,
+        Some(d) => match read_data(d) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                eprintln!("error: --data: {e}");
+                return 2;
+            }
+        },
+    };
+    let method = match args.method.as_deref() {
+        Some(m) => m.to_ascii_uppercase(),
+        None if body.is_some() => "POST".into(),
+        None => "GET".into(),
+    };
+    let method = match reqwest::Method::from_bytes(method.as_bytes()) {
+        Ok(m) => m,
+        Err(_) => {
+            eprintln!("error: not an HTTP method: {method}");
+            return 2;
+        }
+    };
+    let api = security::Api::new(&args.conn.server, &args.conn.token);
+    let url = api.url(&path);
+    let mut req = with_auth(
+        reqwest::Client::new().request(method.clone(), &url),
+        &args.conn.token,
+    );
+    if let Some(b) = body {
+        req = req.header("content-type", "application/json").body(b);
+    }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: request to {url} failed: {e}");
+            return 1;
+        }
+    };
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    if !(200..300).contains(&status) {
+        security::print_failure(&format!("{method} {path}"), api.base(), status, &text);
+        return 1;
+    }
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap_or(text)),
+        Err(_) if text.is_empty() => {}
+        Err(_) => println!("{text}"),
+    }
+    0
+}
+
+/// `--data`: literal JSON, `@file`, or `@-` (stdin).
+fn read_data(d: &str) -> Result<String, String> {
+    match d.strip_prefix('@') {
+        Some("-") => {
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)
+                .map_err(|e| format!("stdin: {e}"))?;
+            Ok(s)
+        }
+        Some(path) => std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}")),
+        None => Ok(d.to_string()),
+    }
 }
 
 #[cfg(test)]
