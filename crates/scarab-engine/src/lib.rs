@@ -1004,7 +1004,8 @@ pub struct RunDeploymentRequest {
 
 /// Complete a succeeding Step's DeploymentRequests from its own `results`
 /// (slice b, criterion 1; plan Q10): each request's DeploymentVersion is its
-/// version result, which must be a **non-empty JSON string**; its evidence is
+/// version result, which must be a **non-empty JSON string** with no
+/// leading or trailing whitespace (never trimmed: a version is opaque); its evidence is
 /// the concatenation of its evidence results, each a JSON string or an array
 /// of strings. Every request is effective at `effective_at` (the start of the
 /// step's first Attempt in its current Take — see
@@ -1094,6 +1095,16 @@ pub fn complete_deployment_inputs(
                 ));
                 None
             }
+            // A DeploymentVersion is opaque and never trimmed: `"v1\n"` would
+            // be a Deployment apart from the plugin's `v1` (git-bug 5f03853).
+            Some(serde_json::Value::String(v)) if !v.trim().is_empty() && v.trim() != v => {
+                problems.push(format!(
+                    "result `{}` (the version for {target}): version has leading/trailing \
+                     whitespace ({v:?}); write it exactly, with nothing around it",
+                    req.version_result
+                ));
+                None
+            }
             Some(serde_json::Value::String(v)) if !v.trim().is_empty() => Some(v.clone()),
             Some(other) => {
                 problems.push(format!(
@@ -1154,7 +1165,9 @@ fn json_kind(v: &serde_json::Value) -> &'static str {
         serde_json::Value::Null => "null",
         serde_json::Value::Bool(_) => "a boolean",
         serde_json::Value::Number(_) => "a number",
-        serde_json::Value::String(_) => "an empty string",
+        serde_json::Value::String(s) if s.is_empty() => "an empty string",
+        serde_json::Value::String(s) if s.trim().is_empty() => "a blank string",
+        serde_json::Value::String(_) => "a string",
         serde_json::Value::Array(_) => "an array",
         serde_json::Value::Object(_) => "an object",
     }
@@ -2182,5 +2195,51 @@ mod tests {
         let json = serde_json::to_string(&payload).unwrap();
         let back: EventPayload = serde_json::from_str(&json).unwrap();
         assert_eq!(back, payload);
+    }
+
+    /// git-bug 5f03853: a DeploymentVersion is opaque, so it is never
+    /// trimmed — `"v1\n"` would be a Deployment apart from the plugin's `v1`.
+    /// Surrounding whitespace is refused instead, and a blank version is
+    /// called blank, not empty.
+    #[test]
+    fn a_version_with_surrounding_whitespace_is_refused_not_trimmed() {
+        let request = RunDeploymentRequest {
+            step: StepId("bump".into()),
+            ordinal: 0,
+            org: "acme".into(),
+            environment: "prod".into(),
+            target_source: "argocd".into(),
+            target_id: "web".into(),
+            version_result: "version".into(),
+            evidence_results: vec![],
+            gate_steps: vec![],
+        };
+        let complete = |version: &str| {
+            complete_deployment_inputs(
+                &RunId("r1".into()),
+                &StepId("bump".into()),
+                std::slice::from_ref(&request),
+                &std::collections::BTreeMap::from([(
+                    "version".to_string(),
+                    serde_json::Value::String(version.into()),
+                )]),
+                Timestamp(0),
+            )
+        };
+        for padded in ["v1\n", " v1", "v1\t"] {
+            let problems = complete(padded).unwrap_err().problems;
+            assert_eq!(problems.len(), 1, "{padded:?}: {problems:?}");
+            assert!(
+                problems[0].contains("version has leading/trailing whitespace"),
+                "{padded:?}: {problems:?}"
+            );
+        }
+        let blank = complete("  ").unwrap_err().problems;
+        assert!(blank[0].contains("got a blank string"), "{blank:?}");
+        let empty = complete("").unwrap_err().problems;
+        assert!(empty[0].contains("got an empty string"), "{empty:?}");
+        assert_eq!(complete("v1").unwrap().len(), 1);
+
+        assert_eq!(json_kind(&serde_json::json!("x")), "a string");
     }
 }
