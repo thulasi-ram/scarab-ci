@@ -723,6 +723,144 @@ async fn a_request_cannot_be_widened() {
     assert_eq!(secrets.puts(), 1);
 }
 
+/// A world with `acme/prod` governed in memory, its baseline
+/// `{approvers:[amy], allowed_refs:[main]}`; and the store, to change it
+/// behind the request's back.
+async fn governed() -> (
+    Harness,
+    Arc<scarab_testkit::InMemoryEnvironmentGovernance>,
+) {
+    use scarab_project::{
+        EnvironmentGovernanceStore, EnvironmentProjectEligibility, EnvironmentProtectionRules,
+    };
+    let gov = Arc::new(
+        scarab_testkit::InMemoryEnvironmentGovernance::new().with_environment(
+            "acme",
+            "prod",
+            EnvironmentProjectEligibility::AllProjects,
+        ),
+    );
+    let wired = gov.clone();
+    let h = harness_with(move |st| {
+        st.with_environment_governance(wired as Arc<dyn EnvironmentGovernanceStore>)
+    });
+    h.grant("amy", Scope::Org("acme".into()), Role::Owner).await;
+    gov.put_environment_protection_expecting(
+        "acme",
+        "prod",
+        &EnvironmentProtectionRules {
+            approvers: vec!["amy".into()],
+            allowed_refs: vec!["main".into()],
+            ..Default::default()
+        },
+        None,
+        "seed",
+        0,
+    )
+    .await
+    .unwrap();
+    (h, gov)
+}
+
+async fn protection(
+    gov: &scarab_testkit::InMemoryEnvironmentGovernance,
+) -> scarab_project::EnvironmentProtectionRules {
+    use scarab_project::EnvironmentGovernanceStore;
+    gov.deploy_governance("acme", "", "prod")
+        .await
+        .unwrap()
+        .expect("acme/prod")
+        .environment
+        .protection
+}
+
+/// Move the stored baseline to `rules`, as a concurrent admin would.
+async fn concurrently(
+    gov: &scarab_testkit::InMemoryEnvironmentGovernance,
+    rules: scarab_project::EnvironmentProtectionRules,
+) {
+    use scarab_project::EnvironmentGovernanceStore;
+    let current = protection(gov).await;
+    gov.put_environment_protection_expecting("acme", "prod", &rules, Some(&current), "bob", 1)
+        .await
+        .unwrap();
+}
+
+/// A token raises "allow any ref" on prod's baseline; the human confirms
+/// exactly that. Before the confirm, someone ADDS approver bob — so the
+/// same body would now also remove bob, a loosening the human never saw.
+/// The replay refuses it: the request fails and bob stays.
+#[tokio::test]
+async fn a_replay_cannot_apply_a_loosening_the_human_never_saw() {
+    let (h, gov) = governed().await;
+    let (amy, mut soft) = amy_in_browser(&h).await;
+    let token = pat(&h, "t1", Scope::Org("acme".into()), Role::Admin).await;
+    let uri = "/v1/orgs/acme/environments/prod/protection";
+    let (st, b) = h
+        .bearer(
+            "PUT",
+            uri,
+            Some(json!({"approvers": ["amy"], "allowed_refs": []})),
+            &token,
+        )
+        .await;
+    assert!(is_step_up(st, &b), "{st} {b}");
+    let id = b["request_id"].as_str().expect("a request").to_string();
+    assert_eq!(b["summary"]["changes"], json!(["allows any ref"]), "{b}");
+
+    concurrently(
+        &gov,
+        scarab_project::EnvironmentProtectionRules {
+            approvers: vec!["amy".into(), "bob".into()],
+            allowed_refs: vec!["main".into()],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let (st, done) = confirm(&h, &amy, &mut soft, &id).await;
+    assert_eq!(st, StatusCode::OK, "{done}");
+    assert_eq!(done["state"], "failed", "{done}");
+    assert_eq!(stored(&h, &id).await.state, RequestState::Failed);
+    let now = protection(&gov).await;
+    assert!(now.approvers.contains(&"bob".to_string()), "{now:?}");
+    assert_eq!(now.allowed_refs, vec!["main".to_string()]);
+}
+
+/// The control: a concurrent change that leaves the loosenings within what
+/// the human confirmed (another allowed ref, still widened to "any") runs.
+#[tokio::test]
+async fn a_replay_within_the_confirmed_loosenings_still_runs() {
+    let (h, gov) = governed().await;
+    let (amy, mut soft) = amy_in_browser(&h).await;
+    let token = pat(&h, "t1", Scope::Org("acme".into()), Role::Admin).await;
+    let (st, b) = h
+        .bearer(
+            "PUT",
+            "/v1/orgs/acme/environments/prod/protection",
+            Some(json!({"approvers": ["amy"], "allowed_refs": []})),
+            &token,
+        )
+        .await;
+    assert!(is_step_up(st, &b), "{st} {b}");
+    let id = b["request_id"].as_str().expect("a request").to_string();
+
+    concurrently(
+        &gov,
+        scarab_project::EnvironmentProtectionRules {
+            approvers: vec!["amy".into()],
+            allowed_refs: vec!["main".into(), "release".into()],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let (st, done) = confirm(&h, &amy, &mut soft, &id).await;
+    assert_eq!(st, StatusCode::OK, "{done}");
+    assert_eq!(done["state"], "executed", "{done}");
+    assert!(protection(&gov).await.allowed_refs.is_empty());
+}
+
 /// Retention: expired challenges and confirmations go, an expired request's
 /// sealed body goes at once, a settled request goes after 30 days — and the
 /// event log is never touched.

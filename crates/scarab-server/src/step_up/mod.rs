@@ -497,10 +497,16 @@ pub(crate) async fn require(
     // A StepUpConfirmationRequest being replayed (ADR-0073 §6): its human
     // confirmed exactly one operation and one digest. Nothing else — another
     // operation, or the same one with any byte changed — is satisfied, so a
-    // request can never be widened. (The task-local is set only by the
-    // confirm endpoint, around its own replay; no request can set it.)
+    // request can never be widened. Nor can the state it lands on: every
+    // change it would make NOW (a conditional handler re-judges its
+    // loosenings against the current state) must be one the human saw.
+    // (The task-local is set only by the confirm endpoint, around its own
+    // replay; no request can set it.)
     if let Some(authority) = requests::replay_authority() {
-        if authority.op_id == op.id && authority.digest.as_slice() == p.digest.as_slice() {
+        if authority.op_id == op.id
+            && authority.digest.as_slice() == p.digest.as_slice()
+            && summary.changes.iter().all(|c| authority.changes.contains(c))
+        {
             return Ok(Some(authority.confirmation_id.clone()));
         }
         return refuse(

@@ -95,8 +95,11 @@ pub(crate) struct ReplayAuthority {
     pub(crate) confirmation_id: String,
     /// The one operation it may satisfy …
     pub(crate) op_id: String,
-    /// … with exactly this digest.
+    /// … with exactly this digest …
     pub(crate) digest: Vec<u8>,
+    /// … changing no more than the human was shown (a conditional handler
+    /// re-judges its loosenings at replay; any it did not confirm refuse).
+    pub(crate) changes: Vec<String>,
     pub(crate) requester: ReplayRequester,
     pub(crate) for_human: String,
     /// A Bearer session's global roles are capped at what the session held
@@ -758,6 +761,16 @@ pub(crate) async fn confirm_request(
                 confirmation_id: confirmation_id.clone(),
                 op_id: r.op.clone(),
                 digest: r.action_digest.clone(),
+                changes: r
+                    .summary
+                    .get("changes")
+                    .and_then(|c| c.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 requester,
                 for_human: r.for_human.clone(),
                 role_cap: r.session_role_cap,
