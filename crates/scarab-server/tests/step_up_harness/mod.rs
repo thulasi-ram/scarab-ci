@@ -189,19 +189,17 @@ impl Harness {
 
     pub async fn session(&self, principal: Principal, login_kind: &str) -> Sess {
         let now = self.now().await;
+        let csrf = uuid::Uuid::new_v4().to_string();
         let s = Session {
             id: uuid::Uuid::new_v4().to_string(),
             principal,
             expires_at: now + 24 * 60 * 60 * 1000,
-            csrf: uuid::Uuid::new_v4().to_string(),
+            csrf_hash: scarab_identity::csrf_hash(&csrf),
             created_at: now,
             login_kind: login_kind.to_string(),
         };
         self.sessions.put(&s).await.unwrap();
-        Sess {
-            id: s.id,
-            csrf: s.csrf,
-        }
+        Sess { id: s.id, csrf }
     }
 
     pub async fn grant(&self, subject: &str, scope: Scope, role: Role) {

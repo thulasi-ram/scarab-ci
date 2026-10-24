@@ -451,18 +451,19 @@ async fn a_challenge_is_refused_at_exactly_its_expiry() {
 #[tokio::test]
 async fn a_pre_upgrade_session_cannot_enroll_the_first_passkey() {
     let h = harness();
+    let csrf = uuid::Uuid::new_v4().to_string();
     let sess = Session {
         id: uuid::Uuid::new_v4().to_string(),
         principal: owner("amy"),
         expires_at: h.now().await + DAY,
-        csrf: uuid::Uuid::new_v4().to_string(),
+        csrf_hash: scarab_identity::csrf_hash(&csrf),
         created_at: 0,
         login_kind: LOGIN_KIND_BROWSER.to_string(),
     };
     h.sessions.put(&sess).await.unwrap();
     let s = Sess {
         id: sess.id.clone(),
-        csrf: sess.csrf.clone(),
+        csrf,
     };
     let (st, b) = h
         .cookie(

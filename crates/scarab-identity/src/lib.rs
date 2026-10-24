@@ -191,17 +191,28 @@ pub trait RbacStore: Send + Sync {
 
 /// A server-side login session for a [`Principal`] (ADR-0032: PG-backed in
 /// production; the store is a port so the backend is swappable).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Neither bearer secret is kept at rest in the clear (git-bug 51d6bcb): a
+/// store keys the session by [`session_id_hash`] of `id` and never writes
+/// `id` itself, and the CSRF token exists on this struct only as its hash —
+/// the plaintext lives in the login response and the browser's cookie, and is
+/// checked with [`Session::csrf_matches`]. So a database read (a backup, a
+/// replica, a leaked dump) yields nothing that rides a session.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
+    /// The session id — the bearer secret behind the `scarab_session` cookie
+    /// and a CLI's `Bearer`. In memory only: stores persist its hash.
     pub id: String,
     pub principal: Principal,
     /// Unix-ms expiry.
     pub expires_at: i64,
-    /// The session's CSRF token (ADR-0049): random, minted with the session,
-    /// double-submitted by browsers (readable cookie → `x-csrf-token` header)
-    /// on every mutation. Bearer (API/CLI) requests never need it.
+    /// [`csrf_hash`] of the session's CSRF token (ADR-0049): the token is
+    /// random, minted with the session, double-submitted by browsers
+    /// (readable cookie → `x-csrf-token` header) on every mutation. Bearer
+    /// (API/CLI) requests never need it. Empty = no CSRF token, which
+    /// matches nothing.
     #[serde(default)]
-    pub csrf: String,
+    pub csrf_hash: String,
     /// Unix-ms the login that minted this session completed (ADR-0073 §2).
     /// `0` = a session from before this was recorded, which is never
     /// "fresh".
@@ -214,7 +225,49 @@ pub struct Session {
     pub login_kind: String,
 }
 
+/// Never prints the session id (a bearer secret) or the CSRF hash.
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("id", &"<redacted>")
+            .field("principal", &self.principal)
+            .field("expires_at", &self.expires_at)
+            .field("csrf_hash", &"<redacted>")
+            .field("created_at", &self.created_at)
+            .field("login_kind", &self.login_kind)
+            .finish()
+    }
+}
+
+/// What a [`SessionStore`] keys a session by: the hex SHA-256 of its id
+/// (the same digest the step-up tables call `session_hash`). A plain digest,
+/// as for [`api_token_hash`]: the id is 122 bits of CSPRNG output, not a
+/// password.
+pub fn session_id_hash(id: &str) -> String {
+    api_token_hash(id)
+}
+
+/// What a [`Session`] keeps of its CSRF token: the hex SHA-256.
+pub fn csrf_hash(token: &str) -> String {
+    api_token_hash(token)
+}
+
 impl Session {
+    /// Does `presented` (the `x-csrf-token` header) carry this session's CSRF
+    /// token? Fails closed: a session with no token matches nothing. The
+    /// compare runs over the digests, in constant time.
+    pub fn csrf_matches(&self, presented: Option<&str>) -> bool {
+        let Some(presented) = presented else {
+            return false;
+        };
+        if self.csrf_hash.is_empty() {
+            return false;
+        }
+        let a = csrf_hash(presented);
+        let (a, b) = (a.as_bytes(), self.csrf_hash.as_bytes());
+        a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    }
+
     /// Is the session still valid at `now_ms`?
     pub fn is_valid(&self, now_ms: i64) -> bool {
         now_ms < self.expires_at
@@ -231,6 +284,11 @@ impl Session {
 
 /// Durable store of login sessions (ADR-0032). A session id (an opaque,
 /// unguessable token) maps to its [`Session`].
+///
+/// Every method takes the session id in the clear — it is what a request
+/// presents — and an implementation keys by [`session_id_hash`] of it and
+/// never persists the id itself; `get` hands back a session whose `id` is the
+/// one it was asked for (git-bug 51d6bcb).
 #[async_trait]
 pub trait SessionStore: Send + Sync {
     async fn put(&self, session: &Session) -> Result<(), IdentityError>;
@@ -766,13 +824,44 @@ mod tests {
                 roles: vec![Role::Owner],
             },
             expires_at: 1_000,
-            csrf: String::new(),
+            csrf_hash: String::new(),
             created_at: 0,
             login_kind: String::new(),
         };
         assert!(s.is_valid(999));
         assert!(!s.is_valid(1_000));
         assert!(!s.is_valid(1_001));
+    }
+
+    /// git-bug 51d6bcb: a session carries its CSRF token only as a hash,
+    /// checks the presented token against it, matches nothing without one,
+    /// and never prints its id.
+    #[test]
+    fn a_session_checks_csrf_by_hash_and_never_prints_its_secrets() {
+        let mut s = Session {
+            id: "the-session-id".into(),
+            principal: Principal {
+                subject: "alice".into(),
+                display_name: None,
+                roles: vec![],
+            },
+            expires_at: 1_000,
+            csrf_hash: csrf_hash("the-csrf-token"),
+            created_at: 0,
+            login_kind: String::new(),
+        };
+        assert_eq!(s.csrf_hash.len(), 64);
+        assert!(s.csrf_matches(Some("the-csrf-token")));
+        assert!(!s.csrf_matches(Some("the-csrf-tokeN")));
+        assert!(!s.csrf_matches(Some(&csrf_hash("the-csrf-token"))));
+        assert!(!s.csrf_matches(None));
+        let shown = format!("{s:?}");
+        assert!(!shown.contains("the-session-id"), "{shown}");
+        assert!(!shown.contains(&s.csrf_hash), "{shown}");
+        s.csrf_hash.clear();
+        assert!(!s.csrf_matches(Some("")));
+        assert!(!s.csrf_matches(Some(&csrf_hash(""))));
+        assert_eq!(session_id_hash("x"), api_token_hash("x"));
     }
 
     #[test]
@@ -785,7 +874,7 @@ mod tests {
                 roles: vec![],
             },
             expires_at: i64::MAX,
-            csrf: String::new(),
+            csrf_hash: String::new(),
             created_at,
             login_kind: kind.into(),
         };

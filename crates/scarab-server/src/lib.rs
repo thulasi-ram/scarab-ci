@@ -6002,7 +6002,7 @@ async fn login(
     let now = st.clock.now().await.0;
     // An API/CLI exchange: never a fresh browser login (ADR-0073 §2), even
     // though it also sets the browser cookies.
-    let session = mint_session(principal.clone(), now, scarab_identity::LOGIN_KIND_API);
+    let (session, csrf) = mint_session(principal.clone(), now, scarab_identity::LOGIN_KIND_API);
     sessions
         .put(&session)
         .await
@@ -6013,11 +6013,11 @@ async fn login(
         Json(LoginResponse {
             session: session.id.clone(),
             subject: principal.subject,
-            csrf: session.csrf.clone(),
+            csrf: csrf.clone(),
         }),
     )
         .into_response();
-    set_session_cookies(resp.headers_mut(), &session);
+    set_session_cookies(resp.headers_mut(), &session, &csrf);
     Ok(resp)
 }
 
@@ -6026,28 +6026,34 @@ async fn login(
 /// [`scarab_identity::LOGIN_KIND_BROWSER`] for the OAuth callback and
 /// [`scarab_identity::LOGIN_KIND_API`] for the API/CLI exchange — only a
 /// fresh browser login may enroll a first passkey.
-fn mint_session(principal: Principal, now_ms: i64, login_kind: &str) -> Session {
-    Session {
+///
+/// Returns the CSRF token beside the session: the session keeps only its hash
+/// (git-bug 51d6bcb), so this is the one place the plaintext exists — for the
+/// cookie and the login response.
+fn mint_session(principal: Principal, now_ms: i64, login_kind: &str) -> (Session, String) {
+    let csrf = Uuid::new_v4().to_string();
+    let session = Session {
         id: Uuid::new_v4().to_string(),
         principal,
         expires_at: now_ms + SESSION_TTL_MS,
-        csrf: Uuid::new_v4().to_string(),
+        csrf_hash: scarab_identity::csrf_hash(&csrf),
         created_at: now_ms,
         login_kind: login_kind.to_string(),
-    }
+    };
+    (session, csrf)
 }
 
 /// Append the login cookies (ADR-0049): the session cookie is `HttpOnly` +
 /// `Secure` + `SameSite=Lax` (script-unreadable); the CSRF cookie is
 /// deliberately script-READABLE — the UI double-submits it as `x-csrf-token`,
 /// which a cross-site attacker cannot do.
-fn set_session_cookies(headers: &mut HeaderMap, session: &Session) {
+fn set_session_cookies(headers: &mut HeaderMap, session: &Session, csrf: &str) {
     for cookie in [
         format!(
             "scarab_session={}; HttpOnly; Secure; Path=/; SameSite=Lax",
             session.id
         ),
-        format!("scarab_csrf={}; Secure; Path=/; SameSite=Lax", session.csrf),
+        format!("scarab_csrf={csrf}; Secure; Path=/; SameSite=Lax"),
     ] {
         if let Ok(v) = axum::http::HeaderValue::from_str(&cookie) {
             headers.append(axum::http::header::SET_COOKIE, v);
@@ -6152,7 +6158,7 @@ async fn oauth_callback(
         ApiError::Unauthorized
     })?;
     let now = st.clock.now().await.0;
-    let session = mint_session(principal, now, scarab_identity::LOGIN_KIND_BROWSER);
+    let (session, csrf) = mint_session(principal, now, scarab_identity::LOGIN_KIND_BROWSER);
     sessions.put(&session).await.map_err(|e| {
         tracing::warn!(error = %e, "OAuth callback: could not store the new session");
         ApiError::Unauthorized
@@ -6170,7 +6176,7 @@ async fn oauth_callback(
             axum::http::HeaderValue::from_static("/"),
         );
     }
-    set_session_cookies(resp.headers_mut(), &session);
+    set_session_cookies(resp.headers_mut(), &session, &csrf);
     // The one-shot state cookie is spent.
     if let Ok(v) = axum::http::HeaderValue::from_str(
         "scarab_oauth_state=; HttpOnly; Secure; Path=/; SameSite=Lax; Max-Age=0",
@@ -7356,7 +7362,7 @@ async fn authenticate(
     // requests (API/CLI) carry the credential explicitly; no CSRF surface.
     if action != Action::Read && via == AuthVia::Cookie {
         let presented = headers.get("x-csrf-token").and_then(|v| v.to_str().ok());
-        if session.csrf.is_empty() || presented != Some(session.csrf.as_str()) {
+        if !session.csrf_matches(presented) {
             return Err(ApiError::Forbidden);
         }
     }

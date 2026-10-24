@@ -139,19 +139,17 @@ async fn serve_with(enforce: bool, extra: impl FnOnce(AppState) -> AppState) -> 
 impl Server {
     async fn session(&self, principal: Principal, login_kind: &str) -> Sess {
         let n = next_id();
+        let csrf = format!("csrf-{n}");
         let s = Session {
             id: format!("sess-{}-{login_kind}-{n}", principal.subject),
             principal,
             expires_at: T0 + DAY,
-            csrf: format!("csrf-{n}"),
+            csrf_hash: scarab_identity::csrf_hash(&csrf),
             created_at: T0,
             login_kind: login_kind.to_string(),
         };
         self.sessions.put(&s).await.unwrap();
-        Sess {
-            id: s.id,
-            csrf: s.csrf,
-        }
+        Sess { id: s.id, csrf }
     }
 
     /// A CLI session of `subject` (an API login, presented as Bearer).

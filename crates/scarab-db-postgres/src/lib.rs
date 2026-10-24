@@ -3536,6 +3536,10 @@ fn db_err(e: sqlx::Error) -> DbError {
 
 // ---------------------------------------------------------------------------
 // SessionStore (ADR-0049 C1): server-side login sessions in Postgres.
+//
+// Keyed by `session_id_hash(id)`, never the id; `csrf` holds the CSRF token's
+// hash (migration 0064, git-bug 51d6bcb). A row read from the table rides no
+// session.
 // ---------------------------------------------------------------------------
 
 #[async_trait]
@@ -3556,9 +3560,9 @@ impl scarab_identity::SessionStore for PostgresDb {
                  created_at = EXCLUDED.created_at,
                  login_kind = EXCLUDED.login_kind",
         )
-        .bind(&session.id)
+        .bind(scarab_identity::session_id_hash(&session.id))
         .bind(&principal)
-        .bind(&session.csrf)
+        .bind(&session.csrf_hash)
         .bind(session.expires_at)
         .bind(session.created_at)
         .bind(&session.login_kind)
@@ -3575,7 +3579,7 @@ impl scarab_identity::SessionStore for PostgresDb {
         let row = sqlx::query(
             "SELECT principal, csrf, expires_at, created_at, login_kind FROM sessions WHERE id = $1",
         )
-        .bind(id)
+        .bind(scarab_identity::session_id_hash(id))
             .fetch_optional(self.pool())
             .await
             .map_err(|e| scarab_identity::IdentityError::Issuance(e.to_string()))?;
@@ -3586,7 +3590,7 @@ impl scarab_identity::SessionStore for PostgresDb {
         Ok(Some(scarab_identity::Session {
             id: id.to_string(),
             principal,
-            csrf: row.get::<String, _>("csrf"),
+            csrf_hash: row.get::<String, _>("csrf"),
             expires_at: row.get::<i64, _>("expires_at"),
             created_at: row.get::<i64, _>("created_at"),
             login_kind: row.get::<String, _>("login_kind"),
@@ -3595,7 +3599,7 @@ impl scarab_identity::SessionStore for PostgresDb {
 
     async fn delete(&self, id: &str) -> Result<(), scarab_identity::IdentityError> {
         sqlx::query("DELETE FROM sessions WHERE id = $1")
-            .bind(id)
+            .bind(scarab_identity::session_id_hash(id))
             .execute(self.pool())
             .await
             .map_err(|e| scarab_identity::IdentityError::Issuance(e.to_string()))?;

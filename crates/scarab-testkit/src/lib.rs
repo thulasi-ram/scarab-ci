@@ -3484,7 +3484,9 @@ impl Authenticator for FakeAuthenticator {
     }
 }
 
-/// An in-memory [`SessionStore`] for tests (the PG-backed store is a follow-up).
+/// An in-memory [`SessionStore`] with the Postgres adapter's semantics:
+/// keyed by `session_id_hash(id)`, the id itself never held (git-bug
+/// 51d6bcb); `get` hands back the id it was asked for.
 #[derive(Default)]
 pub struct InMemorySessions {
     sessions: Mutex<HashMap<String, Session>>,
@@ -3499,19 +3501,34 @@ impl InMemorySessions {
 #[async_trait]
 impl SessionStore for InMemorySessions {
     async fn put(&self, session: &Session) -> Result<(), IdentityError> {
+        let stored = Session {
+            id: String::new(),
+            ..session.clone()
+        };
         self.sessions
             .lock()
             .unwrap()
-            .insert(session.id.clone(), session.clone());
+            .insert(scarab_identity::session_id_hash(&session.id), stored);
         Ok(())
     }
 
     async fn get(&self, id: &str) -> Result<Option<Session>, IdentityError> {
-        Ok(self.sessions.lock().unwrap().get(id).cloned())
+        Ok(self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&scarab_identity::session_id_hash(id))
+            .map(|s| Session {
+                id: id.to_string(),
+                ..s.clone()
+            }))
     }
 
     async fn delete(&self, id: &str) -> Result<(), IdentityError> {
-        self.sessions.lock().unwrap().remove(id);
+        self.sessions
+            .lock()
+            .unwrap()
+            .remove(&scarab_identity::session_id_hash(id));
         Ok(())
     }
 }
