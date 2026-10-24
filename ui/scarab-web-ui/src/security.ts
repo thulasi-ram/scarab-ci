@@ -189,6 +189,16 @@ export function wantsEnroll(search: string): boolean {
   return new URLSearchParams(search).get("enroll") === "1";
 }
 
+/** Start enrollment on arrival? Only when asked (`?enroll=1`), step-up is
+ * enforced, and the person has no passkey yet — an enrolled person following
+ * an old link is not dropped into a ceremony they did not ask for. */
+export function shouldAutoEnroll(
+  search: string,
+  s: { step_up: string; has_passkey: boolean } | null | undefined,
+): boolean {
+  return wantsEnroll(search) && s?.step_up === "enforce" && !s.has_passkey;
+}
+
 /** The label a new passkey gets when the person leaves it blank (the server
  * defaults the same way). */
 export function passkeyLabel(raw: string): string | undefined {
@@ -223,13 +233,42 @@ export function requestConfirmable(r: { state: string; expires_at: number }, now
   return r.state === "pending" && r.expires_at > now;
 }
 
-/** The confirm endpoints' refusals, each in words. */
+/** A server error body in words: the `message` of a JSON error
+ * (`{code, message}`), else the text itself. */
+function messageOf(body: string): string {
+  const t = body.trim();
+  try {
+    const j = JSON.parse(t) as { message?: unknown };
+    if (j && typeof j.message === "string" && j.message) return j.message;
+  } catch {
+    /* plain text */
+  }
+  return t;
+}
+
+/** The confirm endpoints' refusals, each in words. A JSON error body
+ * (`{code, message}`) reads as its message, never raw JSON. */
 export function requestErrorText(status: number, body: string): string {
-  const text = body.trim();
+  const text = messageOf(body);
   if (status === 404) return "No such request for you. It may belong to someone else, or step-up is off.";
   if (status === 409) return `Already confirmed — it ran (or is running) once.${text ? ` ${text}` : ""}`;
   if (status === 410) return "This request has expired. Ask the requester to raise it again.";
   return text || `The confirmation failed (${status}).`;
+}
+
+/** Where a refusal points the person to fix it: a `400 no_passkey` (no
+ * passkey to confirm with) points at enrollment. `null` otherwise. */
+export function requestErrorLink(status: number, body: string): { text: string; href: string } | null {
+  if (status !== 400) return null;
+  try {
+    const j = JSON.parse(body) as { code?: unknown };
+    if (j && j.code === "no_passkey") {
+      return { text: "Enroll a passkey first", href: "/account/security?enroll=1" };
+    }
+  } catch {
+    /* not JSON */
+  }
+  return null;
 }
 
 /**

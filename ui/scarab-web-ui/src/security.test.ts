@@ -12,10 +12,12 @@ import {
   passkeyLabel,
   postureText,
   requestConfirmable,
+  requestErrorLink,
   requestErrorText,
   resetCandidates,
   resultSecret,
   resultText,
+  shouldAutoEnroll,
   wantsEnroll,
 } from "./security";
 
@@ -129,6 +131,18 @@ describe("passkeys", () => {
     expect(wantsEnroll("?enroll=1")).toBe(true);
     expect(wantsEnroll("?enroll=0")).toBe(false);
     expect(wantsEnroll("")).toBe(false);
+  });
+
+  it("auto-starts enrollment only for someone with no passkey yet", () => {
+    const on = { step_up: "enforce", has_passkey: false };
+    expect(shouldAutoEnroll("?enroll=1", on)).toBe(true);
+    expect(shouldAutoEnroll("?enroll=1", { ...on, has_passkey: true })).toBe(false);
+    expect(shouldAutoEnroll("?enroll=1", { ...on, step_up: "off" })).toBe(false);
+    expect(shouldAutoEnroll("", on)).toBe(false);
+    expect(shouldAutoEnroll("?enroll=1", null)).toBe(false);
+  });
+
+  it("leaves a blank passkey label to the server's default", () => {
     expect(passkeyLabel("   ")).toBeUndefined();
     expect(passkeyLabel(" YubiKey ")).toBe("YubiKey");
     expect(passkeyLabel("x".repeat(80))).toHaveLength(64);
@@ -175,6 +189,23 @@ describe("the confirm page", () => {
     expect(requestErrorText(409, "the request is executed")).toMatch(/^Already confirmed/);
     expect(requestErrorText(410, "expired")).toMatch(/expired/);
     expect(requestErrorText(400, "challenge expired")).toBe("challenge expired");
+  });
+
+  it("reads a JSON error body as its message, never raw JSON", () => {
+    const t = requestErrorText(409, '{"code":"x","message":"m"}');
+    expect(t).toContain("m");
+    expect(t).not.toContain('{"code"');
+    expect(requestErrorText(400, '{"code":"challenge_invalid","message":"stale"}')).toBe("stale");
+  });
+
+  it("points a no-passkey refusal at enrollment", () => {
+    expect(requestErrorLink(400, '{"code":"no_passkey","message":"enroll one first"}')).toEqual({
+      text: "Enroll a passkey first",
+      href: "/account/security?enroll=1",
+    });
+    expect(requestErrorLink(400, '{"code":"challenge_invalid"}')).toBeNull();
+    expect(requestErrorLink(404, '{"code":"no_passkey"}')).toBeNull();
+    expect(requestErrorLink(400, "plain")).toBeNull();
   });
 
   it("shows a minted token once, and never twice", () => {

@@ -35,17 +35,24 @@ export default function OrgSecurity(props: { org: string }) {
   const [eventsError, setEventsError] = createSignal<string | null>(null);
   const [loading, setLoading] = createSignal(false);
 
+  // Each load takes a token; a response that is not the latest load's is
+  // dropped, so a slow earlier page (say, the unfiltered log) can never
+  // overwrite the list a later filter asked for.
+  let latest = 0;
   const loadEvents = async (before?: number) => {
+    const token = ++latest;
     setLoading(true);
     try {
       const page = await listOrgSecurityEvents(props.org, { kind: kind(), before });
+      if (token !== latest) return;
       setEvents((prev) => (before === undefined ? page.events : [...prev, ...page.events]));
       setNextBefore(page.next_before ?? null);
       setEventsError(null);
     } catch (e) {
+      if (token !== latest) return;
       setEventsError(e instanceof Error ? e.message : "Could not load the event log.");
     } finally {
-      setLoading(false);
+      if (token === latest) setLoading(false);
     }
   };
   void loadEvents();

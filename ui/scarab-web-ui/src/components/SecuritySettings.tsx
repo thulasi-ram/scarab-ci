@@ -22,7 +22,7 @@ import {
   type SecurityEvent,
 } from "../api/client";
 import { absTime, relTime } from "../fmt";
-import { passkeyBadges, passkeyLabel, wantsEnroll } from "../security";
+import { passkeyBadges, passkeyLabel, shouldAutoEnroll, wantsEnroll } from "../security";
 import { createPasskey, webauthnAvailable, webauthnErrorText } from "../webauthn";
 import Icon from "./Icon";
 import SecurityEventTable from "./SecurityEventTable";
@@ -114,7 +114,7 @@ export default function SecuritySettings() {
     if (wantsEnroll(location.search)) {
       void (async () => {
         const s = await getMySecurity().catch(() => null);
-        if (s?.step_up === "enforce") await enroll(true);
+        if (shouldAutoEnroll(location.search, s)) await enroll(true);
       })();
     }
   });
