@@ -503,8 +503,8 @@ pub struct StepSpec {
     /// The DeploymentRequests this Step makes when it succeeds (ADR-0070 §7,
     /// CONTEXT §4.6): "I changed what should be live on this DeploymentTarget
     /// to this DeploymentVersion". Recorded by core on Step success, in the same
-    /// transaction as the success itself, with the Step's start as the
-    /// request's effective time. Only on an ordinary executed Step of a Deploy
+    /// transaction as the success itself, with the start of the Step's first
+    /// Attempt in its Take as the request's effective time. Only on an ordinary executed Step of a Deploy
     /// pipeline (one with an `environment:`), never on a matrixed one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deployment_requests: Vec<DeploymentRequestSpec>,

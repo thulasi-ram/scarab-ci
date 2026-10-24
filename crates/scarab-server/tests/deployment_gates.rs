@@ -3,8 +3,9 @@
 //! resolved by CORE — the server's [`ServerDeploymentGates`] oracle, folding
 //! the Environment's Deployment input log — never by a plugin.
 //!
-//! Its first wait on a request opens at the request's effective time — the
-//! deploy step's START, so a report received while that step still ran
+//! Its first wait on a request opens at the deploy step's succeeding
+//! Attempt's START — for a step that was not retried, the request's effective
+//! time — so a report received while that step still ran
 //! counts; it passes if the Deployment was live then or is reported live
 //! after, and fails on a `failed` report after, on supersession, or once the
 //! deadline its Project has in the Environment (the baseline, or a tighter
@@ -14,6 +15,13 @@
 //! Attempt that waits afresh from its own start on the SAME Deployment,
 //! without re-running the deploy step. A Rerun of the deploy step makes a new
 //! request, and the gate's next wait opens at THAT request's effective time.
+//!
+//! Attribution and the gate window are split (owner, 2026-10-24): a RETRIED
+//! deploy step's request is still effective at its first Attempt in the
+//! Take (what explains the Deployment), but the gate's first wait opens at
+//! the start of the Attempt that SUCCEEDED — a `failed` reported while an
+//! earlier, failed Attempt ran is history to it, and its stall deadline runs
+//! from the succeeding Attempt, not from how long the operator took to Retry.
 //!
 //! No kind: reports are appended through `DeploymentStore::append`, the step
 //! runs on the `FakeExecutor`, and the scheduler is ticked by hand. Every
@@ -765,7 +773,9 @@ async fn silence_stalls_the_gate_at_its_deadline_and_the_verdict_holds(w: World)
     w.ticks(2).await;
     let gate = w.gate().await;
     assert_eq!(gate.status, StepStatus::Failed);
-    let stalled = Some("stalled: not live within 120s".to_string());
+    // The reason names what the deadline ran from (F4): the deploy step's
+    // start — its only Attempt, which succeeded.
+    let stalled = Some("stalled: not live within 120s of step `bump` starting".to_string());
     assert_eq!(gate.attempts[0].failure_detail, stalled);
 
     // Make a re-derivation PASS: lengthen the deadline well past now (the
@@ -957,6 +967,208 @@ async fn a_deployment_gate_with_no_recorded_request_fails_at_once() {
         "{detail}"
     );
 }
+
+/// `bump`'s first Attempt `a1` starts at [`T0`] and is left running; the
+/// source reports `during_a1` (if any) 5s in; at T0 + 6s `a1` fails (a step
+/// failure: the gate and `after` skip, the Run fails). At T0 + `retry_at`
+/// the operator Retries `bump`: `a2` starts then and is left running.
+/// Returns `a2`'s start.
+async fn a_failed_deploy_attempt_then_a_retry(
+    w: &World,
+    during_a1: Option<(SourceAssertedStatus, &str)>,
+    retry_at: i64,
+) -> Timestamp {
+    w.seed(vec![StepId("live".into())]).await;
+    w.exec
+        .set_results("bump", BTreeMap::from([("version".into(), json!("v1"))]));
+    for _ in 0..6 {
+        if w.step("bump").await.status == StepStatus::Running {
+            break;
+        }
+        w.tick().await;
+    }
+    let bump = w.step("bump").await;
+    assert_eq!(bump.status, StepStatus::Running);
+    assert_eq!(bump.attempts[0].started_at, Timestamp(T0));
+    if let Some((status, label)) = during_a1 {
+        w.clock.advance(5_000);
+        w.report("v1", status, label).await;
+    }
+    let now = w.clock.now().await.0;
+    w.clock.advance(T0 + 6_000 - now);
+    w.exec.script_outcome(ExecState::Failed {
+        exit_code: Some(1),
+        class: scarab_engine::ports::FailureClass::Step,
+        cause: None,
+    });
+    for _ in 0..6 {
+        if w.step("bump").await.status == StepStatus::Failed {
+            break;
+        }
+        w.tick().await;
+    }
+    assert_eq!(w.step("bump").await.status, StepStatus::Failed, "a1 failed");
+    assert!(
+        w.gate().await.attempts.is_empty(),
+        "the gate was never reached"
+    );
+
+    w.clock.advance(T0 + retry_at - w.clock.now().await.0);
+    let retried_at = w.clock.now().await;
+    retry_step(&*w.db, &w.clock, &run(), &StepId("bump".into()), None)
+        .await
+        .unwrap();
+    for _ in 0..6 {
+        if w.step("bump").await.status == StepStatus::Running {
+            break;
+        }
+        w.tick().await;
+    }
+    let bump = w.step("bump").await;
+    assert_eq!(bump.status, StepStatus::Running, "a2 runs");
+    assert_eq!(bump.attempts.len(), 2);
+    assert_eq!(bump.attempts[1].started_at, retried_at);
+    retried_at
+}
+
+/// The request `bump` recorded: its effective time (attribution).
+async fn request_effective_at(w: &World) -> i64 {
+    let requests: Vec<i64> = w
+        .store
+        .inputs(ORG, ENV)
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|l| match &l.input {
+            DeploymentInput::Request { effective_at, .. } => Some(*effective_at),
+            DeploymentInput::Report { .. } => None,
+        })
+        .collect();
+    assert_eq!(requests.len(), 1, "one request, from the succeeding a2");
+    requests[0]
+}
+
+/// F2 (review-followup): `a1` pushes and the source reports `failed` (a
+/// missing secret) while it runs; `a1` fails. The operator fixes the secret
+/// and Retries the deploy step; `a2` succeeds and the source reports `live`
+/// after `a2` started. The gate's first wait opens at `a2`'s start, so the
+/// stale `failed` from `a1`'s time is history: the gate PASSES on the `live`.
+/// Attribution is unchanged — the request is still effective at `a1`.
+async fn a_deploy_retry_after_a_failure_reported_during_its_first_attempt_passes(w: World) {
+    let a2 = a_failed_deploy_attempt_then_a_retry(
+        &w,
+        Some((SourceAssertedStatus::Failed, "sync failed: secret missing")),
+        16_000,
+    )
+    .await;
+    w.clock.advance(1_000);
+    w.report("v1", SourceAssertedStatus::Live, "synced").await;
+    w.clock.advance(1_000);
+    w.exec.script_outcome(ExecState::Succeeded); // bump a2
+    w.exec.script_outcome(ExecState::Succeeded); // after
+    w.ticks(8).await;
+
+    assert_eq!(w.step("bump").await.status, StepStatus::Succeeded);
+    assert_eq!(
+        request_effective_at(&w).await,
+        T0,
+        "attribution: effective at the FIRST Attempt in the Take"
+    );
+    let gate = w.gate().await;
+    assert_eq!(gate.status, StepStatus::Succeeded, "{gate:?}");
+    assert_eq!(gate.attempts.len(), 1);
+    assert_eq!(gate.attempts[0].started_at, Timestamp(a2.0 + 2_000));
+    let verdicts = w.verdicts().await;
+    assert_eq!(verdicts.len(), 1);
+    assert!(verdicts[0].1, "{verdicts:?}");
+    assert_eq!(
+        verdicts[0].2.as_deref(),
+        Some("v1 live on `argocd`/`web`: synced"),
+        "decided by the `live` after a2 started, not a1's stale `failed`"
+    );
+    let first_input = w.store.inputs(ORG, ENV).await.unwrap()[0].seq;
+    assert_eq!(
+        verdicts[0].3,
+        Some(first_input),
+        "the Deployment the report created, which the request joined"
+    );
+    assert_eq!(
+        w.db.run_status(&run()).await.unwrap(),
+        Some(RunStatus::Succeeded)
+    );
+    w.finish().await;
+}
+both!(a_deploy_retry_after_a_failure_reported_during_its_first_attempt_passes);
+
+/// F1 (review-followup): `a1` fails before pushing; the operator Retries
+/// the deploy step TWO deadlines after `a1` started. `a2` succeeds and the
+/// source reports `live` shortly after `a2` started. Measured from `a1`, the
+/// gate would stall on its first ask while the Deployment is live; its stall
+/// clock starts at `a2`, so it PASSES.
+async fn a_deploy_retry_long_after_its_first_attempt_does_not_stall_the_gate(w: World) {
+    let a2 = a_failed_deploy_attempt_then_a_retry(&w, None, 2 * GATE_DEADLINE_MS).await;
+    assert!(
+        a2.0 - T0 > GATE_DEADLINE_MS,
+        "a1's deadline has long passed"
+    );
+    w.clock.advance(1_000);
+    w.report("v1", SourceAssertedStatus::Live, "synced").await;
+    w.clock.advance(1_000);
+    w.exec.script_outcome(ExecState::Succeeded); // bump a2
+    w.exec.script_outcome(ExecState::Succeeded); // after
+    w.ticks(8).await;
+
+    assert_eq!(w.step("bump").await.status, StepStatus::Succeeded);
+    assert_eq!(request_effective_at(&w).await, T0, "attribution unchanged");
+    let gate = w.gate().await;
+    assert_eq!(gate.status, StepStatus::Succeeded, "{gate:?}");
+    let verdicts = w.verdicts().await;
+    assert_eq!(verdicts.len(), 1);
+    assert!(verdicts[0].1, "not stalled: {verdicts:?}");
+    assert_eq!(
+        verdicts[0].2.as_deref(),
+        Some("v1 live on `argocd`/`web`: synced")
+    );
+    assert_eq!(
+        w.db.run_status(&run()).await.unwrap(),
+        Some(RunStatus::Succeeded)
+    );
+    w.finish().await;
+}
+both!(a_deploy_retry_long_after_its_first_attempt_does_not_stall_the_gate);
+
+/// The stall clock of a retried deploy step's first wait: nothing reported,
+/// the gate stalls exactly at `a2`'s start + the deadline (not `a1`'s), and
+/// its reason says what the deadline ran from (F4).
+async fn a_retried_deploy_steps_first_wait_stalls_from_its_succeeding_attempt(w: World) {
+    let a2 = a_failed_deploy_attempt_then_a_retry(&w, None, 10_000).await;
+    w.clock.advance(1_000);
+    w.exec.script_outcome(ExecState::Succeeded); // bump a2
+    w.ticks(6).await;
+    assert_eq!(w.step("bump").await.status, StepStatus::Succeeded);
+    let gate = w.gate().await;
+    assert_eq!(gate.status, StepStatus::Pending, "the gate waits");
+    assert_eq!(gate.attempts.len(), 1);
+
+    let now = w.clock.now().await.0;
+    w.clock.advance(a2.0 + GATE_DEADLINE_MS - 1 - now);
+    w.ticks(2).await;
+    assert_eq!(
+        w.gate().await.status,
+        StepStatus::Pending,
+        "one ms before a2 + deadline (long past a1 + deadline)"
+    );
+    w.clock.advance(1);
+    w.ticks(2).await;
+    let gate = w.gate().await;
+    assert_eq!(gate.status, StepStatus::Failed);
+    assert_eq!(
+        gate.attempts[0].failure_detail.as_deref(),
+        Some("stalled: not live within 120s of step `bump`'s succeeding attempt starting")
+    );
+    w.finish().await;
+}
+both!(a_retried_deploy_steps_first_wait_stalls_from_its_succeeding_attempt);
 
 /// Which request a wait stands on is read off the journal by POSITION: the
 /// deploy step's latest EXECUTED success (`Running → Succeeded`) recorded the

@@ -1629,9 +1629,11 @@ impl Db for PostgresDb {
         // is promoted-and-unfinished, or Succeeded with a DeploymentGate on
         // the request not yet terminal that is either REACHED (no need of it
         // is anything but succeeded — a need with no row is not succeeded) or
-        // whose request's effective time (the requesting Step's latest
-        // Attempt start, else the Run's creation) is after the cutoff — see
-        // the port. Uses run_deployment_requests_target_idx.
+        // whose requesting Step's LATEST Attempt start (the Attempt that
+        // succeeded, where a first wait of its gates opens — not the
+        // request's effective time, which is its first Attempt in the Take),
+        // else the Run's creation, is after the cutoff — see the port. Uses
+        // run_deployment_requests_target_idx.
         let n: i64 = sqlx::query_scalar(
             "SELECT COUNT(DISTINCT r.run_id)
              FROM run_deployment_requests r

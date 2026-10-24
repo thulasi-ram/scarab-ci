@@ -2671,7 +2671,12 @@ impl Executor for K8sExecutor {
             .get_opt(&handle.0)
             .await
             .map_err(|e| ExecError::Other(e.to_string()))?;
-        Ok(pod.as_ref().and_then(pod_results_delivery_failure))
+        // A Pod already gone cannot say whether its sidecar delivered:
+        // "could not check", never "delivered" (which would blame the author).
+        let pod = pod.ok_or_else(|| {
+            ExecError::Other(format!("the step's Pod `{}` is already gone", handle.0))
+        })?;
+        Ok(pod_results_delivery_failure(&pod))
     }
 
     async fn workspace_provisioning(

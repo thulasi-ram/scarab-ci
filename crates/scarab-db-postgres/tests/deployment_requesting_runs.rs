@@ -5,7 +5,7 @@
 //! In flight = the Run is not terminal and a Step of it requesting the target
 //! is `Ready`/`Running`, or `Succeeded` with a DeploymentGate on that request
 //! not yet terminal — reached (every need of it Succeeded), or not reached
-//! and its request's effective time after the caller's cutoff. Distinct Runs,
+//! and its requesting Step's latest Attempt start after the caller's cutoff. Distinct Runs,
 //! scoped to (org, environment, source, id).
 //! One scenario, run against real Postgres (skipped when
 //! `SCARAB_TEST_DATABASE_URL` is unset) and the in-memory twin, so the two
