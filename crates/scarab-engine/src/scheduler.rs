@@ -45,7 +45,7 @@ pub const MAX_DELIVERY_ATTEMPTS: u32 = 10;
 /// and the grace keeps the two from racing in the normal case.
 const TIMEOUT_BACKSTOP_GRACE_MS: i64 = 60_000;
 use crate::{
-    ports::{DeploymentGates, WorkspaceSnapshots},
+    ports::{DeploymentGateWait, DeploymentGates, WorkspaceSnapshots},
     Attempt, AttemptId, AttemptOutcome, Clock, ConcurrencyPolicy, Db, DbError, EventKind,
     EventPayload, ExecError, Executor, FailureKind, GateResolution, OutboxMessage, RunId,
     RunStatus, StepId, StepRun, StepSpec, StepStatus, Timestamp, TransitionError, EVENT_VERSION,
@@ -1194,6 +1194,51 @@ fn is_gate_rearm(kind: &EventPayload, step: &StepId) -> bool {
         EventPayload::RunRerunRequested { invalidated, .. } => invalidated.contains(step),
         _ => false,
     }
+}
+
+/// Whether DeploymentGate `gate`'s open wait `current` **waits afresh**
+/// (ADR-0070 §8): an earlier wait of the gate already resolved against the
+/// request `requester` stands on now. Judged by event *position*, never by
+/// time. The request now standing was recorded by `requester`'s latest
+/// **executed** success — its `Running → Succeeded`, in the same commit as
+/// the request — so a `GateResolved` of `gate` after that success was decided
+/// while this same request stood: this wait is a Retry (or a Rerun of the gate
+/// alone) and waits afresh from its own start. None after it: the first wait
+/// on this request — including the one after a Rerun of the deploy Step made
+/// a new request — which opens at the request's effective time.
+///
+/// A re-arm of `requester` is not a boundary, and neither is a
+/// skip-if-unchanged (`Pending → Succeeded`, no Attempt): neither records a
+/// request, so the old one still stands. A log with no executed success of
+/// `requester` (a hand-seeded run, or a finish whose event was never
+/// written) treats any earlier verdict of the gate as one on this request: a
+/// floor only ever narrows the window (INV-DEP-13), so the doubt never makes a
+/// gate fail sooner.
+pub fn deployment_gate_waits_afresh(
+    events: &[EventKind],
+    gate: &StepId,
+    current: &AttemptId,
+    requester: &StepId,
+) -> bool {
+    let from = events
+        .iter()
+        .rposition(|e| {
+            matches!(
+                &e.kind,
+                EventPayload::StepTransitioned {
+                    step,
+                    from: StepStatus::Running,
+                    to: StepStatus::Succeeded,
+                } if step == requester
+            )
+        })
+        .map_or(0, |i| i + 1);
+    events[from..].iter().any(|e| {
+        matches!(
+            &e.kind,
+            EventPayload::GateResolved { step, attempt, .. } if step == gate && attempt != current
+        )
+    })
 }
 
 /// The distinct principals who approved gate `step` **in its current wait**,
@@ -3598,7 +3643,7 @@ impl<'a> Scheduler<'a> {
     /// 1. The kind's own verdict first (so a timer that elapses at the same
     ///    instant as its deadline passes): `timer` passes at
     ///    `started_at + gate_after`; `deployment` asks the
-    ///    [`DeploymentGates`] oracle, with `started_at` as the window floor
+    ///    [`DeploymentGates`] oracle about this Attempt
     ///    ([`deployment_gate_verdict`](Self::deployment_gate_verdict)).
     ///    `manual` and `external` pass only by an explicit [`release_gate`].
     /// 2. Then **expiry**, for any kind with `gate_expires_after`: failed at
@@ -3661,9 +3706,13 @@ impl<'a> Scheduler<'a> {
     /// before any step exists and never change, so waiting could only end in
     /// its expiry or forever.
     ///
-    /// Otherwise the [`DeploymentGates`] oracle is asked with the Attempt's
-    /// `started_at` as the window floor. No oracle wired, or an oracle error,
-    /// is **no decision** this tick (see [`DeploymentGates`]).
+    /// Otherwise the [`DeploymentGates`] oracle is asked about this Attempt:
+    /// its first wait on the request opens at the request's effective time
+    /// (the deploy Step's start); a wait after an earlier one already
+    /// resolved on that same request waits afresh, its `started_at` the
+    /// window floor ([`deployment_gate_waits_afresh`]; the journal is read
+    /// only when the gate has an earlier Attempt). No oracle wired, or an
+    /// oracle error, is **no decision** this tick (see [`DeploymentGates`]).
     async fn deployment_gate_verdict(
         &self,
         run: &RunId,
@@ -3714,8 +3763,21 @@ impl<'a> Scheduler<'a> {
                 deployment: None,
             }));
         };
+        // Only an earlier Attempt can have resolved: the first wait never
+        // reads the journal.
+        let afresh = gate.attempts.iter().any(|a| a.id != attempt.id)
+            && deployment_gate_waits_afresh(
+                &self.db.events(run).await?,
+                &gate.step,
+                &attempt.id,
+                &request.step,
+            );
+        let wait = DeploymentGateWait {
+            started_at: attempt.started_at,
+            afresh,
+        };
         match oracle
-            .deployment_gate_verdict(run, &gate.step, &request, attempt.started_at, now)
+            .deployment_gate_verdict(run, &gate.step, &request, wait, now)
             .await
         {
             Ok(Some(d)) => Ok(Some(GateVerdict {

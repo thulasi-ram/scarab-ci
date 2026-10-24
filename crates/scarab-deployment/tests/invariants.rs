@@ -1011,6 +1011,121 @@ fn with_a_gitops_commit_scheme_an_unrelated_commit_supersedes_the_request() {
     );
 }
 
+// ---- a first wait opens at the request's effective time (ADR-0070 §8) -----
+
+#[test]
+fn a_first_wait_counts_a_report_received_while_its_deploy_step_ran() {
+    // The deploy step started at 10 and succeeded at 30; the source reported
+    // in between, at 20 — before the request was even recorded, and before
+    // any gate Attempt could start. The first wait opens at the effective
+    // time (10), so that report decides it: a `failed` fails the gate with
+    // the source's label, a `live` passes it on that report. A Retry's floor
+    // (here 30) puts the report before its window: the `failed` is history
+    // to it, the `live` only an earlier live state — the gap the owner
+    // closed for first waits (2026-10-24).
+    for (status, verdict, floored) in [
+        (
+            Failed,
+            DeploymentGateVerdict::Failed {
+                reason: DeploymentGateFailure::Failed,
+                at: 20,
+            },
+            None,
+        ),
+        (
+            Live,
+            DeploymentGateVerdict::Passed { at: 20 },
+            Some(DeploymentGateVerdict::Passed { at: 30 }),
+        ),
+    ] {
+        let mut l = DeploymentLedger::new();
+        let d = l.apply(report("api", "c1", status, 20));
+        assert_eq!(l.apply(request_started("api", "c1", "r1", 10, 30)), d);
+        let deployment = l.get(d).unwrap();
+        let first = deployment
+            .gate_decision(&requester("r1"), 30, DEADLINE)
+            .expect("decided at once");
+        assert_eq!(first.verdict, verdict);
+        assert_eq!(
+            first.report.map(|r| (r.status, r.label.as_str())),
+            Some((status, format!("{status:?}").as_str())),
+            "the report that came in while the step ran decided it"
+        );
+        assert_eq!(
+            deployment.gate_verdict(&requester("r1"), 30, DEADLINE),
+            Some(verdict)
+        );
+        assert_eq!(
+            deployment.gate_verdict_from(&requester("r1"), 30, 31, DEADLINE),
+            floored,
+            "a floored (retried) wait sees the report as before its window"
+        );
+    }
+}
+
+#[test]
+fn a_first_wait_ignores_a_report_from_before_its_deploy_step_started() {
+    // The `failed` at 5 predates the step's start (10): history, whatever
+    // the step then did. The gate waits; a later `live` passes it.
+    let mut l = DeploymentLedger::new();
+    let d = l.apply(report("api", "c1", Failed, 5));
+    assert_eq!(l.apply(request_started("api", "c1", "r1", 10, 30)), d);
+    let deployment = l.get(d).unwrap();
+    assert_eq!(
+        deployment.gate_decision(&requester("r1"), 30, DEADLINE),
+        None
+    );
+    // Left alone, it stalls a deadline after the step's start.
+    let quiet = l.clone();
+    assert_eq!(
+        quiet
+            .get(d)
+            .unwrap()
+            .gate_verdict(&requester("r1"), 10 + DEADLINE, DEADLINE),
+        Some(DeploymentGateVerdict::Failed {
+            reason: DeploymentGateFailure::Stalled,
+            at: 10 + DEADLINE
+        })
+    );
+    l.apply(report("api", "c1", Live, 40));
+    assert_eq!(
+        l.get(d)
+            .unwrap()
+            .gate_verdict(&requester("r1"), 40, DEADLINE),
+        Some(DeploymentGateVerdict::Passed { at: 40 })
+    );
+}
+
+#[test]
+fn a_deploy_step_longer_than_the_deadline_stalls_its_first_wait_when_asked() {
+    // The window and its stall deadline run from the step's start (0). A
+    // step that itself ran past the deadline (succeeding at DEADLINE + 20)
+    // with nothing decisive reported fails its gate `stalled` the first time
+    // it is asked — at the deadline instant, which precedes the ask. A
+    // decisive report before the deadline still wins.
+    let mut l = DeploymentLedger::new();
+    let d = l.apply(report("api", "c1", InProgress, 5));
+    l.apply(request_started("api", "c1", "r1", 0, DEADLINE + 20));
+    assert_eq!(
+        l.get(d)
+            .unwrap()
+            .gate_verdict(&requester("r1"), DEADLINE + 20, DEADLINE),
+        Some(DeploymentGateVerdict::Failed {
+            reason: DeploymentGateFailure::Stalled,
+            at: DEADLINE
+        })
+    );
+    let mut m = DeploymentLedger::new();
+    let e = m.apply(report("api", "c1", Live, DEADLINE - 1));
+    m.apply(request_started("api", "c1", "r1", 0, DEADLINE + 20));
+    assert_eq!(
+        m.get(e)
+            .unwrap()
+            .gate_verdict(&requester("r1"), DEADLINE + 20, DEADLINE),
+        Some(DeploymentGateVerdict::Passed { at: DEADLINE - 1 })
+    );
+}
+
 // ---- the gate Attempt's window floor (ADR-0070 §8, INV-DEP-13) -------------
 
 #[test]

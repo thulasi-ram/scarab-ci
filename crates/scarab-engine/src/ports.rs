@@ -96,6 +96,32 @@ pub struct DeploymentGateDecision {
     pub deployment: Option<u64>,
 }
 
+/// The gate Attempt a DeploymentGate verdict is asked for (ADR-0070 §8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeploymentGateWait {
+    /// The Attempt's frozen `started_at`. No verdict is reached for an
+    /// instant before it: the oracle answers `None` while its `now` (or the
+    /// `now` its fold was read at) is earlier.
+    pub started_at: Timestamp,
+    /// This wait **waits afresh**: an earlier wait of the same gate already
+    /// resolved while this same request stood (a Retry, or a Rerun that
+    /// re-armed the gate but not its requester). Its window then opens at
+    /// the later of the request's effective time and `started_at` (the
+    /// floor), so the verdict the earlier wait reached is history to it.
+    /// `false` — the gate's first wait on this request, including one after
+    /// an upstream Rerun made a new request — opens at the request's
+    /// effective time (the deploy Step's start), so a report received while
+    /// the deploy Step still ran counts.
+    pub afresh: bool,
+}
+
+impl DeploymentGateWait {
+    /// The window floor, when this wait has one.
+    pub fn window_floor(&self) -> Option<Timestamp> {
+        self.afresh.then_some(self.started_at)
+    }
+}
+
 /// The **DeploymentGate oracle** (slice b, criterion 2; ADR-0070 §8): what a
 /// `gate: deployment` step's verdict is read from. Core resolves a
 /// DeploymentGate — never a plugin — by folding its Environment's Deployment
@@ -104,11 +130,12 @@ pub struct DeploymentGateDecision {
 /// through this port.
 ///
 /// The engine asks only for a gate that is **waiting** (Pending, reached, an
-/// open Attempt), passing that Attempt's frozen `started_at` as
-/// `window_floor`; the window opens at the later of the request's effective
-/// time and the floor. Whatever the oracle answers is journalled once, per
-/// Attempt, and never asked again (INV-DEP-10): a terminal gate is never
-/// re-evaluated, and a Retry is a new Attempt with a later floor.
+/// open Attempt), passing that Attempt as a [`DeploymentGateWait`]: the
+/// window opens at the request's effective time, or — for a wait that waits
+/// afresh — at the later of that and the Attempt's start. Whatever the
+/// oracle answers is journalled once, per Attempt, and never asked again
+/// (INV-DEP-10): a terminal gate is never re-evaluated, and a Retry is a new
+/// Attempt that waits afresh from its own start.
 ///
 /// `Ok(None)` = still waiting. `Err` = the oracle could not decide this tick
 /// (a store read failed, a row would not parse): the engine takes **no
@@ -130,7 +157,7 @@ pub trait DeploymentGates: Send + Sync {
         run: &RunId,
         gate: &StepId,
         request: &crate::RunDeploymentRequest,
-        window_floor: Timestamp,
+        wait: DeploymentGateWait,
         now: Timestamp,
     ) -> Result<Option<DeploymentGateDecision>, String>;
 
