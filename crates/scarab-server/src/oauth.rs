@@ -109,6 +109,10 @@ pub struct LoginFlow {
     /// same-origin relative path that passed [`safe_next`]. Empty = `/`.
     /// Carried base64url so it can never contain the `.` separator.
     pub next: String,
+    /// A link flow's expiry (Unix ms, ADR-0073): the callback refuses the
+    /// link after it, and the link binding covers it, so a link begun under
+    /// a step-up dies with that step-up. The 7th cookie part, decimal.
+    pub link_expires_at: Option<i64>,
 }
 
 /// The longest `next` a login may carry.
@@ -137,6 +141,7 @@ impl LoginFlow {
             provider: String::new(),
             link: String::new(),
             next: String::new(),
+            link_expires_at: None,
         }
     }
 
@@ -147,10 +152,12 @@ impl LoginFlow {
         self
     }
 
-    /// The same flow, made a link into the session whose id hashes to
-    /// `session_hash` (ADR-0069 §6).
-    pub fn for_link(mut self, session_hash: &str) -> Self {
-        self.link = session_hash.to_string();
+    /// The same flow, made a link with link component `link` (ADR-0069 §6;
+    /// ADR-0073: the binding the guarded link POST minted), refused by the
+    /// callback after `expires_at`.
+    pub fn for_link(mut self, link: &str, expires_at: i64) -> Self {
+        self.link = link.to_string();
+        self.link_expires_at = Some(expires_at);
         self
     }
 
@@ -169,22 +176,26 @@ impl LoginFlow {
     /// The opaque state-cookie value carrying the whole flow. Every component
     /// is base64url or a provider id, so `.` is an unambiguous separator.
     pub fn to_cookie(&self) -> String {
-        let mut parts = vec![
+        let next = b64url(self.next.as_bytes());
+        let expires = self
+            .link_expires_at
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        let parts = [
             self.state.as_str(),
             self.verifier.as_str(),
             self.nonce.as_str(),
+            self.provider.as_str(),
+            self.link.as_str(),
+            next.as_str(),
+            expires.as_str(),
         ];
-        let next = b64url(self.next.as_bytes());
-        if !self.provider.is_empty() || !self.link.is_empty() || !self.next.is_empty() {
-            parts.push(&self.provider);
-        }
-        if !self.link.is_empty() || !self.next.is_empty() {
-            parts.push(&self.link);
-        }
-        if !self.next.is_empty() {
-            parts.push(&next);
-        }
-        parts.join(".")
+        // Up to the last non-empty optional part (the first three always).
+        let n = (3..parts.len())
+            .rev()
+            .find(|&i| !parts[i].is_empty())
+            .map_or(3, |i| i + 1);
+        parts[..n].join(".")
     }
 
     /// Parse the state cookie back. A single component is accepted as a
@@ -198,9 +209,18 @@ impl LoginFlow {
         let provider = parts.next().unwrap_or_default();
         let link = parts.next().unwrap_or_default();
         let next = parts.next().unwrap_or_default();
+        let expires = parts.next().unwrap_or_default();
         if parts.next().is_some() {
             return None;
         }
+        // The 7th part is a link flow's expiry: decimal Unix ms, or absent.
+        let link_expires_at = if expires.is_empty() {
+            None
+        } else if expires.bytes().all(|b| b.is_ascii_digit()) {
+            Some(expires.parse::<i64>().ok()?)
+        } else {
+            return None;
+        };
         // The 6th part is base64url of a path that passed `safe_next` when
         // the flow began; re-checked here because a cookie is client input.
         let next = if next.is_empty() {
@@ -221,6 +241,7 @@ impl LoginFlow {
             provider: provider.to_string(),
             link: link.to_string(),
             next,
+            link_expires_at,
         })
     }
 
@@ -807,6 +828,7 @@ mod tests {
             provider: String::new(),
             link: String::new(),
             next: String::new(),
+            link_expires_at: None,
         };
         assert_eq!(
             flow.challenge(),
@@ -835,7 +857,7 @@ mod tests {
         assert_eq!(LoginFlow::from_cookie("a.b.c.d.e.f.g"), None);
         let link = LoginFlow::generate()
             .for_provider("github")
-            .for_link("abc123");
+            .for_link("abc123", 1_700_000_000_000);
         assert_eq!(
             LoginFlow::from_cookie(&link.to_cookie()),
             Some(link.clone())

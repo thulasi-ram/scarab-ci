@@ -6176,13 +6176,21 @@ async fn begin_link_identity(
         .oauth_provider(Some(&req.provider))?
         .ok_or(ApiError::NotFound)?;
     let flow = oauth::LoginFlow::generate().for_provider(provider.provider_id());
-    // Enforced: a binding only this (guarded) POST can mint. Off: the bare
-    // session hash, as before — the POST is unguarded then anyway.
+    // The flow lives no longer than the step-up window that authorised it.
+    let expires_at = st.clock.now().await.0 + scarab_identity::STEP_UP_WINDOW_MS;
+    // Enforced: a binding only this (guarded) POST can mint, over the
+    // provider and the expiry too. Off: the bare session hash, as before —
+    // the POST is unguarded then anyway.
     let link = match st.step_up.service() {
-        Some(svc) => svc.link_binding(&flow.state, &session_hash(&sid)),
+        Some(svc) => svc.link_binding(
+            &flow.state,
+            &session_hash(&sid),
+            &flow.provider,
+            expires_at,
+        ),
         None => session_hash(&sid),
     };
-    let flow = flow.for_link(&link);
+    let flow = flow.for_link(&link, expires_at);
     let mut resp = Json(LinkIdentityResponse {
         authorize_url: provider.authorize_redirect(&oauth_callback_url(&st), &flow),
     })
@@ -6210,15 +6218,22 @@ async fn link_callback(
 ) -> Result<Response, ApiError> {
     let (sid, principal) = link_session(st, headers, Action::Read).await?;
     // The link component must be the one the guarded link POST minted for
-    // THIS flow and THIS session (ADR-0073 §3: identity links are a crown
-    // jewel, and the state cookie is unsigned client input).
+    // THIS flow, THIS session, THIS provider and THIS expiry (ADR-0073 §3:
+    // identity links are a crown jewel, and the state cookie is unsigned
+    // client input) — and the flow must not have outlived its step-up.
+    let now = st.clock.now().await.0;
+    let expires_at = flow.link_expires_at.unwrap_or(i64::MIN);
     let expected = match st.step_up.service() {
-        Some(svc) => svc.link_binding(&flow.state, &session_hash(&sid)),
+        Some(svc) => svc.link_binding(
+            &flow.state,
+            &session_hash(&sid),
+            &flow.provider,
+            expires_at,
+        ),
         None => session_hash(&sid),
     };
-    if !step_up::ct_eq(expected.as_bytes(), flow.link.as_bytes()) {
+    if now > expires_at || !step_up::ct_eq(expected.as_bytes(), flow.link.as_bytes()) {
         if let Some(svc) = st.step_up.service() {
-            let now = st.clock.now().await.0;
             let mut ev = step_up::event(
                 scarab_identity::security_event_kind::STEP_UP_REFUSED,
                 &principal.subject,
@@ -6229,7 +6244,7 @@ async fn link_callback(
             ev.op = Some("identity.link".to_string());
             ev.session_hash = Some(session_hash(&sid));
             ev.detail = serde_json::json!({
-                "reason": "link flow not minted by the stepped-up POST",
+                "reason": "link flow not minted by the stepped-up POST, or expired",
             });
             svc.record(ev).await;
         }

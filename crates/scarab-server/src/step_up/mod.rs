@@ -48,9 +48,10 @@ use crate::{ApiError, AppState, Caller};
 pub const DIGEST_KEY_LABEL: &str = "scarab-step-up-digest/v1";
 
 /// The label the identity-link binding key is derived under: a link flow's
-/// state cookie carries `HMAC(K_link, state, session_hash)`, which only the
-/// guarded `POST /v1/me/identities/link` can mint (the cookie is unsigned, so
-/// a bare session hash would let any cookie holder forge a link flow).
+/// state cookie carries `HMAC(K_link, state, session_hash, provider,
+/// expires_at)`, which only the guarded `POST /v1/me/identities/link` can
+/// mint (the cookie is unsigned, so a bare session hash would let any cookie
+/// holder forge a link flow).
 pub const LINK_KEY_LABEL: &str = "scarab-identity-link/v1";
 
 /// Where a refusal with no passkey sends the human.
@@ -131,14 +132,23 @@ impl StepUpService {
     }
 
     /// The link component of an identity-link flow's state cookie: hex
-    /// `HMAC-SHA256(K_link, len(state)‖state‖len(session_hash)‖session_hash)`
-    /// (u32 big-endian lengths). Bound to the server key, the flow's `state`
-    /// and the session, so it can be minted only by the guarded link POST
-    /// and cannot be moved to another flow or session.
-    pub(crate) fn link_binding(&self, state: &str, session_hash: &str) -> String {
+    /// `HMAC-SHA256(K_link, len‖state ‖ len‖session_hash ‖ len‖provider ‖
+    /// len‖expires_at)` (u32 big-endian lengths; `expires_at` in decimal
+    /// Unix ms). Bound to the server key, the flow's `state`, the session,
+    /// the provider the guarded POST was asked for and the flow's expiry, so
+    /// it can be minted only by the guarded link POST, cannot be moved to
+    /// another flow, session or provider, and dies with its step-up.
+    pub(crate) fn link_binding(
+        &self,
+        state: &str,
+        session_hash: &str,
+        provider: &str,
+        expires_at: i64,
+    ) -> String {
         let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.link_key)
             .expect("HMAC accepts any key length");
-        for part in [state, session_hash] {
+        let expires_at = expires_at.to_string();
+        for part in [state, session_hash, provider, expires_at.as_str()] {
             mac.update(&(part.len() as u32).to_be_bytes());
             mac.update(part.as_bytes());
         }
@@ -502,7 +512,7 @@ pub(crate) async fn authorise(
     Ok(confirmation)
 }
 
-/// The one step-up decision (ADR-0073 §2), for the guard and the
+/// The one step-up decision (ADR-0073 §3–§6), for the guard and the
 /// conditional handlers alike. `Ok(confirmation id)` when satisfied; a
 /// refusal is `403 step_up_required` and is recorded (`step_up.refused`,
 /// best-effort).
