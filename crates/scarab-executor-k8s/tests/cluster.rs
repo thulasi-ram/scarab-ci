@@ -114,9 +114,10 @@ fn opted_in() -> Option<String> {
         eprintln!("skipping: set SCARAB_TEST_KUBE=1 to run against a dev cluster");
         return None;
     }
-    // Every case passes this gate before it builds anything that speaks TLS,
-    // so this is where the process-level CryptoProvider goes in (git-bug
-    // 2852828). `kube_client` installs it again for belt and braces.
+    // Every case passes this gate FIRST — before `workspace_fixture` builds
+    // its Depot and cold-store clients and before `kube_client` dials the API
+    // server — so this one call is where the process-level CryptoProvider
+    // goes in (git-bug 2852828).
     install_crypto_provider();
     Some(std::env::var("SCARAB_TEST_KUBE_NS").unwrap_or_else(|_| "default".to_string()))
 }
@@ -133,10 +134,9 @@ fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-/// The kube client every case uses: the ambient-config client, built only
-/// after the CryptoProvider is installed.
+/// The kube client every case uses: the ambient-config client. Only ever
+/// called after [`opted_in`], which installed the CryptoProvider.
 async fn kube_client() -> kube::Client {
-    install_crypto_provider();
     kube::Client::try_default().await.expect("kube client")
 }
 
