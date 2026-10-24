@@ -220,6 +220,13 @@ impl ChallengeStore for InMemoryChallenges {
         c.consumed_at = Some(now_ms);
         Ok(Some(c.clone()))
     }
+
+    async fn reap_expired(&self, now_ms: i64) -> Result<u64, IdentityError> {
+        let mut rows = self.challenges.lock().unwrap();
+        let before = rows.len();
+        rows.retain(|_, c| c.expires_at > now_ms);
+        Ok((before - rows.len()) as u64)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -246,6 +253,17 @@ impl InMemoryStepUp {
     /// Every confirmation recorded, in insert order (a test's view).
     pub fn confirmations(&self) -> Vec<StepUpConfirmation> {
         self.state.lock().unwrap().confirmations.clone()
+    }
+
+    /// Every request recorded, in no particular order (a test's view).
+    pub fn requests(&self) -> Vec<StepUpRequest> {
+        self.state
+            .lock()
+            .unwrap()
+            .requests
+            .values()
+            .cloned()
+            .collect()
     }
 }
 
@@ -449,6 +467,45 @@ impl StepUpStore for InMemoryStepUp {
                     && r.expires_at > now_ms
             })
             .count() as u64)
+    }
+
+    async fn pending_in_org(&self, org: &str, now_ms: i64) -> Result<u64, IdentityError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .requests
+            .values()
+            .filter(|r| {
+                r.org.as_deref() == Some(org)
+                    && r.state == RequestState::Pending
+                    && r.expires_at > now_ms
+            })
+            .count() as u64)
+    }
+
+    async fn reap(&self, now_ms: i64, older_than_ms: i64) -> Result<u64, IdentityError> {
+        let mut state = self.state.lock().unwrap();
+        let before = state.confirmations.len() + state.requests.len();
+        state.confirmations.retain(|c| c.expires_at > now_ms);
+        let stuck = now_ms - scarab_identity::STEP_UP_REQUEST_TTL_MS;
+        for r in state.requests.values_mut() {
+            let expired = r.state == RequestState::Pending && r.expires_at <= now_ms;
+            let left_executing =
+                r.state == RequestState::Executing && r.confirmed_at.is_some_and(|t| t <= stuck);
+            if expired || left_executing {
+                r.sealed = None;
+            }
+        }
+        state.requests.retain(|_, r| {
+            let settled_long_ago =
+                r.state.is_terminal() && r.executed_at.is_some_and(|t| t < older_than_ms);
+            let expired_long_ago = r.state == RequestState::Pending && r.expires_at < older_than_ms;
+            let stuck_long_ago = r.state == RequestState::Executing
+                && r.confirmed_at.is_some_and(|t| t < older_than_ms);
+            !(settled_long_ago || expired_long_ago || stuck_long_ago)
+        });
+        Ok((before - state.confirmations.len() - state.requests.len()) as u64)
     }
 }
 

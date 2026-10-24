@@ -3959,6 +3959,18 @@ impl scarab_identity::RbacStore for InMemoryRbac {
         Ok(out)
     }
 
+    async fn orgs_of(&self, subject: &str) -> Result<Vec<String>, IdentityError> {
+        let orgs: std::collections::BTreeSet<String> = self
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((s, _, _), (role, _))| s == subject && role.is_some())
+            .map(|((_, org, _), _)| org.clone())
+            .collect();
+        Ok(orgs.into_iter().collect())
+    }
+
     async fn import_seeds(
         &self,
         scope: &scarab_identity::Scope,

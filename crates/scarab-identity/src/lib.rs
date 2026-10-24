@@ -164,6 +164,10 @@ pub trait RbacStore: Send + Sync {
     async fn max_role(&self, subject: &str) -> Result<Option<Role>, IdentityError>;
     /// All live bindings within `org` (org- and project-scoped).
     async fn bindings(&self, org: &str) -> Result<Vec<Binding>, IdentityError>;
+    /// Every Org in which `subject` holds a live binding (Org- or
+    /// Project-scoped), sorted (ADR-0073 §10: an Owner may reset a member's
+    /// passkeys only when Owner of every one of them).
+    async fn orgs_of(&self, subject: &str) -> Result<Vec<String>, IdentityError>;
     /// A forge import at `scope` through login provider `via` (ADR-0069 §5),
     /// atomically: each `(subject, role)` is seeded as an `import` row — never
     /// clobbering a native grant or a native revoke — recording `via`. With
