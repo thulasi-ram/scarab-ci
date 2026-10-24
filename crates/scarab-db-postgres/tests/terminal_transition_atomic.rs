@@ -395,7 +395,9 @@ fn is_run_transitioned(p: &EventPayload) -> bool {
 /// the run must stay as it was, and the re-sent cancel lands all three.
 async fn run_transition_crash(db: &dyn Db, clock: &FakeClock) {
     assert!(
-        cancel_run_request(db, clock, &run_id(), None).await.is_err(),
+        cancel_run_request(db, clock, &run_id(), None)
+            .await
+            .is_err(),
         "the crash was injected"
     );
     assert_eq!(
@@ -420,7 +422,13 @@ async fn run_transition_converges(db: &dyn Db, clock: &FakeClock) {
         .unwrap()
         .iter()
         .filter(|e| {
-            matches!(e.kind, EventPayload::RunTransitioned { to: RunStatus::Cancelled, .. })
+            matches!(
+                e.kind,
+                EventPayload::RunTransitioned {
+                    to: RunStatus::Cancelled,
+                    ..
+                }
+            )
         })
         .count();
     assert_eq!(into_cancelled, 1);

@@ -1153,7 +1153,11 @@ async fn a_unit_still_terminating_at_the_bound_is_not_reported_as_failed() {
     for _ in 0..MAX_DELIVERY_ATTEMPTS {
         sched.reconcile_supersessions().await.expect("reconcile");
     }
-    assert_eq!(db.outbox_depth().await.unwrap(), 0, "abandoned at the bound");
+    assert_eq!(
+        db.outbox_depth().await.unwrap(),
+        0,
+        "abandoned at the bound"
+    );
     let reasons = abandoned_reasons(&db, &run).await;
     assert_eq!(reasons.len(), 1, "{reasons:?}");
     assert!(

@@ -384,7 +384,13 @@ steps:
     let db = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
     db.fail_next_event_append(|p| {
-        matches!(p, EventPayload::StepTransitioned { to: StepStatus::Skipped, .. })
+        matches!(
+            p,
+            EventPayload::StepTransitioned {
+                to: StepStatus::Skipped,
+                ..
+            }
+        )
     });
     let created =
         trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &push("feature")).await;
