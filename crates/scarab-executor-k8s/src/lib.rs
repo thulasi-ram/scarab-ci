@@ -2040,13 +2040,37 @@ fn settled_state(pod: &Pod, harvesting: bool, now_secs: i64) -> ExecState {
     // The results-egress drain is owed on a workspace Pod too (ADR-0042):
     // see `results_settled_state`.
     let state = results_settled_state(pod, now_secs);
-    let settling = init_container_running(pod, WORKSPACE_EGRESS_CONTAINER);
+    // The workspace egress still showing `running` is "settle in flight" —
+    // until the sidecar reporting ceiling (red team R3 on git-bug f02588d):
+    // past it a live kubelet has SIGKILLed and reported every sidecar, so a
+    // status frozen at `running` is a lost node, and the sidecar is as gone
+    // as if it had been seen to terminate. Withholding on it hung the step
+    // `Running` until its timeout (`Timeout`, never retried) on every
+    // workspace Pod — the default path.
+    let settling = init_container_running(pod, WORKSPACE_EGRESS_CONTAINER)
+        && !sidecar_reporting_ceiling_passed(pod, now_secs);
+    // The kubelet holds the phase `Running` until every sidecar stopped, and
+    // a lost node never reports them: the step's own exit 0 is the verdict
+    // to settle on once the egress is gone (the snapshot rule below decides
+    // whether it can stand).
+    let state = match state {
+        ExecState::Running
+            if !settling
+                && is_workspace_pod(pod)
+                && sidecar_reporting_ceiling_passed(pod, now_secs)
+                && step_terminated_exit(pod) == Some(0)
+                && !(results_draining(pod) && !results_drain_overdue(pod, now_secs)) =>
+        {
+            ExecState::Succeeded
+        }
+        other => other,
+    };
     match state {
         ExecState::Succeeded if settling => ExecState::Running,
         // ADR-0061 part 4: an Attempt is not `Succeeded` until its Workspace
         // Snapshot is durable. The sidecar being gone is not proof that it is —
         // see `workspace_snapshot_lost`.
-        ExecState::Succeeded if workspace_snapshot_lost(pod) => ExecState::Failed {
+        ExecState::Succeeded if workspace_snapshot_lost(pod, now_secs) => ExecState::Failed {
             exit_code: None,
             // The step's process DID run, so a side effect is possible: the
             // engine's retry has to be the at-least-once kind (CONTEXT.md §2),
@@ -2220,6 +2244,19 @@ const K8S_DEFAULT_TERMINATION_GRACE_SECS: i64 = 30;
 /// SIGKILLed at the grace and reported well inside this.
 const RESULTS_DRAIN_SLACK_SECS: i64 = 300;
 
+/// Has every native sidecar of this Pod had its chance to report terminating
+/// at `now_secs`? True once the step container's `finishedAt` +
+/// [`results_drain_bound_secs`] has passed: the kubelet SIGKILLs a finished
+/// Pod's sidecars within its `terminationGracePeriodSeconds` and reports them
+/// well inside the slack, so a sidecar still showing `running` past this
+/// ceiling belongs to a node that stopped reporting (red team R3 on git-bug
+/// `f02588d`). No `finishedAt`, or a broken clock (`i64::MIN`), → never.
+fn sidecar_reporting_ceiling_passed(pod: &Pod, now_secs: i64) -> bool {
+    step_terminated_finished_at(pod).is_some_and(|finished| {
+        now_secs >= finished.saturating_add(results_drain_bound_secs(pod))
+    })
+}
+
 /// How long after its drain could begin ([`results_drain_began_at`]) a
 /// results drain may withhold the verdict: the Pod's
 /// `terminationGracePeriodSeconds` (the kubelet SIGKILLs the sidecar at it)
@@ -2247,11 +2284,18 @@ fn results_drain_bound_secs(pod: &Pod) -> i64 {
 /// likely landed. No `finishedAt` (the step's exit not yet reported) → no
 /// bound: there is no exit to measure from, and the engine's step timeout
 /// remains the backstop.
+///
+/// A drain whose start is unknown because a later-declared sidecar (the
+/// workspace egress) never reported terminating is overdue once the
+/// [`sidecar_reporting_ceiling_passed`] (red team R3): before it that
+/// sidecar may still be settling; past it, its status is frozen by a lost
+/// node and no start will ever be observed — "no bound" there left the
+/// verdict withheld until the step timeout on every workspace Pod.
 fn results_drain_overdue(pod: &Pod, now_secs: i64) -> bool {
-    let Some(began) = results_drain_began_at(pod) else {
-        return false;
-    };
-    now_secs >= began.saturating_add(results_drain_bound_secs(pod))
+    match results_drain_began_at(pod) {
+        Some(began) => now_secs >= began.saturating_add(results_drain_bound_secs(pod)),
+        None => sidecar_reporting_ceiling_passed(pod, now_secs),
+    }
 }
 
 /// When the results sidecar's drain could begin (unix seconds), or `None`
@@ -2421,10 +2465,15 @@ fn is_workspace_pod(pod: &Pod) -> bool {
 /// A **failed** step is deliberately not covered: its workspace is not an output
 /// (`drive_workspace` snapshots successful steps only), so there is no snapshot to
 /// owe. Its *artifacts* are owed, and [`artifact_harvest_owed`] is that rule.
-fn workspace_snapshot_lost(pod: &Pod) -> bool {
+///
+/// "Gone" includes a sidecar whose status is frozen at `running` past the
+/// [`sidecar_reporting_ceiling_passed`] at `now_secs` — the lost node itself
+/// (red team R3 on git-bug `f02588d`): it will never be seen to terminate.
+fn workspace_snapshot_lost(pod: &Pod, now_secs: i64) -> bool {
     is_workspace_pod(pod)
         && step_terminated_exit(pod) == Some(0)
-        && !init_container_running(pod, WORKSPACE_EGRESS_CONTAINER)
+        && (!init_container_running(pod, WORKSPACE_EGRESS_CONTAINER)
+            || sidecar_reporting_ceiling_passed(pod, now_secs))
         && !pod
             .metadata
             .annotations
@@ -7687,7 +7736,9 @@ mod tests {
             ExecState::Succeeded
         );
         // While the workspace egress has not stopped, the results sidecar has
-        // not begun to drain: no bound at all.
+        // not begun to drain: no drain bound — only the sidecar reporting
+        // ceiling (red team R3), the step's exit + grace + slack, by which a
+        // live kubelet has reported every sidecar.
         let mut settling = pod();
         settling
             .status
@@ -7701,9 +7752,80 @@ mod tests {
             .unwrap()
             .state = Some(results_running());
         assert_eq!(
-            results_settled_state(&settling, i64::MAX - 1),
+            results_settled_state(&settling, finished + bound - 1),
             ExecState::Running
         );
+        assert_eq!(
+            results_settled_state(&settling, finished + bound),
+            ExecState::Succeeded,
+            "past the ceiling a frozen workspace egress no longer removes the bound"
+        );
+    }
+
+    /// Red team R3 on git-bug f02588d: the default path. A workspace Pod on a
+    /// lost node shows its workspace egress frozen at `running` forever (and
+    /// its results sidecar never signalled). Within the sidecar reporting
+    /// ceiling that is a settle in flight — withheld; past it, it is a lost
+    /// node: with no root recorded the verdict is the existing "workspace
+    /// snapshot lost" infra failure (auto-retried), not a hang until the
+    /// step's timeout (`Timeout`, never retried).
+    #[test]
+    fn a_frozen_workspace_egress_past_the_ceiling_is_a_lost_snapshot() {
+        let finished = NOW - 10_000;
+        let grace = 600;
+        let bound = grace + RESULTS_DRAIN_SLACK_SECS;
+        let frozen = |snapshotted: bool| {
+            let mut pod = with_results_sidecar(
+                step_finished_at(
+                    settling_pod_with("Running", 0, true, true, snapshotted),
+                    finished,
+                ),
+                Some(results_status(results_running(), false)),
+            );
+            pod.spec.as_mut().unwrap().termination_grace_period_seconds = Some(grace);
+            pod
+        };
+        // Inside the ceiling: still settling.
+        assert_eq!(
+            settled_state(&frozen(false), true, finished + bound - 1),
+            ExecState::Running
+        );
+        // Past it, no root: the snapshot is lost — retried infra, not a hang.
+        match settled_state(&frozen(false), true, finished + bound) {
+            ExecState::Failed {
+                exit_code: None,
+                class: FailureClass::Infra {
+                    never_started: false,
+                },
+                cause: Some(cause),
+            } => assert!(cause.contains("workspace snapshot lost"), "{cause}"),
+            other => panic!("expected the lost-snapshot infra failure, got {other:?}"),
+        }
+        // Past it with the root recorded: the snapshot is durable, so the
+        // step's exit 0 stands.
+        assert_eq!(
+            settled_state(&frozen(true), true, finished + bound),
+            ExecState::Succeeded
+        );
+        // A broken clock never reaches the ceiling (fail closed: withheld).
+        assert_eq!(
+            settled_state(&frozen(false), true, i64::MIN),
+            ExecState::Running
+        );
+        // Without a results sidecar at all, the same.
+        let mut bare = step_finished_at(
+            settling_pod_with("Running", 0, true, true, false),
+            finished,
+        );
+        bare.spec.as_mut().unwrap().termination_grace_period_seconds = Some(grace);
+        assert_eq!(
+            settled_state(&bare, true, finished + bound - 1),
+            ExecState::Running
+        );
+        assert!(matches!(
+            settled_state(&bare, true, finished + bound),
+            ExecState::Failed { .. }
+        ));
     }
 
     // ------------------------------------------------------------------
@@ -7905,7 +8027,7 @@ mod tests {
     fn succeeded_is_refused_when_the_snapshot_was_lost_with_the_pod() {
         // Step exited 0, sidecar gone, NO workspace root ⇒ the snapshot is gone.
         let lost = settling_pod_with("Succeeded", 0, false, true, false);
-        assert!(workspace_snapshot_lost(&lost));
+        assert!(workspace_snapshot_lost(&lost, NOW));
         match settled_state(&lost, true, NOW) {
             ExecState::Failed {
                 exit_code: None,
@@ -7928,7 +8050,7 @@ mod tests {
 
         // The same Pod WITH the root recorded is the ordinary green path.
         let settled = settling_pod_with("Succeeded", 0, false, true, true);
-        assert!(!workspace_snapshot_lost(&settled));
+        assert!(!workspace_snapshot_lost(&settled, NOW));
         assert_eq!(settled_state(&settled, true, NOW), ExecState::Succeeded);
     }
 
@@ -7958,7 +8080,7 @@ mod tests {
     #[test]
     fn a_failed_step_owes_no_snapshot() {
         let failed = settling_pod_with("Failed", 1, false, true, false);
-        assert!(!workspace_snapshot_lost(&failed));
+        assert!(!workspace_snapshot_lost(&failed, NOW));
         assert_eq!(
             settled_state(&failed, true, NOW),
             ExecState::Failed {
@@ -8005,7 +8127,7 @@ mod tests {
             ..Default::default()
         };
         assert!(!is_workspace_pod(&pod));
-        assert!(!workspace_snapshot_lost(&pod));
+        assert!(!workspace_snapshot_lost(&pod, NOW));
         assert_eq!(settled_state(&pod, false, NOW), ExecState::Succeeded);
     }
 
@@ -8021,7 +8143,7 @@ mod tests {
             // Whatever `ingest` returns for an empty directory: still a root.
             "e".repeat(64),
         );
-        assert!(!workspace_snapshot_lost(&pod));
+        assert!(!workspace_snapshot_lost(&pod, NOW));
         assert_eq!(settled_state(&pod, true, NOW), ExecState::Succeeded);
 
         // …whereas an EMPTY-STRING annotation is not a root and must not pass. The
@@ -8032,7 +8154,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .insert(ANNOTATION_WS_ROOT.to_string(), String::new());
-        assert!(workspace_snapshot_lost(&pod));
+        assert!(workspace_snapshot_lost(&pod, NOW));
     }
 
     /// A platform verdict about a green-looking Pod must not be reclassified. If
