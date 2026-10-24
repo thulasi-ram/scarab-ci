@@ -29,6 +29,29 @@ fn unreadable(what: &str) -> IdentityError {
     IdentityError::Issuance(format!("step-up store holds an unreadable {what}"))
 }
 
+impl PostgresDb {
+    /// Every subject holding a live Admin or Owner binding anywhere — the
+    /// install-wide admins the boot line "step-up enforced; N admins have no
+    /// passkey" counts (ADR-0073 §8). Bootstrap owners come from config and
+    /// are the caller's to add.
+    pub async fn admin_subjects(&self) -> Result<BTreeSet<String>, IdentityError> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT subject, role FROM rbac_bindings WHERE role IS NOT NULL",
+        )
+        .fetch_all(self.pool())
+        .await
+        .map_err(identity_err)?;
+        Ok(rows
+            .into_iter()
+            .filter(|r| {
+                role_from_str(&r.get::<String, _>("role"))
+                    .is_some_and(|role| role >= scarab_identity::Role::Admin)
+            })
+            .map(|r| r.get::<String, _>("subject"))
+            .collect())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Passkeys
 // ---------------------------------------------------------------------------
@@ -424,6 +447,28 @@ impl StepUpStore for PostgresDb {
         .fetch_one(self.pool())
         .await
         .map_err(identity_err)
+    }
+
+    async fn live_window(
+        &self,
+        session_hash: &str,
+        principal: &str,
+        now_ms: i64,
+    ) -> Result<Option<(String, i64)>, IdentityError> {
+        let row: Option<(String, i64)> = sqlx::query_as(
+            "SELECT id, expires_at FROM step_up_confirmations
+             WHERE session_hash = $1 AND principal_id = $2 AND kind = $3 AND expires_at > $4
+             ORDER BY expires_at DESC, id
+             LIMIT 1",
+        )
+        .bind(session_hash)
+        .bind(principal)
+        .bind(ConfirmationKind::Window.as_str())
+        .bind(now_ms)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(identity_err)?;
+        Ok(row)
     }
 
     async fn consume_action(

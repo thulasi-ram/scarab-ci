@@ -103,6 +103,7 @@ pub fn route_table() -> &'static [RouteEntry] {
 
 /// The single route list.
 pub(crate) fn governed_routes() -> Routes {
+    use crate::step_up::ceremony;
     use crate::*;
     Routes::new()
         .get("/healthz", healthz)
@@ -126,6 +127,33 @@ pub(crate) fn governed_routes() -> Routes {
             "/v1/me/identities/{provider}",
             &ops::IDENTITY_UNLINK,
             unlink_identity,
+        )
+        // ADR-0073: the caller's passkeys and the step-up ceremony.
+        .get("/v1/me/security", ceremony::me_security)
+        .post(
+            "/v1/me/passkeys/registration/options",
+            &ops::PASSKEY_ADD,
+            ceremony::passkey_registration_options,
+        )
+        .post(
+            "/v1/me/passkeys/registration",
+            &ops::PASSKEY_REGISTRATION,
+            ceremony::passkey_registration,
+        )
+        .delete(
+            "/v1/me/passkeys/{id}",
+            &ops::PASSKEY_REMOVE,
+            ceremony::remove_passkey,
+        )
+        .post(
+            "/v1/me/step-up/options",
+            &ops::STEP_UP_OPTIONS,
+            ceremony::step_up_options,
+        )
+        .post(
+            "/v1/me/step-up",
+            &ops::STEP_UP_CONFIRM,
+            ceremony::step_up_confirm,
         )
         .get("/v1/orgs/{org}/bindings", list_bindings)
         .put("/v1/orgs/{org}/bindings", &ops::BINDING_PUT, put_binding)

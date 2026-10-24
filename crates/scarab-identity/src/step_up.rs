@@ -434,6 +434,16 @@ pub trait StepUpStore: Send + Sync {
         now_ms: i64,
     ) -> Result<Option<i64>, IdentityError>;
 
+    /// The latest live window of `principal` in `session_hash`, as
+    /// `(confirmation id, expires_at)` — what a window-satisfied operation is
+    /// recorded as authorised by.
+    async fn live_window(
+        &self,
+        session_hash: &str,
+        principal: &str,
+        now_ms: i64,
+    ) -> Result<Option<(String, i64)>, IdentityError>;
+
     /// Consume one live, unconsumed action confirmation of `principal` in
     /// `session_hash` for exactly `digest`, atomically and at most once.
     /// Returns the consumed confirmation's id. A window never satisfies this.

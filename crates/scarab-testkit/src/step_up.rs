@@ -304,6 +304,28 @@ impl StepUpStore for InMemoryStepUp {
             .max())
     }
 
+    async fn live_window(
+        &self,
+        session_hash: &str,
+        principal: &str,
+        now_ms: i64,
+    ) -> Result<Option<(String, i64)>, IdentityError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .confirmations
+            .iter()
+            .filter(|c| {
+                c.kind == ConfirmationKind::Window
+                    && c.session_hash == session_hash
+                    && c.principal == principal
+                    && c.expires_at > now_ms
+            })
+            .max_by(|a, b| a.expires_at.cmp(&b.expires_at).then(b.id.cmp(&a.id)))
+            .map(|c| (c.id.clone(), c.expires_at)))
+    }
+
     async fn consume_action(
         &self,
         session_hash: &str,

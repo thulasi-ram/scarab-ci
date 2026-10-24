@@ -27,7 +27,7 @@
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::Json;
+use axum::{Extension, Json};
 use scarab_engine::DbError;
 use scarab_identity::Action;
 use scarab_project::{
@@ -371,12 +371,17 @@ pub(crate) async fn get_org_environment(
 )]
 pub(crate) async fn put_org_environment(
     State(st): State<AppState>,
+    Extension(ctx): Extension<crate::step_up::GuardCtx>,
     headers: HeaderMap,
     Path((org, env)): Path<(String, String)>,
     Json(body): Json<PutOrgEnvironmentRequest>,
 ) -> Result<Json<OrgEnvironmentDto>, ApiError> {
     let scope = rbac_scope(&org, None);
     let principal = authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
+    // ADR-0073 SEAM (C4): a conditional crown jewel — the step-up is needed
+    // only when this change loosens (rule: E3, a deployment source added). Until the loosening
+    // rules are wired, ask unconditionally: fail-closed.
+    ctx.require(&st, Vec::new()).await?;
     let store = st.org_environments.as_ref().ok_or(ApiError::NotFound)?;
     let deployment_deadline = EnvironmentDeploymentDeadline::new(
         body.deployment_deadline_ms
@@ -555,12 +560,17 @@ pub(crate) async fn get_environment_eligibility(
 )]
 pub(crate) async fn put_environment_eligibility(
     State(st): State<AppState>,
+    Extension(ctx): Extension<crate::step_up::GuardCtx>,
     headers: HeaderMap,
     Path((org, env)): Path<(String, String)>,
     Json(body): Json<EnvironmentEligibilityDto>,
 ) -> Result<Json<EnvironmentEligibilityDto>, ApiError> {
     let scope = rbac_scope(&org, None);
     let principal = authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
+    // ADR-0073 SEAM (C4): a conditional crown jewel — the step-up is needed
+    // only when this change loosens (rule: E2, eligibility widened). Until the loosening
+    // rules are wired, ask unconditionally: fail-closed.
+    ctx.require(&st, Vec::new()).await?;
     let store = st
         .environment_governance
         .as_ref()
@@ -829,12 +839,17 @@ pub(crate) async fn get_environment_protection(
 )]
 pub(crate) async fn put_environment_protection(
     State(st): State<AppState>,
+    Extension(ctx): Extension<crate::step_up::GuardCtx>,
     headers: HeaderMap,
     Path((org, env)): Path<(String, String)>,
     Json(body): Json<PutEnvironmentProtectionRequest>,
 ) -> Result<Json<OrgEnvironmentDto>, ApiError> {
     let scope = rbac_scope(&org, None);
     let principal = authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
+    // ADR-0073 SEAM (C4): a conditional crown jewel — the step-up is needed
+    // only when this change loosens (rule: E1, protection loosened). Until the loosening
+    // rules are wired, ask unconditionally: fail-closed.
+    ctx.require(&st, Vec::new()).await?;
     let store = governance_store(&st)?;
     let rules = checked_rules(
         &st,
@@ -947,12 +962,17 @@ pub(crate) async fn get_environment_project_overlay(
 )]
 pub(crate) async fn put_environment_project_overlay(
     State(st): State<AppState>,
+    Extension(ctx): Extension<crate::step_up::GuardCtx>,
     headers: HeaderMap,
     Path((org, env, project)): Path<(String, String, String)>,
     Json(body): Json<PutEnvironmentProjectOverlayRequest>,
 ) -> Result<Json<EnvironmentProjectOverlayDto>, ApiError> {
     let scope = rbac_scope(&org, Some(&project));
     let principal = authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
+    // ADR-0073 SEAM (C4): a conditional crown jewel — the step-up is needed
+    // only when this change loosens (rule: E1 + gate deadline, overlay loosened). Until the loosening
+    // rules are wired, ask unconditionally: fail-closed.
+    ctx.require(&st, Vec::new()).await?;
     let store = governance_store(&st)?;
     let governance = store
         .deploy_governance(&org, &project, &env)
@@ -1088,12 +1108,17 @@ pub(crate) async fn get_environment_project_privilege_grant(
 )]
 pub(crate) async fn put_environment_project_privilege_grant(
     State(st): State<AppState>,
+    Extension(ctx): Extension<crate::step_up::GuardCtx>,
     headers: HeaderMap,
     Path((org, env, project)): Path<(String, String, String)>,
     Json(body): Json<PutEnvironmentProjectPrivilegeGrantRequest>,
 ) -> Result<Json<EnvironmentProjectPrivilegeGrantDto>, ApiError> {
     let scope = rbac_scope(&org, None);
     let principal = authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
+    // ADR-0073 SEAM (C4): a conditional crown jewel — the step-up is needed
+    // only when this change loosens (rule: E4, privilege whitelist widened). Until the loosening
+    // rules are wired, ask unconditionally: fail-closed.
+    ctx.require(&st, Vec::new()).await?;
     let store = governance_store(&st)?;
     let mut privileged_images: Vec<ImageGrant> = Vec::with_capacity(body.privileged_images.len());
     for g in body.privileged_images {
