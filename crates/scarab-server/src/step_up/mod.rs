@@ -957,8 +957,21 @@ mod tests {
         assert!(check_step_up_composition(false, false, false).is_ok());
     }
 
-    fn refusal(org: &str, subject: &str, caller: &str, op: &str, reason: &str, at: i64) -> SecurityEvent {
-        let mut e = event(kind::STEP_UP_REFUSED, subject, caller.into(), Some(org.into()), at);
+    fn refusal(
+        org: &str,
+        subject: &str,
+        caller: &str,
+        op: &str,
+        reason: &str,
+        at: i64,
+    ) -> SecurityEvent {
+        let mut e = event(
+            kind::STEP_UP_REFUSED,
+            subject,
+            caller.into(),
+            Some(org.into()),
+            at,
+        );
         e.op = Some(op.into());
         e.detail = serde_json::json!({ "reason": reason });
         e
@@ -969,14 +982,24 @@ mod tests {
     fn admit_one(l: &RefusalLimiter, e: SecurityEvent) -> Option<u64> {
         let mut out = l.admit(e);
         assert!(out.len() <= 1, "unexpected flush: {out:?}");
-        out.pop().map(|e| e.detail["suppressed_before"].as_u64().unwrap_or(0))
+        out.pop()
+            .map(|e| e.detail["suppressed_before"].as_u64().unwrap_or(0))
     }
 
     #[test]
     fn the_refusal_limiter_admits_five_a_window_per_key_and_carries_the_rest() {
         let l = RefusalLimiter::default();
         let k = |org: &str, s: &str, c: &str, op: &str, r: &str, at| refusal(org, s, c, op, r, at);
-        let amy = |at| k("acme", "amy", "api_token:t1", "secret.put", "outside_token_scope", at);
+        let amy = |at| {
+            k(
+                "acme",
+                "amy",
+                "api_token:t1",
+                "secret.put",
+                "outside_token_scope",
+                at,
+            )
+        };
         for _ in 0..REFUSALS_PER_WINDOW {
             assert_eq!(admit_one(&l, amy(0)), Some(0));
         }
@@ -984,10 +1007,25 @@ mod tests {
         assert_eq!(admit_one(&l, amy(REFUSAL_WINDOW_MS - 1)), None);
         // Another reason, operation, caller, subject or Org has its own budget.
         let t = "api_token:t1";
-        assert_eq!(admit_one(&l, k("acme", "amy", t, "secret.put", "plugin", 2)), Some(0));
-        assert_eq!(admit_one(&l, k("acme", "amy", t, "secret.delete", "x", 2)), Some(0));
-        assert_eq!(admit_one(&l, k("acme", "amy", "session:cookie", "secret.put", "x", 2)), Some(0));
-        assert_eq!(admit_one(&l, k("acme", "bob", t, "secret.put", "outside_token_scope", 2)), Some(0));
+        assert_eq!(
+            admit_one(&l, k("acme", "amy", t, "secret.put", "plugin", 2)),
+            Some(0)
+        );
+        assert_eq!(
+            admit_one(&l, k("acme", "amy", t, "secret.delete", "x", 2)),
+            Some(0)
+        );
+        assert_eq!(
+            admit_one(&l, k("acme", "amy", "session:cookie", "secret.put", "x", 2)),
+            Some(0)
+        );
+        assert_eq!(
+            admit_one(
+                &l,
+                k("acme", "bob", t, "secret.put", "outside_token_scope", 2)
+            ),
+            Some(0)
+        );
         // The next window: the first recorded carries the two dropped.
         assert_eq!(admit_one(&l, amy(REFUSAL_WINDOW_MS)), Some(2));
         assert_eq!(admit_one(&l, amy(REFUSAL_WINDOW_MS)), Some(0));
@@ -998,7 +1036,8 @@ mod tests {
     #[test]
     fn the_refusal_limiter_keys_by_org() {
         let l = RefusalLimiter::default();
-        let r = |org: &str, at| refusal(org, "amy", "session:cookie", "secret.put", "no_window", at);
+        let r =
+            |org: &str, at| refusal(org, "amy", "session:cookie", "secret.put", "no_window", at);
         for _ in 0..REFUSALS_PER_WINDOW + 3 {
             l.admit(r("acme", 0));
         }
@@ -1016,7 +1055,8 @@ mod tests {
     #[test]
     fn a_closed_windows_suppressed_count_is_flushed_without_its_key_returning() {
         let l = RefusalLimiter::default();
-        let r = |org: &str, op: &str, at| refusal(org, "amy", "session:cookie", op, "no_window", at);
+        let r =
+            |org: &str, op: &str, at| refusal(org, "amy", "session:cookie", op, "no_window", at);
         for i in 0..REFUSALS_PER_WINDOW + 4 {
             l.admit(r("acme", "secret.put", i as i64));
         }
@@ -1024,13 +1064,20 @@ mod tests {
         assert_eq!(l.admit(r("beta", "binding.put", 10)).len(), 1);
         let out = l.admit(r("beta", "binding.put", REFUSAL_WINDOW_MS + 10));
         assert_eq!(out.len(), 2, "{out:?}");
-        let flushed = out.iter().find(|e| e.org.as_deref() == Some("acme")).unwrap();
+        let flushed = out
+            .iter()
+            .find(|e| e.org.as_deref() == Some("acme"))
+            .unwrap();
         assert_eq!(flushed.op.as_deref(), Some("secret.put"));
         // The newest suppressed refusal, carrying the other three.
         assert_eq!(flushed.at, (REFUSALS_PER_WINDOW + 3) as i64);
         assert_eq!(flushed.detail["suppressed_before"], 3);
         // Flushed once.
-        assert_eq!(l.admit(r("beta", "binding.put", 2 * REFUSAL_WINDOW_MS + 20)).len(), 1);
+        assert_eq!(
+            l.admit(r("beta", "binding.put", 2 * REFUSAL_WINDOW_MS + 20))
+                .len(),
+            1
+        );
     }
 
     /// Review F9/S3: with every key live, a new key's refusal is recorded
@@ -1039,7 +1086,14 @@ mod tests {
     fn a_full_refusal_limiter_records_rather_than_drops() {
         let l = RefusalLimiter::default();
         for i in 0..MAX_REFUSAL_KEYS {
-            l.admit(refusal("acme", &format!("s{i}"), "session:cookie", "secret.put", "x", 0));
+            l.admit(refusal(
+                "acme",
+                &format!("s{i}"),
+                "session:cookie",
+                "secret.put",
+                "x",
+                0,
+            ));
         }
         let fresh = || refusal("acme", "newcomer", "session:cookie", "secret.put", "x", 1);
         assert_eq!(admit_one(&l, fresh()), Some(0));
@@ -1047,7 +1101,14 @@ mod tests {
         // Once the old windows close they are pruned and the newcomer is
         // coalesced again.
         for _ in 0..REFUSALS_PER_WINDOW {
-            l.admit(refusal("acme", "newcomer", "session:cookie", "secret.put", "x", REFUSAL_WINDOW_MS));
+            l.admit(refusal(
+                "acme",
+                "newcomer",
+                "session:cookie",
+                "secret.put",
+                "x",
+                REFUSAL_WINDOW_MS,
+            ));
         }
         assert!(l.admit(fresh_at(REFUSAL_WINDOW_MS)).is_empty());
 

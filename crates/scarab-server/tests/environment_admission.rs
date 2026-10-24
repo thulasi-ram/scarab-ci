@@ -291,7 +291,12 @@ async fn a_pipeline_that_cannot_run_is_refused_alone_and_the_rest_still_run() {
         .iter()
         .map(|r| r.pipeline.as_str())
         .collect();
-    assert_eq!(pipelines, [".scarab/a-deploy.yaml"], "{:?}", outcome.refused);
+    assert_eq!(
+        pipelines,
+        [".scarab/a-deploy.yaml"],
+        "{:?}",
+        outcome.refused
+    );
     assert_eq!(outcome.refused[0].environment, "prod");
     assert!(
         outcome.refused[0].reason.contains("inputs.app"),
