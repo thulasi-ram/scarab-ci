@@ -61,6 +61,29 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     ("DELETE", "/v1/me/passkeys/{id}", "passkey.remove", "CJ-A"),
     ("POST", "/v1/me/step-up/options", "step_up.options", "CER"),
     ("POST", "/v1/me/step-up", "step_up.confirm", "CER"),
+    ("GET", "/v1/me/security/events", "read", "READ"),
+    ("GET", "/v1/security/events", "read", "READ"),
+    ("GET", "/v1/orgs/{org}/security/events", "read", "READ"),
+    ("GET", "/v1/orgs/{org}/security/summary", "read", "READ"),
+    (
+        "POST",
+        "/v1/orgs/{org}/members/{subject}/passkeys/reset",
+        "passkey.reset",
+        "CJ-A",
+    ),
+    ("GET", "/v1/step-up/requests/{id}", "read", "READ"),
+    (
+        "POST",
+        "/v1/step-up/requests/{id}/options",
+        "step_up.request_options",
+        "CER",
+    ),
+    (
+        "POST",
+        "/v1/step-up/requests/{id}/confirm",
+        "step_up.request_confirm",
+        "CER",
+    ),
     ("GET", "/v1/orgs/{org}/bindings", "read", "READ"),
     ("PUT", "/v1/orgs/{org}/bindings", "binding.put", "CJ-W"),
     (
@@ -482,6 +505,43 @@ fn the_route_table_is_exactly_the_reviewed_classification() {
     }
 }
 
+/// ADR-0073 C5: the CredentialBroker is a separate listener (PluginPrincipal,
+/// ADR-0072 §11) that never passes through the step-up guard — no broker
+/// path is in the main table, so the plugin paths stay exactly as they were.
+#[test]
+fn no_broker_path_is_in_the_main_route_table() {
+    let prefix = scarab_server::broker::BROKER_PREFIX;
+    let leaked: Vec<_> = route_table()
+        .iter()
+        .filter(|r| r.path.starts_with(prefix) || r.path.starts_with("/_scarab"))
+        .map(|r| format!("{} {}", r.method, r.path))
+        .collect();
+    assert!(leaked.is_empty(), "broker paths in the main router: {leaked:?}");
+}
+
+/// ADR-0073 C8: the operator break-glass has no route. The only passkey
+/// reset reachable over HTTP is the Owner's, an always-ask crown jewel.
+#[test]
+fn the_break_glass_is_not_reachable_over_http() {
+    let resets: Vec<_> = route_table()
+        .iter()
+        .filter(|r| r.op.id.contains("reset") || r.path.contains("reset"))
+        .map(|r| (r.method.as_str().to_string(), r.path, r.op.id, r.op.class.code()))
+        .collect();
+    assert_eq!(
+        resets,
+        vec![(
+            "POST".to_string(),
+            "/v1/orgs/{org}/members/{subject}/passkeys/reset",
+            "passkey.reset",
+            "CJ-A"
+        )]
+    );
+    assert!(route_table()
+        .iter()
+        .all(|r| !r.op.id.contains("break_glass") && !r.path.contains("admin")));
+}
+
 /// (b) No route is registered anywhere but `src/routes.rs` (the broker and
 /// the workspace service are separate listeners with their own routers and
 /// never pass through the guard).
@@ -702,7 +762,9 @@ fn well_formed(r: &scarab_server::RouteEntry) -> (String, Option<Value>) {
             Some(json!({"kind": "github", "base_url": "https://github.com", "credential": "c"}))
         }
         ("POST", "/v1/connections/{id}/repos") => Some(json!({"owner": "acme", "name": "web"})),
-        ("DELETE", _) | ("POST", "/v1/orgs/{org}/plugins/{name}/enable") => None,
+        ("DELETE", _)
+        | ("POST", "/v1/orgs/{org}/plugins/{name}/enable")
+        | ("POST", "/v1/orgs/{org}/members/{subject}/passkeys/reset") => None,
         (m, p) => panic!("add a well-formed request for the crown jewel {m} {p}"),
     };
     (uri, body)

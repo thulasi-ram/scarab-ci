@@ -155,6 +155,37 @@ pub(crate) fn governed_routes() -> Routes {
             &ops::STEP_UP_CONFIRM,
             ceremony::step_up_confirm,
         )
+        // ADR-0073 §6-§8: the OrgSecurityEventLog, StepUpConfirmationRequests,
+        // and an Owner's passkey reset. (The operator break-glass has no route.)
+        .get(
+            "/v1/me/security/events",
+            step_up::events::my_security_events,
+        )
+        .get("/v1/security/events", step_up::events::security_events)
+        .get(
+            "/v1/orgs/{org}/security/events",
+            step_up::events::org_security_events,
+        )
+        .get(
+            "/v1/orgs/{org}/security/summary",
+            step_up::events::org_security_summary,
+        )
+        .post(
+            "/v1/orgs/{org}/members/{subject}/passkeys/reset",
+            &ops::PASSKEY_RESET,
+            step_up::admin::reset_member_passkeys,
+        )
+        .get("/v1/step-up/requests/{id}", step_up::requests::get_request)
+        .post(
+            "/v1/step-up/requests/{id}/options",
+            &ops::STEP_UP_REQUEST_OPTIONS,
+            step_up::requests::request_options,
+        )
+        .post(
+            "/v1/step-up/requests/{id}/confirm",
+            &ops::STEP_UP_REQUEST_CONFIRM,
+            step_up::requests::confirm_request,
+        )
         .get("/v1/orgs/{org}/bindings", list_bindings)
         .put("/v1/orgs/{org}/bindings", &ops::BINDING_PUT, put_binding)
         .delete(

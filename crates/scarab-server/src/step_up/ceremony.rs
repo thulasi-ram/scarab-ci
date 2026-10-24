@@ -130,7 +130,11 @@ pub struct StepUpConfirmResponse {
     pub expires_at: i64,
 }
 
-fn ceremony(status: StatusCode, code: &'static str, message: impl Into<String>) -> ApiError {
+pub(crate) fn ceremony(
+    status: StatusCode,
+    code: &'static str,
+    message: impl Into<String>,
+) -> ApiError {
     ApiError::Ceremony {
         status,
         code,
@@ -138,11 +142,11 @@ fn ceremony(status: StatusCode, code: &'static str, message: impl Into<String>) 
     }
 }
 
-fn webauthn_refused(e: WebauthnError) -> ApiError {
+pub(crate) fn webauthn_refused(e: WebauthnError) -> ApiError {
     ceremony(StatusCode::BAD_REQUEST, e.code(), e.to_string())
 }
 
-fn challenge_invalid() -> ApiError {
+pub(crate) fn challenge_invalid() -> ApiError {
     ceremony(
         StatusCode::BAD_REQUEST,
         "challenge_invalid",
@@ -150,14 +154,14 @@ fn challenge_invalid() -> ApiError {
     )
 }
 
-fn service(st: &AppState) -> Result<std::sync::Arc<StepUpService>, ApiError> {
+pub(crate) fn service(st: &AppState) -> Result<std::sync::Arc<StepUpService>, ApiError> {
     st.step_up.service().cloned().ok_or(ApiError::NotFound)
 }
 
 /// The caller, who must be a human in a browser: a cookie session, never a
 /// token or a session presented as Bearer. Passkeys are browser-only
 /// (ADR-0073 §8).
-async fn browser_session(
+pub(crate) async fn browser_session(
     st: &AppState,
     headers: &HeaderMap,
     action: Action,
@@ -175,7 +179,7 @@ async fn browser_session(
 }
 
 /// Consume `id` in this session, for this principal and one of `purposes`.
-async fn consume(
+pub(crate) async fn consume(
     svc: &StepUpService,
     id: &str,
     caller: &Caller,
@@ -297,6 +301,7 @@ pub(crate) async fn passkey_registration_options(
             subject,
             &facts.id_hash,
             ChallengePurpose::Register,
+            None,
             None,
             Some(label),
             None,
@@ -431,6 +436,7 @@ pub(crate) async fn passkey_registration(
 )]
 pub(crate) async fn remove_passkey(
     State(st): State<AppState>,
+    ctx: Option<Extension<GuardCtx>>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
@@ -455,6 +461,9 @@ pub(crate) async fn remove_passkey(
     );
     ev.passkey_id = Some(id);
     ev.session_hash = caller.session.as_ref().map(|s| s.id_hash.clone());
+    // Linked to the always-ask confirmation (or, replayed, the request)
+    // that authorised it.
+    ev.confirmation_id = ctx.and_then(|Extension(c)| c.confirmation_id());
     svc.record(ev).await;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -492,6 +501,7 @@ pub(crate) async fn step_up_options(
             subject,
             &facts.id_hash,
             ChallengePurpose::Window,
+            None,
             None,
             None,
             None,
@@ -536,97 +546,7 @@ pub(crate) async fn step_up_confirm(
         now,
     )
     .await?;
-    let resp: AuthenticationResponseJson = serde_json::from_value(req.credential)
-        .map_err(|_| webauthn_refused(WebauthnError::MalformedResponse))?;
-    let raw_id = URL_SAFE_NO_PAD
-        .decode(resp.raw_id.as_bytes())
-        .map_err(|_| webauthn_refused(WebauthnError::MalformedResponse))?;
-    let unknown = || {
-        ceremony(
-            StatusCode::BAD_REQUEST,
-            "unknown_credential",
-            "that passkey is not one of yours",
-        )
-    };
-    let passkey = svc
-        .passkeys
-        .get_by_credential(&raw_id)
-        .await
-        .map_err(store_err)?
-        .filter(|p| p.principal == subject)
-        .ok_or_else(unknown)?;
-    let clone_refused = || {
-        ceremony(
-            StatusCode::FORBIDDEN,
-            "clone_suspected",
-            "this passkey's signature counter went backwards, so it may have been cloned; it \
-             is refused from now on — use another passkey or ask an Owner to reset yours",
-        )
-    };
-    if passkey.clone_suspected_at.is_some() {
-        return Err(clone_refused());
-    }
-    let alg = CoseAlgorithm::from_id(i64::from(passkey.alg))
-        .ok_or_else(|| webauthn_refused(WebauthnError::StoredCredentialInconsistent))?;
-    let handle = svc
-        .passkeys
-        .user_handle(&subject, random_bytes())
-        .await
-        .map_err(store_err)?;
-    let stored = StoredCredential {
-        credential_id: passkey.credential_id.clone(),
-        public_key_cose: passkey.public_key_cose.clone(),
-        alg,
-        sign_count: passkey.sign_count,
-        backup_eligible: passkey.backup_eligible,
-    };
-    let clone_event = |detail: serde_json::Value| {
-        let mut ev = event(
-            kind::PASSKEY_CLONE_SUSPECTED,
-            &subject,
-            caller.event_label(),
-            None,
-            now,
-        );
-        ev.passkey_id = Some(passkey.id.clone());
-        ev.session_hash = Some(facts.id_hash.clone());
-        ev.detail = detail;
-        ev
-    };
-    let ok = match scarab_webauthn::verify_assertion(svc.rp(), &sent, &stored, &handle, &resp) {
-        Ok(ok) => ok,
-        Err(WebauthnError::CloneSuspected) => {
-            svc.passkeys
-                .mark_clone(&passkey.id, now)
-                .await
-                .map_err(store_err)?;
-            svc.record(clone_event(serde_json::json!({
-                "stored_count": passkey.sign_count,
-            })))
-            .await;
-            return Err(clone_refused());
-        }
-        Err(e) => return Err(webauthn_refused(e)),
-    };
-    // The counter is accepted with a compare-and-swap: two racing
-    // assertions cannot both pass, and the loser is flagged.
-    match svc
-        .passkeys
-        .record_use(&passkey.id, ok.new_count, ok.backup_state, now)
-        .await
-        .map_err(store_err)?
-    {
-        PasskeyUse::Recorded => {}
-        PasskeyUse::CloneSuspected => {
-            svc.record(clone_event(serde_json::json!({
-                "stored_count": passkey.sign_count,
-                "presented_count": ok.new_count,
-            })))
-            .await;
-            return Err(clone_refused());
-        }
-        PasskeyUse::NotFound => return Err(unknown()),
-    }
+    let passkey = verify_assertion(&svc, &caller, &facts, &sent, req.credential, now).await?;
     let kind_ = match row.purpose {
         ChallengePurpose::Action => ConfirmationKind::Action,
         _ => ConfirmationKind::Window,
@@ -684,6 +604,114 @@ pub(crate) async fn step_up_confirm(
         confirmed_at: now,
         expires_at: confirmation.expires_at,
     }))
+}
+
+/// Verify `credential` as an assertion over `sent` by one of the caller's
+/// OWN passkeys, and accept its signature counter with a compare-and-swap.
+/// A counter that does not move forward flags the passkey (and records
+/// `passkey.clone_suspected`); a flagged passkey is refused for good.
+/// Returns the passkey that signed.
+pub(crate) async fn verify_assertion(
+    svc: &StepUpService,
+    caller: &Caller,
+    facts: &SessionFacts,
+    sent: &[u8; 32],
+    credential: serde_json::Value,
+    now: i64,
+) -> Result<Passkey, ApiError> {
+    let subject = caller.principal.subject.clone();
+    let resp: AuthenticationResponseJson = serde_json::from_value(credential)
+        .map_err(|_| webauthn_refused(WebauthnError::MalformedResponse))?;
+    let raw_id = URL_SAFE_NO_PAD
+        .decode(resp.raw_id.as_bytes())
+        .map_err(|_| webauthn_refused(WebauthnError::MalformedResponse))?;
+    let unknown = || {
+        ceremony(
+            StatusCode::BAD_REQUEST,
+            "unknown_credential",
+            "that passkey is not one of yours",
+        )
+    };
+    let passkey = svc
+        .passkeys
+        .get_by_credential(&raw_id)
+        .await
+        .map_err(store_err)?
+        .filter(|p| p.principal == subject)
+        .ok_or_else(unknown)?;
+    let clone_refused = || {
+        ceremony(
+            StatusCode::FORBIDDEN,
+            "clone_suspected",
+            "this passkey's signature counter went backwards, so it may have been cloned; it \
+             is refused from now on — use another passkey or ask an Owner to reset yours",
+        )
+    };
+    if passkey.clone_suspected_at.is_some() {
+        return Err(clone_refused());
+    }
+    let alg = CoseAlgorithm::from_id(i64::from(passkey.alg))
+        .ok_or_else(|| webauthn_refused(WebauthnError::StoredCredentialInconsistent))?;
+    let handle = svc
+        .passkeys
+        .user_handle(&subject, random_bytes())
+        .await
+        .map_err(store_err)?;
+    let stored = StoredCredential {
+        credential_id: passkey.credential_id.clone(),
+        public_key_cose: passkey.public_key_cose.clone(),
+        alg,
+        sign_count: passkey.sign_count,
+        backup_eligible: passkey.backup_eligible,
+    };
+    let clone_event = |detail: serde_json::Value| {
+        let mut ev = event(
+            kind::PASSKEY_CLONE_SUSPECTED,
+            &subject,
+            caller.event_label(),
+            None,
+            now,
+        );
+        ev.passkey_id = Some(passkey.id.clone());
+        ev.session_hash = Some(facts.id_hash.clone());
+        ev.detail = detail;
+        ev
+    };
+    let ok = match scarab_webauthn::verify_assertion(svc.rp(), sent, &stored, &handle, &resp) {
+        Ok(ok) => ok,
+        Err(WebauthnError::CloneSuspected) => {
+            svc.passkeys
+                .mark_clone(&passkey.id, now)
+                .await
+                .map_err(store_err)?;
+            svc.record(clone_event(serde_json::json!({
+                "stored_count": passkey.sign_count,
+            })))
+            .await;
+            return Err(clone_refused());
+        }
+        Err(e) => return Err(webauthn_refused(e)),
+    };
+    // The counter is accepted with a compare-and-swap: two racing
+    // assertions cannot both pass, and the loser is flagged.
+    match svc
+        .passkeys
+        .record_use(&passkey.id, ok.new_count, ok.backup_state, now)
+        .await
+        .map_err(store_err)?
+    {
+        PasskeyUse::Recorded => {}
+        PasskeyUse::CloneSuspected => {
+            svc.record(clone_event(serde_json::json!({
+                "stored_count": passkey.sign_count,
+                "presented_count": ok.new_count,
+            })))
+            .await;
+            return Err(clone_refused());
+        }
+        PasskeyUse::NotFound => return Err(unknown()),
+    }
+    Ok(passkey)
 }
 
 impl IntoResponse for super::StepUpRefusal {

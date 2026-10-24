@@ -110,6 +110,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // Operator break-glass (ADR-0073 §10): straight at the database, before
+    // the config gate — it needs nothing but the database URL, and it never
+    // migrates. There is no route for this, and no `scarab` CLI command.
+    if let Some(scarab_server::config::ServerCommand::Admin {
+        command: scarab_server::config::AdminCommand::ResetPasskeys { principal, reason },
+    }) = &cli.command
+    {
+        let Some(url) = cli.database_url.as_deref() else {
+            eprintln!(
+                "scarab-server admin reset-passkeys: set --database-url or SCARAB_DATABASE_URL"
+            );
+            std::process::exit(2);
+        };
+        let pg = PostgresDb::connect(url).await?;
+        let operator = scarab_server::step_up::admin::OperatorInfo::current();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or_default();
+        match scarab_server::step_up::admin::reset_passkeys(
+            &pg,
+            principal,
+            reason.as_deref(),
+            &operator,
+            now,
+        )
+        .await
+        {
+            Ok(done) => {
+                println!(
+                    "break-glass: removed {} passkey(s) of `{}` and revoked {} standing \
+                     step-up confirmation(s); recorded as passkey.break_glass_reset \
+                     (host {}, user {}). Their next passkey needs a fresh browser login.",
+                    done.removed,
+                    done.subject,
+                    done.windows_revoked,
+                    operator.host,
+                    operator.os_user
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("scarab-server admin reset-passkeys: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     // The startup gate: refuse to boot on invalid configuration, before any
     // socket binds or connection is made (ADR-0048).
     let config = match Config::resolve(&cli) {
@@ -394,6 +442,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }),
             // Plugin report receipts (ADR-0072 §11): a 7-day idempotency window.
             Some(pg.clone() as Arc<dyn scarab_plugin::PluginStore>),
+            // Step-up rows (ADR-0073): expired challenges and confirmations,
+            // settled requests after 30 days. Never the security event log.
+            Some((
+                pg.clone() as Arc<dyn scarab_identity::ChallengeStore>,
+                pg.clone() as Arc<dyn scarab_identity::StepUpStore>,
+            )),
             Duration::from_secs(300),
         );
         tracing::info!(
