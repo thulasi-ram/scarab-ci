@@ -174,6 +174,10 @@ pub(crate) async fn browser_session(
 ) -> Result<(Caller, SessionFacts), ApiError> {
     let caller = authenticate(st, headers, action).await?;
     if !caller.is_browser_session() {
+        if let Some(svc) = st.step_up.service() {
+            let now = st.clock.now().await.0;
+            record_ceremony_refusal(svc, &caller, "browser_session_required", None, now).await;
+        }
         return Err(ceremony(
             StatusCode::FORBIDDEN,
             "browser_session_required",
@@ -182,6 +186,33 @@ pub(crate) async fn browser_session(
     }
     let facts = caller.session.clone().expect("a browser session has facts");
     Ok((caller, facts))
+}
+
+/// Record a refusal at the ceremony level (git-bug 69e06b5) — a caller
+/// that is not a browser session, an assertion that failed verification, a
+/// request that is not the caller's — as a best-effort, rate-limited
+/// `step_up.refused` (mode `ceremony`). Org-less: it is the caller's own
+/// event. `reason` must never tell a prober more than the response did.
+pub(crate) async fn record_ceremony_refusal(
+    svc: &StepUpService,
+    caller: &Caller,
+    reason: &str,
+    request_id: Option<&str>,
+    now: i64,
+) {
+    let mut ev = event(
+        kind::STEP_UP_REFUSED,
+        &caller.principal.subject,
+        caller.event_label(),
+        None,
+        now,
+    );
+    ev.session_hash = caller.session.as_ref().map(|s| s.id_hash.clone());
+    if let Some(id) = request_id {
+        ev.request_id = Some(id.to_string());
+    }
+    ev.detail = serde_json::json!({ "mode": "ceremony", "reason": reason });
+    svc.record_refusal(ev).await;
 }
 
 /// Consume `id` in this session, for this principal and one of `purposes`.
@@ -680,6 +711,26 @@ pub(crate) async fn step_up_confirm(
 /// `passkey.clone_suspected`); a flagged passkey is refused for good.
 /// Returns the passkey that signed.
 pub(crate) async fn verify_assertion(
+    svc: &StepUpService,
+    caller: &Caller,
+    facts: &SessionFacts,
+    sent: &[u8; 32],
+    credential: serde_json::Value,
+    now: i64,
+) -> Result<Passkey, ApiError> {
+    let verified = verify_assertion_once(svc, caller, facts, sent, credential, now).await;
+    // A failed assertion is a refusal too (git-bug 69e06b5). A suspected
+    // clone already records `passkey.clone_suspected`; a store failure is
+    // not the caller's doing.
+    if let Err(ApiError::Ceremony { code, .. }) = &verified {
+        if *code != "clone_suspected" {
+            record_ceremony_refusal(svc, caller, code, None, now).await;
+        }
+    }
+    verified
+}
+
+async fn verify_assertion_once(
     svc: &StepUpService,
     caller: &Caller,
     facts: &SessionFacts,

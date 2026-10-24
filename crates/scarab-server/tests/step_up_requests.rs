@@ -789,6 +789,78 @@ async fn refusals_are_rate_limited_and_coalesced() {
     assert_eq!(h.events("step_up.refused").await.len(), 7);
 }
 
+/// git-bug 69e06b5: ceremony-level refusals are recorded (best-effort,
+/// rate-limited): a token at a browser-only ceremony, an assertion that
+/// fails verification, and another admin probing a request — with one
+/// reason whether or not the request exists, so the prober's own log is no
+/// existence oracle.
+#[tokio::test]
+async fn ceremony_refusals_are_recorded() {
+    let (h, _) = world(Backend::Memory).await;
+    let reasons = |events: Vec<scarab_identity::SecurityEvent>, subject: &str| -> Vec<String> {
+        events
+            .into_iter()
+            .filter(|e| e.subject == subject && e.detail["mode"] == "ceremony")
+            .map(|e| e.detail["reason"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let token = pat(&h, "t1", Scope::Org("acme".into()), Role::Admin).await;
+    let (st, b) = h
+        .bearer("POST", "/v1/me/step-up/options", None, &token)
+        .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{b}");
+    assert_eq!(
+        reasons(h.events("step_up.refused").await, "amy"),
+        vec!["browser_session_required"]
+    );
+
+    // An assertion made for another origin fails verification.
+    let (amy, mut soft) = amy_in_browser(&h).await;
+    let (st, ch) = h.cookie("POST", "/v1/me/step-up/options", None, &amy).await;
+    assert_eq!(st, StatusCode::OK, "{ch}");
+    let cred = soft
+        .assert(&ch["public_key"], "https://evil.example")
+        .unwrap();
+    let (st, b) = h
+        .cookie(
+            "POST",
+            "/v1/me/step-up",
+            Some(json!({ "challenge_id": ch["id"], "credential": cred })),
+            &amy,
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+    let code = b["code"].as_str().unwrap().to_string();
+    assert_eq!(
+        reasons(h.events("step_up.refused").await, "amy"),
+        vec!["browser_session_required".to_string(), code]
+    );
+
+    // Another Owner probes amy's request, and a request that never was.
+    let id = raise(&h, &token, "v").await;
+    h.grant("bob", Scope::Org("acme".into()), Role::Owner).await;
+    let bob = h.browser_session(scoped("bob")).await;
+    for probe in [id.as_str(), "no-such-request"] {
+        let (st, _) = h
+            .cookie("GET", &format!("/v1/step-up/requests/{probe}"), None, &bob)
+            .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+    let (st, _) = options(&h, &bob, &id).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let probes: Vec<_> = h
+        .events("step_up.refused")
+        .await
+        .into_iter()
+        .filter(|e| e.subject == "bob")
+        .collect();
+    assert_eq!(probes.len(), 3);
+    assert!(probes.iter().all(|e| e.detail
+        == json!({"mode": "ceremony", "reason": "request_not_found"})
+        && e.org.is_none()));
+}
+
 /// A machine caller never raises a request it could never execute
 /// (git-bug ff7a014): the identity-link flows are browser-only (from a token
 /// AND from a Bearer session), a token may not mint tokens, and a token

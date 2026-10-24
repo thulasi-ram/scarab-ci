@@ -587,16 +587,20 @@ async fn load_as_human(
     id: &str,
     caller: &Caller,
 ) -> Result<StepUpRequest, ApiError> {
-    let r = svc
-        .confirmations
-        .get_request(id)
-        .await
-        .map_err(store_err)?
-        .ok_or(ApiError::NotFound)?;
-    if !is_for_human(st, &caller.principal.subject, &r.for_human).await {
-        return Err(ApiError::NotFound);
+    let found = svc.confirmations.get_request(id).await.map_err(store_err)?;
+    match found {
+        Some(r) if is_for_human(st, &caller.principal.subject, &r.for_human).await => Ok(r),
+        _ => Err(probe_refused(st, svc, id, caller).await),
     }
-    Ok(r)
+}
+
+/// The 404 for a request that does not exist or is not the caller's —
+/// recorded (git-bug 69e06b5; ADR-0073 §6's confused deputy) as one reason
+/// for both, so the caller's own event log is no oracle for existence.
+async fn probe_refused(st: &AppState, svc: &StepUpService, id: &str, caller: &Caller) -> ApiError {
+    let now = st.clock.now().await.0;
+    super::ceremony::record_ceremony_refusal(svc, caller, "request_not_found", Some(id), now).await;
+    ApiError::NotFound
 }
 
 /// 410 once expired, 409 once confirmed.
@@ -637,17 +641,19 @@ pub(crate) async fn get_request(
 ) -> Result<Json<StepUpRequestDto>, ApiError> {
     let svc = service(&st)?;
     let caller = authenticate(&st, &headers, Action::Read).await?;
-    let r = svc
+    let Some(r) = svc
         .confirmations
         .get_request(&id)
         .await
         .map_err(store_err)?
-        .ok_or(ApiError::NotFound)?;
+    else {
+        return Err(probe_refused(&st, &svc, &id, &caller).await);
+    };
     let is_human = caller.is_browser_session()
         && is_for_human(&st, &caller.principal.subject, &r.for_human).await;
     let is_requester = requester_of(&caller).is_some_and(|me| me == r.requester);
     if !(is_human || is_requester) {
-        return Err(ApiError::NotFound);
+        return Err(probe_refused(&st, &svc, &id, &caller).await);
     }
     let now = st.clock.now().await.0;
     Ok(Json(StepUpRequestDto::new(&r, now)))
