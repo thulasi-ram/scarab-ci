@@ -216,6 +216,8 @@ async fn link_merges_a_claimed_single_identity_principal_with_its_tokens() {
             },
             expires_at: 10_000,
             csrf: String::new(),
+            created_at: 0,
+            login_kind: String::new(),
         },
     )
     .await

@@ -38,6 +38,9 @@ mod org_environments;
 /// `PluginStore` (ADR-0072): PluginInstallations, the kill switch, and report
 /// ingest into the Deployment record.
 mod plugins;
+/// Step-up confirmation (ADR-0073): `PasskeyStore`, `ChallengeStore`,
+/// `StepUpStore` and the append-only `SecurityEventLog`.
+mod step_up;
 
 /// The embedded, ordered set of forward-only migrations. `MIGRATOR.run(pool)`
 /// applies all pending ones (tracked in `_sqlx_migrations`); tests can also walk
@@ -3543,17 +3546,21 @@ impl scarab_identity::SessionStore for PostgresDb {
         let principal = serde_json::to_value(&session.principal)
             .map_err(|e| scarab_identity::IdentityError::Issuance(e.to_string()))?;
         sqlx::query(
-            "INSERT INTO sessions (id, principal, csrf, expires_at)
-             VALUES ($1, $2, $3, $4)
+            "INSERT INTO sessions (id, principal, csrf, expires_at, created_at, login_kind)
+             VALUES ($1, $2, $3, $4, $5, $6)
              ON CONFLICT (id) DO UPDATE SET
                  principal = EXCLUDED.principal,
                  csrf = EXCLUDED.csrf,
-                 expires_at = EXCLUDED.expires_at",
+                 expires_at = EXCLUDED.expires_at,
+                 created_at = EXCLUDED.created_at,
+                 login_kind = EXCLUDED.login_kind",
         )
         .bind(&session.id)
         .bind(&principal)
         .bind(&session.csrf)
         .bind(session.expires_at)
+        .bind(session.created_at)
+        .bind(&session.login_kind)
         .execute(self.pool())
         .await
         .map_err(|e| scarab_identity::IdentityError::Issuance(e.to_string()))?;
@@ -3564,8 +3571,10 @@ impl scarab_identity::SessionStore for PostgresDb {
         &self,
         id: &str,
     ) -> Result<Option<scarab_identity::Session>, scarab_identity::IdentityError> {
-        let row = sqlx::query("SELECT principal, csrf, expires_at FROM sessions WHERE id = $1")
-            .bind(id)
+        let row = sqlx::query(
+            "SELECT principal, csrf, expires_at, created_at, login_kind FROM sessions WHERE id = $1",
+        )
+        .bind(id)
             .fetch_optional(self.pool())
             .await
             .map_err(|e| scarab_identity::IdentityError::Issuance(e.to_string()))?;
@@ -3578,6 +3587,8 @@ impl scarab_identity::SessionStore for PostgresDb {
             principal,
             csrf: row.get::<String, _>("csrf"),
             expires_at: row.get::<i64, _>("expires_at"),
+            created_at: row.get::<i64, _>("created_at"),
+            login_kind: row.get::<String, _>("login_kind"),
         }))
     }
 
@@ -3603,7 +3614,7 @@ fn scope_cols(scope: &scarab_identity::Scope) -> (&str, &str) {
     }
 }
 
-fn role_str(role: scarab_identity::Role) -> &'static str {
+pub(crate) fn role_str(role: scarab_identity::Role) -> &'static str {
     match role {
         scarab_identity::Role::Viewer => "viewer",
         scarab_identity::Role::Member => "member",
@@ -3612,7 +3623,7 @@ fn role_str(role: scarab_identity::Role) -> &'static str {
     }
 }
 
-fn role_from_str(s: &str) -> Option<scarab_identity::Role> {
+pub(crate) fn role_from_str(s: &str) -> Option<scarab_identity::Role> {
     Some(match s {
         "viewer" => scarab_identity::Role::Viewer,
         "member" => scarab_identity::Role::Member,
@@ -3622,7 +3633,7 @@ fn role_from_str(s: &str) -> Option<scarab_identity::Role> {
     })
 }
 
-fn identity_err(e: sqlx::Error) -> scarab_identity::IdentityError {
+pub(crate) fn identity_err(e: sqlx::Error) -> scarab_identity::IdentityError {
     scarab_identity::IdentityError::Issuance(e.to_string())
 }
 
@@ -3720,6 +3731,25 @@ impl scarab_identity::RbacStore for PostgresDb {
             .max())
     }
 
+    async fn max_role(
+        &self,
+        subject: &str,
+    ) -> Result<Option<scarab_identity::Role>, scarab_identity::IdentityError> {
+        // Every scope, tombstones excluded. The max is taken here, on the
+        // typed role, not in SQL: the column is text and its order is not
+        // the role order. An unreadable role grants nothing.
+        let rows =
+            sqlx::query("SELECT role FROM rbac_bindings WHERE subject = $1 AND role IS NOT NULL")
+                .bind(subject)
+                .fetch_all(self.pool())
+                .await
+                .map_err(identity_err)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| role_from_str(&r.get::<String, _>("role")))
+            .max())
+    }
+
     async fn bindings(
         &self,
         org: &str,
@@ -3753,6 +3783,18 @@ impl scarab_identity::RbacStore for PostgresDb {
                 })
             })
             .collect())
+    }
+
+    async fn orgs_of(&self, subject: &str) -> Result<Vec<String>, scarab_identity::IdentityError> {
+        // Tombstones (role NULL) are no membership.
+        sqlx::query_scalar(
+            "SELECT DISTINCT org FROM rbac_bindings
+             WHERE subject = $1 AND role IS NOT NULL ORDER BY org",
+        )
+        .bind(subject)
+        .fetch_all(self.pool())
+        .await
+        .map_err(identity_err)
     }
 
     async fn import_seeds(
@@ -4451,6 +4493,20 @@ impl scarab_identity::ApiTokenStore for PostgresDb {
             "SELECT {API_TOKEN_COLS} FROM api_tokens WHERE token_hash = $1"
         ))
         .bind(hash)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(identity_err)?;
+        Ok(row.as_ref().and_then(api_token_from_row))
+    }
+
+    async fn by_id(
+        &self,
+        id: &str,
+    ) -> Result<Option<scarab_identity::ApiToken>, scarab_identity::IdentityError> {
+        let row = sqlx::query(&format!(
+            "SELECT {API_TOKEN_COLS} FROM api_tokens WHERE id = $1"
+        ))
+        .bind(id)
         .fetch_optional(self.pool())
         .await
         .map_err(identity_err)?;

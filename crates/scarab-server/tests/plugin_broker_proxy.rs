@@ -1075,3 +1075,56 @@ async fn a_binding_is_checked_before_anything_is_stored() {
     assert_eq!(body["insecure_http"], json!(false));
     h.finish().await;
 }
+
+/// ADR-0073 C5: with step-up ENFORCED on the state, the broker's read proxy
+/// is exactly as before — it is its own listener and a PluginPrincipal never
+/// meets the step-up guard. (The admin side — install, bind — is set up
+/// with it off; it is not under test here.)
+#[tokio::test]
+async fn under_enforced_step_up_the_read_proxy_is_unchanged() {
+    let stash: Arc<Mutex<Option<AppState>>> = Arc::default();
+    let keep = stash.clone();
+    let Some(h) = harness_with(move |st| {
+        *keep.lock().unwrap() = Some(st.clone());
+        st
+    })
+    .await
+    else {
+        return;
+    };
+    let on = stash.lock().unwrap().take().unwrap().with_step_up(
+        scarab_server::step_up::StepUpService::new(
+            Arc::new(scarab_testkit::InMemoryPasskeys::new()),
+            Arc::new(scarab_testkit::InMemoryChallenges::new()),
+            Arc::new(scarab_testkit::InMemoryStepUp::new()),
+            Arc::new(scarab_testkit::InMemorySecurityEvents::new()),
+            Arc::new(scarab_secrets_postgres::PostgresSecrets::with_keys(
+                // The production sealer; a lazy pool never connects.
+                sqlx::postgres::PgPoolOptions::new()
+                    .connect_lazy("postgres://unused@localhost/unused")
+                    .unwrap(),
+                scarab_secrets_postgres::MasterKeySet::new(vec![[7u8; 32]]).unwrap(),
+            )),
+            scarab_webauthn::RelyingParty::from_public_url("https://ci.example.com", "Scarab")
+                .unwrap(),
+        ),
+    );
+    assert!(on.step_up.is_enforced());
+    let enforced_broker = broker::router(on);
+
+    let (up, base) = spawn_upstream().await;
+    let (_, token) = install(&h).await;
+    assert_eq!(bind(&h, &base).await.0, StatusCode::OK);
+    let (status, _, body) =
+        send(&enforced_broker, plugin_get(&token, "/api/v1/applications")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, r#"{"items":[{"metadata":{"name":"web"}}]}"#);
+    let seen = up.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(
+        seen[0].headers.get("authorization").unwrap(),
+        &format!("Bearer {ARGO_TOKEN}"),
+        "the bound credential is injected, as without step-up"
+    );
+    h.finish().await;
+}

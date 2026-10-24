@@ -267,6 +267,57 @@ async fn migration_report_lines(
     Ok(report)
 }
 
+/// Lock and read an Environment's row inside `tx` — the lock every
+/// baseline and eligibility write takes — or [`OrgEnvironmentError::NotFound`].
+async fn lock_environment(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    org: &str,
+    environment: &str,
+) -> Result<sqlx::postgres::PgRow, OrgEnvironmentError> {
+    sqlx::query(&format!(
+        "SELECT {ORG_ENVIRONMENT_COLUMNS} FROM org_environments
+         WHERE org = $1 AND name = $2
+         FOR UPDATE"
+    ))
+    .bind(org)
+    .bind(environment)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(org_environment_store_err)?
+    .ok_or_else(|| not_found(org, environment))
+}
+
+/// Eligibility compared as a set: the store returns patterns sorted, a
+/// caller may hold them in any order.
+fn normalized_eligibility(e: &EnvironmentProjectEligibility) -> EnvironmentProjectEligibility {
+    match e {
+        EnvironmentProjectEligibility::AllProjects => EnvironmentProjectEligibility::AllProjects,
+        EnvironmentProjectEligibility::Projects(p) => {
+            let mut p = p.clone();
+            p.sort();
+            p.dedup();
+            EnvironmentProjectEligibility::Projects(p)
+        }
+    }
+}
+
+impl PostgresDb {
+    /// Why a conditional overlay or grant update matched nothing: the
+    /// Environment is gone, or the row is not what the caller expected.
+    async fn missed(&self, org: &str, environment: &str) -> OrgEnvironmentError {
+        match sqlx::query("SELECT 1 FROM org_environments WHERE org = $1 AND name = $2")
+            .bind(org)
+            .bind(environment)
+            .fetch_optional(self.pool())
+            .await
+        {
+            Ok(Some(_)) => OrgEnvironmentError::changed_concurrently(),
+            Ok(None) => not_found(org, environment),
+            Err(e) => org_environment_store_err(e),
+        }
+    }
+}
+
 #[async_trait]
 impl EnvironmentGovernanceStore for PostgresDb {
     async fn deploy_governance(
@@ -377,11 +428,12 @@ impl EnvironmentGovernanceStore for PostgresDb {
         Ok(governance)
     }
 
-    async fn put_environment_protection(
+    async fn put_environment_protection_expecting(
         &self,
         org: &str,
         environment: &str,
         protection: &EnvironmentProtectionRules,
+        expected: Option<&EnvironmentProtectionRules>,
         updated_by: &str,
         updated_at: i64,
     ) -> Result<OrgEnvironment, OrgEnvironmentError> {
@@ -391,6 +443,15 @@ impl EnvironmentGovernanceStore for PostgresDb {
             .begin()
             .await
             .map_err(org_environment_store_err)?;
+        if let Some(expected) = expected {
+            // ADR-0073 §3: re-read under the row lock the UPDATE below would
+            // take anyway, so nothing can change between this compare and
+            // the write.
+            let row = lock_environment(&mut tx, org, environment).await?;
+            if &protection_rules_from_row(&row, environment)? != expected {
+                return Err(OrgEnvironmentError::changed_concurrently());
+            }
+        }
         let row = sqlx::query(&format!(
             "UPDATE org_environments SET
                  approvers = $3, allowed_refs = $4, wait_timer_s = $5, require_reason = $6,
@@ -416,11 +477,12 @@ impl EnvironmentGovernanceStore for PostgresDb {
         Ok(stored)
     }
 
-    async fn put_environment_eligibility(
+    async fn put_environment_eligibility_expecting(
         &self,
         org: &str,
         environment: &str,
         eligibility: &EnvironmentProjectEligibility,
+        expected: Option<&EnvironmentProjectEligibility>,
         updated_by: &str,
         updated_at: i64,
     ) -> Result<OrgEnvironment, OrgEnvironmentError> {
@@ -434,6 +496,16 @@ impl EnvironmentGovernanceStore for PostgresDb {
             .begin()
             .await
             .map_err(org_environment_store_err)?;
+        if let Some(expected) = expected {
+            // ADR-0073 §3: the Environment row lock is the one every
+            // eligibility replace takes first, so the patterns read under it
+            // are the ones this write replaces.
+            let row = lock_environment(&mut tx, org, environment).await?;
+            let stored = stored_environment(&mut tx, &row, org, environment).await?;
+            if normalized_eligibility(&stored.eligibility) != normalized_eligibility(expected) {
+                return Err(OrgEnvironmentError::changed_concurrently());
+            }
+        }
         // The row update takes the Environment's lock first, so two
         // concurrent replaces serialize and the list ends up as one of them
         // wrote it.
@@ -474,13 +546,91 @@ impl EnvironmentGovernanceStore for PostgresDb {
         Ok(stored)
     }
 
-    async fn put_environment_project_overlay(
+    async fn put_environment_project_overlay_expecting(
         &self,
         overlay: &EnvironmentProjectOverlay,
+        expected: Option<Option<&EnvironmentProjectOverlay>>,
         updated_by: &str,
         updated_at: i64,
     ) -> Result<(), OrgEnvironmentError> {
         let (wait_timer_s, deployment_concurrency) = rule_columns(&overlay.rules)?;
+        match expected {
+            None => {}
+            // ADR-0073 §3. An absent row cannot be locked, so each expectation
+            // is ONE conditional statement instead: insert-if-absent, or
+            // update-if-unchanged. Either matches nothing when a concurrent
+            // write got there first.
+            Some(None) => {
+                let inserted = sqlx::query(
+                    "INSERT INTO environment_project_overlays
+                         (org, environment, project, approvers, allowed_refs, wait_timer_s,
+                          require_reason, deployment_concurrency, deployment_gate_deadline_ms,
+                          updated_at, updated_by)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                     ON CONFLICT (org, environment, project) DO NOTHING",
+                )
+                .bind(&overlay.org)
+                .bind(&overlay.environment)
+                .bind(&overlay.project)
+                .bind(&overlay.rules.approvers)
+                .bind(&overlay.rules.allowed_refs)
+                .bind(wait_timer_s)
+                .bind(overlay.rules.require_reason)
+                .bind(deployment_concurrency)
+                .bind(overlay.deployment_gate_deadline.map(|d| d.millis()))
+                .bind(updated_at)
+                .bind(updated_by)
+                .execute(self.pool())
+                .await
+                .map_err(|e| write_err(e, &overlay.org, &overlay.environment))?
+                .rows_affected();
+                return if inserted == 1 {
+                    Ok(())
+                } else {
+                    Err(OrgEnvironmentError::changed_concurrently())
+                };
+            }
+            Some(Some(old)) => {
+                let (old_wait_timer_s, old_concurrency) = rule_columns(&old.rules)?;
+                let updated = sqlx::query(
+                    "UPDATE environment_project_overlays SET
+                         approvers = $4, allowed_refs = $5, wait_timer_s = $6,
+                         require_reason = $7, deployment_concurrency = $8,
+                         deployment_gate_deadline_ms = $9, updated_at = $10, updated_by = $11
+                     WHERE org = $1 AND environment = $2 AND project = $3
+                       AND approvers = $12 AND allowed_refs = $13 AND wait_timer_s = $14
+                       AND require_reason = $15
+                       AND deployment_concurrency IS NOT DISTINCT FROM $16
+                       AND deployment_gate_deadline_ms IS NOT DISTINCT FROM $17",
+                )
+                .bind(&overlay.org)
+                .bind(&overlay.environment)
+                .bind(&overlay.project)
+                .bind(&overlay.rules.approvers)
+                .bind(&overlay.rules.allowed_refs)
+                .bind(wait_timer_s)
+                .bind(overlay.rules.require_reason)
+                .bind(deployment_concurrency)
+                .bind(overlay.deployment_gate_deadline.map(|d| d.millis()))
+                .bind(updated_at)
+                .bind(updated_by)
+                .bind(&old.rules.approvers)
+                .bind(&old.rules.allowed_refs)
+                .bind(old_wait_timer_s)
+                .bind(old.rules.require_reason)
+                .bind(old_concurrency)
+                .bind(old.deployment_gate_deadline.map(|d| d.millis()))
+                .execute(self.pool())
+                .await
+                .map_err(org_environment_store_err)?
+                .rows_affected();
+                return if updated == 1 {
+                    Ok(())
+                } else {
+                    Err(self.missed(&overlay.org, &overlay.environment).await)
+                };
+            }
+        }
         sqlx::query(
             "INSERT INTO environment_project_overlays
                  (org, environment, project, approvers, allowed_refs, wait_timer_s, require_reason,
@@ -533,14 +683,75 @@ impl EnvironmentGovernanceStore for PostgresDb {
         Ok(deleted > 0)
     }
 
-    async fn put_environment_project_privilege_grant(
+    async fn put_environment_project_privilege_grant_expecting(
         &self,
         grant: &EnvironmentProjectPrivilegeGrant,
+        expected: Option<Option<&EnvironmentProjectPrivilegeGrant>>,
         updated_by: &str,
         updated_at: i64,
     ) -> Result<(), OrgEnvironmentError> {
         let images = serde_json::to_value(&grant.privileged_images)
             .map_err(|e| OrgEnvironmentError::Store(e.to_string()))?;
+        match expected {
+            None => {}
+            // ADR-0073 §3, as for overlays: one conditional statement each.
+            Some(None) => {
+                let inserted = sqlx::query(
+                    "INSERT INTO environment_project_privilege_grants
+                         (org, environment, project, privileged_images, permit_k8s_overlay,
+                          updated_at, updated_by)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7)
+                     ON CONFLICT (org, environment, project) DO NOTHING",
+                )
+                .bind(&grant.org)
+                .bind(&grant.environment)
+                .bind(&grant.project)
+                .bind(&images)
+                .bind(grant.permit_k8s_overlay)
+                .bind(updated_at)
+                .bind(updated_by)
+                .execute(self.pool())
+                .await
+                .map_err(|e| write_err(e, &grant.org, &grant.environment))?
+                .rows_affected();
+                return if inserted == 1 {
+                    Ok(())
+                } else {
+                    Err(OrgEnvironmentError::changed_concurrently())
+                };
+            }
+            Some(Some(old)) => {
+                // JSONB equality: the stored whitelist was written from the
+                // same type, so equal values are equal documents.
+                let old_images = serde_json::to_value(&old.privileged_images)
+                    .map_err(|e| OrgEnvironmentError::Store(e.to_string()))?;
+                let updated = sqlx::query(
+                    "UPDATE environment_project_privilege_grants SET
+                         privileged_images = $4, permit_k8s_overlay = $5,
+                         updated_at = $6, updated_by = $7
+                     WHERE org = $1 AND environment = $2 AND project = $3
+                       AND privileged_images = $8 AND permit_k8s_overlay = $9",
+                )
+                .bind(&grant.org)
+                .bind(&grant.environment)
+                .bind(&grant.project)
+                .bind(&images)
+                .bind(grant.permit_k8s_overlay)
+                .bind(updated_at)
+                .bind(updated_by)
+                .bind(&old_images)
+                .bind(old.permit_k8s_overlay)
+                .execute(self.pool())
+                .await
+                .map_err(org_environment_store_err)?
+                .rows_affected();
+                return if updated == 1 {
+                    Ok(())
+                } else {
+                    Err(self.missed(&grant.org, &grant.environment).await)
+                };
+            }
+        }
         sqlx::query(
             "INSERT INTO environment_project_privilege_grants
                  (org, environment, project, privileged_images, permit_k8s_overlay,

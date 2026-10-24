@@ -683,9 +683,10 @@ struct OrgEnvironmentsDown;
 
 #[async_trait::async_trait]
 impl scarab_project::OrgEnvironmentStore for OrgEnvironmentsDown {
-    async fn put_org_environment(
+    async fn put_org_environment_expecting(
         &self,
         _: &scarab_project::OrgEnvironment,
+        _: Option<&[scarab_project::EnvironmentDeploymentSource]>,
     ) -> Result<scarab_project::OrgEnvironment, scarab_project::OrgEnvironmentError> {
         Err(down())
     }

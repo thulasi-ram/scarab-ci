@@ -105,6 +105,30 @@ pub struct LoginFlow {
     /// of the session that started it. The callback links only into that same
     /// session, so a code cannot be replayed into someone else's account.
     pub link: String,
+    /// Where the browser lands after a sign-in callback (ADR-0073 §10): a
+    /// same-origin relative path that passed [`safe_next`]. Empty = `/`.
+    /// Carried base64url so it can never contain the `.` separator.
+    pub next: String,
+    /// A link flow's expiry (Unix ms, ADR-0073): the callback refuses the
+    /// link after it, and the link binding covers it, so a link begun under
+    /// a step-up dies with that step-up. The 7th cookie part, decimal.
+    pub link_expires_at: Option<i64>,
+}
+
+/// The longest `next` a login may carry.
+pub const MAX_NEXT_LEN: usize = 512;
+
+/// `next` if it is a safe post-login landing: a relative path that starts
+/// with `/`, not `//` (scheme-relative: another host), with no `\` (which
+/// browsers fold into `/`), no control characters, at most
+/// [`MAX_NEXT_LEN`] bytes. Anything else is `None` — never an open redirect.
+pub fn safe_next(next: &str) -> Option<&str> {
+    let ok = next.starts_with('/')
+        && !next.starts_with("//")
+        && !next.contains('\\')
+        && !next.chars().any(|c| c.is_control())
+        && next.len() <= MAX_NEXT_LEN;
+    ok.then_some(next)
 }
 
 impl LoginFlow {
@@ -116,13 +140,24 @@ impl LoginFlow {
             nonce: random_urlsafe(),
             provider: String::new(),
             link: String::new(),
+            next: String::new(),
+            link_expires_at: None,
         }
     }
 
-    /// The same flow, made a link into the session whose id hashes to
-    /// `session_hash` (ADR-0069 §6).
-    pub fn for_link(mut self, session_hash: &str) -> Self {
-        self.link = session_hash.to_string();
+    /// The same flow, landing on `next` after the callback. An unsafe `next`
+    /// (see [`safe_next`]) is dropped.
+    pub fn with_next(mut self, next: &str) -> Self {
+        self.next = safe_next(next).unwrap_or_default().to_string();
+        self
+    }
+
+    /// The same flow, made a link with link component `link` (ADR-0069 §6;
+    /// ADR-0073: the binding the guarded link POST minted), refused by the
+    /// callback after `expires_at`.
+    pub fn for_link(mut self, link: &str, expires_at: i64) -> Self {
+        self.link = link.to_string();
+        self.link_expires_at = Some(expires_at);
         self
     }
 
@@ -141,18 +176,26 @@ impl LoginFlow {
     /// The opaque state-cookie value carrying the whole flow. Every component
     /// is base64url or a provider id, so `.` is an unambiguous separator.
     pub fn to_cookie(&self) -> String {
-        let mut parts = vec![
+        let next = b64url(self.next.as_bytes());
+        let expires = self
+            .link_expires_at
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        let parts = [
             self.state.as_str(),
             self.verifier.as_str(),
             self.nonce.as_str(),
+            self.provider.as_str(),
+            self.link.as_str(),
+            next.as_str(),
+            expires.as_str(),
         ];
-        if !self.provider.is_empty() || !self.link.is_empty() {
-            parts.push(&self.provider);
-        }
-        if !self.link.is_empty() {
-            parts.push(&self.link);
-        }
-        parts.join(".")
+        // Up to the last non-empty optional part (the first three always).
+        let n = (3..parts.len())
+            .rev()
+            .find(|&i| !parts[i].is_empty())
+            .map_or(3, |i| i + 1);
+        parts[..n].join(".")
     }
 
     /// Parse the state cookie back. A single component is accepted as a
@@ -165,15 +208,40 @@ impl LoginFlow {
         let nonce = parts.next().unwrap_or_default();
         let provider = parts.next().unwrap_or_default();
         let link = parts.next().unwrap_or_default();
+        let next = parts.next().unwrap_or_default();
+        let expires = parts.next().unwrap_or_default();
         if parts.next().is_some() {
             return None;
         }
+        // The 7th part is a link flow's expiry: decimal Unix ms, or absent.
+        let link_expires_at = if expires.is_empty() {
+            None
+        } else if expires.bytes().all(|b| b.is_ascii_digit()) {
+            Some(expires.parse::<i64>().ok()?)
+        } else {
+            return None;
+        };
+        // The 6th part is base64url of a path that passed `safe_next` when
+        // the flow began; re-checked here because a cookie is client input.
+        let next = if next.is_empty() {
+            String::new()
+        } else {
+            let raw = base64::Engine::decode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                next.as_bytes(),
+            )
+            .ok()?;
+            let raw = String::from_utf8(raw).ok()?;
+            safe_next(&raw)?.to_string()
+        };
         Some(Self {
             state: state.to_string(),
             verifier: verifier.to_string(),
             nonce: nonce.to_string(),
             provider: provider.to_string(),
             link: link.to_string(),
+            next,
+            link_expires_at,
         })
     }
 
@@ -522,6 +590,12 @@ impl OAuthAuthenticator {
         }
     }
 
+    /// The configured bootstrap owners entries (ids, or matchers by verified
+    /// email) — counted as admins by the ADR-0073 Org security summary.
+    pub fn owners(&self) -> &[String] {
+        &self.cfg.owners
+    }
+
     /// The C1 global bootstrap role `subject` holds **right now**, decided by
     /// subject match against the configured owners (ADR-0049 amendment).
     ///
@@ -568,6 +642,12 @@ impl OAuthAuthenticator {
                     None => o.eq_ignore_ascii_case(email),
                 })
         })
+    }
+
+    /// [`is_owner`](Self::is_owner), for the step-up reset's "is the target
+    /// an install-wide owner?" (ADR-0073 §10) — the one owners matcher.
+    pub(crate) fn matches_owner(&self, subject: &str, verified_email: Option<&str>) -> bool {
+        self.is_owner(subject, verified_email)
     }
 
     /// Verify an `id_token`: RS256 signature against the issuer's JWKS, plus
@@ -747,6 +827,8 @@ mod tests {
             nonce: "n".into(),
             provider: String::new(),
             link: String::new(),
+            next: String::new(),
+            link_expires_at: None,
         };
         assert_eq!(
             flow.challenge(),
@@ -772,10 +854,10 @@ mod tests {
         assert_eq!(flow.verifier(), None, "nothing to replay");
         assert_eq!(flow.nonce(), None, "nothing to check");
         assert_eq!(LoginFlow::from_cookie(""), None);
-        assert_eq!(LoginFlow::from_cookie("a.b.c.d.e.f"), None);
+        assert_eq!(LoginFlow::from_cookie("a.b.c.d.e.f.g"), None);
         let link = LoginFlow::generate()
             .for_provider("github")
-            .for_link("abc123");
+            .for_link("abc123", 1_700_000_000_000);
         assert_eq!(
             LoginFlow::from_cookie(&link.to_cookie()),
             Some(link.clone())
@@ -786,6 +868,40 @@ mod tests {
             LoginFlow::from_cookie(&bound.to_cookie()),
             Some(bound.clone())
         );
+    }
+
+    #[test]
+    fn next_survives_the_cookie_and_only_a_relative_path_does() {
+        let flow = LoginFlow::generate()
+            .for_provider("github")
+            .with_next("/account/security?enroll=1");
+        let back = LoginFlow::from_cookie(&flow.to_cookie()).expect("round trip");
+        assert_eq!(back.next, "/account/security?enroll=1");
+        assert_eq!(back, flow);
+        // Without a provider either, the next still rides in the 6th part.
+        let bare = LoginFlow::generate().with_next("/x");
+        assert_eq!(LoginFlow::from_cookie(&bare.to_cookie()), Some(bare.clone()));
+
+        for bad in [
+            "https://evil.example/",
+            "//evil.example/",
+            "/\\evil.example",
+            "evil",
+            "",
+            "/a\nb",
+        ] {
+            assert_eq!(safe_next(bad), None, "{bad:?}");
+            assert_eq!(LoginFlow::generate().with_next(bad).next, "", "{bad:?}");
+        }
+        assert_eq!(safe_next(&format!("/{}", "a".repeat(MAX_NEXT_LEN))), None);
+        assert_eq!(safe_next("/ok"), Some("/ok"));
+
+        // A forged cookie carrying an absolute URL is refused, not obeyed.
+        let forged = format!(
+            "s.v.n.github..{}",
+            b64url("https://evil.example/".as_bytes())
+        );
+        assert_eq!(LoginFlow::from_cookie(&forged), None);
     }
 
     fn cfg(owners: Vec<String>) -> OAuthConfig {

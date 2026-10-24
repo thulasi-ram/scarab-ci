@@ -219,3 +219,43 @@ async fn import_seeds_prune_only_what_this_provider_seeded_here() {
     assert_eq!(db.role_of("stays", &app).await.unwrap(), None);
     tdb.cleanup().await;
 }
+
+/// ADR-0073's coarse role skip reads the highest role a subject holds
+/// ANYWHERE: every Org and Project counts, a tombstone grants nothing.
+#[tokio::test]
+async fn max_role_is_the_highest_live_role_in_any_scope() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+
+    assert_eq!(db.max_role("amy").await.unwrap(), None);
+    db.grant(
+        &binding("amy", Scope::Org("acme".into()), Role::Viewer),
+        BindingOrigin::Native,
+    )
+    .await
+    .unwrap();
+    db.grant(
+        &binding("amy", project("globex", "web"), Role::Admin),
+        BindingOrigin::Native,
+    )
+    .await
+    .unwrap();
+    db.grant(
+        &binding("amy", Scope::Org("initech".into()), Role::Member),
+        BindingOrigin::Import,
+    )
+    .await
+    .unwrap();
+    // Text order would pick "viewer"; the role order picks Admin.
+    assert_eq!(db.max_role("amy").await.unwrap(), Some(Role::Admin));
+
+    db.revoke("amy", &project("globex", "web")).await.unwrap();
+    assert_eq!(db.max_role("amy").await.unwrap(), Some(Role::Member));
+    assert_eq!(db.max_role("bob").await.unwrap(), None);
+
+    tdb.cleanup().await;
+}

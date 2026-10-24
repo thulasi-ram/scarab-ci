@@ -1781,6 +1781,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
+name = "minicbor"
+version = "2.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7244eafd1e09e7c4e33043881997aa6ab6dffff3ed2cee3395a278980481d6e"
+
+[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2431,12 +2437,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "regex-lite"
-version = "0.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cab834c73d247e67f4fae452806d17d3c7501756d98c8808d7c9c7aa7d18f973"
-
-[[package]]
 name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2647,10 +2647,18 @@ dependencies = [
 name = "scarab-cli"
 version = "0.1.1"
 dependencies = [
+ "axum",
  "clap",
  "reqwest",
+ "scarab-forge",
+ "scarab-identity",
  "scarab-pipeline",
+ "scarab-secrets-postgres",
+ "scarab-server",
+ "scarab-testkit",
+ "scarab-webauthn",
  "serde_json",
+ "sqlx",
  "tokio",
 ]
 
@@ -2893,6 +2901,7 @@ version = "0.1.1"
 dependencies = [
  "aes-gcm",
  "async-trait",
+ "hmac",
  "rand 0.8.7",
  "scarab-secrets",
  "sha2",
@@ -2912,10 +2921,10 @@ dependencies = [
  "filetime",
  "flate2",
  "futures",
+ "hmac",
  "jsonwebtoken",
  "libc",
  "rand 0.8.7",
- "regex-lite",
  "reqwest",
  "rsa",
  "rustls",
@@ -2937,6 +2946,7 @@ dependencies = [
  "scarab-storage",
  "scarab-storage-s3",
  "scarab-testkit",
+ "scarab-webauthn",
  "scarab-workspace-client",
  "serde",
  "serde_json",
@@ -3000,6 +3010,23 @@ dependencies = [
  "scarab-storage",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "scarab-webauthn"
+version = "0.1.1"
+dependencies = [
+ "base64",
+ "minicbor",
+ "num-bigint",
+ "rand 0.8.7",
+ "ring",
+ "rsa",
+ "scarab-webauthn",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

@@ -80,6 +80,15 @@ scarab-workspace-client = { workspace = true }
 scarab-executor-k8s = { workspace = true }
 scarab-executor-local = { workspace = true }
 scarab-testkit = { workspace = true }
+# ADR-0073 step-up: the WebAuthn relying party (passkey registration and
+# assertion verification). Its soft authenticator is a dev-only feature.
+scarab-webauthn = { workspace = true }
+# ADR-0073: the action digest is HMAC-SHA256 under a KEK-derived key. Already
+# in the tree (scarab-secrets-postgres, the forge webhook verifiers).
+hmac = { workspace = true }
+# ADR-0073 §6: a confirmed StepUpConfirmationRequest is replayed through the
+# real router (`ServiceExt::oneshot`). Already in the tree via axum.
+tower = { workspace = true, features = ["util"] }
 
 # ADR-0062 overlay change-set (`changeset.rs`): reading `trusted.overlay.*` off a
 # Step's upper layer. Target-gated to match the `#[cfg(target_os = "linux")]` on
@@ -95,6 +104,6 @@ xattr = { workspace = true }
 libc = "0.2"
 
 [dev-dependencies]
-regex-lite = { workspace = true }
-tower = { workspace = true, features = ["util"] }
+# ADR-0073 tests: a software passkey (a true external — the authenticator).
+scarab-webauthn = { workspace = true, features = ["soft-authenticator"] }
 tempfile = { workspace = true }

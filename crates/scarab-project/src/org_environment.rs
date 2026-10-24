@@ -288,9 +288,22 @@ pub enum OrgEnvironmentError {
     /// Nothing changed.
     #[error("{0}")]
     InUse(String),
+    /// An `…_expecting` write found the stored value changed since the
+    /// caller read it (ADR-0073 §3 optimistic concurrency). Nothing was
+    /// stored; the caller reloads and decides again.
+    #[error("{0}")]
+    Conflict(String),
     /// The backing store failed, or held a row this binary cannot read.
     #[error("org environment store: {0}")]
     Store(String),
+}
+
+impl OrgEnvironmentError {
+    /// The [`Conflict`](Self::Conflict) every store answers when an
+    /// `…_expecting` write lost to a concurrent change.
+    pub fn changed_concurrently() -> Self {
+        Self::Conflict("changed concurrently; reload and retry".into())
+    }
 }
 
 fn not_installed_text(installation: &str, org: &str, already_listed: bool) -> String {
@@ -330,6 +343,19 @@ pub trait OrgEnvironmentStore: Send + Sync {
     async fn put_org_environment(
         &self,
         env: &OrgEnvironment,
+    ) -> Result<OrgEnvironment, OrgEnvironmentError> {
+        self.put_org_environment_expecting(env, None).await
+    }
+
+    /// [`put_org_environment`](Self::put_org_environment), refused with
+    /// [`OrgEnvironmentError::Conflict`] unless the stored source list is
+    /// `expected_sources` (when given; order ignored, and an Environment that
+    /// does not exist yet holds none) — ADR-0073 §3's optimistic concurrency
+    /// for the one governed part of this write, its sources.
+    async fn put_org_environment_expecting(
+        &self,
+        env: &OrgEnvironment,
+        expected_sources: Option<&[EnvironmentDeploymentSource]>,
     ) -> Result<OrgEnvironment, OrgEnvironmentError>;
 
     /// One OrgEnvironment, sources sorted.
