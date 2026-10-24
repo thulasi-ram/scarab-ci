@@ -10886,7 +10886,25 @@ fn router_inner(state: AppState) -> Router {
 /// gets it; anything else (a client-side route like `/acme/web/runs/…`) gets
 /// index.html. Path traversal is rejected by segment sanitization. With no
 /// UI dir configured (dev API-only), non-API paths are plain 404s.
+///
+/// Every answer forbids framing (`frame-ancestors 'none'`, `X-Frame-Options:
+/// DENY`): the step-up confirm page is a human's last look at what a token
+/// asked to run, and a framed one could be click-jacked (ADR-0073 §6).
 async fn serve_ui(State(st): State<AppState>, uri: axum::http::Uri) -> Response {
+    let mut resp = serve_ui_file(&st, &uri).await;
+    let headers = resp.headers_mut();
+    headers.insert(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        axum::http::HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    headers.insert(
+        axum::http::header::X_FRAME_OPTIONS,
+        axum::http::HeaderValue::from_static("DENY"),
+    );
+    resp
+}
+
+async fn serve_ui_file(st: &AppState, uri: &axum::http::Uri) -> Response {
     let Some(dir) = &st.ui_dir else {
         return StatusCode::NOT_FOUND.into_response();
     };

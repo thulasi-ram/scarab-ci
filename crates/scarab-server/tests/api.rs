@@ -320,6 +320,47 @@ fn operation_tags_cover_every_operation() {
     assert!(unused.is_empty(), "declared groups with no operations: {unused:?}");
 }
 
+/// The UI can never be framed (ADR-0073 §6 click-jacking): the step-up
+/// confirm page — a SPA route served from index.html — carries
+/// `frame-ancestors 'none'` and `X-Frame-Options: DENY`.
+#[tokio::test]
+async fn the_confirm_page_cannot_be_framed() {
+    let dist = tempfile::tempdir().unwrap();
+    std::fs::write(dist.path().join("index.html"), "<html>scarab-ui</html>").unwrap();
+    let db = std::sync::Arc::new(scarab_testkit::InMemoryDb::new());
+    let store = std::sync::Arc::new(scarab_testkit::InMemoryObjectStore::new());
+    let logs = std::sync::Arc::new(scarab_server::LogService::new(store, db.clone()));
+    let app = scarab_server::router(
+        scarab_server::AppState::new(
+            db,
+            std::sync::Arc::new(scarab_testkit::FakeClock::new(0)),
+            logs,
+        )
+        .with_ui_dir(dist.path()),
+    );
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/security/confirm/x")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let h = |name: &str| {
+        resp.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    assert_eq!(
+        h("content-security-policy").as_deref(),
+        Some("frame-ancestors 'none'")
+    );
+    assert_eq!(h("x-frame-options").as_deref(), Some("DENY"));
+}
+
 /// The embedded web UI (ADR-0054): `/` serves index.html, real assets serve
 /// with their content type, an SPA client route falls back to index, and the
 /// API keeps winning under /v1. Path traversal cannot escape the dist dir.
