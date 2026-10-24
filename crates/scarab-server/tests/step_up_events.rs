@@ -810,3 +810,141 @@ async fn a_stale_login_s_enrollment_refusal_is_recorded() {
     assert_eq!(refused[0].op.as_deref(), Some("passkey.add"));
     assert_eq!(refused[0].detail["reason"], "fresh login required");
 }
+
+// ---------------------------------------------------------------------------
+// Logged, or not done (ADR-0073 §7: every confirmation and enrollment is
+// recorded) — with the log made unreachable by the fake's fault toggle.
+// ---------------------------------------------------------------------------
+
+fn with_secrets() -> (Harness, Arc<scarab_testkit::FakeSecrets>) {
+    let secrets = Arc::new(scarab_testkit::FakeSecrets::new());
+    let wired = secrets.clone();
+    (harness_with(move |st| st.with_secrets(wired)), secrets)
+}
+
+async fn acme_secret(secrets: &scarab_testkit::FakeSecrets) -> Option<Vec<u8>> {
+    use scarab_secrets::{SecretProvider, SecretScope};
+    secrets
+        .get(&SecretScope::Org { org: "acme".into() }, "DB_PASSWORD")
+        .await
+        .ok()
+        .map(|s| s.value)
+}
+
+/// (a) A step-up whose confirmation cannot be recorded is not made: 503,
+/// and once the log is back the session still has no window.
+#[tokio::test]
+async fn an_unrecorded_step_up_opens_no_window() {
+    let (h, secrets) = with_secrets();
+    let (amy, mut soft) = member(&h, "amy", "acme", Role::Owner).await;
+    let (st, ch) = h.cookie("POST", "/v1/me/step-up/options", None, &amy).await;
+    assert_eq!(st, StatusCode::OK, "{ch}");
+    h.events.fail_appends(true);
+    let (st, b) = h.answer(&amy, &mut soft, &ch).await;
+    assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{b}");
+    h.events.fail_appends(false);
+    let (st, b) = h
+        .cookie("POST", "/v1/secrets", Some(secret("acme", "v")), &amy)
+        .await;
+    assert_step_up(st, &b, "window");
+    assert_eq!(acme_secret(&secrets).await, None);
+}
+
+/// (b) An enrollment that cannot be recorded is undone: 503, no passkey.
+#[tokio::test]
+async fn an_unrecorded_enrollment_leaves_no_passkey() {
+    let h = harness();
+    let s = h.browser_session(scoped("amy")).await;
+    let (st, opts) = h
+        .cookie(
+            "POST",
+            "/v1/me/passkeys/registration/options",
+            Some(json!({"label": "Laptop"})),
+            &s,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{opts}");
+    let mut soft = passkey();
+    let cred = soft.register(&opts["public_key"], ORIGIN).unwrap();
+    h.events.fail_appends(true);
+    let (st, b) = h
+        .cookie(
+            "POST",
+            "/v1/me/passkeys/registration",
+            Some(json!({"challenge_id": opts["id"], "credential": cred})),
+            &s,
+        )
+        .await;
+    assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{b}");
+    h.events.fail_appends(false);
+    let (st, me) = h.cookie("GET", "/v1/me/security", None, &s).await;
+    assert_eq!(st, StatusCode::OK, "{me}");
+    assert_eq!(me["passkeys"], json!([]), "{me}");
+}
+
+/// (c) A request whose confirmation cannot be recorded does not run: it
+/// settles `failed` and the secret is never written.
+#[tokio::test]
+async fn an_unrecorded_request_confirmation_runs_nothing() {
+    let (h, secrets) = with_secrets();
+    let (amy, mut soft) = member(&h, "amy", "acme", Role::Owner).await;
+    let plaintext = "scarab_pat_t1_0123456789abcdef0123456789abcdef";
+    let now = h.now().await;
+    h.tokens
+        .put(
+            &ApiToken {
+                id: "t1".into(),
+                name: "ci".into(),
+                owner_subject: "amy".into(),
+                scope: Scope::Org("acme".into()),
+                role: Role::Admin,
+                expires_at: now + 24 * HOUR,
+                created_by: "amy".into(),
+                created_at: now,
+                last_used_at: None,
+                revoked_at: None,
+            },
+            &api_token_hash(plaintext),
+        )
+        .await
+        .unwrap();
+    let (st, b) = h
+        .bearer("POST", "/v1/secrets", Some(secret("acme", "v")), plaintext)
+        .await;
+    assert!(is_step_up(st, &b), "{st} {b}");
+    let id = b["request_id"].as_str().expect("a request").to_string();
+    let (st, ch) = h
+        .cookie("POST", &format!("/v1/step-up/requests/{id}/options"), None, &amy)
+        .await;
+    assert_eq!(st, StatusCode::OK, "{ch}");
+    let cred = soft.assert(&ch["public_key"], ORIGIN).unwrap();
+    h.events.fail_appends(true);
+    let (st, done) = h
+        .cookie(
+            "POST",
+            &format!("/v1/step-up/requests/{id}/confirm"),
+            Some(json!({"challenge_id": ch["id"], "credential": cred})),
+            &amy,
+        )
+        .await;
+    h.events.fail_appends(false);
+    assert_eq!(st, StatusCode::OK, "{done}");
+    assert_eq!(done["state"], "failed", "{done}");
+    assert_eq!(acme_secret(&secrets).await, None, "the secret was written");
+}
+
+/// (d) A crown jewel whose authorisation cannot be recorded does not run,
+/// even inside a window: 503, nothing written.
+#[tokio::test]
+async fn an_unrecorded_authorisation_runs_nothing() {
+    let (h, secrets) = with_secrets();
+    let (amy, mut soft) = member(&h, "amy", "acme", Role::Owner).await;
+    h.open_window(&amy, &mut soft).await;
+    h.events.fail_appends(true);
+    let (st, b) = h
+        .cookie("POST", "/v1/secrets", Some(secret("acme", "v")), &amy)
+        .await;
+    h.events.fail_appends(false);
+    assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{b}");
+    assert_eq!(acme_secret(&secrets).await, None, "the secret was written");
+}

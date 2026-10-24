@@ -711,7 +711,14 @@ pub(crate) async fn confirm_request(
         "kind": ConfirmationKind::Request.as_str(),
         "summary": r.summary,
     });
-    svc.record(ev).await;
+    // Logged, or not run: an unrecorded confirmation replays nothing.
+    let logged = match svc.events.append(&ev).await {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            tracing::error!(error = %e, request = %id, "step_up.confirmed could not be recorded; not replaying");
+            Err("the security event log is unavailable, so the request was not run".to_string())
+        }
+    };
     let mut ev = event(
         kind::REQUEST_CONFIRMED,
         &human,
@@ -733,10 +740,12 @@ pub(crate) async fn confirm_request(
     svc.record(ev).await;
 
     // Open the sealed body; then replay.
-    let opened = r
-        .sealed
-        .as_deref()
-        .ok_or_else(|| "the request has no sealed body".to_string())
+    let opened = logged
+        .and_then(|()| {
+            r.sealed
+                .as_deref()
+                .ok_or_else(|| "the request has no sealed body".to_string())
+        })
         .and_then(|sealed| {
             svc.sealer
                 .open(sealed, &aad(&id))

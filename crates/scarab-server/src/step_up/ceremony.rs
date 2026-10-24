@@ -431,7 +431,16 @@ pub(crate) async fn passkey_registration(
         "alg": passkey.alg,
         "backup_eligible": passkey.backup_eligible,
     });
-    svc.record(ev).await;
+    // Logged, or not enrolled.
+    if let Err(e) = svc.events.append(&ev).await {
+        tracing::error!(error = %e, "passkey.enrolled could not be recorded; undoing");
+        if let Err(e) = svc.passkeys.remove(&subject, &passkey.id).await {
+            tracing::error!(error = %e, passkey = %passkey.id, "could not undo an unrecorded enrollment");
+        }
+        return Err(ApiError::Unavailable(
+            "the security event log is unavailable, so the passkey was not enrolled".into(),
+        ));
+    }
     Ok((StatusCode::CREATED, Json(PasskeyDto::from(&passkey))))
 }
 
@@ -577,10 +586,6 @@ pub(crate) async fn step_up_confirm(
         expires_at: now + STEP_UP_WINDOW_MS,
         consumed_at: None,
     };
-    svc.confirmations
-        .put_confirmation(&confirmation)
-        .await
-        .map_err(store_err)?;
     let op = row
         .summary
         .as_ref()
@@ -618,7 +623,18 @@ pub(crate) async fn step_up_confirm(
         "expires_at": confirmation.expires_at,
         "summary": row.summary.as_ref().and_then(|s| s.get("summary")),
     });
-    svc.record(ev).await;
+    // Logged, or not made: a confirmation that cannot be recorded is never
+    // stored, so no window or action confirmation exists unlogged.
+    if let Err(e) = svc.events.append(&ev).await {
+        tracing::error!(error = %e, "step_up.confirmed could not be recorded; refusing");
+        return Err(ApiError::Unavailable(
+            "the security event log is unavailable, so the step-up was not recorded".into(),
+        ));
+    }
+    svc.confirmations
+        .put_confirmation(&confirmation)
+        .await
+        .map_err(store_err)?;
     Ok(Json(StepUpConfirmResponse {
         confirmation_id: confirmation.id,
         kind: kind_.as_str().to_string(),
