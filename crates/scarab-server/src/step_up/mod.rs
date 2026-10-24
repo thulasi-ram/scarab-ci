@@ -149,34 +149,103 @@ struct StepUpRefusalLimiterState {
 struct StepUpRefusalBucket {
     window_start: i64,
     recorded: u32,
-    suppressed: u64,
-    /// The newest refusal suppressed in this window — written, carrying the
-    /// rest of the count, when the window closes with no refusal of the key
-    /// to carry it.
-    last_suppressed: Option<SecurityEvent>,
+    /// The refusals suppressed in this window, one entry per distinct
+    /// target in first-seen order, at most [`MAX_SUPPRESSED_TARGETS`]: so a
+    /// burst of decoys cannot hide the one target actually probed among
+    /// them (redteam auth-6), while a caller varying the target still
+    /// writes a bounded number of rows.
+    suppressed: Vec<SuppressedRefusals>,
+    /// Refusals suppressed for targets past the first
+    /// [`MAX_SUPPRESSED_TARGETS`] distinct ones: counted only.
+    suppressed_other_targets: u64,
 }
 
+/// The suppressed refusals of one target in one window.
+struct SuppressedRefusals {
+    /// The newest of them — written, carrying the rest of the count, when
+    /// the window closes.
+    newest: SecurityEvent,
+    count: u64,
+}
+
+/// How many distinct targets one key's closed window writes a row for.
+const MAX_SUPPRESSED_TARGETS: usize = 5;
+
 impl StepUpRefusalBucket {
-    /// The closed window's suppressed refusals as one event: the newest of
-    /// them, carrying how many others it stands for.
-    fn flush(&mut self) -> Option<SecurityEvent> {
-        let mut event = self.last_suppressed.take()?;
-        let others = std::mem::take(&mut self.suppressed).saturating_sub(1);
-        if others > 0 {
-            if let Some(d) = event.detail.as_object_mut() {
-                d.insert("suppressed_before".into(), others.into());
+    fn new(window_start: i64) -> Self {
+        Self {
+            window_start,
+            recorded: 0,
+            suppressed: Vec::new(),
+            suppressed_other_targets: 0,
+        }
+    }
+
+    fn suppress(&mut self, event: SecurityEvent) {
+        if let Some(s) = self
+            .suppressed
+            .iter_mut()
+            .find(|s| s.newest.target == event.target)
+        {
+            s.count += 1;
+            s.newest = event;
+        } else if self.suppressed.len() < MAX_SUPPRESSED_TARGETS {
+            self.suppressed.push(SuppressedRefusals {
+                newest: event,
+                count: 1,
+            });
+        } else {
+            self.suppressed_other_targets += 1;
+        }
+    }
+
+    /// The closed window's suppressed refusals: for each distinct target
+    /// the newest, carrying how many others of that target it stands for
+    /// (`detail.suppressed_before`). `carrier` is a refusal of this key
+    /// about to be recorded: the count of its own target rides on it
+    /// instead of a row of its own (the returned count). Refusals of
+    /// targets past the cap are counted on the last row
+    /// (`detail.suppressed_other_targets`), or on the carrier when there is
+    /// no row.
+    fn drain(&mut self, mut carrier: Option<&mut SecurityEvent>) -> Vec<SecurityEvent> {
+        let mut rows = Vec::new();
+        for s in std::mem::take(&mut self.suppressed) {
+            match carrier.as_deref_mut() {
+                Some(c) if c.target == s.newest.target => {
+                    insert_detail(c, "suppressed_before", s.count);
+                }
+                _ => {
+                    let mut e = s.newest;
+                    if s.count > 1 {
+                        insert_detail(&mut e, "suppressed_before", s.count - 1);
+                    }
+                    rows.push(e);
+                }
             }
         }
-        Some(event)
+        let other = std::mem::take(&mut self.suppressed_other_targets);
+        if other > 0 {
+            if let Some(e) = rows.last_mut().or(carrier) {
+                insert_detail(e, "suppressed_other_targets", other);
+            }
+        }
+        rows
+    }
+}
+
+fn insert_detail(event: &mut SecurityEvent, key: &str, n: u64) {
+    if let Some(d) = event.detail.as_object_mut() {
+        d.insert(key.into(), n.into());
     }
 }
 
 impl StepUpRefusalLimiter {
     /// The events to append for refusal `event`: none (suppressed, counted),
     /// the refusal itself (carrying `detail.suppressed_before` when its key
-    /// dropped some since its last recorded one), and every other key's
-    /// closed window's suppressed count still pending — so a burst followed
-    /// by silence is still written, in its own Org's log, the next time any
+    /// dropped some of its target since its last recorded one, preceded by
+    /// a row per other target dropped), and every other key's closed
+    /// window's suppressed refusals still pending — so a burst followed by
+    /// silence is still written, in its own Org's log, the next time any
     /// refusal reaches the limiter.
     pub(crate) fn admit(&self, mut event: SecurityEvent) -> Vec<SecurityEvent> {
         let now = event.at;
@@ -191,7 +260,7 @@ impl StepUpRefusalLimiter {
                 if *k == key || now - b.window_start < REFUSAL_WINDOW_MS {
                     return true;
                 }
-                out.extend(b.flush());
+                out.extend(b.drain(None));
                 false
             });
         }
@@ -200,29 +269,20 @@ impl StepUpRefusalLimiter {
             out.push(event);
             return out;
         }
-        let b = st.buckets.entry(key).or_insert(StepUpRefusalBucket {
-            window_start: now,
-            recorded: 0,
-            suppressed: 0,
-            last_suppressed: None,
-        });
+        let b = st
+            .buckets
+            .entry(key)
+            .or_insert_with(|| StepUpRefusalBucket::new(now));
         if now - b.window_start >= REFUSAL_WINDOW_MS {
             b.window_start = now;
             b.recorded = 0;
         }
         if b.recorded < REFUSALS_PER_WINDOW {
             b.recorded += 1;
-            b.last_suppressed = None;
-            let n = std::mem::take(&mut b.suppressed);
-            if n > 0 {
-                if let Some(d) = event.detail.as_object_mut() {
-                    d.insert("suppressed_before".into(), n.into());
-                }
-            }
+            out.extend(b.drain(Some(&mut event)));
             out.push(event);
         } else {
-            b.suppressed += 1;
-            b.last_suppressed = Some(event);
+            b.suppress(event);
         }
         out
     }
@@ -1076,6 +1136,37 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    /// Redteam auth-6: a target probed between decoys is written when the
+    /// window closes — one row per distinct suppressed target, capped, the
+    /// rest counted — and never as the decoy's count.
+    #[test]
+    fn a_closed_window_keeps_the_distinct_targets_it_suppressed() {
+        let l = StepUpRefusalLimiter::default();
+        let r = |target: &str, at| {
+            let mut e = refusal("acme", "amy", "session:cookie", "secret.put", "no_window", at);
+            e.target = Some(target.into());
+            e
+        };
+        for _ in 0..REFUSALS_PER_WINDOW {
+            assert_eq!(l.admit(r("DECOY", 0)).len(), 1);
+        }
+        assert!(l.admit(r("PROD", 1)).is_empty());
+        assert!(l.admit(r("DECOY", 2)).is_empty());
+        assert!(l.admit(r("DECOY", 3)).is_empty());
+        // Past the cap of distinct targets: counted, not written.
+        for i in 0..MAX_SUPPRESSED_TARGETS + 2 {
+            assert!(l.admit(r(&format!("T{i}"), 4)).is_empty());
+        }
+        let out = l.admit(r("DECOY", REFUSAL_WINDOW_MS));
+        let targets: Vec<_> = out.iter().map(|e| e.target.clone().unwrap()).collect();
+        assert_eq!(targets, ["PROD", "T0", "T1", "T2", "DECOY"], "{out:?}");
+        assert!(out[0].detail.get("suppressed_before").is_none());
+        // The decoys' count rides on the next decoy recorded.
+        assert_eq!(out.last().unwrap().detail["suppressed_before"], 2);
+        // T3..T6 (four) are past the cap.
+        assert_eq!(out[3].detail["suppressed_other_targets"], 4);
     }
 
     /// Review F9/S3: with every key live, a new key's refusal is recorded

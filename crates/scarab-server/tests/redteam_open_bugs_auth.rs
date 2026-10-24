@@ -486,7 +486,6 @@ async fn rt_hammering_one_org_does_not_mute_another_orgs_refusals() {
 /// then sends one more decoy: the log shows five decoys and a later decoy
 /// "carrying 2" — the real target never appears anywhere.
 #[tokio::test]
-#[ignore = "redteam: BROKE the refusal limiter launders the probed target: a probe of PROD_DB_PASSWORD between decoys is never logged"]
 async fn rt_the_refusal_limiter_hides_the_target_actually_probed() {
     let h = harness();
     let (s, _soft) = amy_in_browser(&h).await;
