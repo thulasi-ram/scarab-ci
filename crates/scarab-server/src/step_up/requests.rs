@@ -691,7 +691,7 @@ pub(crate) async fn confirm_request(
         kind::STEP_UP_CONFIRMED,
         &human,
         caller.event_label(),
-        None,
+        r.org.clone(),
         now,
     );
     ev.op = Some(r.op.clone());

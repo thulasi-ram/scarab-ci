@@ -577,7 +577,10 @@ impl SecurityEventLog for InMemorySecurityEvents {
                 None => true,
                 Some(org) => {
                     e.org.as_deref() == Some(org.as_str())
-                        || (e.org.is_none() && members.contains(&e.subject))
+                        || (e.org.is_none()
+                            && scarab_identity::security_event_kind::ORG_VISIBLE_ORGLESS
+                                .contains(&e.kind.as_str())
+                            && members.contains(&e.subject))
                 }
             })
             .filter(|e| f.subject.as_ref().is_none_or(|s| &e.subject == s))

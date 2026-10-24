@@ -206,7 +206,29 @@ pub(crate) async fn org_security_events(
     .await?;
     let mut filter = filter_of(&q);
     filter.org = Some(org);
-    Ok(Json(page(&st, filter).await?))
+    let mut page = page(&st, filter).await?;
+    for e in &mut page.events {
+        redact_orgless_confirmation(e);
+    }
+    Ok(Json(page))
+}
+
+/// An Org-less `step_up.confirmed` in an Org's view: who confirmed, when,
+/// with which passkey and in which session — not what it was for, which may
+/// be another Org's business (or none of this Org's).
+fn redact_orgless_confirmation(e: &mut SecurityEventDto) {
+    if e.org.is_some() || e.kind != kind::STEP_UP_CONFIRMED {
+        return;
+    }
+    e.op = None;
+    e.target = None;
+    let mut kept = serde_json::Map::new();
+    for k in ["kind", "expires_at"] {
+        if let Some(v) = e.detail.get(k) {
+            kept.insert(k.to_string(), v.clone());
+        }
+    }
+    e.detail = serde_json::Value::Object(kept);
 }
 
 /// Your own security events.

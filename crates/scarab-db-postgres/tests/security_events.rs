@@ -140,6 +140,9 @@ async fn an_org_sees_its_events_and_its_members_passkey_events_only() {
         event("dave-enrolled", None, kind::PASSKEY_ENROLLED, "dave"),
         // An acme event about a non-member is still acme's.
         event("acme-refused", Some("acme"), kind::STEP_UP_REFUSED, "cat"),
+        // An Org-less OPERATION about a member is no Org's: only the
+        // confirmation and passkey kinds follow a member into an Org's log.
+        event("amy-orgless-op", None, kind::OP_AUTHORISED, "amy"),
     ] {
         db.append(&e).await.unwrap();
     }
@@ -180,12 +183,12 @@ async fn an_org_sees_its_events_and_its_members_passkey_events_only() {
     )
     .await
     .unwrap();
-    assert_eq!(ids(&amy), vec!["amy-enrolled", "acme-op"]);
+    assert_eq!(ids(&amy), vec!["amy-orgless-op", "amy-enrolled", "acme-op"]);
 
     // Install-wide: all of it.
     assert_eq!(
         SecurityEventLog::list(&db, &filter()).await.unwrap().len(),
-        8
+        9
     );
 
     // Kinds, keyset pagination and the limit narrow any view.
