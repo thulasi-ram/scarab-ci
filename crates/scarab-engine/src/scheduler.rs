@@ -1679,6 +1679,17 @@ pub async fn cancel_run_request(
         return Ok(false);
     }
     let now = clock.now().await;
+    // The teardown intent — processed by the driver, which owns the executor —
+    // is written BEFORE anything goes terminal (review correctness MED1). It
+    // is what keeps a cancelled deploy Step holding its DeploymentTarget
+    // until its unit is gone (`Db::deployment_requesting_runs`, git-bug
+    // f22056d): written last, a Step already `Cancelled` with no intent yet
+    // counted for nothing, so a held Run could be promoted beside the
+    // holder's still-terminating Pod; and a crash before it lost the intent
+    // for good — a re-sent cancel finds the Run terminal and stops above —
+    // so the Pod was never torn down and never held. The idempotency key
+    // makes the re-sent cancel's enqueue a no-op.
+    enqueue_cancel_teardown(db, run, now).await?;
     // Attribution (ADR-0054): record the operator's cancel request FIRST, so an
     // operator cancel carries the acting principal and is distinguishable in the
     // durable log from the system's concurrency auto-cancel (which drives the
@@ -1766,7 +1777,23 @@ pub async fn cancel_run_request(
         Err(DbError::Conflict) => {}
         Err(e) => return Err(e.into()),
     }
-    // The teardown intent — processed by the driver, which owns the executor.
+    if let Some((group, _)) = db.run_concurrency(run).await? {
+        db.release_slot(&group, run).await?;
+    }
+    Ok(true)
+}
+
+/// Enqueue the [`CANCEL_RUN`] teardown intent for `run` (idempotent on
+/// `cancel:{run}`): the driver deletes every recorded in-flight unit until it
+/// is gone, and tears down the Run's shared services (ADR-0058). Shared by
+/// the operator cancel ([`cancel_run_request`]) and the inline concurrency
+/// auto-cancel ([`Scheduler::cancel_run`]); both write it before any Step
+/// goes terminal.
+async fn enqueue_cancel_teardown(
+    db: &dyn Db,
+    run: &RunId,
+    now: Timestamp,
+) -> Result<(), DbError> {
     db.enqueue_outbox(&OutboxMessage {
         id: crate::OutboxId(0),
         run: run.clone(),
@@ -1775,11 +1802,7 @@ pub async fn cancel_run_request(
         idempotency_key: format!("cancel:{}", run.0),
         at: now,
     })
-    .await?;
-    if let Some((group, _)) = db.run_concurrency(run).await? {
-        db.release_slot(&group, run).await?;
-    }
-    Ok(true)
+    .await
 }
 
 async fn reopen(

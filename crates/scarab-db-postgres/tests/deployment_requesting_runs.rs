@@ -555,3 +555,77 @@ async fn pg_an_unreached_gate_stops_counting_at_the_cutoff() {
 async fn inmemory_an_unreached_gate_stops_counting_at_the_cutoff() {
     an_unreached_gate_stops_counting_at_the_cutoff(&InMemoryDb::new()).await;
 }
+
+/// A cancel that dies part-way still holds the target, and still tears the
+/// unit down (review correctness MED1). The cancel used to enqueue its
+/// `cancel_run` teardown intent LAST — after the deploy Step went
+/// `Cancelled` and the Run transitioned. In between, the Step no longer
+/// counted as in flight and no intent counted for it either, so a held Run
+/// was promoted while the holder's Pod still ran; and a crash there lost the
+/// intent for good (a re-sent cancel finds the Run terminal and does
+/// nothing): no teardown, and no hold. The crash is constructed by refusing
+/// the Run's `RunTransitioned` journal write — the last write of the cancel.
+async fn a_cancel_that_dies_part_way_still_holds(db: &dyn Db, arm: impl FnOnce()) {
+    use scarab_engine::{cancel_run_request, CANCEL_RUN};
+    let clock = scarab_testkit::FakeClock::new(10);
+    let web = || count(db, "prod", "web", "nobody");
+    let run = RunId("t-crash".into());
+    seed_launched(db, "t-crash").await;
+    assert_eq!(web().await, 1);
+
+    arm();
+    assert!(
+        cancel_run_request(db, &clock, &run, None).await.is_err(),
+        "the crash was injected"
+    );
+    assert_eq!(
+        web().await,
+        1,
+        "the holder's unit may still be running: it holds until its teardown is retired"
+    );
+    let cancel = teardown_of(db, "t-crash", CANCEL_RUN).await;
+    db.mark_dispatched(cancel).await.unwrap();
+    assert_eq!(web().await, 0, "its unit is gone");
+}
+
+#[tokio::test]
+async fn pg_a_cancel_that_dies_part_way_still_holds() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+    sqlx::query(
+        "CREATE FUNCTION test_refuse_run_transitioned() RETURNS trigger AS $$
+         BEGIN
+           IF NEW.payload ? 'RunTransitioned' THEN
+             RAISE EXCEPTION 'injected: crash before the run journal';
+           END IF;
+           RETURN NEW;
+         END $$ LANGUAGE plpgsql",
+    )
+    .execute(&tdb.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER test_refuse_run_transitioned BEFORE INSERT ON events
+         FOR EACH ROW EXECUTE FUNCTION test_refuse_run_transitioned()",
+    )
+    .execute(&tdb.pool)
+    .await
+    .unwrap();
+    a_cancel_that_dies_part_way_still_holds(&db, || {}).await;
+    tdb.cleanup().await;
+}
+
+#[tokio::test]
+async fn inmemory_a_cancel_that_dies_part_way_still_holds() {
+    let db = InMemoryDb::new();
+    a_cancel_that_dies_part_way_still_holds(&db, || {
+        db.fail_next_event_append(|p| {
+            matches!(p, scarab_engine::EventPayload::RunTransitioned { .. })
+        })
+    })
+    .await;
+}
