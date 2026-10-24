@@ -28,6 +28,17 @@ describe("loginChoices", () => {
       { href: "/v1/auth/login?provider=okta", label: "Sign in with Okta", primary: false },
     ]);
   });
+
+  it("carries the page that needed the sign-in back as `next` (ADR-0073)", () => {
+    // A step-up confirmation link opened signed-out must land on itself after
+    // the login, not on the dashboard with the link lost.
+    expect(loginChoices([github], "/security/confirm/abc")[0]!.href).toBe(
+      "/v1/auth/login?provider=default&next=%2Fsecurity%2Fconfirm%2Fabc",
+    );
+    expect(loginChoices([], "/")[0]!.href).toBe("/v1/auth/login");
+    // Never an absolute or protocol-relative target: the server would 400 it.
+    expect(loginChoices([], "//evil.example/x")[0]!.href).toBe("/v1/auth/login");
+  });
 });
 
 describe("linking", () => {
