@@ -539,7 +539,7 @@ ui-e2e:
 # Contract gate (mirrors the CI `openapi-drift` job, ADR-0054): regenerate the
 # OpenAPI spec and the generated TS client, then fail if either differs from
 # what is committed. Full-route coverage is asserted by the test suite
-# (every_registered_route_is_in_the_openapi_spec) — this gates DRIFT only.
+# (step_up_routes.rs: route_table_equals_the_openapi_spec) — this gates DRIFT only.
 openapi-drift:
     #!/usr/bin/env bash
     set -euo pipefail

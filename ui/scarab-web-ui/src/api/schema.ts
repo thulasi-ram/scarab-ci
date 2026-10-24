@@ -453,6 +453,108 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/me/passkeys/registration": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Finish enrolling a passkey (ADR-0073 §2) */
+        post: operations["passkey_registration"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/me/passkeys/registration/options": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Begin enrolling a passkey (ADR-0073 §2) */
+        post: operations["passkey_registration_options"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/me/passkeys/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Remove a passkey (ADR-0073 §2; always-ask step-up) */
+        delete: operations["remove_passkey"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/me/security": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** My passkeys and step-up state (ADR-0073) */
+        get: operations["me_security"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/me/step-up": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Confirm a step-up with a passkey (ADR-0073 §4) */
+        post: operations["step_up_confirm"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/me/step-up/options": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Begin a step-up: a challenge that opens a 5-minute window (ADR-0073 §4) */
+        post: operations["step_up_options"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/orgs/{org}/bindings": {
         parameters: {
             query?: never;
@@ -2730,6 +2832,30 @@ export interface components {
             /** @description Stable, forge-agnostic identity subject. */
             subject: string;
         };
+        /** @description `GET /v1/me/security`. */
+        MeSecurityResponse: {
+            /**
+             * @description No usable passkey yet, and this browser session's login is fresh
+             *     enough to enroll the first one.
+             */
+            can_enroll_first: boolean;
+            /**
+             * Format: int64
+             * @description Until when this session's login is fresh (a browser login only).
+             */
+            fresh_login_until?: number | null;
+            /** @description Holds at least one usable (not clone-flagged) passkey. */
+            has_passkey: boolean;
+            passkeys: components["schemas"]["PasskeyDto"][];
+            /** @description `enforce` or `off`. */
+            step_up: string;
+            subject: string;
+            /**
+             * Format: int64
+             * @description This browser session's open window, if any (unix ms).
+             */
+            window_expires_at?: number | null;
+        };
         /**
          * @description `POST /v1/orgs/{org}/tokens` body. Every field is required on purpose: a
          *     credential with no verb and no expiry is the shape this repo already learned
@@ -2777,6 +2903,19 @@ export interface components {
              */
             now?: string | null;
         };
+        /**
+         * @description What a human is asked to confirm: the server-rendered, redacted
+         *     description of one operation (shown in the 403, on the confirm page and
+         *     in the event log).
+         */
+        OpSummary: {
+            /** @description What changes, one line each. Redacted fields read `(hidden)`. */
+            changes: string[];
+            /** @description What is being done ("Write a secret"). */
+            operation: string;
+            /** @description What it is done to ("acme/web/prod/DB_PASSWORD"). */
+            target: string;
+        };
         /** @description An org-level Environment in its minimal shape (ADR-0071, MMP step 1). */
         OrgEnvironmentDto: {
             /**
@@ -2812,6 +2951,33 @@ export interface components {
             updated_at: number;
             /** @description Who last wrote it (a Principal subject). */
             updated_by: string;
+        };
+        /** @description One of the caller's passkeys. */
+        PasskeyDto: {
+            /** @description The credential may be synced to other devices (BE). */
+            backup_eligible: boolean;
+            /** @description It is backed up / synced, as last seen (BS). */
+            backup_state: boolean;
+            /** @description Its signature counter went backwards: it is never accepted again. */
+            clone_suspected: boolean;
+            /** Format: int64 */
+            created_at: number;
+            id: string;
+            label: string;
+            /** Format: int64 */
+            last_used_at?: number | null;
+            transports: string[];
+        };
+        /** @description `POST /v1/me/passkeys/registration/options`. */
+        PasskeyRegistrationOptionsRequest: {
+            /** @description A name for the passkey ("MacBook Touch ID"). Default `Passkey`. */
+            label?: string | null;
+        };
+        /** @description `POST /v1/me/passkeys/registration`. */
+        PasskeyRegistrationRequest: {
+            challenge_id: string;
+            /** @description `RegistrationResponseJSON` — `PublicKeyCredential.toJSON()`. */
+            credential: Record<string, never>;
         };
         /**
          * @description `GET /v1/repos/{org}/{repo}/pipelines?ref=` body: the manually-dispatchable
@@ -3711,6 +3877,57 @@ export interface components {
              */
             uses?: string[];
         };
+        /** @description `POST /v1/me/step-up`. */
+        StepUpConfirmRequest: {
+            challenge_id: string;
+            /** @description `AuthenticationResponseJSON` — `PublicKeyCredential.toJSON()`. */
+            credential: Record<string, never>;
+        };
+        /** @description A StepUpConfirmation just made. */
+        StepUpConfirmResponse: {
+            confirmation_id: string;
+            /** Format: int64 */
+            confirmed_at: number;
+            /**
+             * Format: int64
+             * @description Fixed at `confirmed_at` + 5 minutes; never extended.
+             */
+            expires_at: number;
+            /** @description `window` or `action`. */
+            kind: string;
+        };
+        /** @description The body of a `403 step_up_required` (ADR-0073 §5). */
+        StepUpRefusal: {
+            challenge?: null | components["schemas"]["WebauthnChallengeDto"];
+            /** @description Always `step_up_required`. */
+            code: string;
+            /**
+             * @description An API token or Bearer-session caller: the one-time link its human
+             *     confirms this exact operation at (ADR-0073 §6).
+             */
+            confirmation_url?: string | null;
+            /** @description Mode `enroll`: where to enroll a passkey. */
+            enroll_url?: string | null;
+            /** Format: int64 */
+            expires_at?: number | null;
+            /**
+             * Format: int64
+             * @description Mode `enroll`: until when this session's login is fresh enough to
+             *     enroll a first passkey (absent = it is not; log in again).
+             */
+            fresh_login_until?: number | null;
+            message: string;
+            /**
+             * @description `window` (a 5-minute window will do), `action` (confirm this exact
+             *     action) or `enroll` (no passkey yet).
+             */
+            mode: string;
+            /** @description The operation id (`secret.put`). */
+            op: string;
+            request_id?: string | null;
+            /** @description What is being confirmed, redacted. */
+            summary: components["schemas"]["OpSummary"];
+        };
         /** @description What an uninstall removed. */
         UninstalledPluginDto: {
             name: string;
@@ -3736,6 +3953,21 @@ export interface components {
              */
             reports: number;
             vendor_grouping: string;
+        };
+        /** @description A WebAuthn challenge ready for `navigator.credentials.*`. */
+        WebauthnChallengeDto: {
+            /**
+             * Format: int64
+             * @description Unix ms after which the challenge is refused.
+             */
+            expires_at: number;
+            /** @description Pass back with the credential. */
+            id: string;
+            /**
+             * @description `PublicKeyCredentialRequestOptionsJSON` (or `…CreationOptionsJSON`
+             *     for enrollment) — feed it to `parse*OptionsFromJSON`.
+             */
+            public_key: Record<string, never>;
         };
         /**
          * @description One entry in a workspace directory listing — the merkle-tree children under a
@@ -3896,7 +4128,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description session + CSRF cookies set; redirect to / */
+            /** @description session + CSRF cookies set; redirect to the login's `next`, else / */
             302: {
                 headers: {
                     [name: string]: unknown;
@@ -3917,6 +4149,8 @@ export interface operations {
             query?: {
                 /** @description login provider id (ADR-0069); default = the only, or the unqualified_ids, provider */
                 provider?: string;
+                /** @description a relative path to land on after the callback (ADR-0073); default `/` */
+                next?: string;
             };
             header?: never;
             path?: never;
@@ -3931,7 +4165,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description unknown provider, or several and none named */
+            /** @description unknown provider, several and none named, or a `next` that is not a relative path */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -4482,6 +4716,234 @@ export interface operations {
             };
             /** @description not linked, or the only way to sign in */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    passkey_registration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PasskeyRegistrationRequest"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PasskeyDto"];
+                };
+            };
+            /** @description challenge unknown/used/expired, or the credential failed verification (`code` names the check) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description step-up is off */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description this credential is already registered */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    passkey_registration_options: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PasskeyRegistrationOptionsRequest"];
+            };
+        };
+        responses: {
+            /** @description PublicKeyCredentialCreationOptionsJSON under `public_key` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebauthnChallengeDto"];
+                };
+            };
+            /** @description `fresh_login_required` (a first passkey needs a browser login from the last 5 minutes), `step_up_required` (a later passkey is always-ask), or not a browser session */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description step-up is off */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    remove_passkey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description passkey id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `step_up_required` (mode `action`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such passkey of yours, or step-up is off */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    me_security: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MeSecurityResponse"];
+                };
+            };
+            /** @description not signed in */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    step_up_confirm: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["StepUpConfirmRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpConfirmResponse"];
+                };
+            };
+            /** @description challenge unknown/used/expired/another session's, unknown credential, or the assertion failed verification (`code` names the check) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `clone_suspected`: the passkey's counter went backwards and it is now refused for good; or not a browser session */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description step-up is off */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    step_up_options: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description PublicKeyCredentialRequestOptionsJSON under `public_key` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebauthnChallengeDto"];
+                };
+            };
+            /** @description `no_passkey`: enroll one first */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a browser session */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description step-up is off */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
