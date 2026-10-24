@@ -27,6 +27,10 @@ pub const SETUP_LOGIN_PATH: &str = "/v1/auth/login?next=%2Faccount%2Fsecurity%3F
 /// How often `security setup` asks whether the passkey exists yet.
 const POLL_EVERY: Duration = Duration::from_secs(2);
 
+/// The longest any one API request may take: a hung server must not hang
+/// the CLI (or `security setup`'s wait) forever.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Debug, Subcommand)]
 pub enum SecurityCommand {
     /// Make sure you hold a passkey: if not, log in in a browser, enroll one,
@@ -81,7 +85,10 @@ pub struct Api {
 impl Api {
     pub fn new(server: &str, token: &Option<String>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             base: server.trim_end_matches('/').to_string(),
             token: token.clone(),
         }
@@ -99,26 +106,72 @@ impl Api {
     /// GET `path` and parse the JSON answer. Any failure is printed (see
     /// [`print_failure`]) and comes back as the exit code to use.
     pub async fn get_json(&self, path: &str) -> Result<Value, i32> {
+        self.try_get_json(path).await.map_err(|f| {
+            f.print(path, &self.base);
+            1
+        })
+    }
+
+    /// GET `path` and parse the JSON answer; a failure comes back unprinted,
+    /// so a caller that retries can decide what is worth giving up on.
+    async fn try_get_json(&self, path: &str) -> Result<Value, GetFailure> {
         let url = self.url(path);
         let mut req = self.client.get(&url);
         if let Some(t) = &self.token {
             req = req.bearer_auth(t);
         }
-        let resp = req.send().await.map_err(|e| {
-            eprintln!("error: request to {url} failed: {e}");
-            1
-        })?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| GetFailure::Transport(format!("request to {url} failed: {e}")))?;
         let status = resp.status().as_u16();
         let text = resp.text().await.unwrap_or_default();
         if !(200..300).contains(&status) {
-            print_failure(&format!("GET {path}"), &self.base, status, &text);
-            return Err(1);
+            return Err(GetFailure::Status(status, text));
         }
-        serde_json::from_str(&text).map_err(|e| {
-            eprintln!("error: GET {path}: not JSON: {e}");
-            1
-        })
+        serde_json::from_str(&text)
+            .map_err(|e| GetFailure::Transport(format!("GET {path}: not JSON: {e}")))
     }
+}
+
+/// Why a GET did not produce JSON.
+enum GetFailure {
+    /// No answer, or an unreadable one.
+    Transport(String),
+    /// A non-2xx answer: its status and body.
+    Status(u16, String),
+}
+
+impl GetFailure {
+    fn print(&self, path: &str, server: &str) {
+        match self {
+            GetFailure::Transport(why) => eprintln!("error: {}", sanitize(why)),
+            GetFailure::Status(status, body) => {
+                print_failure(&format!("GET {path}"), server, *status, body)
+            }
+        }
+    }
+
+    /// Only "you are not (or no longer) allowed" ends a wait early; a
+    /// network blip or a 5xx is worth asking again.
+    fn is_final(&self) -> bool {
+        matches!(self, GetFailure::Status(401 | 403, _))
+    }
+}
+
+/// `s` with every control character written as `\u{XX}`: a server string
+/// (another member's label, an Org name, a refusal's target) printed raw
+/// could carry terminal escape sequences.
+pub fn sanitize(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_control() {
+            out.push_str(&format!("\\u{{{:02X}}}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Report a non-2xx API answer on stderr. Step-up refusals get guidance a
@@ -130,7 +183,7 @@ pub fn print_failure(what: &str, server: &str, status: u16, body: &str) {
             "{what} failed (401): not signed in — pass --token (or set SCARAB_TOKEN) to an API \
              token or a session id"
         ),
-        None => eprintln!("{what} failed ({status}): {}", body.trim()),
+        None => eprintln!("{what} failed ({status}): {}", sanitize(body.trim())),
     }
 }
 
@@ -141,22 +194,24 @@ pub fn refusal_guidance(server: &str, status: u16, body: &str) -> Option<String>
         return None;
     }
     let v: Value = serde_json::from_str(body).ok()?;
-    let message = v["message"].as_str().unwrap_or_default();
+    let message = &sanitize(v["message"].as_str().unwrap_or_default());
     match v["code"].as_str()? {
         "step_up_required" => {
             let what = match (
                 v["summary"]["operation"].as_str(),
                 v["summary"]["target"].as_str(),
             ) {
-                (Some(op), Some(target)) if !target.is_empty() => format!("{op} ({target})"),
-                (Some(op), _) => op.to_string(),
-                _ => v["op"].as_str().unwrap_or("this operation").to_string(),
+                (Some(op), Some(target)) if !target.is_empty() => {
+                    format!("{} ({})", sanitize(op), sanitize(target))
+                }
+                (Some(op), _) => sanitize(op),
+                _ => sanitize(v["op"].as_str().unwrap_or("this operation")),
             };
             let mut out = format!("{what} needs a step-up confirmation.\n");
             if let Some(url) = v["confirmation_url"].as_str() {
                 out.push_str(&format!(
                     "This needs your confirmation in a browser: {}",
-                    absolute(server, url)
+                    sanitize(&absolute(server, url))
                 ));
                 if let Some(at) = v["expires_at"].as_i64() {
                     out.push_str(&format!(" (expires {})", fmt_ms(at)));
@@ -176,7 +231,10 @@ pub fn refusal_guidance(server: &str, status: u16, body: &str) -> Option<String>
         "fresh_login_required" => {
             let mut out = message.to_string();
             if let Some(url) = v["login_url"].as_str() {
-                out.push_str(&format!("\nLog in again at: {}", absolute(server, url)));
+                out.push_str(&format!(
+                    "\nLog in again at: {}",
+                    sanitize(&absolute(server, url))
+                ));
             }
             Some(out)
         }
@@ -249,7 +307,7 @@ async fn setup(args: SetupArgs) -> i32 {
         return 0;
     }
 
-    let subject = me["subject"].as_str().unwrap_or("?");
+    let subject = &sanitize(me["subject"].as_str().unwrap_or("?"));
     let url = api.url(SETUP_LOGIN_PATH);
     println!("You have no passkey yet. This CLI acts for `{subject}`: sign in as that account.");
     println!("Log in and enroll a passkey at:");
@@ -271,9 +329,14 @@ async fn setup(args: SetupArgs) -> i32 {
             return 1;
         }
         tokio::time::sleep(left.min(POLL_EVERY)).await;
-        let me = match api.get_json("/v1/me/security").await {
+        let me = match api.try_get_json("/v1/me/security").await {
             Ok(v) => v,
-            Err(code) => return code,
+            Err(f) if f.is_final() => {
+                f.print("/v1/me/security", api.base());
+                return 1;
+            }
+            // A network blip or a 5xx: keep waiting until the deadline.
+            Err(_) => continue,
         };
         if me["has_passkey"] == true {
             println!("passkey enrolled: {} passkey(s)", passkey_count(&me));
@@ -315,7 +378,7 @@ async fn status(conn: Conn) -> i32 {
         Ok(v) => v,
         Err(code) => return code,
     };
-    println!("subject: {}", me["subject"].as_str().unwrap_or("?"));
+    println!("subject: {}", sanitize(me["subject"].as_str().unwrap_or("?")));
     if step_up_off(&me) {
         println!("step-up: off on this server (dev-insecure) — nothing is enforced");
         return 0;
@@ -332,8 +395,8 @@ async fn status(conn: Conn) -> i32 {
                 .map_or_else(|| "never".to_string(), fmt_ms);
             let mut line = format!(
                 "  - {}  (id {}, added {}, last used {})",
-                p["label"].as_str().unwrap_or("?"),
-                p["id"].as_str().unwrap_or("?"),
+                sanitize(p["label"].as_str().unwrap_or("?")),
+                sanitize(p["id"].as_str().unwrap_or("?")),
                 p["created_at"].as_i64().map_or_else(|| "?".into(), fmt_ms),
                 last,
             );
@@ -381,6 +444,7 @@ fn print_org(org: &str, s: &Value) {
         .map(|a| a.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
     println!();
+    let org = sanitize(org);
     println!(
         "org {org} (you are owner): {} admin(s), {} without a passkey",
         s["admins_total"].as_u64().unwrap_or(0),
@@ -389,7 +453,7 @@ fn print_org(org: &str, s: &Value) {
     if !without.is_empty() {
         println!("  admins without a passkey (every crown jewel is refused for them):");
         for a in &without {
-            println!("    - {a}");
+            println!("    - {}", sanitize(a));
         }
     }
     let refusals = s["recent_refusals"].as_array().cloned().unwrap_or_default();
@@ -401,10 +465,10 @@ fn print_org(org: &str, s: &Value) {
             println!(
                 "    - {}  {}  {}  {}  via {}",
                 r["at"].as_i64().map_or_else(|| "?".into(), fmt_ms),
-                r["subject"].as_str().unwrap_or("?"),
-                r["op"].as_str().unwrap_or("?"),
-                r["target"].as_str().unwrap_or(""),
-                r["caller"].as_str().unwrap_or("?"),
+                sanitize(r["subject"].as_str().unwrap_or("?")),
+                sanitize(r["op"].as_str().unwrap_or("?")),
+                sanitize(r["target"].as_str().unwrap_or("")),
+                sanitize(r["caller"].as_str().unwrap_or("?")),
             );
         }
     }
@@ -441,6 +505,21 @@ mod tests {
             g.contains("https://ci.example.com/v1/auth/login?next=/account/security%3Fenroll%3D1"),
             "{g}"
         );
+    }
+
+    #[test]
+    fn sanitize_defuses_terminal_escapes() {
+        let s = sanitize("a\x1b]52;x\x07b");
+        assert!(!s.contains('\x1b') && !s.contains('\x07'), "{s}");
+        assert_eq!(s, "a\\u{1B}]52;x\\u{07}b");
+        let body = serde_json::json!({
+            "code": "step_up_required",
+            "message": "m",
+            "summary": {"operation": "Write a secret", "target": "evil\x1b[2Jorg"},
+        })
+        .to_string();
+        let g = refusal_guidance("http://s", 403, &body).unwrap();
+        assert!(!g.contains('\x1b'), "{g}");
     }
 
     #[test]
