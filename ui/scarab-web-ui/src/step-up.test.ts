@@ -4,14 +4,17 @@
 // responses are real `Response`s.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  MAX_STEP_UP_FREE_RETRIES,
   MAX_STEP_UP_ROUNDS,
   askStepUp,
+  confirmOnce,
   errorMessage,
   parseStepUp,
   shareCeremony,
   stepUpPrompt,
   withStepUp,
   type Ceremony,
+  type CeremonyAnswer,
   type StepUpRequired,
 } from "./step-up";
 
@@ -71,13 +74,15 @@ describe("parseStepUp", () => {
 });
 
 describe("withStepUp", () => {
-  const counting = (answers: boolean[]) => {
+  const counting = (answers: CeremonyAnswer[]) => {
     const seen: StepUpRequired[] = [];
-    const ceremony: Ceremony = async (r) => {
+    const notes: (string | undefined)[] = [];
+    const ceremony: Ceremony = async (r, note) => {
       seen.push(r);
+      notes.push(note);
       return answers.shift() ?? false;
     };
-    return { ceremony, seen };
+    return { ceremony, seen, notes };
   };
 
   it("confirms once and retries the request once", async () => {
@@ -129,6 +134,36 @@ describe("withStepUp", () => {
     expect(retry).toHaveBeenCalledTimes(MAX_STEP_UP_ROUNDS);
   });
 
+  // git-bug 7a01b1c: the server consumes a challenge before it verifies the
+  // assertion, so a refused confirmation can never be retried over the same
+  // challenge. The dialog answers `{ reissue }`; the loop re-sends the request
+  // for a FRESH challenge, tells the reopened dialog why, and spends no round
+  // on it — a window-then-action op still gets both of its rounds.
+  it("a server refusal re-sends the request for a fresh challenge and spends no round", async () => {
+    const fresh = { ...challenge, id: "ch-2" };
+    const { ceremony, seen, notes } = counting([{ reissue: "the signature did not verify" }, true, true]);
+    const answers = [
+      res403(refusalBody("window", { challenge: fresh })),
+      res403(refusalBody("action", { challenge: { ...challenge, id: "ch-3" } })),
+      ok(),
+    ];
+    const retry = vi.fn(async () => answers.shift()!);
+    const res = await withStepUp(res403(refusalBody("window")), retry, ceremony);
+    expect(res.status).toBe(200);
+    expect(seen.map((r) => r.challenge?.id)).toEqual(["ch-1", "ch-2", "ch-3"]);
+    expect(notes).toEqual([undefined, "the signature did not verify", undefined]);
+    expect(retry).toHaveBeenCalledTimes(3);
+  });
+
+  it("free retries are bounded too", async () => {
+    const { ceremony, seen } = counting(Array(20).fill({ reissue: "no" }));
+    const retry = vi.fn(async () => res403(refusalBody("window")));
+    const res = await withStepUp(res403(refusalBody("window")), retry, ceremony);
+    expect(res.status).toBe(403);
+    expect(seen).toHaveLength(MAX_STEP_UP_FREE_RETRIES);
+    expect(retry).toHaveBeenCalledTimes(MAX_STEP_UP_FREE_RETRIES);
+  });
+
   it("passes any other 403 straight through", async () => {
     const ceremony = vi.fn(async () => true);
     const first = res403("insufficient role");
@@ -169,6 +204,83 @@ describe("shareCeremony", () => {
   });
 });
 
+describe("a shared ceremony spends none of the sharer's rounds (git-bug 7a01b1c)", () => {
+  it("a sharer that then needs a window AND its own action still gets both", async () => {
+    let release!: (v: CeremonyAnswer) => void;
+    let calls = 0;
+    const run: Ceremony = () => {
+      calls++;
+      // The first ceremony (A's action) stays on screen until released; every
+      // later one is the human confirming at once.
+      return calls === 1 ? new Promise<CeremonyAnswer>((r) => (release = r)) : Promise.resolve(true);
+    };
+    const shared = shareCeremony(run);
+    const aFirst = res403(refusalBody("action"));
+    const a = withStepUp(aFirst, async () => ok(), shared);
+    // B is refused while A's dialog is open: it waits on A's answer.
+    const bAnswers = [
+      res403(refusalBody("window")), // A's action covered nothing of B's
+      res403(refusalBody("action")),
+      ok(),
+    ];
+    const bRetry = vi.fn(async () => bAnswers.shift()!);
+    const b = withStepUp(res403(refusalBody("window")), bRetry, shared);
+    await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+    release(true);
+    expect((await a).status).toBe(200);
+    expect((await b).status).toBe(200);
+    expect(bRetry).toHaveBeenCalledTimes(3);
+    expect(calls).toBe(3);
+  });
+
+  it("the sharer is told the answer was shared; the owner gets its own", async () => {
+    let release!: (v: CeremonyAnswer) => void;
+    const shared = shareCeremony(() => new Promise<CeremonyAnswer>((r) => (release = r)));
+    const r = parseStepUp(refusalBody("window")) as StepUpRequired;
+    const owner = shared(r);
+    const sharer = shared(r);
+    release({ reissue: "spent" });
+    expect(await owner).toEqual({ reissue: "spent" });
+    expect(await sharer).toBe("shared");
+  });
+});
+
+describe("confirmOnce: which failure may reuse the challenge (git-bug 7a01b1c)", () => {
+  const ch = { id: "ch-1", public_key: { challenge: "AAAA" }, expires_at: 0 };
+  const browserError = (e: unknown) => `browser: ${(e as Error).message}`;
+
+  it("a dismissed passkey prompt never reached the server: try the same challenge again", async () => {
+    const confirm = vi.fn(async () => ({}));
+    const out = await confirmOnce(ch, {
+      assert: async () => {
+        throw new Error("dismissed");
+      },
+      confirm,
+      browserError,
+    });
+    expect(out).toEqual({ kind: "retry", error: "browser: dismissed" });
+    expect(confirm).not.toHaveBeenCalled();
+  });
+
+  it("a server refusal spent the challenge: ask for a fresh one, with the server's reason", async () => {
+    const out = await confirmOnce(ch, {
+      assert: async () => ({ id: "cred" }),
+      confirm: async () => {
+        throw new Error("the step-up challenge is unknown, used, or expired");
+      },
+      browserError,
+    });
+    expect(out).toEqual({ kind: "reissue", error: "the step-up challenge is unknown, used, or expired" });
+  });
+
+  it("an accepted confirmation is confirmed", async () => {
+    const confirm = vi.fn(async () => ({}));
+    const out = await confirmOnce(ch, { assert: async () => ({ id: "cred" }), confirm, browserError });
+    expect(out).toEqual({ kind: "confirmed" });
+    expect(confirm).toHaveBeenCalledWith("ch-1", { id: "cred" });
+  });
+});
+
 describe("the dialog's state", () => {
   afterEach(() => stepUpPrompt()?.settle(false));
 
@@ -179,6 +291,14 @@ describe("the dialog's state", () => {
     stepUpPrompt()!.settle(true);
     expect(await answer).toBe(true);
     expect(stepUpPrompt()).toBeNull();
+  });
+
+  it("a reopened prompt carries the reason the last confirmation was refused", async () => {
+    const refusal = parseStepUp(refusalBody("window")) as StepUpRequired;
+    const answer = askStepUp(refusal, "the signature did not verify");
+    expect(stepUpPrompt()?.note).toBe("the signature did not verify");
+    stepUpPrompt()!.settle({ reissue: "again" });
+    expect(await answer).toEqual({ reissue: "again" });
   });
 });
 

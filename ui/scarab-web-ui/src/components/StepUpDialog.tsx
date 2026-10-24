@@ -10,28 +10,42 @@
 //
 // Cancel closes with `false`, and the caller gets the original 403 — the page
 // that made the call shows its usual error.
+//
+// A failed confirm splits two ways (`confirmOnce`): a dismissed or timed-out
+// passkey prompt never reached the server, so "Try again" over the same
+// challenge is real; a refusal FROM the server spent the challenge, so the
+// dialog closes with `{ reissue }` and the client re-sends the request for a
+// fresh one — the dialog reopens with the server's reason shown.
 import { For, Show, createSignal } from "solid-js";
 import { A } from "@solidjs/router";
 import { confirmStepUp } from "../api/client";
-import { stepUpPrompt, stepUpScope, stepUpTitle } from "../step-up";
+import {
+  confirmOnce,
+  stepUpPrompt,
+  stepUpScope,
+  stepUpTitle,
+  type CeremonyAnswer,
+} from "../step-up";
 import { getAssertion, webauthnAvailable, webauthnErrorText } from "../webauthn";
 import Icon from "./Icon";
 
 export default function StepUpDialog() {
   return (
     <Show when={stepUpPrompt()} keyed>
-      {(p) => <StepUpModal refusal={p.refusal} settle={p.settle} />}
+      {(p) => <StepUpModal refusal={p.refusal} note={p.note} settle={p.settle} />}
     </Show>
   );
 }
 
 function StepUpModal(props: {
   refusal: NonNullable<ReturnType<typeof stepUpPrompt>>["refusal"];
-  settle: (confirmed: boolean) => void;
+  note?: string;
+  settle: (answer: CeremonyAnswer) => void;
 }) {
   const r = () => props.refusal;
   const [busy, setBusy] = createSignal(false);
-  const [error, setError] = createSignal<string | null>(null);
+  // A reopened dialog starts with the reason the last confirmation was refused.
+  const [error, setError] = createSignal<string | null>(props.note ?? null);
   const canConfirm = () => r().mode !== "enroll" && !!r().challenge;
 
   const confirm = async () => {
@@ -39,19 +53,26 @@ function StepUpModal(props: {
     if (!challenge) return;
     setBusy(true);
     setError(null);
-    try {
-      if (!webauthnAvailable()) {
-        throw new Error(
-          "This browser cannot use passkeys here (passkeys need https, or localhost).",
-        );
-      }
-      const credential = await getAssertion(challenge.public_key);
-      await confirmStepUp(challenge.id, credential);
+    const outcome = await confirmOnce(challenge, {
+      assert: async (publicKey) => {
+        if (!webauthnAvailable()) {
+          throw new Error(
+            "This browser cannot use passkeys here (passkeys need https, or localhost).",
+          );
+        }
+        return getAssertion(publicKey);
+      },
+      confirm: confirmStepUp,
+      browserError: webauthnErrorText,
+    });
+    if (outcome.kind === "confirmed") {
       props.settle(true);
-    } catch (e) {
-      // A dismissed prompt leaves the challenge unused, so trying again is
-      // real; a server refusal is shown verbatim (it names the failed check).
-      setError(webauthnErrorText(e));
+    } else if (outcome.kind === "reissue") {
+      // The server spent this challenge: ask the client for a fresh one.
+      props.settle({ reissue: outcome.error });
+    } else {
+      // A dismissed prompt leaves the challenge unused: trying again is real.
+      setError(outcome.error);
       setBusy(false);
     }
   };

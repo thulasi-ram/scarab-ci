@@ -133,12 +133,29 @@ export async function readStepUp(res: Response): Promise<StepUpParsed | null> {
 }
 
 /**
- * Run the confirmation for one refusal: `true` once the server has accepted a
- * StepUpConfirmation (retry the request), `false` if the human cancelled or it
- * cannot be done here (enroll mode, no challenge) — the caller then gets the
- * original 403.
+ * A ceremony's answer for one refusal:
+ * - `true`: the server accepted a StepUpConfirmation for THIS refusal — retry
+ *   the request; that spends one of its rounds;
+ * - `false`: the human cancelled, or it cannot be done here (enroll mode, no
+ *   challenge) — the caller gets the original 403;
+ * - `"shared"`: this refusal waited on a ceremony another refusal had on
+ *   screen (`shareCeremony`) and that one did not cancel — retry, but spend NO
+ *   round: nothing was confirmed for this request, and counting it would starve
+ *   a request that needs a window then its own action (git-bug 7a01b1c);
+ * - `{ reissue }`: the server refused the confirmation. Its challenge is spent
+ *   (the server consumes a challenge before it verifies the assertion), so
+ *   "try again" over it can never succeed: re-send the original request for a
+ *   fresh refusal with a fresh challenge, and show `reissue` — the server's
+ *   reason — when the dialog opens again. Spends no round either.
  */
-export type Ceremony = (refusal: StepUpRequired) => Promise<boolean>;
+export type CeremonyAnswer = boolean | "shared" | { reissue: string };
+
+/**
+ * Run the confirmation for one refusal. `note` is the reason the previous
+ * confirmation for this same request was refused (a `{ reissue }` answer), so
+ * the reopened dialog can say why it is asking again.
+ */
+export type Ceremony = (refusal: StepUpRequired, note?: string) => Promise<CeremonyAnswer>;
 
 /**
  * How many confirm-and-retry rounds one request gets. Two, because a window
@@ -151,6 +168,13 @@ export type Ceremony = (refusal: StepUpRequired) => Promise<boolean>;
 export const MAX_STEP_UP_ROUNDS = 2;
 
 /**
+ * How many retries one request gets that spend no round (`"shared"` and
+ * `{ reissue }` answers). Each of those is driven by a human answering a
+ * dialog, so this is a backstop against a loop, not a policy.
+ */
+export const MAX_STEP_UP_FREE_RETRIES = 5;
+
+/**
  * The retry loop. `first` is the response to the original request; `retry`
  * re-sends that same request (a fresh copy each time — a body can be read
  * once). Anything other than a step-up refusal is returned untouched.
@@ -161,13 +185,23 @@ export async function withStepUp(
   ceremony: Ceremony,
 ): Promise<Response> {
   let current = first;
-  for (let round = 0; round < MAX_STEP_UP_ROUNDS; round++) {
+  let rounds = 0;
+  let free = 0;
+  let note: string | undefined;
+  for (;;) {
     const refusal = await readStepUp(current);
     if (!refusal || refusal.code !== "step_up_required") return current;
-    if (!(await ceremony(refusal))) return current;
+    if (rounds >= MAX_STEP_UP_ROUNDS || free >= MAX_STEP_UP_FREE_RETRIES) return current;
+    const answer = await ceremony(refusal, note);
+    if (answer === false) return current;
+    note = undefined;
+    if (answer === true) rounds++;
+    else {
+      free++;
+      if (typeof answer === "object") note = answer.reissue;
+    }
     current = await retry();
   }
-  return current;
 }
 
 /**
@@ -176,18 +210,59 @@ export async function withStepUp(
  * dialog. A page that fires three saves at once gets one prompt; with a
  * window confirmation all three retries pass, and a request that needed
  * something else (its own action) is refused again on retry and gets its own
- * round then. A cancel answers every sharer with its own original 403.
+ * round then — the shared answer spent none of its rounds (`"shared"`). A
+ * cancel answers every sharer with its own original 403.
  */
 export function shareCeremony(run: Ceremony): Ceremony {
-  let inflight: Promise<boolean> | null = null;
-  return (refusal) => {
-    if (inflight) return inflight;
-    const p = run(refusal).finally(() => {
+  let inflight: Promise<CeremonyAnswer> | null = null;
+  return (refusal, note) => {
+    if (inflight) return inflight.then((a) => (a === false ? false : "shared"));
+    const p = run(refusal, note).finally(() => {
       if (inflight === p) inflight = null;
     });
     inflight = p;
     return p;
   };
+}
+
+/** What one press of "Confirm with passkey" came to. */
+export type ConfirmOutcome =
+  | { kind: "confirmed" }
+  /** The browser side failed (prompt dismissed, timed out, no passkey API):
+   * the challenge was never sent, so trying again over it is real. */
+  | { kind: "retry"; error: string }
+  /** The server refused the confirmation: the challenge is spent, so the
+   * dialog closes with `{ reissue: error }` for a fresh one. */
+  | { kind: "reissue"; error: string };
+
+/**
+ * The dialog's confirm press, minus the DOM: get an assertion over the
+ * challenge, then post it. Which of the two failed decides whether the same
+ * challenge can be tried again.
+ */
+export async function confirmOnce(
+  challenge: StepUpChallenge,
+  io: {
+    assert: (publicKey: Record<string, unknown>) => Promise<Record<string, unknown>>;
+    confirm: (challengeId: string, credential: Record<string, unknown>) => Promise<unknown>;
+    browserError: (e: unknown) => string;
+  },
+): Promise<ConfirmOutcome> {
+  let credential: Record<string, unknown>;
+  try {
+    credential = await io.assert(challenge.public_key);
+  } catch (e) {
+    return { kind: "retry", error: io.browserError(e) };
+  }
+  try {
+    await io.confirm(challenge.id, credential);
+  } catch (e) {
+    return {
+      kind: "reissue",
+      error: e instanceof Error && e.message ? e.message : "The confirmation was refused.",
+    };
+  }
+  return { kind: "confirmed" };
 }
 
 // --- the dialog's state ---------------------------------------------------
@@ -198,8 +273,10 @@ export function shareCeremony(run: Ceremony): Ceremony {
 
 export type StepUpPrompt = {
   refusal: StepUpRequired;
-  /** Close the dialog: `true` once the server accepted the confirmation. */
-  settle: (confirmed: boolean) => void;
+  /** Why the previous confirmation for this request was refused, if it was. */
+  note?: string;
+  /** Close the dialog with the ceremony's answer (`CeremonyAnswer`). */
+  settle: (answer: CeremonyAnswer) => void;
 };
 
 const [stepUpPrompt, setStepUpPrompt] = createSignal<StepUpPrompt | null>(null);
@@ -208,16 +285,17 @@ export { stepUpPrompt };
 /** Open the dialog for `refusal`; resolves with the human's answer. The
  * dialog does the passkey ceremony itself — it needs the click (browsers
  * demand a user gesture for `navigator.credentials.get`). */
-export function askStepUp(refusal: StepUpRequired): Promise<boolean> {
+export function askStepUp(refusal: StepUpRequired, note?: string): Promise<CeremonyAnswer> {
   return new Promise((resolve) => {
     let done = false;
     setStepUpPrompt({
       refusal,
-      settle: (confirmed) => {
+      note,
+      settle: (answer) => {
         if (done) return;
         done = true;
         setStepUpPrompt(null);
-        resolve(confirmed);
+        resolve(answer);
       },
     });
   });
