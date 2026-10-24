@@ -2653,9 +2653,15 @@ dependencies = [
 name = "scarab-cli"
 version = "0.1.1"
 dependencies = [
+ "axum",
  "clap",
  "reqwest",
+ "scarab-forge",
+ "scarab-identity",
  "scarab-pipeline",
+ "scarab-server",
+ "scarab-testkit",
+ "scarab-webauthn",
  "serde_json",
  "tokio",
 ]
