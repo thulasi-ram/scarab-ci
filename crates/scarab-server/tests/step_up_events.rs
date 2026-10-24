@@ -611,3 +611,28 @@ async fn the_break_glass_refuses_an_unmigrated_database() {
     assert_eq!(pg.schema_version().await.unwrap(), None);
     tdb.cleanup().await;
 }
+
+/// A first passkey refused for a stale login is a refusal like any other:
+/// recorded, with who and what for.
+#[tokio::test]
+async fn a_stale_login_s_enrollment_refusal_is_recorded() {
+    let h = harness();
+    let s = h.browser_session(scoped("bob")).await;
+    h.clock.advance(6 * 60 * 1000);
+    let (st, b) = h
+        .cookie(
+            "POST",
+            "/v1/me/passkeys/registration/options",
+            Some(json!({"label": "Laptop"})),
+            &s,
+        )
+        .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{b}");
+    assert_eq!(b["code"], "fresh_login_required");
+    let refused = h.events("step_up.refused").await;
+    assert_eq!(refused.len(), 1);
+    assert_eq!(refused[0].subject, "bob");
+    assert_eq!(refused[0].caller, "session:cookie");
+    assert_eq!(refused[0].op.as_deref(), Some("passkey.add"));
+    assert_eq!(refused[0].detail["reason"], "fresh login required");
+}

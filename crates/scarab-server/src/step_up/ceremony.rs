@@ -288,6 +288,19 @@ pub(crate) async fn passkey_registration_options(
         // The FIRST usable passkey: a valid session is not enough (a stolen
         // one could enroll the thief's passkey), only a fresh browser login.
         if !facts.fresh_login_until.is_some_and(|t| t > now) {
+            // A refusal like any other (ADR-0073 §7): who, and what for.
+            let mut ev = event(
+                kind::STEP_UP_REFUSED,
+                subject,
+                caller.event_label(),
+                None,
+                now,
+            );
+            ev.op = Some(ctx.op.id.to_string());
+            ev.target = Some(label.clone());
+            ev.session_hash = Some(facts.id_hash.clone());
+            ev.detail = serde_json::json!({ "mode": "enroll", "reason": "fresh login required" });
+            svc.record(ev).await;
             return Err(ApiError::FreshLoginRequired);
         }
         ctx.exempt("first passkey: gated by a fresh browser login instead");
