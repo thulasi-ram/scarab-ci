@@ -2625,9 +2625,9 @@ impl<'a> Scheduler<'a> {
                 // every step Pod and left the run's services running forever:
                 // `reconcile_services`' terminal-teardown arm only visits runs in
                 // the ACTIVE set, and a cancelled run has already left it, so no
-                // later tick would collect them. The automated cancel paths
-                // (concurrency auto-cancel / supersede, via `cancel_run`) call
-                // `teardown_services` inline, which is why only this one leaked.
+                // later tick would collect them. The concurrency auto-cancel
+                // (`cancel_run`) also tries `teardown_services` inline, once,
+                // and writes this same intent so a failed try is retried here.
                 //
                 // Deliberately not that helper: it `?`s on an executor error,
                 // which would abort the message body and fall through to
@@ -3592,7 +3592,16 @@ impl<'a> Scheduler<'a> {
     /// kill) is the executor's job on the k8s-live path; the durable terminal
     /// state recorded here is the guarantee the control plane owns.
     pub async fn cancel_run(&self, run: &RunId) -> Result<(), SchedulerError> {
-        let mut torn: Vec<SupersededAttempt> = Vec::new();
+        // The Run's cancel teardown intent, FIRST — the same `cancel_run` an
+        // operator cancel writes (review fit-F3), never a supersession: a
+        // cancel is not a Superseded attempt (CONTEXT.md). The best-effort
+        // cancel below only ASKS each unit to stop; the intent re-cancels
+        // until each unit is GONE, and until then keeps a deploy Step's
+        // DeploymentTarget held (git-bug f22056d). It also tears down the
+        // Run's shared services with retry (ADR-0058), which the inline
+        // `teardown_services` below does only once. Written before any Step
+        // goes terminal, for the reason `cancel_run_request` gives.
+        enqueue_cancel_teardown(self.db, run, self.clock.now().await).await?;
         for step in self.db.steps_of_run(run).await? {
             if !step.status.is_terminal() {
                 // Tear down the in-flight execution first (best-effort —
@@ -3600,39 +3609,12 @@ impl<'a> Scheduler<'a> {
                 if let Some(attempt) = step.attempts.last() {
                     if let Some(h) = self.db.attempt_handle(run, &step.step, &attempt.id).await? {
                         let _ = self.executor.cancel(&ExecHandle(h)).await;
-                        torn.push(SupersededAttempt {
-                            step: step.step.0.clone(),
-                            attempt: attempt.id.0.clone(),
-                        });
                     }
                 }
                 self.transition_step(run, &step.step, step.status, StepStatus::Cancelled)
                     .await?;
                 cancel_open_gate_attempt(self.db, run, &step).await?;
             }
-        }
-        // The best-effort cancel above only asked the units to stop. A scoped
-        // teardown intent for the same handles (drained by
-        // `reconcile_supersessions`) re-cancels until each unit is GONE, and
-        // until then keeps a deploy Step's DeploymentTarget held (git-bug
-        // f22056d) — the same as an operator cancel's `cancel_run` intent.
-        if !torn.is_empty() {
-            let mut disc: Vec<String> = torn
-                .iter()
-                .map(|a| format!("{}/{}", a.step, a.attempt))
-                .collect();
-            disc.sort();
-            self.db
-                .enqueue_outbox(&OutboxMessage {
-                    id: crate::OutboxId(0),
-                    run: run.clone(),
-                    kind: SUPERSEDE_TEARDOWN.to_string(),
-                    payload: serde_json::to_value(SupersedeTeardown { attempts: torn })
-                        .unwrap_or(serde_json::Value::Null),
-                    idempotency_key: format!("autocancel:{}:{}", run.0, disc.join(",")),
-                    at: self.clock.now().await,
-                })
-                .await?;
         }
         if let Some(current) = self.db.run_status(run).await? {
             if !current.is_terminal() {

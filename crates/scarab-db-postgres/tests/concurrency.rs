@@ -143,10 +143,12 @@ async fn cancel_in_progress_group_cancels_the_older() {
 }
 
 /// A `cancel-in-progress` auto-cancel only ASKS the holder's unit to stop
-/// (best-effort, inline). It also leaves a teardown intent scoped to that
-/// unit, which re-cancels until the backend says the unit is GONE — so a
-/// Pod still in its termination grace is neither forgotten nor, for a deploy
-/// Step, released from its DeploymentTarget's hold early (git-bug f22056d).
+/// (best-effort, inline). It also leaves the Run's cancel teardown intent —
+/// the same `cancel_run` an operator cancel writes, never a supersession's
+/// (CONTEXT.md keeps Cancelled and Superseded apart; review fit-F3) — which
+/// re-cancels until the backend says the unit is GONE, so a Pod still in its
+/// termination grace is neither forgotten nor, for a deploy Step, released
+/// from its DeploymentTarget's hold early (git-bug f22056d).
 #[tokio::test]
 async fn an_auto_cancel_tears_the_holder_down_until_it_is_gone() {
     let Some(tdb) = fresh_db().await else {
@@ -183,16 +185,28 @@ async fn an_auto_cancel_tears_the_holder_down_until_it_is_gone() {
     sched.admit(&b).await.unwrap();
     assert_eq!(db.run_status(&a).await.unwrap(), Some(RunStatus::Cancelled));
     assert_eq!(exec.cancelled_handles().len(), 1, "the inline cancel");
+    let teardowns: Vec<String> = db
+        .pending_outbox_kinds(&a)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|k| k == scarab_engine::CANCEL_RUN || k == scarab_engine::SUPERSEDE_TEARDOWN)
+        .collect();
+    assert_eq!(
+        teardowns,
+        vec![scarab_engine::CANCEL_RUN.to_string()],
+        "the cancel's own teardown intent, and no supersession"
+    );
 
-    sched.reconcile_supersessions().await.unwrap();
+    sched.reconcile_cancellations().await.unwrap();
     assert_eq!(
         exec.cancelled_handles().len(),
         2,
         "the teardown intent re-cancels; the Pod is still terminating"
     );
-    sched.reconcile_supersessions().await.unwrap();
+    sched.reconcile_cancellations().await.unwrap();
     assert_eq!(exec.cancelled_handles().len(), 3, "gone now: retired");
-    sched.reconcile_supersessions().await.unwrap();
+    sched.reconcile_cancellations().await.unwrap();
     assert_eq!(
         exec.cancelled_handles().len(),
         3,
