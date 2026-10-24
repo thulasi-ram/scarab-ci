@@ -26,7 +26,7 @@ use scarab_identity::{
 };
 
 use super::store_err;
-use crate::{authenticate, authorize_scoped, ApiError, AppState};
+use crate::{authenticate, ApiError, AppState};
 
 /// The default page size.
 pub const DEFAULT_EVENT_LIMIT: u32 = 50;
@@ -201,20 +201,43 @@ pub(crate) async fn org_security_events(
     Path(org): Path<String>,
     Query(q): Query<EventsQuery>,
 ) -> Result<Json<SecurityEventsResponse>, ApiError> {
-    authorize_scoped(
-        &st,
-        &headers,
-        Action::Administer,
-        Some(&Scope::Org(org.clone())),
-    )
-    .await?;
+    let caller = authenticate(&st, &headers, Action::Administer).await?;
+    let scope = Scope::Org(org.clone());
+    if !(caller.may_globally(Action::Administer)
+        || caller.may(&st, Action::Administer, &scope).await?)
+    {
+        return Err(ApiError::Forbidden);
+    }
     let mut filter = filter_of(&q);
     filter.org = Some(org);
     let mut page = page(&st, filter).await?;
+    // An API token never reads its owner's passkeys (fe777ed): not on
+    // `/v1/me/security`, and not here either (redteam auth-3).
+    let token = caller.grant.is_some();
     for e in &mut page.events {
         redact_orgless_confirmation(e);
+        if token {
+            redact_passkey(e);
+        }
     }
     Ok(Json(page))
+}
+
+/// A row as an API token sees it: which passkey (its id, its label) is
+/// left out — the passkey lifecycle and every confirmation still show
+/// who, when and what.
+fn redact_passkey(e: &mut SecurityEventDto) {
+    e.passkey_id = None;
+    if !e.kind.starts_with("passkey.") {
+        return;
+    }
+    if let Some(d) = e.detail.as_object_mut() {
+        d.remove("label");
+    }
+    // Enrolment's target is the passkey's label; a reset's names the member.
+    if e.kind != kind::PASSKEY_RESET && e.kind != kind::PASSKEY_BREAK_GLASS_RESET {
+        e.target = None;
+    }
 }
 
 /// An Org-less `step_up.confirmed` in an Org's view: who confirmed, when,

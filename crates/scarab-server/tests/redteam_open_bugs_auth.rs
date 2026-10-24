@@ -761,7 +761,6 @@ async fn rt_removing_a_gone_or_bogus_passkey_is_a_clean_404() {
 /// about members are shown to any Org admin. "An API token does not read
 /// its owner's passkeys" (the commit's claim) does not hold.
 #[tokio::test]
-#[ignore = "redteam: BROKE an Org Admin token reads its owner's passkey ids/labels via /v1/orgs/{org}/security/events"]
 async fn rt_an_org_admin_token_reads_its_owners_passkeys_through_the_org_log() {
     let h = harness();
     let (_amy, _) = amy_in_browser(&h).await;
