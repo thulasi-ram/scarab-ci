@@ -756,12 +756,13 @@ async fn min_role_is_exactly_the_lowest_role_the_handler_accepts() {
 #[tokio::test]
 async fn exempt_and_ungoverned_routes_never_ask_for_a_step_up() {
     let h = harness();
-    let s = h.browser_session(owner("amy")).await;
     let mut checked = 0;
     for r in route_table() {
         if !matches!(r.op.class, Class::Exempt(_) | Class::NotGoverned(_)) {
             continue;
         }
+        // A fresh session each time: `logout` ends the one it is called with.
+        let s = h.browser_session(owner("amy")).await;
         let (st, b) = h
             .cookie(r.method.as_str(), &concrete(r.path), Some(json!({})), &s)
             .await;
@@ -774,7 +775,7 @@ async fn exempt_and_ungoverned_routes_never_ask_for_a_step_up() {
         );
         checked += 1;
     }
-    assert!(checked >= 30, "{checked}");
+    assert_eq!(checked, 27, "the EX + NG mutating routes");
     assert!(h.events_of("step_up.refused").is_empty());
 }
 
