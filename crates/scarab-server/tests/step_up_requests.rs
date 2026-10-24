@@ -29,7 +29,7 @@ use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_identity::{
     api_token_hash, ApiToken, ApiTokenStore, Principal, RequestState, Role, Scope, SessionStore,
-    StepUpRequest, StepUpRequester, LOGIN_KIND_API,
+    PendingCaps, RaiseRequest, StepUpRequest, StepUpRequester, LOGIN_KIND_API,
 };
 use scarab_secrets::{Sealer, Secret, SecretError, SecretProvider, SecretScope};
 use scarab_testkit::FakeSecrets;
@@ -978,7 +978,12 @@ async fn a_request_cannot_be_widened() {
             .seal(plain.to_string().as_bytes(), b"step-up-request:forged")
             .unwrap(),
     );
-    h.requests.put_request(&forged).await.unwrap();
+    let uncapped = PendingCaps {
+        per_requester: u64::MAX,
+        per_human: u64::MAX,
+    };
+    let raised = h.requests.raise_request(&forged, uncapped, 0).await.unwrap();
+    assert!(matches!(raised, RaiseRequest::Raised), "{raised:?}");
     let (st, done) = confirm(&h, &amy, &mut soft, "forged").await;
     assert_eq!(st, StatusCode::OK, "{done}");
     assert_eq!(done["state"], "failed", "{done}");

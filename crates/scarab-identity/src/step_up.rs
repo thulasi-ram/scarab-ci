@@ -505,10 +505,6 @@ pub trait StepUpStore: Send + Sync {
     /// clone). Returns how many.
     async fn delete_for_passkey(&self, passkey_id: &str) -> Result<u64, IdentityError>;
 
-    /// Record a new request (state `Pending`), uncapped. The server raises
-    /// through [`raise_request`](Self::raise_request).
-    async fn put_request(&self, request: &StepUpRequest) -> Result<(), IdentityError>;
-
     /// Record a new request (state `Pending`) only if its requester holds
     /// fewer than `caps.per_requester` and its human (`for_human`) fewer than
     /// `caps.per_human` live (pending, unexpired at `now_ms`) requests —

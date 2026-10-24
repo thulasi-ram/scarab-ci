@@ -612,10 +612,6 @@ impl StepUpStore for PostgresDb {
         .rows_affected())
     }
 
-    async fn put_request(&self, r: &StepUpRequest) -> Result<(), IdentityError> {
-        insert_request(self.pool(), r).await
-    }
-
     async fn raise_request(
         &self,
         r: &StepUpRequest,

@@ -98,46 +98,113 @@ pub struct StepUpService {
 
 /// How long one refusal-coalescing window lasts.
 pub const REFUSAL_WINDOW_MS: i64 = 60 * 1000;
-/// How many `step_up.refused` events one (subject, caller, operation,
+/// How many `step_up.refused` events one (org, subject, caller, operation,
 /// reason) records per window. The rest are counted, not written; the next one recorded
 /// carries the count (`detail.suppressed_before`).
 pub const REFUSALS_PER_WINDOW: u32 = 5;
-/// The most (subject, caller, operation, reason) keys tracked at once. Past it (after
-/// dropping every closed window) a new key's refusals are not recorded.
+/// The most (org, subject, caller, operation, reason) keys coalesced at once.
+/// Past it (after dropping every closed window) a new key's refusals are
+/// recorded uncoalesced — never dropped.
 const MAX_REFUSAL_KEYS: usize = 10_000;
+
+/// What one refusal is coalesced by: (org, subject, caller, operation,
+/// `detail.reason`). The Org is in it so one Org's refusals never suppress —
+/// or carry the count of — another's. The target is not: it is free text
+/// the caller picks (a secret's name), so keying on it would let one caller
+/// write unbounded refusals by varying it.
+type RefusalKey = [String; 5];
+
+fn refusal_key(event: &SecurityEvent) -> RefusalKey {
+    let reason = event
+        .detail
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    [
+        event.org.clone().unwrap_or_default(),
+        event.subject.clone(),
+        event.caller.clone(),
+        event.op.clone().unwrap_or_default(),
+        reason.to_string(),
+    ]
+}
 
 /// Rate-limits and coalesces `step_up.refused` events in this process
 /// (git-bug e582326): the log is append-only and never pruned, so a caller
 /// hammering a refused operation must not be able to grow it without bound.
+/// It fails toward recording: a refusal it cannot coalesce is written, and
+/// a closed window's suppressed count is written to its own Org's log.
 #[derive(Default)]
 pub(crate) struct RefusalLimiter {
-    buckets: Mutex<std::collections::HashMap<[String; 4], RefusalBucket>>,
+    state: Mutex<RefusalLimiterState>,
+}
+
+#[derive(Default)]
+struct RefusalLimiterState {
+    buckets: std::collections::HashMap<RefusalKey, RefusalBucket>,
+    /// When closed windows were last swept (at most once a window).
+    last_sweep: i64,
 }
 
 struct RefusalBucket {
     window_start: i64,
     recorded: u32,
     suppressed: u64,
+    /// The newest refusal suppressed in this window — written, carrying the
+    /// rest of the count, when the window closes with no refusal of the key
+    /// to carry it.
+    last_suppressed: Option<SecurityEvent>,
+}
+
+impl RefusalBucket {
+    /// The closed window's suppressed refusals as one event: the newest of
+    /// them, carrying how many others it stands for.
+    fn flush(&mut self) -> Option<SecurityEvent> {
+        let mut event = self.last_suppressed.take()?;
+        let others = std::mem::take(&mut self.suppressed).saturating_sub(1);
+        if others > 0 {
+            if let Some(d) = event.detail.as_object_mut() {
+                d.insert("suppressed_before".into(), others.into());
+            }
+        }
+        Some(event)
+    }
 }
 
 impl RefusalLimiter {
-    /// Whether to record a refusal for `key` at `now`: `Some(n)` = record
-    /// it, carrying the `n` refusals suppressed since the last one recorded;
-    /// `None` = suppress it (counted).
-    pub(crate) fn admit(&self, key: [&str; 4], now: i64) -> Option<u64> {
-        let mut buckets = self.buckets.lock().unwrap();
-        let key = key.map(str::to_string);
-        if !buckets.contains_key(&key) && buckets.len() >= MAX_REFUSAL_KEYS {
-            buckets.retain(|_, b| now - b.window_start < REFUSAL_WINDOW_MS);
-            if buckets.len() >= MAX_REFUSAL_KEYS {
-                tracing::warn!("step_up.refused: too many distinct refusers; not recording");
-                return None;
-            }
+    /// The events to append for refusal `event`: none (suppressed, counted),
+    /// the refusal itself (carrying `detail.suppressed_before` when its key
+    /// dropped some since its last recorded one), and every other key's
+    /// closed window's suppressed count still pending — so a burst followed
+    /// by silence is still written, in its own Org's log, the next time any
+    /// refusal reaches the limiter.
+    pub(crate) fn admit(&self, mut event: SecurityEvent) -> Vec<SecurityEvent> {
+        let now = event.at;
+        let key = refusal_key(&event);
+        let mut st = self.state.lock().unwrap();
+        let mut out = Vec::new();
+        let full = !st.buckets.contains_key(&key) && st.buckets.len() >= MAX_REFUSAL_KEYS;
+        if full || now - st.last_sweep >= REFUSAL_WINDOW_MS {
+            st.last_sweep = now;
+            // This key's own count rides on this refusal instead (below).
+            st.buckets.retain(|k, b| {
+                if *k == key || now - b.window_start < REFUSAL_WINDOW_MS {
+                    return true;
+                }
+                out.extend(b.flush());
+                false
+            });
         }
-        let b = buckets.entry(key).or_insert(RefusalBucket {
+        if !st.buckets.contains_key(&key) && st.buckets.len() >= MAX_REFUSAL_KEYS {
+            tracing::warn!("step_up.refused: too many distinct refusers; recording uncoalesced");
+            out.push(event);
+            return out;
+        }
+        let b = st.buckets.entry(key).or_insert(RefusalBucket {
             window_start: now,
             recorded: 0,
             suppressed: 0,
+            last_suppressed: None,
         });
         if now - b.window_start >= REFUSAL_WINDOW_MS {
             b.window_start = now;
@@ -145,11 +212,19 @@ impl RefusalLimiter {
         }
         if b.recorded < REFUSALS_PER_WINDOW {
             b.recorded += 1;
-            Some(std::mem::take(&mut b.suppressed))
+            b.last_suppressed = None;
+            let n = std::mem::take(&mut b.suppressed);
+            if n > 0 {
+                if let Some(d) = event.detail.as_object_mut() {
+                    d.insert("suppressed_before".into(), n.into());
+                }
+            }
+            out.push(event);
         } else {
             b.suppressed += 1;
-            None
+            b.last_suppressed = Some(event);
         }
+        out
     }
 }
 
@@ -271,36 +346,15 @@ impl StepUpService {
     }
 
     /// Append a `step_up.refused` event, best-effort and rate-limited per
-    /// (subject, caller, operation, `detail.reason`) — so one caller
+    /// (org, subject, caller, operation, `detail.reason`) — so one caller
     /// hammering one refusal cannot grow the append-only log, while every
     /// distinct refusal is still on it: at most [`REFUSALS_PER_WINDOW`]
     /// per [`REFUSAL_WINDOW_MS`]; the next one recorded after a suppression
     /// carries how many were dropped (`detail.suppressed_before`).
-    pub(crate) async fn record_refusal(&self, mut event: SecurityEvent) {
-        let reason = event
-            .detail
-            .get("reason")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        match self.refusals.admit(
-            [
-                &event.subject,
-                &event.caller,
-                event.op.as_deref().unwrap_or_default(),
-                &reason,
-            ],
-            event.at,
-        ) {
-            None => return,
-            Some(0) => {}
-            Some(n) => {
-                if let Some(d) = event.detail.as_object_mut() {
-                    d.insert("suppressed_before".into(), n.into());
-                }
-            }
+    pub(crate) async fn record_refusal(&self, event: SecurityEvent) {
+        for event in self.refusals.admit(event) {
+            self.record(event).await;
         }
-        self.record(event).await;
     }
 
     /// Append an event, best-effort: a failure is logged, never fatal.
@@ -903,23 +957,103 @@ mod tests {
         assert!(check_step_up_composition(false, false, false).is_ok());
     }
 
+    fn refusal(org: &str, subject: &str, caller: &str, op: &str, reason: &str, at: i64) -> SecurityEvent {
+        let mut e = event(kind::STEP_UP_REFUSED, subject, caller.into(), Some(org.into()), at);
+        e.op = Some(op.into());
+        e.detail = serde_json::json!({ "reason": reason });
+        e
+    }
+
+    /// `Some(n)` = recorded alone, carrying `n` suppressed (0 = none);
+    /// `None` = suppressed. Panics if anything else was flushed with it.
+    fn admit_one(l: &RefusalLimiter, e: SecurityEvent) -> Option<u64> {
+        let mut out = l.admit(e);
+        assert!(out.len() <= 1, "unexpected flush: {out:?}");
+        out.pop().map(|e| e.detail["suppressed_before"].as_u64().unwrap_or(0))
+    }
+
     #[test]
     fn the_refusal_limiter_admits_five_a_window_per_key_and_carries_the_rest() {
         let l = RefusalLimiter::default();
-        let k = ["amy", "api_token:t1", "secret.put", "outside_token_scope"];
+        let k = |org: &str, s: &str, c: &str, op: &str, r: &str, at| refusal(org, s, c, op, r, at);
+        let amy = |at| k("acme", "amy", "api_token:t1", "secret.put", "outside_token_scope", at);
         for _ in 0..REFUSALS_PER_WINDOW {
-            assert_eq!(l.admit(k, 0), Some(0));
+            assert_eq!(admit_one(&l, amy(0)), Some(0));
         }
-        assert_eq!(l.admit(k, 1), None);
-        assert_eq!(l.admit(k, REFUSAL_WINDOW_MS - 1), None);
-        // Another reason, operation, caller or subject has its own budget.
-        assert_eq!(l.admit(["amy", k[1], k[2], "plugin"], 2), Some(0));
-        assert_eq!(l.admit(["amy", k[1], "secret.delete", k[3]], 2), Some(0));
-        assert_eq!(l.admit(["amy", "session:cookie", k[2], k[3]], 2), Some(0));
-        assert_eq!(l.admit(["bob", k[1], k[2], k[3]], 2), Some(0));
+        assert_eq!(admit_one(&l, amy(1)), None);
+        assert_eq!(admit_one(&l, amy(REFUSAL_WINDOW_MS - 1)), None);
+        // Another reason, operation, caller, subject or Org has its own budget.
+        let t = "api_token:t1";
+        assert_eq!(admit_one(&l, k("acme", "amy", t, "secret.put", "plugin", 2)), Some(0));
+        assert_eq!(admit_one(&l, k("acme", "amy", t, "secret.delete", "x", 2)), Some(0));
+        assert_eq!(admit_one(&l, k("acme", "amy", "session:cookie", "secret.put", "x", 2)), Some(0));
+        assert_eq!(admit_one(&l, k("acme", "bob", t, "secret.put", "outside_token_scope", 2)), Some(0));
         // The next window: the first recorded carries the two dropped.
-        assert_eq!(l.admit(k, REFUSAL_WINDOW_MS), Some(2));
-        assert_eq!(l.admit(k, REFUSAL_WINDOW_MS), Some(0));
+        assert_eq!(admit_one(&l, amy(REFUSAL_WINDOW_MS)), Some(2));
+        assert_eq!(admit_one(&l, amy(REFUSAL_WINDOW_MS)), Some(0));
+    }
+
+    /// Review S3/F9: one Org's refusals never suppress another Org's, and
+    /// the suppressed count lands in the Org it was suppressed in.
+    #[test]
+    fn the_refusal_limiter_keys_by_org() {
+        let l = RefusalLimiter::default();
+        let r = |org: &str, at| refusal(org, "amy", "session:cookie", "secret.put", "no_window", at);
+        for _ in 0..REFUSALS_PER_WINDOW + 3 {
+            l.admit(r("acme", 0));
+        }
+        // org B is recorded however hard org A was hammered.
+        assert_eq!(admit_one(&l, r("beta", 1)), Some(0));
+        // A's count rides on A's next refusal, never on B's.
+        let out = l.admit(r("acme", REFUSAL_WINDOW_MS));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].org.as_deref(), Some("acme"));
+        assert_eq!(out[0].detail["suppressed_before"], 3);
+    }
+
+    /// Review S3: a burst followed by silence still writes its count, in its
+    /// own Org's log, the next time any refusal reaches the limiter.
+    #[test]
+    fn a_closed_windows_suppressed_count_is_flushed_without_its_key_returning() {
+        let l = RefusalLimiter::default();
+        let r = |org: &str, op: &str, at| refusal(org, "amy", "session:cookie", op, "no_window", at);
+        for i in 0..REFUSALS_PER_WINDOW + 4 {
+            l.admit(r("acme", "secret.put", i as i64));
+        }
+        // Inside the window nothing is flushed.
+        assert_eq!(l.admit(r("beta", "binding.put", 10)).len(), 1);
+        let out = l.admit(r("beta", "binding.put", REFUSAL_WINDOW_MS + 10));
+        assert_eq!(out.len(), 2, "{out:?}");
+        let flushed = out.iter().find(|e| e.org.as_deref() == Some("acme")).unwrap();
+        assert_eq!(flushed.op.as_deref(), Some("secret.put"));
+        // The newest suppressed refusal, carrying the other three.
+        assert_eq!(flushed.at, (REFUSALS_PER_WINDOW + 3) as i64);
+        assert_eq!(flushed.detail["suppressed_before"], 3);
+        // Flushed once.
+        assert_eq!(l.admit(r("beta", "binding.put", 2 * REFUSAL_WINDOW_MS + 20)).len(), 1);
+    }
+
+    /// Review F9/S3: with every key live, a new key's refusal is recorded
+    /// (uncoalesced), never dropped.
+    #[test]
+    fn a_full_refusal_limiter_records_rather_than_drops() {
+        let l = RefusalLimiter::default();
+        for i in 0..MAX_REFUSAL_KEYS {
+            l.admit(refusal("acme", &format!("s{i}"), "session:cookie", "secret.put", "x", 0));
+        }
+        let fresh = || refusal("acme", "newcomer", "session:cookie", "secret.put", "x", 1);
+        assert_eq!(admit_one(&l, fresh()), Some(0));
+        assert_eq!(admit_one(&l, fresh()), Some(0));
+        // Once the old windows close they are pruned and the newcomer is
+        // coalesced again.
+        for _ in 0..REFUSALS_PER_WINDOW {
+            l.admit(refusal("acme", "newcomer", "session:cookie", "secret.put", "x", REFUSAL_WINDOW_MS));
+        }
+        assert!(l.admit(fresh_at(REFUSAL_WINDOW_MS)).is_empty());
+
+        fn fresh_at(at: i64) -> SecurityEvent {
+            refusal("acme", "newcomer", "session:cookie", "secret.put", "x", at)
+        }
     }
 
     #[tokio::test]

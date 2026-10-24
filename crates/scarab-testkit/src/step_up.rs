@@ -390,18 +390,6 @@ impl StepUpStore for InMemoryStepUp {
         Ok((before - state.confirmations.len()) as u64)
     }
 
-    async fn put_request(&self, request: &StepUpRequest) -> Result<(), IdentityError> {
-        let mut state = self.state.lock().unwrap();
-        if state.requests.contains_key(&request.id) {
-            return Err(IdentityError::Conflict(format!(
-                "request `{}` already exists",
-                request.id
-            )));
-        }
-        state.requests.insert(request.id.clone(), request.clone());
-        Ok(())
-    }
-
     async fn raise_request(
         &self,
         request: &StepUpRequest,

@@ -458,11 +458,24 @@ async fn deleting_standing_authority_spares_spent_and_request_confirmations() {
     tdb.cleanup().await;
 }
 
+/// Store `r` as-is: the only write a request has is the capped
+/// `raise_request`, so a test seeds through it with caps nothing reaches.
+async fn seed_request(db: &PostgresDb, r: &StepUpRequest) -> Result<(), IdentityError> {
+    let caps = PendingCaps {
+        per_requester: u64::MAX,
+        per_human: u64::MAX,
+    };
+    match db.raise_request(r, caps, 0).await? {
+        RaiseRequest::Raised => Ok(()),
+        other => panic!("uncapped raise refused: {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn a_request_round_trips_and_settles_once_dropping_its_sealed_body() {
     let Some((tdb, db)) = db().await else { return };
     let r = request("r1", token("t1"), 5_000);
-    db.put_request(&r).await.unwrap();
+    seed_request(&db, &r).await.unwrap();
     assert_eq!(db.get_request("r1").await.unwrap(), Some(r.clone()));
     assert_eq!(db.get_request("nope").await.unwrap(), None);
 
@@ -531,7 +544,7 @@ async fn a_request_round_trips_and_settles_once_dropping_its_sealed_body() {
         },
         5_000,
     );
-    db.put_request(&s).await.unwrap();
+    seed_request(&db, &s).await.unwrap();
     assert_eq!(db.get_request("r2").await.unwrap(), Some(s));
 
     tdb.cleanup().await;
@@ -540,7 +553,7 @@ async fn a_request_round_trips_and_settles_once_dropping_its_sealed_body() {
 #[tokio::test]
 async fn an_expired_request_cannot_begin() {
     let Some((tdb, db)) = db().await else { return };
-    db.put_request(&request("r1", token("t1"), 5_000))
+    seed_request(&db, &request("r1", token("t1"), 5_000))
         .await
         .unwrap();
     assert_eq!(
@@ -562,7 +575,7 @@ async fn an_expired_request_cannot_begin() {
 #[tokio::test]
 async fn two_concurrent_confirmers_begin_a_request_exactly_once() {
     let Some((tdb, db)) = db().await else { return };
-    db.put_request(&request("r1", token("t1"), 50_000))
+    seed_request(&db, &request("r1", token("t1"), 50_000))
         .await
         .unwrap();
 
@@ -620,20 +633,20 @@ async fn pending_count_counts_only_this_requesters_live_pending_requests() {
     let session = StepUpRequester::BearerSession {
         session_hash: "t1".into(),
     };
-    db.put_request(&request("r1", token("t1"), 5_000))
+    seed_request(&db, &request("r1", token("t1"), 5_000))
         .await
         .unwrap();
-    db.put_request(&request("r2", token("t1"), 5_000))
+    seed_request(&db, &request("r2", token("t1"), 5_000))
         .await
         .unwrap();
-    db.put_request(&request("r3", token("t1"), 1_000))
+    seed_request(&db, &request("r3", token("t1"), 1_000))
         .await
         .unwrap(); // expires first
-    db.put_request(&request("r4", token("t2"), 5_000))
+    seed_request(&db, &request("r4", token("t2"), 5_000))
         .await
         .unwrap();
     // Same key text, different credential kind: never counted together.
-    db.put_request(&request("r5", session.clone(), 5_000))
+    seed_request(&db, &request("r5", session.clone(), 5_000))
         .await
         .unwrap();
     db.begin_execution("r2", "amy", "c", 10).await.unwrap();
@@ -671,18 +684,18 @@ async fn a_request_row_must_name_its_requester() {
 #[tokio::test]
 async fn pending_in_org_counts_only_that_org_s_live_pending_requests() {
     let Some((tdb, db)) = db().await else { return };
-    db.put_request(&request("r1", token("t1"), 5_000))
+    seed_request(&db, &request("r1", token("t1"), 5_000))
         .await
         .unwrap();
-    db.put_request(&request("r2", token("t1"), 1_000))
+    seed_request(&db, &request("r2", token("t1"), 1_000))
         .await
         .unwrap();
-    db.put_request(&request("r3", token("t1"), 5_000))
+    seed_request(&db, &request("r3", token("t1"), 5_000))
         .await
         .unwrap();
     let mut other = request("r4", token("t1"), 5_000);
     other.org = Some("beta".into());
-    db.put_request(&other).await.unwrap();
+    seed_request(&db, &other).await.unwrap();
     db.begin_execution("r3", "amy", "c", 10).await.unwrap();
 
     assert_eq!(db.pending_in_org("acme", 10).await.unwrap(), 2); // r1, r2
@@ -728,23 +741,23 @@ async fn reaping_drops_dead_rows_and_dead_bodies_only() {
 
     let cutoff = now - 30 * 24 * 60 * 60 * 1000;
     // Pending, expired now: body cleared, row kept.
-    db.put_request(&request("expired", token("t1"), now))
+    seed_request(&db, &request("expired", token("t1"), now))
         .await
         .unwrap();
     // Pending, live: untouched.
-    db.put_request(&request("live", token("t1"), now + 1))
+    seed_request(&db, &request("live", token("t1"), now + 1))
         .await
         .unwrap();
     // Executing since long ago (a crash mid-replay): body cleared, row kept
     // until the cutoff.
-    db.put_request(&request("stuck", token("t1"), now + 1))
+    seed_request(&db, &request("stuck", token("t1"), now + 1))
         .await
         .unwrap();
     db.begin_execution("stuck", "amy", "c1", now - 6 * 60 * 1000)
         .await
         .unwrap();
     // Settled before the cutoff: gone.
-    db.put_request(&request("old", token("t1"), cutoff))
+    seed_request(&db, &request("old", token("t1"), cutoff))
         .await
         .unwrap();
     db.begin_execution("old", "amy", "c2", cutoff - 2)
@@ -754,7 +767,7 @@ async fn reaping_drops_dead_rows_and_dead_bodies_only() {
         .await
         .unwrap();
     // Expired before the cutoff: gone.
-    db.put_request(&request("ancient", token("t1"), cutoff - 1))
+    seed_request(&db, &request("ancient", token("t1"), cutoff - 1))
         .await
         .unwrap();
 
@@ -845,7 +858,7 @@ async fn raise_request_caps_per_requester_and_per_human() {
         RaiseRequest::HumanFull { pending: 3 }
     );
     // An expired request does not count; nor does a settled one.
-    db.put_request(&request("old", token("t9"), 5))
+    seed_request(&db, &request("old", token("t9"), 5))
         .await
         .unwrap();
     db.begin_execution("r1", "amy", "c", 10).await.unwrap();
@@ -876,6 +889,14 @@ async fn raise_request_counts_and_inserts_under_the_human_s_lock() {
         per_requester: 10,
         per_human: 3,
     };
+    // Three requests of another human, handed to amy inside the lock
+    // holder's transaction: they commit for her exactly as the lock is
+    // released, as a concurrent raise holding it would.
+    for (i, t) in ["t2", "t3", "t4"].iter().enumerate() {
+        let mut r = request(&format!("other{i}"), token(t), 5_000);
+        r.for_human = "zed".into();
+        seed_request(&db, &r).await.unwrap();
+    }
     let mut lock = tdb.pool.begin().await.unwrap();
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(scarab_db_postgres::step_up_request_lock_key("amy"))
@@ -892,11 +913,10 @@ async fn raise_request_counts_and_inserts_under_the_human_s_lock() {
     };
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!racer.is_finished(), "the raise waits for the human's lock");
-    for (i, t) in ["t2", "t3", "t4"].iter().enumerate() {
-        db.put_request(&request(&format!("other{i}"), token(t), 5_000))
-            .await
-            .unwrap();
-    }
+    sqlx::query("UPDATE step_up_requests SET for_human = 'amy' WHERE for_human = 'zed'")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
     lock.commit().await.unwrap();
     assert_eq!(racer.await.unwrap(), RaiseRequest::HumanFull { pending: 3 });
     assert!(db.get_request("racer").await.unwrap().is_none());
