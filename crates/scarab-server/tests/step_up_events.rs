@@ -778,6 +778,66 @@ async fn fold_bobby_into_bob(pg: &PostgresDb) {
     );
 }
 
+/// git-bug fe777ed: an API token (always scoped to one Org or Project)
+/// never reads its owner's personal security: `/v1/me/security` tells it
+/// whether its human holds a passkey (what `scarab security setup` polls)
+/// but not the passkeys, and `/v1/me/security/events` is refused. A session
+/// presented as Bearer (the CLI with a session id) is the human's own and
+/// still sees both.
+#[tokio::test]
+async fn an_api_token_does_not_read_its_owner_s_passkeys_or_history() {
+    let h = harness();
+    let (_amy, _) = member(&h, "amy", "acme", Role::Owner).await;
+    let plaintext = "scarab_pat_tp_0123456789abcdef0123456789abcdef";
+    let now = h.now().await;
+    h.tokens
+        .put(
+            &ApiToken {
+                id: "tp".into(),
+                name: "web-ci".into(),
+                owner_subject: "amy".into(),
+                scope: Scope::Project {
+                    org: "acme".into(),
+                    name: "web".into(),
+                },
+                role: Role::Member,
+                expires_at: now + 24 * HOUR,
+                created_by: "amy".into(),
+                created_at: now,
+                last_used_at: None,
+                revoked_at: None,
+            },
+            &api_token_hash(plaintext),
+        )
+        .await
+        .unwrap();
+    let (st, me) = h.bearer("GET", "/v1/me/security", None, plaintext).await;
+    assert_eq!(st, StatusCode::OK, "{me}");
+    assert_eq!(me["subject"], "amy");
+    assert_eq!(me["has_passkey"], true);
+    assert_eq!(me["usable_passkey_count"], 1);
+    assert_eq!(me["passkeys_hidden"], true);
+    assert_eq!(me["passkeys"], json!([]), "{me}");
+    let (st, b) = h
+        .bearer("GET", "/v1/me/security/events", None, plaintext)
+        .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{b}");
+    assert!(b.get("events").is_none(), "{b}");
+
+    let cli = h
+        .session(scoped("amy"), scarab_identity::LOGIN_KIND_API)
+        .await;
+    let (st, me) = h.bearer("GET", "/v1/me/security", None, &cli.id).await;
+    assert_eq!(st, StatusCode::OK, "{me}");
+    assert_eq!(me["passkeys_hidden"], false);
+    assert_eq!(me["passkeys"].as_array().unwrap().len(), 1, "{me}");
+    let (st, page) = h
+        .bearer("GET", "/v1/me/security/events", None, &cli.id)
+        .await;
+    assert_eq!(st, StatusCode::OK, "{page}");
+    assert!(kinds(&page).contains(&"passkey.enrolled".to_string()));
+}
+
 /// git-bug 0314275: an Owner's reset naming a merged (folded) id resets the
 /// live Principal it was folded into — the one whose bindings and passkeys
 /// those are — exactly as the break-glass resolves it. (Before, the path id

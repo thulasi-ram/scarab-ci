@@ -247,7 +247,8 @@ fn redact_orgless_confirmation(e: &mut SecurityEventDto) {
     summary = "My security events (ADR-0073 §7)",
     responses(
         (status = 200, body = SecurityEventsResponse),
-        (status = 401, description = "not signed in")
+        (status = 401, description = "not signed in"),
+        (status = 403, description = "an API token: it never reads its owner's security history")
     )
 )]
 pub(crate) async fn my_security_events(
@@ -256,6 +257,14 @@ pub(crate) async fn my_security_events(
     Query(q): Query<EventsQuery>,
 ) -> Result<Json<SecurityEventsResponse>, ApiError> {
     let caller = authenticate(&st, &headers, Action::Read).await?;
+    // A token is scoped to one Org or Project; its owner's whole security
+    // history (every Org, every passkey, every confirmation) is not in that
+    // scope (git-bug fe777ed). A session — cookie or Bearer — reads it.
+    if caller.grant.is_some() {
+        return Err(ApiError::Denied(
+            "an API token cannot read its owner's security events; use a signed-in session".into(),
+        ));
+    }
     let mut filter = filter_of(&q);
     filter.subject = Some(caller.principal.subject);
     Ok(Json(page(&st, filter).await?))

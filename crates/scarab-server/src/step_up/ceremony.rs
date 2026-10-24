@@ -83,7 +83,13 @@ pub struct MeSecurityResponse {
     pub step_up: String,
     /// Holds at least one usable (not clone-flagged) passkey.
     pub has_passkey: bool,
+    /// How many usable (not clone-flagged) passkeys are held.
+    pub usable_passkey_count: u64,
+    /// The passkeys — empty for an API-token caller (see `passkeys_hidden`).
     pub passkeys: Vec<PasskeyDto>,
+    /// The caller is an API token: a token, scoped to one Org or Project,
+    /// never reads its owner's passkey list (only whether one is held).
+    pub passkeys_hidden: bool,
     /// This browser session's open window, if any (unix ms).
     pub window_expires_at: Option<i64>,
     /// No usable passkey yet, and this browser session's login is fresh
@@ -224,14 +230,25 @@ pub(crate) async fn me_security(
             subject,
             step_up: "off".into(),
             has_passkey: false,
+            usable_passkey_count: 0,
             passkeys: vec![],
+            passkeys_hidden: false,
             window_expires_at: None,
             can_enroll_first: false,
             fresh_login_until,
         }));
     };
     let passkeys = svc.passkeys.list(&subject).await.map_err(store_err)?;
-    let has_passkey = passkeys.iter().any(|p| p.clone_suspected_at.is_none());
+    let usable_passkey_count = passkeys
+        .iter()
+        .filter(|p| p.clone_suspected_at.is_none())
+        .count() as u64;
+    let has_passkey = usable_passkey_count > 0;
+    // An API token is a narrowing of its owner (one scope, a ceiling): it
+    // learns whether its human can confirm (the CLI's `security setup`
+    // polls that), never the passkeys themselves (git-bug fe777ed). A
+    // session presented as Bearer is the human's own and sees all.
+    let passkeys_hidden = caller.grant.is_some();
     let window_expires_at = match caller.session.as_ref() {
         Some(s) if caller.is_browser_session() => svc
             .confirmations
@@ -244,7 +261,13 @@ pub(crate) async fn me_security(
         subject,
         step_up: "enforce".into(),
         has_passkey,
-        passkeys: passkeys.iter().map(PasskeyDto::from).collect(),
+        usable_passkey_count,
+        passkeys: if passkeys_hidden {
+            vec![]
+        } else {
+            passkeys.iter().map(PasskeyDto::from).collect()
+        },
+        passkeys_hidden,
         window_expires_at,
         can_enroll_first: !has_passkey && fresh_login_until.is_some_and(|t| t > now),
         fresh_login_until,

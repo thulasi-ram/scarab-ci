@@ -314,6 +314,10 @@ pub fn fmt_ms(ms: i64) -> String {
 }
 
 fn passkey_count(me: &Value) -> usize {
+    // An API token is not shown the list, only the count.
+    if let Some(n) = me["usable_passkey_count"].as_u64() {
+        return n as usize;
+    }
     me["passkeys"]
         .as_array()
         .map(|ps| ps.iter().filter(|p| p["clone_suspected"] != true).count())
@@ -427,7 +431,12 @@ async fn status(conn: Conn) -> i32 {
     }
     println!("step-up: enforced");
     let passkeys = me["passkeys"].as_array().cloned().unwrap_or_default();
-    if passkeys.is_empty() {
+    if me["passkeys_hidden"] == true {
+        println!(
+            "passkeys: {} usable (an API token is not shown the list — use a session to see it)",
+            passkey_count(&me)
+        );
+    } else if passkeys.is_empty() {
         println!("passkeys: none — run `scarab security setup` to enroll one");
     } else {
         println!("passkeys ({}):", passkeys.len());
@@ -522,6 +531,20 @@ fn print_org(org: &str, s: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An API token is shown no passkey list, only the count (git-bug
+    /// fe777ed): `security setup` still reports what is held.
+    #[test]
+    fn the_passkey_count_comes_from_the_server_when_the_list_is_hidden() {
+        let token_view = serde_json::json!({
+            "has_passkey": true, "usable_passkey_count": 2, "passkeys": [], "passkeys_hidden": true
+        });
+        assert_eq!(passkey_count(&token_view), 2);
+        let older_server = serde_json::json!({
+            "passkeys": [{"clone_suspected": false}, {"clone_suspected": true}]
+        });
+        assert_eq!(passkey_count(&older_server), 1);
+    }
 
     #[test]
     fn fmt_ms_is_utc_civil_time() {

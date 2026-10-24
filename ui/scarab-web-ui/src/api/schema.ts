@@ -2982,10 +2982,21 @@ export interface components {
             fresh_login_until?: number | null;
             /** @description Holds at least one usable (not clone-flagged) passkey. */
             has_passkey: boolean;
+            /** @description The passkeys — empty for an API-token caller (see `passkeys_hidden`). */
             passkeys: components["schemas"]["PasskeyDto"][];
+            /**
+             * @description The caller is an API token: a token, scoped to one Org or Project,
+             *     never reads its owner's passkey list (only whether one is held).
+             */
+            passkeys_hidden: boolean;
             /** @description `enforce` or `off`. */
             step_up: string;
             subject: string;
+            /**
+             * Format: int64
+             * @description How many usable (not clone-flagged) passkeys are held.
+             */
+            usable_passkey_count: number;
             /**
              * Format: int64
              * @description This browser session's open window, if any (unix ms).
@@ -5284,6 +5295,13 @@ export interface operations {
             };
             /** @description not signed in */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token: it never reads its owner's security history */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };

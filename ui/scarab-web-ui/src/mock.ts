@@ -1343,6 +1343,8 @@ const meSecurity: components["schemas"]["MeSecurityResponse"] = {
   subject: "a.kim",
   step_up: "enforce",
   has_passkey: true,
+  usable_passkey_count: 2,
+  passkeys_hidden: false,
   can_enroll_first: false,
   fresh_login_until: null,
   window_expires_at: now + 3 * min,
@@ -1374,6 +1376,7 @@ const orgSecuritySummary: components["schemas"]["OrgSecuritySummary"] = {
   caller_role: "owner",
   admins_without_passkey: ["j.lee"],
   admins_total: 2,
+  unresolved_owner_entries: 0,
   recent_refusals: securityEvents.filter((e) => e.kind === "step_up.refused"),
   pending_requests: 1,
 };

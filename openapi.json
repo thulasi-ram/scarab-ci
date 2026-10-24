@@ -1113,6 +1113,9 @@
           },
           "401": {
             "description": "not signed in"
+          },
+          "403": {
+            "description": "an API token: it never reads its owner's security history"
           }
         },
         "security": [
@@ -8059,7 +8062,9 @@
           "subject",
           "step_up",
           "has_passkey",
+          "usable_passkey_count",
           "passkeys",
+          "passkeys_hidden",
           "can_enroll_first"
         ],
         "properties": {
@@ -8083,7 +8088,12 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/PasskeyDto"
-            }
+            },
+            "description": "The passkeys — empty for an API-token caller (see `passkeys_hidden`)."
+          },
+          "passkeys_hidden": {
+            "type": "boolean",
+            "description": "The caller is an API token: a token, scoped to one Org or Project,\nnever reads its owner's passkey list (only whether one is held)."
           },
           "step_up": {
             "type": "string",
@@ -8091,6 +8101,12 @@
           },
           "subject": {
             "type": "string"
+          },
+          "usable_passkey_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many usable (not clone-flagged) passkeys are held.",
+            "minimum": 0
           },
           "window_expires_at": {
             "type": [
