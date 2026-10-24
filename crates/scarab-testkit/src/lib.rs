@@ -1660,10 +1660,7 @@ impl Db for InMemoryDb {
         Ok(out)
     }
 
-    async fn steps_of_runs(
-        &self,
-        runs: &[RunId],
-    ) -> Result<HashMap<RunId, Vec<StepRun>>, DbError> {
+    async fn steps_of_runs(&self, runs: &[RunId]) -> Result<HashMap<RunId, Vec<StepRun>>, DbError> {
         let mut out = HashMap::new();
         for run in runs {
             let steps = self.steps_of_run(run).await?;

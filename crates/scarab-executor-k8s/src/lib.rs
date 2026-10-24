@@ -7700,7 +7700,10 @@ mod tests {
             .find(|c| c.name == WORKSPACE_EGRESS_CONTAINER)
             .unwrap()
             .state = Some(results_running());
-        assert_eq!(results_settled_state(&settling, i64::MAX - 1), ExecState::Running);
+        assert_eq!(
+            results_settled_state(&settling, i64::MAX - 1),
+            ExecState::Running
+        );
     }
 
     // ------------------------------------------------------------------

@@ -1793,11 +1793,7 @@ pub async fn cancel_run_request(
 /// the operator cancel ([`cancel_run_request`]) and the inline concurrency
 /// auto-cancel ([`Scheduler::cancel_run`]); both write it before any Step
 /// goes terminal.
-async fn enqueue_cancel_teardown(
-    db: &dyn Db,
-    run: &RunId,
-    now: Timestamp,
-) -> Result<(), DbError> {
+async fn enqueue_cancel_teardown(db: &dyn Db, run: &RunId, now: Timestamp) -> Result<(), DbError> {
     db.enqueue_outbox(&OutboxMessage {
         id: crate::OutboxId(0),
         run: run.clone(),
