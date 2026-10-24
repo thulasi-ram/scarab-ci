@@ -320,6 +320,28 @@ impl PostgresDb {
 
 #[async_trait]
 impl EnvironmentGovernanceStore for PostgresDb {
+    async fn org_environment(
+        &self,
+        org: &str,
+        environment: &str,
+    ) -> Result<Option<OrgEnvironment>, OrgEnvironmentError> {
+        let mut tx = snapshot(self).await?;
+        let Some(row) = sqlx::query(&format!(
+            "SELECT {ORG_ENVIRONMENT_COLUMNS} FROM org_environments WHERE org = $1 AND name = $2"
+        ))
+        .bind(org)
+        .bind(environment)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(org_environment_store_err)?
+        else {
+            return Ok(None);
+        };
+        let env = stored_environment(&mut tx, &row, org, environment).await?;
+        tx.commit().await.map_err(org_environment_store_err)?;
+        Ok(Some(env))
+    }
+
     async fn deploy_governance(
         &self,
         org: &str,

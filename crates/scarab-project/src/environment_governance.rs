@@ -693,6 +693,16 @@ impl EnvironmentMigrationReport {
 /// unconditionally, exactly as the plain form (which is that, provided).
 #[async_trait]
 pub trait EnvironmentGovernanceStore: Send + Sync {
+    /// The Environment — baseline and eligibility included — read in one
+    /// consistent snapshot, with no Project lens: what a conditional
+    /// governance write judges its loosenings against. `None` when the Org
+    /// has no Environment by that name (exact, case-sensitive).
+    async fn org_environment(
+        &self,
+        org: &str,
+        environment: &str,
+    ) -> Result<Option<OrgEnvironment>, OrgEnvironmentError>;
+
     /// The governance of `project`'s Deploy Runs into `environment`, read in
     /// **one consistent snapshot**; `None` when the Org has no Environment by
     /// that name (exact, case-sensitive).

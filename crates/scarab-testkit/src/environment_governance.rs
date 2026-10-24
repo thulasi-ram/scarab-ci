@@ -276,6 +276,18 @@ impl InMemoryEnvironmentGovernance {
 
 #[async_trait]
 impl EnvironmentGovernanceStore for InMemoryEnvironmentGovernance {
+    async fn org_environment(
+        &self,
+        org: &str,
+        environment: &str,
+    ) -> Result<Option<OrgEnvironment>, OrgEnvironmentError> {
+        let state = self.state.lock().unwrap();
+        Ok(state
+            .environments
+            .get(&(org.to_string(), environment.to_string()))
+            .cloned())
+    }
+
     async fn deploy_governance(
         &self,
         org: &str,

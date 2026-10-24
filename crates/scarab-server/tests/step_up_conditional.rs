@@ -592,18 +592,43 @@ async fn overlay_loosening_and_delete_need_a_step_up() {
 // The race: a change committed between the handler's read and its write
 // ---------------------------------------------------------------------------
 
-/// Postgres governance whose `deploy_governance` — the read a conditional
-/// write judges its loosenings against — lets another admin commit a
-/// change right after it, once, when armed. Constructs the interleaving
-/// rather than scheduling it.
+/// Postgres governance whose reads — what a conditional write judges its
+/// loosenings against — let another admin commit a change right after
+/// them, once, when armed. Constructs the interleaving rather than
+/// scheduling it.
+///
+/// With `lensed`, `deploy_governance` also answers `None` for a Project the
+/// Environment does not make eligible — a store that filters its
+/// per-Project read by eligibility (git-bug 0485f41).
 struct RacingGovernance {
     inner: Arc<PostgresDb>,
     armed: AtomicBool,
     concurrent: EnvironmentProtectionRules,
+    lensed: bool,
+}
+
+impl RacingGovernance {
+    async fn race(&self, org: &str, environment: &str) -> Result<(), OrgEnvironmentError> {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            self.inner
+                .put_environment_protection(org, environment, &self.concurrent, "carol", 1)
+                .await?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl EnvironmentGovernanceStore for RacingGovernance {
+    async fn org_environment(
+        &self,
+        org: &str,
+        environment: &str,
+    ) -> Result<Option<OrgEnvironment>, OrgEnvironmentError> {
+        let read = self.inner.org_environment(org, environment).await?;
+        self.race(org, environment).await?;
+        Ok(read)
+    }
     async fn deploy_governance(
         &self,
         org: &str,
@@ -613,12 +638,9 @@ impl EnvironmentGovernanceStore for RacingGovernance {
         let read = self
             .inner
             .deploy_governance(org, project, environment)
-            .await?;
-        if self.armed.swap(false, Ordering::SeqCst) {
-            self.inner
-                .put_environment_protection(org, environment, &self.concurrent, "carol", 1)
-                .await?;
-        }
+            .await?
+            .filter(|g| !self.lensed || g.eligible);
+        self.race(org, environment).await?;
         Ok(read)
     }
     async fn project_environment_governance(
@@ -765,6 +787,7 @@ async fn a_change_committed_between_read_and_write_is_a_409() {
             inner: pg,
             armed: AtomicBool::new(false),
             concurrent: rules(&["amy", "bob"], &[]),
+            lensed: false,
         });
         hook.set(r.clone()).ok().unwrap();
         r
@@ -801,6 +824,61 @@ async fn a_change_committed_between_read_and_write_is_a_409() {
         strings(&["amy", "bob"]),
         "the concurrent change stands; bob was not silently dropped"
     );
+
+    g.tdb.cleanup().await;
+}
+
+/// git-bug 0485f41: the read a governance write judges against is the
+/// Environment itself, not some Project's view of it. A store whose
+/// per-Project read filters by eligibility — a legal refinement — must not
+/// turn every protection and eligibility write on a list-eligible
+/// Environment into a 404.
+#[tokio::test]
+async fn governance_writes_read_the_environment_without_a_project_lens() {
+    let Some(g) = governed_with(|pg| {
+        Arc::new(RacingGovernance {
+            inner: pg,
+            armed: AtomicBool::new(false),
+            concurrent: rules(&[], &[]),
+            lensed: true,
+        })
+    })
+    .await
+    else {
+        return;
+    };
+    let (h, pg) = (&g.h, &g.pg);
+    let (s, _soft) = signed_in_admin(h).await;
+    pg.put_environment_eligibility(
+        "acme",
+        "prod",
+        &EnvironmentProjectEligibility::Projects(strings(&["web"])),
+        "seed",
+        0,
+    )
+    .await
+    .unwrap();
+
+    // Both tightenings: exempt, so the only way to fail is the read.
+    let (st, b) = h
+        .cookie(
+            "PUT",
+            &format!("{PROD}/protection"),
+            Some(json!({ "approvers": ["amy"] })),
+            &s,
+        )
+        .await;
+    assert_ok(st, &b);
+    let (st, b) = h
+        .cookie(
+            "PUT",
+            &format!("{PROD}/eligibility"),
+            Some(json!({ "all_projects": false, "projects": [] })),
+            &s,
+        )
+        .await;
+    assert_ok(st, &b);
+    assert_eq!(stored_protection(pg).await.approvers, strings(&["amy"]));
 
     g.tdb.cleanup().await;
 }

@@ -661,19 +661,19 @@ fn governance_store(st: &AppState) -> Result<&dyn EnvironmentGovernanceStore, Ap
 /// The Environment as `store` holds it now — what a conditional governance
 /// write judges its loosenings against and then writes conditionally on
 /// (ADR-0073 §3). Read from the store the write goes to, in its one
-/// snapshot; the Environment row does not depend on the Project the read
-/// is keyed by, so none is named. 404 when there is no such Environment.
+/// snapshot, as the Environment itself — never through a Project's
+/// governance view, whose answer may depend on that Project (git-bug
+/// 0485f41). 404 when there is no such Environment.
 async fn stored_environment(
     store: &dyn EnvironmentGovernanceStore,
     org: &str,
     env: &str,
 ) -> Result<OrgEnvironment, ApiError> {
-    Ok(store
-        .deploy_governance(org, "", env)
+    store
+        .org_environment(org, env)
         .await
         .map_err(org_environment_api_error)?
-        .ok_or(ApiError::NotFound)?
-        .environment)
+        .ok_or(ApiError::NotFound)
 }
 
 /// ADR-0073 §3: a conditional crown jewel's one decision. A write that
