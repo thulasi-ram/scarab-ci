@@ -214,11 +214,15 @@ const CHANGE_VALUE_END: usize = 96;
 
 /// The default description: the label; the target from [`Op::target`]; one
 /// `field = value` line per body leaf (nested objects flattened to
-/// `a.b = c`, sorted, redacted fields already `(hidden)`); for a URL value
-/// a `field host = …` line too; and one `?key = value` line per query
-/// parameter the target does not already name. Every value is escaped so no
-/// control or bidi character reaches the human, and a long value keeps its
-/// end visible (a URL is never cut).
+/// `a.b = c`, sorted, redacted fields already `(hidden)`; a key that is not
+/// plain `[A-Za-z0-9_-]+` is quoted, so `{"a.b": x}` and `{"a": {"b": y}}`
+/// never render under one path); for a URL value — however the handler's
+/// WHATWG parser would accept it spelled — the URL as the handler will use
+/// it, in full, and a `field host = …` line in its ASCII (punycode) form; and
+/// one `?key = value` line per query parameter the target does not already
+/// name. Every value is escaped ([`escape_invisible`]) so no control, bidi or
+/// invisible character reaches the human, and a long value keeps its end
+/// visible (a URL is never cut).
 pub fn describe_generic(op: &Op, input: &OpInput) -> OpSummary {
     let target: Vec<String> = op.target.iter().filter_map(|s| input.source(s)).collect();
     let mut changes = Vec::new();
@@ -232,7 +236,7 @@ pub fn describe_generic(op: &Op, input: &OpInput) -> OpSummary {
         .collect();
     for (k, v) in &input.query {
         if !named.contains(&k.as_str()) {
-            leaf_lines(&format!("?{}", escape_invisible(k)), v, &mut changes);
+            leaf_lines(&format!("?{}", render_key(k)), v, &mut changes);
         }
     }
     OpSummary {
@@ -247,7 +251,7 @@ fn flatten(map: &serde_json::Map<String, Value>, prefix: &str, out: &mut Vec<Str
     let mut keys: Vec<&String> = map.keys().collect();
     keys.sort();
     for k in keys {
-        let key = format!("{prefix}{}", escape_invisible(k));
+        let key = format!("{prefix}{}", render_key(k));
         match &map[k] {
             Value::Object(inner) if !inner.is_empty() => flatten(inner, &format!("{key}."), out),
             Value::String(s) => leaf_lines(&key, s, out),
@@ -256,12 +260,53 @@ fn flatten(map: &serde_json::Map<String, Value>, prefix: &str, out: &mut Vec<Str
     }
 }
 
+/// One path segment of a flattened key: bare when it is `[A-Za-z0-9_-]+`,
+/// else quoted (`"a.b"`, with `\` and `"` escaped) — so a key holding the
+/// `.` separator, a space (`"base_url host"`) or a leading `?` can never
+/// pass for a nested path, a host line or a query line.
+fn render_key(k: &str) -> String {
+    let bare = !k.is_empty()
+        && k.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if bare {
+        k.to_string()
+    } else {
+        format!("\"{}\"", escape_invisible(k).replace('"', "\\\""))
+    }
+}
+
 /// The line(s) for one string value: a URL in full plus its host, anything
 /// else head…tail when long.
 fn leaf_lines(key: &str, v: &str, out: &mut Vec<String>) {
-    if v.starts_with("http://") || v.starts_with("https://") {
+    // What `normalize_connection_base_url` (and any WHATWG consumer) would
+    // accept: surrounding whitespace trimmed, the scheme in any case.
+    let trimmed = v.trim();
+    if let Ok(url) = reqwest::Url::parse(trimmed) {
+        if matches!(url.scheme(), "http" | "https") {
+            let host = url.host_str().unwrap_or_default();
+            let mut notes = Vec::new();
+            if !url.username().is_empty() || url.password().is_some() {
+                notes.push("URL carries userinfo");
+            }
+            if host.split('.').any(|l| l.starts_with("xn--")) {
+                notes.push("internationalized host: check every character");
+            }
+            let note = if notes.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", notes.join("; "))
+            };
+            out.push(format!("{key} = {}", escape_invisible(url.as_str())));
+            out.push(format!("{key} host = {}{note}", escape_invisible(host)));
+            return;
+        }
+    }
+    let lower = trimmed.get(..8).unwrap_or(trimmed).to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        // Not a URL the parser accepts (so no handler will use it), but it
+        // reads like one: still never cut, and its host still shown.
         out.push(format!("{key} = {}", escape_invisible(v)));
-        let (host, userinfo) = url_host(v);
+        let (host, userinfo) = url_host(trimmed);
         let note = if userinfo {
             " (URL carries userinfo)"
         } else {
@@ -274,8 +319,8 @@ fn leaf_lines(key: &str, v: &str, out: &mut Vec<String>) {
 }
 
 /// The host of an `http(s)://` URL (the authority after its last `@`, port
-/// stripped) and whether the authority carries userinfo. Parsed by hand: no
-/// URL crate for one line of a summary.
+/// stripped) and whether the authority carries userinfo. Parsed by hand: the
+/// fallback for a URL-looking value the WHATWG parser refuses.
 pub(crate) fn url_host(url: &str) -> (&str, bool) {
     let rest = url.split_once("://").map_or(url, |(_, r)| r);
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
@@ -309,21 +354,54 @@ fn long_value(v: &str) -> String {
     )
 }
 
-/// `s` with every control character and every invisible / bidi-override
-/// character written as `\u{XXXX}`, so what the human reads is what runs.
+/// Does `c` render as nothing, or rearrange or break the text around it?
+/// Every control (Cc), format (Cf), line- and paragraph-separator (Zl, Zp)
+/// character, plus the other default-ignorable code points (variation
+/// selectors, Hangul fillers, the combining grapheme joiner) — enumerated by
+/// hand (Unicode 15.1) rather than pulling in a Unicode-properties crate.
+/// The CLI's `sanitize` mirrors this set.
+pub fn is_invisible(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{00AD}'
+                | '\u{034F}'
+                | '\u{0600}'..='\u{0605}'
+                | '\u{061C}'
+                | '\u{06DD}'
+                | '\u{070F}'
+                | '\u{0890}'..='\u{0891}'
+                | '\u{08E2}'
+                | '\u{115F}'..='\u{1160}'
+                | '\u{17B4}'..='\u{17B5}'
+                | '\u{180B}'..='\u{180F}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{206F}'
+                | '\u{3164}'
+                | '\u{FE00}'..='\u{FE0F}'
+                | '\u{FEFF}'
+                | '\u{FFA0}'
+                | '\u{FFF0}'..='\u{FFFB}'
+                | '\u{110BD}'
+                | '\u{110CD}'
+                | '\u{13430}'..='\u{1343F}'
+                | '\u{1BCA0}'..='\u{1BCA3}'
+                | '\u{1D173}'..='\u{1D17A}'
+                | '\u{E0000}'..='\u{E0FFF}'
+        )
+}
+
+/// `s` with every [`is_invisible`] character written as `\u{XXXX}` and every
+/// `\` as `\\` — so the escaping is unambiguous (a literal `\u{202E}` typed
+/// by a user reads `\\u{202E}`, never like the real character) and what the
+/// human reads is what runs.
 pub fn escape_invisible(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        let invisible = c.is_control()
-            || matches!(
-                c,
-                '\u{200B}'..='\u{200F}'
-                    | '\u{202A}'..='\u{202E}'
-                    | '\u{2060}'..='\u{2064}'
-                    | '\u{2066}'..='\u{2069}'
-                    | '\u{FEFF}'
-            );
-        if invisible {
+        if c == '\\' {
+            out.push_str("\\\\");
+        } else if is_invisible(c) {
             out.push_str(&format!("\\u{{{:04X}}}", c as u32));
         } else {
             out.push(c);
