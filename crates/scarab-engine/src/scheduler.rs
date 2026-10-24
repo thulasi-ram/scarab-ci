@@ -1777,32 +1777,8 @@ pub async fn cancel_run_request(
             Err(e) => return Err(e.into()),
         }
     }
-    match db
-        .record_transition(run, current, RunStatus::Cancelled)
-        .await
-    {
-        Ok(()) => {
-            db.append_event(&EventKind {
-                version: EVENT_VERSION,
-                run: run.clone(),
-                kind: EventPayload::RunTransitioned {
-                    from: current,
-                    to: RunStatus::Cancelled,
-                },
-                at: now,
-            })
-            .await?;
-            db.enqueue_outbox(&OutboxMessage {
-                id: crate::OutboxId(0),
-                run: run.clone(),
-                kind: RUN_STATUS_CHANGED.to_string(),
-                payload: serde_json::json!({ "to": RunStatus::Cancelled }),
-                idempotency_key: format!("status:{}:Cancelled", run.0),
-                at: now,
-            })
-            .await?;
-        }
-        Err(DbError::Conflict) => {}
+    match commit_run_transition(db, run, current, RunStatus::Cancelled, now, true).await {
+        Ok(()) | Err(DbError::Conflict) => {}
         Err(e) => return Err(e.into()),
     }
     if let Some((group, _)) = db.run_concurrency(run).await? {
@@ -1840,21 +1816,42 @@ async fn reopen(
     from: RunStatus,
     to: RunStatus,
 ) -> Result<(), RerunError> {
-    match db.record_transition(run, from, to).await {
-        Ok(()) => {
-            let now = clock.now().await;
-            db.append_event(&EventKind {
-                version: EVENT_VERSION,
-                run: run.clone(),
-                kind: EventPayload::RunTransitioned { from, to },
-                at: now,
-            })
-            .await?;
-            Ok(())
-        }
-        Err(DbError::Conflict) => Ok(()),
+    let now = clock.now().await;
+    match commit_run_transition(db, run, from, to, now, false).await {
+        Ok(()) | Err(DbError::Conflict) => Ok(()),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Move `run` `from → to` with its `RunTransitioned` — and, when `notify`,
+/// the exactly-once [`RUN_STATUS_CHANGED`] post for external observers (e.g.
+/// forge commit statuses; the key is unique per (run, state)) — as ONE commit
+/// ([`Db::commit_run_transition`]). `Conflict` = a peer already moved it,
+/// nothing written.
+async fn commit_run_transition(
+    db: &dyn Db,
+    run: &RunId,
+    from: RunStatus,
+    to: RunStatus,
+    now: Timestamp,
+    notify: bool,
+) -> Result<(), DbError> {
+    let events = [event(run, EventPayload::RunTransitioned { from, to }, now)];
+    let post = OutboxMessage {
+        id: crate::OutboxId(0),
+        run: run.clone(),
+        kind: RUN_STATUS_CHANGED.to_string(),
+        payload: serde_json::json!({ "to": to }),
+        idempotency_key: format!("status:{}:{to:?}", run.0),
+        at: now,
+    };
+    let outbox: &[OutboxMessage] = if notify {
+        std::slice::from_ref(&post)
+    } else {
+        &[]
+    };
+    db.commit_run_transition(run, from, to, &events, outbox)
+        .await
 }
 
 /// Configuration knobs (sane slice-1 defaults via [`Scheduler::new`]).
@@ -4969,27 +4966,11 @@ impl<'a> Scheduler<'a> {
         from: RunStatus,
         to: RunStatus,
     ) -> Result<(), SchedulerError> {
-        match self.db.record_transition(run, from, to).await {
-            Ok(()) => {
-                let now = self.clock.now().await;
-                self.append(run, EventPayload::RunTransitioned { from, to }, now)
-                    .await?;
-                // Notify external observers (e.g. forge commit-status posting)
-                // exactly-once via the outbox. The key is unique per (run, state),
-                // so a re-driven transition enqueues at most one post.
-                self.db
-                    .enqueue_outbox(&OutboxMessage {
-                        id: crate::OutboxId(0),
-                        run: run.clone(),
-                        kind: RUN_STATUS_CHANGED.to_string(),
-                        payload: serde_json::json!({ "to": to }),
-                        idempotency_key: format!("status:{}:{to:?}", run.0),
-                        at: now,
-                    })
-                    .await?;
-                Ok(())
-            }
-            Err(DbError::Conflict) => Ok(()),
+        // The CAS, its journal entry and the exactly-once notification of
+        // external observers (forge commit statuses) are one commit.
+        let now = self.clock.now().await;
+        match commit_run_transition(self.db, run, from, to, now, true).await {
+            Ok(()) | Err(DbError::Conflict) => Ok(()),
             Err(e) => Err(e.into()),
         }
     }

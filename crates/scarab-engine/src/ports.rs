@@ -824,6 +824,25 @@ pub trait Db: Send + Sync {
         to: RunStatus,
     ) -> Result<(), DbError>;
 
+    /// One run transition as ONE commit (review correctness F4, the run-level
+    /// residual of git-bug 586187a): the guarded `from → to` CAS (exactly
+    /// [`record_transition`](Db::record_transition)), then — only if it won —
+    /// every one of `events` and every one of `outbox` (each idempotent on its
+    /// key, as [`enqueue_outbox`](Db::enqueue_outbox)), in order. All of it
+    /// lands or none of it does: a lost CAS is [`DbError::Conflict`] with
+    /// nothing written; any later failure rolls the CAS back, leaving the run
+    /// in `from` for the caller's re-drive. Separately, a crash after the CAS
+    /// left a terminal run with no `RunTransitioned` and no forge status post,
+    /// and nothing could ever write them: the re-driven CAS conflicts.
+    async fn commit_run_transition(
+        &self,
+        run: &RunId,
+        from: RunStatus,
+        to: RunStatus,
+        events: &[EventKind],
+        outbox: &[OutboxMessage],
+    ) -> Result<(), DbError>;
+
     /// Record a step status transition (guarded by optimistic concurrency on
     /// `from`, so a duplicate/stale writer is rejected rather than double-applied).
     async fn record_step_transition(

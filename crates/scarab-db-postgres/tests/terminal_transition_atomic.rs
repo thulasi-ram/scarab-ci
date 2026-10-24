@@ -381,3 +381,106 @@ async fn a_cancelled_step_and_its_event_are_one_commit() {
         "the in-flight attempt is stamped in the same commit"
     );
 }
+
+fn is_run_transitioned(p: &EventPayload) -> bool {
+    matches!(p, EventPayload::RunTransitioned { .. })
+}
+
+/// A run transition, its `RunTransitioned` and its `run_status_changed`
+/// notification are ONE commit (review correctness F4, the run-level residual
+/// of git-bug 586187a). They were a CAS then separate writes: a crash in
+/// between left the run terminal with no journal entry and no forge status
+/// post, and no re-drive could write either — the re-sent cancel finds the run
+/// terminal and does nothing. Here the cancel's `RunTransitioned` write fails:
+/// the run must stay as it was, and the re-sent cancel lands all three.
+async fn run_transition_crash(db: &dyn Db, clock: &FakeClock) {
+    assert!(
+        cancel_run_request(db, clock, &run_id(), None).await.is_err(),
+        "the crash was injected"
+    );
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(scarab_engine::RunStatus::Running),
+        "the run's CAS rolled back with its journal entry"
+    );
+}
+
+async fn run_transition_converges(db: &dyn Db, clock: &FakeClock) {
+    use scarab_engine::RunStatus;
+    assert!(cancel_run_request(db, clock, &run_id(), None)
+        .await
+        .unwrap());
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Cancelled)
+    );
+    let into_cancelled = db
+        .events(&run_id())
+        .await
+        .unwrap()
+        .iter()
+        .filter(|e| {
+            matches!(e.kind, EventPayload::RunTransitioned { to: RunStatus::Cancelled, .. })
+        })
+        .count();
+    assert_eq!(into_cancelled, 1);
+    let posts = db
+        .claim_outbox("test", Some(scarab_engine::RUN_STATUS_CHANGED), 100, 0)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|m| m.idempotency_key == format!("status:{}:Cancelled", run_id().0))
+        .count();
+    assert_eq!(posts, 1, "the forge status post rides the same commit");
+}
+
+#[tokio::test]
+async fn a_run_transition_and_its_journal_are_one_commit_in_memory() {
+    let db = InMemoryDb::new();
+    let (clock, exec) = (FakeClock::new(1_000), FakeExecutor::new());
+    one_step_run(&db).await;
+    tick(&db, &clock, &exec).await;
+    db.fail_next_event_append(is_run_transitioned);
+    run_transition_crash(&db, &clock).await;
+    assert!(!db.event_append_failure_armed());
+    run_transition_converges(&db, &clock).await;
+}
+
+#[tokio::test]
+async fn a_run_transition_and_its_journal_are_one_commit_postgres() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+    let (clock, exec) = (FakeClock::new(1_000), FakeExecutor::new());
+    one_step_run(&db).await;
+    tick(&db, &clock, &exec).await;
+    sqlx::query(
+        "CREATE FUNCTION test_refuse_run_transitioned() RETURNS trigger AS $$
+         BEGIN
+           IF NEW.payload ? 'RunTransitioned' THEN
+             RAISE EXCEPTION 'injected: crash before the run journal';
+           END IF;
+           RETURN NEW;
+         END $$ LANGUAGE plpgsql",
+    )
+    .execute(&tdb.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER test_refuse_run_transitioned BEFORE INSERT ON events
+         FOR EACH ROW EXECUTE FUNCTION test_refuse_run_transitioned()",
+    )
+    .execute(&tdb.pool)
+    .await
+    .unwrap();
+    run_transition_crash(&db, &clock).await;
+    sqlx::query("DROP TRIGGER test_refuse_run_transitioned ON events")
+        .execute(&tdb.pool)
+        .await
+        .unwrap();
+    run_transition_converges(&db, &clock).await;
+    tdb.cleanup().await;
+}

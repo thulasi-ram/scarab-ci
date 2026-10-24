@@ -1919,22 +1919,35 @@ impl Db for PostgresDb {
         // `from`. Zero rows affected means a concurrent/duplicate writer already
         // moved it (e.g. a crashed worker re-driving) → Conflict, not a second
         // advance. This is the state-table guard behind exactly-once admission.
-        let affected = sqlx::query(
-            "UPDATE runs
-             SET status = $3, updated_at = (extract(epoch from now()) * 1000)::bigint
-             WHERE id = $1 AND status = $2",
-        )
-        .bind(&run.0)
-        .bind(run_status_str(from))
-        .bind(run_status_str(to))
-        .execute(self.pool())
-        .await
-        .map_err(db_err)?
-        .rows_affected();
-        if affected == 0 {
+        if !cas_run_status(self.pool(), run, from, to).await? {
             return Err(DbError::Conflict);
         }
         Ok(())
+    }
+
+    async fn commit_run_transition(
+        &self,
+        run: &RunId,
+        from: RunStatus,
+        to: RunStatus,
+        events: &[EventKind],
+        outbox: &[OutboxMessage],
+    ) -> Result<(), DbError> {
+        // ONE transaction: the CAS takes the run row's lock first, so a
+        // competing CAS waits and then sees the committed status (Conflict).
+        // An early return drops `tx`, which rolls everything back.
+        let mut tx = self.pool().begin().await.map_err(db_err)?;
+        if !cas_run_status(&mut *tx, run, from, to).await? {
+            tx.rollback().await.map_err(db_err)?;
+            return Err(DbError::Conflict);
+        }
+        for event in events {
+            insert_event(&mut *tx, event).await?;
+        }
+        for msg in outbox {
+            insert_outbox(&mut *tx, msg).await?;
+        }
+        tx.commit().await.map_err(db_err)
     }
 
     async fn append_event(&self, event: &EventKind) -> Result<(), DbError> {
@@ -2111,22 +2124,7 @@ impl Db for PostgresDb {
     }
 
     async fn enqueue_outbox(&self, msg: &OutboxMessage) -> Result<(), DbError> {
-        // Unique idempotency_key: a retried enqueue collapses to the existing
-        // row, so the logical effect is enqueued exactly once.
-        sqlx::query(
-            "INSERT INTO outbox (run_id, kind, payload, idempotency_key, created_at)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (idempotency_key) DO NOTHING",
-        )
-        .bind(&msg.run.0)
-        .bind(&msg.kind)
-        .bind(&msg.payload)
-        .bind(&msg.idempotency_key)
-        .bind(msg.at.0)
-        .execute(self.pool())
-        .await
-        .map_err(db_err)?;
-        Ok(())
+        insert_outbox(self.pool(), msg).await
     }
 
     async fn claim_outbox(
@@ -3547,6 +3545,53 @@ async fn attempts_on<'e, E: sqlx::PgExecutor<'e>>(
 /// (NULL `outcome`) is running unless it recorded a failure — the same
 /// derivation [`attempts_on`] applies on read.
 const ATTEMPT_IS_RUNNING: &str = "(outcome = 'running' OR (outcome IS NULL AND failure IS NULL))";
+
+/// The guarded run-status CAS on any executor: `true` iff the row was in
+/// `from` and is now `to`. Zero rows means a concurrent/duplicate writer
+/// already moved it.
+async fn cas_run_status<'e, E: sqlx::PgExecutor<'e>>(
+    exec: E,
+    run: &RunId,
+    from: RunStatus,
+    to: RunStatus,
+) -> Result<bool, DbError> {
+    let affected = sqlx::query(
+        "UPDATE runs
+         SET status = $3, updated_at = (extract(epoch from now()) * 1000)::bigint
+         WHERE id = $1 AND status = $2",
+    )
+    .bind(&run.0)
+    .bind(run_status_str(from))
+    .bind(run_status_str(to))
+    .execute(exec)
+    .await
+    .map_err(db_err)?
+    .rows_affected();
+    Ok(affected > 0)
+}
+
+/// Enqueue one outbox message on any executor. Unique idempotency_key: a
+/// retried enqueue collapses to the existing row, so the logical effect is
+/// enqueued exactly once.
+async fn insert_outbox<'e, E: sqlx::PgExecutor<'e>>(
+    exec: E,
+    msg: &OutboxMessage,
+) -> Result<(), DbError> {
+    sqlx::query(
+        "INSERT INTO outbox (run_id, kind, payload, idempotency_key, created_at)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (idempotency_key) DO NOTHING",
+    )
+    .bind(&msg.run.0)
+    .bind(&msg.kind)
+    .bind(&msg.payload)
+    .bind(&msg.idempotency_key)
+    .bind(msg.at.0)
+    .execute(exec)
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
 
 /// Append one event on any executor (the pool, or an open transaction).
 /// The guarded step-status CAS on any executor: `true` iff the row was in

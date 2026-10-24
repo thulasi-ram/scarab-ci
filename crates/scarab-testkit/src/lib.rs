@@ -581,6 +581,28 @@ fn take_event_append_failure(st: &mut InMemoryState, events: &[EventKind]) -> Re
     Ok(())
 }
 
+/// [`Db::enqueue_outbox`] under the caller's lock. Idempotent on the key: a
+/// duplicate enqueue is a no-op.
+fn enqueue_outbox_locked(st: &mut InMemoryState, msg: &OutboxMessage) {
+    if st
+        .outbox
+        .iter()
+        .any(|e| e.msg.idempotency_key == msg.idempotency_key)
+    {
+        return;
+    }
+    let id = OutboxId(st.outbox.len() as i64 + 1);
+    let mut msg = msg.clone();
+    msg.id = id;
+    st.outbox.push(OutboxEntry {
+        msg,
+        claimed_until: None,
+        dispatched: false,
+        delivery_attempts: 0,
+        dead_lettered: false,
+    });
+}
+
 /// [`Db::set_attempt_outcome`] / [`Db::set_attempt_failure`] under the
 /// caller's lock, with their terminal-by-intent guard.
 fn stamp_attempt_locked(
@@ -1999,6 +2021,30 @@ impl Db for InMemoryDb {
         Ok(())
     }
 
+    async fn commit_run_transition(
+        &self,
+        run: &RunId,
+        from: RunStatus,
+        to: RunStatus,
+        events: &[EventKind],
+        outbox: &[OutboxMessage],
+    ) -> Result<(), DbError> {
+        // One lock = the Postgres transaction: every check (including the
+        // crash injector) runs before the first mutation.
+        let mut st = self.state.lock().unwrap();
+        let current = st.runs.get(run).copied().unwrap_or(RunStatus::Pending);
+        if current != from {
+            return Err(DbError::Conflict);
+        }
+        take_event_append_failure(&mut st, events)?;
+        st.runs.insert(run.clone(), to);
+        st.events.extend(events.iter().cloned());
+        for msg in outbox {
+            enqueue_outbox_locked(&mut st, msg);
+        }
+        Ok(())
+    }
+
     async fn append_event(&self, event: &EventKind) -> Result<(), DbError> {
         let mut st = self.state.lock().unwrap();
         take_event_append_failure(&mut st, std::slice::from_ref(event))?;
@@ -2100,24 +2146,7 @@ impl Db for InMemoryDb {
 
     async fn enqueue_outbox(&self, msg: &OutboxMessage) -> Result<(), DbError> {
         let mut st = self.state.lock().unwrap();
-        // Idempotent on the key: a duplicate enqueue is a no-op.
-        if st
-            .outbox
-            .iter()
-            .any(|e| e.msg.idempotency_key == msg.idempotency_key)
-        {
-            return Ok(());
-        }
-        let id = OutboxId(st.outbox.len() as i64 + 1);
-        let mut msg = msg.clone();
-        msg.id = id;
-        st.outbox.push(OutboxEntry {
-            msg,
-            claimed_until: None,
-            dispatched: false,
-            delivery_attempts: 0,
-            dead_lettered: false,
-        });
+        enqueue_outbox_locked(&mut st, msg);
         Ok(())
     }
 
