@@ -687,3 +687,110 @@ fn the_first_attempt_is_counted_from_the_steps_latest_rerun() {
         "the new Take's first Attempt"
     );
 }
+
+/// A deploy Step is never skipped as unchanged (git-bug d880466): `build` →
+/// `bump`, both with content-addressed outputs. Rerunning `build` with an
+/// identical output re-arms `bump` with an unchanged input signature —
+/// which skip-if-unchanged (ADR-0027) would mark `Succeeded` with no
+/// Attempt and no DeploymentRequest, so the operator's rerun silently
+/// deploys nothing. A Step declaring `deployment_requests` re-runs instead,
+/// and its new Attempt records its own request.
+#[tokio::test]
+async fn a_deploy_step_is_never_skipped_as_unchanged() {
+    let db = InMemoryDb::new();
+    let build = StepId("build".into());
+    db.create_run(&run_id(), 2, 1, Timestamp(1_000))
+        .await
+        .unwrap();
+    db.create_step_run(&run_id(), &build, Some(&spec()), &[], Timestamp(1_000))
+        .await
+        .unwrap();
+    db.create_step_run(
+        &run_id(),
+        &step_id(),
+        Some(&spec()),
+        &[build.clone()],
+        Timestamp(1_000),
+    )
+    .await
+    .unwrap();
+    db.store_run_ir(
+        &run_id(),
+        &json!({ "ir_version": 2, "environment": "prod", "steps": [
+            { "id": "build", "image": "img" },
+            { "id": "bump", "image": "img", "needs": ["build"],
+              "results": ["version", "images"] },
+        ] }),
+    )
+    .await
+    .unwrap();
+    db.set_run_deployment_requests(&run_id(), &[requested()])
+        .await
+        .unwrap();
+
+    let clock = FakeClock::new(1_000);
+    let exec = FakeExecutor::new();
+    exec.set_output("build", "ob");
+    exec.set_output("bump", "obump");
+    exec.set_results(
+        "bump",
+        BTreeMap::from([
+            ("version".to_string(), json!("v42")),
+            ("images".to_string(), json!("sha256:aaa")),
+        ]),
+    );
+    for _ in 0..8 {
+        exec.script_outcome(ExecState::Succeeded);
+    }
+    let drive = || async {
+        for _ in 0..10 {
+            tick(&db, &clock, &exec).await;
+            clock.advance(1_000);
+            if db.run_status(&run_id()).await.unwrap().unwrap().is_terminal() {
+                return;
+            }
+        }
+        panic!("run did not settle");
+    };
+    drive().await;
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Succeeded)
+    );
+    assert_eq!(db.inputs("acme", "prod").await.unwrap().len(), 1);
+
+    scarab_engine::rerun_step(&db, &clock, &run_id(), &build, None)
+        .await
+        .expect("rerun build");
+    drive().await;
+
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Succeeded)
+    );
+    assert_eq!(
+        db.attempts_of_step(&run_id(), &build).await.unwrap().len(),
+        2,
+        "the rerun target re-ran"
+    );
+    assert_eq!(
+        db.attempts_of_step(&run_id(), &step_id())
+            .await
+            .unwrap()
+            .len(),
+        2,
+        "the deploy step re-ran although its inputs were unchanged"
+    );
+    assert!(
+        !db.events(&run_id()).await.unwrap().iter().any(|e| matches!(
+            &e.kind,
+            scarab_engine::EventPayload::StepSkipped { step, .. } if step == &step_id()
+        )),
+        "a deploy step is never skipped as unchanged"
+    );
+    assert_eq!(
+        db.inputs("acme", "prod").await.unwrap().len(),
+        2,
+        "the re-run records its own DeploymentRequest"
+    );
+}

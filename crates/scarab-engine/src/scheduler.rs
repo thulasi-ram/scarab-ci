@@ -2381,8 +2381,17 @@ impl<'a> Scheduler<'a> {
                     &signature_of,
                 );
                 let prev = self.db.step_input(run, &step.step).await?;
+                // Never for a deploy Step (git-bug d880466): skipping marks
+                // it `Succeeded` with no Attempt and no DeploymentRequest, so
+                // a rerun that re-arms it would silently deploy nothing. Its
+                // effect is the request, not its output; it always re-runs.
                 let unchanged = signature_of.contains_key(&step.step)
-                    && prev.as_deref() == Some(cur.as_str());
+                    && prev.as_deref() == Some(cur.as_str())
+                    && self
+                        .db
+                        .run_deployment_requests(run, &step.step)
+                        .await?
+                        .is_empty();
                 if unchanged {
                     self.skip_unchanged(run, &step.step).await?;
                 } else {
