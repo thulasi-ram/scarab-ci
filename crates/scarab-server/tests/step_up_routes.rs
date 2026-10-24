@@ -398,7 +398,7 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "POST",
         "/v1/connections/{id}/resync",
         "connection.resync",
-        "NG",
+        "CJ-W",
     ),
     ("GET", "/v1/connections/{id}/preflight", "read", "READ"),
     (
@@ -696,6 +696,35 @@ async fn every_crown_jewel_needs_a_step_up_even_for_an_owner() {
     assert!(refused.iter().all(|e| e.caller == "session:cookie"));
 }
 
+/// `connection.resync` binds every reported repo through the same path as
+/// `connection.bind_repo`, so it needs the same window step-up: under
+/// enforcement an Owner without one is refused, exactly like bind_repo.
+#[tokio::test]
+async fn resync_needs_the_same_step_up_as_bind_repo() {
+    let h = harness();
+    let (s, _soft) = {
+        h.grant("amy", Scope::Org("acme".into()), Role::Owner).await;
+        let s = h.browser_session(owner("amy")).await;
+        let mut soft = passkey();
+        h.enroll(&s, &mut soft, "Laptop").await;
+        (s, soft)
+    };
+    let (st, resync) = h
+        .cookie("POST", "/v1/connections/gh/resync", None, &s)
+        .await;
+    assert_step_up(st, &resync, "window");
+    assert_eq!(resync["op"], "connection.resync");
+    let (st, bind) = h
+        .cookie(
+            "POST",
+            "/v1/connections/gh/repos",
+            Some(json!({"owner": "acme", "name": "web"})),
+            &s,
+        )
+        .await;
+    assert_step_up(st, &bind, "window");
+}
+
 /// The 403 (and the refusal it records) never echoes a redacted field.
 #[tokio::test]
 async fn a_refusal_never_echoes_a_secret_value() {
@@ -773,6 +802,7 @@ fn well_formed(r: &scarab_server::RouteEntry) -> (String, Option<Value>) {
         }
         ("POST", "/v1/connections/{id}/repos") => Some(json!({"owner": "acme", "name": "web"})),
         ("DELETE", _)
+        | ("POST", "/v1/connections/{id}/resync")
         | ("POST", "/v1/orgs/{org}/plugins/{name}/enable")
         | ("POST", "/v1/orgs/{org}/members/{subject}/passkeys/reset") => None,
         (m, p) => panic!("add a well-formed request for the crown jewel {m} {p}"),
@@ -847,7 +877,7 @@ async fn exempt_and_ungoverned_routes_never_ask_for_a_step_up() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 27, "the EX + NG mutating routes");
+    assert_eq!(checked, 26, "the EX + NG mutating routes");
     assert!(h.events_of("step_up.refused").is_empty());
 }
 
