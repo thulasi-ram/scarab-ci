@@ -681,6 +681,114 @@ async fn the_eleventh_pending_request_is_429() {
     raise(&h, &token, "later").await;
 }
 
+/// The pending cap is per human too (git-bug e582326): however many tokens
+/// act for one human, at most 20 requests wait for them; the 21st is 429
+/// (recorded) — and the per-credential cap still holds.
+#[tokio::test]
+async fn at_most_twenty_requests_wait_for_one_human_across_credentials() {
+    let (h, _) = world(Backend::Memory).await;
+    for t in ["t1", "t2"] {
+        let token = pat(&h, t, Scope::Org("acme".into()), Role::Admin).await;
+        for i in 0..10 {
+            raise(&h, &token, &format!("{t}-{i}")).await;
+        }
+    }
+    let third = pat(&h, "t3", Scope::Org("acme".into()), Role::Admin).await;
+    let (st, b) = h
+        .bearer("POST", "/v1/secrets", Some(secret("t3")), &third)
+        .await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{b}");
+    assert_eq!(h.step_up.requests().len(), 20);
+    let refused = h.events("step_up.refused").await;
+    assert_eq!(
+        refused.last().unwrap().detail["reason"],
+        "too many pending confirmation requests for this human"
+    );
+    // Once they expire, the human may be asked again.
+    h.clock.advance(5 * MIN);
+    raise(&h, &third, "later").await;
+}
+
+/// A request seals at most its operation's body cap (git-bug e582326): a
+/// 300 KiB secret raises none (413, recorded); a 100 KiB one still does
+/// (secret.put allows 256 KiB), and so does a body within another op's
+/// 64 KiB default.
+#[tokio::test]
+async fn a_body_over_the_op_s_cap_raises_no_request() {
+    let (h, _) = world(Backend::Memory).await;
+    let token = pat(&h, "t1", Scope::Org("acme".into()), Role::Admin).await;
+    let big = "x".repeat(300 * 1024);
+    let (st, b) = h
+        .bearer("POST", "/v1/secrets", Some(secret(&big)), &token)
+        .await;
+    assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE, "{st}");
+    assert_eq!(b["code"], "request_body_too_large", "{b}");
+    assert!(h.step_up.requests().is_empty());
+    let refused = h.events("step_up.refused").await;
+    assert_eq!(
+        refused.last().unwrap().detail["reason"],
+        "request body too large"
+    );
+    raise(&h, &token, &"y".repeat(100 * 1024)).await;
+    assert_eq!(h.step_up.requests().len(), 1);
+
+    // binding.put keeps the 64 KiB default.
+    let (st, b) = h
+        .bearer(
+            "PUT",
+            "/v1/orgs/acme/bindings",
+            Some(json!({"subject": "bob", "role": "admin", "note": "z".repeat(70 * 1024)})),
+            &token,
+        )
+        .await;
+    assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE, "{b}");
+    assert_eq!(h.step_up.requests().len(), 1);
+}
+
+/// Refusals are rate-limited per (subject, caller, operation, reason) (git-bug
+/// e582326): a token hammering an operation it can never run writes 5
+/// `step_up.refused` rows a minute, not one per call; the next window's
+/// first row carries how many were dropped.
+#[tokio::test]
+async fn refusals_are_rate_limited_and_coalesced() {
+    let (h, _) = world(Backend::Memory).await;
+    h.grant("amy", Scope::Org("beta".into()), Role::Owner).await;
+    let token = pat(&h, "t1", Scope::Org("acme".into()), Role::Owner).await;
+    let beta = json!({"org": "beta", "name": "DB_PASSWORD", "value": "v"});
+    let hammer = |n: usize| {
+        let (h, token, beta) = (&h, &token, &beta);
+        async move {
+            for _ in 0..n {
+                let (st, _) = h
+                    .bearer("POST", "/v1/secrets", Some(beta.clone()), token)
+                    .await;
+                assert_eq!(st, StatusCode::FORBIDDEN);
+            }
+        }
+    };
+    hammer(12).await;
+    let refused = h.events("step_up.refused").await;
+    assert_eq!(refused.len(), 5, "5 a minute, not 12");
+    assert!(refused
+        .iter()
+        .all(|e| e.detail.get("suppressed_before").is_none()));
+
+    h.clock.advance(MIN);
+    hammer(1).await;
+    let refused = h.events("step_up.refused").await;
+    assert_eq!(refused.len(), 6);
+    assert_eq!(refused.last().unwrap().detail["suppressed_before"], 7);
+
+    // Another reason (or caller) is its own budget: amy's browser is
+    // refused and recorded however hard her token hammered.
+    let amy = h.browser_session(owner("amy")).await;
+    let (st, _) = h
+        .cookie("POST", "/v1/secrets", Some(secret("v")), &amy)
+        .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    assert_eq!(h.events("step_up.refused").await.len(), 7);
+}
+
 /// A machine caller never raises a request it could never execute
 /// (git-bug ff7a014): the identity-link flows are browser-only (from a token
 /// AND from a Bearer session), a token may not mint tokens, and a token

@@ -6,8 +6,14 @@
 //! for the human it acts for (the token's owner, the session's principal):
 //! the body sealed under the KEK with the AAD bound to the request id, the
 //! action digest, a redacted summary, a 5-minute expiry. The 403 carries a
-//! one-time `confirmation_url`. At most [`MAX_PENDING_STEP_UP_REQUESTS`] may
-//! wait per requester (then 429). A PluginPrincipal never raises one.
+//! one-time `confirmation_url`. At most
+//! [`MAX_PENDING_STEP_UP_REQUESTS`](scarab_identity::MAX_PENDING_STEP_UP_REQUESTS) may wait
+//! per requester and
+//! [`MAX_PENDING_STEP_UP_REQUESTS_PER_HUMAN`](scarab_identity::MAX_PENDING_STEP_UP_REQUESTS_PER_HUMAN) per
+//! human, counted atomically with the insert (then 429); a body bigger than
+//! the operation's [`Op::max_request_body`] raises none (413). A
+//! PluginPrincipal never raises one, nor does a requester that could never
+//! execute the operation ([`requestable`]).
 //!
 //! **Confirm.** Only that human, in their own browser, with their own
 //! passkey: `GET /v1/step-up/requests/{id}` shows what would run (anyone
@@ -41,8 +47,8 @@ use utoipa::ToSchema;
 
 use scarab_identity::{
     security_event_kind as kind, Action, BeginExecution, ChallengePurpose, ConfirmationKind,
-    Principal, RequestState, Role, StepUpConfirmation, StepUpRequest, StepUpRequester,
-    MAX_PENDING_STEP_UP_REQUESTS, STEP_UP_REQUEST_TTL_MS, STEP_UP_WINDOW_MS,
+    PendingCaps, Principal, RaiseRequest, RequestState, Role, StepUpConfirmation, StepUpRequest,
+    StepUpRequester, STEP_UP_REQUEST_TTL_MS, STEP_UP_WINDOW_MS,
 };
 
 use super::ceremony::{
@@ -235,12 +241,9 @@ pub(crate) async fn raise<T>(
     let human = caller.principal.subject.clone();
     let now = st.clock.now().await.0;
 
-    let pending = svc
-        .confirmations
-        .pending_count(&requester, now)
-        .await
-        .map_err(store_err)?;
-    if pending >= MAX_PENDING_STEP_UP_REQUESTS {
+    // The sealed body is parked until the request settles or is reaped:
+    // bounded per operation, well under the guard's limit.
+    if p.body.len() > op.max_request_body {
         let mut ev = event(
             kind::STEP_UP_REFUSED,
             &human,
@@ -253,14 +256,22 @@ pub(crate) async fn raise<T>(
         ev.session_hash = caller.session.as_ref().map(|s| s.id_hash.clone());
         ev.detail = serde_json::json!({
             "mode": refusal.mode,
-            "reason": "too many pending confirmation requests",
-            "pending": pending,
+            "reason": "request body too large",
+            "bytes": p.body.len(),
+            "limit": op.max_request_body,
         });
-        svc.record(ev).await;
-        return Err(ApiError::TooManyRequests(format!(
-            "{pending} step-up confirmation requests from this credential are already waiting \
-             for {human}; confirm them, or let them expire (5 minutes), first"
-        )));
+        svc.record_refusal(ev).await;
+        return Err(super::ceremony::ceremony(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_body_too_large",
+            format!(
+                "the body ({} bytes) is larger than a confirmation request for {} may carry ({} \
+                 bytes), so none was raised; do it from a signed-in browser instead",
+                p.body.len(),
+                op.label,
+                op.max_request_body
+            ),
+        ));
     }
 
     let id = random_id();
@@ -312,10 +323,51 @@ pub(crate) async fn raise<T>(
         result_status: None,
         result_summary: None,
     };
-    svc.confirmations
-        .put_request(&row)
+    // The caps are counted atomically with the insert: per credential, and
+    // per human across every credential acting for them.
+    let full = match svc
+        .confirmations
+        .raise_request(&row, PendingCaps::DEFAULT, now)
         .await
-        .map_err(store_err)?;
+        .map_err(store_err)?
+    {
+        RaiseRequest::Raised => None,
+        RaiseRequest::RequesterFull { pending } => Some((
+            pending,
+            "too many pending confirmation requests",
+            format!(
+                "{pending} step-up confirmation requests from this credential are already \
+                 waiting for {human}; confirm them, or let them expire (5 minutes), first"
+            ),
+        )),
+        RaiseRequest::HumanFull { pending } => Some((
+            pending,
+            "too many pending confirmation requests for this human",
+            format!(
+                "{pending} step-up confirmation requests are already waiting for {human}; \
+                 confirm them, or let them expire (5 minutes), first"
+            ),
+        )),
+    };
+    if let Some((pending, reason, message)) = full {
+        let mut ev = event(
+            kind::STEP_UP_REFUSED,
+            &human,
+            caller.event_label(),
+            p.org.clone(),
+            now,
+        );
+        ev.op = Some(op.id.to_string());
+        ev.target = Some(summary.target.clone());
+        ev.session_hash = caller.session.as_ref().map(|s| s.id_hash.clone());
+        ev.detail = serde_json::json!({
+            "mode": refusal.mode,
+            "reason": reason,
+            "pending": pending,
+        });
+        svc.record_refusal(ev).await;
+        return Err(ApiError::TooManyRequests(message));
+    }
 
     let mut ev = event(
         kind::REQUEST_RAISED,

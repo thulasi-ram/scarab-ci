@@ -34,6 +34,40 @@ pub const FRESH_LOGIN_MS: i64 = 5 * 60 * 1000;
 /// The most live (pending, unexpired) requests one requester may hold.
 pub const MAX_PENDING_STEP_UP_REQUESTS: u64 = 10;
 
+/// The most live (pending, unexpired) requests that may wait for one human,
+/// across every credential acting for them — so N tokens cannot park N×10.
+pub const MAX_PENDING_STEP_UP_REQUESTS_PER_HUMAN: u64 = 20;
+
+/// The caps [`StepUpStore::raise_request`] enforces, counted atomically with
+/// the insert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingCaps {
+    /// Live requests one requester (a token, a Bearer session) may hold.
+    pub per_requester: u64,
+    /// Live requests one human (`for_human`) may have waiting.
+    pub per_human: u64,
+}
+
+impl PendingCaps {
+    /// [`MAX_PENDING_STEP_UP_REQUESTS`] and
+    /// [`MAX_PENDING_STEP_UP_REQUESTS_PER_HUMAN`].
+    pub const DEFAULT: PendingCaps = PendingCaps {
+        per_requester: MAX_PENDING_STEP_UP_REQUESTS,
+        per_human: MAX_PENDING_STEP_UP_REQUESTS_PER_HUMAN,
+    };
+}
+
+/// What [`StepUpStore::raise_request`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RaiseRequest {
+    /// Recorded, pending.
+    Raised,
+    /// Not recorded: the requester already holds `pending` live requests.
+    RequesterFull { pending: u64 },
+    /// Not recorded: `pending` live requests already wait for the human.
+    HumanFull { pending: u64 },
+}
+
 /// [`Session::login_kind`](crate::Session::login_kind) for a login completed
 /// by the browser OAuth callback.
 pub const LOGIN_KIND_BROWSER: &str = "browser";
@@ -465,8 +499,21 @@ pub trait StepUpStore: Send + Sync {
     /// reset). Returns how many.
     async fn delete_windows_for(&self, principal: &str) -> Result<u64, IdentityError>;
 
-    /// Record a new request (state `Pending`).
+    /// Record a new request (state `Pending`), uncapped. The server raises
+    /// through [`raise_request`](Self::raise_request).
     async fn put_request(&self, request: &StepUpRequest) -> Result<(), IdentityError>;
+
+    /// Record a new request (state `Pending`) only if its requester holds
+    /// fewer than `caps.per_requester` and its human (`for_human`) fewer than
+    /// `caps.per_human` live (pending, unexpired at `now_ms`) requests —
+    /// counted and inserted **atomically**: concurrent raises for one human
+    /// can never together exceed the caps.
+    async fn raise_request(
+        &self,
+        request: &StepUpRequest,
+        caps: PendingCaps,
+        now_ms: i64,
+    ) -> Result<RaiseRequest, IdentityError>;
 
     async fn get_request(&self, id: &str) -> Result<Option<StepUpRequest>, IdentityError>;
 

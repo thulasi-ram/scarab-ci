@@ -217,7 +217,14 @@ pub struct Op {
     pub describe: fn(&Op, &OpInput) -> OpSummary,
     /// Whether a machine caller may raise a request for it.
     pub machine: MachineUse,
+    /// The largest body a StepUpConfirmationRequest for it may seal (bytes);
+    /// a bigger one raises none (413). Well under the guard's 2 MiB: a
+    /// request parks its body, sealed, until it settles or is reaped.
+    pub max_request_body: usize,
 }
+
+/// [`Op::max_request_body`] unless an operation says otherwise.
+pub const DEFAULT_MAX_REQUEST_BODY: usize = 64 * 1024;
 
 impl Op {
     pub fn summary(&self, input: &OpInput) -> OpSummary {
@@ -236,6 +243,14 @@ impl Op {
     const fn not_by_token(self) -> Op {
         Op {
             machine: MachineUse::NotByToken,
+            ..self
+        }
+    }
+
+    /// A request for it may seal a body of up to `bytes`.
+    const fn max_request_body(self, bytes: usize) -> Op {
+        Op {
+            max_request_body: bytes,
             ..self
         }
     }
@@ -481,6 +496,7 @@ const fn op(
         target,
         describe: describe_generic,
         machine: MachineUse::Requestable,
+        max_request_body: DEFAULT_MAX_REQUEST_BODY,
     }
 }
 
@@ -838,7 +854,9 @@ pub static SECRET_PUT: Op = op(
     OrgOf::Body("/org"),
     &["/value"],
     &["body:/org", "body:/repo", "body:/environment", "body:/name"],
-);
+)
+// A secret value (a certificate chain, a kubeconfig) may be bigger.
+.max_request_body(256 * 1024);
 pub static SECRET_DELETE: Op = op(
     "secret.delete",
     "Delete a secret",

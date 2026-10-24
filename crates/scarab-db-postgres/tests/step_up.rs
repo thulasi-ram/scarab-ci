@@ -12,8 +12,8 @@ use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_identity::{
     BeginExecution, ChallengePurpose, ChallengeStore, ConfirmationKind, IdentityError, Passkey,
-    PasskeyStore, PasskeyUse, RequestState, Role, StepUpConfirmation, StepUpRequest,
-    StepUpRequester, StepUpStore, WebauthnChallenge, STEP_UP_WINDOW_MS,
+    PasskeyStore, PasskeyUse, PendingCaps, RaiseRequest, RequestState, Role, StepUpConfirmation,
+    StepUpRequest, StepUpRequester, StepUpStore, WebauthnChallenge, STEP_UP_WINDOW_MS,
 };
 
 fn passkey(id: &str, principal: &str, credential: &[u8], count: u32) -> Passkey {
@@ -816,5 +816,89 @@ async fn schema_version_reads_the_applied_migrations() {
     assert_eq!(db.schema_version().await.unwrap(), None);
     db.migrate().await.unwrap();
     assert!(db.schema_version().await.unwrap().unwrap() >= 62);
+    tdb.cleanup().await;
+}
+
+/// git-bug e582326: `raise_request` caps live pending requests per requester
+/// AND per human (across credentials); expired or settled ones do not count.
+#[tokio::test]
+async fn raise_request_caps_per_requester_and_per_human() {
+    let Some((tdb, db)) = db().await else { return };
+    let caps = PendingCaps {
+        per_requester: 2,
+        per_human: 3,
+    };
+    let raise = |id: &str, requester: StepUpRequester| {
+        let r = request(id, requester, 5_000);
+        let db = &db;
+        async move { db.raise_request(&r, caps, 10).await.unwrap() }
+    };
+    assert_eq!(raise("r1", token("t1")).await, RaiseRequest::Raised);
+    assert_eq!(raise("r2", token("t1")).await, RaiseRequest::Raised);
+    assert_eq!(
+        raise("r3", token("t1")).await,
+        RaiseRequest::RequesterFull { pending: 2 }
+    );
+    assert_eq!(raise("r4", token("t2")).await, RaiseRequest::Raised);
+    assert_eq!(
+        raise("r5", token("t3")).await,
+        RaiseRequest::HumanFull { pending: 3 }
+    );
+    // An expired request does not count; nor does a settled one.
+    db.put_request(&request("old", token("t9"), 5))
+        .await
+        .unwrap();
+    db.begin_execution("r1", "amy", "c", 10).await.unwrap();
+    assert_eq!(raise("r6", token("t3")).await, RaiseRequest::Raised);
+    // Another human is not affected.
+    let mut bob = request("b1", token("tb"), 5_000);
+    bob.for_human = "bob".into();
+    assert_eq!(
+        db.raise_request(&bob, caps, 10).await.unwrap(),
+        RaiseRequest::Raised
+    );
+    for id in ["r3", "r5"] {
+        assert!(db.get_request(id).await.unwrap().is_none(), "{id}");
+    }
+    tdb.cleanup().await;
+}
+
+/// git-bug e582326: the count and the insert are one atomic step. The test
+/// holds the human's raise lock, starts a raise (it must wait), lets 3 other
+/// requests for the human commit meanwhile, then releases: the raise counts
+/// them and is refused. A count-then-insert outside the lock would already
+/// have inserted, over the cap.
+#[tokio::test]
+async fn raise_request_counts_and_inserts_under_the_human_s_lock() {
+    let Some((tdb, db)) = db().await else { return };
+    let db = std::sync::Arc::new(db);
+    let caps = PendingCaps {
+        per_requester: 10,
+        per_human: 3,
+    };
+    let mut lock = tdb.pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(scarab_db_postgres::step_up_request_lock_key("amy"))
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    let racer = {
+        let db = db.clone();
+        tokio::spawn(async move {
+            db.raise_request(&request("racer", token("t1"), 5_000), caps, 10)
+                .await
+                .unwrap()
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!racer.is_finished(), "the raise waits for the human's lock");
+    for (i, t) in ["t2", "t3", "t4"].iter().enumerate() {
+        db.put_request(&request(&format!("other{i}"), token(t), 5_000))
+            .await
+            .unwrap();
+    }
+    lock.commit().await.unwrap();
+    assert_eq!(racer.await.unwrap(), RaiseRequest::HumanFull { pending: 3 });
+    assert!(db.get_request("racer").await.unwrap().is_none());
     tdb.cleanup().await;
 }

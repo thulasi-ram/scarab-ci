@@ -14,8 +14,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use scarab_identity::{
     BeginExecution, ChallengeStore, ConfirmationKind, IdentityError, Passkey, PasskeyStore,
-    PasskeyUse, RbacStore, RequestState, SecurityEvent, SecurityEventFilter, SecurityEventLog,
-    StepUpConfirmation, StepUpRequest, StepUpRequester, StepUpStore, WebauthnChallenge,
+    PasskeyUse, PendingCaps, RaiseRequest, RbacStore, RequestState, SecurityEvent,
+    SecurityEventFilter, SecurityEventLog, StepUpConfirmation, StepUpRequest, StepUpRequester,
+    StepUpStore, WebauthnChallenge,
 };
 
 // ---------------------------------------------------------------------------
@@ -388,6 +389,44 @@ impl StepUpStore for InMemoryStepUp {
         }
         state.requests.insert(request.id.clone(), request.clone());
         Ok(())
+    }
+
+    async fn raise_request(
+        &self,
+        request: &StepUpRequest,
+        caps: PendingCaps,
+        now_ms: i64,
+    ) -> Result<RaiseRequest, IdentityError> {
+        let mut state = self.state.lock().unwrap();
+        let live = |r: &&StepUpRequest| r.state == RequestState::Pending && r.expires_at > now_ms;
+        let by_requester = state
+            .requests
+            .values()
+            .filter(live)
+            .filter(|r| requester_matches(r, &request.requester))
+            .count() as u64;
+        if by_requester >= caps.per_requester {
+            return Ok(RaiseRequest::RequesterFull {
+                pending: by_requester,
+            });
+        }
+        let for_human = state
+            .requests
+            .values()
+            .filter(live)
+            .filter(|r| r.for_human == request.for_human)
+            .count() as u64;
+        if for_human >= caps.per_human {
+            return Ok(RaiseRequest::HumanFull { pending: for_human });
+        }
+        if state.requests.contains_key(&request.id) {
+            return Err(IdentityError::Conflict(format!(
+                "request `{}` already exists",
+                request.id
+            )));
+        }
+        state.requests.insert(request.id.clone(), request.clone());
+        Ok(RaiseRequest::Raised)
     }
 
     async fn get_request(&self, id: &str) -> Result<Option<StepUpRequest>, IdentityError> {

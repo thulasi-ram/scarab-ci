@@ -93,6 +93,64 @@ pub struct StepUpService {
     digest_key: [u8; 32],
     link_key: [u8; 32],
     rp: RelyingParty,
+    refusals: RefusalLimiter,
+}
+
+/// How long one refusal-coalescing window lasts.
+pub const REFUSAL_WINDOW_MS: i64 = 60 * 1000;
+/// How many `step_up.refused` events one (subject, caller, operation,
+/// reason) records per window. The rest are counted, not written; the next one recorded
+/// carries the count (`detail.suppressed_before`).
+pub const REFUSALS_PER_WINDOW: u32 = 5;
+/// The most (subject, caller, operation, reason) keys tracked at once. Past it (after
+/// dropping every closed window) a new key's refusals are not recorded.
+const MAX_REFUSAL_KEYS: usize = 10_000;
+
+/// Rate-limits and coalesces `step_up.refused` events in this process
+/// (git-bug e582326): the log is append-only and never pruned, so a caller
+/// hammering a refused operation must not be able to grow it without bound.
+#[derive(Default)]
+pub(crate) struct RefusalLimiter {
+    buckets: Mutex<std::collections::HashMap<[String; 4], RefusalBucket>>,
+}
+
+struct RefusalBucket {
+    window_start: i64,
+    recorded: u32,
+    suppressed: u64,
+}
+
+impl RefusalLimiter {
+    /// Whether to record a refusal for `key` at `now`: `Some(n)` = record
+    /// it, carrying the `n` refusals suppressed since the last one recorded;
+    /// `None` = suppress it (counted).
+    pub(crate) fn admit(&self, key: [&str; 4], now: i64) -> Option<u64> {
+        let mut buckets = self.buckets.lock().unwrap();
+        let key = key.map(str::to_string);
+        if !buckets.contains_key(&key) && buckets.len() >= MAX_REFUSAL_KEYS {
+            buckets.retain(|_, b| now - b.window_start < REFUSAL_WINDOW_MS);
+            if buckets.len() >= MAX_REFUSAL_KEYS {
+                tracing::warn!("step_up.refused: too many distinct refusers; not recording");
+                return None;
+            }
+        }
+        let b = buckets.entry(key).or_insert(RefusalBucket {
+            window_start: now,
+            recorded: 0,
+            suppressed: 0,
+        });
+        if now - b.window_start >= REFUSAL_WINDOW_MS {
+            b.window_start = now;
+            b.recorded = 0;
+        }
+        if b.recorded < REFUSALS_PER_WINDOW {
+            b.recorded += 1;
+            Some(std::mem::take(&mut b.suppressed))
+        } else {
+            b.suppressed += 1;
+            None
+        }
+    }
 }
 
 impl StepUpService {
@@ -115,6 +173,7 @@ impl StepUpService {
             digest_key,
             link_key,
             rp,
+            refusals: RefusalLimiter::default(),
         }
     }
 
@@ -209,6 +268,39 @@ impl StepUpService {
             row,
             scarab_webauthn::action_challenge(&nonce, digest.as_ref()),
         ))
+    }
+
+    /// Append a `step_up.refused` event, best-effort and rate-limited per
+    /// (subject, caller, operation, `detail.reason`) — so one caller
+    /// hammering one refusal cannot grow the append-only log, while every
+    /// distinct refusal is still on it: at most [`REFUSALS_PER_WINDOW`]
+    /// per [`REFUSAL_WINDOW_MS`]; the next one recorded after a suppression
+    /// carries how many were dropped (`detail.suppressed_before`).
+    pub(crate) async fn record_refusal(&self, mut event: SecurityEvent) {
+        let reason = event
+            .detail
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        match self.refusals.admit(
+            [
+                &event.subject,
+                &event.caller,
+                event.op.as_deref().unwrap_or_default(),
+                &reason,
+            ],
+            event.at,
+        ) {
+            None => return,
+            Some(0) => {}
+            Some(n) => {
+                if let Some(d) = event.detail.as_object_mut() {
+                    d.insert("suppressed_before".into(), n.into());
+                }
+            }
+        }
+        self.record(event).await;
     }
 
     /// Append an event, best-effort: a failure is logged, never fatal.
@@ -692,10 +784,15 @@ pub(crate) async fn refuse_with<T>(
     ev.target = Some(refusal.summary.target.clone());
     ev.session_hash = p.caller.session.as_ref().map(|s| s.id_hash.clone());
     ev.detail = serde_json::json!({ "mode": refusal.mode, "reason": reason });
-    if request_id.is_some() {
-        ev.request_id = request_id;
+    match request_id {
+        // Linked to the request it raised: always recorded (bounded by the
+        // pending caps, and the request's evidence).
+        Some(id) => {
+            ev.request_id = Some(id);
+            p.svc.record(ev).await;
+        }
+        None => p.svc.record_refusal(ev).await,
     }
-    p.svc.record(ev).await;
     Err(ApiError::StepUpRequired(Box::new(refusal)))
 }
 
@@ -721,7 +818,7 @@ async fn refuse_unrequestable<T>(
     ev.target = Some(p.summary.target.clone());
     ev.session_hash = p.caller.session.as_ref().map(|s| s.id_hash.clone());
     ev.detail = serde_json::json!({ "mode": mode.as_str(), "reason": why.code() });
-    p.svc.record(ev).await;
+    p.svc.record_refusal(ev).await;
     Err(ApiError::Ceremony {
         status: axum::http::StatusCode::FORBIDDEN,
         code: why.code(),
@@ -748,6 +845,25 @@ mod tests {
         assert!(check_step_up_composition(false, true, true).is_ok());
         assert!(check_step_up_composition(true, true, false).is_ok());
         assert!(check_step_up_composition(false, false, false).is_ok());
+    }
+
+    #[test]
+    fn the_refusal_limiter_admits_five_a_window_per_key_and_carries_the_rest() {
+        let l = RefusalLimiter::default();
+        let k = ["amy", "api_token:t1", "secret.put", "outside_token_scope"];
+        for _ in 0..REFUSALS_PER_WINDOW {
+            assert_eq!(l.admit(k, 0), Some(0));
+        }
+        assert_eq!(l.admit(k, 1), None);
+        assert_eq!(l.admit(k, REFUSAL_WINDOW_MS - 1), None);
+        // Another reason, operation, caller or subject has its own budget.
+        assert_eq!(l.admit(["amy", k[1], k[2], "plugin"], 2), Some(0));
+        assert_eq!(l.admit(["amy", k[1], "secret.delete", k[3]], 2), Some(0));
+        assert_eq!(l.admit(["amy", "session:cookie", k[2], k[3]], 2), Some(0));
+        assert_eq!(l.admit(["bob", k[1], k[2], k[3]], 2), Some(0));
+        // The next window: the first recorded carries the two dropped.
+        assert_eq!(l.admit(k, REFUSAL_WINDOW_MS), Some(2));
+        assert_eq!(l.admit(k, REFUSAL_WINDOW_MS), Some(0));
     }
 
     #[tokio::test]

@@ -16,8 +16,9 @@ use sqlx::Row;
 
 use scarab_identity::{
     BeginExecution, ChallengePurpose, ChallengeStore, ConfirmationKind, IdentityError, Passkey,
-    PasskeyStore, PasskeyUse, RequestState, SecurityEvent, SecurityEventFilter, SecurityEventLog,
-    StepUpConfirmation, StepUpRequest, StepUpRequester, StepUpStore, WebauthnChallenge,
+    PasskeyStore, PasskeyUse, PendingCaps, RaiseRequest, RequestState, SecurityEvent,
+    SecurityEventFilter, SecurityEventLog, StepUpConfirmation, StepUpRequest, StepUpRequester,
+    StepUpStore, WebauthnChallenge,
 };
 
 use crate::{identity_err, role_from_str, role_str, PostgresDb};
@@ -421,6 +422,59 @@ fn request_from_row(r: &sqlx::postgres::PgRow) -> Result<StepUpRequest, Identity
     })
 }
 
+/// The advisory-lock key every [`StepUpStore::raise_request`] for
+/// `for_human` takes (`pg_advisory_xact_lock(hashtextextended(key, 0))`).
+pub fn step_up_request_lock_key(for_human: &str) -> String {
+    format!("scarab:step-up-request:{for_human}")
+}
+
+/// Insert one StepUpConfirmationRequest row.
+async fn insert_request<'e, E: sqlx::PgExecutor<'e>>(
+    ex: E,
+    r: &StepUpRequest,
+) -> Result<(), IdentityError> {
+    let (api_token_id, session_hash) = match &r.requester {
+        StepUpRequester::ApiToken { id } => (Some(id.as_str()), None),
+        StepUpRequester::BearerSession { session_hash } => (None, Some(session_hash.as_str())),
+    };
+    sqlx::query(
+        "INSERT INTO step_up_requests
+             (id, org, op, method, path, query, sealed, action_digest, summary, for_human,
+              requested_via, api_token_id, session_hash, session_role_cap, created_at,
+              expires_at, state, confirmed_by, confirmed_at, confirmation_id, executed_at,
+              result_status, result_summary)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+                 $17, $18, $19, $20, $21, $22, $23)",
+    )
+    .bind(&r.id)
+    .bind(&r.org)
+    .bind(&r.op)
+    .bind(&r.method)
+    .bind(&r.path)
+    .bind(&r.query)
+    .bind(&r.sealed)
+    .bind(&r.action_digest)
+    .bind(&r.summary)
+    .bind(&r.for_human)
+    .bind(r.requester.via())
+    .bind(api_token_id)
+    .bind(session_hash)
+    .bind(r.session_role_cap.map(role_str))
+    .bind(r.created_at)
+    .bind(r.expires_at)
+    .bind(r.state.as_str())
+    .bind(&r.confirmed_by)
+    .bind(r.confirmed_at)
+    .bind(&r.confirmation_id)
+    .bind(r.executed_at)
+    .bind(r.result_status)
+    .bind(&r.result_summary)
+    .execute(ex)
+    .await
+    .map_err(identity_err)?;
+    Ok(())
+}
+
 #[async_trait]
 impl StepUpStore for PostgresDb {
     async fn put_confirmation(&self, c: &StepUpConfirmation) -> Result<(), IdentityError> {
@@ -546,46 +600,60 @@ impl StepUpStore for PostgresDb {
     }
 
     async fn put_request(&self, r: &StepUpRequest) -> Result<(), IdentityError> {
-        let (api_token_id, session_hash) = match &r.requester {
-            StepUpRequester::ApiToken { id } => (Some(id.as_str()), None),
-            StepUpRequester::BearerSession { session_hash } => (None, Some(session_hash.as_str())),
+        insert_request(self.pool(), r).await
+    }
+
+    async fn raise_request(
+        &self,
+        r: &StepUpRequest,
+        caps: PendingCaps,
+        now_ms: i64,
+    ) -> Result<RaiseRequest, IdentityError> {
+        let mut tx = self.pool().begin().await.map_err(identity_err)?;
+        // Every raise for one human runs its count-then-insert under one
+        // transaction-scoped advisory lock, so concurrent raises (from any
+        // number of credentials) serialize and never together pass a cap.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(step_up_request_lock_key(&r.for_human))
+            .execute(&mut *tx)
+            .await
+            .map_err(identity_err)?;
+        let (column, key) = match &r.requester {
+            StepUpRequester::ApiToken { id } => ("api_token_id", id),
+            StepUpRequester::BearerSession { session_hash } => ("session_hash", session_hash),
         };
-        sqlx::query(
-            "INSERT INTO step_up_requests
-                 (id, org, op, method, path, query, sealed, action_digest, summary, for_human,
-                  requested_via, api_token_id, session_hash, session_role_cap, created_at,
-                  expires_at, state, confirmed_by, confirmed_at, confirmation_id, executed_at,
-                  result_status, result_summary)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                     $17, $18, $19, $20, $21, $22, $23)",
-        )
-        .bind(&r.id)
-        .bind(&r.org)
-        .bind(&r.op)
-        .bind(&r.method)
-        .bind(&r.path)
-        .bind(&r.query)
-        .bind(&r.sealed)
-        .bind(&r.action_digest)
-        .bind(&r.summary)
-        .bind(&r.for_human)
+        let by_requester: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM step_up_requests
+             WHERE requested_via = $1 AND {column} = $2 AND state = 'pending' AND expires_at > $3"
+        ))
         .bind(r.requester.via())
-        .bind(api_token_id)
-        .bind(session_hash)
-        .bind(r.session_role_cap.map(role_str))
-        .bind(r.created_at)
-        .bind(r.expires_at)
-        .bind(r.state.as_str())
-        .bind(&r.confirmed_by)
-        .bind(r.confirmed_at)
-        .bind(&r.confirmation_id)
-        .bind(r.executed_at)
-        .bind(r.result_status)
-        .bind(&r.result_summary)
-        .execute(self.pool())
+        .bind(key)
+        .bind(now_ms)
+        .fetch_one(&mut *tx)
         .await
         .map_err(identity_err)?;
-        Ok(())
+        let by_requester = by_requester.max(0) as u64;
+        if by_requester >= caps.per_requester {
+            return Ok(RaiseRequest::RequesterFull {
+                pending: by_requester,
+            });
+        }
+        let for_human: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM step_up_requests
+             WHERE for_human = $1 AND state = 'pending' AND expires_at > $2",
+        )
+        .bind(&r.for_human)
+        .bind(now_ms)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(identity_err)?;
+        let for_human = for_human.max(0) as u64;
+        if for_human >= caps.per_human {
+            return Ok(RaiseRequest::HumanFull { pending: for_human });
+        }
+        insert_request(&mut *tx, r).await?;
+        tx.commit().await.map_err(identity_err)?;
+        Ok(RaiseRequest::Raised)
     }
 
     async fn get_request(&self, id: &str) -> Result<Option<StepUpRequest>, IdentityError> {
