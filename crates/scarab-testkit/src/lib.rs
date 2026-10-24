@@ -32,7 +32,7 @@ pub use environment_governance::InMemoryEnvironmentGovernance;
 /// the Postgres adapter's single-use, expiry and compare-and-swap semantics.
 mod step_up;
 pub use step_up::{
-    InMemoryChallenges, InMemoryPasskeys, InMemorySealer, InMemorySecurityEvents, InMemoryStepUp,
+    InMemoryChallenges, InMemoryPasskeys, InMemorySecurityEvents, InMemoryStepUp,
 };
 
 // ---------------------------------------------------------------------------

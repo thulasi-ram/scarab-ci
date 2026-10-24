@@ -27,3 +27,7 @@ scarab-forge = { workspace = true }
 # A software passkey: the authenticator is the one true external.
 scarab-webauthn = { workspace = true, features = ["soft-authenticator"] }
 axum = { workspace = true }
+# The production KEK sealer (ADR-0073 §5) for the enforced server: sealing is
+# pure computation over a lazy pool that never connects.
+scarab-secrets-postgres = { workspace = true }
+sqlx = { workspace = true }

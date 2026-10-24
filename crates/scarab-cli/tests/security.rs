@@ -22,7 +22,7 @@ use scarab_server::step_up::StepUpService;
 use scarab_server::{router, AppState, LogService};
 use scarab_testkit::{
     FakeAuthenticator, FakeClock, FakeSecrets, InMemoryChallenges, InMemoryDb, InMemoryObjectStore,
-    InMemoryPasskeys, InMemoryRbac, InMemorySealer, InMemorySecurityEvents, InMemorySessions,
+    InMemoryPasskeys, InMemoryRbac, InMemorySecurityEvents, InMemorySessions,
     InMemoryStepUp,
 };
 use scarab_webauthn::soft::{SoftAlg, SoftPasskey};
@@ -108,7 +108,13 @@ async fn serve(enforce: bool) -> Server {
             Arc::new(InMemoryChallenges::new()),
             Arc::new(InMemoryStepUp::new()),
             Arc::new(InMemorySecurityEvents::new().with_rbac(rbac.clone())),
-            Arc::new(InMemorySealer::new()),
+            // The production sealer; a lazy pool never connects.
+            Arc::new(scarab_secrets_postgres::PostgresSecrets::with_keys(
+                sqlx::postgres::PgPoolOptions::new()
+                    .connect_lazy("postgres://unused@localhost/unused")
+                    .unwrap(),
+                scarab_secrets_postgres::MasterKeySet::new(vec![[7u8; 32]]).unwrap(),
+            )),
             RelyingParty::from_public_url(PUBLIC_URL, "Scarab").unwrap(),
         ));
     }

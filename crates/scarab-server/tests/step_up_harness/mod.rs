@@ -22,7 +22,7 @@ use scarab_server::step_up::StepUpService;
 use scarab_server::{router, AppState, LogService};
 use scarab_testkit::{
     FakeAuthenticator, FakeClock, FakeSecrets, InMemoryApiTokens, InMemoryChallenges, InMemoryDb,
-    InMemoryObjectStore, InMemoryPasskeys, InMemoryRbac, InMemorySealer, InMemorySecurityEvents,
+    InMemoryObjectStore, InMemoryPasskeys, InMemoryRbac, InMemorySecurityEvents,
     InMemorySessions, InMemoryStepUp,
 };
 use scarab_webauthn::soft::{SoftAlg, SoftPasskey};
@@ -140,7 +140,7 @@ pub fn harness_on(backend: Backend, extra: impl FnOnce(AppState) -> AppState) ->
         challenge_store.clone(),
         requests.clone(),
         log.clone(),
-        Arc::new(InMemorySealer::new()),
+        real_sealer(),
         rp,
     ));
     Harness {
@@ -159,6 +159,18 @@ pub fn harness_on(backend: Backend, extra: impl FnOnce(AppState) -> AppState) ->
         requests,
         log,
     }
+}
+
+/// The production KEK sealer (`PostgresSecrets`), over a lazy pool that
+/// never connects: sealing is pure computation, so no database is needed.
+pub fn real_sealer() -> Arc<scarab_secrets_postgres::PostgresSecrets> {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://unused@localhost/unused")
+        .expect("a lazy pool never connects");
+    Arc::new(scarab_secrets_postgres::PostgresSecrets::with_keys(
+        pool,
+        scarab_secrets_postgres::MasterKeySet::new(vec![[7u8; 32]]).unwrap(),
+    ))
 }
 
 pub fn harness() -> Harness {
