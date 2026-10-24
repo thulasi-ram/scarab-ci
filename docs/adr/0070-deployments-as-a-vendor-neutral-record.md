@@ -304,8 +304,11 @@ resolves it. Any principal who can write to the Run may **reject** it with a rea
 every gate (§9), because rejecting only tightens. `gate_expires_after` still bounds its
 wait.
 
-Its window opens at **max(request effective time, gate Attempt start)**, for **every**
-Attempt. From there:
+A gate's **first wait** on a request opens at the **request's effective time**, which is
+the deploy Step's start. Only a wait that **waits afresh** opens at **max(request
+effective time, gate Attempt start)**. A wait waits afresh when an earlier wait of the same
+gate already reached a verdict while this same request stood: a Retry, or a Rerun of the
+gate alone. From there:
 
 - **passed** if the Deployment was live at that point, or is reported `live` after it;
 - **failed** on a `failed` report after it, on supersession, or once the
@@ -314,13 +317,30 @@ Attempt. From there:
 Whatever happens first decides. A failure that predates the window never fails the gate:
 a re-deploy after fixing a missing secret is not failed by the earlier failure.
 
-In practice the window opens at the Attempt's start, because a gate's first Attempt
-starts only after the deploy Step has succeeded, which is after the request's effective
-time. So a `failed` received *while the deploy Step was still running* is history to the
-gate: the gate does not fail with that label but waits, and fails `stalled` at the
-deadline unless the source reports again after the Attempt opened. Whether the first
-Attempt should open at the effective time instead is an open owner question (git-bug
-`fce05da`).
+So a report received *while the deploy Step was still running*, after it started and
+before the gate's Attempt existed, counts. A `failed` then fails the gate with the
+source's label, and a `live` then passes it, instead of the gate waiting out its deadline.
+The owner decided this on 2026-10-24 (git-bug `fce05da`): the gap between the deploy
+Step's start and the gate's start is exactly what the gate must not miss. A report
+received before the deploy Step started is still history.
+
+The stall deadline runs from the window start too, so for a first wait it runs from the
+deploy Step's start. A deploy Step that itself ran past the deadline, with nothing
+decisive reported, fails its gate `stalled` the first time the gate is asked. A deadline
+shorter than the deploy is a misconfiguration. No verdict is reached for an instant
+before the gate's own Attempt exists: the oracle answers only for a `now` at or after
+that Attempt's start, even when the verdict's own instant (a report, the deadline) is
+earlier.
+
+Whether a wait waits afresh is judged on the Run's journal, by position and never by
+time. The request now standing was recorded by its requester Step's latest **executed**
+success (`Running → Succeeded`), in the same commit as that success. So a `GateResolved`
+of the gate after that success was reached on this same request. A Rerun of the deploy
+Step makes a **new request**, with a new effective time. The gate's next wait is then a
+first wait on that request and opens at its effective time, not at the gate Attempt's
+start. A re-arm of the deploy Step, or a skip-if-unchanged of it, records no request, so
+the old one still stands. A journal with no executed success of the requester counts any
+earlier verdict of the gate, because a floor only narrows the window (INV-DEP-13).
 
 The Attempt-start bound is the instant *(Attempt start, after every sequence number)*.
 An input received in the millisecond the Attempt started therefore counts as **before**
@@ -346,7 +366,9 @@ follows:
   request commits with the deploy Step's success, and the gate's wait opened after that.
 - **The record cannot be read.** The gate takes **no decision** that tick, so one bad row
   cannot fail every Deploy Run in the Environment, but only until the deadline has
-  elapsed since the window opened. After that it fails `stalled`, and the read error is
+  elapsed since the gate Attempt's start. That is the one window start known without the
+  record, and never earlier than the real one, so an unreadable record never fails a gate
+  sooner than a readable one would. After that it fails `stalled`, and the read error is
   in the reason. An error reading the deadline itself still means no decision (git-bug
   `eace9a8`).
 
@@ -377,7 +399,8 @@ carrying the Deployment's id, and never re-derived from the log afterwards: a ga
 can race an append, and a verdict the engine has already acted on must not flip. The
 Deployment's status may move on: a Run that went red on `stalled` stays red even if the
 Deployment later goes `live`. **Retry is a new Attempt that waits afresh** on the same
-Deployment, and its later Attempt start opens a new window. The recovery path is: fix
+Deployment, and its later Attempt start opens a new window, so the failure that failed
+the last Attempt is history to it. The recovery path is: fix
 the secret, Resync (a PluginAction, ADR-0072), Retry the gate. The deploy Step does not
 run again. Gate Retry is built; Resync is not (ADR-0072's MLP), so today the source must
 report again by itself.
@@ -490,12 +513,12 @@ behaviour is the same across CD tools:
 - **Back off on 429 and 503** by `Retry-After`. 429: a batch from this installation is
   already in flight — send one at a time. 503: core is saturated; nothing was recorded, so
   the same batch is safe to resend.
-- **A failure during the deploy Step is history to its gate.** A DeploymentGate's window
-  opens at its Attempt's start, after the deploy Step succeeded (§8). A `failed` that the
-  deploy Step's own change caused, reported while that Step was still running, therefore
-  fails the gate only through the deadline, unless the reporter reports again after the
-  gate opened. Whether the first Attempt should open earlier is the owner question in
-  git-bug `fce05da`.
+- **A report during the deploy Step counts.** A DeploymentGate's first wait opens at the
+  deploy Step's start (§8). A `failed` that the Step's own change caused, reported while
+  that Step was still running, fails the gate with its label, and a `live` passes it. The
+  reporter need not report again once the gate opens. Only a Retry of the gate waits
+  afresh, so after a Retry the reporter must report again (Resync, ADR-0072). This closes
+  the gap of git-bug `fce05da`.
 
 The first-party Argo plugin is the contract's reference implementation.
 
@@ -518,19 +541,20 @@ crate disagree, the crate wins and this ADR is stale.
   latest report is neither `live` nor `failed`.
 - **INV-DEP-8** No input is lost: every request and every report lands on exactly one
   Deployment with its key.
-- **INV-DEP-9** A DeploymentGate looks forward from its window start, the later of its
-  request's effective time and its gate Attempt's start. A failure **received before**
-  the window opens never fails it; one **received after** may.
+- **INV-DEP-9** A DeploymentGate looks forward from its window start: its request's
+  effective time for a first wait, or the later of that and its gate Attempt's start for
+  a wait that waits afresh (§8). A failure **received before** the window opens never
+  fails it; one **received after** may.
 - **INV-DEP-10** A DeploymentGate verdict, once reached, never changes. The fold keeps
   this for a reader whose `now` is below the store's horizon (§8). The oracle reads only
   so, and the engine also journals the verdict per Attempt.
 - **INV-DEP-11** A late request joins the Deployment the source already saw. It is not a
   rollback.
 - **INV-DEP-12** A claim never explains a Deployment, and nothing un-explains one (§2).
-- **INV-DEP-13** A gate Attempt's start only ever narrows its window. An input received
-  at or before the Attempt started never fails the gate, and the Attempt-start bound never
-  makes a verdict arrive sooner or land earlier than it would without it (§8). So the
-  Retry of a failed DeploymentGate waits afresh on the same Deployment.
+- **INV-DEP-13** The Attempt-start bound of a wait that waits afresh only ever narrows
+  its window. An input received at or before that Attempt started never fails the gate,
+  and the bound never makes a verdict arrive sooner or land earlier than it would without
+  it (§8). So the Retry of a failed DeploymentGate waits afresh on the same Deployment.
 
 The property suite found three real holes before any persistence existed: an older
 version reported live again rejoining its old Deployment (INV-DEP-3), a gate verdict
@@ -638,16 +662,17 @@ cut** keeps ADR-0037's one Environment per Run. Promotion is chained Deploy Runs
   4. **The Run side** (slice (b), built): `results:` and `deployment_requests`,
      DeploymentGate, per-DeploymentTarget concurrency holds (ADR-0071 §9), and the general
      gate changes: gates can fail and be rejected, per-gate clocks, holding only
-     dependents, verdicts journaled per Attempt, and gate Retry with the Attempt-start
-     window (§8, §9). The Run page shows each gate's verdict and reason, what a waiting
-     DeploymentGate waits on, and why a deploy Step is held; the Deployments view links
-     each requester to its Run.
+     dependents, verdicts journaled per Attempt, a first wait opening at the deploy Step's
+     start, and gate Retry with the Attempt-start window (§8, §9). The Run page shows
+     each gate's verdict and reason, what a waiting DeploymentGate waits on, and why a
+     deploy Step is held; the Deployments view links each requester to its Run.
 - **MLP:** the Resync PluginAction that makes the gate-Retry recovery path usable.
 - **Known follow-ups**, deferred from slice (b) with tickets:
   - the scheme check (§7, `5fc1860`) and the ownership rejection (`9c1173a`);
   - a target first claimed by two Environments at once (`9e66f2c`);
   - a failed results drain on Kubernetes reads as DeploymentRequest incomplete (`0cb5895`);
-  - when the first gate Attempt's window should open (owner question, `fce05da`);
+  - when the first gate Attempt's window should open (`fce05da`): **decided** 2026-10-24
+    and built, at the request's effective time (§8);
   - a wait with no bound when its deadline cannot be read (`eace9a8`);
   - an incremental or snapshot fold (`1f2163f`);
   - a Rerun skips a deploy Step whose inputs are unchanged, so a rollback Rerun fails its

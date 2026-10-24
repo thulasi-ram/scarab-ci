@@ -49,8 +49,9 @@ use scarab_deployment::{
 };
 use scarab_engine::{
     release_gate, Attempt, AttemptId, AttemptOutcome, Clock, Db, DeployContext,
-    DeploymentConcurrencyHold, DeploymentGateDecision, DeploymentGates, RunDeploymentRequest,
-    RunId, RunStatus, Scheduler, StepId, StepRun, StepSpec, StepStatus, Timestamp,
+    DeploymentConcurrencyHold, DeploymentGateDecision, DeploymentGateWait, DeploymentGates,
+    RunDeploymentRequest, RunId, RunStatus, Scheduler, StepId, StepRun, StepSpec, StepStatus,
+    Timestamp,
 };
 use scarab_project::{
     EnvironmentGovernanceStore, EnvironmentProjectEligibility, EnvironmentProjectOverlay,
@@ -246,11 +247,11 @@ impl DeploymentGates for ApproveMidPass<'_> {
         run: &RunId,
         gate: &StepId,
         request: &RunDeploymentRequest,
-        window_floor: Timestamp,
+        wait: DeploymentGateWait,
         now: Timestamp,
     ) -> Result<Option<DeploymentGateDecision>, String> {
         self.inner
-            .deployment_gate_verdict(run, gate, request, window_floor, now)
+            .deployment_gate_verdict(run, gate, request, wait, now)
             .await
     }
 
@@ -526,7 +527,9 @@ fn report_input(status: SourceAssertedStatus, at: Millis) -> DeploymentInput {
 
 /// What the server's oracle (a fresh per-tick view) answers for `ra`'s
 /// DeploymentGate `live` on `bump`'s request, its Attempt started at
-/// `floor`, asked at `now`.
+/// `floor`, asked at `now`. The wait waits afresh (a Retry on the same
+/// request), so `floor` IS its window start — these scenarios place inputs
+/// relative to it.
 async fn decide(
     oracle: &ServerDeploymentGates,
     floor: Millis,
@@ -538,7 +541,10 @@ async fn decide(
             &rid("ra"),
             &id("live"),
             &request_row("bump", "web", &["live"]),
-            Timestamp(floor),
+            DeploymentGateWait {
+                started_at: Timestamp(floor),
+                afresh: true,
+            },
             Timestamp(now),
         )
         .await

@@ -13,8 +13,15 @@
 //! 2. the Environment's log, folded ([`scarab_deployment::fold_ledger`]);
 //! 3. the Deployment the requester's current request landed on
 //!    ([`DeploymentLedger::request_of`](scarab_deployment::DeploymentLedger::request_of)),
-//!    and its verdict with the gate Attempt's start as the window floor
+//!    and its verdict: for the gate's first wait on the request, a window
+//!    opening at the request's effective time — the deploy Step's start, so a
+//!    report received while that Step still ran counts
+//!    ([`Deployment::gate_decision`](scarab_deployment::Deployment::gate_decision));
+//!    for a wait that waits afresh (a Retry after a verdict on the same
+//!    request), the gate Attempt's start as the window floor
 //!    ([`Deployment::gate_decision_from`](scarab_deployment::Deployment::gate_decision_from)).
+//!    Either way no verdict is reached for an instant before the gate
+//!    Attempt's own start.
 //!
 //! **Per tick.** Both reads are cached per tick ([`ServerDeploymentGates::for_tick`]):
 //! every waiting gate on one Environment shares one fold, instead of each
@@ -33,8 +40,8 @@
 //! **Errors** are logged here and returned, and the engine takes no decision
 //! that tick (plan Q6): one unreadable row must not dead-letter every Deploy
 //! Run waiting in its Environment — but only until the deadline. A record
-//! that still cannot be read once the deadline has elapsed since the window
-//! start fails the gate `stalled`, the read error in the reason, so the
+//! that still cannot be read once the deadline has elapsed since the gate
+//! Attempt's start fails the gate `stalled`, the read error in the reason, so the
 //! deadline bounds the wait even with no `gate_expires_after`. An error
 //! reading the deadline itself (governance store, deploy context) stays no
 //! decision.
@@ -62,8 +69,8 @@ use scarab_deployment::{
     DeploymentStore, DeploymentTarget, FoldedLedger, Millis, DEFAULT_DEPLOYMENT_DEADLINE_MS,
 };
 use scarab_engine::{
-    Db, DeploymentConcurrencyHold, DeploymentGateDecision, DeploymentGates, RunDeploymentRequest,
-    RunId, StepId, Timestamp,
+    Db, DeploymentConcurrencyHold, DeploymentGateDecision, DeploymentGateWait, DeploymentGates,
+    RunDeploymentRequest, RunId, StepId, Timestamp,
 };
 use scarab_project::EnvironmentGovernanceStore;
 
@@ -318,7 +325,7 @@ impl ServerDeploymentGates {
         &self,
         run: &RunId,
         request: &RunDeploymentRequest,
-        window_floor: Timestamp,
+        wait: DeploymentGateWait,
         now: Timestamp,
     ) -> Result<Option<DeploymentGateDecision>, String> {
         let deadline = match self
@@ -347,7 +354,7 @@ impl ServerDeploymentGates {
             .await
         {
             Ok(fold) => fold,
-            Err(e) => return unreadable_record(e, window_floor, tick_now, deadline),
+            Err(e) => return unreadable_record(e, wait.started_at, tick_now, deadline),
         };
         let target = DeploymentTarget {
             environment: request.environment.clone(),
@@ -360,8 +367,9 @@ impl ServerDeploymentGates {
         };
         let deployment = loop {
             let now = tick_now.0.min(cached.read_now);
-            if now < window_floor.0 {
-                // The fold predates the window: it cannot speak for it yet.
+            if now < wait.started_at.0 {
+                // The fold predates the gate's Attempt: it cannot speak for
+                // the wait yet (no verdict before the Attempt exists).
                 return Ok(None);
             }
             if let Some(deployment) = cached.folded.ledger().request_of(&requester, &target) {
@@ -377,7 +385,7 @@ impl ServerDeploymentGates {
                     .await
                 {
                     Ok(fresh) => fresh,
-                    Err(e) => return unreadable_record(e, window_floor, tick_now, deadline),
+                    Err(e) => return unreadable_record(e, wait.started_at, tick_now, deadline),
                 };
                 from_cache = false;
                 continue;
@@ -401,9 +409,13 @@ impl ServerDeploymentGates {
         };
         let now = tick_now.0.min(cached.read_now);
         let ledger = cached.folded.ledger();
-        let Some(decision) =
-            deployment.gate_decision_from(&requester, window_floor.0, now, deadline)
-        else {
+        // The first wait on this request opens at the request's effective
+        // time; only a wait that waits afresh has a floor (ADR-0070 §8).
+        let decision = match wait.window_floor() {
+            Some(floor) => deployment.gate_decision_from(&requester, floor.0, now, deadline),
+            None => deployment.gate_decision(&requester, now, deadline),
+        };
+        let Some(decision) = decision else {
             return Ok(None);
         };
         let on = format!("`{}`/`{}`", request.target_source, request.target_id);
@@ -458,22 +470,25 @@ impl ServerDeploymentGates {
 
 /// The Deployment record could not be read (the fold errored) — judge Q6 as
 /// amended: **no decision** (`Err`, logged by the caller) while the deadline
-/// has not elapsed since the window start; at or after it, the gate fails
+/// has not elapsed since the gate Attempt's start; at or after it, the gate fails
 /// `stalled` with the read error in the reason, so a persistent read error
 /// can never make the wait unbounded (criterion 2's deadline clause).
 ///
-/// The window start here is `window_floor`: the window opens at
-/// max(request effective_at, Attempt start), and the request's effective_at
-/// is the deploy Step Attempt's start, which precedes that Step's success,
-/// which is at or before this gate Attempt's start (`window_floor`). So the
-/// max is `window_floor` — known without the record.
+/// The deadline here runs from the gate Attempt's start (`wait_started`),
+/// the one window start known without the record. It is the window start of
+/// a wait that waits afresh (max(request effective_at, Attempt start), and the
+/// effective_at — the deploy Step Attempt's start — precedes that Step's
+/// success, which is at or before the gate Attempt's start). A first wait's
+/// window opens earlier, at the effective_at itself, so measured from the
+/// Attempt's start this stall comes no sooner than the record's would: an
+/// unreadable record never fails a gate earlier than a readable one.
 fn unreadable_record(
     error: String,
-    window_floor: Timestamp,
+    wait_started: Timestamp,
     now: Timestamp,
     deadline: Millis,
 ) -> Result<Option<DeploymentGateDecision>, String> {
-    if now.0 >= window_floor.0.saturating_add(deadline) {
+    if now.0 >= wait_started.0.saturating_add(deadline) {
         return Ok(Some(DeploymentGateDecision {
             passed: false,
             reason: format!(
@@ -503,10 +518,10 @@ impl DeploymentGates for ServerDeploymentGates {
         run: &RunId,
         gate: &StepId,
         request: &RunDeploymentRequest,
-        window_floor: Timestamp,
+        wait: DeploymentGateWait,
         now: Timestamp,
     ) -> Result<Option<DeploymentGateDecision>, String> {
-        let res = self.decide(run, request, window_floor, now).await;
+        let res = self.decide(run, request, wait, now).await;
         if let Err(e) = &res {
             tracing::warn!(
                 run = %run.0, gate = %gate.0, error = %e,
