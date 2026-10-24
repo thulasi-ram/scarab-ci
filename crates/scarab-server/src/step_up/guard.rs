@@ -1,5 +1,6 @@
-//! The step-up guard (ADR-0073 §2): one middleware on every route of the
-//! main router, deciding from the route's registered [`Op`].
+//! The step-up guard (ADR-0073 §3, and "The guard" in its Implementation
+//! notes): one middleware on every route of the main router, deciding from
+//! the route's registered [`Op`].
 //!
 //! 1. A mutating request on a (method, path) the table does not know is
 //!    refused 500 — fail-closed at runtime, whatever the tests missed.
@@ -9,7 +10,9 @@
 //!    "off".
 //! 4. Otherwise the body is buffered (within the default body limit), the
 //!    caller authenticated exactly as the handler will (401, CSRF), and the
-//!    request's canonical form digested under `K_digest`.
+//!    request's canonical form digested under `K_digest`. A non-empty body
+//!    that is not JSON the guard can parse is refused 400, so no request
+//!    runs on a body whose summary and Org the guard could not read.
 //! 5. A caller who holds no role reaching the op's `min_role` anywhere goes
 //!    straight to the handler, which refuses it for its role.
 //! 6. A crown jewel needs a step-up BEFORE the handler; `op.authorised` is
@@ -116,10 +119,18 @@ pub async fn guard_with(table: &[RouteEntry], st: AppState, req: Request, next: 
     let raw_query = parts.uri.query().unwrap_or_default().to_string();
     let params = path_params(&pattern, &path);
     let query = sorted_query(&raw_query);
+    // Fail closed on a body the guard cannot read: a typed `Json<T>`
+    // extractor skips an unknown field without serde_json's recursion limit
+    // or number range check, so a junk field (300-deep nesting, `1e400`) the
+    // `Value` parser refuses would otherwise run with a blank summary and no
+    // Org. A bodyless request (a DELETE) is not affected.
     let json: Option<Value> = if bytes.is_empty() {
         None
     } else {
-        serde_json::from_slice(&bytes).ok()
+        match serde_json::from_slice(&bytes) {
+            Ok(v) => Some(v),
+            Err(e) => return unreadable_body(&e),
+        }
     };
     let canonical = canonical_form(parts.method.as_str(), &path, &query, &bytes, json.as_ref());
     let digest = svc.digest(&canonical);
@@ -146,6 +157,14 @@ pub async fn guard_with(table: &[RouteEntry], st: AppState, req: Request, next: 
         OrgOf::None => None,
     }
     .filter(|o| !o.is_empty());
+    // An Org is recorded only for a caller who holds a role in it: the Org is
+    // resolved from client input before any handler authorization, so a
+    // non-member's confirmation (with her own summary text) must not land
+    // in another Org's log. Hers is Org-less, so redacted there.
+    let org = match org {
+        Some(o) if holds_role_in(&st, &caller, &o).await => Some(o),
+        _ => None,
+    };
     let summary = op.summary(&OpInput {
         method: parts.method.as_str().to_string(),
         path: path.clone(),
@@ -249,6 +268,41 @@ async fn tripwire(st: &AppState, ctx: &GuardCtx, p: Option<&Prepared>, status: S
         ev.session_hash = p.caller.session.as_ref().map(|s| s.id_hash.clone());
         ev.detail = serde_json::json!({ "status": status.as_u16() });
         p.svc.record(ev).await;
+    }
+}
+
+/// The 400 for a governed request whose non-empty body is not parseable
+/// JSON.
+fn unreadable_body(e: &serde_json::Error) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        axum::Json(serde_json::json!({
+            "code": "unreadable_body",
+            "message": format!(
+                "the request body is not JSON this operation can be confirmed from ({e}); \
+                 a step-up-governed request must carry a plain JSON body (nesting at most \
+                 128 deep, numbers in range) or none"
+            ),
+        })),
+    )
+        .into_response()
+}
+
+/// Does `caller`'s human hold a live role in Org `org` — a binding there
+/// (Org- or Project-scoped), or an install-wide role above the blanket
+/// `Viewer` every login carries? A store error answers "no": the event is
+/// then Org-less, never planted.
+async fn holds_role_in(st: &AppState, caller: &Caller, org: &str) -> bool {
+    use scarab_identity::Role;
+    if caller.principal.roles.iter().any(|r| *r > Role::Viewer) {
+        return true;
+    }
+    match st.rbac.as_ref() {
+        Some(rbac) => rbac
+            .orgs_of(&caller.principal.subject)
+            .await
+            .is_ok_and(|orgs| orgs.iter().any(|o| o == org)),
+        None => false,
     }
 }
 
