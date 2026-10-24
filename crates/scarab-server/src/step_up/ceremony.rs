@@ -355,7 +355,9 @@ pub(crate) async fn passkey_registration_options(
             ev.session_hash = Some(facts.id_hash.clone());
             ev.detail = serde_json::json!({ "mode": "enroll", "reason": "fresh login required" });
             svc.record_refusal(ev).await;
-            return Err(ApiError::FreshLoginRequired);
+            return Err(ApiError::FreshLoginRequired {
+                login_url: st.fresh_login_url(subject).await,
+            });
         }
         ctx.exempt("first passkey: gated by a fresh browser login instead");
     } else {

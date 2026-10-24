@@ -70,6 +70,11 @@ fn scoped(subject: &str) -> Principal {
 /// `acme/web` bound, so the Org `acme` exists), and — when `enforce` — the
 /// step-up service, served on an ephemeral port.
 async fn serve(enforce: bool) -> Server {
+    serve_with(enforce, |st| st).await
+}
+
+/// [`serve`], with `extra` adjusting the state (login providers, say).
+async fn serve_with(enforce: bool, extra: impl FnOnce(AppState) -> AppState) -> Server {
     let db = Arc::new(InMemoryDb::new());
     db.put_connection(&ForgeConnection {
         id: "gh".into(),
@@ -102,6 +107,7 @@ async fn serve(enforce: bool) -> Server {
         .with_secrets(Arc::new(FakeSecrets::new()))
         .with_forge_connections(db.clone())
         .with_public_url(PUBLIC_URL);
+    st = extra(st);
     if enforce {
         st = st.with_step_up(StepUpService::new(
             Arc::new(InMemoryPasskeys::new()),
@@ -349,6 +355,70 @@ async fn setup_without_a_passkey_times_out_with_exit_1() {
     assert_eq!(out.status.code(), Some(1), "{stdout}{stderr}");
     assert!(stdout.contains("/v1/auth/login?next="), "{stdout}");
     assert!(stderr.contains("timed out"), "{stderr}");
+}
+
+/// An OAuth login provider the server can redirect to (never called).
+fn provider(id: &str, unqualified: bool) -> Arc<scarab_server::oauth::OAuthAuthenticator> {
+    Arc::new(scarab_server::oauth::OAuthAuthenticator::new(
+        scarab_server::config::OAuthConfig {
+            client_id: "cid".into(),
+            client_secret: "sekret".into(),
+            authorize_url: format!("https://{id}.example.com/authorize"),
+            token_url: format!("https://{id}.example.com/token"),
+            userinfo_url: format!("https://{id}.example.com/user"),
+            oidc_issuer: None,
+            scopes: String::new(),
+            owners: vec![],
+            provider_id: id.into(),
+            unqualified_ids: unqualified,
+            name: id.into(),
+            forge_url: None,
+        },
+    ))
+}
+
+/// git-bug 584bd03: with several login providers and no default an unnamed
+/// login is a 400, so `security setup` names the provider this CLI's human
+/// signs in with — chosen through `GET /v1/auth/providers` by the subject's
+/// prefix — and the URL it prints actually reaches that provider.
+#[tokio::test(flavor = "multi_thread")]
+async fn setup_names_the_login_provider_when_there_is_no_default() {
+    let srv = serve_with(true, |st| {
+        st.with_oauth_login(provider("gitea", false))
+            .with_oauth_login(provider("okta", false))
+    })
+    .await;
+    let amy = srv.cli("okta:amy").await;
+    let out = output(scarab(
+        &srv,
+        &amy,
+        &["security", "setup", "--no-browser", "--timeout", "1"],
+    ))
+    .await;
+    let stdout = text(&out.stdout);
+    let url = stdout
+        .lines()
+        .find(|l| l.contains("/v1/auth/login"))
+        .unwrap_or_else(|| panic!("no login URL: {stdout}"))
+        .trim()
+        .to_string();
+    assert!(url.contains("provider=okta"), "{url}");
+    assert!(
+        url.contains("next=%2Faccount%2Fsecurity%3Fenroll%3D1"),
+        "{url}"
+    );
+    // Following it reaches Okta, not a 400.
+    let resp = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap()
+        .get(&url)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 302, "{url}");
+    let to = resp.headers()["location"].to_str().unwrap();
+    assert!(to.starts_with("https://okta.example.com/authorize"), "{to}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

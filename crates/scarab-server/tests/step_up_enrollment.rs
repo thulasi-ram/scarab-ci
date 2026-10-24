@@ -3,6 +3,7 @@
 //! to log in again); later adds and removals are always-ask crown jewels;
 //! enrollment is prompted, never forced; and a login is never a step-up.
 
+mod common;
 mod step_up_harness;
 
 use axum::body::Body;
@@ -11,7 +12,13 @@ use base64::Engine;
 use serde_json::json;
 use tower::ServiceExt;
 
-use scarab_identity::LOGIN_KIND_API;
+use std::sync::Arc;
+
+use scarab_db_postgres::PostgresDb;
+use scarab_identity::{IdentityStore, ProviderIdentity, LOGIN_KIND_API};
+use scarab_server::config::OAuthConfig;
+use scarab_server::oauth::OAuthAuthenticator;
+use scarab_server::AppState;
 
 use step_up_harness::*;
 
@@ -208,4 +215,119 @@ async fn login_is_never_a_step_up_and_enrollment_is_never_forced() {
     let (fresh, _) = browser_login(&h, "amy-code", "/").await;
     let (st, b) = h.cookie("POST", "/v1/secrets", Some(secret), &fresh).await;
     assert_step_up(st, &b, "window");
+}
+
+// --- git-bug 584bd03: the fresh login names the caller's provider ----------
+
+/// An OAuth provider the login route can redirect to (it is never called).
+fn provider(id: &str, unqualified: bool) -> Arc<OAuthAuthenticator> {
+    Arc::new(OAuthAuthenticator::new(OAuthConfig {
+        client_id: "cid".into(),
+        client_secret: "sekret".into(),
+        authorize_url: format!("https://{id}.example.com/authorize"),
+        token_url: format!("https://{id}.example.com/token"),
+        userinfo_url: format!("https://{id}.example.com/user"),
+        oidc_issuer: None,
+        scopes: String::new(),
+        owners: vec![],
+        provider_id: id.into(),
+        unqualified_ids: unqualified,
+        name: id.into(),
+        forge_url: None,
+    }))
+}
+
+/// The fresh-login refusal for `subject`'s API session, and what following
+/// its `login_url` answers.
+async fn fresh_login_for(h: &Harness, subject: &str) -> (String, StatusCode, String) {
+    let s = h.session(owner(subject), LOGIN_KIND_API).await;
+    let (st, b) = registration_options(h, &s).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{b}");
+    assert_eq!(b["code"], "fresh_login_required", "{b}");
+    let url = b["login_url"].as_str().unwrap().to_string();
+    let resp = h
+        .app
+        .clone()
+        .oneshot(Request::builder().uri(&url).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let to = resp
+        .headers()
+        .get("location")
+        .map(|v| v.to_str().unwrap().to_string())
+        .unwrap_or_default();
+    (url, resp.status(), to)
+}
+
+/// With several login providers and NO default, an unnamed login is a 400 —
+/// so the "Log in again" link must name the provider the caller signs in
+/// with (its id's prefix), and following it must reach that provider.
+#[tokio::test]
+async fn the_fresh_login_link_names_the_callers_provider_when_there_is_no_default() {
+    let h = harness_with(|st: AppState| {
+        st.with_oauth_login(provider("gitea", false))
+            .with_oauth_login(provider("okta", false))
+    });
+    let (url, st, to) = fresh_login_for(&h, "okta:amy").await;
+    assert!(url.contains("provider=okta"), "{url}");
+    assert!(url.contains("next=/account/security%3Fenroll%3D1"), "{url}");
+    assert_eq!(st, StatusCode::FOUND, "{url}");
+    assert!(to.starts_with("https://okta.example.com/authorize"), "{to}");
+}
+
+/// With a default provider, a non-default user's link must still name THEIR
+/// provider: the unnamed login would sign them in through the default one as
+/// somebody else.
+#[tokio::test]
+async fn the_fresh_login_link_never_sends_a_non_default_user_to_the_default_provider() {
+    let h = harness_with(|st: AppState| {
+        st.with_oauth_login(provider("default", true))
+            .with_oauth_login(provider("okta", false))
+    });
+    let (url, st, to) = fresh_login_for(&h, "okta:amy").await;
+    assert!(url.contains("provider=okta"), "{url}");
+    assert_eq!(st, StatusCode::FOUND);
+    assert!(to.starts_with("https://okta.example.com/authorize"), "{to}");
+    // A bare (pre-ADR-0069) id is the default provider's.
+    let (url, st, to) = fresh_login_for(&h, "amy").await;
+    assert!(url.contains("provider=default"), "{url}");
+    assert_eq!(st, StatusCode::FOUND);
+    assert!(
+        to.starts_with("https://default.example.com/authorize"),
+        "{to}"
+    );
+}
+
+/// Where an identity store knows which accounts the Principal can sign in
+/// with, that wins over the id's spelling: a bare id pinned only to an Okta
+/// account logs in again through Okta.
+#[tokio::test]
+async fn the_fresh_login_link_follows_the_principals_pinned_identity() {
+    let Some(tdb) = common::fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
+    pg.migrate().await.unwrap();
+    let okta_zed = ProviderIdentity {
+        provider: "okta".into(),
+        external_id: "00u-zed".into(),
+        handle: "zed".into(),
+        email: None,
+        email_verified: false,
+        display_name: None,
+    };
+    let id = pg.pin(&okta_zed, "zed", 1).await.unwrap();
+    assert_eq!(id, "zed");
+    let store = pg.clone();
+    let h = harness_with(move |st: AppState| {
+        st.with_oauth_login(provider("default", true))
+            .with_oauth_login(provider("okta", false))
+            .with_identities(store)
+    });
+    let (url, st, to) = fresh_login_for(&h, "zed").await;
+    assert!(url.contains("provider=okta"), "{url}");
+    assert_eq!(st, StatusCode::FOUND);
+    assert!(to.starts_with("https://okta.example.com/authorize"), "{to}");
+    tdb.cleanup().await;
 }

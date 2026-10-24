@@ -40,7 +40,7 @@ use tokio::sync::RwLock;
 use crate::config::OAuthConfig;
 
 /// Percent-encode a query value (RFC 3986: everything but unreserved).
-fn percent_encode(v: &str) -> String {
+pub(crate) fn percent_encode(v: &str) -> String {
     let mut out = String::with_capacity(v.len());
     for b in v.bytes() {
         match b {

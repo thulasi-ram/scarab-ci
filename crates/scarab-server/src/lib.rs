@@ -646,6 +646,60 @@ impl AppState {
                 }),
         }
     }
+
+    /// The login provider `subject` signs in again through (git-bug 584bd03),
+    /// `None` when there is no OAuth provider or none can be told.
+    ///
+    /// A fresh login must be THIS Principal's: an unnamed login answers 400
+    /// with several providers and no default, and with a default it would
+    /// send a non-default user through the default provider — signing them
+    /// in as someone else. So, among the configured providers:
+    /// 1. the providers the identity store has pinned to `subject` — the one
+    ///    its id is prefixed with if it is among them, else the first;
+    /// 2. without a store (or a pinned configured one): the id's
+    ///    `provider:` prefix (ADR-0069 §2 mints `provider:handle`);
+    /// 3. else the default — a bare id is the `unqualified_ids` provider's.
+    pub async fn login_provider_for(&self, subject: &str) -> Option<String> {
+        let configured = |id: &str| self.oauth_providers.iter().any(|p| p.provider_id() == id);
+        let prefix = subject
+            .split_once(':')
+            .map(|(p, _)| p)
+            .filter(|p| configured(p));
+        if let Some(store) = self.identities.as_ref() {
+            // A store error falls through to the id's spelling: this only
+            // picks where the login goes, never who it signs in as.
+            let pinned: Vec<String> = store
+                .identities_of(subject)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|i| i.provider)
+                .filter(|p| configured(p))
+                .collect();
+            if let Some(p) = prefix.filter(|p| pinned.iter().any(|q| q == p)) {
+                return Some(p.to_string());
+            }
+            if let Some(p) = pinned.into_iter().next() {
+                return Some(p);
+            }
+        }
+        if let Some(p) = prefix {
+            return Some(p.to_string());
+        }
+        self.oauth_provider(None)
+            .ok()
+            .flatten()
+            .map(|p| p.provider_id().to_string())
+    }
+
+    /// The `fresh_login_required` refusal's `login_url` for `subject`:
+    /// [`FRESH_LOGIN_URL`] naming the provider it signs in with.
+    pub async fn fresh_login_url(&self, subject: &str) -> String {
+        match self.login_provider_for(subject).await {
+            Some(p) => format!("{FRESH_LOGIN_URL}&provider={}", oauth::percent_encode(&p)),
+            None => FRESH_LOGIN_URL.to_string(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1422,7 +1476,11 @@ pub enum ApiError {
     StepUpRequired(Box<step_up::StepUpRefusal>),
     /// `403 fresh_login_required` (ADR-0073 §2): a FIRST passkey can be
     /// enrolled only from a browser login made in the last 5 minutes.
-    FreshLoginRequired,
+    /// `login_url` is that login, naming the caller's provider
+    /// ([`AppState::fresh_login_url`]).
+    FreshLoginRequired {
+        login_url: String,
+    },
     /// A passkey / step-up ceremony was refused; `code` names the check.
     /// JSON body `{code, message}`.
     Ceremony {
@@ -1476,7 +1534,8 @@ impl From<DispatchError> for ApiError {
 }
 
 /// Where a `fresh_login_required` refusal sends the browser: a fresh login
-/// that lands on passkey enrollment (ADR-0073 §2, §10).
+/// that lands on passkey enrollment (ADR-0073 §2, §10). The refusal adds the
+/// caller's `provider` ([`AppState::fresh_login_url`]).
 pub const FRESH_LOGIN_URL: &str = "/v1/auth/login?next=/account/security%3Fenroll%3D1";
 
 impl IntoResponse for ApiError {
@@ -1501,13 +1560,13 @@ impl IntoResponse for ApiError {
             )
                 .into_response(),
             ApiError::StepUpRequired(refusal) => refusal.into_response(),
-            ApiError::FreshLoginRequired => (
+            ApiError::FreshLoginRequired { login_url } => (
                 StatusCode::FORBIDDEN,
                 Json(serde_json::json!({
                     "code": "fresh_login_required",
                     "message": "Log in again to enroll your first passkey (within 5 minutes of \
                                 signing in).",
-                    "login_url": FRESH_LOGIN_URL,
+                    "login_url": login_url,
                 })),
             )
                 .into_response(),
