@@ -3381,3 +3381,57 @@ h1, .crumb-head, .run-title {
 .dep-link { font-size: 11.5px; color: var(--sage); text-decoration: none; }
 .dep-link:hover { color: var(--emerald); }
 .dep-at { margin-left: auto; font-size: 11.5px; }
+
+/* ════════════════════════════════════════════════════════════════════════
+   Step-up confirmation (ADR-0073) — the confirm dialog, Account → Security,
+   Settings → Security, the confirm page, the app banner
+   ════════════════════════════════════════════════════════════════════════ */
+
+.step-up-modal { width: min(520px, 92vw); }
+/* What is being confirmed: the server's own summary, laid out as label/value
+   so the target and every change line read as data, not prose. */
+.step-up-summary {
+  display: grid; grid-template-columns: max-content 1fr; gap: 6px 14px; margin: 0;
+  font-size: 13px;
+}
+.step-up-summary dt {
+  font-family: var(--font-mono); font-size: 10.5px; text-transform: uppercase;
+  letter-spacing: 1px; color: var(--muted-sage); padding-top: 2px;
+}
+.step-up-summary dd { margin: 0; color: var(--soft-white); word-break: break-word; }
+.step-up-changes { list-style: none; margin: 0; padding: 0; display: grid; gap: 3px; font-size: 12px; }
+
+.sec-sub {
+  font-family: var(--font-mono); font-size: 11px; font-weight: 500; text-transform: uppercase;
+  letter-spacing: 1px; color: var(--muted-sage); margin: 18px 0 8px;
+}
+.sec-table { font-size: 12.5px; }
+.sec-table td { vertical-align: top; }
+.sec-table td:first-child, .sec-table td:nth-child(3) { white-space: nowrap; }
+.sec-kind { white-space: nowrap; }
+.sec-danger { color: var(--danger); }
+.sec-warn { color: var(--copper); }
+.sec-ok { color: var(--ok); }
+.sec-plain { color: var(--sage); }
+.sec-add, .sec-filter { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.sec-add .input { flex: 1 1 220px; max-width: 340px; }
+.sec-filter .input { max-width: 280px; }
+.sec-chips { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+.sec-chips li {
+  font-size: 12px; color: var(--copper); border: 1px dashed var(--border-copper);
+  border-radius: var(--radius-sm); padding: 2px 8px;
+}
+.sec-result { display: grid; gap: 10px; margin-top: 10px; }
+.sec-result-body {
+  margin: 0; background: var(--terminal); color: var(--terminal-ink);
+  border: 1px solid var(--terminal-line); border-radius: var(--radius-sm);
+  padding: 12px 14px; font-size: 12px; overflow-x: auto; max-height: 320px;
+}
+
+/* App-wide: admins without a passkey are refused every crown jewel. */
+.sec-banner {
+  display: flex; align-items: center; gap: 8px; padding: 7px 16px;
+  font-family: var(--font-mono); font-size: 12px; color: var(--copper);
+  border-bottom: 1px dashed var(--border-copper); background: var(--carapace-black);
+}
+.sec-banner-link { color: var(--emerald); margin-left: auto; }

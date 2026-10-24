@@ -12,6 +12,7 @@ import RunPipeline from "./routes/RunPipeline";
 import Settings from "./routes/Settings";
 import Account from "./routes/Account";
 import Deployments from "./routes/Deployments";
+import ConfirmRequest from "./routes/ConfirmRequest";
 
 export default function App() {
   // The sign-in gate sits ABOVE the Router, not inside its root, and that
@@ -33,6 +34,13 @@ export default function App() {
       <Route path="/settings" component={Settings} />
       {/* Your sign-in accounts (ADR-0069) — everyone's, not admin-gated. */}
       <Route path="/account" component={Account} />
+      {/* The same page, scrolled to Security (ADR-0073): where every "enroll
+          a passkey" link and the fresh-login redirect land (`?enroll=1`). */}
+      <Route path="/account/security" component={Account} />
+      {/* A machine's StepUpConfirmationRequest (ADR-0073 §6): the
+          `confirmation_url` its human opens. Three segments, so it can't
+          collide with the two-segment /:org/:repo tier. */}
+      <Route path="/security/confirm/:id" component={ConfirmRequest} />
       {/* What is live where (ADR-0070), org-scoped; `?env=` picks the
           Environment. One segment, like /settings. */}
       <Route path="/deployments" component={Deployments} />

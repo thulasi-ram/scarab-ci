@@ -21,7 +21,9 @@ import { loginChoices } from "./identities";
 
 export default function Login() {
   const [providers] = createResource(listAuthProviders);
-  const choices = () => loginChoices(providers() ?? []);
+  // Come back to the page that needed the sign-in (a confirmation link, say).
+  const choices = () =>
+    loginChoices(providers() ?? [], window.location.pathname + window.location.search);
   return (
     <div class="login">
       <div class="login-card">
