@@ -384,4 +384,4 @@ Filed as git-bug tickets:
 - 51d6bcb: session ids and CSRF tokens are stored in plaintext (predates this build;
   the step-up tables raise its stakes).
 
-Not yet ticketed: whether `attach`/`debug-pod` should be a crown jewel.
+- `606102b`: whether `attach`/`debug-pod` (a shell into a step Pod) should be a crown jewel.
