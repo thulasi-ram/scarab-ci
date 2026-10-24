@@ -2906,6 +2906,81 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
+    /// Whether `attempt` of `step` is still the unit to launch: the Run is not
+    /// terminal, and the step is `Running` with `attempt` its latest Attempt,
+    /// still in flight (not stamped `Cancelled`/`Superseded`). See
+    /// [`process_launch_intent`](Self::process_launch_intent).
+    async fn launch_still_wanted(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<bool, SchedulerError> {
+        let steps = self.db.steps_of_run(run).await?;
+        let step_wanted = steps.iter().find(|s| &s.step == step).is_some_and(|s| {
+            s.status == StepStatus::Running
+                && s.attempts
+                    .last()
+                    .is_some_and(|a| &a.id == attempt && a.outcome == AttemptOutcome::Running)
+        });
+        if !step_wanted {
+            return Ok(false);
+        }
+        Ok(self
+            .db
+            .run_status(run)
+            .await?
+            .is_some_and(|s| !s.is_terminal()))
+    }
+
+    /// The teardown of a unit launched for an attempt that stopped being
+    /// wanted while it launched ([`process_launch_intent`](Self::process_launch_intent)).
+    /// A cancelled step or a terminal Run gets a [`CANCEL_RUN`] of its own —
+    /// the cancel's own intent may already be retired — and an attempt
+    /// superseded in a live Run a [`SUPERSEDE_TEARDOWN`] naming only it (a
+    /// Run-wide cancel would kill its live units). Keyed per attempt: an
+    /// attempt is launched for real at most once.
+    async fn enqueue_late_launch_teardown(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<(), SchedulerError> {
+        let now = self.clock.now().await;
+        let cancelled = self
+            .db
+            .steps_of_run(run)
+            .await?
+            .iter()
+            .any(|s| &s.step == step && s.status == StepStatus::Cancelled);
+        let run_over = self
+            .db
+            .run_status(run)
+            .await?
+            .is_none_or(|s| s.is_terminal());
+        let msg = if cancelled || run_over {
+            let mut msg = cancel_teardown_intent(self.db, run, now).await?;
+            msg.idempotency_key =
+                format!("{}:launch:{}/{}", msg.idempotency_key, step.0, attempt.0);
+            msg
+        } else {
+            let mut msg = supersede_teardown_intent(
+                run,
+                step,
+                SupersededAttempt {
+                    step: step.0.clone(),
+                    attempt: attempt.0.clone(),
+                },
+                now,
+            );
+            msg.idempotency_key =
+                format!("supersede:{}:launch:{}/{}", run.0, step.0, attempt.0);
+            msg
+        };
+        self.db.enqueue_outbox(&msg).await?;
+        Ok(())
+    }
+
     /// Process one launch intent: launch-or-adopt, poll, settle. Extracted so
     /// [`reconcile`](Self::reconcile) can fault-isolate each message
     /// (ADR-0047 poison handling).
@@ -2951,6 +3026,21 @@ impl<'a> Scheduler<'a> {
                     ExecHandle(h)
                 }
                 None => {
+                    // Launch only a unit that is still wanted (red team A2):
+                    // the step still `Running` on THIS attempt, in a Run not
+                    // terminal. A launch intent can outlive its claim — an
+                    // operator cancel, or a rerun superseding the attempt,
+                    // lands between the claim and this drain (another
+                    // replica's, or this one after a transient launch error
+                    // left the intent for redelivery) — and a cancel's
+                    // teardown that ran first found no handle and was retired
+                    // as "gone". Launched anyway, the Pod ran (a deploy acting
+                    // on its target) for a Cancelled step, never torn down
+                    // and holding nothing.
+                    if !self.launch_still_wanted(&run, &step, &attempt).await? {
+                        self.db.mark_dispatched(msg.id).await?;
+                        return Ok(());
+                    }
                     let spec = self
                         .db
                         .step_spec(&run, &step)
@@ -3119,6 +3209,19 @@ impl<'a> Scheduler<'a> {
                     self.db
                         .set_attempt_handle(&run, &step, &attempt, &handle.0)
                         .await?;
+                    // The attempt stopped being wanted WHILE it launched
+                    // (red team A2): a cancel or supersession committed
+                    // between the check above and the handle — its teardown
+                    // may already have run and found nothing. Tear the unit
+                    // down with an intent of its own (the handle is recorded
+                    // first, so the teardown, and the DeploymentTarget hold
+                    // that counts it, see it) and stop supervising it.
+                    if !self.launch_still_wanted(&run, &step, &attempt).await? {
+                        self.enqueue_late_launch_teardown(&run, &step, &attempt)
+                            .await?;
+                        self.db.mark_dispatched(msg.id).await?;
+                        return Ok(());
+                    }
                     // We launched it — later re-polls by this instance are
                     // routine supervision, not adoption (ADR-0056).
                     self.supervised.first_contact(supervision_key);

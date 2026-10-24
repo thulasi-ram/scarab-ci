@@ -2647,14 +2647,33 @@ pub struct FakeExecutor {
     inner: Mutex<FakeExecState>,
     /// Handles `cancel` was called with (teardown assertions).
     cancelled: Mutex<Vec<String>>,
+    /// A one-shot hook the next `launch` awaits before it returns — see
+    /// [`during_next_launch`](Self::during_next_launch).
+    launch_hook: Mutex<Option<LaunchHook>>,
 }
+
+/// Work a test runs while a [`FakeExecutor::launch`] is in flight.
+pub type LaunchHook = Box<
+    dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send,
+>;
 
 impl FakeExecutor {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(FakeExecState::default()),
             cancelled: Mutex::new(Vec::new()),
+            launch_hook: Mutex::new(None),
         }
+    }
+
+    /// Run `hook` to completion INSIDE the next `launch`, before it returns
+    /// its handle (test seam): models a write another task commits while a
+    /// launch is in flight — e.g. a cancel landing, and another replica
+    /// draining its teardown, between the launch's last check and the
+    /// handle it records (red team A2). Constructs the interleaving instead
+    /// of scheduling it.
+    pub fn during_next_launch(&self, hook: LaunchHook) {
+        *self.launch_hook.lock().unwrap() = Some(hook);
     }
 
     /// The handles torn down via `cancel`, in call order.
@@ -2919,6 +2938,10 @@ impl Default for FakeExecutor {
 #[async_trait]
 impl Executor for FakeExecutor {
     async fn launch(&self, step: &StepRun, spec: &StepSpec) -> Result<ExecHandle, ExecError> {
+        let hook = self.launch_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
         let handle = Self::handle_for(step);
         let mut st = self.inner.lock().unwrap();
         *st.launches.entry(handle.0.clone()).or_insert(0) += 1;

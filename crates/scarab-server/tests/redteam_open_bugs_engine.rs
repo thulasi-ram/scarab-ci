@@ -456,15 +456,79 @@ async fn a_launch_landing_after_the_cancel_teardown_is_torn_down(w: World) {
          torn down (cancelled: {:?})",
         w.exec.cancelled_handles()
     );
+    // Fix round 2: the launch now checks the step first, so no Pod is ever
+    // created for the Cancelled step and nothing is left alive to hold the
+    // target. The hold is owed only while a launched unit is being torn
+    // down — `a_cancel_landing_while_the_launch_is_in_flight_…` covers that.
     w.seed_deploy("rb", None).await;
     w.ticks(2).await;
+    if launched > 0 {
+        w.assert_held("rb").await;
+    }
+    w.finish().await;
+}
+both!(a_launch_landing_after_the_cancel_teardown_is_torn_down, Some(1));
+
+// ---------------------------------------------------------------------------
+// A2' (fix round 2) — the cancel lands WHILE the launch is in flight: after
+// the launch's own status check, before its handle is recorded. Another
+// replica drains the cancel's teardown in that window and finds no handle,
+// so retires it as "gone". The Pod then exists for a Cancelled step: the
+// launch must tear it down itself, and its DeploymentTarget must stay held
+// while it terminates.
+// ---------------------------------------------------------------------------
+async fn a_cancel_landing_while_the_launch_is_in_flight_tears_it_down_and_holds(w: World) {
+    w.seed_deploy("ra", None).await;
+    let db = w.db.clone();
+    w.exec.during_next_launch(Box::new(move || {
+        Box::pin(async move {
+            let clock = FakeClock::new(T0);
+            assert!(cancel_run_request(&*db, &clock, &rid("ra"), Some("amy".into()))
+                .await
+                .unwrap());
+            // Replica B (its own executor client) drains the teardown first.
+            let replica_b = FakeExecutor::new();
+            Scheduler::new(&*db, &clock, &replica_b, "replica-b")
+                .with_outbox_visibility_ms(0)
+                .reconcile_cancellations()
+                .await
+                .unwrap();
+        })
+    }));
+    // The Pod lingers through three teardown checks.
+    w.exec.linger_after_cancel(3);
+    let h = handle("ra", "bump", "a1");
+    for _ in 0..8 {
+        if w.exec.launch_count(&ExecHandle(h.clone())) > 0 {
+            break;
+        }
+        w.tick().await;
+    }
+    assert_eq!(w.exec.launch_count(&ExecHandle(h.clone())), 1);
+    assert_eq!(w.run_status("ra").await, RunStatus::Cancelled);
+
+    w.ticks(1).await;
+    w.seed_deploy("rb", None).await;
+    w.ticks(2).await;
+    assert!(
+        w.torn_down(&h),
+        "a Pod launched while its step was being cancelled was never torn down \
+         (cancelled: {:?})",
+        w.exec.cancelled_handles()
+    );
     w.assert_held("rb").await;
+    // Once it is gone, the hold ends.
+    w.ticks(3).await;
+    let bump_b = w.step("rb", "bump").await;
+    assert!(
+        matches!(bump_b.status, StepStatus::Ready | StepStatus::Running),
+        "the hold ends once the unit is gone: {bump_b:?}"
+    );
     w.finish().await;
 }
 both!(
-    a_launch_landing_after_the_cancel_teardown_is_torn_down,
-    Some(1),
-    ignore = "redteam: BROKE cancel teardown retired before the claimed launch lands; launch has no status guard — Pod runs for a Cancelled step, unheld"
+    a_cancel_landing_while_the_launch_is_in_flight_tears_it_down_and_holds,
+    Some(1)
 );
 
 // ---------------------------------------------------------------------------
@@ -611,7 +675,12 @@ async fn a_step_claimed_mid_cancel_still_holds_its_target() {
     w.seed_deploy("rb", None).await;
     w.ticks(2).await;
     let bump = w.step("ra", "bump").await;
-    w.assert_held("rb").await;
+    // Fix round 2: the cancel now retries the raced step to `Cancelled`, and
+    // the launch checks the step first, so no Pod is created for it and there
+    // is nothing alive to hold the target. Held only if one was launched.
+    if w.exec.launch_count(&ExecHandle(handle("ra", "bump", "a1"))) > 0 {
+        w.assert_held("rb").await;
+    }
     assert!(
         bump.status.is_terminal(),
         "half-cancelled limbo: {bump:?} in a Cancelled Run"
