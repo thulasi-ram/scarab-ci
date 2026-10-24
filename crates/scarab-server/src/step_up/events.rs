@@ -344,9 +344,7 @@ pub(crate) async fn org_security_summary(
         }));
     };
     let list: Vec<String> = admins.into_iter().collect();
-    let with = svc
-        .passkeys
-        .principals_with_passkeys(&list)
+    let admins_without_passkey = super::admins_without_passkey(svc.passkeys.as_ref(), &list)
         .await
         .map_err(store_err)?;
     let now = st.clock.now().await.0;
@@ -373,7 +371,7 @@ pub(crate) async fn org_security_summary(
     Ok(Json(OrgSecuritySummary {
         enforced: true,
         caller_role: role.map(role_name),
-        admins_without_passkey: list.into_iter().filter(|a| !with.contains(a)).collect(),
+        admins_without_passkey,
         admins_total,
         recent_refusals,
         pending_requests,

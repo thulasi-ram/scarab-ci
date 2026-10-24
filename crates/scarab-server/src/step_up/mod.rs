@@ -214,6 +214,42 @@ pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// Which of `admins` hold no usable passkey — every crown jewel is refused
+/// for them until they enroll one. The one count behind the boot line and
+/// the Org summary.
+pub async fn admins_without_passkey(
+    passkeys: &dyn PasskeyStore,
+    admins: &[String],
+) -> Result<Vec<String>, scarab_identity::IdentityError> {
+    let with = passkeys.principals_with_passkeys(admins).await?;
+    Ok(admins
+        .iter()
+        .filter(|a| !with.contains(*a))
+        .cloned()
+        .collect())
+}
+
+/// The boot log line (ADR-0073 §8).
+pub fn step_up_boot_line(admins_without_passkey: usize) -> String {
+    format!("step-up enforced; {admins_without_passkey} admins have no passkey")
+}
+
+/// The fail-closed composition the server refuses to boot without
+/// (ADR-0073 §8): outside the dev escape hatch, a wired login means
+/// enforced step-up.
+pub fn check_step_up_composition(
+    dev_insecure: bool,
+    oauth_configured: bool,
+    enforced: bool,
+) -> Result<(), String> {
+    if !dev_insecure && oauth_configured && !enforced {
+        return Err("OAuth login is wired without step-up enforcement outside \
+                    SCARAB_DEV_INSECURE; refusing to start (ADR-0073 §8)"
+            .into());
+    }
+    Ok(())
+}
+
 /// The challenge that was actually sent for a stored challenge row, or
 /// `None` for a row this binary did not write.
 pub(crate) fn sent_challenge(row: &WebauthnChallenge) -> Option<[u8; 32]> {
@@ -637,4 +673,56 @@ pub(crate) async fn refuse_with<T>(
     }
     p.svc.record(ev).await;
     Err(ApiError::StepUpRequired(Box::new(refusal)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scarab_testkit::InMemoryPasskeys;
+
+    #[test]
+    fn the_boot_line_is_the_criterion_text() {
+        assert_eq!(
+            step_up_boot_line(2),
+            "step-up enforced; 2 admins have no passkey"
+        );
+    }
+
+    #[test]
+    fn login_without_step_up_refuses_to_boot_outside_dev_insecure() {
+        assert!(check_step_up_composition(false, true, false).is_err());
+        assert!(check_step_up_composition(false, true, true).is_ok());
+        assert!(check_step_up_composition(true, true, false).is_ok());
+        assert!(check_step_up_composition(false, false, false).is_ok());
+    }
+
+    #[tokio::test]
+    async fn admins_without_a_passkey_are_counted() {
+        let passkeys = InMemoryPasskeys::new();
+        passkeys
+            .insert(&Passkey {
+                id: "pk1".into(),
+                principal: "amy".into(),
+                credential_id: vec![1, 2, 3],
+                public_key_cose: vec![4],
+                alg: -7,
+                sign_count: 0,
+                label: "Laptop".into(),
+                transports: vec![],
+                aaguid: None,
+                backup_eligible: false,
+                backup_state: false,
+                created_at: 1,
+                created_session_hash: "h".into(),
+                last_used_at: None,
+                clone_suspected_at: None,
+            })
+            .await
+            .unwrap();
+        let admins = vec!["amy".to_string(), "bob".to_string()];
+        assert_eq!(
+            admins_without_passkey(&passkeys, &admins).await.unwrap(),
+            vec!["bob".to_string()]
+        );
+    }
 }

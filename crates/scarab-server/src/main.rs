@@ -972,25 +972,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 admins.extend(provider.owners.iter().cloned());
             }
             let admins: Vec<String> = admins.into_iter().collect();
-            let with_passkey = scarab_identity::PasskeyStore::principals_with_passkeys(
-                pg.as_ref(),
-                &admins,
-            )
-            .await
-            .unwrap_or_default();
-            let without = admins.iter().filter(|a| !with_passkey.contains(*a)).count();
-            let line = format!("step-up enforced; {without} admins have no passkey");
+            let without =
+                scarab_server::step_up::admins_without_passkey(pg.as_ref(), &admins)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "step-up: could not read passkeys for the boot count");
+                        admins.clone()
+                    })
+                    .len();
+            let line = scarab_server::step_up::step_up_boot_line(without);
             tracing::info!("startup: {line}");
             println!("startup: {line}");
         }
     }
     // Fail-closed composition (ADR-0073 §8): outside the dev escape hatch,
     // login wired means step-up wired. Config already refuses every other
-    // mode; this catches a future wiring slip.
-    debug_assert!(
-        config.dev_insecure || config.oauth.is_empty() || state.step_up.is_enforced(),
-        "OAuth login is wired without step-up outside SCARAB_DEV_INSECURE"
-    );
+    // mode; this catches a future wiring slip — in release builds too.
+    scarab_server::step_up::check_step_up_composition(
+        config.dev_insecure,
+        !config.oauth.is_empty(),
+        state.step_up.is_enforced(),
+    )?;
     if config.step_up == StepUpMode::Enforce && !state.step_up.is_enforced() {
         tracing::warn!(
             "step-up: SCARAB_STEP_UP=enforce but no login is configured; nothing is enforced"
