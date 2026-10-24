@@ -840,13 +840,36 @@ async fn rearm_invalidation_set(
         }
     }
 
+    // The teardown intent for every in-flight attempt this re-arm supersedes,
+    // FIRST — before any of them leaves `Running` (review correctness MED2).
+    // It is what keeps a superseded deploy Step holding its DeploymentTarget
+    // until its Pod is gone (`Db::deployment_requesting_runs`, git-bug
+    // f22056d); written after the re-arm, a Step already `Pending` with no
+    // intent yet counted for nothing — a held Run could be promoted beside
+    // the still-running Pod — and a crash in between left no teardown and no
+    // hold at all. A step that raced into `Running` past this snapshot gets
+    // its own intent, also before its re-arm ([`rearm_raced_step`]). Should a
+    // listed step's re-arm then conflict (it finished meanwhile), cancelling
+    // its gone unit is a harmless no-op.
+    let superseded: Vec<SupersededAttempt> = steps
+        .iter()
+        .filter(|s| invalid.contains(&s.step) && s.status == StepStatus::Running)
+        .filter_map(|s| {
+            s.attempts.last().map(|a| SupersededAttempt {
+                step: s.step.0.clone(),
+                attempt: a.id.0.clone(),
+            })
+        })
+        .collect();
+    enqueue_supersede_teardown(db, clock, run, target, superseded).await?;
+
     // Re-arm each invalidated step (terminal or in-flight) to Pending. A peer
     // that already moved it is a benign Conflict. An in-flight step re-armed
     // here has its running attempt SUPERSEDED (ADR-0056 amendment): its Pod is
-    // collected for teardown so it does not orphan, its attempt is stamped
-    // `Superseded` (never a green `failed:false`), and an `AttemptSuperseded`
-    // event records the fact.
-    let mut superseded: Vec<SupersededAttempt> = Vec::new();
+    // torn down by the intent above so it does not orphan, its attempt is
+    // stamped `Superseded` (never a green `failed:false`), and an
+    // `AttemptSuperseded` event records the fact — in the same commit as the
+    // re-arm and its `StepTransitioned` (git-bug 586187a).
     for s in steps {
         // A gate still WAITING (Pending, open Attempt) is not re-armed by the
         // status loop below — it is already Pending — but its wait's premise
@@ -863,44 +886,13 @@ async fn rearm_invalidation_set(
                     // snapshot and now (or a cancel closed it). A resolved gate
                     // is terminal, so re-arm it from its LIVE status, exactly
                     // like a step that raced past the snapshot.
-                    rearm_raced_step(db, clock, run, &s.step, by.as_deref(), &mut superseded)
-                        .await?;
+                    rearm_raced_step(db, clock, run, target, &s.step, by.as_deref()).await?;
                 }
             }
         }
         if invalid.contains(&s.step) && s.status != StepStatus::Pending {
-            match db
-                .record_step_transition(run, &s.step, s.status, StepStatus::Pending)
-                .await
-            {
-                Ok(()) => {
-                    let now = clock.now().await;
-                    db.append_event(&EventKind {
-                        version: EVENT_VERSION,
-                        run: run.clone(),
-                        kind: EventPayload::StepTransitioned {
-                            step: s.step.clone(),
-                            from: s.status,
-                            to: StepStatus::Pending,
-                        },
-                        at: now,
-                    })
-                    .await?;
-                    if s.status == StepStatus::Running {
-                        if let Some(a) = s.attempts.last() {
-                            mark_superseded(
-                                db,
-                                clock,
-                                run,
-                                &s.step,
-                                &a.id,
-                                by.as_deref(),
-                                &mut superseded,
-                            )
-                            .await?;
-                        }
-                    }
-                }
+            match commit_rearm(db, clock, run, s, by.as_deref()).await {
+                Ok(()) => {}
                 // TOCTOU (orphan fix): the optimistic `from` came from a stale
                 // snapshot. A descendant may have raced Pending/Ready→Running
                 // between the snapshot and now, so the guarded UPDATE matched 0
@@ -909,84 +901,103 @@ async fn rearm_invalidation_set(
                 // Re-read the live row and re-arm from its ACTUAL status,
                 // capturing an in-flight attempt for teardown.
                 Err(DbError::Conflict) => {
-                    rearm_raced_step(db, clock, run, &s.step, by.as_deref(), &mut superseded)
-                        .await?;
+                    rearm_raced_step(db, clock, run, target, &s.step, by.as_deref()).await?;
                 }
                 Err(e) => return Err(e.into()),
             }
         }
     }
-
-    // One teardown intent for every superseded in-flight attempt. The driver
-    // (which owns the executor) SIGTERMs their Pods; the run itself stays alive.
-    if !superseded.is_empty() {
-        let now = clock.now().await;
-        // The idempotency key must be distinct per distinct supersession
-        // (collision fix): the old `supersede:{run}:{tick}` collided for two
-        // reruns landing in the same clock tick, deduping one teardown away and
-        // orphaning its Pod. Key on the rerun target plus the specific
-        // superseded (step, attempt) handles, so distinct supersessions never
-        // collapse while an identical re-enqueue still dedups exactly-once.
-        let mut disc: Vec<String> = superseded
-            .iter()
-            .map(|a| format!("{}/{}", a.step, a.attempt))
-            .collect();
-        disc.sort();
-        db.enqueue_outbox(&OutboxMessage {
-            id: crate::OutboxId(0),
-            run: run.clone(),
-            kind: SUPERSEDE_TEARDOWN.to_string(),
-            payload: serde_json::to_value(SupersedeTeardown {
-                attempts: superseded,
-            })
-            .unwrap_or(serde_json::Value::Null),
-            idempotency_key: format!("supersede:{}:{}:{}", run.0, target.0, disc.join(",")),
-            at: now,
-        })
-        .await?;
-    }
     Ok(())
 }
 
-/// Record one superseded in-flight attempt (ADR-0056 amendment): enqueue it for
-/// Pod teardown, stamp its attempt row `Superseded` (so the abandoned attempt
-/// never renders as a green `failed:false`), and append an [`AttemptSuperseded`]
-/// event — promoting the previously-invisible supersession into a recorded fact.
-async fn mark_superseded(
+/// Enqueue one [`SUPERSEDE_TEARDOWN`] intent for `superseded` (nothing when
+/// it is empty). The driver (which owns the executor) SIGTERMs their Pods;
+/// the run itself stays alive.
+async fn enqueue_supersede_teardown(
     db: &dyn Db,
     clock: &dyn Clock,
     run: &RunId,
-    step: &StepId,
-    attempt: &AttemptId,
-    by: Option<&str>,
-    superseded: &mut Vec<SupersededAttempt>,
-) -> Result<(), RerunError> {
-    superseded.push(SupersededAttempt {
-        step: step.0.clone(),
-        attempt: attempt.0.clone(),
-    });
-    db.set_attempt_outcome(run, step, attempt, AttemptOutcome::Superseded)
-        .await?;
+    target: &StepId,
+    superseded: Vec<SupersededAttempt>,
+) -> Result<(), DbError> {
+    if superseded.is_empty() {
+        return Ok(());
+    }
     let now = clock.now().await;
-    db.append_event(&EventKind {
-        version: EVENT_VERSION,
+    // The idempotency key must be distinct per distinct supersession
+    // (collision fix): the old `supersede:{run}:{tick}` collided for two
+    // reruns landing in the same clock tick, deduping one teardown away and
+    // orphaning its Pod. Key on the rerun target plus the specific
+    // superseded (step, attempt) handles, so distinct supersessions never
+    // collapse while an identical re-enqueue still dedups exactly-once.
+    let mut disc: Vec<String> = superseded
+        .iter()
+        .map(|a| format!("{}/{}", a.step, a.attempt))
+        .collect();
+    disc.sort();
+    db.enqueue_outbox(&OutboxMessage {
+        id: crate::OutboxId(0),
         run: run.clone(),
-        kind: EventPayload::AttemptSuperseded {
-            step: step.clone(),
-            attempt: attempt.clone(),
-            by: by.map(str::to_string),
-        },
+        kind: SUPERSEDE_TEARDOWN.to_string(),
+        payload: serde_json::to_value(SupersedeTeardown {
+            attempts: superseded,
+        })
+        .unwrap_or(serde_json::Value::Null),
+        idempotency_key: format!("supersede:{}:{}:{}", run.0, target.0, disc.join(",")),
         at: now,
     })
-    .await?;
-    Ok(())
+    .await
+}
+
+/// Re-arm `s` from the status it was read in to `Pending`, as ONE commit
+/// (git-bug 586187a): the guarded CAS, its `StepTransitioned`, and — when it
+/// was `Running` — its latest attempt stamped `Superseded` with an
+/// [`AttemptSuperseded`](EventPayload::AttemptSuperseded) fact (ADR-0056
+/// amendment). `Conflict` when `s` is no longer in that status, nothing
+/// written. The caller has already enqueued the superseded attempt's
+/// teardown.
+async fn commit_rearm(
+    db: &dyn Db,
+    clock: &dyn Clock,
+    run: &RunId,
+    s: &StepRun,
+    by: Option<&str>,
+) -> Result<(), DbError> {
+    let now = clock.now().await;
+    let mut events = vec![event(
+        run,
+        EventPayload::StepTransitioned {
+            step: s.step.clone(),
+            from: s.status,
+            to: StepStatus::Pending,
+        },
+        now,
+    )];
+    let superseded = AttemptStamp::Outcome(AttemptOutcome::Superseded);
+    let mut stamp = None;
+    if s.status == StepStatus::Running {
+        if let Some(a) = s.attempts.last() {
+            stamp = Some((&a.id, &superseded));
+            events.push(event(
+                run,
+                EventPayload::AttemptSuperseded {
+                    step: s.step.clone(),
+                    attempt: a.id.clone(),
+                    by: by.map(str::to_string),
+                },
+                now,
+            ));
+        }
+    }
+    db.commit_step_transition(run, &s.step, s.status, StepStatus::Pending, stamp, &events)
+        .await
 }
 
 /// Recover a re-arm that hit [`DbError::Conflict`] because the invalidation-set
 /// snapshot was stale (the TOCTOU orphan fix). Re-read the live row and re-arm
 /// from its ACTUAL status; if the step raced into `Running` (an in-flight Pod
-/// the snapshot missed) capture it via [`mark_superseded`] so it is torn down
-/// rather than orphaned. A step a peer already re-armed to `Pending`, or one now
+/// the snapshot missed) enqueue its teardown, then re-arm it
+/// ([`commit_rearm`]), so it is torn down rather than orphaned. A step a peer already re-armed to `Pending`, or one now
 /// terminal with no live attempt, is genuinely benign. Bounded re-read/retry:
 /// each competing transition moves the step toward `Pending` or a terminal sink,
 /// so this converges in a couple of passes — the bound only guards a
@@ -995,9 +1006,9 @@ async fn rearm_raced_step(
     db: &dyn Db,
     clock: &dyn Clock,
     run: &RunId,
+    target: &StepId,
     step: &StepId,
     by: Option<&str>,
-    superseded: &mut Vec<SupersededAttempt>,
 ) -> Result<(), RerunError> {
     for _ in 0..8 {
         let live = db.steps_of_run(run).await?;
@@ -1007,30 +1018,19 @@ async fn rearm_raced_step(
         if s.status == StepStatus::Pending {
             return Ok(());
         }
-        match db
-            .record_step_transition(run, step, s.status, StepStatus::Pending)
-            .await
-        {
-            Ok(()) => {
-                let now = clock.now().await;
-                db.append_event(&EventKind {
-                    version: EVENT_VERSION,
-                    run: run.clone(),
-                    kind: EventPayload::StepTransitioned {
-                        step: step.clone(),
-                        from: s.status,
-                        to: StepStatus::Pending,
-                    },
-                    at: now,
-                })
-                .await?;
-                if s.status == StepStatus::Running {
-                    if let Some(a) = s.attempts.last() {
-                        mark_superseded(db, clock, run, step, &a.id, by, superseded).await?;
-                    }
-                }
-                return Ok(());
+        // A step that raced into `Running`: its teardown intent first, as
+        // for the snapshot's in-flight steps (review correctness MED2).
+        if s.status == StepStatus::Running {
+            if let Some(a) = s.attempts.last() {
+                let raced = vec![SupersededAttempt {
+                    step: step.0.clone(),
+                    attempt: a.id.0.clone(),
+                }];
+                enqueue_supersede_teardown(db, clock, run, target, raced).await?;
             }
+        }
+        match commit_rearm(db, clock, run, s, by).await {
+            Ok(()) => return Ok(()),
             Err(DbError::Conflict) => continue,
             Err(e) => return Err(e.into()),
         }

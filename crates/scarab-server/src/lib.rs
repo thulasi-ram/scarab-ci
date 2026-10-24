@@ -5639,10 +5639,9 @@ async fn persist_run_from_ir(
 
         // A `when:`-excluded step is kept in the DAG (edges intact) but starts
         // Skipped, so the scheduler transitively skips its descendants (ADR-0033).
+        // The transition and its journal entry are one commit (git-bug 586187a).
         if excluded.iter().any(|e| e == &step.id) {
-            db.record_step_transition(run, &step_id, StepStatus::Pending, StepStatus::Skipped)
-                .await?;
-            db.append_event(&EventKind {
+            let transitioned = EventKind {
                 version: EVENT_VERSION,
                 run: run.clone(),
                 kind: EventPayload::StepTransitioned {
@@ -5651,7 +5650,15 @@ async fn persist_run_from_ir(
                     to: StepStatus::Skipped,
                 },
                 at: now,
-            })
+            };
+            db.commit_step_transition(
+                run,
+                &step_id,
+                StepStatus::Pending,
+                StepStatus::Skipped,
+                None,
+                std::slice::from_ref(&transitioned),
+            )
             .await?;
         }
     }
