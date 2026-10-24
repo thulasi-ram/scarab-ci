@@ -629,7 +629,6 @@ async fn assert_ignoring_allow_list(
 /// record — so the attacker's continued use leaves no evidence at all
 /// (ticket 69e06b5: "a failed assertion" writes no event).
 #[tokio::test]
-#[ignore = "redteam: BROKE assertions with an already clone-flagged passkey are refused but never recorded"]
 async fn rt_reusing_a_clone_flagged_passkey_leaves_no_evidence() {
     let h = harness();
     let (s, mut k1, _k2, _) = amy_with_two_passkeys(&h).await;

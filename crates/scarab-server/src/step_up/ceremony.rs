@@ -28,7 +28,7 @@ use utoipa::ToSchema;
 
 use scarab_identity::{
     security_event_kind as kind, Action, ChallengePurpose, ConfirmationKind, Passkey, PasskeyUse,
-    StepUpConfirmation, WebauthnChallenge, STEP_UP_WINDOW_MS,
+    SecurityEvent, StepUpConfirmation, WebauthnChallenge, STEP_UP_WINDOW_MS,
 };
 use scarab_webauthn::{
     AuthenticationResponseJson, CoseAlgorithm, RegistrationResponseJson, StoredCredential,
@@ -204,6 +204,18 @@ pub(crate) async fn record_ceremony_refusal(
     request_id: Option<&str>,
     now: i64,
 ) {
+    svc.record_refusal(ceremony_refusal(caller, reason, request_id, now))
+        .await;
+}
+
+/// The `step_up.refused` (mode `ceremony`) [`record_ceremony_refusal`]
+/// records.
+fn ceremony_refusal(
+    caller: &Caller,
+    reason: &str,
+    request_id: Option<&str>,
+    now: i64,
+) -> SecurityEvent {
     let mut ev = event(
         kind::STEP_UP_REFUSED,
         &caller.principal.subject,
@@ -216,7 +228,7 @@ pub(crate) async fn record_ceremony_refusal(
         ev.request_id = Some(id.to_string());
     }
     ev.detail = serde_json::json!({ "mode": "ceremony", "reason": reason });
-    svc.record_refusal(ev).await;
+    ev
 }
 
 /// Consume `id` in this session, for this principal and one of `purposes`.
@@ -743,8 +755,9 @@ pub(crate) async fn verify_assertion(
 ) -> Result<Passkey, ApiError> {
     let verified = verify_assertion_once(svc, caller, facts, sent, credential, now).await;
     // A failed assertion is a refusal too (git-bug 69e06b5). A suspected
-    // clone already records `passkey.clone_suspected`; a store failure is
-    // not the caller's doing.
+    // clone records its own evidence (`passkey.clone_suspected` on
+    // detection, a refusal naming the passkey on each later use); a store
+    // failure is not the caller's doing.
     if let Err(ApiError::Ceremony { code, .. }) = &verified {
         if *code != "clone_suspected" {
             record_ceremony_refusal(svc, caller, code, None, now).await;
@@ -790,6 +803,12 @@ async fn verify_assertion_once(
         )
     };
     if passkey.clone_suspected_at.is_some() {
+        // Every further use of a flagged passkey is evidence (whoever holds
+        // the copy keeps trying): a rate-limited refusal naming the passkey
+        // (redteam auth-5). The first detection is `passkey.clone_suspected`.
+        let mut ev = ceremony_refusal(caller, "clone_suspected", None, now);
+        ev.passkey_id = Some(passkey.id.clone());
+        svc.record_refusal(ev).await;
         return Err(clone_refused());
     }
     let alg = CoseAlgorithm::from_id(i64::from(passkey.alg))
