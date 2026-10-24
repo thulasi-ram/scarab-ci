@@ -343,9 +343,12 @@ async fn the_org_summary_counts_admins_without_a_passkey() {
     assert!(refusals.iter().all(|e| e["kind"] == "step_up.refused"));
 
     h.clock.advance(25 * HOUR);
-    let (_, sum) = h
+    // Sessions live 24 hours, so a day later Amy signs in again.
+    let amy = h.browser_session(scoped("amy")).await;
+    let (st, sum) = h
         .cookie("GET", "/v1/orgs/acme/security/summary", None, &amy)
         .await;
+    assert_eq!(st, StatusCode::OK, "{sum}");
     assert!(sum["recent_refusals"].as_array().unwrap().is_empty());
     assert_eq!(sum["pending_requests"], 0, "expired requests do not wait");
 }
