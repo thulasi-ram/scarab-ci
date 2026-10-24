@@ -9189,11 +9189,10 @@ pub const FORGE_CREDENTIALS_ORG: &str = "_forge";
 /// Org names Scarab keeps for itself: every `_`-prefixed name. Its own
 /// credential scopes live there — [`FORGE_CREDENTIALS_ORG`] and
 /// [`plugins::PLUGIN_CONNECTION_CREDENTIALS_ORG`] — so no Project is homed in
-/// one (it would inherit those secrets), no plugin is installed into one, and
-/// `/v1/secrets` reaches only `_forge` among them (git-bug 97223c7).
-pub fn is_reserved_org(org: &str) -> bool {
-    org.starts_with('_')
-}
+/// one (it would inherit those secrets; the registry's `bind_repo` refuses it
+/// on every path), no plugin is installed into one, and `/v1/secrets`
+/// reaches only `_forge` among them (git-bug 97223c7).
+pub use scarab_forge::is_reserved_org;
 
 /// `400` when `org` is reserved ([`is_reserved_org`]); `use_` names what it
 /// was refused for.
@@ -9724,6 +9723,17 @@ async fn resync_connection(
     for repo in reported {
         if known.contains(&repo) {
             confirmed += 1;
+            continue;
+        }
+        // A forge account named like one of Scarab's own Orgs is never homed
+        // there (the registry refuses it too); skipping it keeps one such
+        // repo from failing the whole re-sync.
+        if is_reserved_org(&repo.owner) {
+            tracing::warn!(
+                connection = %id,
+                repo = %format!("{}/{}", repo.owner, repo.name),
+                "re-sync skipped a repo whose owner is a reserved org name"
+            );
             continue;
         }
         // Project name = repo name, org = repo owner — the same 1:1 mapping

@@ -2628,7 +2628,7 @@ impl ForgeConnectionStore for PostgresDb {
         Ok(())
     }
 
-    async fn bind_repo(
+    async fn upsert_repo_binding(
         &self,
         connection_id: &str,
         repo: &RepoRef,

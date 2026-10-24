@@ -1357,6 +1357,55 @@ async fn unbinding_removes_the_project() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+/// Review S4: the reserved-org refusal guarded only the manual bind. A
+/// re-sync binds every repo the forge lists — a forge account named `_forge`
+/// would have homed a Project in Scarab's own credential scope. It is
+/// skipped there, and the registry refuses it on every other path
+/// (installation sync, declarative connections).
+#[tokio::test]
+async fn no_bind_path_homes_a_repo_in_a_reserved_org() {
+    let h = harness(
+        &[],
+        Arc::new(FakeForge::new().with_accessible_repos(&[("_forge", "web"), ("acme", "api")])),
+        true,
+    )
+    .await;
+    let root = login(&h.app, "root-code").await;
+    let result: serde_json::Value = serde_json::from_str(
+        &body_bytes(
+            h.app
+                .clone()
+                .oneshot(authed("POST", "/v1/connections/gh/resync", &root))
+                .await
+                .unwrap(),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(result["bound"], serde_json::json!(["acme/api"]), "{result}");
+    let forge_web = RepoRef {
+        owner: "_forge".into(),
+        name: "web".into(),
+    };
+    assert!(h.db.resolve(&forge_web).await.unwrap().is_none());
+
+    // The installation-sync path (GitHub) goes through the same registry.
+    let sync = scarab_forge_github::InstallationSync {
+        installation_id: 1,
+        account: "_forge".into(),
+        added: vec![forge_web.clone()],
+        removed: vec![],
+    };
+    let err = scarab_forge_github::apply_installation_sync(h.db.as_ref(), "gh", "_forge", &sync)
+        .await
+        .expect_err("a reserved org is refused");
+    assert!(
+        matches!(err, scarab_forge::RegistryError::ReservedOrg(ref o) if o == "_forge"),
+        "{err:?}"
+    );
+    assert!(h.db.resolve(&forge_web).await.unwrap().is_none());
+}
+
 /// git-bug 97223c7: `_`-prefixed orgs are Scarab's own credential scopes. A
 /// repo whose owner is one would home a Project there and inherit those
 /// secrets, so binding it is refused and nothing is bound.

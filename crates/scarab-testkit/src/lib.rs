@@ -3360,7 +3360,7 @@ impl scarab_forge::ForgeConnectionStore for InMemoryDb {
         Ok(())
     }
 
-    async fn bind_repo(
+    async fn upsert_repo_binding(
         &self,
         connection_id: &str,
         repo: &scarab_forge::RepoRef,
