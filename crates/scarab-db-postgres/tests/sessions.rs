@@ -19,6 +19,8 @@ fn session(id: &str, subject: &str, expires_at: i64) -> Session {
         },
         expires_at,
         csrf: format!("csrf-{id}"),
+        created_at: 1_000,
+        login_kind: scarab_identity::LOGIN_KIND_BROWSER.into(),
     }
 }
 
@@ -51,10 +53,42 @@ async fn session_lifecycle_put_get_refresh_delete() {
     db.put(&refreshed).await.unwrap();
     assert_eq!(db.get("sid-1").await.unwrap().unwrap(), refreshed);
 
+    // ADR-0073: the login stamp round-trips, and a refresh keeps whatever
+    // the caller puts (the server re-puts the session it read).
+    assert_eq!(got.created_at, 1_000);
+    assert_eq!(got.login_kind, "browser");
+    assert_eq!(got.fresh_login_until(), Some(1_000 + scarab_identity::FRESH_LOGIN_MS));
+
     // delete revokes; deleting an unknown id is a no-op.
     db.delete("sid-1").await.unwrap();
     assert_eq!(db.get("sid-1").await.unwrap(), None);
     db.delete("sid-1").await.unwrap();
+
+    tdb.cleanup().await;
+}
+
+/// ADR-0073: a session row written before migration 0059 (an old binary's
+/// INSERT, which never names the new columns) reads back as never fresh.
+#[tokio::test]
+async fn a_pre_upgrade_session_row_reads_as_never_fresh() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+
+    sqlx::query(
+        "INSERT INTO sessions (id, principal, csrf, expires_at)
+         VALUES ('old', '{\"subject\":\"alice\",\"display_name\":null,\"roles\":[]}', '', 9000)",
+    )
+    .execute(&tdb.pool)
+    .await
+    .unwrap();
+    let got = db.get("old").await.unwrap().expect("stored");
+    assert_eq!(got.created_at, 0);
+    assert_eq!(got.login_kind, "");
+    assert_eq!(got.fresh_login_until(), None);
 
     tdb.cleanup().await;
 }

@@ -116,3 +116,28 @@ async fn api_token_lifecycle_put_lookup_list_touch_revoke() {
 
     tdb.cleanup().await;
 }
+
+/// ADR-0073: a StepUpConfirmationRequest's replay re-reads its requesting
+/// token by row id — live or not, so the caller can tell "revoked" apart.
+#[tokio::test]
+async fn a_token_is_found_by_its_row_id_revoked_or_not() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+
+    let t = token("t-1", Scope::Org("acme".into()), 1_000);
+    db.put(&t, &api_token_hash("scarab_pat_one")).await.unwrap();
+    assert_eq!(db.by_id("t-1").await.unwrap(), Some(t.clone()));
+    assert_eq!(db.by_id("scarab_pat_one").await.unwrap(), None, "not by plaintext");
+    assert_eq!(db.by_id(&api_token_hash("scarab_pat_one")).await.unwrap(), None);
+
+    assert!(db.revoke("t-1", 2_000).await.unwrap());
+    let revoked = db.by_id("t-1").await.unwrap().expect("still found");
+    assert_eq!(revoked.revoked_at, Some(2_000));
+    assert!(!revoked.is_live(1_500));
+
+    tdb.cleanup().await;
+}

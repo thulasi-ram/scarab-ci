@@ -17,6 +17,13 @@ scarab-project = { workspace = true }
 scarab-deployment = { workspace = true }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
+# ADR-0073: `InMemorySealer` is a REAL AEAD (AES-256-GCM under a fixed test
+# key) and derives keys with HMAC-SHA256, so a server test that opens a
+# sealed request body with the wrong AAD fails as it would in production — a
+# no-op sealer would let exactly that bug through. Crates already in the tree.
+aes-gcm = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
 
 # Test-only: an async runtime to drive the async `Db`/`Clock` ports in tests.
 # This is a dev-dependency, so the testkit library itself stays infra-free.
