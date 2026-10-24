@@ -611,10 +611,6 @@ impl OAuthAuthenticator {
     ///   mint a global Owner;
     /// - a bare email matches any provider, which boot permits only when there
     ///   is exactly one.
-    pub(crate) fn matches_owner(&self, subject: &str, verified_email: Option<&str>) -> bool {
-        self.is_owner(subject, verified_email)
-    }
-
     fn is_owner(&self, subject: &str, verified_email: Option<&str>) -> bool {
         self.cfg.owners.iter().any(|o| {
             o == subject
@@ -625,6 +621,12 @@ impl OAuthAuthenticator {
                     None => o.eq_ignore_ascii_case(email),
                 })
         })
+    }
+
+    /// [`is_owner`](Self::is_owner), for the step-up reset's "is the target
+    /// an install-wide owner?" (ADR-0073 §10) — the one owners matcher.
+    pub(crate) fn matches_owner(&self, subject: &str, verified_email: Option<&str>) -> bool {
+        self.is_owner(subject, verified_email)
     }
 
     /// Verify an `id_token`: RS256 signature against the issuer's JWKS, plus
