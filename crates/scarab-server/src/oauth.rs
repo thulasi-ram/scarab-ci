@@ -105,6 +105,26 @@ pub struct LoginFlow {
     /// of the session that started it. The callback links only into that same
     /// session, so a code cannot be replayed into someone else's account.
     pub link: String,
+    /// Where the browser lands after a sign-in callback (ADR-0073 §10): a
+    /// same-origin relative path that passed [`safe_next`]. Empty = `/`.
+    /// Carried base64url so it can never contain the `.` separator.
+    pub next: String,
+}
+
+/// The longest `next` a login may carry.
+pub const MAX_NEXT_LEN: usize = 512;
+
+/// `next` if it is a safe post-login landing: a relative path that starts
+/// with `/`, not `//` (scheme-relative: another host), with no `\` (which
+/// browsers fold into `/`), no control characters, at most
+/// [`MAX_NEXT_LEN`] bytes. Anything else is `None` — never an open redirect.
+pub fn safe_next(next: &str) -> Option<&str> {
+    let ok = next.starts_with('/')
+        && !next.starts_with("//")
+        && !next.contains('\\')
+        && !next.chars().any(|c| c.is_control())
+        && next.len() <= MAX_NEXT_LEN;
+    ok.then_some(next)
 }
 
 impl LoginFlow {
@@ -116,7 +136,15 @@ impl LoginFlow {
             nonce: random_urlsafe(),
             provider: String::new(),
             link: String::new(),
+            next: String::new(),
         }
+    }
+
+    /// The same flow, landing on `next` after the callback. An unsafe `next`
+    /// (see [`safe_next`]) is dropped.
+    pub fn with_next(mut self, next: &str) -> Self {
+        self.next = safe_next(next).unwrap_or_default().to_string();
+        self
     }
 
     /// The same flow, made a link into the session whose id hashes to
@@ -146,11 +174,15 @@ impl LoginFlow {
             self.verifier.as_str(),
             self.nonce.as_str(),
         ];
-        if !self.provider.is_empty() || !self.link.is_empty() {
+        let next = b64url(self.next.as_bytes());
+        if !self.provider.is_empty() || !self.link.is_empty() || !self.next.is_empty() {
             parts.push(&self.provider);
         }
-        if !self.link.is_empty() {
+        if !self.link.is_empty() || !self.next.is_empty() {
             parts.push(&self.link);
+        }
+        if !self.next.is_empty() {
+            parts.push(&next);
         }
         parts.join(".")
     }
@@ -165,15 +197,30 @@ impl LoginFlow {
         let nonce = parts.next().unwrap_or_default();
         let provider = parts.next().unwrap_or_default();
         let link = parts.next().unwrap_or_default();
+        let next = parts.next().unwrap_or_default();
         if parts.next().is_some() {
             return None;
         }
+        // The 6th part is base64url of a path that passed `safe_next` when
+        // the flow began; re-checked here because a cookie is client input.
+        let next = if next.is_empty() {
+            String::new()
+        } else {
+            let raw = base64::Engine::decode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                next.as_bytes(),
+            )
+            .ok()?;
+            let raw = String::from_utf8(raw).ok()?;
+            safe_next(&raw)?.to_string()
+        };
         Some(Self {
             state: state.to_string(),
             verifier: verifier.to_string(),
             nonce: nonce.to_string(),
             provider: provider.to_string(),
             link: link.to_string(),
+            next,
         })
     }
 
@@ -747,6 +794,7 @@ mod tests {
             nonce: "n".into(),
             provider: String::new(),
             link: String::new(),
+            next: String::new(),
         };
         assert_eq!(
             flow.challenge(),
@@ -772,7 +820,7 @@ mod tests {
         assert_eq!(flow.verifier(), None, "nothing to replay");
         assert_eq!(flow.nonce(), None, "nothing to check");
         assert_eq!(LoginFlow::from_cookie(""), None);
-        assert_eq!(LoginFlow::from_cookie("a.b.c.d.e.f"), None);
+        assert_eq!(LoginFlow::from_cookie("a.b.c.d.e.f.g"), None);
         let link = LoginFlow::generate()
             .for_provider("github")
             .for_link("abc123");
@@ -786,6 +834,40 @@ mod tests {
             LoginFlow::from_cookie(&bound.to_cookie()),
             Some(bound.clone())
         );
+    }
+
+    #[test]
+    fn next_survives_the_cookie_and_only_a_relative_path_does() {
+        let flow = LoginFlow::generate()
+            .for_provider("github")
+            .with_next("/account/security?enroll=1");
+        let back = LoginFlow::from_cookie(&flow.to_cookie()).expect("round trip");
+        assert_eq!(back.next, "/account/security?enroll=1");
+        assert_eq!(back, flow);
+        // Without a provider either, the next still rides in the 6th part.
+        let bare = LoginFlow::generate().with_next("/x");
+        assert_eq!(LoginFlow::from_cookie(&bare.to_cookie()), Some(bare.clone()));
+
+        for bad in [
+            "https://evil.example/",
+            "//evil.example/",
+            "/\\evil.example",
+            "evil",
+            "",
+            "/a\nb",
+        ] {
+            assert_eq!(safe_next(bad), None, "{bad:?}");
+            assert_eq!(LoginFlow::generate().with_next(bad).next, "", "{bad:?}");
+        }
+        assert_eq!(safe_next(&format!("/{}", "a".repeat(MAX_NEXT_LEN))), None);
+        assert_eq!(safe_next("/ok"), Some("/ok"));
+
+        // A forged cookie carrying an absolute URL is refused, not obeyed.
+        let forged = format!(
+            "s.v.n.github..{}",
+            b64url("https://evil.example/".as_bytes())
+        );
+        assert_eq!(LoginFlow::from_cookie(&forged), None);
     }
 
     fn cfg(owners: Vec<String>) -> OAuthConfig {

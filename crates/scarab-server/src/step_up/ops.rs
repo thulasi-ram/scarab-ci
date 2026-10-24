@@ -256,6 +256,7 @@ pub fn redact(body: &Value, redact: &[&str]) -> Value {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 const fn op(
     id: &'static str,
     label: &'static str,

@@ -21,7 +21,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use futures::stream::{self, BoxStream, Stream, StreamExt};
 use futures::SinkExt;
 use serde::{Deserialize, Serialize};
@@ -283,6 +283,11 @@ pub struct AppState {
     /// [`with_snapshot_retention_days`](AppState::with_snapshot_retention_days)
     /// so the UI never quotes a different number than the sweeper enforces.
     pub snapshot_retention_days: u32,
+    /// Step-up confirmation (ADR-0073). [`AppState::new`] leaves it
+    /// [`Off`](step_up::StepUpPolicy::Off) — a hand-built state, or
+    /// `SCARAB_DEV_INSECURE`; production wires
+    /// [`with_step_up`](AppState::with_step_up) in `main.rs`.
+    pub step_up: step_up::StepUpPolicy,
 }
 
 impl AppState {
@@ -326,7 +331,16 @@ impl AppState {
             public_url: "http://localhost:8080".into(),
             credential_overrides: Arc::new(connections_config::CredentialOverrides::new()),
             snapshot_retention_days: DEFAULT_SNAPSHOT_RETENTION_DAYS,
+            step_up: step_up::StepUpPolicy::Off,
         }
+    }
+
+    /// Enforce step-up confirmation (ADR-0073): every crown-jewel route needs
+    /// a passkey StepUpConfirmation, and the passkey ceremony endpoints are
+    /// live.
+    pub fn with_step_up(mut self, service: step_up::StepUpService) -> Self {
+        self.step_up = step_up::StepUpPolicy::Enforce(Arc::new(service));
+        self
     }
 
     /// The cold-tier Workspace-Snapshot retention window the sweeper actually
@@ -1403,6 +1417,22 @@ pub enum ApiError {
     /// the org-level Environment (ADR-0071).
     Gone(String),
     Db(DbError),
+    /// `403 step_up_required` (ADR-0073 §5): a crown-jewel operation without
+    /// a valid StepUpConfirmation. JSON body: [`step_up::StepUpRefusal`].
+    StepUpRequired(Box<step_up::StepUpRefusal>),
+    /// `403 fresh_login_required` (ADR-0073 §2): a FIRST passkey can be
+    /// enrolled only from a browser login made in the last 5 minutes.
+    FreshLoginRequired,
+    /// A passkey / step-up ceremony was refused; `code` names the check.
+    /// JSON body `{code, message}`.
+    Ceremony {
+        status: StatusCode,
+        code: &'static str,
+        message: String,
+    },
+    /// A dependency that must work for the request to be safe is down (503):
+    /// a crown jewel whose authorisation cannot be recorded does not run.
+    Unavailable(String),
     /// A log body read failed while the index says chunks exist — the bytes are
     /// gone or unreachable, and the reader must be told rather than handed a
     /// plausible blank pane (ADR-0063 part 5: absence is authoritative only when
@@ -1442,6 +1472,10 @@ impl From<DispatchError> for ApiError {
     }
 }
 
+/// Where a `fresh_login_required` refusal sends the browser: a fresh login
+/// that lands on passkey enrollment (ADR-0073 §2, §10).
+pub const FRESH_LOGIN_URL: &str = "/v1/auth/login?next=/account/security%3Fenroll%3D1";
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         match self {
@@ -1463,6 +1497,27 @@ impl IntoResponse for ApiError {
                 format!("log storage read failed: {e}"),
             )
                 .into_response(),
+            ApiError::StepUpRequired(refusal) => refusal.into_response(),
+            ApiError::FreshLoginRequired => (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "code": "fresh_login_required",
+                    "message": "Log in again to enroll your first passkey (within 5 minutes of \
+                                signing in).",
+                    "login_url": FRESH_LOGIN_URL,
+                })),
+            )
+                .into_response(),
+            ApiError::Ceremony {
+                status,
+                code,
+                message,
+            } => (
+                status,
+                Json(serde_json::json!({ "code": code, "message": message })),
+            )
+                .into_response(),
+            ApiError::Unavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m).into_response(),
         }
     }
 }
@@ -5882,7 +5937,9 @@ async fn login(
         ApiError::Unauthorized
     })?;
     let now = st.clock.now().await.0;
-    let session = mint_session(principal.clone(), now);
+    // An API/CLI exchange: never a fresh browser login (ADR-0073 §2), even
+    // though it also sets the browser cookies.
+    let session = mint_session(principal.clone(), now, scarab_identity::LOGIN_KIND_API);
     sessions
         .put(&session)
         .await
@@ -5901,17 +5958,19 @@ async fn login(
     Ok(resp)
 }
 
-/// Mint a fresh [`Session`] (opaque id + CSRF token, 24h TTL).
-fn mint_session(principal: Principal, now_ms: i64) -> Session {
+/// Mint a fresh [`Session`] (opaque id + CSRF token, 24h TTL), stamped with
+/// when the login completed and how (ADR-0073 §2): `login_kind` is
+/// [`scarab_identity::LOGIN_KIND_BROWSER`] for the OAuth callback and
+/// [`scarab_identity::LOGIN_KIND_API`] for the API/CLI exchange — only a
+/// fresh browser login may enroll a first passkey.
+fn mint_session(principal: Principal, now_ms: i64, login_kind: &str) -> Session {
     Session {
         id: Uuid::new_v4().to_string(),
         principal,
         expires_at: now_ms + SESSION_TTL_MS,
         csrf: Uuid::new_v4().to_string(),
         created_at: now_ms,
-        // ADR-0073 C3 stamps "browser" / "api" here; until then no login
-        // counts as fresh.
-        login_kind: String::new(),
+        login_kind: login_kind.to_string(),
     }
 }
 
@@ -5944,7 +6003,7 @@ fn oauth_callback_url(st: &AppState) -> String {
 /// login secrets (`state` + PKCE verifier + OIDC nonce), keep them in one
 /// HttpOnly cookie (10 min), and redirect to the provider's authorize endpoint
 /// with the `state` echo and the S256 `code_challenge`.
-#[utoipa::path(get, path = "/v1/auth/login", summary = "Begin the browser OAuth flow (ADR-0049)", params(("provider" = Option<String>, Query, description = "login provider id (ADR-0069); default = the only, or the unqualified_ids, provider")), responses((status = 302, description = "redirect to the provider with a state cookie"), (status = 400, description = "unknown provider, or several and none named"), (status = 404, description = "OAuth not configured")))]
+#[utoipa::path(get, path = "/v1/auth/login", summary = "Begin the browser OAuth flow (ADR-0049)", params(("provider" = Option<String>, Query, description = "login provider id (ADR-0069); default = the only, or the unqualified_ids, provider"), ("next" = Option<String>, Query, description = "a relative path to land on after the callback (ADR-0073); default `/`")), responses((status = 302, description = "redirect to the provider with a state cookie"), (status = 400, description = "unknown provider, several and none named, or a `next` that is not a relative path"), (status = 404, description = "OAuth not configured")))]
 async fn oauth_login_redirect(
     State(st): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -5954,7 +6013,18 @@ async fn oauth_login_redirect(
     };
     // The provider rides in the state cookie, so every provider shares the one
     // registered callback URL (ADR-0069).
-    let flow = oauth::LoginFlow::generate().for_provider(provider.provider_id());
+    // `?next=` (ADR-0073 §10): where the browser lands after the callback —
+    // e.g. `scarab security setup` sends a fresh login straight to passkey
+    // enrollment. Only a same-origin relative path is kept; anything else
+    // is refused rather than silently dropped.
+    let next = match q.get("next").filter(|n| !n.is_empty()) {
+        Some(n) => oauth::safe_next(n)
+            .ok_or_else(|| ApiError::BadRequest("`next` must be a relative path".into()))?,
+        None => "",
+    };
+    let flow = oauth::LoginFlow::generate()
+        .for_provider(provider.provider_id())
+        .with_next(next);
     let location = provider.authorize_redirect(&oauth_callback_url(&st), &flow);
     let mut resp = (StatusCode::FOUND, ()).into_response();
     if let Ok(v) = axum::http::HeaderValue::from_str(&location) {
@@ -5975,7 +6045,7 @@ async fn oauth_login_redirect(
 /// `GET /v1/auth/callback?code&state` (ADR-0049): finish the browser OAuth
 /// flow — verify the `state` echo against the cookie, exchange the code for a
 /// [`Principal`], mint the PG session + CSRF token, and land on `/`.
-#[utoipa::path(get, path = "/v1/auth/callback", summary = "Finish the browser OAuth flow (ADR-0049)", responses((status = 302, description = "session + CSRF cookies set; redirect to /"), (status = 401, description = "state mismatch or bad code")))]
+#[utoipa::path(get, path = "/v1/auth/callback", summary = "Finish the browser OAuth flow (ADR-0049)", responses((status = 302, description = "session + CSRF cookies set; redirect to the login's `next`, else /"), (status = 401, description = "state mismatch or bad code")))]
 async fn oauth_callback(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -6019,17 +6089,24 @@ async fn oauth_callback(
         ApiError::Unauthorized
     })?;
     let now = st.clock.now().await.0;
-    let session = mint_session(principal, now);
+    let session = mint_session(principal, now, scarab_identity::LOGIN_KIND_BROWSER);
     sessions.put(&session).await.map_err(|e| {
         tracing::warn!(error = %e, "OAuth callback: could not store the new session");
         ApiError::Unauthorized
     })?;
 
+    // Land where the login was started for (`?next=` on `GET
+    // /v1/auth/login`, validated twice: when set and here), else `/`.
+    let landing = oauth::safe_next(&flow.next).unwrap_or("/");
     let mut resp = (StatusCode::FOUND, ()).into_response();
-    resp.headers_mut().insert(
-        axum::http::header::LOCATION,
-        axum::http::HeaderValue::from_static("/"),
-    );
+    if let Ok(v) = axum::http::HeaderValue::from_str(landing) {
+        resp.headers_mut().insert(axum::http::header::LOCATION, v);
+    } else {
+        resp.headers_mut().insert(
+            axum::http::header::LOCATION,
+            axum::http::HeaderValue::from_static("/"),
+        );
+    }
     set_session_cookies(resp.headers_mut(), &session);
     // The one-shot state cookie is spent.
     if let Ok(v) = axum::http::HeaderValue::from_str(
@@ -6986,15 +7063,56 @@ struct Caller {
     principal: Principal,
     /// `Some` when an issued API token authenticated this request.
     grant: Option<scarab_identity::ApiToken>,
+    /// How the credential was presented. `None` only for the dev-insecure
+    /// synthetic Owner (no session store wired), which presented nothing.
+    via: Option<AuthVia>,
+    /// The session behind the request, when it was one (cookie or Bearer) —
+    /// what a StepUpConfirmation is bound to (ADR-0073 §4, §7).
+    session: Option<SessionFacts>,
+}
+
+/// What ADR-0073 needs to know about the session a request rode on.
+#[derive(Debug, Clone)]
+struct SessionFacts {
+    /// Hex SHA-256 of the session id: confirmations are keyed by it, never
+    /// by the id itself.
+    id_hash: String,
+    /// When the login that minted it completed (0 = before this was stamped).
+    #[allow(dead_code)] // read by the StepUpConfirmationRequest path (ADR-0073 C5)
+    created_at: i64,
+    /// `browser` (OAuth callback) or `api` (the API/CLI exchange).
+    #[allow(dead_code)] // read by the StepUpConfirmationRequest path (ADR-0073 C5)
+    login_kind: String,
+    /// Until when it counts as a fresh browser login (first-passkey rule).
+    fresh_login_until: Option<i64>,
 }
 
 impl Caller {
-    /// A caller with no token narrowing — a session, or the dev-insecure
-    /// synthetic Owner.
+    /// A caller with no token narrowing and no session behind it — the
+    /// dev-insecure synthetic Owner.
     fn session(principal: Principal) -> Self {
         Self {
             principal,
             grant: None,
+            via: None,
+            session: None,
+        }
+    }
+
+    /// May a window / action StepUpConfirmation stand for this caller? Only a
+    /// human's own browser: a cookie session, never a token or a session
+    /// presented as Bearer (ADR-0073 §7).
+    fn is_browser_session(&self) -> bool {
+        self.grant.is_none() && self.via == Some(AuthVia::Cookie) && self.session.is_some()
+    }
+
+    /// The `caller` column of an OrgSecurityEventLog row.
+    fn event_label(&self) -> String {
+        match (&self.grant, self.via) {
+            (Some(token), _) => format!("api_token:{}", token.id),
+            (None, Some(AuthVia::Cookie)) => "session:cookie".to_string(),
+            (None, Some(AuthVia::Bearer)) => "session:bearer".to_string(),
+            (None, None) => "dev:insecure".to_string(),
         }
     }
 
@@ -7129,7 +7247,18 @@ async fn authenticate(
             return Err(ApiError::Forbidden);
         }
     }
-    Ok(Caller::session(session.principal))
+    let facts = SessionFacts {
+        id_hash: session_hash(&session.id),
+        created_at: session.created_at,
+        login_kind: session.login_kind.clone(),
+        fresh_login_until: session.fresh_login_until(),
+    };
+    Ok(Caller {
+        principal: session.principal,
+        grant: None,
+        via: Some(via),
+        session: Some(facts),
+    })
 }
 
 /// Authenticate a `scarab_pat_…` bearer (ADR-0049 amendment): hash it, load the
@@ -7179,6 +7308,8 @@ async fn authenticate_api_token(
             roles,
         },
         grant: Some(token),
+        via: Some(via),
+        session: None,
     })
 }
 
@@ -7288,12 +7419,17 @@ fn gate_approvers(events: &[EventKind], step: &StepId) -> Vec<String> {
 )]
 async fn approve_gate(
     State(st): State<AppState>,
+    Extension(ctx): Extension<crate::step_up::GuardCtx>,
     headers: HeaderMap,
     Path((id, step)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
     let run = RunId(id);
     let scope = run_scope(&st, &run).await;
     let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
+    // ADR-0073 SEAM (C4): a conditional crown jewel — the step-up is needed
+    // only when this change loosens (rule: the run's Environment has approvers). Until the loosening
+    // rules are wired, ask unconditionally: fail-closed.
+    ctx.require(&st, Vec::new()).await?;
     let step = StepId(step);
 
     // 1. Record this principal's approval — append-only, no resume, idempotent
@@ -10432,7 +10568,13 @@ impl utoipa::Modify for SecuritySchemes {
         release_gate_external,
         put_secret,
         list_secrets,
-        delete_secret
+        delete_secret,
+        step_up::ceremony::me_security,
+        step_up::ceremony::passkey_registration_options,
+        step_up::ceremony::passkey_registration,
+        step_up::ceremony::remove_passkey,
+        step_up::ceremony::step_up_options,
+        step_up::ceremony::step_up_confirm
     ),
     components(schemas(
         CreateRunRequest,
@@ -10532,7 +10674,16 @@ impl utoipa::Modify for SecuritySchemes {
         plugins::UnmappedGroupingDto,
         plugins::DeploymentSourceTargetDto,
         plugins::PluginConnectionDto,
-        plugins::PutPluginConnectionRequest
+        plugins::PutPluginConnectionRequest,
+        step_up::OpSummary,
+        step_up::StepUpRefusal,
+        step_up::WebauthnChallengeDto,
+        step_up::ceremony::PasskeyDto,
+        step_up::ceremony::MeSecurityResponse,
+        step_up::ceremony::PasskeyRegistrationOptionsRequest,
+        step_up::ceremony::PasskeyRegistrationRequest,
+        step_up::ceremony::StepUpConfirmRequest,
+        step_up::ceremony::StepUpConfirmResponse
     ))
 )]
 pub struct ApiDoc;
@@ -10556,6 +10707,12 @@ fn router_inner(state: AppState) -> Router {
     // its ADR-0073 classification.
     routes::governed_routes()
         .router
+        // ADR-0073: the step-up guard runs on every matched route, deciding
+        // from the route's registered classification.
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            step_up::guard::guard,
+        ))
         // The embedded web UI (ADR-0054): everything no API route claimed
         // falls through here — a real file from dist/, else index.html (SPA
         // client routing). Same-origin by construction: no CORS anywhere.
