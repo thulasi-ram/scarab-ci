@@ -4176,6 +4176,11 @@ export interface components {
             op: string;
             org?: string | null;
             path: string;
+            /**
+             * @description The raw query string the operation runs with (empty = none) — part
+             *     of what runs, so the confirm page shows it.
+             */
+            query: string;
             /** @description Who asked: `API token “ci-bot” (<id>)` or `a CLI session (Bearer)`. */
             requested_by: string;
             /** @description `api_token` or `bearer_session`. */
@@ -4933,6 +4938,15 @@ export interface operations {
                     "application/json": components["schemas"]["ResyncResultDto"];
                 };
             };
+            /** @description `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
             /** @description no such connection, or no registry/forge wired */
             404: {
                 headers: {
@@ -4942,6 +4956,13 @@ export interface operations {
             };
             /** @description the connection is managed by configuration (read-only) */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };
