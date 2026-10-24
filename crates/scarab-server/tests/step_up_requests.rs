@@ -32,7 +32,7 @@ use scarab_identity::{
     StepUpRequest, StepUpRequester, LOGIN_KIND_API,
 };
 use scarab_secrets::{Sealer, Secret, SecretError, SecretProvider, SecretScope};
-use scarab_testkit::{FakeSecrets, InMemorySealer};
+use scarab_testkit::FakeSecrets;
 use scarab_webauthn::soft::SoftPasskey;
 
 use step_up_harness::*;
@@ -708,8 +708,10 @@ async fn a_request_cannot_be_widened() {
     forged.id = "forged".into();
     let body = serde_json::to_vec(&secret("EVIL")).unwrap();
     let plain = json!({ "body": base64::engine::general_purpose::STANDARD.encode(body) });
+    // Sealed by the production sealer under the harness's KEK, so the replay
+    // opens it and only the digest check stands in the way.
     forged.sealed = Some(
-        InMemorySealer::new()
+        real_sealer()
             .seal(plain.to_string().as_bytes(), b"step-up-request:forged")
             .unwrap(),
     );

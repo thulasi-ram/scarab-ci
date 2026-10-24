@@ -1098,7 +1098,13 @@ async fn under_enforced_step_up_the_read_proxy_is_unchanged() {
             Arc::new(scarab_testkit::InMemoryChallenges::new()),
             Arc::new(scarab_testkit::InMemoryStepUp::new()),
             Arc::new(scarab_testkit::InMemorySecurityEvents::new()),
-            Arc::new(scarab_testkit::InMemorySealer::new()),
+            Arc::new(scarab_secrets_postgres::PostgresSecrets::with_keys(
+                // The production sealer; a lazy pool never connects.
+                sqlx::postgres::PgPoolOptions::new()
+                    .connect_lazy("postgres://unused@localhost/unused")
+                    .unwrap(),
+                scarab_secrets_postgres::MasterKeySet::new(vec![[7u8; 32]]).unwrap(),
+            )),
             scarab_webauthn::RelyingParty::from_public_url("https://ci.example.com", "Scarab")
                 .unwrap(),
         ),

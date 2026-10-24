@@ -2659,10 +2659,12 @@ dependencies = [
  "scarab-forge",
  "scarab-identity",
  "scarab-pipeline",
+ "scarab-secrets-postgres",
  "scarab-server",
  "scarab-testkit",
  "scarab-webauthn",
  "serde_json",
+ "sqlx",
  "tokio",
 ]
 
@@ -3004,9 +3006,7 @@ dependencies = [
 name = "scarab-testkit"
 version = "0.1.1"
 dependencies = [
- "aes-gcm",
  "async-trait",
- "hmac",
  "scarab-deployment",
  "scarab-engine",
  "scarab-forge",
@@ -3016,7 +3016,6 @@ dependencies = [
  "scarab-secrets",
  "scarab-storage",
  "serde_json",
- "sha2",
  "tokio",
 ]
 

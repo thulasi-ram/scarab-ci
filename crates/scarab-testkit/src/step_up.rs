@@ -8,18 +8,15 @@
 //! Each store is one lock, so every "atomic" here is trivially so.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use aes_gcm::aead::{Aead, Payload};
-use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use async_trait::async_trait;
 use scarab_identity::{
     BeginExecution, ChallengeStore, ConfirmationKind, IdentityError, Passkey, PasskeyStore,
     PasskeyUse, RbacStore, RequestState, SecurityEvent, SecurityEventFilter, SecurityEventLog,
     StepUpConfirmation, StepUpRequest, StepUpRequester, StepUpStore, WebauthnChallenge,
 };
-use scarab_secrets::{Sealer, SecretError};
 
 // ---------------------------------------------------------------------------
 // Passkeys
@@ -604,82 +601,6 @@ impl SecurityEventLog for InMemorySecurityEvents {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Sealer
-// ---------------------------------------------------------------------------
-
-/// A [`Sealer`] for tests: real AES-256-GCM under a fixed key, so a wrong
-/// AAD or a tampered seal fails exactly as in production. Nonces come from a
-/// per-instance counter — unique under the one key for this instance's life,
-/// which is all a test needs (and why this is not a production sealer).
-pub struct InMemorySealer {
-    key: [u8; 32],
-    nonce: AtomicU64,
-}
-
-impl Default for InMemorySealer {
-    fn default() -> Self {
-        Self::with_key([0x5a; 32])
-    }
-}
-
-impl InMemorySealer {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// A sealer under `key` — a different key opens nothing the default
-    /// one sealed.
-    pub fn with_key(key: [u8; 32]) -> Self {
-        Self {
-            key,
-            nonce: AtomicU64::new(1),
-        }
-    }
-
-    fn cipher(&self) -> Aes256Gcm {
-        Aes256Gcm::new_from_slice(&self.key).expect("a 32-byte key")
-    }
-}
-
-impl Sealer for InMemorySealer {
-    fn seal(&self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, SecretError> {
-        let mut nonce = [0u8; 12];
-        nonce[4..].copy_from_slice(&self.nonce.fetch_add(1, Ordering::SeqCst).to_be_bytes());
-        let ct = self
-            .cipher()
-            .encrypt(
-                Nonce::from_slice(&nonce),
-                Payload {
-                    msg: plaintext,
-                    aad,
-                },
-            )
-            .map_err(|_| SecretError::Backend("encryption failed".into()))?;
-        let mut out = nonce.to_vec();
-        out.extend_from_slice(&ct);
-        Ok(out)
-    }
-
-    fn open(&self, sealed: &[u8], aad: &[u8]) -> Result<Vec<u8>, SecretError> {
-        if sealed.len() < 12 + 16 {
-            return Err(SecretError::Backend("sealed payload is malformed".into()));
-        }
-        let (nonce, ct) = sealed.split_at(12);
-        self.cipher()
-            .decrypt(Nonce::from_slice(nonce), Payload { msg: ct, aad })
-            .map_err(|_| SecretError::Backend("decryption failed".into()))
-    }
-
-    fn derive_key(&self, label: &str) -> [u8; 32] {
-        use hmac::{Hmac, Mac};
-        let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(&self.key)
-            .expect("HMAC accepts a key of any length");
-        mac.update(label.as_bytes());
-        mac.finalize().into_bytes().into()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -795,23 +716,5 @@ mod tests {
             .await
             .unwrap());
         assert!(!su.has_window("s", "amy", STEP_UP_WINDOW_MS).await.unwrap());
-    }
-
-    #[test]
-    fn the_test_sealer_is_a_real_aead() {
-        let s = InMemorySealer::new();
-        let sealed = s.seal(b"body", b"step-up-request:r1").unwrap();
-        assert_eq!(s.open(&sealed, b"step-up-request:r1").unwrap(), b"body");
-        assert!(s.open(&sealed, b"step-up-request:r2").is_err());
-        assert!(InMemorySealer::with_key([1; 32])
-            .open(&sealed, b"step-up-request:r1")
-            .is_err());
-        assert_ne!(
-            s.seal(b"body", b"a").unwrap(),
-            s.seal(b"body", b"a").unwrap(),
-            "fresh nonce per seal"
-        );
-        assert_eq!(s.derive_key("x"), s.derive_key("x"));
-        assert_ne!(s.derive_key("x"), s.derive_key("y"));
     }
 }
