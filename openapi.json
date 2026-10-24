@@ -103,7 +103,7 @@
         "operationId": "oauth_callback",
         "responses": {
           "302": {
-            "description": "session + CSRF cookies set; redirect to /"
+            "description": "session + CSRF cookies set; redirect to the login's `next`, else /"
           },
           "401": {
             "description": "state mismatch or bad code"
@@ -128,6 +128,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "next",
+            "in": "query",
+            "description": "a relative path to land on after the callback (ADR-0073); default `/`",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -135,7 +144,7 @@
             "description": "redirect to the provider with a state cookie"
           },
           "400": {
-            "description": "unknown provider, or several and none named"
+            "description": "unknown provider, several and none named, or a `next` that is not a relative path"
           },
           "404": {
             "description": "OAuth not configured"
@@ -777,6 +786,256 @@
           },
           "409": {
             "description": "not linked, or the only way to sign in"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/me/passkeys/registration": {
+      "post": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Finish enrolling a passkey (ADR-0073 §2)",
+        "operationId": "passkey_registration",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasskeyRegistrationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PasskeyDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "challenge unknown/used/expired, or the credential failed verification (`code` names the check)"
+          },
+          "404": {
+            "description": "step-up is off"
+          },
+          "409": {
+            "description": "this credential is already registered"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/me/passkeys/registration/options": {
+      "post": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Begin enrolling a passkey (ADR-0073 §2)",
+        "operationId": "passkey_registration_options",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasskeyRegistrationOptionsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "PublicKeyCredentialCreationOptionsJSON under `public_key`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebauthnChallengeDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`fresh_login_required` (a first passkey needs a browser login from the last 5 minutes), `step_up_required` (a later passkey is always-ask), or not a browser session"
+          },
+          "404": {
+            "description": "step-up is off"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/me/passkeys/{id}": {
+      "delete": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Remove a passkey (ADR-0073 §2; always-ask step-up)",
+        "operationId": "remove_passkey",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "passkey id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "removed"
+          },
+          "403": {
+            "description": "`step_up_required` (mode `action`)"
+          },
+          "404": {
+            "description": "no such passkey of yours, or step-up is off"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/me/security": {
+      "get": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "My passkeys and step-up state (ADR-0073)",
+        "operationId": "me_security",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MeSecurityResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "not signed in"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/me/step-up": {
+      "post": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Confirm a step-up with a passkey (ADR-0073 §4)",
+        "operationId": "step_up_confirm",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StepUpConfirmRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpConfirmResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "challenge unknown/used/expired/another session's, unknown credential, or the assertion failed verification (`code` names the check)"
+          },
+          "403": {
+            "description": "`clone_suspected`: the passkey's counter went backwards and it is now refused for good; or not a browser session"
+          },
+          "404": {
+            "description": "step-up is off"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/me/step-up/options": {
+      "post": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Begin a step-up: a challenge that opens a 5-minute window (ADR-0073 §4)",
+        "operationId": "step_up_options",
+        "responses": {
+          "200": {
+            "description": "PublicKeyCredentialRequestOptionsJSON under `public_key`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebauthnChallengeDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`no_passkey`: enroll one first"
+          },
+          "403": {
+            "description": "not a browser session"
+          },
+          "404": {
+            "description": "step-up is off"
           }
         },
         "security": [
@@ -7013,6 +7272,56 @@
           }
         }
       },
+      "MeSecurityResponse": {
+        "type": "object",
+        "description": "`GET /v1/me/security`.",
+        "required": [
+          "subject",
+          "step_up",
+          "has_passkey",
+          "passkeys",
+          "can_enroll_first"
+        ],
+        "properties": {
+          "can_enroll_first": {
+            "type": "boolean",
+            "description": "No usable passkey yet, and this browser session's login is fresh\nenough to enroll the first one."
+          },
+          "fresh_login_until": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Until when this session's login is fresh (a browser login only)."
+          },
+          "has_passkey": {
+            "type": "boolean",
+            "description": "Holds at least one usable (not clone-flagged) passkey."
+          },
+          "passkeys": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PasskeyDto"
+            }
+          },
+          "step_up": {
+            "type": "string",
+            "description": "`enforce` or `off`."
+          },
+          "subject": {
+            "type": "string"
+          },
+          "window_expires_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "This browser session's open window, if any (unix ms)."
+          }
+        }
+      },
       "MintTokenRequest": {
         "type": "object",
         "description": "`POST /v1/orgs/{org}/tokens` body. Every field is required on purpose: a\ncredential with no verb and no expiry is the shape this repo already learned\nnot to mint twice.",
@@ -7076,6 +7385,32 @@
           }
         }
       },
+      "OpSummary": {
+        "type": "object",
+        "description": "What a human is asked to confirm: the server-rendered, redacted\ndescription of one operation (shown in the 403, on the confirm page and\nin the event log).",
+        "required": [
+          "operation",
+          "target",
+          "changes"
+        ],
+        "properties": {
+          "changes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "What changes, one line each. Redacted fields read `(hidden)`."
+          },
+          "operation": {
+            "type": "string",
+            "description": "What is being done (\"Write a secret\")."
+          },
+          "target": {
+            "type": "string",
+            "description": "What it is done to (\"acme/web/prod/DB_PASSWORD\")."
+          }
+        }
+      },
       "OrgEnvironmentDto": {
         "type": "object",
         "description": "An org-level Environment in its minimal shape (ADR-0071, MMP step 1).",
@@ -7134,6 +7469,86 @@
           "updated_by": {
             "type": "string",
             "description": "Who last wrote it (a Principal subject)."
+          }
+        }
+      },
+      "PasskeyDto": {
+        "type": "object",
+        "description": "One of the caller's passkeys.",
+        "required": [
+          "id",
+          "label",
+          "created_at",
+          "backup_eligible",
+          "backup_state",
+          "clone_suspected",
+          "transports"
+        ],
+        "properties": {
+          "backup_eligible": {
+            "type": "boolean",
+            "description": "The credential may be synced to other devices (BE)."
+          },
+          "backup_state": {
+            "type": "boolean",
+            "description": "It is backed up / synced, as last seen (BS)."
+          },
+          "clone_suspected": {
+            "type": "boolean",
+            "description": "Its signature counter went backwards: it is never accepted again."
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "last_used_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "transports": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "PasskeyRegistrationOptionsRequest": {
+        "type": "object",
+        "description": "`POST /v1/me/passkeys/registration/options`.",
+        "properties": {
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A name for the passkey (\"MacBook Touch ID\"). Default `Passkey`."
+          }
+        }
+      },
+      "PasskeyRegistrationRequest": {
+        "type": "object",
+        "description": "`POST /v1/me/passkeys/registration`.",
+        "required": [
+          "challenge_id",
+          "credential"
+        ],
+        "properties": {
+          "challenge_id": {
+            "type": "string"
+          },
+          "credential": {
+            "type": "object",
+            "description": "`RegistrationResponseJSON` — `PublicKeyCredential.toJSON()`."
           }
         }
       },
@@ -8681,6 +9096,129 @@
           }
         }
       },
+      "StepUpConfirmRequest": {
+        "type": "object",
+        "description": "`POST /v1/me/step-up`.",
+        "required": [
+          "challenge_id",
+          "credential"
+        ],
+        "properties": {
+          "challenge_id": {
+            "type": "string"
+          },
+          "credential": {
+            "type": "object",
+            "description": "`AuthenticationResponseJSON` — `PublicKeyCredential.toJSON()`."
+          }
+        }
+      },
+      "StepUpConfirmResponse": {
+        "type": "object",
+        "description": "A StepUpConfirmation just made.",
+        "required": [
+          "confirmation_id",
+          "kind",
+          "confirmed_at",
+          "expires_at"
+        ],
+        "properties": {
+          "confirmation_id": {
+            "type": "string"
+          },
+          "confirmed_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "expires_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Fixed at `confirmed_at` + 5 minutes; never extended."
+          },
+          "kind": {
+            "type": "string",
+            "description": "`window` or `action`."
+          }
+        }
+      },
+      "StepUpRefusal": {
+        "type": "object",
+        "description": "The body of a `403 step_up_required` (ADR-0073 §5).",
+        "required": [
+          "code",
+          "message",
+          "mode",
+          "op",
+          "summary"
+        ],
+        "properties": {
+          "challenge": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/WebauthnChallengeDto",
+                "description": "A cookie session with a passkey: the ready challenge to answer at\n`POST /v1/me/step-up`, then retry the request."
+              }
+            ]
+          },
+          "code": {
+            "type": "string",
+            "description": "Always `step_up_required`."
+          },
+          "confirmation_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An API token or Bearer-session caller: the one-time link its human\nconfirms this exact operation at (ADR-0073 §6)."
+          },
+          "enroll_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Mode `enroll`: where to enroll a passkey."
+          },
+          "expires_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "fresh_login_until": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Mode `enroll`: until when this session's login is fresh enough to\nenroll a first passkey (absent = it is not; log in again)."
+          },
+          "message": {
+            "type": "string"
+          },
+          "mode": {
+            "type": "string",
+            "description": "`window` (a 5-minute window will do), `action` (confirm this exact\naction) or `enroll` (no passkey yet)."
+          },
+          "op": {
+            "type": "string",
+            "description": "The operation id (`secret.put`)."
+          },
+          "request_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "summary": {
+            "$ref": "#/components/schemas/OpSummary",
+            "description": "What is being confirmed, redacted."
+          }
+        }
+      },
       "UninstalledPluginDto": {
         "type": "object",
         "description": "What an uninstall removed.",
@@ -8733,6 +9271,30 @@
           },
           "vendor_grouping": {
             "type": "string"
+          }
+        }
+      },
+      "WebauthnChallengeDto": {
+        "type": "object",
+        "description": "A WebAuthn challenge ready for `navigator.credentials.*`.",
+        "required": [
+          "id",
+          "public_key",
+          "expires_at"
+        ],
+        "properties": {
+          "expires_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix ms after which the challenge is refused."
+          },
+          "id": {
+            "type": "string",
+            "description": "Pass back with the credential."
+          },
+          "public_key": {
+            "type": "object",
+            "description": "`PublicKeyCredentialRequestOptionsJSON` (or `…CreationOptionsJSON`\nfor enrollment) — feed it to `parse*OptionsFromJSON`."
           }
         }
       },
