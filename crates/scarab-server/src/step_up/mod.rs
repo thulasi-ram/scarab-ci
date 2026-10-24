@@ -422,7 +422,9 @@ pub async fn resolve_owner_entries(
             Some(principal) => {
                 out.principals.insert(principal);
             }
-            None if entry.contains('@') => out.email_matchers.push(entry.clone()),
+            None if crate::oauth::is_email_owner_entry(entry) => {
+                out.email_matchers.push(entry.clone())
+            }
             None => {
                 out.principals.insert(entry.clone());
             }

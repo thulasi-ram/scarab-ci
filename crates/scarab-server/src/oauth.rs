@@ -257,6 +257,24 @@ impl LoginFlow {
 }
 
 /// [`Authenticator`] over a configured OAuth/OIDC provider.
+/// One bootstrap owners entry read as an email matcher (the grammar
+/// [`OAuthAuthenticator`]'s owners matcher applies): `<provider>:<email>`
+/// matches `<email>` from `<provider>` only; a bare entry matches from any
+/// provider. Returns `(provider, address)`.
+pub(crate) fn owner_entry_email(entry: &str) -> (Option<&str>, &str) {
+    match entry.split_once(':') {
+        Some((provider, addr)) => (Some(provider), addr),
+        None => (None, entry),
+    }
+}
+
+/// Whether an owners entry can match by email at all — its address is
+/// email-shaped (`a@b`, `<provider>:a@b`). Such an entry that names no
+/// Principal is only ever a login-time matcher.
+pub(crate) fn is_email_owner_entry(entry: &str) -> bool {
+    owner_entry_email(entry).1.contains('@')
+}
+
 pub struct OAuthAuthenticator {
     cfg: OAuthConfig,
     http: reqwest::Client,
@@ -635,11 +653,10 @@ impl OAuthAuthenticator {
     fn is_owner(&self, subject: &str, verified_email: Option<&str>) -> bool {
         self.cfg.owners.iter().any(|o| {
             o == subject
-                || verified_email.is_some_and(|email| match o.split_once(':') {
-                    Some((provider, addr)) => {
-                        provider == self.cfg.provider_id && addr.eq_ignore_ascii_case(email)
-                    }
-                    None => o.eq_ignore_ascii_case(email),
+                || verified_email.is_some_and(|email| {
+                    let (provider, addr) = owner_entry_email(o);
+                    provider.is_none_or(|p| p == self.cfg.provider_id)
+                        && addr.eq_ignore_ascii_case(email)
                 })
         })
     }
