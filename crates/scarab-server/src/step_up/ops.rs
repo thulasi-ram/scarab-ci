@@ -262,7 +262,11 @@ fn leaf_lines(key: &str, v: &str, out: &mut Vec<String>) {
     if v.starts_with("http://") || v.starts_with("https://") {
         out.push(format!("{key} = {}", escape_invisible(v)));
         let (host, userinfo) = url_host(v);
-        let note = if userinfo { " (URL carries userinfo)" } else { "" };
+        let note = if userinfo {
+            " (URL carries userinfo)"
+        } else {
+            ""
+        };
         out.push(format!("{key} host = {}{note}", escape_invisible(host)));
     } else {
         out.push(format!("{key} = {}", long_value(v)));
@@ -280,9 +284,7 @@ pub(crate) fn url_host(url: &str) -> (&str, bool) {
         None => (authority, false),
     };
     let host = if host_port.starts_with('[') {
-        host_port
-            .find(']')
-            .map_or(host_port, |i| &host_port[..=i])
+        host_port.find(']').map_or(host_port, |i| &host_port[..=i])
     } else {
         host_port.split(':').next().unwrap_or_default()
     };
@@ -1045,7 +1047,9 @@ mod tests {
         let url = format!("https://{}attacker.net/", "a".repeat(300));
         let c = changes(json!({ "base_url": url }));
         assert!(c[0].contains("attacker.net"), "{c:?}");
-        assert!(c.iter().any(|l| l == &format!("base_url host = {}attacker.net", "a".repeat(300))));
+        assert!(c
+            .iter()
+            .any(|l| l == &format!("base_url host = {}attacker.net", "a".repeat(300))));
     }
 
     #[test]

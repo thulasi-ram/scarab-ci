@@ -378,7 +378,10 @@ async fn status(conn: Conn) -> i32 {
         Ok(v) => v,
         Err(code) => return code,
     };
-    println!("subject: {}", sanitize(me["subject"].as_str().unwrap_or("?")));
+    println!(
+        "subject: {}",
+        sanitize(me["subject"].as_str().unwrap_or("?"))
+    );
     if step_up_off(&me) {
         println!("step-up: off on this server (dev-insecure) — nothing is enforced");
         return 0;
