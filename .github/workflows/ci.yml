@@ -293,7 +293,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Full-route coverage is asserted by the test suite
-      # (every_registered_route_is_in_the_openapi_spec); this job gates DRIFT:
+      # (step_up_routes.rs::route_table_equals_the_openapi_spec); this job gates DRIFT:
       # the committed openapi.json must equal the generated one.
       - name: Regenerate the spec
         run: cargo run -p scarab-server -- --emit-openapi openapi.json
