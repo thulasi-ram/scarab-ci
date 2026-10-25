@@ -250,14 +250,27 @@ impl StepUpRefusalBucket {
     }
 }
 
+/// How far before a window's start a refusal may be stamped and still count
+/// in that window. A refusal's `at` is stamped before the limiter's lock
+/// (and, for a probe, before an earlier append is awaited), so concurrent
+/// refusals reach it slightly out of order; treating each such inversion as
+/// a clock step opened a fresh budget per inversion (redteam R2-U6). One
+/// second covers that reordering (lock wait plus a task's scheduling and
+/// one store append) with margin, while the auth-7 cost it brings back is
+/// bounded by it: a real clock step back of at most this much merely
+/// lengthens the current window by at most 1 s of its 60 s.
+const REFUSAL_CLOCK_SKEW_MS: i64 = 1000;
+
 /// Has the window that opened at `start` closed by `now`? Also when the
-/// wall clock stepped back past its start (an NTP step, a VM resume): the
-/// window is then over, not merely longer, else every refusal of a key
-/// that used its budget is suppressed until the clock catches up (redteam
-/// auth-7). The limiter keeps the event's clock rather than a monotonic
-/// one so its windows line up with the times the log records.
+/// wall clock stepped back past its start by more than
+/// [`REFUSAL_CLOCK_SKEW_MS`] (an NTP step, a VM resume): the window is then
+/// over, not merely longer, else every refusal of a key that used its
+/// budget is suppressed until the clock catches up (redteam auth-7). A
+/// smaller step back is reordering, not a clock step, and counts in the
+/// current window. The limiter keeps the event's clock rather than a
+/// monotonic one so its windows line up with the times the log records.
 fn window_closed(start: i64, now: i64) -> bool {
-    now < start || now - start >= REFUSAL_WINDOW_MS
+    start - now > REFUSAL_CLOCK_SKEW_MS || now - start >= REFUSAL_WINDOW_MS
 }
 
 fn insert_detail(event: &mut SecurityEvent, key: &str, n: u64) {
@@ -1212,6 +1225,23 @@ mod tests {
         // Ten minutes back: recorded, carrying the one suppressed.
         assert_eq!(admit_one(&l, r(t - 10 * 60 * 1000)), Some(1));
         assert_eq!(admit_one(&l, r(t - 10 * 60 * 1000)), Some(0));
+    }
+
+    /// Redteam R2-U6: a refusal stamped slightly before its window's start
+    /// (stamped before the lock, admitted out of order) counts in that
+    /// window; only a step back past the skew allowance opens a new one.
+    #[test]
+    fn reordering_within_the_skew_allowance_stays_in_the_window() {
+        let l = StepUpRefusalLimiter::default();
+        let r = |at| refusal("acme", "amy", "session:cookie", "secret.put", "no_window", at);
+        let t = 10 * REFUSAL_WINDOW_MS;
+        for _ in 0..REFUSALS_PER_WINDOW {
+            assert_eq!(admit_one(&l, r(t)), Some(0));
+        }
+        assert_eq!(admit_one(&l, r(t - 1)), None);
+        assert_eq!(admit_one(&l, r(t - REFUSAL_CLOCK_SKEW_MS)), None);
+        // Past the allowance it is a clock step: recorded, carrying both.
+        assert_eq!(admit_one(&l, r(t - REFUSAL_CLOCK_SKEW_MS - 1)), Some(2));
     }
 
     /// Review F9/S3: with every key live, a new key's refusal is recorded

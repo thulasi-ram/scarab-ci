@@ -1378,7 +1378,6 @@ async fn r2_a_token_reads_no_passkey_after_clone_evidence() {
 /// lock and admitted out of order (each 1 ms "earlier") each open a fresh
 /// budget. Ten refusals inside one second, each 1 ms back, are all written.
 #[tokio::test]
-#[ignore = "redteam: BROKE R2-U6 1 ms backward jitter re-opens the refusal budget every time"]
 async fn r2_ms_jitter_does_not_reopen_the_refusal_budget() {
     let h = harness();
     let (s, _soft) = amy_in_browser(&h).await;
