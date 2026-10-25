@@ -2036,6 +2036,34 @@ fn step_terminated_exit(pod: &Pod) -> Option<i32> {
 /// withhold `Succeeded` while the sidecar *proxy* says the settle is in flight,
 /// and this one refuses `Succeeded` outright when the sidecar is gone and the
 /// settle's *product* is not there.
+/// What `poll` does with a workspace Pod before it execs into the egress
+/// sidecar (red team R2-K1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceLeg {
+    /// Drive the settle (`KubeExecutor::drive_workspace`): the egress is
+    /// gone (a no-op) or may still answer an exec.
+    Drive,
+    /// Skip it: the egress still shows `running` past the
+    /// [`sidecar_reporting_ceiling_passed`] — a node that stopped reporting
+    /// (red team R3), where no exec into it (drain, harvest, release) can
+    /// land. A failed exec there is not weather to retry: returned as
+    /// Transient on every poll, it errored the launch intent to its poison
+    /// ceiling and dead-lettered the Run, and kept [`settled_state`]'s own
+    /// ceiling verdict — snapshot lost (auto-retried infra) without a root,
+    /// the step's exit 0 with one — unreachable.
+    PastCeiling,
+}
+
+fn workspace_leg(pod: &Pod, now_secs: i64) -> WorkspaceLeg {
+    if init_container_running(pod, WORKSPACE_EGRESS_CONTAINER)
+        && sidecar_reporting_ceiling_passed(pod, now_secs)
+    {
+        WorkspaceLeg::PastCeiling
+    } else {
+        WorkspaceLeg::Drive
+    }
+}
+
 fn settled_state(pod: &Pod, harvesting: bool, now_secs: i64) -> ExecState {
     // The results-egress drain is owed on a workspace Pod too (ADR-0042):
     // see `results_settled_state`.
@@ -2600,6 +2628,20 @@ impl Executor for K8sExecutor {
                 // idempotent and derive ALL state from the Pod itself, so an
                 // adopted Pod after a control-plane restart resumes cleanly.
                 if self.workspace_cas.is_some() {
+                    // Decided BEFORE any exec into the egress (red team
+                    // R2-K1): past the sidecar reporting ceiling an egress
+                    // still showing `running` is a lost node, so every exec
+                    // into it fails, and `drive_workspace`'s Transient
+                    // return kept `settled_state`'s ceiling verdict
+                    // unreachable — a root-present Pod errored on every poll
+                    // until its Run dead-lettered. Skip straight to it.
+                    if workspace_leg(&pod, unix_now_secs()) == WorkspaceLeg::PastCeiling {
+                        return Ok(settled_state(
+                            &pod,
+                            self.artifact_store.is_some(),
+                            unix_now_secs(),
+                        ));
+                    }
                     match self.drive_workspace(&pods, &pod).await {
                         Ok(()) => {}
                         // Permanent and author-fixable (ADR-0007): the step ran and
@@ -7826,6 +7868,67 @@ mod tests {
             settled_state(&bare, true, finished + bound),
             ExecState::Failed { .. }
         ));
+    }
+
+    /// Red team R2-K1: on a lost node `poll` must reach the ceiling verdict
+    /// WITHOUT an exec into the frozen egress (which can only fail). Inside
+    /// the ceiling, on a gone egress, or on a broken clock it drives the
+    /// settle as before; past it, it settles on `settled_state` alone — and
+    /// that verdict is final for both a root-less and a root-present Pod.
+    #[test]
+    fn a_frozen_egress_past_the_ceiling_is_settled_without_an_exec() {
+        let finished = NOW - 10_000;
+        let grace = 600;
+        let bound = grace + RESULTS_DRAIN_SLACK_SECS;
+        let frozen = |snapshotted: bool| {
+            let mut pod = step_finished_at(
+                settling_pod_with("Running", 0, true, true, snapshotted),
+                finished,
+            );
+            pod.spec.as_mut().unwrap().termination_grace_period_seconds = Some(grace);
+            pod
+        };
+        for snapshotted in [false, true] {
+            let pod = frozen(snapshotted);
+            assert_eq!(
+                workspace_leg(&pod, finished + bound - 1),
+                WorkspaceLeg::Drive,
+                "inside the ceiling the egress may still answer (root: {snapshotted})"
+            );
+            assert_eq!(
+                workspace_leg(&pod, i64::MIN),
+                WorkspaceLeg::Drive,
+                "a broken clock never reaches the ceiling"
+            );
+            assert_eq!(
+                workspace_leg(&pod, finished + bound),
+                WorkspaceLeg::PastCeiling,
+                "past the ceiling no exec into the frozen egress can land \
+                 (root: {snapshotted})"
+            );
+        }
+        // What poll then reports — never an error: the root-present Pod's
+        // exit 0 stands, the root-less one is the retried lost snapshot.
+        assert_eq!(
+            settled_state(&frozen(true), true, finished + bound),
+            ExecState::Succeeded
+        );
+        assert!(matches!(
+            settled_state(&frozen(false), true, finished + bound),
+            ExecState::Failed {
+                class: FailureClass::Infra {
+                    never_started: false
+                },
+                ..
+            }
+        ));
+        // An egress seen to terminate is driven (a no-op exec-wise), however
+        // late.
+        let gone = step_finished_at(
+            settling_pod_with("Running", 0, false, true, true),
+            finished,
+        );
+        assert_eq!(workspace_leg(&gone, finished + bound), WorkspaceLeg::Drive);
     }
 
     // ------------------------------------------------------------------
