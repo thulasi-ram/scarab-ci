@@ -98,34 +98,51 @@ pub struct StepUpService {
 
 /// How long one refusal-coalescing window lasts.
 pub const REFUSAL_WINDOW_MS: i64 = 60 * 1000;
-/// How many `step_up.refused` events one (org, subject, caller, operation,
-/// reason) records per window. The rest are counted, not written; the next one recorded
+/// How many `step_up.refused` events one refusal key ([`refusal_key`])
+/// records per window. The rest are counted, not written; the next one recorded
 /// carries the count (`detail.suppressed_before`).
 pub const REFUSALS_PER_WINDOW: u32 = 5;
-/// The most (org, subject, caller, operation, reason) keys coalesced at once.
+/// The most refusal keys ([`refusal_key`]) coalesced at once.
 /// Past it (after dropping every closed window) a new key's refusals are
 /// recorded uncoalesced — never dropped.
 const MAX_REFUSAL_KEYS: usize = 10_000;
 
 /// What one refusal is coalesced by: (org, subject, caller, operation,
-/// `detail.reason`). The Org is in it so one Org's refusals never suppress —
-/// or carry the count of — another's. The target is not: it is free text
-/// the caller picks (a secret's name), so keying on it would let one caller
-/// write unbounded refusals by varying it.
-type StepUpRefusalKey = [String; 5];
+/// `detail.reason`, `detail.probed_by`). The Org is in it so one Org's
+/// refusals never suppress — or carry the count of — another's. The target
+/// is not: it is free text the caller picks (a secret's name), so keying on
+/// it would let one caller write unbounded refusals by varying it.
+///
+/// `detail.probed_by` (empty for every other refusal) is the principal who
+/// probed a request that is not theirs: that row is the request OWNER's
+/// event (its subject is the owner, its caller label `session:cookie` for
+/// every human), so without the prober in the key a decoy prober could burn
+/// the owner's window and the newest-row-per-target flush would write only
+/// the decoy, laundering the real prober out of the owner's and the Org's
+/// log (redteam R2-U4). Keying on it rather than adding it to the
+/// distinct-target list: that list is capped at five entries, so five decoy
+/// accounts would still hide a sixth; a key of its own is touched only by
+/// that prober. It does not lift the bound: the prober is an authenticated
+/// principal, never caller-chosen text, and each prober's own refusal row
+/// is already a key of its own, so this at most doubles a prober's rows.
+type StepUpRefusalKey = [String; 6];
 
 fn refusal_key(event: &SecurityEvent) -> StepUpRefusalKey {
-    let reason = event
-        .detail
-        .get("reason")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
+    let detail = |k: &str| {
+        event
+            .detail
+            .get(k)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
     [
         event.org.clone().unwrap_or_default(),
         event.subject.clone(),
         event.caller.clone(),
         event.op.clone().unwrap_or_default(),
-        reason.to_string(),
+        detail("reason"),
+        detail("probed_by"),
     ]
 }
 
@@ -416,7 +433,8 @@ impl StepUpService {
     }
 
     /// Append a `step_up.refused` event, best-effort and rate-limited per
-    /// (org, subject, caller, operation, `detail.reason`) — so one caller
+    /// refusal key ([`refusal_key`]: org, subject, caller, operation,
+    /// `detail.reason`, `detail.probed_by`) — so one caller
     /// hammering one refusal cannot grow the append-only log, while every
     /// distinct refusal is still on it: at most [`REFUSALS_PER_WINDOW`]
     /// per [`REFUSAL_WINDOW_MS`]; the next one recorded after a suppression

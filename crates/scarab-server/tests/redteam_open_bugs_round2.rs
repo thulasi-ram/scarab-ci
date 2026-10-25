@@ -1284,7 +1284,6 @@ async fn r2_probe_evidence_reaches_the_owner_and_is_no_oracle_for_the_prober() {
 /// suppressed row — dave's. carl's probe of amy's request never reaches amy
 /// or acme.
 #[tokio::test]
-#[ignore = "redteam: BROKE R2-U4 a decoy prober launders the real prober out of the owner's log"]
 async fn r2_a_decoy_prober_cannot_launder_the_real_prober() {
     let h = harness();
     let (amy, _) = amy_in_browser(&h).await;
