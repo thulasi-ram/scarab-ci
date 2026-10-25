@@ -697,11 +697,18 @@ async fn transitions_are_guarded_by_frontier_and_generation(db: &dyn Db) {
     );
 
     // Run grain: the generation the caller read.
-    let run_to = |from, to, generation| db.commit_run_transition(&run, from, to, generation, &[], &[]);
-    run_to(RunStatus::Pending, RunStatus::Running, 0).await.unwrap();
-    run_to(RunStatus::Running, RunStatus::Cancelled, 0).await.unwrap();
+    let run_to =
+        |from, to, generation| db.commit_run_transition(&run, from, to, generation, &[], &[]);
+    run_to(RunStatus::Pending, RunStatus::Running, 0)
+        .await
+        .unwrap();
+    run_to(RunStatus::Running, RunStatus::Cancelled, 0)
+        .await
+        .unwrap();
     // The reopen bumps the generation…
-    run_to(RunStatus::Cancelled, RunStatus::Running, 0).await.unwrap();
+    run_to(RunStatus::Cancelled, RunStatus::Running, 0)
+        .await
+        .unwrap();
     assert_eq!(db.run_reopen_generation(&run).await.unwrap(), 1);
     // …so a writer that read generation 0 conflicts, though the status
     // matches again (ABA), and nothing changes.
@@ -710,7 +717,9 @@ async fn transitions_are_guarded_by_frontier_and_generation(db: &dyn Db) {
         Err(DbError::Conflict)
     ));
     assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Running));
-    run_to(RunStatus::Running, RunStatus::Cancelled, 1).await.unwrap();
+    run_to(RunStatus::Running, RunStatus::Cancelled, 1)
+        .await
+        .unwrap();
 }
 
 contract_test!(
@@ -732,7 +741,10 @@ async fn outbox_key_pending_is_neither_dispatched_nor_dead(db: &dyn Db) {
         db.enqueue_outbox(&msg(&run, "kind-p", key)).await.unwrap();
         assert!(db.outbox_key_pending(key).await.unwrap(), "{key}");
     }
-    let claimed = db.claim_outbox("o", Some("kind-p"), 10, 60_000).await.unwrap();
+    let claimed = db
+        .claim_outbox("o", Some("kind-p"), 10, 60_000)
+        .await
+        .unwrap();
     assert_eq!(claimed.len(), 2);
     assert!(
         db.outbox_key_pending("k-done").await.unwrap(),

@@ -191,9 +191,7 @@ async fn an_auto_cancel_tears_the_holder_down_until_it_is_gone() {
         .await
         .unwrap()
         .into_iter()
-        .filter(|k| {
-            k == scarab_engine::CANCEL_ATTEMPT || k == scarab_engine::SUPERSEDE_TEARDOWN
-        })
+        .filter(|k| k == scarab_engine::CANCEL_ATTEMPT || k == scarab_engine::SUPERSEDE_TEARDOWN)
         .collect();
     assert_eq!(
         teardowns,

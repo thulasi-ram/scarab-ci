@@ -657,7 +657,10 @@ async fn a_stale_generation_read_cannot_orphan_the_reruns_attempt(w: World) {
 }
 // Fixed round 3: the cancel's CAS names the attempt it read
 // (`AttemptFrontier`), so the ABA conflicts, re-reads, and cancels a2.
-both!(a_stale_generation_read_cannot_orphan_the_reruns_attempt, None);
+both!(
+    a_stale_generation_read_cannot_orphan_the_reruns_attempt,
+    None
+);
 
 // ---------------------------------------------------------------------------
 // R2-E4 — cancel → rerun → cancel, three times. Each cancel must write its

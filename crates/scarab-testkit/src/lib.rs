@@ -2257,9 +2257,10 @@ impl Db for InMemoryDb {
 
     async fn outbox_key_pending(&self, idempotency_key: &str) -> Result<bool, DbError> {
         let st = self.state.lock().unwrap();
-        Ok(st.outbox.iter().any(|e| {
-            e.msg.idempotency_key == idempotency_key && !e.dispatched && !e.dead_lettered
-        }))
+        Ok(st
+            .outbox
+            .iter()
+            .any(|e| e.msg.idempotency_key == idempotency_key && !e.dispatched && !e.dead_lettered))
     }
 
     async fn record_outbox_failure(&self, id: OutboxId) -> Result<u32, DbError> {

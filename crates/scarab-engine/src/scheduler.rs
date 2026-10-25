@@ -47,10 +47,9 @@ const TIMEOUT_BACKSTOP_GRACE_MS: i64 = 60_000;
 use crate::{
     ports::{DeploymentGateWait, DeploymentGates, WorkspaceSnapshots},
     Attempt, AttemptFrontier, AttemptId, AttemptOutcome, AttemptStamp, Clock, ConcurrencyPolicy,
-    Db, DbError,
-    EventKind, EventPayload, ExecError, Executor, FailureKind, GateResolution, OutboxMessage,
-    RunId, RunStatus, StepId, StepRun, StepSpec, StepStatus, Timestamp, TransitionError,
-    EVENT_VERSION,
+    Db, DbError, EventKind, EventPayload, ExecError, Executor, FailureKind, GateResolution,
+    OutboxMessage, RunId, RunStatus, StepId, StepRun, StepSpec, StepStatus, Timestamp,
+    TransitionError, EVENT_VERSION,
 };
 
 /// Outbox `kind` for "launch this step".
@@ -2802,7 +2801,8 @@ impl<'a> Scheduler<'a> {
                         else {
                             continue;
                         };
-                        if let Some(h) = self.db.attempt_handle(&msg.run, &step.step, &a.id).await? {
+                        if let Some(h) = self.db.attempt_handle(&msg.run, &step.step, &a.id).await?
+                        {
                             let h = ExecHandle(h);
                             let gone = self.cancel_until_gone(&h).await;
                             outcome.absorb(gone, &h);
@@ -3107,18 +3107,13 @@ impl<'a> Scheduler<'a> {
         step: &StepId,
         attempt: &AttemptId,
     ) -> Result<(), SchedulerError> {
-        let owed = self
-            .db
-            .attempts_of_step(run, step)
-            .await?
-            .iter()
-            .any(|a| {
-                &a.id == attempt
-                    && matches!(
-                        a.outcome,
-                        AttemptOutcome::Cancelled | AttemptOutcome::Superseded
-                    )
-            });
+        let owed = self.db.attempts_of_step(run, step).await?.iter().any(|a| {
+            &a.id == attempt
+                && matches!(
+                    a.outcome,
+                    AttemptOutcome::Cancelled | AttemptOutcome::Superseded
+                )
+        });
         if owed {
             return Ok(());
         }
@@ -5322,7 +5317,16 @@ impl<'a> Scheduler<'a> {
             .collect();
         match self
             .db
-            .commit_step_transition(run, step, from, to, AttemptFrontier::Any, None, &events, &[])
+            .commit_step_transition(
+                run,
+                step,
+                from,
+                to,
+                AttemptFrontier::Any,
+                None,
+                &events,
+                &[],
+            )
             .await
         {
             Ok(()) => Ok(()),
