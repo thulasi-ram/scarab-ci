@@ -775,10 +775,11 @@ async fn a_redelivered_stale_post_does_not_end_the_forge_on_the_old_verdict(w: W
     );
     w.finish().await;
 }
+// Fixed round 3: posts carry their generation; the drainer retires a stale
+// one unposted.
 both!(
     a_redelivered_stale_post_does_not_end_the_forge_on_the_old_verdict,
-    None,
-    ignore = "redteam: BROKE R2-E5 a redelivered gen-0 Failed post lands after gen-1 Succeeded"
+    None
 );
 
 // ---------------------------------------------------------------------------

@@ -5715,6 +5715,18 @@ pub async fn drain_forge_statuses(
             db.mark_dispatched(msg.id).await?; // malformed payload → drop, don't loop
             continue;
         };
+        // A superseded post is retired unposted (red team R2-E5): delivery
+        // is at-least-once, so a post that failed and is redelivered after
+        // its lease can land AFTER a newer verdict and leave the forge on the
+        // old one — a green rerun's required check stuck red. A post with no
+        // generation (written before it was carried) cannot be ordered, and
+        // is posted as before.
+        if let Some(generation) = msg.payload.get("generation").and_then(|g| g.as_u64()) {
+            if status_post_superseded(db, &msg.run, generation, to).await? {
+                db.mark_dispatched(msg.id).await?;
+                continue;
+            }
+        }
         let status = scarab_forge::Status {
             context: "scarab".into(),
             state: run_status_to_forge(to),
@@ -5765,6 +5777,40 @@ pub async fn drain_forge_statuses(
         }
     }
     Ok(posted)
+}
+
+/// Whether a `to` post of `run` from reopen generation `generation` is
+/// superseded by a newer verdict the forge already has (red team R2-E5):
+///
+/// - it is from an older generation than the run's current one — the run
+///   was reopened since, and the newer generation's posts own the forge; or
+/// - it is a non-terminal post of the current generation, the run has
+///   settled in it, and that settle's terminal post is no longer pending
+///   (delivered, or dead-lettered): a run goes non-terminal → terminal once
+///   per generation, so the terminal post is the newer word. While the
+///   terminal post is still pending the non-terminal one is posted first —
+///   the ordinary in-order drain.
+async fn status_post_superseded(
+    db: &dyn Db,
+    run: &RunId,
+    generation: u64,
+    to: RunStatus,
+) -> Result<bool, DbError> {
+    let current = db.run_reopen_generation(run).await?;
+    if generation < current {
+        return Ok(true);
+    }
+    if to.is_terminal() || generation != current {
+        return Ok(false);
+    }
+    match db.run_status(run).await? {
+        Some(settled) if settled.is_terminal() => Ok(!db
+            .outbox_key_pending(&scarab_engine::run_status_post_key(
+                run, generation, settled,
+            ))
+            .await?),
+        _ => Ok(false),
+    }
 }
 
 /// Map a run's lifecycle status to a forge commit-status state (ADR-0010).
