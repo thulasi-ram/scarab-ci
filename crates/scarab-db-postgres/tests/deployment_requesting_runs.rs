@@ -357,7 +357,7 @@ async fn teardown_of(db: &dyn Db, run: &str, kind: &str) -> scarab_engine::Outbo
 /// dead-lettered (abandoned, with a diagnostic). A cancel that caught the
 /// Step before anything launched holds nothing.
 async fn a_requester_counts_until_its_teardown_is_retired(db: &dyn Db) {
-    use scarab_engine::{cancel_run_request, rerun_step, CANCEL_RUN, SUPERSEDE_TEARDOWN};
+    use scarab_engine::{cancel_run_request, rerun_step, CANCEL_ATTEMPT, SUPERSEDE_TEARDOWN};
     let clock = scarab_testkit::FakeClock::new(10);
     let web = || count(db, "prod", "web", "nobody");
 
@@ -399,10 +399,10 @@ async fn a_requester_counts_until_its_teardown_is_retired(db: &dyn Db) {
          the unlaunched one never had a unit"
     );
 
-    let cancel = teardown_of(db, "t-cancel", CANCEL_RUN).await;
+    let cancel = teardown_of(db, "t-cancel", CANCEL_ATTEMPT).await;
     db.mark_dispatched(cancel).await.unwrap();
     assert_eq!(web().await, 2, "t-cancel's unit is gone");
-    let abandoned = teardown_of(db, "t-abandoned", CANCEL_RUN).await;
+    let abandoned = teardown_of(db, "t-abandoned", CANCEL_ATTEMPT).await;
     db.dead_letter_outbox(abandoned).await.unwrap();
     assert_eq!(web().await, 1, "an abandoned teardown holds no longer");
     let rerun = teardown_of(db, "t-rerun", SUPERSEDE_TEARDOWN).await;
@@ -558,7 +558,7 @@ async fn inmemory_an_unreached_gate_stops_counting_at_the_cutoff() {
 
 /// A cancel that dies part-way still holds the target, and still tears the
 /// unit down (review correctness MED1). The cancel used to enqueue its
-/// `cancel_run` teardown intent LAST — after the deploy Step went
+/// teardown intent LAST — after the deploy Step went
 /// `Cancelled` and the Run transitioned. In between, the Step no longer
 /// counted as in flight and no intent counted for it either, so a held Run
 /// was promoted while the holder's Pod still ran; and a crash there lost the
@@ -566,7 +566,7 @@ async fn inmemory_an_unreached_gate_stops_counting_at_the_cutoff() {
 /// nothing): no teardown, and no hold. The crash is constructed by refusing
 /// the Run's `RunTransitioned` journal write — the last write of the cancel.
 async fn a_cancel_that_dies_part_way_still_holds(db: &dyn Db, arm: impl FnOnce()) {
-    use scarab_engine::{cancel_run_request, CANCEL_RUN};
+    use scarab_engine::{cancel_run_request, CANCEL_ATTEMPT};
     let clock = scarab_testkit::FakeClock::new(10);
     let web = || count(db, "prod", "web", "nobody");
     let run = RunId("t-crash".into());
@@ -583,7 +583,7 @@ async fn a_cancel_that_dies_part_way_still_holds(db: &dyn Db, arm: impl FnOnce()
         1,
         "the holder's unit may still be running: it holds until its teardown is retired"
     );
-    let cancel = teardown_of(db, "t-crash", CANCEL_RUN).await;
+    let cancel = teardown_of(db, "t-crash", CANCEL_ATTEMPT).await;
     db.mark_dispatched(cancel).await.unwrap();
     assert_eq!(web().await, 0, "its unit is gone");
 }

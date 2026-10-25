@@ -623,3 +623,133 @@ async fn steps_of_runs_is_steps_of_run_per_run(db: &dyn Db) {
 }
 
 contract_test!(steps_of_runs_batched, steps_of_runs_is_steps_of_run_per_run);
+
+// ---------------------------------------------------------------------------
+// Red team R2-E3: a transition that acts on a step's in-flight attempt names
+// it (`AttemptFrontier`), and a run transition names the reopen generation
+// its caller read — so a step or run that went round (cancelled, rerun,
+// back in the same status) between the read and the commit is a Conflict
+// with nothing written, never an ABA hit on the stale attempt/generation.
+// ---------------------------------------------------------------------------
+
+async fn transitions_are_guarded_by_frontier_and_generation(db: &dyn Db) {
+    use scarab_engine::{AttemptFrontier, AttemptStamp};
+    let run = RunId("aba-run".into());
+    let step = StepId("s".into());
+    seed_run_and_step(db, &run, &step).await;
+    db.record_step_transition(&run, &step, StepStatus::Pending, StepStatus::Running)
+        .await
+        .unwrap();
+    let (a1, a2, a10) = (
+        AttemptId("a1".into()),
+        AttemptId("a2".into()),
+        AttemptId("a10".into()),
+    );
+    db.record_attempt(&run, &step, &attempt("a1", 1))
+        .await
+        .unwrap();
+    let cancelled = AttemptStamp::Outcome(AttemptOutcome::Cancelled);
+    let to_cancelled = |frontier, stamp| {
+        db.commit_step_transition(
+            &run,
+            &step,
+            StepStatus::Running,
+            StepStatus::Cancelled,
+            frontier,
+            stamp,
+            &[],
+            &[],
+        )
+    };
+    // A frontier that names no attempt, or the wrong one, conflicts.
+    assert!(matches!(
+        to_cancelled(AttemptFrontier::Is(None), None).await,
+        Err(DbError::Conflict)
+    ));
+    // a2 minted after the read of a1: the read's frontier is stale.
+    db.record_attempt(&run, &step, &attempt("a2", 2))
+        .await
+        .unwrap();
+    assert!(matches!(
+        to_cancelled(AttemptFrontier::Is(Some(&a1)), Some((&a1, &cancelled))).await,
+        Err(DbError::Conflict)
+    ));
+    // Nothing of the loser landed: still Running, a1 unstamped.
+    let s = &db.steps_of_run(&run).await.unwrap()[0];
+    assert_eq!(s.status, StepStatus::Running);
+    assert_eq!(s.attempts[0].outcome, AttemptOutcome::Running);
+    // Latest by mint ORDER, numerically: a10 outranks a2.
+    db.record_attempt(&run, &step, &attempt("a10", 3))
+        .await
+        .unwrap();
+    assert!(matches!(
+        to_cancelled(AttemptFrontier::Is(Some(&a2)), None).await,
+        Err(DbError::Conflict)
+    ));
+    to_cancelled(AttemptFrontier::Is(Some(&a10)), Some((&a10, &cancelled)))
+        .await
+        .unwrap();
+    let s = &db.steps_of_run(&run).await.unwrap()[0];
+    assert_eq!(s.status, StepStatus::Cancelled);
+    assert_eq!(
+        s.attempts.last().map(|a| (&a.id, a.outcome)),
+        Some((&a10, AttemptOutcome::Cancelled))
+    );
+
+    // Run grain: the generation the caller read.
+    let run_to = |from, to, generation| db.commit_run_transition(&run, from, to, generation, &[], &[]);
+    run_to(RunStatus::Pending, RunStatus::Running, 0).await.unwrap();
+    run_to(RunStatus::Running, RunStatus::Cancelled, 0).await.unwrap();
+    // The reopen bumps the generation…
+    run_to(RunStatus::Cancelled, RunStatus::Running, 0).await.unwrap();
+    assert_eq!(db.run_reopen_generation(&run).await.unwrap(), 1);
+    // …so a writer that read generation 0 conflicts, though the status
+    // matches again (ABA), and nothing changes.
+    assert!(matches!(
+        run_to(RunStatus::Running, RunStatus::Cancelled, 0).await,
+        Err(DbError::Conflict)
+    ));
+    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Running));
+    run_to(RunStatus::Running, RunStatus::Cancelled, 1).await.unwrap();
+}
+
+contract_test!(
+    transitions_guarded_by_frontier_and_generation,
+    transitions_are_guarded_by_frontier_and_generation
+);
+
+// ---------------------------------------------------------------------------
+// `outbox_key_pending`: an intent exists and is neither dispatched nor
+// dead-lettered — what an attempt teardown asks of a `launch:` intent before
+// it calls an attempt with no handle gone.
+// ---------------------------------------------------------------------------
+
+async fn outbox_key_pending_is_neither_dispatched_nor_dead(db: &dyn Db) {
+    let run = RunId("pending-run".into());
+    db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+    assert!(!db.outbox_key_pending("k-absent").await.unwrap());
+    for key in ["k-done", "k-dead"] {
+        db.enqueue_outbox(&msg(&run, "kind-p", key)).await.unwrap();
+        assert!(db.outbox_key_pending(key).await.unwrap(), "{key}");
+    }
+    let claimed = db.claim_outbox("o", Some("kind-p"), 10, 60_000).await.unwrap();
+    assert_eq!(claimed.len(), 2);
+    assert!(
+        db.outbox_key_pending("k-done").await.unwrap(),
+        "claimed is still pending"
+    );
+    for m in claimed {
+        if m.idempotency_key == "k-done" {
+            db.mark_dispatched(m.id).await.unwrap();
+        } else {
+            db.dead_letter_outbox(m.id).await.unwrap();
+        }
+    }
+    assert!(!db.outbox_key_pending("k-done").await.unwrap());
+    assert!(!db.outbox_key_pending("k-dead").await.unwrap());
+}
+
+contract_test!(
+    outbox_key_pending_contract,
+    outbox_key_pending_is_neither_dispatched_nor_dead
+);

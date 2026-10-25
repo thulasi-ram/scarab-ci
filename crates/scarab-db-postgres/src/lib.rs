@@ -1595,6 +1595,7 @@ impl Db for PostgresDb {
         step: &StepId,
         from: StepStatus,
         to: StepStatus,
+        frontier: scarab_engine::AttemptFrontier<'_>,
         stamp: Option<(&AttemptId, &scarab_engine::AttemptStamp)>,
         events: &[EventKind],
         outbox: &[OutboxMessage],
@@ -1607,6 +1608,28 @@ impl Db for PostgresDb {
         if !cas_step_status(&mut *tx, run, step, from, to).await? {
             tx.rollback().await.map_err(db_err)?;
             return Err(DbError::Conflict);
+        }
+        // The frontier (red team R2-E3), read only now that the CAS holds
+        // the step row: `record_attempt` holds it `FOR SHARE` while it mints,
+        // so an attempt minted concurrently is either visible to this
+        // statement (READ COMMITTED: a fresh snapshot) or minted after this
+        // commit, under the status it writes.
+        if let scarab_engine::AttemptFrontier::Is(expected) = frontier {
+            let latest: Option<String> = sqlx::query_scalar(
+                "SELECT attempt_id FROM attempts
+                 WHERE run_id = $1 AND step_id = $2
+                 ORDER BY CAST(substring(attempt_id FROM 2) AS INTEGER) DESC
+                 LIMIT 1",
+            )
+            .bind(&run.0)
+            .bind(&step.0)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            if latest.as_deref() != expected.map(|a| a.0.as_str()) {
+                tx.rollback().await.map_err(db_err)?;
+                return Err(DbError::Conflict);
+            }
         }
         match stamp {
             Some((attempt, scarab_engine::AttemptStamp::Outcome(outcome))) => {
@@ -1644,6 +1667,17 @@ impl Db for PostgresDb {
         // authoritative evidence and nothing in this INSERT legitimately
         // refreshes (the launch handle is a separate column, written by
         // `set_attempt_handle`), so keep the existing row untouched.
+        //
+        // The mint holds the step row `FOR SHARE` (see the port): a step
+        // transition's frontier check either sees this attempt or commits
+        // first, so the attempt is minted under the status it wrote.
+        let mut tx = self.pool().begin().await.map_err(db_err)?;
+        sqlx::query("SELECT 1 FROM step_runs WHERE run_id = $1 AND step_id = $2 FOR SHARE")
+            .bind(&run.0)
+            .bind(&step.0)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
         sqlx::query(
             "INSERT INTO attempts
                  (run_id, step_id, attempt_id, started_at, failure, failure_detail, outcome)
@@ -1657,10 +1691,10 @@ impl Db for PostgresDb {
         .bind(attempt.failure.map(failure_str))
         .bind(attempt.failure_detail.as_deref())
         .bind(attempt.outcome.as_str())
-        .execute(self.pool())
+        .execute(&mut *tx)
         .await
         .map_err(db_err)?;
-        Ok(())
+        tx.commit().await.map_err(db_err)
     }
 
     async fn attempts_of_step(&self, run: &RunId, step: &StepId) -> Result<Vec<Attempt>, DbError> {
@@ -1821,15 +1855,13 @@ impl Db for PostgresDb {
         // else the Run's creation, is after the cutoff — see the port. Uses
         // run_deployment_requests_target_idx.
         //
-        // OR — whatever the Run's status — a teardown of the requesting
-        // Step's unit is still pending (git-bug f22056d): a `cancel_run`
-        // intent for the Run while the requesting Step's latest Attempt was
-        // launched — whatever the Step's status (red team A5: a Step claimed
-        // mid-cancel, or launched after it, is not `cancelled` yet its unit
-        // is alive and the intent will tear it down) — or a
-        // `supersede_teardown` naming the Step. Pending = neither dispatched
-        // (the unit is gone) nor dead-lettered (abandoned, with a
-        // diagnostic).
+        // OR — whatever the Run's or the Step's status — an attempt-scoped
+        // teardown of one of the requesting Step's OWN attempts is still
+        // pending (git-bug f22056d, red team R2-E1/E2b/E7): a
+        // `cancel_attempt` or `supersede_teardown` whose payload names the
+        // Step. Never the Run-level `cancel_run` (shared services only).
+        // Pending = neither dispatched (the unit is gone) nor dead-lettered
+        // (abandoned, with a diagnostic).
         let n: i64 = sqlx::query_scalar(
             "SELECT COUNT(DISTINCT r.run_id)
              FROM run_deployment_requests r
@@ -1859,14 +1891,9 @@ impl Db for PostgresDb {
                         SELECT 1 FROM outbox o
                         WHERE o.run_id = r.run_id
                           AND o.dispatched_at IS NULL AND o.dead_lettered_at IS NULL
-                          AND ((o.kind = $7
-                                AND (SELECT a.handle FROM attempts a
-                                     WHERE a.run_id = r.run_id AND a.step_id = r.step_id
-                                     ORDER BY CAST(substring(a.attempt_id FROM 2) AS INTEGER) DESC
-                                     LIMIT 1) IS NOT NULL)
-                               OR (o.kind = $8
-                                   AND o.payload -> 'attempts'
-                                       @> jsonb_build_array(jsonb_build_object('step', r.step_id))))))",
+                          AND o.kind IN ($7, $8)
+                          AND o.payload -> 'attempts'
+                              @> jsonb_build_array(jsonb_build_object('step', r.step_id))))",
         )
         .bind(org)
         .bind(environment)
@@ -1874,7 +1901,7 @@ impl Db for PostgresDb {
         .bind(id)
         .bind(&excluding.0)
         .bind(unreached_gate_cutoff.0)
-        .bind(scarab_engine::CANCEL_RUN)
+        .bind(scarab_engine::CANCEL_ATTEMPT)
         .bind(scarab_engine::SUPERSEDE_TEARDOWN)
         .fetch_one(self.pool())
         .await
@@ -2050,7 +2077,7 @@ impl Db for PostgresDb {
         // `from`. Zero rows affected means a concurrent/duplicate writer already
         // moved it (e.g. a crashed worker re-driving) → Conflict, not a second
         // advance. This is the state-table guard behind exactly-once admission.
-        if !cas_run_status(self.pool(), run, from, to).await? {
+        if !cas_run_status(self.pool(), run, from, to, None).await? {
             return Err(DbError::Conflict);
         }
         Ok(())
@@ -2061,6 +2088,7 @@ impl Db for PostgresDb {
         run: &RunId,
         from: RunStatus,
         to: RunStatus,
+        generation: u64,
         events: &[EventKind],
         outbox: &[OutboxMessage],
     ) -> Result<(), DbError> {
@@ -2068,7 +2096,7 @@ impl Db for PostgresDb {
         // competing CAS waits and then sees the committed status (Conflict).
         // An early return drops `tx`, which rolls everything back.
         let mut tx = self.pool().begin().await.map_err(db_err)?;
-        if !cas_run_status(&mut *tx, run, from, to).await? {
+        if !cas_run_status(&mut *tx, run, from, to, Some(generation)).await? {
             tx.rollback().await.map_err(db_err)?;
             return Err(DbError::Conflict);
         }
@@ -2318,6 +2346,20 @@ impl Db for PostgresDb {
         .await
         .map_err(db_err)?;
         Ok(())
+    }
+
+    async fn outbox_key_pending(&self, idempotency_key: &str) -> Result<bool, DbError> {
+        let pending: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM outbox
+                 WHERE idempotency_key = $1
+                   AND dispatched_at IS NULL AND dead_lettered_at IS NULL)",
+        )
+        .bind(idempotency_key)
+        .fetch_one(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(pending)
     }
 
     async fn record_outbox_failure(&self, id: OutboxId) -> Result<u32, DbError> {
@@ -3688,17 +3730,22 @@ async fn cas_run_status<'e, E: sqlx::PgExecutor<'e>>(
     run: &RunId,
     from: RunStatus,
     to: RunStatus,
+    generation: Option<u64>,
 ) -> Result<bool, DbError> {
+    // `generation`, when given, is the reopen generation the caller read:
+    // a run reopened since (and back in `from`) is a miss, not an ABA hit.
     let affected = sqlx::query(
         "UPDATE runs
          SET status = $3, updated_at = (extract(epoch from now()) * 1000)::bigint,
              reopen_generation = reopen_generation + CASE WHEN $4 THEN 1 ELSE 0 END
-         WHERE id = $1 AND status = $2",
+         WHERE id = $1 AND status = $2
+           AND ($5::BIGINT IS NULL OR reopen_generation = $5)",
     )
     .bind(&run.0)
     .bind(run_status_str(from))
     .bind(run_status_str(to))
     .bind(from.is_terminal())
+    .bind(generation.map(|g| g as i64))
     .execute(exec)
     .await
     .map_err(db_err)?

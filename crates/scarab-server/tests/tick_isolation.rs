@@ -227,7 +227,7 @@ async fn a_malformed_teardown_payload_does_not_wedge_the_tick() {
         id: OutboxId(0),
         run: RunId("run-gone".into()),
         kind: SUPERSEDE_TEARDOWN.to_string(),
-        payload: serde_json::json!({ "not": "a SupersedeTeardown" }),
+        payload: serde_json::json!({ "not": "an AttemptTeardown" }),
         idempotency_key: "poison-payload".into(),
         at: Timestamp(START),
     })

@@ -29,10 +29,11 @@ pub use scheduler::{
     deployment_request_first_attempt,
     gate_approvers, pin_run_snapshots, plan_rerun, record_gate_approval,
     reject_gate, release_gate, wait_began_at,
-    rerun_step, rerun_step_widened, retry_step, retry_step_widened, unpin_run_snapshots,
+    rerun_step, rerun_step_widened, retry_step, retry_step_widened, run_status_post_key,
+    unpin_run_snapshots,
     ExpiredInput, PlanReason, PlannedStep, RerunError, RerunPlan, Scheduler, SchedulerError,
-    SupersedeTeardown, SupersededAttempt, Supervision, TickHealth, CANCEL_RUN, LAUNCH_STEP,
-    MAX_DELIVERY_ATTEMPTS,
+    AttemptTeardown, Supervision, TeardownAttempt, TickHealth, CANCEL_ATTEMPT, CANCEL_RUN,
+    LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS,
     RUN_STATUS_CHANGED, SUPERSEDE_TEARDOWN,
 };
 
@@ -386,6 +387,24 @@ pub enum AttemptStamp {
         kind: FailureKind,
         detail: Option<String>,
     },
+}
+
+/// What a step transition's CAS requires of the step's **latest** Attempt,
+/// besides its status ([`Db::commit_step_transition`]).
+///
+/// A status-only CAS is ABA-blind (red team R2-E3): a step read `Running` on
+/// `a1` can be cancelled, rerun and claimed `Running` on `a2` before the
+/// reader's commit, which then still matches `Running` — and stamps, and
+/// tears down, the stale `a1` while `a2` runs on unowned. A transition that
+/// acts on the step's in-flight attempt names the one it read, so a frontier
+/// that moved is a [`DbError::Conflict`] and the caller re-reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptFrontier<'a> {
+    /// No requirement: the CAS is on the status alone.
+    Any,
+    /// The step's latest Attempt (by mint order) is exactly this one —
+    /// `None`: the step has no Attempt at all.
+    Is(Option<&'a AttemptId>),
 }
 
 /// How one gate wait ends — the verdict a [`Db::resolve_gate_wait`] writes in

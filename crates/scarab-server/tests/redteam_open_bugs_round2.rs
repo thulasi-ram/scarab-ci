@@ -470,11 +470,9 @@ async fn a_stale_cancel_intent_spares_the_reruns_attempt(w: World) {
     );
     w.finish().await;
 }
-both!(
-    a_stale_cancel_intent_spares_the_reruns_attempt,
-    None,
-    ignore = "redteam: BROKE R2-E1 stale gen-0 CANCEL_RUN kills the rerun's a2"
-);
+// Fixed round 3: cancel intents are attempt-scoped (`cancel_attempt` names
+// a1), so the drain never reads the rerun's a2.
+both!(a_stale_cancel_intent_spares_the_reruns_attempt, None);
 
 // ---------------------------------------------------------------------------
 // R2-E2 — the intent rides the FIRST transition of a multi-step cancel and
@@ -591,11 +589,11 @@ both!(
     a_cancel_drained_mid_cancel_still_tears_down_a_step_launched_in_between,
     Some(1)
 );
+// Fixed round 3: each step's cancel commit carries its own attempt-keyed
+// intent, so c_bump's is never a no-op behind a key retired mid-cancel.
 both!(
     a_mid_cancel_drain_survives_a_transient_inline_cancel_error,
-    Some(1),
-    ignore =
-        "redteam: BROKE R2-E2b intent retired mid-cancel; a failed inline cancel is never retried"
+    Some(1)
 );
 
 // ---------------------------------------------------------------------------
@@ -657,11 +655,9 @@ async fn a_stale_generation_read_cannot_orphan_the_reruns_attempt(w: World) {
     );
     w.finish().await;
 }
-both!(
-    a_stale_generation_read_cannot_orphan_the_reruns_attempt,
-    None,
-    ignore = "redteam: BROKE R2-E3 generation read before the commits (ABA) orphans a2"
-);
+// Fixed round 3: the cancel's CAS names the attempt it read
+// (`AttemptFrontier`), so the ABA conflicts, re-reads, and cancels a2.
+both!(a_stale_generation_read_cannot_orphan_the_reruns_attempt, None);
 
 // ---------------------------------------------------------------------------
 // R2-E4 — cancel → rerun → cancel, three times. Each cancel must write its
@@ -971,9 +967,10 @@ async fn a_rerun_by_an_old_binary_still_gets_its_cancel(w: World) {
     );
     w.finish().await;
 }
+// Fixed round 3: the cancel intent is keyed by the attempt, not the
+// generation, so an old binary's missing bump cannot collide it.
 mod a_rerun_by_an_old_binary_still_gets_its_cancel {
     #[tokio::test]
-    #[ignore = "redteam: BROKE R2-E8 mixed-version window re-opens A1 (old binary never bumps)"]
     async fn pg() {
         match super::World::pg(None).await {
             Some(w) => super::a_rerun_by_an_old_binary_still_gets_its_cancel(w).await,

@@ -143,12 +143,13 @@ async fn cancel_in_progress_group_cancels_the_older() {
 }
 
 /// A `cancel-in-progress` auto-cancel only ASKS the holder's unit to stop
-/// (best-effort, inline). It also leaves the Run's cancel teardown intent —
-/// the same `cancel_run` an operator cancel writes, never a supersession's
-/// (CONTEXT.md keeps Cancelled and Superseded apart; review fit-F3) — which
-/// re-cancels until the backend says the unit is GONE, so a Pod still in its
-/// termination grace is neither forgotten nor, for a deploy Step, released
-/// from its DeploymentTarget's hold early (git-bug f22056d).
+/// (best-effort, inline). It also leaves the cancel's teardown intent for
+/// that unit's attempt — the same `cancel_attempt` an operator cancel
+/// writes, never a supersession's (CONTEXT.md keeps Cancelled and Superseded
+/// apart; review fit-F3) — which re-cancels until the backend says the unit
+/// is GONE, so a Pod still in its termination grace is neither forgotten nor,
+/// for a deploy Step, released from its DeploymentTarget's hold early
+/// (git-bug f22056d).
 #[tokio::test]
 async fn an_auto_cancel_tears_the_holder_down_until_it_is_gone() {
     let Some(tdb) = fresh_db().await else {
@@ -190,12 +191,14 @@ async fn an_auto_cancel_tears_the_holder_down_until_it_is_gone() {
         .await
         .unwrap()
         .into_iter()
-        .filter(|k| k == scarab_engine::CANCEL_RUN || k == scarab_engine::SUPERSEDE_TEARDOWN)
+        .filter(|k| {
+            k == scarab_engine::CANCEL_ATTEMPT || k == scarab_engine::SUPERSEDE_TEARDOWN
+        })
         .collect();
     assert_eq!(
         teardowns,
-        vec![scarab_engine::CANCEL_RUN.to_string()],
-        "the cancel's own teardown intent, and no supersession"
+        vec![scarab_engine::CANCEL_ATTEMPT.to_string()],
+        "the cancel's own teardown intent for the unit, and no supersession"
     );
 
     sched.reconcile_cancellations().await.unwrap();

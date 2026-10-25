@@ -9,7 +9,7 @@ use scarab_engine::ports::ExecHandle;
 use scarab_engine::{
     cancel_run_request, rerun_step, retry_step, Attempt, AttemptId, AttemptOutcome, Db,
     EventPayload, FailureKind, OutboxId, OutboxMessage, RerunError, RunId, RunStatus, Scheduler,
-    StepId, StepSpec, StepStatus, SupersedeTeardown, SupersededAttempt, Timestamp, LAUNCH_STEP,
+    StepId, StepSpec, StepStatus, AttemptTeardown, TeardownAttempt, Timestamp, LAUNCH_STEP,
     MAX_DELIVERY_ATTEMPTS, SUPERSEDE_TEARDOWN,
 };
 use scarab_testkit::{FakeClock, FakeExecutor, InMemoryDb};
@@ -443,7 +443,7 @@ async fn rerun_captures_descendant_that_raced_into_running() {
     let captured: Vec<(String, String)> = msgs
         .iter()
         .flat_map(|m| {
-            serde_json::from_value::<SupersedeTeardown>(m.payload.clone())
+            serde_json::from_value::<AttemptTeardown>(m.payload.clone())
                 .unwrap()
                 .attempts
                 .into_iter()
@@ -665,8 +665,8 @@ async fn superseded_attempt_survives_teardown_induced_lost() {
 
 /// Regression — the CANCEL-path mirror of
 /// `superseded_attempt_survives_teardown_induced_lost`. Cancelling a run stamps
-/// its in-flight step `Cancelled` and SIGTERMs that step's Pod (the `CANCEL_RUN`
-/// teardown); the dying Pod is then reported `Lost`. `a1`'s launch intent was
+/// its in-flight step `Cancelled` and SIGTERMs that step's Pod (the `CANCEL_ATTEMPT`
+/// teardown naming a1); the dying Pod is then reported `Lost`. `a1`'s launch intent was
 /// never dispatched, so it lingers on the outbox and `reconcile` re-polls it —
 /// observing `Lost`. Unlike a supersede, a cancel mints NO successor attempt, so
 /// the cancelled attempt is STILL the step's frontier — the "only the frontier
@@ -723,7 +723,7 @@ async fn cancelled_attempt_survives_teardown_induced_lost() {
     db.seed_run(&run, RunStatus::Running);
 
     // The human cancels the run: c → Cancelled, a1 stamped Cancelled, run →
-    // Cancelled, and a CANCEL_RUN teardown is enqueued for a1's Pod.
+    // Cancelled, and a CANCEL_ATTEMPT teardown naming a1 is enqueued.
     let clock = FakeClock::new(1_000);
     let cancelled = cancel_run_request(&db, &clock, &run, Some("alice".to_string()))
         .await
@@ -993,8 +993,8 @@ async fn seed_supersede_teardown(db: &InMemoryDb, run_name: &str) -> (RunId, Str
         id: OutboxId(0),
         run: run.clone(),
         kind: SUPERSEDE_TEARDOWN.to_string(),
-        payload: serde_json::to_value(SupersedeTeardown {
-            attempts: vec![SupersededAttempt {
+        payload: serde_json::to_value(AttemptTeardown {
+            attempts: vec![TeardownAttempt {
                 step: c.0.clone(),
                 attempt: a1.0.clone(),
             }],

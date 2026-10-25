@@ -795,12 +795,13 @@ pub trait Db: Send + Sync {
     /// ([`record_transition`](Db::record_transition),
     /// [`commit_run_transition`](Db::commit_run_transition)).
     ///
-    /// Outbox idempotency keys are unique forever, so an intent that may
-    /// recur on one run — its cancel teardown, its status post for a given
-    /// state — is keyed to this generation (red team A1/A7): keyed per run,
-    /// the second cancel after a rerun, or the second `Succeeded` after a
-    /// `Failed` rerun, collapsed onto the first one's dispatched row and was
-    /// never written.
+    /// Outbox idempotency keys are unique forever, so a status post that
+    /// may recur on one run — the second `Succeeded` after a `Failed` rerun
+    /// — is keyed to this generation (red team A7), and carries it, so the
+    /// forge-status drainer can drop a redelivered post an older generation
+    /// left behind (red team R2-E5). A run transition commits only against
+    /// the generation its caller read ([`commit_run_transition`](Db::commit_run_transition)),
+    /// so the generation a post names is the one its transition happened in.
     async fn run_reopen_generation(&self, run: &RunId) -> Result<u64, DbError>;
 
     /// Ids of all non-terminal runs — the work list a converged scheduler drives.
@@ -869,7 +870,13 @@ pub trait Db: Send + Sync {
 
     /// One run transition as ONE commit (review correctness F4, the run-level
     /// residual of git-bug 586187a): the guarded `from → to` CAS (exactly
-    /// [`record_transition`](Db::record_transition)), then — only if it won —
+    /// [`record_transition`](Db::record_transition), and ALSO requiring the
+    /// run's [`reopen generation`](Db::run_reopen_generation) still to be
+    /// `generation`, the one the caller read — so a run cancelled, rerun and
+    /// back in `from` between the read and the commit is a
+    /// [`DbError::Conflict`], never a status post or intent keyed to a
+    /// generation it does not belong to: red team R2-E3's ABA at run grain),
+    /// then — only if it won —
     /// every one of `events` and every one of `outbox` (each idempotent on its
     /// key, as [`enqueue_outbox`](Db::enqueue_outbox)), in order. All of it
     /// lands or none of it does: a lost CAS is [`DbError::Conflict`] with
@@ -882,6 +889,7 @@ pub trait Db: Send + Sync {
         run: &RunId,
         from: RunStatus,
         to: RunStatus,
+        generation: u64,
         events: &[EventKind],
         outbox: &[OutboxMessage],
     ) -> Result<(), DbError>;
@@ -897,36 +905,44 @@ pub trait Db: Send + Sync {
     ) -> Result<(), DbError>;
 
     /// One step transition as ONE commit (git-bug 586187a): the guarded
-    /// `from → to` CAS (exactly [`record_step_transition`](Db::record_step_transition)),
-    /// then — only if it won — `stamp` on its Attempt, every one of
-    /// `events`, in order, and every one of `outbox` (each idempotent on its
-    /// key, as [`enqueue_outbox`](Db::enqueue_outbox)). The outbox carries
-    /// the teardown intent a cancel or a supersession owes the unit this
-    /// transition abandons (red team A3/A6): written in a separate, earlier
-    /// commit, an intent could outlive a transition that then failed — and
-    /// kill a live attempt of a Run nobody cancelled. All of it lands or none
-    /// of it does:
+    /// `from → to` CAS (exactly [`record_step_transition`](Db::record_step_transition),
+    /// plus the `frontier` requirement on the step's latest Attempt), then —
+    /// only if it won — `stamp` on its Attempt, every one of `events`, in
+    /// order, and every one of `outbox` (each idempotent on its key, as
+    /// [`enqueue_outbox`](Db::enqueue_outbox)). The outbox carries the
+    /// attempt-scoped teardown intent a cancel or a supersession owes the
+    /// unit this transition abandons (red team A3/A6, R2-E1): written in a
+    /// separate, earlier commit, an intent could outlive a transition that
+    /// then failed — and kill a live attempt of a Run nobody cancelled. All
+    /// of it lands or none of it does:
     ///
-    /// - the step is no longer in `from` → [`DbError::Conflict`], nothing
-    ///   written (the duplicate/stale finalizer writes no events);
+    /// - the step is no longer in `from`, or its latest Attempt is not what
+    ///   `frontier` names → [`DbError::Conflict`], nothing written (the
+    ///   duplicate/stale finalizer writes no events);
     /// - any later write fails → an error, and the CAS rolls back with it: the
     ///   step stays in `from` for the caller's re-drive.
     ///
     /// The separate CAS-then-append it replaces could crash in between and
     /// leave a terminal step with no journal entry — and no re-drive could
     /// ever write one, because its CAS now conflicts.
+    #[allow(clippy::too_many_arguments)]
     async fn commit_step_transition(
         &self,
         run: &RunId,
         step: &StepId,
         from: StepStatus,
         to: StepStatus,
+        frontier: crate::AttemptFrontier<'_>,
         stamp: Option<(&AttemptId, &crate::AttemptStamp)>,
         events: &[EventKind],
         outbox: &[OutboxMessage],
     ) -> Result<(), DbError>;
 
-    /// Persist an attempt (idempotent on its id — restart-safe).
+    /// Persist an attempt (idempotent on its id — restart-safe). Serialized
+    /// against [`commit_step_transition`](Db::commit_step_transition) on the
+    /// same step (Postgres: it holds the step row `FOR SHARE`), so a
+    /// transition's [`AttemptFrontier`](crate::AttemptFrontier) check never
+    /// misses an Attempt minted concurrently with its commit.
     async fn record_attempt(
         &self,
         run: &RunId,
@@ -1035,18 +1051,19 @@ pub trait Db: Send + Sync {
     /// A Step that is still `Pending` (itself held, or not reached) does not
     /// count; one that failed made no request.
     ///
-    /// R is also in flight — **whatever its status** — while a teardown of
-    /// the requesting Step's unit is pending (git-bug f22056d): a
-    /// [`CANCEL_RUN`](crate::CANCEL_RUN) intent for R while the Step's
-    /// latest Attempt was launched (a recorded handle) — whatever the Step's
-    /// status: a Step claimed mid-cancel, or launched after it, is not
-    /// `Cancelled` yet its unit is alive and the intent tears it down — or a
-    /// [`SUPERSEDE_TEARDOWN`](crate::SUPERSEDE_TEARDOWN) naming the Step. A
-    /// cancel or a rerun makes the Step terminal or `Pending` at once, while
-    /// its unit (a Pod in its termination grace) may still be acting on the
-    /// target. Pending = neither dispatched (the scheduler retires it only
-    /// once [`Executor::torn_down`] says the unit is gone) nor dead-lettered
-    /// (abandoned after the delivery ceiling, with a diagnostic).
+    /// R is also in flight — **whatever its status** — while an
+    /// attempt-scoped teardown of one of the requesting Step's own Attempts
+    /// is pending (git-bug f22056d, red team R2-E1/E2b): a
+    /// [`CANCEL_ATTEMPT`](crate::CANCEL_ATTEMPT) or
+    /// [`SUPERSEDE_TEARDOWN`](crate::SUPERSEDE_TEARDOWN) whose payload names
+    /// an Attempt of the Step. A cancel or a rerun makes the Step terminal or
+    /// `Pending` at once, while its unit (a Pod in its termination grace) may
+    /// still be acting on the target. Pending = neither dispatched (the
+    /// scheduler retires it only once [`Executor::torn_down`] says the unit
+    /// is gone, and never while that Attempt's launch is still in flight) nor
+    /// dead-lettered (abandoned after the delivery ceiling, with a
+    /// diagnostic). The Run-level [`CANCEL_RUN`](crate::CANCEL_RUN) — shared
+    /// services only — never counts: it names no unit of the Step.
     async fn deployment_requesting_runs(
         &self,
         org: &str,
@@ -1171,6 +1188,13 @@ pub trait Db: Send + Sync {
 
     /// Mark a claimed outbox message dispatched, so it is never redelivered.
     async fn mark_dispatched(&self, id: OutboxId) -> Result<(), DbError>;
+
+    /// Whether the outbox message with `idempotency_key` exists and is
+    /// still pending — neither dispatched nor dead-lettered. A teardown asks
+    /// it of an Attempt's `launch:` intent before calling an Attempt with no
+    /// recorded handle gone: while that intent is pending a launch may be
+    /// creating its unit right now.
+    async fn outbox_key_pending(&self, idempotency_key: &str) -> Result<bool, DbError>;
 
     /// Record one failed delivery of an outbox message (ADR-0047 poison
     /// handling) and return the total failures so far. Benign redeliveries of

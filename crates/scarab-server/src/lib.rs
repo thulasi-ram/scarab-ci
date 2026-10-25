@@ -5669,6 +5669,7 @@ async fn persist_run_from_ir(
                 &step_id,
                 StepStatus::Pending,
                 StepStatus::Skipped,
+                scarab_engine::AttemptFrontier::Any,
                 None,
                 std::slice::from_ref(&transitioned),
                 &[],
