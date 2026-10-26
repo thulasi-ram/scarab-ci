@@ -2738,3 +2738,214 @@ async fn fanin_collision_summary_survives_the_termination_log_as_uid_65532() {
         "declared indices: root 1 (C) wins over root 0 (B)"
     );
 }
+
+/// LIVE `DebugLauncher` (git-bug 16faa7c): a debug Pod opened on a finished
+/// step re-materialises that step's snapshot at `/workspace`, and a shell
+/// attached to it can read the content.
+///
+/// The debug Pod shares the fetcher with a real Step (ADR-0061 s3-feed) but
+/// three things about its path were never observed working, and this case
+/// pins all of them on the real cluster:
+///
+/// 1. its token is minted on a fence no Step ever produces (`attempt:
+///    "debug"`, a single root) — if the service refused it, the fetcher init
+///    container fails and the shell container never starts;
+/// 2. its token Secret is created AFTER the Pod (so it can be
+///    owner-referenced) — if the kubelet's FailedMount retry did not pick it
+///    up, the Pod never reaches Running inside `launch_debug`'s wait;
+/// 3. the snapshot actually lands: the shell reads A's bytes back through
+///    `attach_debug`, the same stream the UI's "open a shell" bridges.
+///
+/// (The ticket's third concern, a TTL past the token's 24 h cap, is not
+/// reachable: the only production caller passes 3600 s.)
+#[tokio::test]
+#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
+async fn a_debug_pod_rematerialises_a_finished_steps_snapshot() {
+    use scarab_executor_k8s::DebugLauncher;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let Some(ns) = opted_in() else { return };
+    let Some(ws) = workspace_fixture() else { return };
+
+    let client = kube_client().await;
+    let exec = K8sExecutor::with_client(ns, client)
+        .with_workspace_cas(ws.cas.clone())
+        .with_workspace_depot(ws.depot.clone())
+        .with_workspace_service(ws.fetch.clone());
+
+    // --- A finished step with a snapshot to debug. ---
+    let a = StepRun {
+        step: StepId("producer".into()),
+        ..step("run-debug")
+    };
+    let mut spec = busybox_spec("echo scarab-debug-marker > /workspace/out.txt", true);
+    spec.timeout_seconds = Some(120);
+    let ha = exec.launch(&a, &spec).await.expect("launch A");
+    assert_eq!(
+        poll_to_terminal(&exec, &ha, 90).await,
+        Some(ExecState::Succeeded),
+        "A succeeds"
+    );
+    let root_a = exec
+        .output(&ha)
+        .await
+        .expect("output")
+        .expect("A produced a workspace snapshot");
+
+    // --- The debug Pod. `launch_debug` returns only once the shell container
+    // is Running, i.e. after the fetcher init container exited 0 — which needs
+    // both the late-created token Secret mounted and the `debug` fence's token
+    // accepted by the service. ---
+    let dp = exec
+        .launch_debug(&a, "busybox:latest", Some(&root_a), 300)
+        .await
+        .expect("the debug Pod reaches Running with its snapshot fed");
+
+    // --- Shell in and read the snapshot back. ---
+    let mut io = exec.attach_debug(&dp.name).await.expect("attach");
+    io.input
+        .write_all(b"cat /workspace/out.txt; exit\n")
+        .await
+        .expect("type into the shell");
+    io.input.flush().await.expect("flush");
+    let mut seen = Vec::new();
+    let read = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut buf = [0u8; 4096];
+        loop {
+            match io.output.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    seen.extend_from_slice(&buf[..n]);
+                    // The TTY echoes the typed line, which does not contain
+                    // the marker — only `cat`'s output does.
+                    if String::from_utf8_lossy(&seen).contains("scarab-debug-marker") {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    let out = String::from_utf8_lossy(&seen).into_owned();
+    exec.teardown_debug(&dp.name).await.expect("teardown");
+    exec.cancel(&ha).await.expect("cleanup");
+    assert!(
+        read.is_ok(),
+        "the shell went quiet without output; got: {out:?}"
+    );
+    assert!(
+        out.contains("scarab-debug-marker"),
+        "the debug shell must see the finished step's workspace; got: {out:?}"
+    );
+}
+
+/// LIVE `needs:` + a uid-pinned service sidecar (git-bug 908f534).
+///
+/// The ticket's worry: a service pinning a non-root uid (ADR-0058
+/// `run_as_user`, `999` for the official `postgres` image) used to become the
+/// Pod's `fsGroup`, the kubelet would chown `/workspace` to `root:999 0775`, and
+/// neither the fetcher nor the step (both only in group 65532) could write it.
+/// PR #110 moved the service gid to `supplementalGroups` and pinned `fsGroup`
+/// to `WORKSPACE_GID`.
+///
+/// Observed on kind (k8s 1.36, containerd) with the PRE-#110 shape forced back
+/// in (`fsGroup: 999`, `supplementalGroups: [65532]`), this case still passes:
+/// the emptyDir is created `drwxrwsrwx` (0777, not 0775), and the kubelet adds
+/// `fsGroup` to every container's supplementary groups, so both the fetcher
+/// and the step are in group 999 anyway. So this is not a regression test for
+/// that shape — it is the ticket's owed proof that the combination works:
+/// the step reads the fed input, modifies a fed file, writes into a fed
+/// directory and the root, reaches the service on localhost:5432, succeeds,
+/// and its drained snapshot holds the result.
+#[tokio::test]
+#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
+async fn a_needs_step_with_a_uid_pinned_service_can_write_its_workspace() {
+    let Some(ns) = opted_in() else { return };
+    let Some(ws) = workspace_fixture() else { return };
+
+    let client = kube_client().await;
+    let exec = K8sExecutor::with_client(ns, client)
+        .with_workspace_cas(ws.cas.clone())
+        .with_workspace_depot(ws.depot.clone())
+        .with_workspace_service(ws.fetch.clone());
+
+    let run_id = unique_run("run-svc-ws");
+    let a = step_run_of(&run_id, "producer");
+    let mut producer = busybox_spec(
+        "mkdir -p /workspace/sub \
+         && echo seeded > /workspace/seed.txt \
+         && echo inner > /workspace/sub/inner.txt",
+        true,
+    );
+    producer.timeout_seconds = Some(120);
+    let ha = exec.launch(&a, &producer).await.expect("launch producer");
+    assert_eq!(
+        poll_to_terminal(&exec, &ha, 90).await,
+        Some(ExecState::Succeeded),
+        "producer succeeds"
+    );
+    let root_a = exec
+        .output(&ha)
+        .await
+        .expect("output")
+        .expect("producer snapshot");
+
+    let b = step_run_of(&run_id, "consumer");
+    let mut consumer = busybox_spec(
+        "test -f /workspace/seed.txt \
+         && echo appended >> /workspace/seed.txt \
+         && touch /workspace/sub/from-consumer \
+         && touch /workspace/from-consumer \
+         && nc -z -w 10 127.0.0.1 5432",
+        true,
+    );
+    consumer.timeout_seconds = Some(180);
+    consumer.workspace_inputs = vec![root_a];
+    consumer.services = vec![scarab_pipeline::ServiceSpec {
+        // Kind-loaded by `just kube-tests` and the kind workflow: a tagged
+        // image is IfNotPresent, so the node never pulls it.
+        image: "postgres:16".into(),
+        command: vec![],
+        args: vec![],
+        env: [("POSTGRES_HOST_AUTH_METHOD".to_string(), "trust".to_string())].into(),
+        ports: vec![5432],
+        ready: None,
+        run_as_user: Some(999),
+        run_as_root: false,
+    }];
+    let hb = exec.launch(&b, &consumer).await.expect("launch consumer");
+    let terminal = poll_to_terminal(&exec, &hb, 180).await;
+    assert_eq!(
+        terminal,
+        Some(ExecState::Succeeded),
+        "a needs: step beside a uid-999 service must get a writable /workspace"
+    );
+
+    let root_b = exec
+        .output(&hb)
+        .await
+        .expect("output")
+        .expect("consumer snapshot");
+    let mut names: Vec<String> = ws
+        .cas
+        .tree_entries(&scarab_storage::TreeHash(root_b))
+        .await
+        .expect("read the consumer's tree")
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            "from-consumer".to_string(),
+            "seed.txt".to_string(),
+            "sub".to_string()
+        ],
+        "the drain snapshotted the fed input AND the step's own write"
+    );
+
+    for h in [ha, hb] {
+        exec.cancel(&h).await.expect("cleanup");
+    }
+}

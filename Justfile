@@ -419,6 +419,20 @@ kube-tests filter="":
       docker build -q -t "$1" "$2" >/dev/null
       kind load docker-image "$1" --name "$cluster" >/dev/null
     done
+    # The service image the uid-pinned-service case runs (git-bug 908f534). A
+    # tagged image is IfNotPresent, so a kind-loaded copy is never pulled by the
+    # node — whose Docker Hub DNS has been flaky here. Loaded as a ONE-platform
+    # archive: `kind load docker-image` imports `--all-platforms` and fails on a
+    # multi-arch pull under the containerd image store (only one platform's
+    # layers are local).
+    platform="linux/$(docker version -f '{{{{.Server.Arch}}')"
+    for img in postgres:16; do
+      docker image inspect "$img" >/dev/null 2>&1 || docker pull -q --platform "$platform" "$img" >/dev/null
+      archive="$(mktemp -t scarab-kind-image).tar"
+      docker save --platform "$platform" -o "$archive" "$img"
+      kind load image-archive "$archive" --name "$cluster" >/dev/null
+      rm -f "$archive"
+    done
     export SCARAB_TEST_CLONE_IMAGE=scarab-clone:kube-tests
     export SCARAB_TEST_SIDECAR_IMAGE=scarab-results-sidecar:kube-tests
     # 3. The plain-HTTP registry the `kind: build` case pushes to and then reads

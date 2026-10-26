@@ -12,7 +12,8 @@ async-trait = { workspace = true }
 kube = { workspace = true }
 tar = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true }
+# `io-util`: the live debug-Pod case types into an attached shell.
+tokio = { workspace = true, features = ["io-util"] }
 serde_json = { workspace = true }
 base64 = { workspace = true }
 scarab-storage = { workspace = true }
@@ -40,7 +41,8 @@ scarab-storage-s3 = { workspace = true }
 # executor through the engine's supersede-teardown path over the in-memory Db.
 scarab-testkit = { workspace = true }
 axum = { workspace = true }
-tokio = { workspace = true }
+# `io-util`: the live debug-Pod case types into an attached shell.
+tokio = { workspace = true, features = ["io-util"] }
 # The cluster tier builds a kube client (rustls) in a test graph that links more
 # than one rustls CryptoProvider, so rustls cannot pick one and panics on the
 # first handshake; tests/cluster.rs installs `ring` (git-bug 2852828), as
