@@ -1773,7 +1773,7 @@ pub async fn cancel_run_request(
         RunStatus::Cancelled,
         now,
         true,
-        &[cancel_services_intent(run, now)],
+        &[cancel_services_intent(db, run, now).await?],
     )
     .await
     {
@@ -1821,12 +1821,27 @@ fn cancel_attempt_intent(
 /// shared services (ADR-0058), which no Attempt names. It names no step
 /// unit and the drain touches none.
 ///
+/// It names the newest service Take the cancel stops (`through_take`, git-bug
+/// 8335544), the services twin of an attempt-scoped intent: a cancel whose
+/// services teardown is still pending when the Run is rerun must not tear
+/// down the rerun's fresh Take — the drain spares every later Take while the
+/// Run is live again.
+///
 /// Its key needs no determinism — it rides the Run's status CAS, which one
 /// writer wins, so it lands exactly once per cancel — but it must be unique
 /// per cancel: a deterministic per-run (or per-generation) key collided with
 /// an earlier cancel's dispatched row and silently wrote nothing (red team
 /// A1, R2-E8). A per-call random nonce never does.
-fn cancel_services_intent(run: &RunId, now: Timestamp) -> OutboxMessage {
+async fn cancel_services_intent(
+    db: &dyn Db,
+    run: &RunId,
+    now: Timestamp,
+) -> Result<OutboxMessage, DbError> {
+    let through_take = Scheduler::current_service_take(&db.run_services(run).await?);
+    Ok(cancel_services_intent_through(run, through_take, now))
+}
+
+fn cancel_services_intent_through(run: &RunId, through_take: i64, now: Timestamp) -> OutboxMessage {
     use std::hash::{BuildHasher, Hasher};
     // `RandomState` is seeded randomly per process and advanced per
     // instance: a dependency-free nonce.
@@ -1836,7 +1851,7 @@ fn cancel_services_intent(run: &RunId, now: Timestamp) -> OutboxMessage {
         id: crate::OutboxId(0),
         run: run.clone(),
         kind: CANCEL_RUN.to_string(),
-        payload: serde_json::json!({ "services": true }),
+        payload: serde_json::json!({ "services": true, "through_take": through_take }),
         idempotency_key: format!("cancel:{}:services:{:016x}", run.0, nonce.finish()),
         at: now,
     }
@@ -2826,8 +2841,25 @@ impl<'a> Scheduler<'a> {
                 // accounting that retries a genuinely failed teardown. Folding
                 // the error into `outcome` keeps the promise in this function's
                 // doc comment.
+                //
+                // Take-scoped (git-bug 8335544): once the Run is live again
+                // (rerun), only the Takes this cancel stopped are torn down;
+                // a later Take is the rerun's own. A Run still terminal keeps
+                // nothing alive, so every Take goes — which also covers a
+                // rerun that birthed a Take between the cancel's read and its
+                // commit. A payload without `through_take` (an older binary)
+                // keeps the old run-wide drain.
+                let through_take = msg.payload.get("through_take").and_then(|t| t.as_i64());
+                let reopened = self
+                    .db
+                    .run_status(&msg.run)
+                    .await?
+                    .is_some_and(|s| !s.is_terminal());
                 for svc in self.db.run_services(&msg.run).await? {
                     if svc.status.is_terminal() {
+                        continue;
+                    }
+                    if reopened && through_take.is_some_and(|t| svc.take > t) {
                         continue;
                     }
                     if let Some(h) = &svc.handle {
@@ -3994,7 +4026,7 @@ impl<'a> Scheduler<'a> {
                     RunStatus::Cancelled,
                     now,
                     true,
-                    &[cancel_services_intent(run, now)],
+                    &[cancel_services_intent(self.db, run, now).await?],
                 )
                 .await
                 {

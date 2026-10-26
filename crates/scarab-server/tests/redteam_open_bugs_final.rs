@@ -758,11 +758,7 @@ async fn a_stale_services_cancel_spares_the_reruns_services(w: World) {
     );
     w.finish().await;
 }
-both!(
-    a_stale_services_cancel_spares_the_reruns_services,
-    None,
-    ignore = "redteam: BROKE F5 — CANCEL_RUN services drain is not Take-scoped"
-);
+both!(a_stale_services_cancel_spares_the_reruns_services, None);
 
 // ---------------------------------------------------------------------------
 // F6 — the random-nonce CANCEL_RUN key. A re-sent operator cancel, and a
