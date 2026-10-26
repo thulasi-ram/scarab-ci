@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1793008521,"nonce":"R85rt8axTukKy5uaF/rwzG0WNmA=","message":"Closing as stale: rerun confirm names the whole cascade from the engine's plan (ui/scarab-web-ui/src/rerun-confirm.ts, RerunPlanResponse); tests rerun-confirm.test.ts.","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1793008521,"nonce":"JEjYjIfh5ee0dsiO9gR2x08Pkvg=","status":2}]}
