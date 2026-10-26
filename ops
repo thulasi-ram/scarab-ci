@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1793008520,"nonce":"BDXRAg4Un2cq/rden8ADv7m3ZXw=","message":"Closing as stale: browse reports kind 'symlink' with its target and serves x-scarab-symlink (crates/scarab-server/src/lib.rs browse handlers); test crates/scarab-server/tests/browse.rs.","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1793008520,"nonce":"v2UFSCjDFL53XJt5Ap0gfrWW9HQ=","status":2}]}
