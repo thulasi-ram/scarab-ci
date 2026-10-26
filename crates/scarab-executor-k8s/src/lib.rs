@@ -2036,6 +2036,59 @@ fn step_terminated_exit(pod: &Pod) -> Option<i32> {
 /// withhold `Succeeded` while the sidecar *proxy* says the settle is in flight,
 /// and this one refuses `Succeeded` outright when the sidecar is gone and the
 /// settle's *product* is not there.
+/// What `poll` does with a workspace Pod before it execs into the egress
+/// sidecar (git-bug 0440e6a, red team R2-K1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceLeg {
+    /// Drive the settle (`drive_workspace`): the egress is gone (a no-op) or
+    /// may still answer an exec.
+    Drive,
+    /// Skip it: the egress still shows `running` past the
+    /// [`sidecar_reporting_ceiling_passed`] — a node that stopped reporting,
+    /// where no exec into it (drain, harvest, release) can land. A failed exec
+    /// there is not weather to retry: returned as Transient on every poll, it
+    /// errored the launch intent to its poison ceiling and dead-lettered the
+    /// Run, and kept [`settled_state`]'s own ceiling verdict unreachable.
+    PastCeiling,
+}
+
+fn workspace_leg(pod: &Pod, now_secs: i64) -> WorkspaceLeg {
+    if init_container_running(pod, WORKSPACE_EGRESS_CONTAINER)
+        && sidecar_reporting_ceiling_passed(pod, now_secs)
+    {
+        WorkspaceLeg::PastCeiling
+    } else {
+        WorkspaceLeg::Drive
+    }
+}
+
+/// Did the step declare artifacts of record (`artifacts:`, ADR-0052)? Read
+/// off the Pod (`scarab.io/artifact-globs`, set by `build_pod`), so it
+/// survives a control-plane restart.
+fn declares_artifacts(pod: &Pod) -> bool {
+    pod.metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(ANNOTATION_ARTIFACT_GLOBS))
+        .and_then(|v| serde_json::from_str::<Vec<String>>(v).ok())
+        .is_some_and(|globs| !globs.is_empty())
+}
+
+/// The step's own non-zero exit, as the verdict a Pod held `Running` by a
+/// sidecar that will never be reported terminating can no longer deliver
+/// (git-bug 0440e6a): the kubelet keeps the phase `Running` until every
+/// sidecar stopped, so without this the step waits out its timeout and
+/// lands as `Timeout` — a verdict about the wrong thing.
+fn frozen_step_failure(pod: &Pod) -> Option<ExecState> {
+    let code = step_terminated_exit(pod).filter(|c| *c != 0)?;
+    let (class, cause) = classify_failed_pod(pod, Some(code));
+    Some(ExecState::Failed {
+        exit_code: Some(code),
+        class,
+        cause,
+    })
+}
+
 fn settled_state(pod: &Pod, harvesting: bool, now_secs: i64) -> ExecState {
     // The results-egress drain is owed on a workspace Pod too (ADR-0042):
     // see `results_settled_state`.
@@ -2063,6 +2116,15 @@ fn settled_state(pod: &Pod, harvesting: bool, now_secs: i64) -> ExecState {
         {
             ExecState::Succeeded
         }
+        // Its non-zero twin (git-bug 0440e6a): the step's own failure is the
+        // verdict once the egress can no longer be reported.
+        ExecState::Running
+            if !settling
+                && is_workspace_pod(pod)
+                && sidecar_reporting_ceiling_passed(pod, now_secs) =>
+        {
+            frozen_step_failure(pod).unwrap_or(ExecState::Running)
+        }
         other => other,
     };
     match state {
@@ -2085,6 +2147,30 @@ fn settled_state(pod: &Pod, harvesting: bool, now_secs: i64) -> ExecState {
                     .to_string(),
             ),
         },
+        // The artifacts twin of the rule above (git-bug 0440e6a, red team
+        // K1): the egress is gone (or past the reporting ceiling) and the
+        // harvest of DECLARED artifacts never recorded its index — the
+        // artifacts lived on the Pod's emptyDir and can never be harvested
+        // now. Reporting `Succeeded` would index none and mark the step green
+        // with its artifacts of record silently missing. Same at-least-once
+        // Infra verdict. A step that declared none owes only the empty index,
+        // which `artifacts()` already reads as `[]`, so it may succeed.
+        ExecState::Succeeded
+            if artifact_harvest_owed(pod, harvesting) && declares_artifacts(pod) =>
+        {
+            ExecState::Failed {
+                exit_code: None,
+                class: FailureClass::Infra {
+                    never_started: false,
+                },
+                cause: Some(
+                    "artifacts lost: the step exited 0 but its egress sidecar was lost \
+                     before the declared artifacts were harvested — they lived on the \
+                     Pod's emptyDir and can never be collected (ADR-0052)"
+                        .to_string(),
+                ),
+            }
+        }
         ExecState::Failed {
             class: FailureClass::Step,
             ..
@@ -2384,6 +2470,9 @@ fn results_settled_state(pod: &Pod, now_secs: i64) -> ExecState {
         ExecState::Running if overdue && step_terminated_exit(pod) == Some(0) => {
             ExecState::Succeeded
         }
+        // A non-zero exit held `Running` by the overdue drain (git-bug
+        // 0440e6a): its own failure is the verdict, not the step timeout.
+        ExecState::Running if overdue => frozen_step_failure(pod).unwrap_or(ExecState::Running),
         other => other,
     }
 }
@@ -2600,6 +2689,19 @@ impl Executor for K8sExecutor {
                 // idempotent and derive ALL state from the Pod itself, so an
                 // adopted Pod after a control-plane restart resumes cleanly.
                 if self.workspace_cas.is_some() {
+                    // Decided BEFORE any exec into the egress (git-bug
+                    // 0440e6a): past the sidecar reporting ceiling an egress
+                    // still showing `running` is a lost node, so every exec
+                    // into it fails, and `drive_workspace`'s Transient return
+                    // kept `settled_state`'s ceiling verdict unreachable — the
+                    // Pod errored on every poll until its Run dead-lettered.
+                    // Skip straight to that verdict, which owns what a lost
+                    // node forfeits: no root, or declared artifacts never
+                    // harvested, is the retried Infra failure — never green.
+                    let now = unix_now_secs();
+                    if workspace_leg(&pod, now) == WorkspaceLeg::PastCeiling {
+                        return Ok(settled_state(&pod, self.artifact_store.is_some(), now));
+                    }
                     match self.drive_workspace(&pods, &pod).await {
                         Ok(()) => {}
                         // Permanent and author-fixable (ADR-0007): the step ran and
@@ -7411,6 +7513,137 @@ mod tests {
         assert_eq!(results_settled_state(&waiting, NOW), ExecState::Succeeded);
     }
 
+    /// git-bug 0440e6a (red team R2-K1, K1): on a lost node `poll` reaches the
+    /// ceiling verdict WITHOUT an exec into the frozen egress, and that verdict
+    /// never reports green while the node took owed evidence with it.
+    #[test]
+    fn a_lost_node_past_the_ceiling_settles_without_an_exec_and_never_green_on_lost_evidence() {
+        let finished = NOW - 10_000;
+        let grace = 600;
+        let bound = grace + RESULTS_DRAIN_SLACK_SECS;
+        let past = finished + bound;
+        let frozen = |exit: i32, harvested: bool, snapshotted: bool, declared: bool| {
+            let mut pod = step_finished_at(
+                settling_pod_with("Running", exit, true, harvested, snapshotted),
+                finished,
+            );
+            pod.spec.as_mut().unwrap().termination_grace_period_seconds = Some(grace);
+            if declared {
+                pod.metadata
+                    .annotations
+                    .get_or_insert_with(Default::default)
+                    .insert(
+                        ANNOTATION_ARTIFACT_GLOBS.to_string(),
+                        "[\"dist/**\"]".to_string(),
+                    );
+            }
+            pod
+        };
+        let infra_lost = |state: ExecState| {
+            matches!(
+                state,
+                ExecState::Failed {
+                    exit_code: None,
+                    class: FailureClass::Infra {
+                        never_started: false
+                    },
+                    ..
+                }
+            )
+        };
+
+        // The leg: drive inside the ceiling and on a broken clock, skip past it.
+        let pod = frozen(0, false, true, true);
+        assert_eq!(workspace_leg(&pod, past - 1), WorkspaceLeg::Drive);
+        assert_eq!(workspace_leg(&pod, i64::MIN), WorkspaceLeg::Drive);
+        assert_eq!(workspace_leg(&pod, past), WorkspaceLeg::PastCeiling);
+        let gone = step_finished_at(
+            settling_pod_with("Running", 0, false, false, true),
+            finished,
+        );
+        assert_eq!(
+            workspace_leg(&gone, past),
+            WorkspaceLeg::Drive,
+            "an egress seen to terminate is driven (a no-op exec-wise), however late"
+        );
+
+        // A root and nothing owed: the step's exit 0 stands.
+        assert_eq!(
+            settled_state(&frozen(0, true, true, true), true, past),
+            ExecState::Succeeded
+        );
+        // K1: a root, but DECLARED artifacts never harvested — the retried
+        // infra failure, never a green step with its artifacts silently gone.
+        assert!(infra_lost(settled_state(
+            &frozen(0, false, true, true),
+            true,
+            past
+        )));
+        // Nothing declared: only the empty index was owed, which reads as [].
+        assert_eq!(
+            settled_state(&frozen(0, false, true, false), true, past),
+            ExecState::Succeeded
+        );
+        // No artifact store wired: no harvest is ever owed.
+        assert_eq!(
+            settled_state(&frozen(0, false, true, true), false, past),
+            ExecState::Succeeded
+        );
+        // No root: the snapshot is lost (ADR-0061 part 4).
+        assert!(infra_lost(settled_state(
+            &frozen(0, true, false, false),
+            true,
+            past
+        )));
+
+        // A non-zero exit held `Running` by the frozen egress: its own failure,
+        // promptly — not a `Timeout` an hour later.
+        assert!(matches!(
+            settled_state(&frozen(3, false, false, true), true, past),
+            ExecState::Failed {
+                exit_code: Some(3),
+                class: FailureClass::Step,
+                ..
+            }
+        ));
+        // Inside the ceiling it is still withheld while its harvest is owed.
+        assert_eq!(
+            settled_state(&frozen(3, false, false, true), true, past - 1),
+            ExecState::Running
+        );
+    }
+
+    /// git-bug 0440e6a, non-workspace half: a non-zero exit whose Pod phase is
+    /// held `Running` by a results sidecar that never reports terminating is
+    /// the step's own failure once the drain is overdue — not a `Timeout`.
+    #[test]
+    fn a_non_zero_exit_held_running_by_an_overdue_drain_fails_promptly() {
+        let finished = NOW - 10_000;
+        let held = |exit: i32| {
+            step_finished_at(
+                with_results_sidecar(
+                    plain_pod("Running", exit),
+                    Some(results_status(results_running(), false)),
+                ),
+                finished,
+            )
+        };
+        assert!(matches!(
+            results_settled_state(&held(2), NOW),
+            ExecState::Failed {
+                exit_code: Some(2),
+                class: FailureClass::Step,
+                ..
+            }
+        ));
+        assert_eq!(results_settled_state(&held(0), NOW), ExecState::Succeeded);
+        // Not yet overdue: withheld as before.
+        assert_eq!(
+            results_settled_state(&step_finished_at(held(2), NOW), NOW),
+            ExecState::Running
+        );
+    }
+
     /// No results egress configured (no sidecar in the spec): the verdict is
     /// `pod_state`'s, unchanged — including a `Succeeded` with no init
     /// container statuses at all.
@@ -7583,13 +7816,22 @@ mod tests {
             ExecState::Running
         );
 
-        // Never promoted: a step that exited non-zero, and a Pod with no
-        // results sidecar declared (its `Running` is not a drain's).
+        // Never promoted to `Succeeded`: a step that exited non-zero gets its
+        // own failure (git-bug 0440e6a — not the step timeout), and a Pod
+        // with no results sidecar declared stays `Running` (its `Running` is
+        // not a drain's).
         let failed_step = with_grace(with_results_sidecar(
             step_finished_at(plain_pod("Running", 1), finished),
             Some(results_status(results_running(), false)),
         ));
-        assert_eq!(results_settled_state(&failed_step, NOW), ExecState::Running);
+        assert!(matches!(
+            results_settled_state(&failed_step, NOW),
+            ExecState::Failed {
+                exit_code: Some(1),
+                class: FailureClass::Step,
+                ..
+            }
+        ));
         let no_sidecar = with_grace(step_finished_at(plain_pod("Running", 0), finished));
         assert_eq!(results_settled_state(&no_sidecar, NOW), ExecState::Running);
 
