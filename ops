@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1793008519,"nonce":"yWmDpWMv3DJODub+E98NFeOjy9M=","message":"Closing as stale: fixed by 3bee82b — step_up/guard.rs records the Org only if holds_role_in; covered by crates/scarab-server/tests/step_up_redteam2.rs.","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1793008519,"nonce":"Ci+ivOKMAfKPyJSSoZVOH+mvhQg=","status":2}]}
