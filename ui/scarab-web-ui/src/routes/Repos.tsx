@@ -14,6 +14,7 @@ import {
   type RunSummary,
 } from "../api/client";
 import { getVisited } from "../visited";
+import { inboxDetail, inboxRuns, inboxVerb } from "../gates";
 import { relTime, absTime } from "../fmt";
 import Icon from "../components/Icon";
 import RunBars from "../components/RunBars";
@@ -71,7 +72,9 @@ export default function Repos() {
   const [runs] = createResource(() => listRuns(50));
   const [query, setQuery] = createSignal("");
 
-  const inbox = () => (runs() ?? []).filter((r) => r.status === "suspended");
+  // Runs waiting on a gate — by their reached gates, not run status: a gate
+  // reached while a sibling still runs leaves the run `running` (c489346).
+  const inbox = () => inboxRuns(runs() ?? []);
 
   // Recently visited (browser-local); falls back to the most-active repos so a
   // fresh browser is never empty. Resolved against the project list for metadata.
@@ -111,7 +114,7 @@ export default function Repos() {
         </Show>
 
         <Show when={!loading()} fallback={<p class="empty">loading…</p>}>
-          {/* ── Waiting on you (action inbox: suspended runs) ─────────────────── */}
+          {/* ── Waiting on you (action inbox: runs with a waiting gate) ───────── */}
           <Show
             when={inbox().length > 0}
             fallback={
@@ -119,7 +122,7 @@ export default function Repos() {
                 <Icon icon="shield-check" size={22} class="ac-ico" />
                 <div>
                   <div class="ac-title">All clear — nothing needs you</div>
-                  <div class="ac-sub">No runs are suspended on a gate. New work will surface here.</div>
+                  <div class="ac-sub">No run is waiting on a gate. New work will surface here.</div>
                 </div>
               </div>
             }
@@ -131,13 +134,13 @@ export default function Repos() {
               <For each={inbox()}>
                 {(r) => (
                   <div class="inbox-row" onClick={() => nav(runHref(r))}>
-                    <span class="inbox-verb verb-approve">approve</span>
+                    <span class="inbox-verb verb-approve">{inboxVerb(r)}</span>
                     <span class="inbox-what">
                       <span class="inbox-msg">
-                        approve gate — run <span class="sha mono">{shortId(r.id)}</span>
+                        {inboxVerb(r)} gate — run <span class="sha mono">{shortId(r.id)}</span>
                         <Show when={tenant(r)}>{(t) => <span class="repo"> {t()}</span>}</Show>
                       </span>
-                      <span class="inbox-detail">suspended on a gate · waiting for a decision</span>
+                      <span class="inbox-detail">{inboxDetail(r)}</span>
                     </span>
                     <span class="inbox-age" title={absTime(r.created_at)}>
                       {relTime(r.created_at)}

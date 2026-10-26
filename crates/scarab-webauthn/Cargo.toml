@@ -1,0 +1,38 @@
+[package]
+name = "scarab-webauthn"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "WebAuthn Level 2 relying-party verifier for ADR-0073 step-up (passkeys, attestation \"none\")."
+
+# A library crate, not a pure-domain crate: it names `ring` (crypto) and
+# `minicbor` (the CBOR codec). It does no I/O, reads no clock and generates no
+# randomness — every challenge is supplied by the caller (ADR-0073: the
+# composition root owns the RNG).
+
+[features]
+# `scarab_webauthn::soft::SoftPasskey`: a software authenticator for tests,
+# written independently of the verifier. Never enabled in a server build.
+soft-authenticator = ["dep:rsa", "dep:rand"]
+
+[dependencies]
+ring = { workspace = true }
+minicbor = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+# Point validation at registration (src/curve.rs): P-256 on-curve and Ed25519
+# decompression. Not a new crate: num-bigint 0.4 is already in Cargo.lock.
+num-bigint = "0.4"
+# soft-authenticator only: RS256 signing and RSA key generation. The verifier
+# never touches these; it checks RS256 with ring.
+rsa = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Self dev-dependency: `cargo test -p scarab-webauthn` always builds the soft
+# authenticator, so `tests/verify.rs` can never be silently skipped by a
+# missing `--features` flag.
+scarab-webauthn = { path = ".", features = ["soft-authenticator"] }

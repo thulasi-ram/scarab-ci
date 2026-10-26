@@ -13,3 +13,7 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+# Property tests for ADR-0071's tighten-only merge and migration equivalence
+# (src/environment_governance.rs). Dev-only: a test harness never linked into a
+# binary, so it does not cross the purity boundary.
+proptest = { workspace = true }

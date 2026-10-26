@@ -252,8 +252,9 @@ cd ui/scarab-web-ui && npm run gen && npm run typecheck
 ```
 
 Full-route coverage is enforced by the test
-`every_registered_route_is_in_the_openapi_spec` — a new `.route(...)` without
-a `#[utoipa::path]` annotation fails the suite.
+`route_table_equals_the_openapi_spec` (`crates/scarab-server/tests/step_up_routes.rs`)
+— a registered route missing from the spec (no `#[utoipa::path]` annotation),
+or a spec operation with no route, fails the suite.
 
 ## License
 

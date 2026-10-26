@@ -182,12 +182,18 @@ demo-oracle ref="edge":
 
 # Run scarab-server in the FOREGROUND against the dev stack (Ctrl-C to stop).
 # Useful when iterating; `just up` runs it in the background instead. Needs the
-# stack up first (`just up`). Env comes from the one dev env file, not inline.
+# stack up first (`just up`). Env comes from the one dev env file, not inline,
+# plus what `just up` DISCOVERED (`.env.generated`, when present): the plugin
+# namespace and how a plugin Pod reaches the broker. Without it, with
+# SCARAB_PLUGINS=on, the broker peer is unset and no plugin ever runs.
 serve:
     #!/usr/bin/env bash
     set -euo pipefail
     [ -f deploy/local-proc/.env ] || { echo "==> creating deploy/local-proc/.env from .env.example"; cp deploy/local-proc/.env.example deploy/local-proc/.env; }
     set -a && source deploy/local-proc/.env && set +a
+    if [ -f deploy/local-proc/.env.generated ]; then
+      set -a && source deploy/local-proc/.env.generated && set +a
+    fi
     export KUBECONFIG=deploy/local-proc/.kubeconfig
     cargo run -p scarab-server -- --role converged --serve
 
@@ -413,6 +419,20 @@ kube-tests filter="":
       docker build -q -t "$1" "$2" >/dev/null
       kind load docker-image "$1" --name "$cluster" >/dev/null
     done
+    # The service image the uid-pinned-service case runs (git-bug 908f534). A
+    # tagged image is IfNotPresent, so a kind-loaded copy is never pulled by the
+    # node — whose Docker Hub DNS has been flaky here. Loaded as a ONE-platform
+    # archive: `kind load docker-image` imports `--all-platforms` and fails on a
+    # multi-arch pull under the containerd image store (only one platform's
+    # layers are local).
+    platform="linux/$(docker version -f '{{{{.Server.Arch}}')"
+    for img in postgres:16; do
+      docker image inspect "$img" >/dev/null 2>&1 || docker pull -q --platform "$platform" "$img" >/dev/null
+      archive="$(mktemp -t scarab-kind-image).tar"
+      docker save --platform "$platform" -o "$archive" "$img"
+      kind load image-archive "$archive" --name "$cluster" >/dev/null
+      rm -f "$archive"
+    done
     export SCARAB_TEST_CLONE_IMAGE=scarab-clone:kube-tests
     export SCARAB_TEST_SIDECAR_IMAGE=scarab-results-sidecar:kube-tests
     # 3. The plain-HTTP registry the `kind: build` case pushes to and then reads
@@ -457,13 +477,63 @@ kube-tests filter="":
     export SCARAB_TEST_KUBE=1
     echo "==> running the live tier (ns=$ns, workspace=$SCARAB_TEST_WORKSPACE_URL,"
     echo "    pod-facing=$SCARAB_TEST_WORKSPACE_POD_URL, fetcher=$SCARAB_TEST_WSFETCH_IMAGE)"
+    # Both live suites: the executor's and the plugin runtime's (ADR-0072 §9 —
+    # its isolation probe, Pod Security admission, TokenReview).
     if [ -n "{{filter}}" ]; then
-      cargo nextest run -p scarab-executor-k8s --test cluster \
+      cargo nextest run -p scarab-executor-k8s -p scarab-plugin-k8s --test cluster \
         --run-ignored all --no-fail-fast -E 'test(~{{filter}})'
     else
-      cargo nextest run -p scarab-executor-k8s --test cluster \
+      cargo nextest run -p scarab-executor-k8s -p scarab-plugin-k8s --test cluster \
         --run-ignored all --no-fail-fast
     fi
+
+# LIVE plugin-runtime tier alone (`crates/scarab-plugin-k8s/tests/cluster.rs`,
+# ADR-0072 §9/§11): the isolation probe passes on kind and FAILS once the egress
+# policies are gone; the namespace baseline refuses a non-`restricted` namespace
+# and a stray policy; Pod Security admits the plugin workload; TokenReview accepts
+# a live Pod's broker token and nothing else. Self-contained — throwaway
+# namespaces and an in-cluster fake broker — so it needs only the proc-mode kind
+# cluster, through its ISOLATED kubeconfig (the suite also refuses any context
+# that is not `kind-*`). Usage: `just plugin-kube-tests` | `just plugin-kube-tests token_review`.
+plugin-kube-tests filter="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    bash deploy/local-proc/up.sh
+    export KUBECONFIG="$PWD/deploy/local-proc/.kubeconfig"
+    ctx="$(kubectl config current-context)"
+    case "$ctx" in
+      kind-*) ;;
+      *) echo "error: refusing to run against context '$ctx' (expected kind-*)" >&2; exit 1 ;;
+    esac
+    export SCARAB_TEST_KUBE=1
+    if [ -n "{{filter}}" ]; then
+      cargo nextest run -p scarab-plugin-k8s --test cluster \
+        --run-ignored all --no-fail-fast -E 'test(~{{filter}})'
+    else
+      cargo nextest run -p scarab-plugin-k8s --test cluster \
+        --run-ignored all --no-fail-fast
+    fi
+
+# LIVE first-party Argo CD reporter (ADR-0072, ADR-0070 §11) on the proc-mode
+# kind cluster: builds the reporter image and kind-loads it, brings the stack up
+# with plugins on and the dev-only tag knob, runs a fake Argo CD on the host,
+# installs the plugin through the API, binds its connection, lists its project
+# in an Environment, and drives the fake through sync → hook failure → retries
+# exhausted → fix while polling the Environment's Deployments; then asserts the
+# isolation probe passed and that the kill switch makes the broker answer 403
+# and scales the workload to 0. Asserts the ISOLATED kubeconfig's context is
+# kind-scarab-dev before any cluster command. Leaves the stack up (`just down`).
+# Before the kill switch, the Deploy Run leg (slice b): a REAL Forgejo
+# (deploy/local-forgejo/up.sh, left running) holds `.scarab/deploy.yaml`, bound
+# declaratively via SCARAB_CONNECTIONS; Run A (r3) requests a Deployment and its
+# DeploymentGate passes when the fake syncs it, Run B (r4) fails its gate on the
+# exhausted migrate hook. PLUGIN_VERIFY_DEPLOY_RUN=0 skips it;
+# PLUGIN_VERIFY_DEPLOY_EXECUTOR=local (default) | k8s picks where `bump` runs
+# (k8s = a kind Pod + the results sidecar; NOT yet proven green live, and it
+# binds the unauthenticated dev API on 0.0.0.0 — see the script header).
+# Usage: `just plugin-verify` | `KEEP=1 just plugin-verify` (keep the fake Argo).
+plugin-verify:
+    bash deploy/local-proc/plugin-verify.sh
 
 # UI no-DOM suite (test-strategy Phase 3, base of the UI pyramid): vitest over
 # the run-detail derivations — event folding, Takes, attempts, logs, DAG layout.
@@ -483,7 +553,7 @@ ui-e2e:
 # Contract gate (mirrors the CI `openapi-drift` job, ADR-0054): regenerate the
 # OpenAPI spec and the generated TS client, then fail if either differs from
 # what is committed. Full-route coverage is asserted by the test suite
-# (every_registered_route_is_in_the_openapi_spec) — this gates DRIFT only.
+# (step_up_routes.rs: route_table_equals_the_openapi_spec) — this gates DRIFT only.
 openapi-drift:
     #!/usr/bin/env bash
     set -euo pipefail

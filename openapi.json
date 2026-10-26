@@ -103,7 +103,7 @@
         "operationId": "oauth_callback",
         "responses": {
           "302": {
-            "description": "session + CSRF cookies set; redirect to /"
+            "description": "session + CSRF cookies set; redirect to the login's `next`, else /"
           },
           "401": {
             "description": "state mismatch or bad code"
@@ -128,6 +128,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "next",
+            "in": "query",
+            "description": "a relative path to land on after the callback (ADR-0073); default `/`",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -135,7 +144,7 @@
             "description": "redirect to the provider with a state cookie"
           },
           "400": {
-            "description": "unknown provider, or several and none named"
+            "description": "unknown provider, several and none named, or a `next` that is not a relative path"
           },
           "404": {
             "description": "OAuth not configured"
@@ -280,13 +289,23 @@
             "description": "unknown kind, non-creatable kind, or a malformed base URL"
           },
           "403": {
-            "description": "requires Administer on the org"
+            "description": "requires Administer on the org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
           },
           "404": {
             "description": "no connection registry or secret store wired"
           },
           "409": {
             "description": "a connection to that forge and base URL already exists"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
           }
         },
         "security": [
@@ -332,13 +351,23 @@
             "description": "connection deleted"
           },
           "403": {
-            "description": "requires Administer on the org"
+            "description": "requires Administer on the org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
           },
           "404": {
             "description": "no such connection, or no registry wired"
           },
           "409": {
             "description": "the connection still has bound repos (Projects)"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
           }
         },
         "security": [
@@ -495,13 +524,23 @@
             "description": "missing owner/name"
           },
           "403": {
-            "description": "requires Administer on the org"
+            "description": "requires Administer on the org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
           },
           "404": {
             "description": "no such connection, or no registry wired"
           },
           "409": {
             "description": "the repo is already bound to a different connection"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
           }
         },
         "security": [
@@ -556,10 +595,20 @@
             "description": "repo unbound"
           },
           "403": {
-            "description": "requires Administer on the org"
+            "description": "requires Administer on the org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
           },
           "404": {
             "description": "no such connection, or the repo is not bound to it"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
           }
         },
         "security": [
@@ -670,11 +719,24 @@
               }
             }
           },
+          "403": {
+            "description": "`step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
           "404": {
             "description": "no such connection, or no registry/forge wired"
           },
           "409": {
             "description": "the connection is managed by configuration (read-only)"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
           },
           "501": {
             "description": "this forge adapter cannot enumerate repos"
@@ -751,7 +813,17 @@
             }
           },
           "403": {
-            "description": "not a browser session"
+            "description": "not a browser session — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
           }
         },
         "security": [
@@ -775,8 +847,361 @@
           "204": {
             "description": "unlinked"
           },
+          "403": {
+            "description": "`step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
           "409": {
             "description": "not linked, or the only way to sign in"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/me/passkeys/registration": {
+      "post": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Finish enrolling a passkey (ADR-0073 §2)",
+        "operationId": "passkey_registration",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasskeyRegistrationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PasskeyDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "challenge unknown/used/expired, or the credential failed verification (`code` names the check)"
+          },
+          "404": {
+            "description": "step-up is off"
+          },
+          "409": {
+            "description": "this credential is already registered"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/me/passkeys/registration/options": {
+      "post": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Begin enrolling a passkey (ADR-0073 §2)",
+        "operationId": "passkey_registration_options",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasskeyRegistrationOptionsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "PublicKeyCredentialCreationOptionsJSON under `public_key`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebauthnChallengeDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`fresh_login_required` (a first passkey needs a browser login from the last 5 minutes), `step_up_required` (a later passkey is always-ask), or not a browser session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "step-up is off"
+          },
+          "409": {
+            "description": "the governed state changed between this request's read and its write (reload and retry), or the request conflicts with the current state"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/me/passkeys/{id}": {
+      "delete": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Remove a passkey (ADR-0073 §2; always-ask step-up)",
+        "operationId": "remove_passkey",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "passkey id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "removed"
+          },
+          "403": {
+            "description": "`step_up_required` (mode `action`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such passkey of yours, or step-up is off"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/me/security": {
+      "get": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "My passkeys and step-up state (ADR-0073)",
+        "operationId": "me_security",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MeSecurityResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "not signed in"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/me/security/events": {
+      "get": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "My security events (ADR-0073 §7)",
+        "operationId": "my_security_events",
+        "parameters": [
+          {
+            "name": "kind",
+            "in": "query",
+            "description": "comma-separated event kinds",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "description": "only events with seq below this (paging)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "page size (default 50, max 200)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecurityEventsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "not signed in"
+          },
+          "403": {
+            "description": "an API token: it never reads its owner's security history"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/me/step-up": {
+      "post": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Confirm a step-up with a passkey (ADR-0073 §4)",
+        "operationId": "step_up_confirm",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StepUpConfirmRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpConfirmResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "challenge unknown/used/expired/another session's, unknown credential, or the assertion failed verification (`code` names the check)"
+          },
+          "403": {
+            "description": "`clone_suspected`: the passkey's counter went backwards and it is now refused for good; or not a browser session"
+          },
+          "404": {
+            "description": "step-up is off"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/me/step-up/options": {
+      "post": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Begin a step-up: a challenge that opens a 5-minute window (ADR-0073 §4)",
+        "operationId": "step_up_options",
+        "responses": {
+          "200": {
+            "description": "PublicKeyCredentialRequestOptionsJSON under `public_key`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebauthnChallengeDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`no_passkey`: enroll one first"
+          },
+          "403": {
+            "description": "not a browser session"
+          },
+          "404": {
+            "description": "step-up is off"
           }
         },
         "security": [
@@ -832,6 +1257,19 @@
         "responses": {
           "204": {
             "description": "granted"
+          },
+          "403": {
+            "description": "`step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
           }
         },
         "security": [
@@ -852,6 +1290,2154 @@
         "responses": {
           "204": {
             "description": "revoked"
+          },
+          "403": {
+            "description": "`step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/board": {
+      "get": {
+        "tags": [
+          "Deployments"
+        ],
+        "summary": "The Environment board: what is live on each DeploymentTarget (ADR-0070)",
+        "operationId": "get_environment_board",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment",
+            "in": "query",
+            "description": "Only this Environment's rows; omitted = every Environment with any\nDeployment.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/EnvironmentBoardRowDto"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "no Read on the org"
+          },
+          "404": {
+            "description": "deployments not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/environment-migration-report": {
+      "get": {
+        "tags": [
+          "Environments"
+        ],
+        "summary": "The ADR-0071 migration's split report (ADR-0071 §10 step 8)",
+        "operationId": "get_environment_migration_report",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/EnvironmentMigrationReportDto"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/environment-migration-report/{env}/acknowledge": {
+      "post": {
+        "tags": [
+          "Environments"
+        ],
+        "summary": "Acknowledge a split-report line (ADR-0071 §10 step 8)",
+        "operationId": "acknowledge_environment_migration_report",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnvironmentMigrationReportDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "no report line for that name, or not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/environments": {
+      "get": {
+        "tags": [
+          "Environments"
+        ],
+        "summary": "List an org's Environments (ADR-0071)",
+        "operationId": "list_org_environments",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/OrgEnvironmentDto"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "no Read on the org"
+          },
+          "404": {
+            "description": "org Environments not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/environments/{env}": {
+      "get": {
+        "tags": [
+          "Environments"
+        ],
+        "summary": "One org Environment (ADR-0071)",
+        "operationId": "get_org_environment",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrgEnvironmentDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "no Read on the org"
+          },
+          "404": {
+            "description": "no such Environment, or not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "Environments"
+        ],
+        "summary": "Create or replace an org Environment (ADR-0071)",
+        "operationId": "put_org_environment",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PutOrgEnvironmentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrgEnvironmentDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "invalid name, deadline or source, or a source naming no installation in the org"
+          },
+          "403": {
+            "description": "not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "org Environments not configured"
+          },
+          "409": {
+            "description": "a source is already listed by another Environment"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "Environments"
+        ],
+        "summary": "Delete an org Environment with no Deployments (ADR-0071)",
+        "description": "Refused (409) while any Project holds an overlay or privilege grant in\nit (ADR-0071 §3, §8: those are never dropped as a side effect), and while\nthe Deployment record holds anything for the name:\nthe record is keyed by name, so deleting and re-creating the Environment\nwould silently re-adopt that history under whatever the new one says.",
+        "operationId": "delete_org_environment",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "deleted"
+          },
+          "403": {
+            "description": "not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such Environment, or not configured"
+          },
+          "409": {
+            "description": "the Environment has Deployments, or project overlays or grants"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/environments/{env}/deployment-targets": {
+      "get": {
+        "tags": [
+          "Deployments"
+        ],
+        "summary": "An Environment's reported DeploymentTargets and their owners (ADR-0072)",
+        "operationId": "environment_deployment_targets",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "after_source",
+            "in": "query",
+            "description": "Start after this target — the last row of the previous page: its\n`source` …",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "after_target_id",
+            "in": "query",
+            "description": "… and its `target_id`. Both or neither.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size: default 500, at most 1000. A page shorter than this is\nthe last.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/DeploymentSourceTargetDto"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "no Read on the org"
+          },
+          "404": {
+            "description": "plugins not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/environments/{env}/deployments": {
+      "get": {
+        "tags": [
+          "Deployments"
+        ],
+        "summary": "An Environment's Deployments, newest first (ADR-0070)",
+        "operationId": "list_environment_deployments",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "target_source",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "target_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "At most this many, newest first (default 200, capped at 1000). Bounds\nthe response only: the server still folds the Environment's whole log\nto derive each status.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/DeploymentDto"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "no Read on the org"
+          },
+          "404": {
+            "description": "deployments not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/environments/{env}/deployments/{id}": {
+      "get": {
+        "tags": [
+          "Deployments"
+        ],
+        "summary": "One Deployment and its stages (ADR-0070)",
+        "operationId": "get_deployment",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Deployment id",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeploymentDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "no Read on the org"
+          },
+          "404": {
+            "description": "no such Deployment in this Environment"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/environments/{env}/eligibility": {
+      "get": {
+        "tags": [
+          "Environments"
+        ],
+        "summary": "Which projects may deploy into an org Environment (ADR-0071 §2)",
+        "operationId": "get_environment_eligibility",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnvironmentEligibilityDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "no Read on the org"
+          },
+          "404": {
+            "description": "no such Environment, or not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "Environments"
+        ],
+        "summary": "Replace which projects may deploy into an org Environment (ADR-0071 §2)",
+        "operationId": "put_environment_eligibility",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EnvironmentEligibilityDto"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnvironmentEligibilityDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "an empty or duplicated pattern, or patterns with all_projects"
+          },
+          "403": {
+            "description": "not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such Environment, or not configured"
+          },
+          "409": {
+            "description": "the governed state changed between this request's read and its write (reload and retry), or the request conflicts with the current state"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/environments/{env}/projects": {
+      "get": {
+        "tags": [
+          "Environments"
+        ],
+        "summary": "Projects with an overlay or privilege grant in an org Environment (ADR-0071 §3, §8)",
+        "operationId": "list_environment_projects",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/EnvironmentProjectDto"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "no Read on the org"
+          },
+          "404": {
+            "description": "no such Environment, or not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/environments/{env}/projects/{project}/overlay": {
+      "get": {
+        "tags": [
+          "Environments"
+        ],
+        "summary": "A project's tighten-only overlay in an org Environment (ADR-0071 §3)",
+        "operationId": "get_environment_project_overlay",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "project",
+            "in": "path",
+            "description": "project (repo) name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnvironmentProjectOverlayDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "no Read on the project"
+          },
+          "404": {
+            "description": "no such Environment, no overlay, or not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "Environments"
+        ],
+        "summary": "Tighten an org Environment for one project (ADR-0071 §3)",
+        "description": "Refused (409) for a Project the Environment does not admit and which\nholds no overlay there yet: a Project that may not deploy here has\nnothing to tighten, and an overlay pins the Environment against deletion\n(ON DELETE RESTRICT), so a stray one would let any Project admin block an\norg admin's delete. An existing overlay stays editable after eligibility\nis withdrawn.",
+        "operationId": "put_environment_project_overlay",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "project",
+            "in": "path",
+            "description": "project (repo) name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PutEnvironmentProjectOverlayRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnvironmentProjectOverlayDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "an approver who is not a Scarab user, an empty entry, a zero concurrency or an out-of-range deadline"
+          },
+          "403": {
+            "description": "not an admin of the project or org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such Environment, or not configured"
+          },
+          "409": {
+            "description": "the project is not eligible for the Environment"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "Environments"
+        ],
+        "summary": "Remove a project's overlay in an org Environment (ADR-0071 §3)",
+        "operationId": "delete_environment_project_overlay",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "project",
+            "in": "path",
+            "description": "project (repo) name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "removed"
+          },
+          "403": {
+            "description": "not an admin of the project or org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no overlay, or not configured"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/environments/{env}/projects/{project}/privilege-grant": {
+      "get": {
+        "tags": [
+          "Environments"
+        ],
+        "summary": "A project's privilege grant in an org Environment (ADR-0071 §8)",
+        "operationId": "get_environment_project_privilege_grant",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "project",
+            "in": "path",
+            "description": "project (repo) name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnvironmentProjectPrivilegeGrantDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "no Read on the org"
+          },
+          "404": {
+            "description": "no such Environment, no grant, or not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "Environments"
+        ],
+        "summary": "Grant a project privileges in an org Environment (ADR-0071 §8)",
+        "operationId": "put_environment_project_privilege_grant",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "project",
+            "in": "path",
+            "description": "project (repo) name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PutEnvironmentProjectPrivilegeGrantRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnvironmentProjectPrivilegeGrantDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "a digest that is not `sha256:…`, or one listed twice"
+          },
+          "403": {
+            "description": "not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such Environment, or not configured"
+          },
+          "409": {
+            "description": "the governed state changed between this request's read and its write (reload and retry), or the request conflicts with the current state"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "Environments"
+        ],
+        "summary": "Withdraw a project's privilege grant in an org Environment (ADR-0071 §8)",
+        "operationId": "delete_environment_project_privilege_grant",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "project",
+            "in": "path",
+            "description": "project (repo) name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "withdrawn"
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "no grant, or not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/environments/{env}/protection": {
+      "get": {
+        "tags": [
+          "Environments"
+        ],
+        "summary": "An org Environment's baseline protection rules (ADR-0071 §1)",
+        "operationId": "get_environment_protection",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnvironmentProtectionRulesDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "no Read on the org"
+          },
+          "404": {
+            "description": "no such Environment, or not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "Environments"
+        ],
+        "summary": "Replace an org Environment's baseline protection rules (ADR-0071 §1)",
+        "operationId": "put_environment_protection",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PutEnvironmentProtectionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrgEnvironmentDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "an approver who is not a Scarab user, an empty entry, or a zero concurrency"
+          },
+          "403": {
+            "description": "not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such Environment, or not configured"
+          },
+          "409": {
+            "description": "the governed state changed between this request's read and its write (reload and retry), or the request conflicts with the current state"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/members/{subject}/passkeys/reset": {
+      "post": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Reset a member's passkeys (ADR-0073 §10; Owner, always-ask step-up)",
+        "operationId": "reset_member_passkeys",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "subject",
+            "in": "path",
+            "description": "the member's principal id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PasskeyResetDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`step_up_required` (mode `action`); not an Owner of the Org; or the member also belongs to an Org you do not own (not named)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member of the Org, or step-up is off"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/plugin-catalog": {
+      "get": {
+        "tags": [
+          "Plugins"
+        ],
+        "summary": "The installable (first-party) plugins (ADR-0072)",
+        "operationId": "plugin_catalog",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PluginCatalogEntryDto"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "plugins not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/plugins": {
+      "get": {
+        "tags": [
+          "Plugins"
+        ],
+        "summary": "List an org's plugin installations (ADR-0072)",
+        "operationId": "list_plugins",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PluginInstallationDto"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "plugins not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "Plugins"
+        ],
+        "summary": "Install a first-party plugin (ADR-0072)",
+        "description": "Third-party installs are off (403), and so are installs while\n`SCARAB_PLUGINS=off` (409). The response lists any Environment source\nthat already named this installation — written before it existed — which\nit now feeds.",
+        "operationId": "install_plugin",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InstallPluginRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginInstallationDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "invalid name or config"
+          },
+          "403": {
+            "description": "not an org admin, or not a first-party plugin pinned by digest — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "plugins not configured"
+          },
+          "409": {
+            "description": "the name is taken or retired, or plugins are off"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/plugins/{name}": {
+      "get": {
+        "tags": [
+          "Plugins"
+        ],
+        "summary": "One plugin installation (ADR-0072)",
+        "operationId": "get_plugin",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "installation name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginInstallationDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "no such installation, or plugins not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "Plugins"
+        ],
+        "summary": "Uninstall a plugin; its name is retired (ADR-0072)",
+        "operationId": "uninstall_plugin",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "installation name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UninstalledPluginDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "no such installation, or plugins not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/plugins/{name}/connections": {
+      "get": {
+        "tags": [
+          "Plugins"
+        ],
+        "summary": "A plugin's connection slots and their bindings (ADR-0072 §5)",
+        "operationId": "list_plugin_connections",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "installation name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PluginConnectionDto"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "no such installation, or plugins not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/plugins/{name}/connections/{slot}": {
+      "put": {
+        "tags": [
+          "Plugins"
+        ],
+        "summary": "Bind a plugin connection's destination and credential (ADR-0072 §5)",
+        "description": "The credential is written through to the secret store under a fresh\nserver-minted key and is never readable back; the previous binding's\ncredential is deleted once the new binding is stored. A response stream\nthe plugin has open on the old binding is cut within seconds.",
+        "operationId": "put_plugin_connection",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "installation name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "slot",
+            "in": "path",
+            "description": "the manifest's connection slot",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PutPluginConnectionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginConnectionDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "unknown slot, or a malformed base URL, credential or CA"
+          },
+          "403": {
+            "description": "not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such installation, or plugins or the secret store not configured"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "Plugins"
+        ],
+        "summary": "Unbind a plugin connection and delete its credential (ADR-0072 §5)",
+        "operationId": "delete_plugin_connection",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "installation name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "slot",
+            "in": "path",
+            "description": "the manifest's connection slot",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "unbound"
+          },
+          "400": {
+            "description": "unknown slot"
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "no such installation or binding, or plugins not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/plugins/{name}/enable": {
+      "post": {
+        "tags": [
+          "Plugins"
+        ],
+        "summary": "Re-enable a killed plugin installation (ADR-0072)",
+        "operationId": "enable_plugin",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "installation name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginInstallationDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such installation, or plugins not configured"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/plugins/{name}/kill": {
+      "post": {
+        "tags": [
+          "Plugins"
+        ],
+        "summary": "Kill a plugin installation at once (ADR-0072)",
+        "operationId": "kill_plugin",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "installation name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginInstallationDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "no such installation, or plugins not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/plugins/{name}/unmapped-groupings": {
+      "get": {
+        "tags": [
+          "Plugins"
+        ],
+        "summary": "A plugin's vendor groupings no Environment lists (ADR-0071 §5)",
+        "operationId": "unmapped_groupings",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "installation name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "description": "Start after this grouping — the last one of the previous page.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size: default 500, at most 1000. A page shorter than this is\nthe last.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/UnmappedGroupingDto"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "no such installation, or plugins not configured"
           }
         },
         "security": [
@@ -898,6 +3484,128 @@
           },
           "403": {
             "description": "not an org admin"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/security/events": {
+      "get": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "An Org's security event log (ADR-0073 §7)",
+        "operationId": "org_security_events",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "kind",
+            "in": "query",
+            "description": "comma-separated event kinds",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "description": "only events with seq below this (paging)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "page size (default 50, max 200)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecurityEventsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "not signed in"
+          },
+          "403": {
+            "description": "not an admin of the Org"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/security/summary": {
+      "get": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "An Org's step-up posture: admins without a passkey, recent refusals (ADR-0073 §8)",
+        "operationId": "org_security_summary",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrgSecuritySummary"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "not signed in"
+          },
+          "403": {
+            "description": "not an admin of the Org"
           }
         },
         "security": [
@@ -1000,10 +3708,20 @@
             "description": "bad role, name, or lifetime, or the role exceeds the minter's"
           },
           "403": {
-            "description": "not an admin of the target scope, or the caller is itself a token"
+            "description": "not an admin of the target scope, or the caller is itself a token — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
           },
           "404": {
             "description": "API tokens not configured"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
           }
         },
         "security": [
@@ -1118,8 +3836,21 @@
               }
             }
           },
+          "403": {
+            "description": "`step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
           "409": {
             "description": "no login provider is associated with this repo's forge"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
           },
           "501": {
             "description": "the forge adapter cannot list collaborators"
@@ -1182,6 +3913,9 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "the caller may not dispatch, or the pipeline's Environment does not exist in the org or does not admit this project (ADR-0071); the body says what an org admin must do. No run is created"
           }
         },
         "security": [
@@ -1199,11 +3933,41 @@
         "tags": [
           "Environments"
         ],
-        "summary": "List a repo's environments",
+        "summary": "The environments this project may deploy into, with baseline/overlay/effective rules (ADR-0071)",
         "operationId": "list_environments",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "repo owner",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "repo name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
-            "description": "the environments"
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ProjectEnvironmentDto"
+                  }
+                }
+              }
+            }
           }
         },
         "security": [
@@ -1221,14 +3985,50 @@
         "tags": [
           "Environments"
         ],
-        "summary": "One environment's protection rules",
+        "summary": "One environment as this project sees it: baseline, overlay, effective (ADR-0071)",
         "operationId": "get_environment",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "repo owner",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "repo name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
-            "description": "the environment"
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectEnvironmentDto"
+                }
+              }
+            }
           },
           "404": {
-            "description": "unknown"
+            "description": "unknown, or not this project's"
           }
         },
         "security": [
@@ -1244,11 +4044,40 @@
         "tags": [
           "Environments"
         ],
-        "summary": "Create/replace a protected environment (ADR-0024/0037)",
+        "summary": "Retired: per-repo environments are org-level Environments now (ADR-0071)",
         "operationId": "put_environment",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "repo owner",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "repo name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
-          "200": {
-            "description": "stored"
+          "410": {
+            "description": "gone; the body says where it went"
           }
         },
         "security": [
@@ -1264,11 +4093,40 @@
         "tags": [
           "Environments"
         ],
-        "summary": "Delete an environment (idempotent)",
+        "summary": "Retired: per-repo environments are org-level Environments now (ADR-0071)",
         "operationId": "delete_environment",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "repo owner",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "repo name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
-          "204": {
-            "description": "deleted"
+          "410": {
+            "description": "gone; the body says where it went"
           }
         },
         "security": [
@@ -1286,8 +4144,37 @@
         "tags": [
           "Environments"
         ],
-        "summary": "An environment's deployment history (ADR-0037)",
+        "summary": "Legacy approval history (ADR-0070 §1)",
         "operationId": "list_deployments",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "repo owner",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "repo name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Environment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "most recent first"
@@ -1966,7 +4853,7 @@
         "tags": [
           "Runs"
         ],
-        "summary": "Approve a `manual` gate (ADR-0008, 0037). The authenticated principal's\napproval is recorded on the event log (append-only, idempotent). For a\n**deploy** run (one with a target environment), the gate is released only\nonce the accumulated approvers satisfy the environment's protection rules\n(`admits`); on release the deployment is written to history. A plain gate (no\nenvironment) releases on the first approval. Authz'd as a write.",
+        "summary": "Approve a `manual` gate (ADR-0008, 0037). The authenticated principal's\napproval is recorded on the event log (append-only, idempotent). For a\n**deploy** run (one with a target environment), the gate is released only\nonce the accumulated approvers satisfy the Environment's effective rules for\nthe run's Project (ADR-0071 §3, `admits`); on release the deployment is\nwritten to the legacy history. If the Environment no longer exists or no\nlonger admits the Project, the gate does not release (409). A plain gate (no\nenvironment) releases on the first approval. Authz'd as a write.",
         "operationId": "approve_gate",
         "parameters": [
           {
@@ -1992,8 +4879,86 @@
           "202": {
             "description": "approval recorded (released or awaiting more approvals)"
           },
+          "403": {
+            "description": "`step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
           "404": {
             "description": "no such run or gate"
+          },
+          "409": {
+            "description": "not an approvable gate (not a manual gate, not pending, or not reached yet), or the run's Environment no longer exists or no longer admits its project"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/runs/{id}/gates/{step}/reject": {
+      "post": {
+        "tags": [
+          "Runs"
+        ],
+        "summary": "Reject a waiting gate: fail it with a reason (ADR-0070 §9).",
+        "description": "For any gate — `manual`, `timer`, `external` or `deployment` — that is\npending and reached (every step it needs has succeeded; slice b, criteria 2\nand 3). A deployment gate can only be rejected, never approved or\nreleased: core passes it from the Deployment record. The gate's Attempt fails with\nthe reason and the rejecting principal, its dependents are skipped, and the\nrun ends `failed`; retrying the gate opens a new wait that asks again.\n\nAuthz'd as a run write, the same as approve. A reject only ever stops a\ndeploy — any writer can already cancel the run — so it does NOT consult the\nEnvironment's approver rules, and it works when the Environment is gone or\nno longer admits the project: the clean way out of a held gate.",
+        "operationId": "reject_gate",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "run id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "step",
+            "in": "path",
+            "description": "gate step id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RejectGateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "this call rejected the gate: `{\"rejected\": true}`"
+          },
+          "400": {
+            "description": "missing, empty or over-long reason"
+          },
+          "404": {
+            "description": "no such run or step"
+          },
+          "409": {
+            "description": "not a rejectable gate, not pending, or not reached yet"
           }
         },
         "security": [
@@ -2011,7 +4976,8 @@
         "tags": [
           "Runs"
         ],
-        "summary": "Release an **external** gate by presenting its token (ADR-0034) — the path an\noutside system (a deploy webhook, a change-management tool) uses instead of an\ninteractive approval. The token is `HMAC-SHA256(secret, \"{run}:{step}\")`\n(`sha256=<hex>`), verified in constant time; no per-gate storage. The endpoint\nis 404 when no token secret is configured, and only releases gates of kind\n`external` (manual gates stay approval-only).",
+        "summary": "Release an **external** gate by presenting its token (ADR-0034) — the path an\noutside system (a deploy webhook, a change-management tool) uses instead of an\ninteractive approval. The token is `HMAC-SHA256(secret, \"{run}:{step}\")`\n(`sha256=<hex>`), verified in constant time; no per-gate storage. The endpoint\nis 404 when no token secret is configured, and only releases gates of kind\n`external` (manual gates stay approval-only). In a Deploy Run, the gate is\nheld (409) when the run's Environment no longer exists or no longer admits\nits Project (ADR-0071 §2) — the same check `approve_gate` makes. The token\nproves who is releasing, not that the deploy is still allowed.",
+        "description": "The same token can instead **fail** the gate with a reason: a body of\n`{\"passed\": false, \"reason\": \"…\"}` rejects it (journalled `by\nexternal:{step}`). A fail is never held — it only stops the deploy — so it\nskips the Environment check. No body, or `\"passed\": true`, is a release.",
         "operationId": "release_gate_external",
         "parameters": [
           {
@@ -2033,15 +4999,38 @@
             }
           }
         ],
+        "requestBody": {
+          "description": "optional: `{\"passed\": false, \"reason\": \"…\"}` fails the gate instead of releasing it",
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ExternalGateVerdict"
+                  }
+                ]
+              }
+            }
+          }
+        },
         "responses": {
           "202": {
-            "description": "gate released"
+            "description": "gate released (or, with a fail body, failed)"
+          },
+          "400": {
+            "description": "malformed body, or a fail without a 1..1024-byte reason"
           },
           "401": {
             "description": "bad or missing token"
           },
           "404": {
             "description": "no such external gate, or token release disabled"
+          },
+          "409": {
+            "description": "the gate is not pending or not reached yet, or (a release) the run's Environment no longer exists or no longer admits its project"
           }
         },
         "security": [
@@ -2664,7 +5653,7 @@
           "Runs"
         ],
         "summary": "Ingest a step's named results (ADR-0040/0042): the trusted per-Pod egress\nsidecar POSTs `{ name: value, … }` here, authenticated by a fence-scoped\ntoken, and the control plane persists them to `step_runs.results`. The\nuntrusted step never calls this — only the sidecar holds the token.",
-        "description": "404 when no token secret is configured; 401 on a bad/missing token; 404 for\nan unknown step; 413 for an over-large body. The write is idempotent on the\nfence (a re-drive overwrites deterministically, ADR-0021).",
+        "description": "404 when no token secret is configured; 401 on a bad/missing token; 404 for\nan unknown step; 413 for an over-large body; 409 when the attempt is no\nlonger the step's running frontier. The write is idempotent on the fence\n(a re-drive overwrites deterministically, ADR-0021).",
         "operationId": "ingest_step_results",
         "parameters": [
           {
@@ -2695,6 +5684,9 @@
           },
           "404": {
             "description": "no such step, or results ingest disabled"
+          },
+          "409": {
+            "description": "the attempt is not the step's running frontier"
           }
         },
         "security": [
@@ -2975,8 +5967,21 @@
           "204": {
             "description": "secret stored"
           },
+          "403": {
+            "description": "`step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
           "404": {
             "description": "secrets not configured"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
           }
         },
         "security": [
@@ -3036,8 +6041,254 @@
           "204": {
             "description": "deleted (idempotent)"
           },
+          "403": {
+            "description": "`step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
           "404": {
             "description": "secrets not configured"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/security/events": {
+      "get": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "The install-wide security event log (ADR-0073 §7)",
+        "operationId": "security_events",
+        "parameters": [
+          {
+            "name": "kind",
+            "in": "query",
+            "description": "comma-separated event kinds",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "description": "only events with seq below this (paging)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "page size (default 50, max 200)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecurityEventsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "not signed in"
+          },
+          "403": {
+            "description": "not a global administrator"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/step-up/requests/{id}": {
+      "get": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "A step-up confirmation request (ADR-0073 §6)",
+        "operationId": "get_request",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "request id (from `confirmation_url`)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRequestDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "not signed in"
+          },
+          "404": {
+            "description": "no such request, or you are neither its human nor its requester; or step-up is off"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/step-up/requests/{id}/confirm": {
+      "post": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Confirm a step-up confirmation request: it runs once (ADR-0073 §6)",
+        "operationId": "confirm_request",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "request id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StepUpConfirmRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "it ran; `state` says whether the operation succeeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRequestResultDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "challenge unknown/used/expired/for another request, or the assertion failed verification (`code` names the check)"
+          },
+          "403": {
+            "description": "not a browser session, or `clone_suspected`"
+          },
+          "404": {
+            "description": "no such request of yours, or step-up is off"
+          },
+          "409": {
+            "description": "already confirmed — it ran (or is running) once"
+          },
+          "410": {
+            "description": "expired"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/step-up/requests/{id}/options": {
+      "post": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Begin confirming a step-up confirmation request (ADR-0073 §6)",
+        "operationId": "request_options",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "request id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "PublicKeyCredentialRequestOptionsJSON under `public_key`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebauthnChallengeDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`no_passkey`: enroll one first"
+          },
+          "403": {
+            "description": "not a browser session"
+          },
+          "404": {
+            "description": "no such request of yours, or step-up is off"
+          },
+          "409": {
+            "description": "already confirmed"
+          },
+          "410": {
+            "description": "expired"
           }
         },
         "security": [
@@ -3215,7 +6466,7 @@
               "string",
               "null"
             ],
-            "description": "Coarse failure kind when `failed`: `infra` | `step` | `timeout` | `lost`\n| `config` | `missing-inputs` (an input snapshot gone from every tier —\nRerun/Retry regenerates it; ticket e140121)."
+            "description": "Coarse failure kind when `failed`: `infra` | `step` | `timeout` | `lost`\n| `config` | `missing-inputs` (an input snapshot gone from every tier —\nRerun/Retry regenerates it; ticket e140121) | `gate` (a gate's wait\nresolved failed — e.g. not released within `gate_expires_after`; the\nreason is in `failure_detail`) | `deployment-request-incomplete` (the\nstep exited 0 but its results could not complete a DeploymentRequest\nit declares; never auto-retried; what is missing is in\n`failure_detail`)."
           },
           "failure_detail": {
             "type": [
@@ -3587,6 +6838,32 @@
           }
         }
       },
+      "ConnectionSlotDto": {
+        "type": "object",
+        "description": "A named external system the plugin reaches through the broker.",
+        "required": [
+          "name",
+          "auth_schemes",
+          "read_rules"
+        ],
+        "properties": {
+          "auth_schemes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "name": {
+            "type": "string"
+          },
+          "read_rules": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RequestRuleDto"
+            }
+          }
+        }
+      },
       "ConsumedDto": {
         "type": "object",
         "description": "What an attempt consumed (ADR-0056): the map `upstream step id → attempt\nid` stamped at its launch — the durable answer to \"which generation of\n`build` did `test` actually build on?\" after a mid-run restart leaves the\nrun a patchwork of attempt generations. `attempt` names the attempt the\nmap belongs to; empty map = nothing recorded (no upstream evidence, or a\npre-ADR-0056 attempt).",
@@ -3687,6 +6964,342 @@
           }
         }
       },
+      "DeploymentDto": {
+        "type": "object",
+        "description": "One Deployment: a DeploymentVersion made (or asked to be made) live on a\nDeploymentTarget, and what was reported about it since (ADR-0070 §2).",
+        "required": [
+          "id",
+          "target",
+          "version",
+          "status",
+          "requesters",
+          "reports",
+          "created_at",
+          "was_ever_live",
+          "unexplained",
+          "unconfirmed"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix-ms."
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Org-scoped and stable: the sequence number of the input that created\nit.",
+            "minimum": 0
+          },
+          "reports": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DeploymentStatusReportDto"
+            },
+            "description": "The stages, oldest first."
+          },
+          "requesters": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DeploymentRequesterDto"
+            },
+            "description": "In the order their requests arrived, claims included. Who made it\nlive is the requesters that are not claims; `unexplained` says\nwhether there is one."
+          },
+          "status": {
+            "$ref": "#/components/schemas/DeploymentStatusDto"
+          },
+          "superseded_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix-ms a newer Deployment took its place, if one has."
+          },
+          "target": {
+            "$ref": "#/components/schemas/DeploymentTargetDto"
+          },
+          "unconfirmed": {
+            "type": "boolean",
+            "description": "Display term: requested on a DeploymentTarget its source has never\nreported on."
+          },
+          "unexplained": {
+            "type": "boolean",
+            "description": "Display term: no Deploy Run's request explains it — a change made\noutside Scarab. It may still carry claims."
+          },
+          "version": {
+            "type": "string",
+            "description": "Opaque, in the source's scheme; compared only for equality."
+          },
+          "was_ever_live": {
+            "type": "boolean",
+            "description": "Whether it was ever reported live."
+          }
+        }
+      },
+      "DeploymentGateDto": {
+        "type": "object",
+        "description": "A waiting DeploymentGate: the DeploymentTarget it waits on and, once its\nrequester's DeploymentRequest is in the record, where that Deployment\nstands (as the Deployments view folds it).",
+        "required": [
+          "environment",
+          "target_source",
+          "target_id"
+        ],
+        "properties": {
+          "deployment_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The Deployment the requester's current request landed on.",
+            "minimum": 0
+          },
+          "deployment_status": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DeploymentStatusDto",
+                "description": "The Deployment's own status — on its Environment's **baseline**\ndeadline, over the Deployment's lifetime, as the Deployments page\nshows it. Not the gate's clock: a Retry waits afresh while this can\nalready read `stalled` (see `fails_at`)."
+              }
+            ]
+          },
+          "environment": {
+            "type": "string"
+          },
+          "fails_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When this gate fails `stalled` if nothing decisive is reported first\n(epoch millis): its wait's window opening plus its Project's effective\ngate deadline — the engine's own computation (git-bug `ec84c5d`).\nAbsent when unknown (no Deployment, or the deadline could not be read)."
+          },
+          "latest_label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The latest source report's label, when it has one."
+          },
+          "record_unreadable": {
+            "type": "boolean",
+            "description": "`true` when the Deployment record could not be read for this view (a\nstore error, logged): the Deployment fields are then absent because\nthey are unknown, not because no Deployment is recorded. Omitted when\n`false`."
+          },
+          "target_id": {
+            "type": "string"
+          },
+          "target_source": {
+            "type": "string"
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The DeploymentVersion asked for."
+          }
+        }
+      },
+      "DeploymentRequesterDto": {
+        "type": "object",
+        "description": "A Deploy Run step that requested a Deployment.",
+        "required": [
+          "run",
+          "step",
+          "effective_at",
+          "claim",
+          "evidence"
+        ],
+        "properties": {
+          "claim": {
+            "type": "boolean",
+            "description": "Only a claim: the request joined a Deployment a source report created,\nand its Step started after Scarab first saw that Deployment — so it\ndid not make it live and does not explain it (ADR-0070 §2)."
+          },
+          "effective_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix-ms the requesting Step started."
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "What the Step offered as evidence for the change — image digests,\ntypically — read from its results (ADR-0070 §7). Shown, never used to\ncorrelate; empty when it declared none."
+          },
+          "project": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Project the run belongs to, when it is stamped and in this Org —\nwhat a link to the run (`/{org}/{project}/runs/{run}`) needs."
+          },
+          "run": {
+            "type": "string"
+          },
+          "step": {
+            "type": "string"
+          }
+        }
+      },
+      "DeploymentSourceTargetDto": {
+        "type": "object",
+        "description": "A DeploymentTarget a source reports into an Environment — one whose\ngrouping the Environment lists NOW: who reports it, its owners and\ndeclared version scheme, and its last status as reported HERE.",
+        "required": [
+          "source",
+          "principal",
+          "target_id",
+          "vendor_grouping",
+          "owner_projects",
+          "resend",
+          "last_sequence",
+          "updated_at"
+        ],
+        "properties": {
+          "last_label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_sequence": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "last_status": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`in_progress` / `live` / `failed`, as last reported here."
+          },
+          "last_version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The last status reported into THIS Environment; absent when its last\nstatus went elsewhere (or nowhere) — a status recorded in another\nEnvironment is never shown as this one's."
+          },
+          "owner_projects": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Projects (`org/repo`) that own the target, as the source last said."
+          },
+          "owners_reported_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix-ms the owners were last reported."
+          },
+          "principal": {
+            "type": "string",
+            "description": "`plugin:<name>`."
+          },
+          "resend": {
+            "type": "boolean",
+            "description": "Its source owes a re-send here: the grouping was mapped or moved into\nthis Environment after its last status. A running reporter re-sends\nwithin about a minute (ADR-0070 §11), and it appears on the board."
+          },
+          "source": {
+            "type": "string",
+            "description": "The reporting installation's name — the target's `source`."
+          },
+          "target_id": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix-ms."
+          },
+          "vendor_grouping": {
+            "type": "string"
+          },
+          "version_scheme": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "DeploymentStatusDto": {
+        "type": "string",
+        "description": "A Deployment's fixed, vendor-neutral status (ADR-0070 §5).",
+        "enum": [
+          "requested",
+          "in_progress",
+          "live",
+          "failed",
+          "stalled",
+          "superseded"
+        ]
+      },
+      "DeploymentStatusReportDto": {
+        "type": "object",
+        "description": "One stage of a Deployment as its source reported it.",
+        "required": [
+          "status",
+          "label",
+          "at"
+        ],
+        "properties": {
+          "at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix-ms Scarab received the report — the time the record is ordered by."
+          },
+          "label": {
+            "type": "string",
+            "description": "Free-form; shown, never interpreted."
+          },
+          "link": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where the source shows this stage. Only an `http`/`https` URL is\npassed on; any other scheme reads as absent."
+          },
+          "source_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix-ms the source stamped on it, by its own clock. Display only.\nPresent on every recorded report."
+          },
+          "status": {
+            "$ref": "#/components/schemas/SourceAssertedStatusDto"
+          }
+        }
+      },
+      "DeploymentTargetDto": {
+        "type": "object",
+        "description": "The smallest unit a Deployment can independently succeed or fail on.\n`source` + `id` are opaque and source-supplied.",
+        "required": [
+          "environment",
+          "source",
+          "id"
+        ],
+        "properties": {
+          "environment": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          }
+        }
+      },
       "DispatchKind": {
         "type": "string",
         "description": "Which trigger a dispatch opts into: a human [`Manual`](DispatchKind::Manual)\ndispatch (the default) or its programmatic [`Api`](DispatchKind::Api) sibling\n(ADR-0043 §4). The named pipeline must declare the matching `on:` trigger to\nbe dispatchable.",
@@ -3728,6 +7341,401 @@
           }
         }
       },
+      "EffectiveProtectionDto": {
+        "type": "object",
+        "description": "The rules admission enforces for one Project in one Environment: the\nbaseline merged with the Project's overlay (ADR-0071 §3), computed by the\nserver so no client re-implements the merge.",
+        "required": [
+          "approvers",
+          "allowed_ref_layers",
+          "wait_timer_s",
+          "require_reason",
+          "deployment_gate_deadline_ms"
+        ],
+        "properties": {
+          "allowed_ref_layers": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "description": "One list per layer (baseline first, then overlay): a ref must match\n**every** non-empty layer. Never pre-intersected — `[main]` and\n`[tags/*]` intersect to `[]`, which would read as \"any ref\"."
+          },
+          "approvers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Baseline approvers, then the overlay's not already listed — all required."
+          },
+          "deployment_concurrency": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "deployment_gate_deadline_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The deadline this Project's DeploymentGates use."
+          },
+          "require_reason": {
+            "type": "boolean"
+          },
+          "wait_timer_s": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "EnvironmentBoardRowDto": {
+        "type": "object",
+        "description": "One DeploymentTarget's line on the Environment board.",
+        "required": [
+          "target"
+        ],
+        "properties": {
+          "live": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DeploymentDto",
+                "description": "What is live there now, if anything — as this Environment's record\nlast heard. When `moved_away` is set it is history: the last thing\nreported live HERE, not what this Environment runs now."
+              }
+            ]
+          },
+          "moved_away": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MovedAwayDto",
+                "description": "Display term **Moved** (ADR-0070 §3), not a status: the target's\nsource now routes it to another Environment, or to none. Its record\nhere is untouched; a request for it here waits, and stalls, because\nits reports now land elsewhere."
+              }
+            ]
+          },
+          "newest": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DeploymentDto",
+                "description": "The newest Deployment, only when it is not the live one — a change in\nflight, stalled or failed."
+              }
+            ]
+          },
+          "target": {
+            "$ref": "#/components/schemas/DeploymentTargetDto"
+          }
+        }
+      },
+      "EnvironmentDeploymentSourceDto": {
+        "type": "object",
+        "description": "A source allowed to report into an Environment (ADR-0071 §5).",
+        "required": [
+          "installation",
+          "vendor_grouping"
+        ],
+        "properties": {
+          "installation": {
+            "type": "string",
+            "description": "The PluginInstallation's name: a DNS-1123 label (lowercase letters,\ndigits, `-`; at most 63), installed in this org — a PUT naming one\nthat is not is refused (400)."
+          },
+          "vendor_grouping": {
+            "type": "string",
+            "description": "The vendor's grouping that maps into this Environment (an Argo CD\nproject, say). Opaque; matched exactly, no wildcards. No leading or\ntrailing whitespace (refused, never trimmed)."
+          }
+        },
+        "additionalProperties": false
+      },
+      "EnvironmentEligibilityDto": {
+        "type": "object",
+        "description": "Which Projects may run Deploy Runs into an Environment (ADR-0071 §2):\nevery Project in the org, or exactly those matching one of `projects`\n(project-name globs, `*` wildcards).",
+        "required": [
+          "all_projects"
+        ],
+        "properties": {
+          "all_projects": {
+            "type": "boolean",
+            "description": "Every Project in the org. `projects` must then be empty."
+          },
+          "projects": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Project-name globs. An empty list with `all_projects: false` admits\n**no** Project — eligibility starts closed."
+          }
+        },
+        "additionalProperties": false
+      },
+      "EnvironmentMigrationReportDto": {
+        "type": "object",
+        "description": "One line of the split report: an Environment name merged across several\nProjects, or created with eligibility *all projects* because no Project\ndefined it. If the merged Projects really meant different places (one\n`prod` that is `prod-eu`), the split is a YAML change: those Projects\nrename their `environment:` and an org admin creates the new\nEnvironment — nothing is renamed for them.",
+        "required": [
+          "environment",
+          "merged_projects",
+          "referenced_only",
+          "referencing_projects",
+          "differing_rules",
+          "environment_exists",
+          "permissive_baseline",
+          "projects",
+          "created_at"
+        ],
+        "properties": {
+          "acknowledged_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix-ms; absent until an admin acknowledges the line."
+          },
+          "acknowledged_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix-ms."
+          },
+          "differing_rules": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The legacy rules the merged Projects disagreed on, by ADR-0037 field\nname (`approvers`, `allowed_refs`, `wait_timer`, `require_reason`,\n`privileged_images`, `permit_k8s_overlay`). Lists compare as sets."
+          },
+          "environment": {
+            "type": "string"
+          },
+          "environment_exists": {
+            "type": "boolean",
+            "description": "The Environment still exists."
+          },
+          "merged_projects": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "permissive_baseline": {
+            "type": "boolean",
+            "description": "Its baseline is still the permissive one the migration gave it:\nnothing org-wide protects it yet — set a baseline."
+          },
+          "projects": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EnvironmentMigrationReportProjectDto"
+            }
+          },
+          "referenced_only": {
+            "type": "boolean",
+            "description": "No Project defined it: migrated with eligibility *all projects*."
+          },
+          "referencing_projects": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Projects whose Runs named it without defining it."
+          }
+        }
+      },
+      "EnvironmentMigrationReportProjectDto": {
+        "type": "object",
+        "description": "One Project in a split-report line: what it had, and what it has now.",
+        "required": [
+          "project"
+        ],
+        "properties": {
+          "legacy": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LegacyProtectionRulesDto",
+                "description": "Its per-repo rules before the migration; absent for a Project whose\nRuns only named the Environment."
+              }
+            ]
+          },
+          "overlay": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EnvironmentProjectOverlayDto",
+                "description": "Its overlay now (the migration wrote it from `legacy`; it may have\nbeen changed or removed since)."
+              }
+            ]
+          },
+          "project": {
+            "type": "string"
+          }
+        }
+      },
+      "EnvironmentProjectDto": {
+        "type": "object",
+        "description": "One Project's standing in one Environment, for the Environment's admin.",
+        "required": [
+          "project",
+          "eligible"
+        ],
+        "properties": {
+          "eligible": {
+            "type": "boolean",
+            "description": "Whether the Environment's eligibility admits it now."
+          },
+          "overlay": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EnvironmentProjectOverlayDto"
+              }
+            ]
+          },
+          "privilege_grant": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EnvironmentProjectPrivilegeGrantDto"
+              }
+            ]
+          },
+          "project": {
+            "type": "string"
+          }
+        }
+      },
+      "EnvironmentProjectOverlayDto": {
+        "type": "object",
+        "description": "A Project's overlay as stored.",
+        "required": [
+          "approvers",
+          "allowed_refs",
+          "wait_timer_s",
+          "require_reason"
+        ],
+        "properties": {
+          "allowed_refs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "approvers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "deployment_concurrency": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "deployment_gate_deadline_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "require_reason": {
+            "type": "boolean"
+          },
+          "wait_timer_s": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "EnvironmentProjectPrivilegeGrantDto": {
+        "type": "object",
+        "description": "The privileges one Project holds within one Environment (ADR-0071 §8).",
+        "required": [
+          "privileged_images",
+          "permit_k8s_overlay"
+        ],
+        "properties": {
+          "permit_k8s_overlay": {
+            "type": "boolean"
+          },
+          "privileged_images": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ImageGrantDto"
+            }
+          }
+        }
+      },
+      "EnvironmentProtectionRulesDto": {
+        "type": "object",
+        "description": "Protection rules as one layer holds them — an Environment's baseline or a\nProject's overlay (ADR-0071 §1, §3).",
+        "required": [
+          "approvers",
+          "allowed_refs",
+          "wait_timer_s",
+          "require_reason"
+        ],
+        "properties": {
+          "allowed_refs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Ref globs a deploy's symbolic ref must match; empty = any ref."
+          },
+          "approvers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Principal ids; every one must approve (AND)."
+          },
+          "deployment_concurrency": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "In-flight Deployments per DeploymentTarget; absent = no limit.\nEnforced once deployment requests ship (ADR-0071 §9).",
+            "minimum": 0
+          },
+          "require_reason": {
+            "type": "boolean",
+            "description": "A human dispatch must carry a reason (ADR-0057 §3)."
+          },
+          "wait_timer_s": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Seconds. Carried and merged, not yet enforced (git-bug 2b94989).",
+            "minimum": 0
+          }
+        }
+      },
       "ExpiredInputDto": {
         "type": "object",
         "description": "One expired Workspace Snapshot behind a widened rerun (ADR-0061 s5).",
@@ -3751,6 +7759,70 @@
           }
         }
       },
+      "ExternalGateVerdict": {
+        "type": "object",
+        "description": "Optional `POST /v1/runs/{id}/gates/{step}/release` body: an external gate's\nverdict. Absent (or `passed: true`) releases the gate; `passed: false`\nfails it with `reason`.",
+        "properties": {
+          "passed": {
+            "type": "boolean",
+            "description": "`false` fails the gate; `true` (the default) releases it."
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the gate failed — required (1 to 1024 bytes, trimmed) with\n`passed: false`; ignored on a release."
+          }
+        }
+      },
+      "GateResolutionDto": {
+        "type": "object",
+        "description": "How a gate's wait resolved: its `GateResolved` journal entry.",
+        "required": [
+          "passed",
+          "at",
+          "attempt"
+        ],
+        "properties": {
+          "at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix-ms the verdict was journalled."
+          },
+          "attempt": {
+            "type": "string",
+            "description": "The gate Attempt the verdict closed (`a1`, `a2`, …)."
+          },
+          "by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Who rejected it, for a rejection by request (`external:{step}` for an\nexternal gate's token). Absent for a verdict the engine reached."
+          },
+          "deployment_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The Deployment a DeploymentGate's verdict was read from (its\nOrg-scoped id, as the Deployments view shows it).",
+            "minimum": 0
+          },
+          "passed": {
+            "type": "boolean",
+            "description": "`true`: the gate passed and its dependents may run."
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why — a timer elapsing, a DeploymentGate's \"v1 live on …\", the\nsource's failure label, a rejection's reason."
+          }
+        }
+      },
       "GrantedPermissionDto": {
         "type": "object",
         "description": "A permission the forge reports as granted.",
@@ -3764,6 +7836,140 @@
           },
           "name": {
             "type": "string"
+          }
+        }
+      },
+      "ImageGrantDto": {
+        "type": "object",
+        "description": "One entry of a privilege whitelist (ADR-0039).",
+        "required": [
+          "image_digest"
+        ],
+        "properties": {
+          "capabilities": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The Linux capabilities it may add."
+          },
+          "image_digest": {
+            "type": "string",
+            "description": "`sha256:…` — the digest a step's image must be pinned to\n(`repo@sha256:…`). Matched exactly."
+          },
+          "privileged": {
+            "type": "boolean",
+            "description": "May run as a privileged container."
+          }
+        },
+        "additionalProperties": false
+      },
+      "InstallPluginRequest": {
+        "type": "object",
+        "description": "`POST /v1/orgs/{org}/plugins`.",
+        "required": [
+          "name",
+          "plugin",
+          "image"
+        ],
+        "properties": {
+          "config": {
+            "type": "object",
+            "description": "Values for the manifest's `config_keys`; omitted = none.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "image": {
+            "type": "string",
+            "description": "`<catalog image_repository>@sha256:<64 hex>`."
+          },
+          "name": {
+            "type": "string",
+            "description": "The installation's name: a DNS-1123 label, unique in the org and\nnever reused once uninstalled."
+          },
+          "plugin": {
+            "type": "string",
+            "description": "The catalog plugin (`argocd`)."
+          }
+        },
+        "additionalProperties": false
+      },
+      "InstallationDeploymentSourceDto": {
+        "type": "object",
+        "description": "An Environment source that routes one of the installation's groupings.",
+        "required": [
+          "environment",
+          "vendor_grouping"
+        ],
+        "properties": {
+          "environment": {
+            "type": "string"
+          },
+          "vendor_grouping": {
+            "type": "string"
+          }
+        }
+      },
+      "InstallationStateDto": {
+        "type": "string",
+        "description": "Whether an installation's reports and broker calls are accepted.",
+        "enum": [
+          "enabled",
+          "killed"
+        ]
+      },
+      "LegacyProtectionRulesDto": {
+        "type": "object",
+        "description": "A Project's ADR-0037 per-repo rules as the migration found them. The\ncanonical `secret_scope` / `oidc_subject` are left out: the server always\nderived them from the coordinates, so they never differed by choice.",
+        "required": [
+          "approvers",
+          "allowed_refs",
+          "wait_timer",
+          "concurrency",
+          "require_reason",
+          "privileged_images",
+          "permit_k8s_overlay"
+        ],
+        "properties": {
+          "allowed_refs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "approvers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "concurrency": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Stored but never read; not carried by the migration (§10 step 3).",
+            "minimum": 0
+          },
+          "permit_k8s_overlay": {
+            "type": "boolean"
+          },
+          "privileged_images": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ImageGrantDto"
+            }
+          },
+          "require_reason": {
+            "type": "boolean"
+          },
+          "wait_timer": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Seconds.",
+            "minimum": 0
           }
         }
       },
@@ -3861,6 +8067,74 @@
           }
         }
       },
+      "MeSecurityResponse": {
+        "type": "object",
+        "description": "`GET /v1/me/security`.",
+        "required": [
+          "subject",
+          "step_up",
+          "has_passkey",
+          "usable_passkey_count",
+          "passkeys",
+          "passkeys_hidden",
+          "can_enroll_first",
+          "fresh_login_url"
+        ],
+        "properties": {
+          "can_enroll_first": {
+            "type": "boolean",
+            "description": "No usable passkey yet, and this browser session's login is fresh\nenough to enroll the first one."
+          },
+          "fresh_login_until": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Until when this session's login is fresh (a browser login only)."
+          },
+          "fresh_login_url": {
+            "type": "string",
+            "description": "Where this human logs in again — through the login provider they sign\nin with — landing on enrollment (a relative URL). The one place the\nprovider is chosen: `scarab security setup` prints this."
+          },
+          "has_passkey": {
+            "type": "boolean",
+            "description": "Holds at least one usable (not clone-flagged) passkey."
+          },
+          "passkeys": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PasskeyDto"
+            },
+            "description": "The passkeys — empty for an API-token caller (see `passkeys_hidden`)."
+          },
+          "passkeys_hidden": {
+            "type": "boolean",
+            "description": "The caller is an API token: a token, scoped to one Org or Project,\nnever reads its owner's passkey list (only whether one is held)."
+          },
+          "step_up": {
+            "type": "string",
+            "description": "`enforce` or `off`."
+          },
+          "subject": {
+            "type": "string"
+          },
+          "usable_passkey_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many usable (not clone-flagged) passkeys are held.",
+            "minimum": 0
+          },
+          "window_expires_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "This browser session's open window, if any (unix ms)."
+          }
+        }
+      },
       "MintTokenRequest": {
         "type": "object",
         "description": "`POST /v1/orgs/{org}/tokens` body. Every field is required on purpose: a\ncredential with no verb and no expiry is the shape this repo already learned\nnot to mint twice.",
@@ -3908,6 +8182,269 @@
           "token": {
             "type": "string",
             "description": "The credential. Returned once, here. Scarab keeps only its SHA-256, so\nthis exact string cannot be recovered from the database, from a backup,\nor by any later API call: a lost token is re-minted, never re-read."
+          }
+        }
+      },
+      "MovedAwayDto": {
+        "type": "object",
+        "description": "Where a moved DeploymentTarget's reports go now.",
+        "properties": {
+          "now": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Environment that lists its source's grouping now; absent = none\ndoes (unmapped — its reports are dropped)."
+          }
+        }
+      },
+      "OpSummary": {
+        "type": "object",
+        "description": "What a human is asked to confirm: the server-rendered, redacted\ndescription of one operation (shown in the 403, on the confirm page and\nin the event log).",
+        "required": [
+          "operation",
+          "target",
+          "changes"
+        ],
+        "properties": {
+          "changes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "What changes, one line each. Redacted fields read `(hidden)`."
+          },
+          "operation": {
+            "type": "string",
+            "description": "What is being done (\"Write a secret\")."
+          },
+          "target": {
+            "type": "string",
+            "description": "What it is done to (\"acme/web/prod/DB_PASSWORD\")."
+          }
+        }
+      },
+      "OrgEnvironmentDto": {
+        "type": "object",
+        "description": "An org-level Environment in its minimal shape (ADR-0071, MMP step 1).",
+        "required": [
+          "org",
+          "name",
+          "description",
+          "deployment_deadline_ms",
+          "deployment_sources",
+          "protection",
+          "eligibility",
+          "created_at",
+          "updated_at",
+          "updated_by"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix-ms."
+          },
+          "deployment_deadline_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The EnvironmentDeploymentDeadline: how long a Deployment here may stay\n`requested` or `in_progress` before it reads `stalled`."
+          },
+          "deployment_sources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EnvironmentDeploymentSourceDto"
+            },
+            "description": "Sorted by installation, then vendor grouping."
+          },
+          "description": {
+            "type": "string"
+          },
+          "eligibility": {
+            "$ref": "#/components/schemas/EnvironmentEligibilityDto",
+            "description": "Which Projects may deploy here. Read-only here: written through\n`…/eligibility`."
+          },
+          "name": {
+            "type": "string"
+          },
+          "org": {
+            "type": "string"
+          },
+          "protection": {
+            "$ref": "#/components/schemas/EnvironmentProtectionRulesDto",
+            "description": "The baseline every Project's Deploy Runs obey. Read-only here:\nwritten through `…/protection`, never by the whole-Environment PUT."
+          },
+          "updated_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix-ms."
+          },
+          "updated_by": {
+            "type": "string",
+            "description": "Who last wrote it (a Principal subject)."
+          }
+        }
+      },
+      "OrgSecuritySummary": {
+        "type": "object",
+        "description": "`GET /v1/orgs/{org}/security/summary`.",
+        "required": [
+          "enforced",
+          "admins_without_passkey",
+          "admins_total",
+          "unresolved_owner_entries",
+          "recent_refusals",
+          "pending_requests"
+        ],
+        "properties": {
+          "admins_total": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "admins_without_passkey": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Admins of the Org (Admin/Owner bindings on the Org, and — for a\nglobal administrator only — the bootstrap owners) who hold no usable\npasskey: every crown jewel is refused for them until they enroll one."
+          },
+          "caller_role": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Your role in the Org (`owner`, `admin`, …)."
+          },
+          "enforced": {
+            "type": "boolean",
+            "description": "Step-up is enforced on this install."
+          },
+          "pending_requests": {
+            "type": "integer",
+            "format": "int64",
+            "description": "StepUpConfirmationRequests waiting for a human in this Org.",
+            "minimum": 0
+          },
+          "recent_refusals": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SecurityEventDto"
+            },
+            "description": "The last 20 refusals in the Org, from the last 24 hours."
+          },
+          "unresolved_owner_entries": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bootstrap owners entries that match only a verified email at login\nand name no Principal: not counted above, since no passkey is ever\nstored under one (a global administrator's view; 0 otherwise).",
+            "minimum": 0
+          }
+        }
+      },
+      "PasskeyDto": {
+        "type": "object",
+        "description": "One of the caller's passkeys.",
+        "required": [
+          "id",
+          "label",
+          "created_at",
+          "backup_eligible",
+          "backup_state",
+          "clone_suspected",
+          "transports"
+        ],
+        "properties": {
+          "backup_eligible": {
+            "type": "boolean",
+            "description": "The credential may be synced to other devices (BE)."
+          },
+          "backup_state": {
+            "type": "boolean",
+            "description": "It is backed up / synced, as last seen (BS)."
+          },
+          "clone_suspected": {
+            "type": "boolean",
+            "description": "Its signature counter went backwards: it is never accepted again."
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "last_used_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "transports": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "PasskeyRegistrationOptionsRequest": {
+        "type": "object",
+        "description": "`POST /v1/me/passkeys/registration/options`.",
+        "properties": {
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A name for the passkey (\"MacBook Touch ID\"). Default `Passkey`."
+          }
+        }
+      },
+      "PasskeyRegistrationRequest": {
+        "type": "object",
+        "description": "`POST /v1/me/passkeys/registration`.",
+        "required": [
+          "challenge_id",
+          "credential"
+        ],
+        "properties": {
+          "challenge_id": {
+            "type": "string"
+          },
+          "credential": {
+            "type": "object",
+            "description": "`RegistrationResponseJSON` — `PublicKeyCredential.toJSON()`."
+          }
+        }
+      },
+      "PasskeyResetDto": {
+        "type": "object",
+        "description": "What a passkey reset removed.",
+        "required": [
+          "subject",
+          "removed",
+          "windows_revoked"
+        ],
+        "properties": {
+          "removed": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many passkeys were removed.",
+            "minimum": 0
+          },
+          "subject": {
+            "type": "string",
+            "description": "The principal whose passkeys were reset."
+          },
+          "windows_revoked": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many standing step-up confirmations (windows, unconsumed action\nconfirmations) were revoked.",
+            "minimum": 0
           }
         }
       },
@@ -4038,6 +8575,304 @@
           }
         }
       },
+      "PluginCapabilityDto": {
+        "type": "string",
+        "description": "One entry of the closed PluginCapability vocabulary (ADR-0072 §2).",
+        "enum": [
+          "report_deployments",
+          "subscribe_events",
+          "offer_actions",
+          "use_connection",
+          "contribute_ui",
+          "approve_gates"
+        ]
+      },
+      "PluginCatalogEntryDto": {
+        "type": "object",
+        "description": "A plugin this Scarab can install.",
+        "required": [
+          "plugin",
+          "description",
+          "image_repository",
+          "manifest",
+          "first_party"
+        ],
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "first_party": {
+            "type": "boolean",
+            "description": "Always true today: third-party installs are off."
+          },
+          "image_repository": {
+            "type": "string",
+            "description": "Install as `<image_repository>@sha256:<digest>`."
+          },
+          "manifest": {
+            "$ref": "#/components/schemas/PluginManifestDto"
+          },
+          "plugin": {
+            "type": "string",
+            "description": "The catalog key `POST …/plugins` names as `plugin`."
+          }
+        }
+      },
+      "PluginConnectionDto": {
+        "type": "object",
+        "description": "One connection slot of an installation and what an admin bound to it\n(ADR-0072 §5). Never carries the credential, nor its secret key.",
+        "required": [
+          "slot",
+          "auth_schemes",
+          "read_rules",
+          "configured",
+          "credential_set",
+          "insecure_http"
+        ],
+        "properties": {
+          "auth_scheme": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "auth_schemes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The schemes the manifest allows; `bearer` is the only one today."
+          },
+          "base_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where every request on it goes — and nowhere else."
+          },
+          "ca_pem": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The CA certificates (PEM) that are the ONLY trust anchors for\n`base_url`; absent = the platform's roots. Certificates are public."
+          },
+          "configured": {
+            "type": "boolean",
+            "description": "Whether an admin has bound it. Unbound, the broker answers the\nplugin's requests on it with 409."
+          },
+          "credential_set": {
+            "type": "boolean",
+            "description": "Whether the credential is present in the secret store. Write-only:\nno endpoint returns it."
+          },
+          "insecure_http": {
+            "type": "boolean",
+            "description": "`base_url` is plain `http://`: the credential crosses the network in\nthe clear. Allowed (an in-cluster Service, say); the UI warns."
+          },
+          "read_rules": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RequestRuleDto"
+            },
+            "description": "What the plugin may send through it: reads only."
+          },
+          "slot": {
+            "type": "string",
+            "description": "The manifest's slot name."
+          },
+          "updated_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix-ms."
+          },
+          "updated_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "PluginInstallationDto": {
+        "type": "object",
+        "description": "A PluginInstallation (ADR-0072 §10).",
+        "required": [
+          "id",
+          "org",
+          "name",
+          "plugin",
+          "principal",
+          "image",
+          "manifest",
+          "manifest_sha256",
+          "config",
+          "state",
+          "runtime_status",
+          "runtime_message",
+          "approved_by",
+          "approved_at",
+          "deployment_sources",
+          "usage"
+        ],
+        "properties": {
+          "approved_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix-ms."
+          },
+          "approved_by": {
+            "type": "string"
+          },
+          "config": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "deployment_sources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InstallationDeploymentSourceDto"
+            },
+            "description": "The Environment sources that name this installation — at install,\nthe ones written before it existed, which it now feeds."
+          },
+          "id": {
+            "type": "string",
+            "description": "Server-minted, 10 hex; names the installation's ServiceAccount."
+          },
+          "image": {
+            "type": "string"
+          },
+          "killed_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix-ms."
+          },
+          "killed_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "manifest": {
+            "$ref": "#/components/schemas/PluginManifestDto"
+          },
+          "manifest_sha256": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string",
+            "description": "Unique in the org and never reused; reports carry it as their\nDeploymentTarget `source`."
+          },
+          "org": {
+            "type": "string"
+          },
+          "plugin": {
+            "type": "string",
+            "description": "The catalog plugin."
+          },
+          "principal": {
+            "type": "string",
+            "description": "`plugin:<name>` — what it acts as in audit."
+          },
+          "probe_passed_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix-ms the isolation probe last passed."
+          },
+          "runtime_message": {
+            "type": "string"
+          },
+          "runtime_status": {
+            "$ref": "#/components/schemas/RuntimeStatusDto"
+          },
+          "state": {
+            "$ref": "#/components/schemas/InstallationStateDto"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/PluginUsageDto"
+          }
+        }
+      },
+      "PluginManifestDto": {
+        "type": "object",
+        "description": "What the plugin asks for — exactly what an admin approves with the\ndigest (ADR-0072 §1-2).",
+        "required": [
+          "plugin",
+          "capabilities",
+          "connections",
+          "config_keys"
+        ],
+        "properties": {
+          "capabilities": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PluginCapabilityDto"
+            }
+          },
+          "config_keys": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "connections": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConnectionSlotDto"
+            }
+          },
+          "plugin": {
+            "type": "string"
+          }
+        }
+      },
+      "PluginUsageDto": {
+        "type": "object",
+        "description": "How much of its per-installation caps an installation uses: past one, a\nreport about a NEW target (or a new unmapped grouping) is rejected; known\ntargets keep reporting.",
+        "required": [
+          "targets",
+          "max_targets",
+          "unmapped_groupings",
+          "max_unmapped_groupings"
+        ],
+        "properties": {
+          "max_targets": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "max_unmapped_groupings": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "targets": {
+            "type": "integer",
+            "format": "int64",
+            "description": "DeploymentTargets it has reported on.",
+            "minimum": 0
+          },
+          "unmapped_groupings": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Groupings counted as reported on with no Environment listing them\n(one an Environment lists since stays counted until its next report).",
+            "minimum": 0
+          }
+        }
+      },
       "PrincipalDto": {
         "type": "object",
         "description": "A Principal, as the grant/approver typeahead offers it (ADR-0069 §3).",
@@ -4124,6 +8959,228 @@
           }
         }
       },
+      "ProjectEnvironmentDto": {
+        "type": "object",
+        "description": "An org-level Environment as one Project sees it (ADR-0071): the read\nmodel behind `GET /v1/repos/{org}/{repo}/environments`, which until\nADR-0071 returned the repo's own per-repo environments.",
+        "required": [
+          "name",
+          "eligible",
+          "baseline",
+          "deployment_deadline_ms",
+          "effective"
+        ],
+        "properties": {
+          "baseline": {
+            "$ref": "#/components/schemas/EnvironmentProtectionRulesDto",
+            "description": "The Environment's baseline, set by an org admin."
+          },
+          "deployment_deadline_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The Environment's EnvironmentDeploymentDeadline."
+          },
+          "effective": {
+            "$ref": "#/components/schemas/EffectiveProtectionDto",
+            "description": "What admission enforces: the baseline merged with the overlay."
+          },
+          "eligible": {
+            "type": "boolean",
+            "description": "Whether this Project may deploy here now (EnvironmentProjectEligibility).\n`false` only for an Environment the Project still holds an overlay or\ngrant in after an admin made it ineligible."
+          },
+          "name": {
+            "type": "string"
+          },
+          "overlay": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EnvironmentProtectionRulesDto",
+                "description": "This Project's tighten-only overlay, if it has one."
+              }
+            ]
+          },
+          "overlay_deployment_gate_deadline_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The overlay's tighter deadline for this Project's DeploymentGates."
+          },
+          "privilege_grant": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EnvironmentProjectPrivilegeGrantDto",
+                "description": "This Project's privileges here, if an admin granted any."
+              }
+            ]
+          }
+        }
+      },
+      "PutEnvironmentProjectOverlayRequest": {
+        "type": "object",
+        "description": "A Project overlay (`…/projects/{project}/overlay`) body: the baseline's\nfive rules, which can only **tighten** (ADR-0071 §3), plus a tighter\ndeadline for this Project's DeploymentGates. Replaced whole, omitted =\npermissive default, unknown fields refused — as for the baseline.",
+        "properties": {
+          "allowed_refs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "approvers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "deployment_concurrency": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "deployment_gate_deadline_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "60000 to 604800000; applies to this Project's DeploymentGates only,\nand only when shorter than the Environment's. Omitted = none."
+          },
+          "require_reason": {
+            "type": "boolean"
+          },
+          "wait_timer_s": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "PutEnvironmentProjectPrivilegeGrantRequest": {
+        "type": "object",
+        "description": "A Project's privilege grant (`…/projects/{project}/privilege-grant`)\nbody, replaced whole.",
+        "properties": {
+          "permit_k8s_overlay": {
+            "type": "boolean",
+            "description": "May the Project's steps here set a raw `k8s_overlay` (ADR-0055)."
+          },
+          "privileged_images": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ImageGrantDto"
+            },
+            "description": "The ADR-0039 whitelist; each digest listed once."
+          }
+        },
+        "additionalProperties": false
+      },
+      "PutEnvironmentProtectionRequest": {
+        "type": "object",
+        "description": "A baseline (`…/protection`) body: the five rules, replaced whole. Every\nfield is optional and an omitted one takes the **permissive** default —\nnever the stored value — so `{}` resets the baseline to permissive.\nUnknown fields are refused, so the retired per-repo shape (`wait_timer`,\n`concurrency`) is a 400, not a silently ignored rule.",
+        "properties": {
+          "allowed_refs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Ref globs (`refs/heads/main`, `refs/tags/*`); empty = any ref."
+          },
+          "approvers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Principal ids (ADR-0069): each must name an existing Principal; a\nmerged id is stored as the Principal it now is. All must approve."
+          },
+          "deployment_concurrency": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "In-flight Deployments per DeploymentTarget, at least 1; omitted or\n`null` = no limit. Enforced once deployment requests ship (§9).",
+            "minimum": 0
+          },
+          "require_reason": {
+            "type": "boolean",
+            "description": "A human dispatch must carry a reason (ADR-0057 §3). Omitted = off."
+          },
+          "wait_timer_s": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Seconds. Carried and merged, not yet enforced (git-bug 2b94989).",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "PutOrgEnvironmentRequest": {
+        "type": "object",
+        "description": "`PUT /v1/orgs/{org}/environments/{env}`: the whole Environment, replaced.\nAn omitted optional field takes its default — it does not keep the stored\nvalue. Unknown fields are refused, so a misspelt field is a 4xx rather\nthan a silently reset deadline.",
+        "required": [
+          "deployment_sources"
+        ],
+        "properties": {
+          "deployment_deadline_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "60000 (1 minute) to 604800000 (7 days); omitted = the server default\n(one hour)."
+          },
+          "deployment_sources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EnvironmentDeploymentSourceDto"
+            },
+            "description": "The complete list; it replaces the stored one. `[]` clears it."
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Free text; omitted = empty."
+          }
+        },
+        "additionalProperties": false
+      },
+      "PutPluginConnectionRequest": {
+        "type": "object",
+        "description": "`PUT /v1/orgs/{org}/plugins/{name}/connections/{slot}`: bind the slot's\ndestination and credential, replacing any previous binding whole.",
+        "required": [
+          "base_url",
+          "credential"
+        ],
+        "properties": {
+          "base_url": {
+            "type": "string",
+            "description": "`https://host[:port][/prefix]` (or `http://`, warned about). Every\nrequest the plugin sends on this slot goes here; it cannot pick\nanother host."
+          },
+          "ca_pem": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "PEM CA certificates to trust INSTEAD of the platform roots, for an\ninternal CA (https only). There is no skip-verify."
+          },
+          "credential": {
+            "type": "string",
+            "description": "The bearer token the broker adds upstream. Required on every bind —\na new destination never inherits a credential entered for another —\nand never readable back."
+          }
+        },
+        "additionalProperties": false
+      },
       "PutSecretRequest": {
         "type": "object",
         "description": "`POST /v1/secrets` body: define (or overwrite) a secret at a scope. The\n`value` is **write-only** — no endpoint ever returns it.",
@@ -4197,6 +9254,43 @@
               "$ref": "#/components/schemas/RefDto"
             },
             "description": "Branches first, then tags; each group name-sorted."
+          }
+        }
+      },
+      "RejectGateRequest": {
+        "type": "object",
+        "description": "`POST /v1/runs/{id}/gates/{step}/reject` body: why the gate is failed.",
+        "required": [
+          "reason"
+        ],
+        "properties": {
+          "reason": {
+            "type": "string",
+            "description": "The human reason, journalled on the gate's verdict and its Attempt.\nRequired: 1 to 1024 bytes once trimmed."
+          }
+        }
+      },
+      "RequestRuleDto": {
+        "type": "object",
+        "description": "An allowed read on a connection: method + path pattern (`*` = one\nsegment) + the query keys it may carry.",
+        "required": [
+          "method",
+          "path",
+          "query"
+        ],
+        "properties": {
+          "method": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "query": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The query keys a request under this rule may carry, each at most\nonce; empty = no query. Anything else is refused by the broker."
           }
         }
       },
@@ -4460,8 +9554,27 @@
               "null"
             ],
             "description": "The run **Headline** (ADR-0057) — the one human line saying what this run\nis about (a push's commit subject; later a PR title / dispatch reason),\ndisambiguated by the trigger kind. Display/audit only; absent when the\ntrigger carried no headline and on runs created before headline-stamping."
+          },
+          "waiting_gates": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WaitingGateDto"
+            },
+            "description": "The run's **waiting gates** (git-bug `c489346`): gate steps that are\n`Pending`, reached (every need `Succeeded`) and have an open Attempt —\nthe engine's \"waiting gate\". Since a waiting gate holds only its\ndependents (ADR-0070 §9), a Run with one can still be `running` while\nindependent steps run, so this — not `status == suspended` — is what\nsays a Run waits on a gate. Omitted when empty (and always for a\nterminal or queued Run)."
           }
         }
+      },
+      "RuntimeStatusDto": {
+        "type": "string",
+        "description": "What the plugin runtime last observed of the workload.",
+        "enum": [
+          "pending",
+          "probing",
+          "running",
+          "probe_failed",
+          "error",
+          "stopped"
+        ]
       },
       "SecretListResponse": {
         "type": "object",
@@ -4539,6 +9652,118 @@
             "propertyNames": {
               "type": "string"
             }
+          }
+        }
+      },
+      "SecurityEventDto": {
+        "type": "object",
+        "description": "One OrgSecurityEventLog row.",
+        "required": [
+          "seq",
+          "id",
+          "at",
+          "kind",
+          "subject",
+          "caller",
+          "detail"
+        ],
+        "properties": {
+          "at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix ms."
+          },
+          "caller": {
+            "type": "string",
+            "description": "`session:cookie`, `session:bearer`, `api_token:<id>` or\n`operator:break-glass`."
+          },
+          "confirmation_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The StepUpConfirmation it was authorised by / that it records."
+          },
+          "detail": {
+            "type": "object"
+          },
+          "id": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "description": "`step_up.confirmed`, `step_up.refused`, `op.authorised`,\n`op.completed`, `request.raised|confirmed|executed|failed`,\n`passkey.enrolled|removed|reset|break_glass_reset|clone_suspected`,\n`guard.not_consulted`."
+          },
+          "op": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "org": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`None`: not bound to one Org (a passkey, a confirmation)."
+          },
+          "passkey_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "request_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The StepUpConfirmationRequest it belongs to."
+          },
+          "seq": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Orders the log; pass the last one's as `before` to page."
+          },
+          "session_hash": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "SHA-256 of the session (never the session id)."
+          },
+          "subject": {
+            "type": "string",
+            "description": "The human/principal it is about."
+          },
+          "target": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "SecurityEventsResponse": {
+        "type": "object",
+        "description": "A page of the log.",
+        "required": [
+          "events"
+        ],
+        "properties": {
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SecurityEventDto"
+            }
+          },
+          "next_before": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Pass as `before` for the next page; absent on the last."
           }
         }
       },
@@ -4637,6 +9862,15 @@
             "minimum": 0
           }
         }
+      },
+      "SourceAssertedStatusDto": {
+        "type": "string",
+        "description": "The statuses a source may assert in a report (INV-DEP-6) — a subset of\n[`DeploymentStatusDto`], typed apart so the wire says so too.",
+        "enum": [
+          "in_progress",
+          "live",
+          "failed"
+        ]
       },
       "StepDto": {
         "type": "object",
@@ -4812,12 +10046,41 @@
             "type": "integer",
             "minimum": 0
           },
+          "deployment_gate": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DeploymentGateDto",
+                "description": "For a `deployment` gate that is waiting right now: the\nDeploymentTarget it waits on and where its Deployment stands. Display\nonly — the verdict is core's (ADR-0070 §8). Absent otherwise."
+              }
+            ]
+          },
           "gate": {
             "type": [
               "string",
               "null"
             ],
-            "description": "`manual`/`timer`/`external` if this step is a gate (ADR-0008), else absent.\nGates launch no pod and suspend the run until released."
+            "description": "`manual`/`timer`/`external`/`deployment` if this step is a gate\n(ADR-0008, ADR-0070 §8), else absent. Gates launch no pod; a waiting\ngate holds only the steps that need it."
+          },
+          "gate_resolution": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GateResolutionDto",
+                "description": "How this gate's latest wait resolved — its latest `GateResolved` in\nthe run's journal, never re-derived. Absent for a step that is not a\ngate or a gate that has never resolved. A gate re-armed since (a\nretry or rerun) keeps showing the old verdict here; compare `attempt`\nwith the latest of `attempt_list` to tell."
+              }
+            ]
+          },
+          "held": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why this deploy Step is held `pending` by per-DeploymentTarget\nconcurrency (ADR-0071 §9), e.g. \"held: waiting for deployment\nconcurrency on `argocd`/`web` (1/1 in flight)\". Derived each read\n(nothing is journalled per scheduler pass). Absent when not held."
           },
           "id": {
             "type": "string"
@@ -4845,6 +10108,362 @@
               "type": "string"
             },
             "description": "Names of pipeline-level shared services this step opts into via `uses:`\n(ADR-0058) — the DAG's service edges. Empty for a step that uses none."
+          }
+        }
+      },
+      "StepUpConfirmRequest": {
+        "type": "object",
+        "description": "`POST /v1/me/step-up`.",
+        "required": [
+          "challenge_id",
+          "credential"
+        ],
+        "properties": {
+          "challenge_id": {
+            "type": "string"
+          },
+          "credential": {
+            "type": "object",
+            "description": "`AuthenticationResponseJSON` — `PublicKeyCredential.toJSON()`."
+          }
+        }
+      },
+      "StepUpConfirmResponse": {
+        "type": "object",
+        "description": "A StepUpConfirmation just made.",
+        "required": [
+          "confirmation_id",
+          "kind",
+          "confirmed_at",
+          "expires_at"
+        ],
+        "properties": {
+          "confirmation_id": {
+            "type": "string"
+          },
+          "confirmed_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "expires_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Fixed at `confirmed_at` + 5 minutes; never extended."
+          },
+          "kind": {
+            "type": "string",
+            "description": "`window` or `action`."
+          }
+        }
+      },
+      "StepUpRefusal": {
+        "type": "object",
+        "description": "The body of a `403 step_up_required` (ADR-0073 §5).",
+        "required": [
+          "code",
+          "message",
+          "mode",
+          "op",
+          "summary"
+        ],
+        "properties": {
+          "challenge": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/WebauthnChallengeDto",
+                "description": "A cookie session with a passkey: the ready challenge to answer at\n`POST /v1/me/step-up`, then retry the request."
+              }
+            ]
+          },
+          "code": {
+            "type": "string",
+            "description": "Always `step_up_required`."
+          },
+          "confirmation_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An API token or Bearer-session caller: the one-time link its human\nconfirms this exact operation at (ADR-0073 §6)."
+          },
+          "enroll_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Mode `enroll`: where to enroll a passkey."
+          },
+          "expires_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "fresh_login_until": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Mode `enroll`: until when this session's login is fresh enough to\nenroll a first passkey (absent = it is not; log in again)."
+          },
+          "message": {
+            "type": "string"
+          },
+          "mode": {
+            "type": "string",
+            "description": "`window` (a 5-minute window will do), `action` (confirm this exact\naction) or `enroll` (no passkey yet)."
+          },
+          "op": {
+            "type": "string",
+            "description": "The operation id (`secret.put`)."
+          },
+          "request_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "summary": {
+            "$ref": "#/components/schemas/OpSummary",
+            "description": "What is being confirmed, redacted."
+          }
+        }
+      },
+      "StepUpRequestDto": {
+        "type": "object",
+        "description": "A StepUpConfirmationRequest as its human (or its polling requester)\nsees it.",
+        "required": [
+          "id",
+          "op",
+          "summary",
+          "requested_by",
+          "requested_via",
+          "for_human",
+          "method",
+          "path",
+          "query",
+          "state",
+          "created_at",
+          "expires_at"
+        ],
+        "properties": {
+          "confirmed_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "confirmed_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "executed_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "expires_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "A pending request past this can no longer be confirmed."
+          },
+          "for_human": {
+            "type": "string",
+            "description": "The only human who can confirm it."
+          },
+          "id": {
+            "type": "string"
+          },
+          "method": {
+            "type": "string"
+          },
+          "op": {
+            "type": "string",
+            "description": "The operation id (`secret.put`)."
+          },
+          "org": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "type": "string"
+          },
+          "query": {
+            "type": "string",
+            "description": "The raw query string the operation runs with (empty = none) — part\nof what runs, so the confirm page shows it."
+          },
+          "requested_by": {
+            "type": "string",
+            "description": "Who asked: `API token “ci-bot” (<id>)` or `a CLI session (Bearer)`."
+          },
+          "requested_via": {
+            "type": "string",
+            "description": "`api_token` or `bearer_session`."
+          },
+          "result_status": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The replayed operation's HTTP status, once it ran."
+          },
+          "state": {
+            "type": "string",
+            "description": "`pending`, `executing`, `executed`, `failed` or `expired`."
+          },
+          "summary": {
+            "$ref": "#/components/schemas/OpSummary",
+            "description": "What would run, redacted (secret values read `(hidden)`)."
+          }
+        }
+      },
+      "StepUpRequestResultDto": {
+        "type": "object",
+        "description": "What a confirmed request did.",
+        "required": [
+          "request_id",
+          "state",
+          "result_body"
+        ],
+        "properties": {
+          "request_id": {
+            "type": "string"
+          },
+          "result_body": {
+            "type": "object",
+            "description": "The operation's response body (JSON, or a string), returned once\nand never stored — a minted token's plaintext shows only here."
+          },
+          "result_status": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The operation's HTTP status."
+          },
+          "state": {
+            "type": "string",
+            "description": "`executed` (the operation answered 2xx) or `failed`."
+          }
+        }
+      },
+      "UninstalledPluginDto": {
+        "type": "object",
+        "description": "What an uninstall removed.",
+        "required": [
+          "name",
+          "removed_deployment_sources"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "removed_deployment_sources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InstallationDeploymentSourceDto"
+            },
+            "description": "The Environment sources that named it — removed with it."
+          }
+        }
+      },
+      "UnmappedGroupingDto": {
+        "type": "object",
+        "description": "A grouping the installation reports on that no Environment lists.",
+        "required": [
+          "vendor_grouping",
+          "reports",
+          "first_at",
+          "last_at",
+          "last_target_id"
+        ],
+        "properties": {
+          "first_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix-ms."
+          },
+          "last_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix-ms."
+          },
+          "last_target_id": {
+            "type": "string"
+          },
+          "reports": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Reports dropped for it so far.",
+            "minimum": 0
+          },
+          "vendor_grouping": {
+            "type": "string"
+          }
+        }
+      },
+      "WaitingGateDto": {
+        "type": "object",
+        "description": "One waiting gate of a run in the list view ([`RunSummaryDto::waiting_gates`]).",
+        "required": [
+          "step",
+          "kind",
+          "since"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "The gate kind: `manual` / `timer` / `external` / `deployment`."
+          },
+          "since": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When its wait opened (epoch millis): its open Attempt's start."
+          },
+          "step": {
+            "type": "string",
+            "description": "The gate step's id."
+          }
+        }
+      },
+      "WebauthnChallengeDto": {
+        "type": "object",
+        "description": "A WebAuthn challenge ready for `navigator.credentials.*`.",
+        "required": [
+          "id",
+          "public_key",
+          "expires_at"
+        ],
+        "properties": {
+          "expires_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix ms after which the challenge is refused."
+          },
+          "id": {
+            "type": "string",
+            "description": "Pass back with the credential."
+          },
+          "public_key": {
+            "type": "object",
+            "description": "`PublicKeyCredentialRequestOptionsJSON` (or `…CreationOptionsJSON`\nfor enrollment) — feed it to `parse*OptionsFromJSON`."
           }
         }
       },
@@ -4924,7 +10543,15 @@
     },
     {
       "name": "Environments",
-      "description": "Environments and their protection rules, plus deployment history."
+      "description": "Org-level Environments (ADR-0071) with their deployment deadline and sources; per-repo Environments and their protection rules, plus their legacy approval history."
+    },
+    {
+      "name": "Deployments",
+      "description": "The vendor-neutral Deployment record (ADR-0070): what is live on each DeploymentTarget, how it got there, and the Environment board."
+    },
+    {
+      "name": "Plugins",
+      "description": "PluginInstallations (ADR-0072): the first-party catalog, install and uninstall, the kill switch, the vendor groupings no Environment lists yet, and the PluginConnections the CredentialBroker proxies to."
     },
     {
       "name": "Secrets",

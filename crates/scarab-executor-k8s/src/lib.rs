@@ -2036,15 +2036,103 @@ fn step_terminated_exit(pod: &Pod) -> Option<i32> {
 /// withhold `Succeeded` while the sidecar *proxy* says the settle is in flight,
 /// and this one refuses `Succeeded` outright when the sidecar is gone and the
 /// settle's *product* is not there.
-fn settled_state(pod: &Pod, harvesting: bool) -> ExecState {
-    let state = pod_state(pod);
-    let settling = init_container_running(pod, WORKSPACE_EGRESS_CONTAINER);
+/// What `poll` does with a workspace Pod before it execs into the egress
+/// sidecar (git-bug 0440e6a, red team R2-K1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceLeg {
+    /// Drive the settle (`drive_workspace`): the egress is gone (a no-op) or
+    /// may still answer an exec.
+    Drive,
+    /// Skip it: the egress still shows `running` past the
+    /// [`sidecar_reporting_ceiling_passed`] — a node that stopped reporting,
+    /// where no exec into it (drain, harvest, release) can land. A failed exec
+    /// there is not weather to retry: returned as Transient on every poll, it
+    /// errored the launch intent to its poison ceiling and dead-lettered the
+    /// Run, and kept [`settled_state`]'s own ceiling verdict unreachable.
+    PastCeiling,
+}
+
+fn workspace_leg(pod: &Pod, now_secs: i64) -> WorkspaceLeg {
+    if init_container_running(pod, WORKSPACE_EGRESS_CONTAINER)
+        && sidecar_reporting_ceiling_passed(pod, now_secs)
+    {
+        WorkspaceLeg::PastCeiling
+    } else {
+        WorkspaceLeg::Drive
+    }
+}
+
+/// Did the step declare artifacts of record (`artifacts:`, ADR-0052)? Read
+/// off the Pod (`scarab.io/artifact-globs`, set by `build_pod`), so it
+/// survives a control-plane restart.
+fn declares_artifacts(pod: &Pod) -> bool {
+    pod.metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(ANNOTATION_ARTIFACT_GLOBS))
+        .and_then(|v| serde_json::from_str::<Vec<String>>(v).ok())
+        .is_some_and(|globs| !globs.is_empty())
+}
+
+/// The step's own non-zero exit, as the verdict a Pod held `Running` by a
+/// sidecar that will never be reported terminating can no longer deliver
+/// (git-bug 0440e6a): the kubelet keeps the phase `Running` until every
+/// sidecar stopped, so without this the step waits out its timeout and
+/// lands as `Timeout` — a verdict about the wrong thing.
+fn frozen_step_failure(pod: &Pod) -> Option<ExecState> {
+    let code = step_terminated_exit(pod).filter(|c| *c != 0)?;
+    let (class, cause) = classify_failed_pod(pod, Some(code));
+    Some(ExecState::Failed {
+        exit_code: Some(code),
+        class,
+        cause,
+    })
+}
+
+fn settled_state(pod: &Pod, harvesting: bool, now_secs: i64) -> ExecState {
+    // The results-egress drain is owed on a workspace Pod too (ADR-0042):
+    // see `results_settled_state`.
+    let state = results_settled_state(pod, now_secs);
+    // The workspace egress still showing `running` is "settle in flight" —
+    // until the sidecar reporting ceiling (red team R3 on git-bug f02588d):
+    // past it a live kubelet has SIGKILLed and reported every sidecar, so a
+    // status frozen at `running` is a lost node, and the sidecar is as gone
+    // as if it had been seen to terminate. Withholding on it hung the step
+    // `Running` until its timeout (`Timeout`, never retried) on every
+    // workspace Pod — the default path.
+    let settling = init_container_running(pod, WORKSPACE_EGRESS_CONTAINER)
+        && !sidecar_reporting_ceiling_passed(pod, now_secs);
+    // The kubelet holds the phase `Running` until every sidecar stopped, and
+    // a lost node never reports them: the step's own exit 0 is the verdict
+    // to settle on once the egress is gone (the snapshot rule below decides
+    // whether it can stand).
+    let state = match state {
+        ExecState::Running
+            if !settling
+                && is_workspace_pod(pod)
+                && sidecar_reporting_ceiling_passed(pod, now_secs)
+                && step_terminated_exit(pod) == Some(0)
+                && !(results_draining(pod) && !results_drain_overdue(pod, now_secs)) =>
+        {
+            ExecState::Succeeded
+        }
+        // Its non-zero twin (git-bug 0440e6a): the step's own failure is the
+        // verdict once the egress can no longer be reported.
+        ExecState::Running
+            if !settling
+                && is_workspace_pod(pod)
+                && sidecar_reporting_ceiling_passed(pod, now_secs) =>
+        {
+            frozen_step_failure(pod).unwrap_or(ExecState::Running)
+        }
+        other => other,
+    };
     match state {
         ExecState::Succeeded if settling => ExecState::Running,
         // ADR-0061 part 4: an Attempt is not `Succeeded` until its Workspace
         // Snapshot is durable. The sidecar being gone is not proof that it is —
         // see `workspace_snapshot_lost`.
-        ExecState::Succeeded if workspace_snapshot_lost(pod) => ExecState::Failed {
+        ExecState::Succeeded if workspace_snapshot_lost(pod, now_secs) => ExecState::Failed {
             exit_code: None,
             // The step's process DID run, so a side effect is possible: the
             // engine's retry has to be the at-least-once kind (CONTEXT.md §2),
@@ -2059,12 +2147,351 @@ fn settled_state(pod: &Pod, harvesting: bool) -> ExecState {
                     .to_string(),
             ),
         },
+        // The artifacts twin of the rule above (git-bug 0440e6a, red team
+        // K1): the egress is gone (or past the reporting ceiling) and the
+        // harvest of DECLARED artifacts never recorded its index — the
+        // artifacts lived on the Pod's emptyDir and can never be harvested
+        // now. Reporting `Succeeded` would index none and mark the step green
+        // with its artifacts of record silently missing. Same at-least-once
+        // Infra verdict. A step that declared none owes only the empty index,
+        // which `artifacts()` already reads as `[]`, so it may succeed.
+        ExecState::Succeeded
+            if artifact_harvest_owed(pod, harvesting) && declares_artifacts(pod) =>
+        {
+            ExecState::Failed {
+                exit_code: None,
+                class: FailureClass::Infra {
+                    never_started: false,
+                },
+                cause: Some(
+                    "artifacts lost: the step exited 0 but its egress sidecar was lost \
+                     before the declared artifacts were harvested — they lived on the \
+                     Pod's emptyDir and can never be collected (ADR-0052)"
+                        .to_string(),
+                ),
+            }
+        }
         ExecState::Failed {
             class: FailureClass::Step,
             ..
         } if settling && artifact_harvest_owed(pod, harvesting) => ExecState::Running,
         other => other,
     }
+}
+
+/// The results-egress native sidecar's container name (ADR-0042).
+const RESULTS_EGRESS_CONTAINER: &str = "scarab-results-egress";
+
+/// Is the results-egress drain still in flight on this Pod? (ADR-0042; slice
+/// b, judge-b23 J1.) True while the Pod's **spec** declares the
+/// [`RESULTS_EGRESS_CONTAINER`] native sidecar and its status does not show it
+/// terminated.
+///
+/// On k8s a step's named results are NOT handed back through
+/// `Executor::results` (the port default, empty): the sidecar, SIGTERMed by
+/// the kubelet after the step container exits, drains `/scarab/results` and
+/// POSTs it to the fence-scoped ingest endpoint, which answers 2xx only after
+/// `Db::set_step_results` committed — and the sidecar's `curl -f` exits only
+/// after that answer (or after its bounded retries failed, exit non-zero). So
+/// "terminated" means "committed, or the drain failed"; anything before it may
+/// be a drain whose results are not in the store yet. The engine completes a
+/// step's DeploymentRequests from the stored results at `Succeeded`, so
+/// reporting `Succeeded` before this flips false could read them before they
+/// land — under either reading of whether a native sidecar gates the Pod
+/// phase.
+///
+/// - No sidecar declared (results egress not configured) → never draining:
+///   the Pod's verdict is unchanged.
+/// - Terminated, exit 0 or not → not draining. A failed drain (non-zero, or
+///   SIGKILLed at the grace period) reads as results missing — a Deploy Step
+///   then fails `DeploymentRequestIncomplete`, its reason naming the failed
+///   delivery ([`pod_results_delivery_failure`], git-bug `0cb5895`) rather
+///   than the author's results.
+/// - `waiting` with a previous termination (a crash-looping sidecar the
+///   kubelet will not restart once the step is done) → not draining either:
+///   nothing is in flight, and withholding would only run out the clock.
+/// - No status entry, or `running` → draining.
+///
+/// This is the *observation* only; how long it may withhold a verdict is
+/// bounded by [`results_drain_overdue`] (git-bug `f02588d`), applied in
+/// [`results_settled_state`].
+fn results_draining(pod: &Pod) -> bool {
+    let declared = pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.init_containers.as_ref())
+        .into_iter()
+        .flatten()
+        .any(|c| c.name == RESULTS_EGRESS_CONTAINER);
+    if !declared {
+        return false;
+    }
+    let settled = pod
+        .status
+        .as_ref()
+        .and_then(|s| s.init_container_statuses.as_ref())
+        .into_iter()
+        .flatten()
+        .find(|c| c.name == RESULTS_EGRESS_CONTAINER)
+        .is_some_and(|c| {
+            let state = c.state.as_ref();
+            state.is_some_and(|st| st.terminated.is_some())
+                || (state.is_some_and(|st| st.waiting.is_some())
+                    && c.last_state
+                        .as_ref()
+                        .is_some_and(|st| st.terminated.is_some()))
+        });
+    !settled
+}
+
+/// How the results-egress drain **failed** on this Pod, or `None` (ADR-0042;
+/// git-bug `0cb5895`). `Some` when the Pod's spec declares the
+/// [`RESULTS_EGRESS_CONTAINER`] native sidecar and its status shows it
+/// terminated non-zero — its bounded `curl -f` retries gave up (exit 1), or the
+/// kubelet SIGKILLed it at the termination grace (137) — either now or as its
+/// previous termination while it waits (a crash-looping sidecar the kubelet
+/// will not restart once the step is done). The clause names the exit code and
+/// the kubelet's reason when it gave one.
+///
+/// Also `Some` when the drain is still unobserved-as-finished (no status, or
+/// `running`) but [`results_drain_overdue`] at `now_secs` (git-bug
+/// `f02588d`): the verdict was released without the sidecar's word, so a
+/// missing result is an UNCONFIRMED delivery — most likely a lost node — not
+/// the author's omission.
+///
+/// `None` for no sidecar (results egress not configured), an exit 0 (the POST
+/// committed), and a drain still in flight or never observed within its bound
+/// — nothing proves a failure, so the author-facing reason stands.
+fn pod_results_delivery_failure(pod: &Pod, now_secs: i64) -> Option<String> {
+    let declared = pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.init_containers.as_ref())
+        .into_iter()
+        .flatten()
+        .any(|c| c.name == RESULTS_EGRESS_CONTAINER);
+    if !declared {
+        return None;
+    }
+    let status = pod
+        .status
+        .as_ref()
+        .and_then(|s| s.init_container_statuses.as_ref())
+        .into_iter()
+        .flatten()
+        .find(|c| c.name == RESULTS_EGRESS_CONTAINER);
+    let terminated = status.and_then(|status| match status.state.as_ref() {
+        Some(st) if st.terminated.is_some() => st.terminated.as_ref(),
+        Some(st) if st.waiting.is_some() => status
+            .last_state
+            .as_ref()
+            .and_then(|l| l.terminated.as_ref()),
+        _ => None,
+    });
+    let Some(terminated) = terminated else {
+        // Never seen to finish. Only the bound turns that into a reason.
+        if results_draining(pod) && results_drain_overdue(pod, now_secs) {
+            let bound = results_drain_bound_secs(pod);
+            return Some(format!(
+                "the results sidecar `{RESULTS_EGRESS_CONTAINER}` never reported \
+                 terminating within {bound}s of its drain beginning (its node may be \
+                 lost), so the delivery is unconfirmed"
+            ));
+        }
+        return None;
+    };
+    if terminated.exit_code == 0 {
+        return None;
+    }
+    let why = terminated
+        .reason
+        .as_deref()
+        .filter(|r| !r.trim().is_empty())
+        .map(|r| format!(" ({r})"))
+        .unwrap_or_default();
+    Some(format!(
+        "the results sidecar `{RESULTS_EGRESS_CONTAINER}` exited {}{why}",
+        terminated.exit_code
+    ))
+}
+
+/// The Kubernetes default `terminationGracePeriodSeconds`, used when a Pod's
+/// spec does not carry one (the API server defaults it, so this is only a
+/// fallback for a spec read before defaulting).
+const K8S_DEFAULT_TERMINATION_GRACE_SECS: i64 = 30;
+
+/// Slack past the termination grace before a results drain that never
+/// reported finishing stops withholding the verdict (git-bug `f02588d`): the
+/// kubelet's status sync lag plus a margin — mostly a margin for **clock
+/// skew**, since the bound compares the control plane's wall clock with a
+/// `finishedAt` stamped by the node's (review safety S1): Kubernetes does not
+/// keep the two in step, and a node running behind would otherwise release a
+/// healthy drain's verdict early. A drain the kubelet is alive to manage is
+/// SIGKILLed at the grace and reported well inside this.
+const RESULTS_DRAIN_SLACK_SECS: i64 = 300;
+
+/// Has every native sidecar of this Pod had its chance to report terminating
+/// at `now_secs`? True once the step container's `finishedAt` +
+/// [`results_drain_bound_secs`] has passed: the kubelet SIGKILLs a finished
+/// Pod's sidecars within its `terminationGracePeriodSeconds` and reports them
+/// well inside the slack, so a sidecar still showing `running` past this
+/// ceiling belongs to a node that stopped reporting (red team R3 on git-bug
+/// `f02588d`). No `finishedAt`, or a broken clock (`i64::MIN`), → never.
+fn sidecar_reporting_ceiling_passed(pod: &Pod, now_secs: i64) -> bool {
+    step_terminated_finished_at(pod).is_some_and(|finished| {
+        now_secs >= finished.saturating_add(results_drain_bound_secs(pod))
+    })
+}
+
+/// How long after its drain could begin ([`results_drain_began_at`]) a
+/// results drain may withhold the verdict: the Pod's
+/// `terminationGracePeriodSeconds` (the kubelet SIGKILLs the sidecar at it)
+/// plus [`RESULTS_DRAIN_SLACK_SECS`].
+fn results_drain_bound_secs(pod: &Pod) -> i64 {
+    let grace = pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.termination_grace_period_seconds)
+        .unwrap_or(K8S_DEFAULT_TERMINATION_GRACE_SECS)
+        .max(0);
+    grace.saturating_add(RESULTS_DRAIN_SLACK_SECS)
+}
+
+/// Has a results drain that is still not seen to finish outlived its bound at
+/// `now_secs` (unix seconds)? (git-bug `f02588d`.) True once the step
+/// container's `finishedAt` + [`results_drain_bound_secs`] has passed.
+///
+/// A live kubelet ends the sidecar inside that bound (SIGKILL at the grace)
+/// and reports it, so the only Pod still showing the drain in flight past it
+/// is one whose kubelet stopped reporting — a lost node. Withholding there
+/// gains nothing (no status will ever arrive) and costs the step: it would sit
+/// `Running` until the engine's step timeout and fail `Timeout`, which is
+/// never auto-retried, although the step exited 0 and its side effect most
+/// likely landed. No `finishedAt` (the step's exit not yet reported) → no
+/// bound: there is no exit to measure from, and the engine's step timeout
+/// remains the backstop.
+///
+/// A drain whose start is unknown because a later-declared sidecar (the
+/// workspace egress) never reported terminating is overdue once the
+/// [`sidecar_reporting_ceiling_passed`] (red team R3): before it that
+/// sidecar may still be settling; past it, its status is frozen by a lost
+/// node and no start will ever be observed — "no bound" there left the
+/// verdict withheld until the step timeout on every workspace Pod.
+fn results_drain_overdue(pod: &Pod, now_secs: i64) -> bool {
+    match results_drain_began_at(pod) {
+        Some(began) => now_secs >= began.saturating_add(results_drain_bound_secs(pod)),
+        None => sidecar_reporting_ceiling_passed(pod, now_secs),
+    }
+}
+
+/// When the results sidecar's drain could begin (unix seconds), or `None`
+/// when that is not known yet — no bound applies then (review correctness
+/// F5). The kubelet stops a finished Pod's native sidecars in REVERSE
+/// declaration order, and the results egress is declared FIRST: every
+/// sidecar declared after it — the workspace egress, whose settle may run its
+/// own long grace, and any service sidecar — stops before the results sidecar
+/// is even signalled. So the drain begins at the later of the step
+/// container's exit and those sidecars' terminations; measured from the
+/// step's exit alone, a long workspace settle used up the results drain's
+/// bound and a workspace Pod was released mid-drain.
+///
+/// `None` while the step's exit is unreported, or while a later-declared
+/// sidecar has not terminated (or terminated without a `finishedAt`): the
+/// results sidecar has not started draining, so there is nothing to bound
+/// yet, and the engine's step timeout stays the backstop.
+fn results_drain_began_at(pod: &Pod) -> Option<i64> {
+    let mut began = step_terminated_finished_at(pod)?;
+    let declared = pod.spec.as_ref()?.init_containers.as_deref().unwrap_or(&[]);
+    let after_results = declared
+        .iter()
+        .skip_while(|c| c.name != RESULTS_EGRESS_CONTAINER)
+        .skip(1)
+        .filter(|c| c.restart_policy.as_deref() == Some("Always"));
+    let statuses = pod
+        .status
+        .as_ref()
+        .and_then(|s| s.init_container_statuses.as_deref())
+        .unwrap_or(&[]);
+    for sidecar in after_results {
+        let status = statuses.iter().find(|st| st.name == sidecar.name)?;
+        let terminated = match status.state.as_ref() {
+            Some(st) if st.terminated.is_some() => st.terminated.as_ref(),
+            Some(st) if st.waiting.is_some() => status
+                .last_state
+                .as_ref()
+                .and_then(|l| l.terminated.as_ref()),
+            _ => None,
+        }?;
+        began = began.max(terminated.finished_at.as_ref()?.0.as_second());
+    }
+    Some(began)
+}
+
+/// The step container's `finishedAt` (unix seconds), once terminated.
+fn step_terminated_finished_at(pod: &Pod) -> Option<i64> {
+    pod.status
+        .as_ref()?
+        .container_statuses
+        .as_ref()?
+        .iter()
+        .find(|c| c.name == STEP_CONTAINER)?
+        .state
+        .as_ref()?
+        .terminated
+        .as_ref()?
+        .finished_at
+        .as_ref()
+        .map(|t| t.0.as_second())
+}
+
+/// [`pod_state`] with `Succeeded` withheld (reported `Running`) while the
+/// results-egress drain is in flight ([`results_draining`]) — but only until
+/// that drain is [`results_drain_overdue`] at `now_secs` (git-bug `f02588d`).
+/// Past the bound the step's own exit 0 is the verdict: `Succeeded`, and a
+/// result that never arrived reads as missing, its reason naming the
+/// unconfirmed delivery ([`pod_results_delivery_failure`], git-bug `0cb5895`).
+///
+/// The bound applies to both shapes a lost node leaves behind: phase
+/// `Succeeded` with the sidecar still showing `running` (or no status), and —
+/// the usual one, since the kubelet holds the phase non-terminal until every
+/// container including native sidecars has stopped — phase `Running` with the
+/// step container terminated exit 0 and the sidecar still showing in flight.
+/// The latter is promoted to `Succeeded` only past the bound and only when a
+/// results sidecar is declared; every other `Running` passes through.
+///
+/// Every other verdict passes through verbatim — a failed or lost Pod owes no
+/// results the engine would read. Pure: the scheduler's next poll re-derives
+/// it from the Pod.
+fn results_settled_state(pod: &Pod, now_secs: i64) -> ExecState {
+    let draining = results_draining(pod);
+    let overdue = draining && results_drain_overdue(pod, now_secs);
+    match pod_state(pod) {
+        ExecState::Succeeded if draining && !overdue => ExecState::Running,
+        ExecState::Running if overdue && step_terminated_exit(pod) == Some(0) => {
+            ExecState::Succeeded
+        }
+        // A non-zero exit held `Running` by the overdue drain (git-bug
+        // 0440e6a): its own failure is the verdict, not the step timeout.
+        ExecState::Running if overdue => frozen_step_failure(pod).unwrap_or(ExecState::Running),
+        other => other,
+    }
+}
+
+/// Wall-clock unix seconds, the `now` the pure verdict functions take.
+fn unix_now_secs() -> i64 {
+    unix_secs(std::time::SystemTime::now())
+}
+
+/// `t` as unix seconds — failing CLOSED (review safety S5): a clock before
+/// the epoch is broken, and reads as the earliest possible instant, so no
+/// time-based bound ([`results_drain_overdue`]) is ever past on it and the
+/// verdict stays withheld (the engine's step timeout remains the backstop).
+/// `i64::MAX` here made every drain "overdue" and released `Succeeded` while
+/// results were still in flight.
+fn unix_secs(t: std::time::SystemTime) -> i64 {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(i64::MIN)
 }
 
 /// Is this a Pod on the workspace flow?
@@ -2127,10 +2554,15 @@ fn is_workspace_pod(pod: &Pod) -> bool {
 /// A **failed** step is deliberately not covered: its workspace is not an output
 /// (`drive_workspace` snapshots successful steps only), so there is no snapshot to
 /// owe. Its *artifacts* are owed, and [`artifact_harvest_owed`] is that rule.
-fn workspace_snapshot_lost(pod: &Pod) -> bool {
+///
+/// "Gone" includes a sidecar whose status is frozen at `running` past the
+/// [`sidecar_reporting_ceiling_passed`] at `now_secs` — the lost node itself
+/// (red team R3 on git-bug `f02588d`): it will never be seen to terminate.
+fn workspace_snapshot_lost(pod: &Pod, now_secs: i64) -> bool {
     is_workspace_pod(pod)
         && step_terminated_exit(pod) == Some(0)
-        && !init_container_running(pod, WORKSPACE_EGRESS_CONTAINER)
+        && (!init_container_running(pod, WORKSPACE_EGRESS_CONTAINER)
+            || sidecar_reporting_ceiling_passed(pod, now_secs))
         && !pod
             .metadata
             .annotations
@@ -2257,6 +2689,19 @@ impl Executor for K8sExecutor {
                 // idempotent and derive ALL state from the Pod itself, so an
                 // adopted Pod after a control-plane restart resumes cleanly.
                 if self.workspace_cas.is_some() {
+                    // Decided BEFORE any exec into the egress (git-bug
+                    // 0440e6a): past the sidecar reporting ceiling an egress
+                    // still showing `running` is a lost node, so every exec
+                    // into it fails, and `drive_workspace`'s Transient return
+                    // kept `settled_state`'s ceiling verdict unreachable — the
+                    // Pod errored on every poll until its Run dead-lettered.
+                    // Skip straight to that verdict, which owns what a lost
+                    // node forfeits: no root, or declared artifacts never
+                    // harvested, is the retried Infra failure — never green.
+                    let now = unix_now_secs();
+                    if workspace_leg(&pod, now) == WorkspaceLeg::PastCeiling {
+                        return Ok(settled_state(&pod, self.artifact_store.is_some(), now));
+                    }
                     match self.drive_workspace(&pods, &pod).await {
                         Ok(()) => {}
                         // Permanent and author-fixable (ADR-0007): the step ran and
@@ -2385,9 +2830,17 @@ impl Executor for K8sExecutor {
                         Some(pod) => pod,
                         None => return Ok(ExecState::Lost),
                     };
-                    return Ok(settled_state(&pod, self.artifact_store.is_some()));
+                    return Ok(settled_state(
+                        &pod,
+                        self.artifact_store.is_some(),
+                        unix_now_secs(),
+                    ));
                 }
-                Ok(pod_state(&pod))
+                // No workspace settle, but the results-egress drain may
+                // still be owed (ADR-0042): withhold `Succeeded` until it
+                // finished (see `results_draining`), bounded by
+                // `results_drain_overdue` (git-bug f02588d).
+                Ok(results_settled_state(&pod, unix_now_secs()))
             }
             // The Pod is gone (evicted, GC'd, node lost) — the backend lost it.
             None => Ok(ExecState::Lost),
@@ -2524,6 +2977,26 @@ impl Executor for K8sExecutor {
         }))
     }
 
+    /// The results-egress sidecar's failed delivery ([`pod_results_delivery_failure`],
+    /// git-bug `0cb5895`), read from the Pod at settle. Pod gone ⇒ `None`:
+    /// nothing proves the delivery failed, so the author-facing reason stands.
+    async fn results_delivery_failure(
+        &self,
+        handle: &ExecHandle,
+    ) -> Result<Option<String>, ExecError> {
+        let pods = self.pods()?;
+        let pod = pods
+            .get_opt(&handle.0)
+            .await
+            .map_err(|e| ExecError::Other(e.to_string()))?;
+        // A Pod already gone cannot say whether its sidecar delivered:
+        // "could not check", never "delivered" (which would blame the author).
+        let pod = pod.ok_or_else(|| {
+            ExecError::Other(format!("the step's Pod `{}` is already gone", handle.0))
+        })?;
+        Ok(pod_results_delivery_failure(&pod, unix_now_secs()))
+    }
+
     async fn workspace_provisioning(
         &self,
         handle: &ExecHandle,
@@ -2612,14 +3085,33 @@ impl Executor for K8sExecutor {
         }
     }
 
+    /// The deterministic fence-named Pod (`pod_name`) — the Pod a launch
+    /// creates or adopts, whether or not that launch returned `Ok`.
+    fn unit_handle(&self, step: &StepRun) -> Option<ExecHandle> {
+        Some(ExecHandle(pod_name(step)))
+    }
+
+    /// Gone = the Pod object no longer exists. A deleted Pod keeps running
+    /// through its termination grace (up to `CANCEL_GRACE_SECS`) with a
+    /// `deletionTimestamp` set — still acting on whatever it deploys to — so
+    /// "delete accepted" is not "torn down" (git-bug f22056d).
+    async fn torn_down(&self, handle: &ExecHandle) -> Result<bool, ExecError> {
+        let pods = self.pods()?;
+        pods.get_opt(&handle.0)
+            .await
+            .map(|pod| pod.is_none())
+            .map_err(|e| ExecError::Other(e.to_string()))
+    }
+
     // `results` intentionally uses the port default (empty): on k8s the egress
     // **sidecar** (see `build_pod`/`egress_sidecar`, ADR-0042) writes results
     // straight to Postgres via the fence-scoped results API, so the orchestrator
     // reads them from the store — not back through this method. (A
     // `restartPolicy: Never` Pod is gone after completion and the log stream is
     // best-effort, so post-hoc scraping is not an option; hence the sidecar.)
-    // Remaining to make this live end-to-end: the sidecar image (the `scarab` CLI
-    // that drains + POSTs on shutdown) and a real-cluster lifecycle test.
+    // `poll` withholds `Succeeded` until that sidecar has terminated
+    // (`results_draining`), so the store holds the results before the
+    // orchestrator reads them on the terminal verdict.
 
     /// Open a live tail of the step Pod's stdout/stderr via the k8s log endpoint
     /// (ADR-0013): `follow: true` on the deterministic `{run, step, attempt}` Pod,
@@ -4199,7 +4691,7 @@ fn egress_sidecar(
         env_var("SCARAB_ATTEMPT", attempt),
     ];
     Container {
-        name: "scarab-results-egress".to_string(),
+        name: RESULTS_EGRESS_CONTAINER.to_string(),
         image: Some(egress.sidecar_image.clone()),
         // Native sidecar: an initContainer that keeps running alongside the step.
         restart_policy: Some("Always".to_string()),
@@ -6838,15 +7330,750 @@ mod tests {
     fn succeeded_is_withheld_until_the_settle_sidecar_has_finished() {
         // Step exited 0, settle still in flight -> NOT terminal yet.
         assert_eq!(
-            settled_state(&settling_pod("Succeeded", 0, true, false), true),
+            settled_state(&settling_pod("Succeeded", 0, true, false), true, NOW),
             ExecState::Running,
             "reporting Succeeded here loses the artifact index permanently"
         );
         // Sidecar gone = settle recorded -> the real verdict.
         assert_eq!(
-            settled_state(&settling_pod("Succeeded", 0, false, true), true),
+            settled_state(&settling_pod("Succeeded", 0, false, true), true, NOW),
             ExecState::Succeeded
         );
+    }
+
+    // ------------------------------------------------------------------
+    // ADR-0042 / judge-b23 J1: `Succeeded` is withheld while the
+    // results-egress sidecar's drain is in flight, on workspace and
+    // non-workspace Pods alike — the engine completes DeploymentRequests from
+    // the STORED results at `Succeeded`, and the sidecar's POST commits them.
+    // ------------------------------------------------------------------
+
+    /// A fixed wall clock for the pure verdict functions. The fixture Pods
+    /// carry no `finishedAt` unless a test sets one (`step_finished_at`), so
+    /// at `NOW` no results-drain bound applies to them.
+    const NOW: i64 = 1_800_000_000;
+
+    /// `pod` with its step container's terminated state stamped
+    /// `finishedAt = at` (unix seconds).
+    fn step_finished_at(mut pod: Pod, at: i64) -> Pod {
+        let terminated = pod
+            .status
+            .as_mut()
+            .and_then(|s| s.container_statuses.as_mut())
+            .and_then(|cs| cs.iter_mut().find(|c| c.name == STEP_CONTAINER))
+            .and_then(|c| c.state.as_mut())
+            .and_then(|st| st.terminated.as_mut())
+            .expect("fixture has a terminated step container");
+        terminated.finished_at = Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+            k8s_openapi::jiff::Timestamp::from_second(at).expect("valid timestamp"),
+        ));
+        pod
+    }
+
+    /// A results-egress sidecar status in `state` (with an optional previous
+    /// termination).
+    fn results_status(
+        state: k8s_openapi::api::core::v1::ContainerState,
+        last_terminated: bool,
+    ) -> k8s_openapi::api::core::v1::ContainerStatus {
+        use k8s_openapi::api::core::v1::{
+            ContainerState, ContainerStateTerminated, ContainerStatus,
+        };
+        ContainerStatus {
+            name: RESULTS_EGRESS_CONTAINER.into(),
+            state: Some(state),
+            last_state: last_terminated.then(|| ContainerState {
+                terminated: Some(ContainerStateTerminated {
+                    exit_code: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn results_running() -> k8s_openapi::api::core::v1::ContainerState {
+        k8s_openapi::api::core::v1::ContainerState {
+            running: Some(Default::default()),
+            ..Default::default()
+        }
+    }
+
+    fn results_terminated(code: i32) -> k8s_openapi::api::core::v1::ContainerState {
+        k8s_openapi::api::core::v1::ContainerState {
+            terminated: Some(k8s_openapi::api::core::v1::ContainerStateTerminated {
+                exit_code: code,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// `pod` with the results-egress native sidecar declared in its spec and,
+    /// when `status` is `Some`, that sidecar's status appended.
+    fn with_results_sidecar(
+        mut pod: Pod,
+        status: Option<k8s_openapi::api::core::v1::ContainerStatus>,
+    ) -> Pod {
+        let spec = pod.spec.get_or_insert_with(Default::default);
+        spec.init_containers
+            .get_or_insert_with(Vec::new)
+            .push(Container {
+                name: RESULTS_EGRESS_CONTAINER.to_string(),
+                restart_policy: Some("Always".to_string()),
+                ..Default::default()
+            });
+        if let Some(status) = status {
+            pod.status
+                .get_or_insert_with(Default::default)
+                .init_container_statuses
+                .get_or_insert_with(Vec::new)
+                .push(status);
+        }
+        pod
+    }
+
+    /// A non-workspace step Pod in `phase`, its step container terminated at
+    /// `exit` (no workspace egress barrier in its spec).
+    fn plain_pod(phase: &str, exit: i32) -> Pod {
+        use k8s_openapi::api::core::v1::{
+            ContainerState, ContainerStateTerminated, ContainerStatus, PodStatus,
+        };
+        Pod {
+            spec: Some(PodSpec {
+                containers: vec![Container {
+                    name: STEP_CONTAINER.to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            status: Some(PodStatus {
+                phase: Some(phase.into()),
+                container_statuses: Some(vec![ContainerStatus {
+                    name: STEP_CONTAINER.into(),
+                    state: Some(ContainerState {
+                        terminated: Some(ContainerStateTerminated {
+                            exit_code: exit,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Non-workspace Pod (the `poll` branch that used to return `pod_state`
+    /// verbatim): phase `Succeeded` while the results sidecar still runs —
+    /// its POST may not have committed — is `Running`; once it terminated,
+    /// exit 0 or not, the real verdict. A failed drain must not hang the
+    /// step: it reads as results missing (D7), not as forever-Running.
+    #[test]
+    fn a_plain_pod_withholds_succeeded_until_the_results_drain_finished() {
+        let draining = with_results_sidecar(
+            plain_pod("Succeeded", 0),
+            Some(results_status(results_running(), false)),
+        );
+        assert!(results_draining(&draining));
+        assert_eq!(results_settled_state(&draining, NOW), ExecState::Running);
+
+        for code in [0, 1, 137] {
+            let done = with_results_sidecar(
+                plain_pod("Succeeded", 0),
+                Some(results_status(results_terminated(code), false)),
+            );
+            assert!(!results_draining(&done), "exit {code}");
+            assert_eq!(
+                results_settled_state(&done, NOW),
+                ExecState::Succeeded,
+                "exit {code}"
+            );
+        }
+
+        // Declared but no status entry yet: nothing proves the drain is done.
+        let unknown = with_results_sidecar(plain_pod("Succeeded", 0), None);
+        assert_eq!(results_settled_state(&unknown, NOW), ExecState::Running);
+
+        // A crash-looping sidecar the kubelet will not restart (waiting, with
+        // a previous termination) has nothing in flight: no withholding.
+        let waiting = with_results_sidecar(
+            plain_pod("Succeeded", 0),
+            Some(results_status(
+                k8s_openapi::api::core::v1::ContainerState {
+                    waiting: Some(Default::default()),
+                    ..Default::default()
+                },
+                true,
+            )),
+        );
+        assert_eq!(results_settled_state(&waiting, NOW), ExecState::Succeeded);
+    }
+
+    /// git-bug 0440e6a (red team R2-K1, K1): on a lost node `poll` reaches the
+    /// ceiling verdict WITHOUT an exec into the frozen egress, and that verdict
+    /// never reports green while the node took owed evidence with it.
+    #[test]
+    fn a_lost_node_past_the_ceiling_settles_without_an_exec_and_never_green_on_lost_evidence() {
+        let finished = NOW - 10_000;
+        let grace = 600;
+        let bound = grace + RESULTS_DRAIN_SLACK_SECS;
+        let past = finished + bound;
+        let frozen = |exit: i32, harvested: bool, snapshotted: bool, declared: bool| {
+            let mut pod = step_finished_at(
+                settling_pod_with("Running", exit, true, harvested, snapshotted),
+                finished,
+            );
+            pod.spec.as_mut().unwrap().termination_grace_period_seconds = Some(grace);
+            if declared {
+                pod.metadata
+                    .annotations
+                    .get_or_insert_with(Default::default)
+                    .insert(
+                        ANNOTATION_ARTIFACT_GLOBS.to_string(),
+                        "[\"dist/**\"]".to_string(),
+                    );
+            }
+            pod
+        };
+        let infra_lost = |state: ExecState| {
+            matches!(
+                state,
+                ExecState::Failed {
+                    exit_code: None,
+                    class: FailureClass::Infra {
+                        never_started: false
+                    },
+                    ..
+                }
+            )
+        };
+
+        // The leg: drive inside the ceiling and on a broken clock, skip past it.
+        let pod = frozen(0, false, true, true);
+        assert_eq!(workspace_leg(&pod, past - 1), WorkspaceLeg::Drive);
+        assert_eq!(workspace_leg(&pod, i64::MIN), WorkspaceLeg::Drive);
+        assert_eq!(workspace_leg(&pod, past), WorkspaceLeg::PastCeiling);
+        let gone = step_finished_at(
+            settling_pod_with("Running", 0, false, false, true),
+            finished,
+        );
+        assert_eq!(
+            workspace_leg(&gone, past),
+            WorkspaceLeg::Drive,
+            "an egress seen to terminate is driven (a no-op exec-wise), however late"
+        );
+
+        // A root and nothing owed: the step's exit 0 stands.
+        assert_eq!(
+            settled_state(&frozen(0, true, true, true), true, past),
+            ExecState::Succeeded
+        );
+        // K1: a root, but DECLARED artifacts never harvested — the retried
+        // infra failure, never a green step with its artifacts silently gone.
+        assert!(infra_lost(settled_state(
+            &frozen(0, false, true, true),
+            true,
+            past
+        )));
+        // Nothing declared: only the empty index was owed, which reads as [].
+        assert_eq!(
+            settled_state(&frozen(0, false, true, false), true, past),
+            ExecState::Succeeded
+        );
+        // No artifact store wired: no harvest is ever owed.
+        assert_eq!(
+            settled_state(&frozen(0, false, true, true), false, past),
+            ExecState::Succeeded
+        );
+        // No root: the snapshot is lost (ADR-0061 part 4).
+        assert!(infra_lost(settled_state(
+            &frozen(0, true, false, false),
+            true,
+            past
+        )));
+
+        // A non-zero exit held `Running` by the frozen egress: its own failure,
+        // promptly — not a `Timeout` an hour later.
+        assert!(matches!(
+            settled_state(&frozen(3, false, false, true), true, past),
+            ExecState::Failed {
+                exit_code: Some(3),
+                class: FailureClass::Step,
+                ..
+            }
+        ));
+        // Inside the ceiling it is still withheld while its harvest is owed.
+        assert_eq!(
+            settled_state(&frozen(3, false, false, true), true, past - 1),
+            ExecState::Running
+        );
+    }
+
+    /// git-bug 0440e6a, non-workspace half: a non-zero exit whose Pod phase is
+    /// held `Running` by a results sidecar that never reports terminating is
+    /// the step's own failure once the drain is overdue — not a `Timeout`.
+    #[test]
+    fn a_non_zero_exit_held_running_by_an_overdue_drain_fails_promptly() {
+        let finished = NOW - 10_000;
+        let held = |exit: i32| {
+            step_finished_at(
+                with_results_sidecar(
+                    plain_pod("Running", exit),
+                    Some(results_status(results_running(), false)),
+                ),
+                finished,
+            )
+        };
+        assert!(matches!(
+            results_settled_state(&held(2), NOW),
+            ExecState::Failed {
+                exit_code: Some(2),
+                class: FailureClass::Step,
+                ..
+            }
+        ));
+        assert_eq!(results_settled_state(&held(0), NOW), ExecState::Succeeded);
+        // Not yet overdue: withheld as before.
+        assert_eq!(
+            results_settled_state(&step_finished_at(held(2), NOW), NOW),
+            ExecState::Running
+        );
+    }
+
+    /// No results egress configured (no sidecar in the spec): the verdict is
+    /// `pod_state`'s, unchanged — including a `Succeeded` with no init
+    /// container statuses at all.
+    #[test]
+    fn a_pod_without_results_egress_is_unchanged() {
+        let pod = plain_pod("Succeeded", 0);
+        assert!(!results_draining(&pod));
+        assert_eq!(results_settled_state(&pod, NOW), ExecState::Succeeded);
+        assert_eq!(results_settled_state(&pod, NOW), pod_state(&pod));
+    }
+
+    /// git-bug 0cb5895: a results sidecar that terminated non-zero is a FAILED
+    /// DELIVERY — named, with its exit code and the kubelet's reason — so the
+    /// engine's DeploymentRequest-incomplete reason blames the delivery, not
+    /// the author. Exit 0, no sidecar, a drain still in flight, and a sidecar
+    /// never observed prove no failure: `None`, the author-facing reason
+    /// stands. A crash-looping sidecar reports its previous termination.
+    #[test]
+    fn a_results_sidecar_that_exited_non_zero_is_a_failed_delivery() {
+        let failed = with_results_sidecar(
+            plain_pod("Succeeded", 0),
+            Some(results_status(results_terminated(1), false)),
+        );
+        assert_eq!(
+            pod_results_delivery_failure(&failed, NOW).as_deref(),
+            Some("the results sidecar `scarab-results-egress` exited 1")
+        );
+
+        let mut killed = results_status(results_terminated(137), false);
+        if let Some(t) = killed.state.as_mut().and_then(|s| s.terminated.as_mut()) {
+            t.reason = Some("Error".into());
+        }
+        let killed = with_results_sidecar(plain_pod("Succeeded", 0), Some(killed));
+        assert_eq!(
+            pod_results_delivery_failure(&killed, NOW).as_deref(),
+            Some("the results sidecar `scarab-results-egress` exited 137 (Error)")
+        );
+
+        // Waiting after a previous non-zero termination (results_status's
+        // last_state exits 1): the failure is that previous termination.
+        let crash_looped = with_results_sidecar(
+            plain_pod("Succeeded", 0),
+            Some(results_status(
+                k8s_openapi::api::core::v1::ContainerState {
+                    waiting: Some(Default::default()),
+                    ..Default::default()
+                },
+                true,
+            )),
+        );
+        assert_eq!(
+            pod_results_delivery_failure(&crash_looped, NOW).as_deref(),
+            Some("the results sidecar `scarab-results-egress` exited 1")
+        );
+
+        let delivered = with_results_sidecar(
+            plain_pod("Succeeded", 0),
+            Some(results_status(results_terminated(0), false)),
+        );
+        assert_eq!(
+            pod_results_delivery_failure(&delivered, NOW),
+            None,
+            "exit 0"
+        );
+        assert_eq!(
+            pod_results_delivery_failure(&plain_pod("Succeeded", 0), NOW),
+            None,
+            "no results sidecar declared"
+        );
+        let in_flight = with_results_sidecar(
+            plain_pod("Succeeded", 0),
+            Some(results_status(results_running(), false)),
+        );
+        assert_eq!(
+            pod_results_delivery_failure(&in_flight, NOW),
+            None,
+            "still draining"
+        );
+        let unseen = with_results_sidecar(plain_pod("Succeeded", 0), None);
+        assert_eq!(
+            pod_results_delivery_failure(&unseen, NOW),
+            None,
+            "no status entry"
+        );
+    }
+
+    /// git-bug f02588d: a node lost after the step exited 0 but before the
+    /// kubelet reported the results sidecar terminating leaves the drain
+    /// "in flight" forever. The withholding is bounded at the Pod's
+    /// termination grace + slack after the step container's `finishedAt`;
+    /// past it the step's exit 0 is released as `Succeeded` (not left to the
+    /// engine's step timeout, which fails `Timeout` and is never retried),
+    /// and the missing results' reason names the unconfirmed delivery.
+    #[test]
+    fn a_results_drain_never_seen_to_finish_stops_withholding_past_its_bound() {
+        let finished = NOW - 1_000;
+        let grace = 30;
+        let bound = grace + RESULTS_DRAIN_SLACK_SECS;
+        let with_grace = |mut pod: Pod| {
+            pod.spec
+                .get_or_insert_with(Default::default)
+                .termination_grace_period_seconds = Some(grace);
+            pod
+        };
+        // Both node-lost shapes: phase Succeeded (sidecar running / no
+        // status), and phase Running held by the in-flight sidecar.
+        for (phase, status) in [
+            ("Succeeded", Some(results_status(results_running(), false))),
+            ("Succeeded", None),
+            ("Running", Some(results_status(results_running(), false))),
+            ("Running", None),
+        ] {
+            let pod = with_grace(with_results_sidecar(
+                step_finished_at(plain_pod(phase, 0), finished),
+                status.clone(),
+            ));
+            let why = format!("{phase} / sidecar status {}", status.is_some());
+            // Inside the bound: still withheld, and no failure is claimed.
+            let inside = finished + bound - 1;
+            assert_eq!(
+                results_settled_state(&pod, inside),
+                ExecState::Running,
+                "{why}"
+            );
+            assert_eq!(pod_results_delivery_failure(&pod, inside), None, "{why}");
+            // At / past the bound: released, the delivery named unconfirmed.
+            for at in [finished + bound, NOW] {
+                assert_eq!(
+                    results_settled_state(&pod, at),
+                    ExecState::Succeeded,
+                    "{why} at +{}",
+                    at - finished
+                );
+                assert_eq!(
+                    pod_results_delivery_failure(&pod, at).as_deref(),
+                    Some(
+                        "the results sidecar `scarab-results-egress` never reported \
+                         terminating within 330s of its drain beginning (its node may be \
+                         lost), so the delivery is unconfirmed"
+                    ),
+                    "{why}"
+                );
+            }
+        }
+
+        // The Pod's own grace is honoured: a 600 s grace is not cut at 330 s.
+        let long = with_results_sidecar(
+            step_finished_at(plain_pod("Running", 0), finished),
+            Some(results_status(results_running(), false)),
+        );
+        let mut long = long;
+        long.spec.as_mut().unwrap().termination_grace_period_seconds = Some(600);
+        assert_eq!(
+            results_settled_state(&long, finished + 600 + RESULTS_DRAIN_SLACK_SECS - 1),
+            ExecState::Running
+        );
+        assert_eq!(
+            results_settled_state(&long, finished + 600 + RESULTS_DRAIN_SLACK_SECS),
+            ExecState::Succeeded
+        );
+
+        // No `finishedAt` (the step's exit not reported): no bound, the
+        // engine's step timeout stays the backstop.
+        let unstamped = with_results_sidecar(
+            plain_pod("Running", 0),
+            Some(results_status(results_running(), false)),
+        );
+        assert_eq!(
+            results_settled_state(&unstamped, i64::MAX),
+            ExecState::Running
+        );
+
+        // Never promoted to `Succeeded`: a step that exited non-zero gets its
+        // own failure (git-bug 0440e6a — not the step timeout), and a Pod
+        // with no results sidecar declared stays `Running` (its `Running` is
+        // not a drain's).
+        let failed_step = with_grace(with_results_sidecar(
+            step_finished_at(plain_pod("Running", 1), finished),
+            Some(results_status(results_running(), false)),
+        ));
+        assert!(matches!(
+            results_settled_state(&failed_step, NOW),
+            ExecState::Failed {
+                exit_code: Some(1),
+                class: FailureClass::Step,
+                ..
+            }
+        ));
+        let no_sidecar = with_grace(step_finished_at(plain_pod("Running", 0), finished));
+        assert_eq!(results_settled_state(&no_sidecar, NOW), ExecState::Running);
+
+        // A drain seen to finish is unaffected by the clock: its verdict and
+        // its failure (if any) are the sidecar's own.
+        let delivered = with_grace(with_results_sidecar(
+            step_finished_at(plain_pod("Succeeded", 0), finished),
+            Some(results_status(results_terminated(0), false)),
+        ));
+        assert_eq!(results_settled_state(&delivered, NOW), ExecState::Succeeded);
+        assert_eq!(pod_results_delivery_failure(&delivered, NOW), None);
+    }
+
+    /// Only `Succeeded` is withheld: a failed Pod owes no results the engine
+    /// reads, so `Failed` passes through verbatim even mid-drain.
+    #[test]
+    fn a_failed_pod_is_never_withheld_for_results() {
+        let pod = with_results_sidecar(
+            plain_pod("Failed", 2),
+            Some(results_status(results_running(), false)),
+        );
+        let state = results_settled_state(&pod, NOW);
+        assert_eq!(state, pod_state(&pod));
+        assert!(matches!(state, ExecState::Failed { .. }), "{state:?}");
+    }
+
+    /// Workspace Pod (`settled_state`): the workspace settle finished (egress
+    /// barrier terminated, root and artifact index recorded) but the results
+    /// sidecar still drains → `Running`; once it terminated → `Succeeded`.
+    #[test]
+    fn a_workspace_pod_withholds_succeeded_until_the_results_drain_finished() {
+        let draining = with_results_sidecar(
+            settling_pod("Succeeded", 0, false, true),
+            Some(results_status(results_running(), false)),
+        );
+        assert_eq!(settled_state(&draining, true, NOW), ExecState::Running);
+        let done = with_results_sidecar(
+            settling_pod("Succeeded", 0, false, true),
+            Some(results_status(results_terminated(0), false)),
+        );
+        assert_eq!(settled_state(&done, true, NOW), ExecState::Succeeded);
+    }
+
+    /// Review safety S1: the bound compares the control plane's clock with
+    /// the node's `finishedAt`, which Kubernetes does not keep in step. A node
+    /// a couple of minutes behind must not release a healthy drain: the slack
+    /// past the grace absorbs a skew of minutes, not of one.
+    #[test]
+    fn a_results_drain_bound_absorbs_minutes_of_node_clock_skew() {
+        let finished = NOW - 10_000;
+        let mut pod = with_results_sidecar(
+            step_finished_at(plain_pod("Running", 0), finished),
+            Some(results_status(results_running(), false)),
+        );
+        pod.spec.as_mut().unwrap().termination_grace_period_seconds = Some(30);
+        // The node's clock runs 4 minutes behind: the control plane sees the
+        // exit as 30 s grace + 240 s skew old while the drain is healthy.
+        assert_eq!(
+            results_settled_state(&pod, finished + 30 + 240),
+            ExecState::Running,
+            "a skewed node clock must not release a draining verdict"
+        );
+    }
+
+    /// Review safety S5: a broken (pre-epoch) wall clock fails CLOSED — no
+    /// drain is ever overdue on it, so `Succeeded` stays withheld while the
+    /// results are in flight (it used to read as the far future, releasing
+    /// every drain at once).
+    #[test]
+    fn a_broken_clock_never_makes_a_results_drain_overdue() {
+        let broken = std::time::UNIX_EPOCH - std::time::Duration::from_secs(1);
+        let now = unix_secs(broken);
+        let pod = with_results_sidecar(
+            step_finished_at(plain_pod("Running", 0), NOW - 100_000),
+            Some(results_status(results_running(), false)),
+        );
+        assert_eq!(results_settled_state(&pod, now), ExecState::Running);
+        assert_eq!(pod_results_delivery_failure(&pod, now), None);
+        let succeeded = with_results_sidecar(
+            step_finished_at(plain_pod("Succeeded", 0), NOW - 100_000),
+            Some(results_status(results_running(), false)),
+        );
+        assert_eq!(results_settled_state(&succeeded, now), ExecState::Running);
+    }
+
+    /// Review correctness F5: the kubelet stops a finished Pod's native
+    /// sidecars in reverse declaration order, and the results egress is
+    /// declared before the workspace egress — so the results sidecar only
+    /// starts draining once the workspace settle has ended, which may take
+    /// most of its long grace. The bound runs from THAT, not from the step's
+    /// exit, so a long settle cannot use up the results drain's bound.
+    #[test]
+    fn a_long_workspace_settle_does_not_use_up_the_results_drain_bound() {
+        use k8s_openapi::api::core::v1::ContainerState;
+        let finished = NOW - 10_000;
+        let grace = 600;
+        let settled_at = finished + 500;
+        let pod = || {
+            // Declared order as `build_pod` makes it: results egress, then the
+            // workspace egress.
+            let mut pod = step_finished_at(settling_pod("Running", 0, false, true), finished);
+            let spec = pod.spec.as_mut().unwrap();
+            spec.termination_grace_period_seconds = Some(grace);
+            spec.init_containers.as_mut().unwrap().insert(
+                0,
+                Container {
+                    name: RESULTS_EGRESS_CONTAINER.to_string(),
+                    restart_policy: Some("Always".to_string()),
+                    ..Default::default()
+                },
+            );
+            let statuses = pod
+                .status
+                .as_mut()
+                .unwrap()
+                .init_container_statuses
+                .as_mut()
+                .unwrap();
+            let egress = statuses
+                .iter_mut()
+                .find(|c| c.name == WORKSPACE_EGRESS_CONTAINER)
+                .unwrap();
+            egress.state = Some(ContainerState {
+                terminated: Some(k8s_openapi::api::core::v1::ContainerStateTerminated {
+                    exit_code: 0,
+                    finished_at: Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                        k8s_openapi::jiff::Timestamp::from_second(settled_at).unwrap(),
+                    )),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            statuses.push(results_status(results_running(), false));
+            pod
+        };
+        let bound = grace + RESULTS_DRAIN_SLACK_SECS;
+        // Past the step's exit + bound, but the drain began only when the
+        // workspace settle ended: still withheld.
+        assert_eq!(
+            settled_state(&pod(), true, finished + bound),
+            ExecState::Running,
+            "the results drain's bound runs from the settle's end"
+        );
+        assert_eq!(
+            settled_state(&pod(), true, settled_at + bound - 1),
+            ExecState::Running
+        );
+        assert_eq!(
+            settled_state(&pod(), true, settled_at + bound),
+            ExecState::Succeeded
+        );
+        // While the workspace egress has not stopped, the results sidecar has
+        // not begun to drain: no drain bound — only the sidecar reporting
+        // ceiling (red team R3), the step's exit + grace + slack, by which a
+        // live kubelet has reported every sidecar.
+        let mut settling = pod();
+        settling
+            .status
+            .as_mut()
+            .unwrap()
+            .init_container_statuses
+            .as_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|c| c.name == WORKSPACE_EGRESS_CONTAINER)
+            .unwrap()
+            .state = Some(results_running());
+        assert_eq!(
+            results_settled_state(&settling, finished + bound - 1),
+            ExecState::Running
+        );
+        assert_eq!(
+            results_settled_state(&settling, finished + bound),
+            ExecState::Succeeded,
+            "past the ceiling a frozen workspace egress no longer removes the bound"
+        );
+    }
+
+    /// Red team R3 on git-bug f02588d: the default path. A workspace Pod on a
+    /// lost node shows its workspace egress frozen at `running` forever (and
+    /// its results sidecar never signalled). Within the sidecar reporting
+    /// ceiling that is a settle in flight — withheld; past it, it is a lost
+    /// node: with no root recorded the verdict is the existing "workspace
+    /// snapshot lost" infra failure (auto-retried), not a hang until the
+    /// step's timeout (`Timeout`, never retried).
+    #[test]
+    fn a_frozen_workspace_egress_past_the_ceiling_is_a_lost_snapshot() {
+        let finished = NOW - 10_000;
+        let grace = 600;
+        let bound = grace + RESULTS_DRAIN_SLACK_SECS;
+        let frozen = |snapshotted: bool| {
+            let mut pod = with_results_sidecar(
+                step_finished_at(
+                    settling_pod_with("Running", 0, true, true, snapshotted),
+                    finished,
+                ),
+                Some(results_status(results_running(), false)),
+            );
+            pod.spec.as_mut().unwrap().termination_grace_period_seconds = Some(grace);
+            pod
+        };
+        // Inside the ceiling: still settling.
+        assert_eq!(
+            settled_state(&frozen(false), true, finished + bound - 1),
+            ExecState::Running
+        );
+        // Past it, no root: the snapshot is lost — retried infra, not a hang.
+        match settled_state(&frozen(false), true, finished + bound) {
+            ExecState::Failed {
+                exit_code: None,
+                class: FailureClass::Infra {
+                    never_started: false,
+                },
+                cause: Some(cause),
+            } => assert!(cause.contains("workspace snapshot lost"), "{cause}"),
+            other => panic!("expected the lost-snapshot infra failure, got {other:?}"),
+        }
+        // Past it with the root recorded: the snapshot is durable, so the
+        // step's exit 0 stands.
+        assert_eq!(
+            settled_state(&frozen(true), true, finished + bound),
+            ExecState::Succeeded
+        );
+        // A broken clock never reaches the ceiling (fail closed: withheld).
+        assert_eq!(
+            settled_state(&frozen(false), true, i64::MIN),
+            ExecState::Running
+        );
+        // Without a results sidecar at all, the same.
+        let mut bare = step_finished_at(
+            settling_pod_with("Running", 0, true, true, false),
+            finished,
+        );
+        bare.spec.as_mut().unwrap().termination_grace_period_seconds = Some(grace);
+        assert_eq!(
+            settled_state(&bare, true, finished + bound - 1),
+            ExecState::Running
+        );
+        assert!(matches!(
+            settled_state(&bare, true, finished + bound),
+            ExecState::Failed { .. }
+        ));
     }
 
     // ------------------------------------------------------------------
@@ -7048,8 +8275,8 @@ mod tests {
     fn succeeded_is_refused_when_the_snapshot_was_lost_with_the_pod() {
         // Step exited 0, sidecar gone, NO workspace root ⇒ the snapshot is gone.
         let lost = settling_pod_with("Succeeded", 0, false, true, false);
-        assert!(workspace_snapshot_lost(&lost));
-        match settled_state(&lost, true) {
+        assert!(workspace_snapshot_lost(&lost, NOW));
+        match settled_state(&lost, true, NOW) {
             ExecState::Failed {
                 exit_code: None,
                 // The process RAN, so a side effect is possible: the retry is the
@@ -7071,8 +8298,8 @@ mod tests {
 
         // The same Pod WITH the root recorded is the ordinary green path.
         let settled = settling_pod_with("Succeeded", 0, false, true, true);
-        assert!(!workspace_snapshot_lost(&settled));
-        assert_eq!(settled_state(&settled, true), ExecState::Succeeded);
+        assert!(!workspace_snapshot_lost(&settled, NOW));
+        assert_eq!(settled_state(&settled, true, NOW), ExecState::Succeeded);
     }
 
     /// It must not become a way to hang a Run either. While the sidecar is alive
@@ -7086,7 +8313,7 @@ mod tests {
     fn a_drain_still_in_flight_is_withheld_not_failed() {
         let draining = settling_pod_with("Succeeded", 0, true, false, false);
         assert_eq!(
-            settled_state(&draining, true),
+            settled_state(&draining, true, NOW),
             ExecState::Running,
             "the drain has not run yet — this is not a lost snapshot, it is a pending one"
         );
@@ -7101,9 +8328,9 @@ mod tests {
     #[test]
     fn a_failed_step_owes_no_snapshot() {
         let failed = settling_pod_with("Failed", 1, false, true, false);
-        assert!(!workspace_snapshot_lost(&failed));
+        assert!(!workspace_snapshot_lost(&failed, NOW));
         assert_eq!(
-            settled_state(&failed, true),
+            settled_state(&failed, true, NOW),
             ExecState::Failed {
                 exit_code: Some(1),
                 class: FailureClass::Step,
@@ -7148,8 +8375,8 @@ mod tests {
             ..Default::default()
         };
         assert!(!is_workspace_pod(&pod));
-        assert!(!workspace_snapshot_lost(&pod));
-        assert_eq!(settled_state(&pod, false), ExecState::Succeeded);
+        assert!(!workspace_snapshot_lost(&pod, NOW));
+        assert_eq!(settled_state(&pod, false, NOW), ExecState::Succeeded);
     }
 
     /// An EMPTY workspace still has a root — the empty tree's hash — so a step that
@@ -7164,8 +8391,8 @@ mod tests {
             // Whatever `ingest` returns for an empty directory: still a root.
             "e".repeat(64),
         );
-        assert!(!workspace_snapshot_lost(&pod));
-        assert_eq!(settled_state(&pod, true), ExecState::Succeeded);
+        assert!(!workspace_snapshot_lost(&pod, NOW));
+        assert_eq!(settled_state(&pod, true, NOW), ExecState::Succeeded);
 
         // …whereas an EMPTY-STRING annotation is not a root and must not pass. The
         // annotation is only ever written from a real `Snapshot.root`, so this is
@@ -7175,7 +8402,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .insert(ANNOTATION_WS_ROOT.to_string(), String::new());
-        assert!(workspace_snapshot_lost(&pod));
+        assert!(workspace_snapshot_lost(&pod, NOW));
     }
 
     /// A platform verdict about a green-looking Pod must not be reclassified. If
@@ -7188,7 +8415,7 @@ mod tests {
         let mut pod = settling_pod_with("Failed", 137, false, true, false);
         pod.status.as_mut().unwrap().reason = Some("DeadlineExceeded".into());
         assert_eq!(
-            settled_state(&pod, true),
+            settled_state(&pod, true, NOW),
             ExecState::Failed {
                 exit_code: Some(137),
                 class: FailureClass::Timeout,
@@ -7215,23 +8442,23 @@ mod tests {
         // Step exited 1, index not yet on the Pod -> withhold, or the evidence
         // is uploaded-but-unindexed forever.
         assert_eq!(
-            settled_state(&settling_pod("Failed", 1, true, false), true),
+            settled_state(&settling_pod("Failed", 1, true, false), true, NOW),
             ExecState::Running,
             "reporting Failed here loses the failed attempt's artifact index"
         );
         // Index recorded -> report the failure at once; do not wait on the drain.
         assert_eq!(
-            settled_state(&settling_pod("Failed", 1, true, true), true),
+            settled_state(&settling_pod("Failed", 1, true, true), true, NOW),
             failed,
             "the harvest landed — a still-draining sidecar must not hide the verdict"
         );
         assert_eq!(
-            settled_state(&settling_pod("Failed", 1, false, true), true),
+            settled_state(&settling_pod("Failed", 1, false, true), true, NOW),
             failed
         );
         // No artifact store wired -> nothing is ever owed, nothing is withheld.
         assert_eq!(
-            settled_state(&settling_pod("Failed", 1, true, false), false),
+            settled_state(&settling_pod("Failed", 1, true, false), false, NOW),
             failed
         );
     }
@@ -7250,7 +8477,7 @@ mod tests {
             "precondition: the harvest is outstanding"
         );
         assert_eq!(
-            settled_state(&pod, true),
+            settled_state(&pod, true, NOW),
             ExecState::Failed {
                 exit_code: Some(137),
                 class: FailureClass::Timeout,

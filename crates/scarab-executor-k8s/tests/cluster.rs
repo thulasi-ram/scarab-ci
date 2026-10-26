@@ -114,7 +114,30 @@ fn opted_in() -> Option<String> {
         eprintln!("skipping: set SCARAB_TEST_KUBE=1 to run against a dev cluster");
         return None;
     }
+    // Every case passes this gate FIRST — before `workspace_fixture` builds
+    // its Depot and cold-store clients and before `kube_client` dials the API
+    // server — so this one call is where the process-level CryptoProvider
+    // goes in (git-bug 2852828).
+    install_crypto_provider();
     Some(std::env::var("SCARAB_TEST_KUBE_NS").unwrap_or_else(|_| "default".to_string()))
+}
+
+/// Install `ring` as the process-level rustls CryptoProvider (git-bug
+/// 2852828). This test binary's graph links more than one provider (`ring`
+/// and `aws-lc-rs`), so rustls 0.23 refuses to auto-select and panics ("Could
+/// not automatically determine the process-level CryptoProvider") at the first
+/// TLS handshake — the kube client dialing the API server. Same call as
+/// `scarab-server`'s `main.rs` and `scarab-plugin-k8s`'s cluster tier; the
+/// `Err` (a provider is already installed, by an earlier case in this
+/// process) is ignored.
+fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+/// The kube client every case uses: the ambient-config client. Only ever
+/// called after [`opted_in`], which installed the CryptoProvider.
+async fn kube_client() -> kube::Client {
+    kube::Client::try_default().await.expect("kube client")
 }
 
 /// Read a `SCARAB_TEST_*` var the tier's runner is expected to provide.
@@ -388,7 +411,7 @@ fn step(run_prefix: &str) -> StepRun {
 async fn busybox_runs_to_completion_and_relaunch_reattaches() {
     let Some(ns) = opted_in() else { return };
 
-    let client = kube::Client::try_default().await.expect("kube client");
+    let client = kube_client().await;
     let exec = K8sExecutor::with_client(ns, client);
     let step = step("run-echo");
     let spec = StepSpec {
@@ -441,7 +464,7 @@ async fn busybox_runs_to_completion_and_relaunch_reattaches() {
 async fn sleeping_step_is_killed_at_its_deadline() {
     let Some(ns) = opted_in() else { return };
 
-    let client = kube::Client::try_default().await.expect("kube client");
+    let client = kube_client().await;
     let exec = K8sExecutor::with_client(ns, client);
     let step = StepRun {
         run: RunId("run-timeout".into()),
@@ -510,7 +533,7 @@ async fn sleeping_step_is_killed_at_its_deadline() {
 async fn log_stream_tails_pod_stdout() {
     let Some(ns) = opted_in() else { return };
 
-    let client = kube::Client::try_default().await.expect("kube client");
+    let client = kube_client().await;
     let exec = K8sExecutor::with_client(ns, client);
     let step = step("run-logs");
     let spec = StepSpec {
@@ -577,7 +600,7 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
     let Some(ns) = opted_in() else { return };
     let Some(ws) = workspace_fixture() else { return };
 
-    let client = kube::Client::try_default().await.expect("kube client");
+    let client = kube_client().await;
     let exec = K8sExecutor::with_client(ns, client)
         .with_workspace_cas(ws.cas.clone())
         .with_workspace_depot(ws.depot.clone())
@@ -785,7 +808,7 @@ async fn a_green_attempt_is_backed_by_a_durable_snapshot_at_the_instant_it_goes_
     let Some(ns) = opted_in() else { return };
     let Some(ws) = workspace_fixture() else { return };
 
-    let client = kube::Client::try_default().await.expect("kube client");
+    let client = kube_client().await;
     let exec = K8sExecutor::with_client(ns, client)
         .with_workspace_cas(ws.cas.clone())
         .with_workspace_depot(ws.depot.clone())
@@ -965,7 +988,7 @@ async fn a_missing_input_snapshot_fails_the_attempt_instead_of_hanging() {
     let Some(ns) = opted_in() else { return };
     let Some(ws) = workspace_fixture() else { return };
 
-    let client = kube::Client::try_default().await.expect("kube client");
+    let client = kube_client().await;
     let exec = K8sExecutor::with_client(ns, client)
         .with_workspace_cas(ws.cas.clone())
         .with_workspace_depot(ws.depot.clone())
@@ -1053,7 +1076,7 @@ async fn a_missing_input_snapshot_fails_the_attempt_instead_of_hanging() {
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn a_step_with_inputs_is_refused_when_no_workspace_service_is_configured() {
     let Some(ns) = opted_in() else { return };
-    let client = kube::Client::try_default().await.expect("kube client");
+    let client = kube_client().await;
     let tmp = tempfile::tempdir().expect("cas dir");
     let cas: std::sync::Arc<dyn scarab_storage::Cas> = std::sync::Arc::new(
         scarab_storage_s3::S3Storage::local(tmp.path().to_str().unwrap()).expect("local cas"),
@@ -1099,7 +1122,7 @@ async fn a_step_with_inputs_is_refused_when_no_workspace_service_is_configured()
         matrix_values: Default::default(),
     };
     let pods: kube::Api<k8s_openapi::api::core::v1::Pod> = kube::Api::namespaced(
-        kube::Client::try_default().await.expect("kube client"),
+        kube_client().await,
         &std::env::var("SCARAB_TEST_KUBE_NS").unwrap_or_else(|_| "default".to_string()),
     );
     // With inputs (/workspace would be silently empty), then with none (the
@@ -1131,7 +1154,7 @@ async fn a_step_with_inputs_is_refused_when_no_workspace_service_is_configured()
     let ws = workspace_fixture().expect("the tier is opted in, so the fixture is wired");
     let configured = K8sExecutor::with_client(
         std::env::var("SCARAB_TEST_KUBE_NS").unwrap_or_else(|_| "default".to_string()),
-        kube::Client::try_default().await.expect("kube client"),
+        kube_client().await,
     )
     .with_workspace_cas(ws.cas.clone())
     .with_workspace_depot(ws.depot.clone())
@@ -1160,7 +1183,7 @@ async fn declared_outputs_publish_only_those_paths_through_the_cas() {
     let Some(ws) = workspace_fixture() else { return };
     let run_id = unique_run("run-ws-out");
 
-    let client = kube::Client::try_default().await.expect("kube client");
+    let client = kube_client().await;
     // The pruned root must be readable BY THE FETCHER, so the executor's `Cas` is
     // the workspace service — a host tempdir would leave step B unable to see
     // anything and the assertion below would pass for the wrong reason.
@@ -1309,7 +1332,7 @@ async fn clone_step_produces_a_source_workspace() {
     let Some(ws) = workspace_fixture() else { return };
     let cas = ws.cas.clone();
 
-    let client = kube::Client::try_default().await.expect("kube client");
+    let client = kube_client().await;
     let exec = K8sExecutor::with_client(ns, client)
         .with_workspace_cas(cas.clone())
         .with_workspace_depot(ws.depot.clone())
@@ -1478,7 +1501,7 @@ async fn clone_depth_full_exposes_history() {
     // fetcher (ADR-0061 s3-feed).
     let Some(ws) = workspace_fixture() else { return };
 
-    let client = kube::Client::try_default().await.expect("kube client");
+    let client = kube_client().await;
     let exec = K8sExecutor::with_client(ns, client)
         .with_workspace_cas(ws.cas.clone())
         .with_workspace_depot(ws.depot.clone())
@@ -1611,7 +1634,7 @@ async fn clone_vanished_sha_fails_fast_with_source_unavailable() {
     // ADR-0061 s3-drain it launches only with a workspace service configured.
     let ws = workspace_fixture().expect("the tier is opted in, so the fixture is wired");
 
-    let client = kube::Client::try_default().await.expect("kube client");
+    let client = kube_client().await;
     let exec = K8sExecutor::with_client(ns, client)
         .with_workspace_cas(ws.cas.clone())
         .with_workspace_depot(ws.depot.clone())
@@ -1705,7 +1728,7 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
     let Some(ws) = workspace_fixture() else { return };
     let run_id = unique_run("run-build");
 
-    let client = kube::Client::try_default().await.expect("kube client");
+    let client = kube_client().await;
     let exec = K8sExecutor::with_client(ns, client)
         .with_workspace_cas(ws.cas.clone())
         .with_workspace_depot(ws.depot.clone())
@@ -1886,7 +1909,7 @@ async fn results_sidecar_captures_a_named_result_end_to_end() {
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
     let secret = b"live-results-secret".to_vec();
-    let client = kube::Client::try_default().await.expect("kube client");
+    let client = kube_client().await;
     let exec = K8sExecutor::with_client(ns, client).with_results_egress(
         scarab_executor_k8s::ResultsEgress {
             base_url: format!("http://{host_ip}:{port}"),
@@ -1963,6 +1986,117 @@ async fn results_sidecar_captures_a_named_result_end_to_end() {
     exec.cancel(&h).await.expect("cleanup");
 }
 
+/// LIVE results withholding on the NON-workspace `poll` branch (ADR-0042,
+/// git-bug 2852828): with no workspace service wired, `poll` returns
+/// `results_settled_state` directly, and `Succeeded` must not be reported
+/// before the results sidecar's drain has committed — the engine completes a
+/// step's DeploymentRequests from the STORED results at `Succeeded`. The stub
+/// ingest endpoint holds its answer (as a slow `Db::set_step_results` commit
+/// would), and the test asserts that the first `Succeeded` `poll` reports
+/// comes only after the stub committed, and that the step's own exit was
+/// observed while the verdict was still withheld.
+#[tokio::test]
+#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
+async fn a_plain_step_is_not_succeeded_until_its_results_drain_committed() {
+    use k8s_openapi::api::core::v1::Pod;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let Some(ns) = opted_in() else { return };
+    let sidecar_image = tier_var("SCARAB_TEST_SIDECAR_IMAGE");
+    let host_ip = tier_var("SCARAB_TEST_HOST_IP");
+    let run_id = unique_run("run-results-hold");
+
+    // The stub commits only after a hold well inside the sidecar's per-try
+    // `curl -m 10` and the Pod's default 30 s termination grace.
+    const HOLD: std::time::Duration = std::time::Duration::from_secs(5);
+    let committed = std::sync::Arc::new(AtomicBool::new(false));
+    let flag = committed.clone();
+    use axum::routing::post;
+    let app = axum::Router::new().route(
+        "/v1/runs/{run}/steps/{step}/results",
+        post(move || {
+            let flag = flag.clone();
+            async move {
+                tokio::time::sleep(HOLD).await;
+                flag.store(true, Ordering::SeqCst);
+                axum::http::StatusCode::ACCEPTED
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let client = kube_client().await;
+    // No `with_workspace_cas`: `poll` takes the non-workspace branch.
+    let exec = K8sExecutor::with_client(ns.clone(), client.clone()).with_results_egress(
+        scarab_executor_k8s::ResultsEgress {
+            base_url: format!("http://{host_ip}:{port}"),
+            token_secret: b"live-results-hold-secret".to_vec(),
+            sidecar_image,
+        },
+    );
+    let pods: kube::Api<Pod> = kube::Api::namespaced(client, &ns);
+
+    let step = step_run_of(&run_id, "emit");
+    let spec = busybox_spec(
+        "echo '{\"answer\":42}' > /scarab/results/compute.json && echo emitted",
+        true, // busybox runs as root
+    );
+    let h = exec.launch(&step, &spec).await.expect("launch");
+
+    let mut consecutive = 0;
+    let mut withheld_after_exit = false;
+    let mut terminal = None;
+    for _ in 0..180 {
+        match exec.poll(&h).await {
+            Ok(ExecState::Succeeded) => {
+                terminal = Some(ExecState::Succeeded);
+                break;
+            }
+            Ok(s @ (ExecState::Failed { .. } | ExecState::Lost)) => {
+                terminal = Some(s);
+                break;
+            }
+            Ok(_) => {
+                consecutive = 0;
+                // The verdict is withheld; has the step itself already exited?
+                let pod = pods.get_opt(&pod_name(&step)).await.expect("get pod");
+                let step_exited = pod
+                    .and_then(|p| p.status)
+                    .and_then(|s| s.container_statuses)
+                    .into_iter()
+                    .flatten()
+                    .any(|c| c.name == "step" && c.state.and_then(|st| st.terminated).is_some());
+                if step_exited {
+                    withheld_after_exit = true;
+                }
+            }
+            Err(e) => {
+                consecutive += 1;
+                assert!(
+                    consecutive <= MAX_TRANSIENT_POLL_ERRS,
+                    "poll failed {consecutive}x consecutively — not a transient fault: {e}"
+                );
+                eprintln!("poll: riding out transient error #{consecutive}: {e}");
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert_eq!(terminal, Some(ExecState::Succeeded), "step succeeds");
+    assert!(
+        committed.load(Ordering::SeqCst),
+        "`Succeeded` was reported before the results drain committed"
+    );
+    assert!(
+        withheld_after_exit,
+        "the step's exit was never observed while the verdict was withheld — the \
+         hold did not exercise the drain window"
+    );
+
+    exec.cancel(&h).await.expect("cleanup");
+}
+
 /// LIVE cancel teardown (ADR-0054): a RUNNING step's Pod is actually deleted
 /// from the cluster by `cancel` (SIGTERM + grace), not just marked cancelled.
 #[tokio::test]
@@ -1971,7 +2105,7 @@ async fn cancel_tears_down_a_running_pod() {
     let Some(ns) = opted_in() else { return };
     let run_id = unique_run("run-cancel");
 
-    let client = kube::Client::try_default().await.expect("kube client");
+    let client = kube_client().await;
     let exec = K8sExecutor::with_client(ns.clone(), client.clone());
     let step = StepRun {
         run: RunId(run_id.clone()),
@@ -2045,7 +2179,7 @@ async fn artifacts_are_harvested_post_step() {
     let Some(ns) = opted_in() else { return };
     let run_id = unique_run("run-artifacts");
 
-    let client = kube::Client::try_default().await.expect("kube client");
+    let client = kube_client().await;
     let tmp = tempfile::tempdir().expect("store dir");
     let storage = std::sync::Arc::new(
         scarab_storage_s3::S3Storage::local(tmp.path().to_str().unwrap()).expect("local store"),
@@ -2140,7 +2274,7 @@ async fn artifacts_are_harvested_from_a_failed_step() {
     let Some(ns) = opted_in() else { return };
     let run_id = unique_run("run-artifacts-failed");
 
-    let client = kube::Client::try_default().await.expect("kube client");
+    let client = kube_client().await;
     let tmp = tempfile::tempdir().expect("store dir");
     let storage = std::sync::Arc::new(
         scarab_storage_s3::S3Storage::local(tmp.path().to_str().unwrap()).expect("local store"),
@@ -2268,7 +2402,7 @@ fn busybox_spec(cmd: &str, run_as_root: bool) -> StepSpec {
 async fn run_as_root_is_reflected_on_the_admitted_pod() {
     let Some(ns) = opted_in() else { return };
 
-    let client = kube::Client::try_default().await.expect("kube client");
+    let client = kube_client().await;
     let exec = K8sExecutor::with_client(ns.clone(), client.clone());
     use kube::api::Api;
     let pods: Api<k8s_openapi::api::core::v1::Pod> = Api::namespaced(client, &ns);
@@ -2325,7 +2459,7 @@ async fn run_as_root_is_reflected_on_the_admitted_pod() {
 async fn image_pull_failure_fails_the_attempt_fast() {
     let Some(ns) = opted_in() else { return };
 
-    let client = kube::Client::try_default().await.expect("kube client");
+    let client = kube_client().await;
     let exec = K8sExecutor::with_client(ns, client);
     let step = step_run_of(&unique_run("run-nopull"), "nopull");
     let spec = StepSpec {
@@ -2385,7 +2519,7 @@ async fn rerun_supersede_tears_down_the_in_flight_descendant_pod() {
     let c = StepId("c".into());
     let a1 = AttemptId("a1".into());
 
-    let client = kube::Client::try_default().await.expect("kube client");
+    let client = kube_client().await;
     let exec = K8sExecutor::with_client(ns.clone(), client.clone());
 
     // Launch c's Pod for real: a sleeper that outlives the test if orphaned.
@@ -2500,7 +2634,7 @@ async fn fanin_collision_summary_survives_the_termination_log_as_uid_65532() {
     let Some(ns) = opted_in() else { return };
     let Some(ws) = workspace_fixture() else { return };
 
-    let client = kube::Client::try_default().await.expect("kube client");
+    let client = kube_client().await;
     let exec = K8sExecutor::with_client(ns, client)
         .with_workspace_cas(ws.cas.clone())
         .with_workspace_depot(ws.depot.clone())
@@ -2603,4 +2737,215 @@ async fn fanin_collision_summary_survives_the_termination_log_as_uid_65532() {
         (1, 0),
         "declared indices: root 1 (C) wins over root 0 (B)"
     );
+}
+
+/// LIVE `DebugLauncher` (git-bug 16faa7c): a debug Pod opened on a finished
+/// step re-materialises that step's snapshot at `/workspace`, and a shell
+/// attached to it can read the content.
+///
+/// The debug Pod shares the fetcher with a real Step (ADR-0061 s3-feed) but
+/// three things about its path were never observed working, and this case
+/// pins all of them on the real cluster:
+///
+/// 1. its token is minted on a fence no Step ever produces (`attempt:
+///    "debug"`, a single root) — if the service refused it, the fetcher init
+///    container fails and the shell container never starts;
+/// 2. its token Secret is created AFTER the Pod (so it can be
+///    owner-referenced) — if the kubelet's FailedMount retry did not pick it
+///    up, the Pod never reaches Running inside `launch_debug`'s wait;
+/// 3. the snapshot actually lands: the shell reads A's bytes back through
+///    `attach_debug`, the same stream the UI's "open a shell" bridges.
+///
+/// (The ticket's third concern, a TTL past the token's 24 h cap, is not
+/// reachable: the only production caller passes 3600 s.)
+#[tokio::test]
+#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
+async fn a_debug_pod_rematerialises_a_finished_steps_snapshot() {
+    use scarab_executor_k8s::DebugLauncher;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let Some(ns) = opted_in() else { return };
+    let Some(ws) = workspace_fixture() else { return };
+
+    let client = kube_client().await;
+    let exec = K8sExecutor::with_client(ns, client)
+        .with_workspace_cas(ws.cas.clone())
+        .with_workspace_depot(ws.depot.clone())
+        .with_workspace_service(ws.fetch.clone());
+
+    // --- A finished step with a snapshot to debug. ---
+    let a = StepRun {
+        step: StepId("producer".into()),
+        ..step("run-debug")
+    };
+    let mut spec = busybox_spec("echo scarab-debug-marker > /workspace/out.txt", true);
+    spec.timeout_seconds = Some(120);
+    let ha = exec.launch(&a, &spec).await.expect("launch A");
+    assert_eq!(
+        poll_to_terminal(&exec, &ha, 90).await,
+        Some(ExecState::Succeeded),
+        "A succeeds"
+    );
+    let root_a = exec
+        .output(&ha)
+        .await
+        .expect("output")
+        .expect("A produced a workspace snapshot");
+
+    // --- The debug Pod. `launch_debug` returns only once the shell container
+    // is Running, i.e. after the fetcher init container exited 0 — which needs
+    // both the late-created token Secret mounted and the `debug` fence's token
+    // accepted by the service. ---
+    let dp = exec
+        .launch_debug(&a, "busybox:latest", Some(&root_a), 300)
+        .await
+        .expect("the debug Pod reaches Running with its snapshot fed");
+
+    // --- Shell in and read the snapshot back. ---
+    let mut io = exec.attach_debug(&dp.name).await.expect("attach");
+    io.input
+        .write_all(b"cat /workspace/out.txt; exit\n")
+        .await
+        .expect("type into the shell");
+    io.input.flush().await.expect("flush");
+    let mut seen = Vec::new();
+    let read = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut buf = [0u8; 4096];
+        loop {
+            match io.output.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    seen.extend_from_slice(&buf[..n]);
+                    // The TTY echoes the typed line, which does not contain
+                    // the marker — only `cat`'s output does.
+                    if String::from_utf8_lossy(&seen).contains("scarab-debug-marker") {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    let out = String::from_utf8_lossy(&seen).into_owned();
+    exec.teardown_debug(&dp.name).await.expect("teardown");
+    exec.cancel(&ha).await.expect("cleanup");
+    assert!(
+        read.is_ok(),
+        "the shell went quiet without output; got: {out:?}"
+    );
+    assert!(
+        out.contains("scarab-debug-marker"),
+        "the debug shell must see the finished step's workspace; got: {out:?}"
+    );
+}
+
+/// LIVE `needs:` + a uid-pinned service sidecar (git-bug 908f534).
+///
+/// The ticket's worry: a service pinning a non-root uid (ADR-0058
+/// `run_as_user`, `999` for the official `postgres` image) used to become the
+/// Pod's `fsGroup`, the kubelet would chown `/workspace` to `root:999 0775`, and
+/// neither the fetcher nor the step (both only in group 65532) could write it.
+/// PR #110 moved the service gid to `supplementalGroups` and pinned `fsGroup`
+/// to `WORKSPACE_GID`.
+///
+/// Observed on kind (k8s 1.36, containerd) with the PRE-#110 shape forced back
+/// in (`fsGroup: 999`, `supplementalGroups: [65532]`), this case still passes:
+/// the emptyDir is created `drwxrwsrwx` (0777, not 0775), and the kubelet adds
+/// `fsGroup` to every container's supplementary groups, so both the fetcher
+/// and the step are in group 999 anyway. So this is not a regression test for
+/// that shape — it is the ticket's owed proof that the combination works:
+/// the step reads the fed input, modifies a fed file, writes into a fed
+/// directory and the root, reaches the service on localhost:5432, succeeds,
+/// and its drained snapshot holds the result.
+#[tokio::test]
+#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
+async fn a_needs_step_with_a_uid_pinned_service_can_write_its_workspace() {
+    let Some(ns) = opted_in() else { return };
+    let Some(ws) = workspace_fixture() else { return };
+
+    let client = kube_client().await;
+    let exec = K8sExecutor::with_client(ns, client)
+        .with_workspace_cas(ws.cas.clone())
+        .with_workspace_depot(ws.depot.clone())
+        .with_workspace_service(ws.fetch.clone());
+
+    let run_id = unique_run("run-svc-ws");
+    let a = step_run_of(&run_id, "producer");
+    let mut producer = busybox_spec(
+        "mkdir -p /workspace/sub \
+         && echo seeded > /workspace/seed.txt \
+         && echo inner > /workspace/sub/inner.txt",
+        true,
+    );
+    producer.timeout_seconds = Some(120);
+    let ha = exec.launch(&a, &producer).await.expect("launch producer");
+    assert_eq!(
+        poll_to_terminal(&exec, &ha, 90).await,
+        Some(ExecState::Succeeded),
+        "producer succeeds"
+    );
+    let root_a = exec
+        .output(&ha)
+        .await
+        .expect("output")
+        .expect("producer snapshot");
+
+    let b = step_run_of(&run_id, "consumer");
+    let mut consumer = busybox_spec(
+        "test -f /workspace/seed.txt \
+         && echo appended >> /workspace/seed.txt \
+         && touch /workspace/sub/from-consumer \
+         && touch /workspace/from-consumer \
+         && nc -z -w 10 127.0.0.1 5432",
+        true,
+    );
+    consumer.timeout_seconds = Some(180);
+    consumer.workspace_inputs = vec![root_a];
+    consumer.services = vec![scarab_pipeline::ServiceSpec {
+        // Kind-loaded by `just kube-tests` and the kind workflow: a tagged
+        // image is IfNotPresent, so the node never pulls it.
+        image: "postgres:16".into(),
+        command: vec![],
+        args: vec![],
+        env: [("POSTGRES_HOST_AUTH_METHOD".to_string(), "trust".to_string())].into(),
+        ports: vec![5432],
+        ready: None,
+        run_as_user: Some(999),
+        run_as_root: false,
+    }];
+    let hb = exec.launch(&b, &consumer).await.expect("launch consumer");
+    let terminal = poll_to_terminal(&exec, &hb, 180).await;
+    assert_eq!(
+        terminal,
+        Some(ExecState::Succeeded),
+        "a needs: step beside a uid-999 service must get a writable /workspace"
+    );
+
+    let root_b = exec
+        .output(&hb)
+        .await
+        .expect("output")
+        .expect("consumer snapshot");
+    let mut names: Vec<String> = ws
+        .cas
+        .tree_entries(&scarab_storage::TreeHash(root_b))
+        .await
+        .expect("read the consumer's tree")
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            "from-consumer".to_string(),
+            "seed.txt".to_string(),
+            "sub".to_string()
+        ],
+        "the drain snapshotted the fed input AND the step's own write"
+    );
+
+    for h in [ha, hb] {
+        exec.cancel(&h).await.expect("cleanup");
+    }
 }

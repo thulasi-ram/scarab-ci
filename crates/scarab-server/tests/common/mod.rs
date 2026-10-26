@@ -84,3 +84,6 @@ fn swap_db(url: &str, dbname: &str) -> String {
     }
     out
 }
+
+/// Seeding org-level Environment governance (ADR-0071) on real Postgres.
+pub mod governance;

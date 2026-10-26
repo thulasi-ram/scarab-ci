@@ -56,6 +56,15 @@ scarab-identity = { workspace = true }
 scarab-secrets = { workspace = true }
 scarab-storage = { workspace = true }
 scarab-project = { workspace = true }
+# ADR-0070: the Deployment record — its store port and the fold every read
+# runs (the board and the Deployments view).
+scarab-deployment = { workspace = true }
+# ADR-0072: PluginInstallations, the report wire shape and its rules, and the
+# PluginStore / PluginTokenVerifier ports the broker and admin API speak.
+scarab-plugin = { workspace = true }
+# ADR-0072 §9/§11: the plugin runtime on Kubernetes (reconciled by
+# `plugin_runtime.rs`) and the TokenReview broker-token verifier.
+scarab-plugin-k8s = { workspace = true }
 scarab-db-postgres = { workspace = true }
 scarab-forge-github = { workspace = true }
 scarab-forge-forgejo = { workspace = true }
@@ -71,6 +80,15 @@ scarab-workspace-client = { workspace = true }
 scarab-executor-k8s = { workspace = true }
 scarab-executor-local = { workspace = true }
 scarab-testkit = { workspace = true }
+# ADR-0073 step-up: the WebAuthn relying party (passkey registration and
+# assertion verification). Its soft authenticator is a dev-only feature.
+scarab-webauthn = { workspace = true }
+# ADR-0073: the action digest is HMAC-SHA256 under a KEK-derived key. Already
+# in the tree (scarab-secrets-postgres, the forge webhook verifiers).
+hmac = { workspace = true }
+# ADR-0073 §6: a confirmed StepUpConfirmationRequest is replayed through the
+# real router (`ServiceExt::oneshot`). Already in the tree via axum.
+tower = { workspace = true, features = ["util"] }
 
 # ADR-0062 overlay change-set (`changeset.rs`): reading `trusted.overlay.*` off a
 # Step's upper layer. Target-gated to match the `#[cfg(target_os = "linux")]` on
@@ -86,6 +104,6 @@ xattr = { workspace = true }
 libc = "0.2"
 
 [dev-dependencies]
-regex-lite = { workspace = true }
-tower = { workspace = true, features = ["util"] }
+# ADR-0073 tests: a software passkey (a true external — the authenticator).
+scarab-webauthn = { workspace = true, features = ["soft-authenticator"] }
 tempfile = { workspace = true }

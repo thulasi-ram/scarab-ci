@@ -15,6 +15,10 @@
 #     crate simply cannot be named inside a pure crate's manifest.
 [workspace]
 resolver = "2"
+# `crates/scarab-plugin-argocd` (ADR-0072) is a member like any other, but it
+# names NO `scarab-*` crate outside `[dev-dependencies]`: it is the first-party
+# reporter and proves the third-party plugin contract is reachable over HTTP
+# alone.
 members = ["crates/*"]
 
 [workspace.package]
@@ -68,6 +72,18 @@ scarab-workspace-client = { path = "crates/scarab-workspace-client" }
 scarab-executor-k8s = { path = "crates/scarab-executor-k8s" }
 scarab-executor-local = { path = "crates/scarab-executor-local" }
 scarab-testkit = { path = "crates/scarab-testkit" }
+# ADR-0073: the WebAuthn relying-party verifier the step-up ceremony uses.
+scarab-webauthn = { path = "crates/scarab-webauthn" }
+scarab-deployment = { path = "crates/scarab-deployment" }
+scarab-plugin = { path = "crates/scarab-plugin" }
+# ADR-0072 §9/§11: the plugin runtime's Kubernetes adapter (namespace
+# baseline, workloads, isolation probe, TokenReview).
+scarab-plugin-k8s = { path = "crates/scarab-plugin-k8s" }
+
+# --- test-only ---------------------------------------------------------------
+# Property testing for pure domain folds (invariant suites). Dev-dependency
+# only; never linked into a binary.
+proptest = { version = "1", default-features = false, features = ["std"] }
 
 # --- infra (only inside adapter / binary crates) ---------------------------
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "sync", "net"] }
@@ -76,7 +92,6 @@ axum = "0.8"
 utoipa = { version = "5" }
 uuid = { version = "1", features = ["v4", "v7"] }
 futures = "0.3"
-regex-lite = "0.1"
 filetime = "0.2"
 flate2 = "1"
 tower = "0.5"
@@ -86,7 +101,9 @@ clap = { version = "4", features = ["derive", "env"] }
 # that actually writes, installed only by the composition root.
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring", "migrate", "macros", "json"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+# `stream`: the CredentialBroker streams an upstream response body to the
+# Plugin as it arrives (ADR-0072 §5 — Argo CD's watch API never ends).
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
 # Pin the rustls default CryptoProvider (ring) at the composition root; see the
 # note in scarab-server/src/main.rs. `ring` matches sqlx's `tls-rustls-ring`.
 rustls = { version = "0.23", features = ["ring"] }
@@ -110,6 +127,17 @@ reflink-copy = "0.1"
 # call site; the crate itself is unconditional here.
 xattr = "1"
 rsa = { version = "0.9", features = ["pem"] }
+# ADR-0073 step-up: the WebAuthn relying party (`crates/scarab-webauthn`)
+# verifies ES256 / EdDSA / RS256 assertion signatures with ring. Not a new
+# crate: ring 0.17 is already in the tree as the rustls/sqlx provider, and
+# webauthn-rs was rejected because it needs OpenSSL.
+ring = "0.17"
+# The one new external dep of ADR-0073: CBOR, to decode a WebAuthn
+# attestationObject and the COSE public key inside authenticatorData. There is
+# no CBOR crate in the tree. It is only ever used through the strict wrapper in
+# `crates/scarab-webauthn/src/cbor.rs` (definite lengths only, no tags, no
+# trailing bytes, depth and length limits). 2.x, not the superseded 0.x line.
+minicbor = { version = "2.3", features = ["alloc"] }
 kube = { version = "4", default-features = false, features = ["client", "ws", "rustls-tls"] }
 k8s-openapi = { version = "0.28", features = ["latest"] }
 

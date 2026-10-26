@@ -43,6 +43,7 @@
 //! | `SCARAB_MASTER_KEYS` | env | comma-separated base64 32-byte KEKs for envelope encryption; **first = active writer**, the rest decrypt-only (rotation, git-bug f37463a). Authoritative when set |
 //! | `SCARAB_MASTER_KEY` | env | legacy single KEK ≡ a one-key list (ADR-0014) — one of the two is **required** unless `SCARAB_DEV_INSECURE=1`. When both are set the list wins; a legacy key that is not a list member refuses to boot |
 //! | `SCARAB_DEV_INSECURE` | env | `1`/`true`: downgrade the **security** hard-fails (KEK, auth) to loud boot warnings — dev only, never relaxes the Postgres requirement |
+//! | `SCARAB_STEP_UP` | env | step-up confirmation (ADR-0073). Unset/blank or `enforce` = **enforce** (production: crown-jewel operations need a passkey confirmation); any other value refuses boot — there is no `off` or `log` mode. Under `SCARAB_DEV_INSECURE=1` it is off unless explicitly `enforce` (local passkey testing). Enforce with OAuth login needs an `https` (or loopback) `SCARAB_PUBLIC_URL` |
 //! | `SCARAB_STEP_TIMEOUT_SECS` | env | global default step deadline (ADR-0047); default 3600 (1h), per-step overridable via `timeout:` |
 //! | `SCARAB_PUBLIC_URL` | env | Scarab's public base URL — the run deep-link every forge status carries (ADR-0046); default `http://localhost:8080` (dev) |
 //! | `SCARAB_CLONE_IMAGE` | env | the canonical scarab-clone image a `clone` step runs (ADR-0045); default `ghcr.io/thulasi-ram/scarab-clone:edge` — digest-pin in production |
@@ -61,6 +62,15 @@
 //! | `SCARAB_OAUTH_PROVIDERS` / `_FILE` | env | further login providers as a YAML/JSON list (ADR-0069): `{id, name, client_id, client_secret \| client_secret_env, authorize_url, token_url, userinfo_url, issuer?, scopes?, forge_url?, unqualified_ids?}`. Ids are `[a-z0-9-]+` and prefix the Principal ids they mint. Duplicate ids, two `unqualified_ids`, or two providers on one `forge_url` refuse boot. Inline wins over `_FILE` |
 //! | `SCARAB_CONNECTIONS` | env | the declarative `connections:` block inline (YAML/JSON, ADR-0060 part D): config-owned forge connections, provisioned at boot and read-only in the UI. Wins over `_FILE` |
 //! | `SCARAB_CONNECTIONS_FILE` | env | path to a file holding the same `connections:` block (the GitOps shape: a ConfigMap mount). A bad path/parse/validation is a boot failure |
+//! | `SCARAB_PLUGINS` | env | `on`/`off` (default `off`): the plugin runtime (ADR-0072) — the CredentialBroker listener and plugin installs. The registry, the kill switch and the read views work either way; anything else refuses boot |
+//! | `SCARAB_BROKER_ADDR` | env | the CredentialBroker's own listener (ADR-0072 §11), separate from the API so plugins never reach the public surface; default `0.0.0.0:8090`. Only bound with `SCARAB_PLUGINS=on` |
+//! | `SCARAB_PLUGIN_NAMESPACE` | env | the one shared namespace Plugins run in (ADR-0072 §9); default `scarab-plugins`. A broker caller's ServiceAccount must be in it. Never `SCARAB_NAMESPACE`, `default` or `kube-*` (refused at boot) |
+//! | `SCARAB_PLUGIN_BROKER_URL` | env | the broker URL the runtime injects into every Plugin Pod (`SCARAB_BROKER_URL`); default `http://scarab-broker:8090`. Plugins have no DNS, so a host NAME is resolved by the runtime every pass and injected as an IP |
+//! | `SCARAB_PLUGIN_BROKER_PEER` | env | how the `plugin-egress` NetworkPolicy names the broker: `pods:<namespace>:<k=v,…>` or `cidr:<ip>/<prefix>` (at most a /24). Unset = the runtime refuses its baseline and no Plugin runs |
+//! | `SCARAB_PLUGIN_PROBE_IMAGE` | env | the isolation-probe and per-Pod self-check image (ADR-0072 §9); default `busybox:1.36.1` pinned by digest. Pin an override by digest too |
+//! | `SCARAB_PLUGIN_ARGOCD_REPO` | env | the repository the first-party Argo CD plugin installs from; default `ghcr.io/thulasi-ram/scarab-plugin-argocd`. An install must pin it by `@sha256:` digest |
+//! | `SCARAB_DEV_PLUGIN_TOKENS` | env | **dev only, needs `SCARAB_DEV_INSECURE`**: `<installation-id>=<token>,…` static broker tokens standing in for TokenReview (slice d2). Loud at boot |
+//! | `SCARAB_DEV_PLUGIN_ALLOW_TAG` | env | **dev only, needs `SCARAB_DEV_INSECURE`**: `1` lets a first-party install name a tag instead of a digest (kind/colima images have no repo digest). Loud at boot |
 //!
 //! Step-runtime env is injected *into* step containers (or their init/sidecar
 //! containers) by the executors and is **not** boot configuration — this table
@@ -73,7 +83,7 @@
 //! `SCARAB_SERVER`/`SCARAB_TOKEN` belong to `scarab` (the CLI client).
 
 use base64::Engine;
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
 
 /// Which slice(s) of Scarab this process should run.
@@ -98,6 +108,13 @@ pub enum Role {
 }
 
 impl Role {
+    /// Roles that serve the CredentialBroker's listener when plugins are on
+    /// (ADR-0072 §11): the ones that serve the API. The broker is part of
+    /// the control plane's front door, not of the scheduler or executor.
+    pub fn serves_broker(self) -> bool {
+        matches!(self, Role::Converged | Role::Api)
+    }
+
     /// Roles that drive the scheduler + executor background loop.
     pub fn runs_driver(self) -> bool {
         matches!(self, Role::Converged | Role::Scheduler | Role::Executor)
@@ -161,7 +178,7 @@ pub struct Cli {
     /// Postgres connection URL. Mandatory for every serving role (ADR-0048):
     /// Postgres is the durable core and the coordination bus — there is no
     /// API-only mode. `--emit-openapi` is the only DB-free path.
-    #[arg(long, env = "SCARAB_DATABASE_URL")]
+    #[arg(long, env = "SCARAB_DATABASE_URL", global = true)]
     pub database_url: Option<String>,
 
     /// Local directory backing the object store (logs/artifacts) — a bucket
@@ -184,6 +201,43 @@ pub struct Cli {
     /// codegen / CI spec check). Never connects to Postgres or serves.
     #[arg(long, value_name = "PATH")]
     pub emit_openapi: Option<String>,
+
+    /// An operator command instead of serving. Each runs against the
+    /// database directly and exits; none is reachable over HTTP or from the
+    /// `scarab` CLI.
+    #[command(subcommand)]
+    pub command: Option<ServerCommand>,
+}
+
+/// `scarab-server <command>`: operator tooling that needs the server's own
+/// database credentials.
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum ServerCommand {
+    /// Operator break-glass commands (ADR-0073 §10).
+    Admin {
+        #[command(subcommand)]
+        command: AdminCommand,
+    },
+}
+
+/// `scarab-server admin <command>`.
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum AdminCommand {
+    /// Remove EVERY passkey of a principal and revoke its standing
+    /// step-ups, for when no Owner can step up to reset them. Needs only
+    /// `--database-url` / `SCARAB_DATABASE_URL`; never migrates (refuses a
+    /// schema older than the security event log). Recorded in the
+    /// OrgSecurityEventLog as `passkey.break_glass_reset` with this host,
+    /// OS user and reason. The principal's next passkey needs a fresh
+    /// browser login.
+    ResetPasskeys {
+        /// The principal id (a merged id is followed to its Principal).
+        #[arg(long)]
+        principal: String,
+        /// Why — recorded with the reset.
+        #[arg(long)]
+        reason: Option<String>,
+    },
 }
 
 /// S3/MinIO object-store settings (selected by `SCARAB_S3_BUCKET`).
@@ -553,6 +607,272 @@ pub struct Config {
     /// connection is DB-owned (the pre-0060 world). Each of these is
     /// authoritative over its DB row and read-only in the UI.
     pub connections: Vec<ConnectionSpec>,
+    /// The plugin runtime and its CredentialBroker (ADR-0072).
+    pub plugins: PluginsConfig,
+    /// Step-up confirmation (ADR-0073, `SCARAB_STEP_UP`).
+    pub step_up: StepUpMode,
+}
+
+/// Whether crown-jewel operations need a passkey StepUpConfirmation
+/// (ADR-0073 §8). There is no `log` mode and no production `off`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepUpMode {
+    /// Production, and the default.
+    Enforce,
+    /// Only under `SCARAB_DEV_INSECURE`.
+    Off,
+}
+
+impl StepUpMode {
+    /// Resolve `SCARAB_STEP_UP`. Unset, blank or `enforce` is
+    /// [`Enforce`](StepUpMode::Enforce); any other value refuses the boot,
+    /// unless `dev_insecure`, which means off unless the value is
+    /// explicitly `enforce`.
+    pub fn resolve(raw: Option<&str>, dev_insecure: bool) -> Result<Self, ConfigError> {
+        let raw = raw.map(str::trim).filter(|v| !v.is_empty());
+        let enforce = raw.is_some_and(|v| v.eq_ignore_ascii_case("enforce"));
+        match (dev_insecure, raw) {
+            (true, _) if enforce => Ok(StepUpMode::Enforce),
+            (true, _) => Ok(StepUpMode::Off),
+            (false, None) => Ok(StepUpMode::Enforce),
+            (false, Some(_)) if enforce => Ok(StepUpMode::Enforce),
+            (false, Some(other)) => Err(ConfigError::InvalidStepUpMode(other.to_string())),
+        }
+    }
+}
+
+/// Is `public_url` acceptable as the WebAuthn relying party when step-up is
+/// enforced: `https`, or plain `http` only on a loopback host.
+fn step_up_public_url_ok(public_url: &str) -> bool {
+    let Ok(rp) = scarab_webauthn::RelyingParty::from_public_url(public_url, "Scarab") else {
+        return false;
+    };
+    rp.origin().starts_with("https://")
+        || matches!(rp.rp_id(), "localhost" | "127.0.0.1" | "::1")
+}
+
+/// The broker listener's default address (ADR-0072 §11).
+pub const DEFAULT_BROKER_ADDR: &str = "0.0.0.0:8090";
+/// The shared namespace Plugins run in (ADR-0072 §9).
+pub const DEFAULT_PLUGIN_NAMESPACE: &str = "scarab-plugins";
+/// Where the first-party Argo CD plugin's image is published.
+pub const DEFAULT_PLUGIN_ARGOCD_REPO: &str = "ghcr.io/thulasi-ram/scarab-plugin-argocd";
+
+/// The plugin runtime's knobs (ADR-0072). Fail-closed: `enabled` is off
+/// unless asked for, a junk value refuses boot, and the two dev knobs exist
+/// only under `SCARAB_DEV_INSECURE`.
+#[derive(Debug, Clone)]
+pub struct PluginsConfig {
+    /// `SCARAB_PLUGINS=on`: serve the broker and accept installs. Off, the
+    /// registry, kill switch and read views still work — an operator who
+    /// turned plugins off can still see and clean up what is installed.
+    pub enabled: bool,
+    /// `SCARAB_BROKER_ADDR`, validated as a socket address.
+    pub broker_addr: String,
+    pub namespace: String,
+    pub broker_url: String,
+    /// `pods:<ns>:<k=v,…>` or `cidr:<cidr>`, validated. `None` = unset: the
+    /// plugin runtime then refuses its namespace baseline and nothing runs.
+    pub broker_peer: Option<String>,
+    /// `None` = the runtime's default probe image (busybox).
+    pub probe_image: Option<String>,
+    /// The repository the first-party Argo CD catalog entry installs from.
+    pub argocd_repo: String,
+    /// Dev only: accept `<repo>:<tag>` for a first-party install.
+    pub dev_allow_tag: bool,
+    /// Dev only: static `(installation id, token)` pairs standing in for
+    /// TokenReview.
+    pub dev_tokens: Vec<(String, Redacted)>,
+}
+
+impl PluginsConfig {
+    /// Resolve the plugin knobs. `dev_insecure` gates the two dev knobs;
+    /// `exec_namespace` is `SCARAB_NAMESPACE`, which the plugin namespace
+    /// must never be.
+    fn resolve(
+        env: &impl Fn(&str) -> Option<String>,
+        dev_insecure: bool,
+        api_addr: &str,
+        exec_namespace: &str,
+    ) -> Result<Self, ConfigError> {
+        let set = |k: &str| {
+            env(k)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        let invalid = |m: String| ConfigError::InvalidPlugins(m);
+        let enabled = match set("SCARAB_PLUGINS").as_deref() {
+            None | Some("off") => false,
+            Some("on") => true,
+            Some(other) => {
+                return Err(invalid(format!(
+                    "SCARAB_PLUGINS must be `on` or `off`, got {other:?}"
+                )))
+            }
+        };
+        let broker_addr = set("SCARAB_BROKER_ADDR").unwrap_or_else(|| DEFAULT_BROKER_ADDR.into());
+        if broker_addr.parse::<std::net::SocketAddr>().is_err() {
+            return Err(invalid(format!(
+                "SCARAB_BROKER_ADDR must be an `ip:port` socket address, got {broker_addr:?}"
+            )));
+        }
+        if enabled && listeners_clash(&broker_addr, api_addr) {
+            return Err(invalid(format!(
+                "SCARAB_BROKER_ADDR ({broker_addr}) is the API's own address; the broker is a \
+                 separate listener so plugins never reach the public API (ADR-0072 §11)"
+            )));
+        }
+        let namespace =
+            set("SCARAB_PLUGIN_NAMESPACE").unwrap_or_else(|| DEFAULT_PLUGIN_NAMESPACE.into());
+        if scarab_plugin::validate_installation_name(&namespace).is_err() {
+            return Err(invalid(format!(
+                "SCARAB_PLUGIN_NAMESPACE must be a DNS-1123 label, got {namespace:?}"
+            )));
+        }
+        // The runtime applies a default-deny NetworkPolicy selecting EVERY
+        // Pod of this namespace (ADR-0072 §9): shared with step Pods it would
+        // cut them off — and put PR code beside plugins — and `default` or a
+        // `kube-*` namespace is no place for Scarab to create workloads. Only
+        // with plugins on: off, nothing is ever created there, and an
+        // unrelated deployment should not refuse to boot over it.
+        if enabled && namespace == exec_namespace {
+            return Err(invalid(format!(
+                "SCARAB_PLUGIN_NAMESPACE ({namespace}) is SCARAB_NAMESPACE, where step Pods \
+                 run; plugins need a namespace of their own (ADR-0072 §9)"
+            )));
+        }
+        if enabled && (namespace == "default" || namespace.starts_with("kube-")) {
+            return Err(invalid(format!(
+                "SCARAB_PLUGIN_NAMESPACE ({namespace}) is a namespace Kubernetes owns; plugins \
+                 need a namespace of their own (ADR-0072 §9)"
+            )));
+        }
+        let broker_url =
+            set("SCARAB_PLUGIN_BROKER_URL").unwrap_or_else(|| "http://scarab-broker:8090".into());
+        // The runtime takes it apart to hand Pods the broker by IP; a URL it
+        // cannot take apart would refuse every pass, so refuse boot instead.
+        if let Err(e) = scarab_plugin_k8s::BrokerUrl::parse(&broker_url) {
+            return Err(invalid(format!("SCARAB_PLUGIN_BROKER_URL: {e}")));
+        }
+        let broker_peer = set("SCARAB_PLUGIN_BROKER_PEER");
+        if let Some(peer) = &broker_peer {
+            // Parsed in full, not just by prefix: this is the one egress
+            // allowance a Plugin gets, so a selector that matches every Pod
+            // or a CIDR wider than a broker refuses boot (ADR-0072 §9).
+            if let Err(e) = scarab_plugin_k8s::BrokerPeer::parse(peer) {
+                return Err(invalid(format!("SCARAB_PLUGIN_BROKER_PEER: {e}")));
+            }
+        }
+        let argocd_repo =
+            set("SCARAB_PLUGIN_ARGOCD_REPO").unwrap_or_else(|| DEFAULT_PLUGIN_ARGOCD_REPO.into());
+        // A repository, not a reference: the digest (or dev tag) is the
+        // install's to name.
+        if argocd_repo.contains('@')
+            || argocd_repo
+                .rsplit('/')
+                .next()
+                .is_some_and(|l| l.contains(':'))
+        {
+            return Err(invalid(format!(
+                "SCARAB_PLUGIN_ARGOCD_REPO must be a repository with no tag or digest, got \
+                 {argocd_repo:?}"
+            )));
+        }
+        let dev_allow_tag = match set("SCARAB_DEV_PLUGIN_ALLOW_TAG").as_deref() {
+            None | Some("0") | Some("false") => false,
+            Some("1") | Some("true") if dev_insecure => true,
+            Some("1") | Some("true") => {
+                return Err(invalid(
+                    "SCARAB_DEV_PLUGIN_ALLOW_TAG needs SCARAB_DEV_INSECURE=1: installing a \
+                     plugin by tag is a dev convenience, never a production mode"
+                        .into(),
+                ))
+            }
+            Some(other) => {
+                return Err(invalid(format!(
+                    "SCARAB_DEV_PLUGIN_ALLOW_TAG must be `1` or `0`, got {other:?}"
+                )))
+            }
+        };
+        let dev_tokens = match set("SCARAB_DEV_PLUGIN_TOKENS") {
+            None => Vec::new(),
+            Some(_) if !dev_insecure => {
+                return Err(invalid(
+                    "SCARAB_DEV_PLUGIN_TOKENS needs SCARAB_DEV_INSECURE=1: static broker \
+                     tokens stand in for TokenReview in dev only"
+                        .into(),
+                ))
+            }
+            Some(raw) => {
+                let mut tokens: Vec<(String, Redacted)> = Vec::new();
+                for pair in raw.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                    let (id, token) = pair.split_once('=').ok_or_else(|| {
+                        invalid(
+                            "SCARAB_DEV_PLUGIN_TOKENS wants `<installation-id>=<token>,…`".into(),
+                        )
+                    })?;
+                    if !scarab_plugin::is_installation_id(id) || token.is_empty() {
+                        return Err(invalid(format!(
+                            "SCARAB_DEV_PLUGIN_TOKENS: `{id}` must be a 10-hex installation id \
+                             with a non-empty token"
+                        )));
+                    }
+                    if tokens.iter().any(|(i, t)| i == id || t.expose() == token) {
+                        return Err(invalid(
+                            "SCARAB_DEV_PLUGIN_TOKENS repeats an installation id or a token".into(),
+                        ));
+                    }
+                    tokens.push((id.to_string(), Redacted::new(token)));
+                }
+                tokens
+            }
+        };
+        Ok(PluginsConfig {
+            enabled,
+            broker_addr,
+            namespace,
+            broker_url,
+            broker_peer,
+            probe_image: set("SCARAB_PLUGIN_PROBE_IMAGE"),
+            argocd_repo,
+            dev_allow_tag,
+            dev_tokens,
+        })
+    }
+
+    /// Off, with every default: what a hand-built [`Config`] (tests) uses.
+    pub fn off() -> Self {
+        PluginsConfig {
+            enabled: false,
+            broker_addr: DEFAULT_BROKER_ADDR.into(),
+            namespace: DEFAULT_PLUGIN_NAMESPACE.into(),
+            broker_url: "http://scarab-broker:8090".into(),
+            broker_peer: None,
+            probe_image: None,
+            argocd_repo: DEFAULT_PLUGIN_ARGOCD_REPO.into(),
+            dev_allow_tag: false,
+            dev_tokens: Vec::new(),
+        }
+    }
+}
+
+/// Whether the broker's address and the API's would bind the same socket.
+/// Compared as socket addresses, not strings: `127.0.0.1:8080` or
+/// `[::]:8080` against an API on `0.0.0.0:8080` is the same port on an
+/// overlapping address — a wildcard covers every address of its port. An
+/// API address that is not `ip:port` falls back to a string compare.
+fn listeners_clash(broker_addr: &str, api_addr: &str) -> bool {
+    use std::net::SocketAddr;
+    match (
+        broker_addr.parse::<SocketAddr>(),
+        api_addr.parse::<SocketAddr>(),
+    ) {
+        (Ok(b), Ok(a)) => {
+            b.port() == a.port()
+                && (b.ip() == a.ip() || b.ip().is_unspecified() || a.ip().is_unspecified())
+        }
+        _ => broker_addr == api_addr,
+    }
 }
 
 /// The forge-agnostic OAuth/OIDC login provider (ADR-0049): explicit
@@ -662,7 +982,8 @@ fn oauth_providers(
         for e in entries {
             if !is_provider_id(&e.id) {
                 return Err(bad(format!(
-                    "{source}: provider id `{}` — want lowercase letters, digits and `-`",
+                    "{source}: provider id `{}` — want lowercase letters, digits and `-`, \
+                     and not `plugin` (reserved for PluginPrincipals, ADR-0072 §3)",
                     e.id
                 )));
             }
@@ -848,13 +1169,28 @@ pub enum ConfigError {
 
     #[error(
         "SCARAB_OAUTH_PROVIDER_ID `{0}` is invalid (ADR-0069) — want lowercase \
-         letters, digits and `-`. It prefixes every Principal id the provider \
-         mints, so it may not carry the `:`/`~` an id is parsed by."
+         letters, digits and `-`, and not `plugin`. It prefixes every Principal id \
+         the provider mints, so it may not carry the `:`/`~` an id is parsed by, \
+         nor claim the prefix PluginPrincipals use (ADR-0072 §3)."
     )]
     InvalidProviderId(String),
 
     #[error("login providers are misconfigured (ADR-0069): {0}")]
     InvalidOAuthProviders(String),
+
+    #[error(
+        "SCARAB_STEP_UP=`{0}` is not a mode (ADR-0073). Step-up confirmation is always \
+         enforced in production: unset it, or set it to `enforce`. There is no `off` or \
+         `log` mode — only SCARAB_DEV_INSECURE=1 (dev only) turns it off."
+    )]
+    InvalidStepUpMode(String),
+
+    #[error(
+        "step-up is enforced (ADR-0073) but SCARAB_PUBLIC_URL `{0}` cannot be a WebAuthn \
+         relying party: passkeys need an https origin (plain http only on localhost / \
+         127.0.0.1 / ::1). Set SCARAB_PUBLIC_URL to the https URL browsers reach Scarab at."
+    )]
+    StepUpNeedsHttpsPublicUrl(String),
 
     #[error(
         "SCARAB_RETENTION_LOG_DAYS is set but invalid — want a positive integer number \
@@ -928,6 +1264,13 @@ pub enum ConfigError {
          typo refuses the boot (ADR-0048)."
     )]
     InvalidBlobAuthzMode(String),
+
+    #[error(
+        "the plugin configuration is invalid (ADR-0072): {0}. A plugin runtime Scarab \
+         cannot run as configured would fail at the first install or report, not at \
+         boot (ADR-0048), so this refuses to start."
+    )]
+    InvalidPlugins(String),
 }
 
 impl Config {
@@ -1250,6 +1593,25 @@ impl Config {
             None => 14,
         };
 
+        let plugins = PluginsConfig::resolve(&env, dev_insecure, &cli.addr, &cli.namespace)?;
+
+        let public_url = env("SCARAB_PUBLIC_URL")
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "http://localhost:8080".into());
+        // Step-up (ADR-0073 §8): enforce unless the dev escape hatch says
+        // otherwise; a typo or an `off` refuses the boot.
+        let step_up = StepUpMode::resolve(env("SCARAB_STEP_UP").as_deref(), dev_insecure)?;
+        // Passkeys are bound to the public URL's origin: with login wired,
+        // an origin browsers will not run WebAuthn on would make every
+        // crown jewel unconfirmable.
+        if step_up == StepUpMode::Enforce
+            && !oauth.is_empty()
+            && !matches!(cli.role, Role::Workspace)
+            && !step_up_public_url_ok(&public_url)
+        {
+            return Err(ConfigError::StepUpNeedsHttpsPublicUrl(public_url));
+        }
+
         Ok(Config {
             role: cli.role,
             addr: cli.addr.clone(),
@@ -1267,9 +1629,7 @@ impl Config {
             master_key_warnings,
             dev_insecure,
             step_timeout_secs,
-            public_url: env("SCARAB_PUBLIC_URL")
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| "http://localhost:8080".into()),
+            public_url,
             github_app_id: env("SCARAB_GITHUB_APP_ID").filter(|v| !v.is_empty()),
             github_app_pem: env("SCARAB_GITHUB_APP_PEM").filter(|v| !v.is_empty()),
             github_app_pem_file: env("SCARAB_GITHUB_APP_PEM_FILE").filter(|v| !v.is_empty()),
@@ -1311,6 +1671,8 @@ impl Config {
             retention_config_file: env("SCARAB_RETENTION_CONFIG_FILE").filter(|v| !v.is_empty()),
             cas_concurrency,
             connections,
+            plugins,
+            step_up,
         })
     }
 
@@ -1318,6 +1680,39 @@ impl Config {
     /// (ADR-0048): insecure is opt-in and screaming, never silent.
     pub fn boot_warnings(&self) -> Vec<String> {
         let mut warnings = self.master_key_warnings.clone();
+        if !self.plugins.dev_tokens.is_empty() {
+            warnings.push(format!(
+                "⚠ DEV PLUGIN TOKENS — {} static broker token(s) stand in for TokenReview; \
+                 anyone holding one reports as that installation (SCARAB_DEV_PLUGIN_TOKENS, \
+                 dev only)",
+                self.plugins.dev_tokens.len()
+            ));
+        }
+        if self.plugins.dev_allow_tag {
+            warnings.push(
+                "⚠ PLUGIN TAG INSTALLS — first-party plugins may be installed by TAG, so what \
+                 was approved can change under the same name (SCARAB_DEV_PLUGIN_ALLOW_TAG, \
+                 dev only)"
+                    .to_string(),
+            );
+        }
+        if self.dev_insecure && self.step_up == StepUpMode::Off {
+            warnings.push(
+                "⚠ STEP-UP OFF — crown-jewel operations need no passkey confirmation \
+                 (SCARAB_DEV_INSECURE=1, dev only; SCARAB_STEP_UP=enforce opts back in)"
+                    .to_string(),
+            );
+        }
+        if self.step_up == StepUpMode::Enforce
+            && self.oauth.is_empty()
+            && !matches!(self.role, Role::Workspace)
+        {
+            warnings.push(
+                "⚠ STEP-UP INACTIVE — SCARAB_STEP_UP=enforce but no login is configured, so \
+                 there is no human to confirm anything (SCARAB_DEV_INSECURE=1, dev only)"
+                    .to_string(),
+            );
+        }
         if self.dev_insecure {
             warnings.push(
                 "⚠ AUTH DISABLED — no authenticator; ALL callers are treated as Owner \
@@ -1333,6 +1728,29 @@ impl Config {
             }
         }
         warnings
+    }
+
+    /// The startup report's step-up line (ADR-0073 §8).
+    pub fn step_up_report(&self) -> String {
+        match (self.role, self.step_up) {
+            (Role::Workspace, _) => "step-up: n/a (workspace role)".to_string(),
+            (_, StepUpMode::Off) => "step-up: OFF — SCARAB_DEV_INSECURE".to_string(),
+            (_, StepUpMode::Enforce) if self.oauth.is_empty() => {
+                "step-up: INACTIVE — SCARAB_STEP_UP=enforce but no login is configured \
+                 (SCARAB_DEV_INSECURE)"
+                    .to_string()
+            }
+            (_, StepUpMode::Enforce) => {
+                match scarab_webauthn::RelyingParty::from_public_url(&self.public_url, "Scarab") {
+                    Ok(rp) => format!(
+                        "step-up: enforced (ADR-0073; rpId={}, origin={})",
+                        rp.rp_id(),
+                        rp.origin()
+                    ),
+                    Err(e) => format!("step-up: enforced (ADR-0073; {e})"),
+                }
+            }
+        }
     }
 
     /// The startup report (ADR-0048): one line per subsystem, enabled/disabled,
@@ -1389,6 +1807,7 @@ impl Config {
                 self.step_timeout_secs,
             ),
             format!("public url: {} (run deep-links, ADR-0046)", self.public_url),
+            self.step_up_report(),
             format!("clone image: {} (ADR-0045)", self.clone_image),
             format!(
                 "forge: registry-routed; github auth {} (ADR-0046)",
@@ -1459,6 +1878,41 @@ impl Config {
                     o.issuer_url, o.signing_key_file,
                 ),
                 None => "oidc issuer: disabled".to_string(),
+            },
+            if self.plugins.enabled {
+                format!(
+                    "plugins: ON (ADR-0072) — broker {}, namespace {}, argocd from {}; \
+                     token verification: {}; installs: {}",
+                    if self.role.serves_broker() {
+                        format!("on {}", self.plugins.broker_addr)
+                    } else {
+                        "not served by this role (api/converged only)".to_string()
+                    },
+                    self.plugins.namespace,
+                    self.plugins.argocd_repo,
+                    if self.plugins.dev_tokens.is_empty() {
+                        format!(
+                            "TokenReview once a cluster is reachable (else every broker call \
+                             is refused); broker peer {}",
+                            self.plugins.broker_peer.as_deref().unwrap_or(
+                                "UNSET — the runtime refuses its namespace and no plugin runs"
+                            )
+                        )
+                    } else {
+                        format!(
+                            "DEV static tokens for {} installation(s)",
+                            self.plugins.dev_tokens.len()
+                        )
+                    },
+                    if self.plugins.dev_allow_tag {
+                        "first-party, digest or DEV tag"
+                    } else {
+                        "first-party, digest-pinned only"
+                    },
+                )
+            } else {
+                "plugins: off (SCARAB_PLUGINS; the registry and kill switch still work)"
+                    .to_string()
             },
         ]
         .into_iter()
@@ -1674,9 +2128,13 @@ fn resolve_connection(
 
 /// Redact the password in a connection URL for logging
 /// (`postgres://user:***@host/db`).
-/// A login provider id (ADR-0069): `[a-z0-9-]+`.
+/// A login provider id (ADR-0069): `[a-z0-9-]+`, and never `plugin`: a
+/// provider mints Principal ids `<provider>:<login>`, and `plugin:<name>` is
+/// a PluginPrincipal's (ADR-0072 §3) — a provider by that id could mint a
+/// human id indistinguishable from an installation's.
 fn is_provider_id(id: &str) -> bool {
-    !id.is_empty()
+    id != "plugin"
+        && !id.is_empty()
         && id
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
@@ -1710,6 +2168,7 @@ mod tests {
             namespace: "scarab".into(),
             executor: ExecutorKind::K8s,
             emit_openapi: None,
+            command: None,
         }
     }
 
@@ -2759,6 +3218,132 @@ connections:
         }
     }
 
+    /// A production env: OAuth login + a master key, no dev escape hatch,
+    /// plus `extra` (which wins).
+    fn prod_env(extra: Vec<(&'static str, String)>) -> impl Fn(&str) -> Option<String> {
+        move |k: &str| {
+            if let Some((_, v)) = extra.iter().find(|(key, _)| *key == k) {
+                return Some(v.clone());
+            }
+            Some(
+                match k {
+                    "SCARAB_MASTER_KEY" => key_b64(),
+                    "SCARAB_OAUTH_CLIENT_ID" => "cid".into(),
+                    "SCARAB_OAUTH_CLIENT_SECRET" => "sekret".into(),
+                    "SCARAB_OAUTH_AUTHORIZE_URL" => "https://idp.example/authorize".into(),
+                    "SCARAB_OAUTH_TOKEN_URL" => "https://idp.example/token".into(),
+                    "SCARAB_OAUTH_USERINFO_URL" => "https://idp.example/userinfo".into(),
+                    "SCARAB_PUBLIC_URL" => "https://ci.example.com".into(),
+                    _ => return None,
+                }
+                .to_string(),
+            )
+        }
+    }
+
+    /// ADR-0073 §8: production is `enforce`; there is no other mode.
+    #[test]
+    fn step_up_is_enforced_unless_dev_insecure_and_nothing_else_boots() {
+        let cli = cli(Some("postgres://l/scarab"));
+        let resolve = |extra| Config::resolve_from(&cli, prod_env(extra));
+
+        let unset = resolve(vec![]).expect("a production config boots");
+        assert_eq!(unset.step_up, StepUpMode::Enforce, "unset = enforce");
+        assert_eq!(
+            resolve(vec![("SCARAB_STEP_UP", "  ".into())]).unwrap().step_up,
+            StepUpMode::Enforce,
+            "blank = enforce"
+        );
+        assert_eq!(
+            resolve(vec![("SCARAB_STEP_UP", "enforce".into())])
+                .unwrap()
+                .step_up,
+            StepUpMode::Enforce
+        );
+        for bad in ["off", "log", "false", "0", "enforced"] {
+            assert_eq!(
+                resolve(vec![("SCARAB_STEP_UP", bad.into())]).unwrap_err(),
+                ConfigError::InvalidStepUpMode(bad.into()),
+                "{bad}"
+            );
+        }
+        let msg = ConfigError::InvalidStepUpMode("off".into()).to_string();
+        assert!(msg.contains("no `off` or `log` mode"), "{msg}");
+
+        // The dev escape hatch implies off — with an explicit opt back in.
+        let dev = |v: Option<&str>| StepUpMode::resolve(v, true).unwrap();
+        assert_eq!(dev(None), StepUpMode::Off);
+        assert_eq!(dev(Some("off")), StepUpMode::Off);
+        assert_eq!(dev(Some("log")), StepUpMode::Off);
+        assert_eq!(dev(Some("enforce")), StepUpMode::Enforce);
+        let devcfg = Config::resolve_from(&cli, dev_env(&[])).unwrap();
+        assert_eq!(devcfg.step_up, StepUpMode::Off);
+        assert!(devcfg
+            .startup_report()
+            .contains(&"step-up: OFF — SCARAB_DEV_INSECURE".to_string()));
+        assert!(devcfg
+            .boot_warnings()
+            .iter()
+            .any(|w| w.contains("STEP-UP OFF")));
+    }
+
+    /// Passkeys are bound to the public URL's origin, which must be https —
+    /// or plain http on a loopback host (a dev box opting in).
+    #[test]
+    fn enforced_step_up_needs_an_https_or_loopback_public_url() {
+        let cli = cli(Some("postgres://l/scarab"));
+        let with_url = |url: &str| {
+            Config::resolve_from(&cli, prod_env(vec![("SCARAB_PUBLIC_URL", url.to_string())]))
+        };
+        assert_eq!(
+            with_url("http://ci.example.com").unwrap_err(),
+            ConfigError::StepUpNeedsHttpsPublicUrl("http://ci.example.com".into())
+        );
+        assert!(matches!(
+            with_url("ftp://ci.example.com").unwrap_err(),
+            ConfigError::StepUpNeedsHttpsPublicUrl(_)
+        ));
+        for ok in [
+            "https://ci.example.com",
+            "https://ci.example.com:8443/scarab",
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+            "http://[::1]:8080",
+        ] {
+            assert!(with_url(ok).is_ok(), "{ok}");
+        }
+        let cfg = with_url("https://ci.example.com:8443").unwrap();
+        assert!(
+            cfg.startup_report().contains(
+                &"step-up: enforced (ADR-0073; rpId=ci.example.com, origin=https://ci.example.com:8443)"
+                    .to_string()
+            ),
+            "{:?}",
+            cfg.startup_report()
+        );
+        assert!(!cfg.boot_warnings().iter().any(|w| w.contains("STEP-UP")));
+    }
+
+    /// Without OAuth and without the dev escape hatch there is no boot at all
+    /// (ADR-0048 auth default-deny), so production never reaches the
+    /// dev-insecure synthetic Owner with step-up silently unwired.
+    #[test]
+    fn no_login_means_no_production_boot_so_step_up_cannot_be_bypassed_that_way() {
+        let cli = cli(Some("postgres://l/scarab"));
+        let env = |k: &str| (k == "SCARAB_MASTER_KEY").then(key_b64);
+        assert_eq!(
+            Config::resolve_from(&cli, env).unwrap_err(),
+            ConfigError::NoAuthenticator
+        );
+        // A dev box that asked for enforce without login is told it is inert.
+        let cfg = Config::resolve_from(&cli, dev_env(&[("SCARAB_STEP_UP", "enforce")])).unwrap();
+        assert_eq!(cfg.step_up, StepUpMode::Enforce);
+        assert!(cfg
+            .boot_warnings()
+            .iter()
+            .any(|w| w.contains("STEP-UP INACTIVE")));
+    }
+
     #[test]
     fn oauth_issuer_is_optional_but_never_silently_ignored() {
         const FIVE: &[(&str, &str)] = &[
@@ -2821,5 +3406,236 @@ connections:
         let warnings = cfg.boot_warnings().join("\n");
         assert!(warnings.contains("AUTH DISABLED"), "{warnings}");
         assert!(!warnings.contains("EPHEMERAL SECRET KEY"), "{warnings}");
+    }
+
+    /// The plugin knobs from a fixed env (ADR-0072), with or without the dev
+    /// escape hatch.
+    fn plugins_from(
+        pairs: &'static [(&'static str, &'static str)],
+        dev_insecure: bool,
+    ) -> Result<PluginsConfig, ConfigError> {
+        let env = |k: &str| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| v.to_string())
+        };
+        PluginsConfig::resolve(&env, dev_insecure, "0.0.0.0:8080", "scarab")
+    }
+
+    #[test]
+    fn plugins_are_off_unless_asked_for_and_reported_either_way() {
+        let off = plugins_from(&[], false).unwrap();
+        assert!(!off.enabled);
+        assert_eq!(off.broker_addr, DEFAULT_BROKER_ADDR);
+        assert_eq!(off.namespace, DEFAULT_PLUGIN_NAMESPACE);
+        assert!(
+            plugins_from(&[("SCARAB_PLUGINS", "on")], false)
+                .unwrap()
+                .enabled
+        );
+
+        let cfg = Config::resolve_from(&cli(Some("postgres://l/scarab")), dev_env(&[])).unwrap();
+        let report = cfg.startup_report().join("\n");
+        assert!(report.contains("plugins: off"), "{report}");
+        let cfg = Config::resolve_from(
+            &cli(Some("postgres://l/scarab")),
+            dev_env(&[("SCARAB_PLUGINS", "on")]),
+        )
+        .unwrap();
+        let report = cfg.startup_report().join("\n");
+        assert!(report.contains("plugins: ON"), "{report}");
+        assert!(
+            report.contains("every broker call is refused"),
+            "no verifier is said out loud: {report}"
+        );
+        assert!(
+            report.contains("broker peer UNSET"),
+            "a runtime that will refuse its namespace is said out loud: {report}"
+        );
+    }
+
+    #[test]
+    fn junk_plugin_knobs_refuse_boot() {
+        for pairs in [
+            &[("SCARAB_PLUGINS", "yes")][..],
+            &[("SCARAB_BROKER_ADDR", "localhost")],
+            &[
+                ("SCARAB_PLUGINS", "on"),
+                ("SCARAB_BROKER_ADDR", "0.0.0.0:8080"),
+            ],
+            // The API's port on a narrower or IPv6 address is still its
+            // socket: a string compare let these through (red-team F-8).
+            &[
+                ("SCARAB_PLUGINS", "on"),
+                ("SCARAB_BROKER_ADDR", "127.0.0.1:8080"),
+            ],
+            &[
+                ("SCARAB_PLUGINS", "on"),
+                ("SCARAB_BROKER_ADDR", "[::]:8080"),
+            ],
+            &[("SCARAB_PLUGIN_NAMESPACE", "Scarab_Plugins")],
+            // A namespace of its own: never the step namespace
+            // (SCARAB_NAMESPACE, `scarab` here), never Kubernetes'.
+            &[
+                ("SCARAB_PLUGINS", "on"),
+                ("SCARAB_PLUGIN_NAMESPACE", "scarab"),
+            ],
+            &[
+                ("SCARAB_PLUGINS", "on"),
+                ("SCARAB_PLUGIN_NAMESPACE", "default"),
+            ],
+            &[
+                ("SCARAB_PLUGINS", "on"),
+                ("SCARAB_PLUGIN_NAMESPACE", "kube-system"),
+            ],
+            &[("SCARAB_PLUGIN_BROKER_URL", "scarab-broker:8090")],
+            &[("SCARAB_PLUGIN_BROKER_URL", "http://user:pw@broker:8090")],
+            &[("SCARAB_PLUGIN_BROKER_PEER", "10.0.0.1/32")],
+            // The one egress allowance must name the broker, not a network
+            // or every Pod of a namespace (ADR-0072 §9).
+            &[("SCARAB_PLUGIN_BROKER_PEER", "cidr:0.0.0.0/0")],
+            &[("SCARAB_PLUGIN_BROKER_PEER", "pods:scarab:")],
+            &[("SCARAB_PLUGIN_ARGOCD_REPO", "ghcr.io/x/argocd:v1")],
+            &[("SCARAB_PLUGIN_ARGOCD_REPO", "ghcr.io/x/argocd@sha256:abc")],
+            &[("SCARAB_DEV_PLUGIN_TOKENS", "not-an-id=tok")],
+            &[("SCARAB_DEV_PLUGIN_TOKENS", "0123456789=")],
+            &[("SCARAB_DEV_PLUGIN_TOKENS", "0123456789=a,abcdefabcd=a")],
+            &[("SCARAB_DEV_PLUGIN_ALLOW_TAG", "maybe")],
+        ] {
+            assert!(
+                matches!(
+                    plugins_from(pairs, true),
+                    Err(ConfigError::InvalidPlugins(_))
+                ),
+                "{pairs:?}"
+            );
+        }
+        // A registry port is fine in a repository name.
+        assert!(plugins_from(
+            &[("SCARAB_PLUGIN_ARGOCD_REPO", "registry:5000/x/argocd")],
+            true
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn the_dev_plugin_knobs_exist_only_under_dev_insecure_and_are_loud() {
+        for pairs in [
+            &[("SCARAB_DEV_PLUGIN_TOKENS", "0123456789=secret")][..],
+            &[("SCARAB_DEV_PLUGIN_ALLOW_TAG", "1")],
+        ] {
+            assert!(
+                matches!(
+                    plugins_from(pairs, false),
+                    Err(ConfigError::InvalidPlugins(_))
+                ),
+                "{pairs:?}"
+            );
+        }
+        let dev = plugins_from(
+            &[
+                (
+                    "SCARAB_DEV_PLUGIN_TOKENS",
+                    "0123456789=secret, abcdefabcd=other",
+                ),
+                ("SCARAB_DEV_PLUGIN_ALLOW_TAG", "1"),
+            ],
+            true,
+        )
+        .unwrap();
+        assert!(dev.dev_allow_tag);
+        let ids: Vec<&str> = dev.dev_tokens.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["0123456789", "abcdefabcd"]);
+
+        let cfg = Config::resolve_from(
+            &cli(Some("postgres://l/scarab")),
+            dev_env(&[
+                ("SCARAB_DEV_PLUGIN_TOKENS", "0123456789=dev-tok-7f3c9a1e"),
+                ("SCARAB_DEV_PLUGIN_ALLOW_TAG", "1"),
+            ]),
+        )
+        .unwrap();
+        let warnings = cfg.boot_warnings().join("\n");
+        assert!(warnings.contains("DEV PLUGIN TOKENS"), "{warnings}");
+        assert!(warnings.contains("PLUGIN TAG INSTALLS"), "{warnings}");
+        assert!(
+            // A distinctive value: "secret" alone also matches field NAMES
+            // such as `github_webhook_secret` in the Debug output.
+            !format!("{cfg:?}").contains("dev-tok-7f3c9a1e"),
+            "a dev token never reaches Debug output"
+        );
+    }
+
+    #[test]
+    fn listeners_clash_by_socket_not_by_string() {
+        for (broker, api) in [
+            ("0.0.0.0:8080", "0.0.0.0:8080"),
+            ("127.0.0.1:8080", "0.0.0.0:8080"),
+            ("0.0.0.0:8080", "127.0.0.1:8080"),
+            ("[::]:8080", "0.0.0.0:8080"),
+            ("10.0.0.5:8080", "10.0.0.5:8080"),
+        ] {
+            assert!(listeners_clash(broker, api), "{broker} vs {api}");
+        }
+        for (broker, api) in [
+            ("0.0.0.0:8090", "0.0.0.0:8080"),
+            ("127.0.0.1:8080", "10.0.0.5:8080"),
+            ("[::1]:8080", "127.0.0.1:8080"),
+        ] {
+            assert!(!listeners_clash(broker, api), "{broker} vs {api}");
+        }
+    }
+
+    #[test]
+    fn only_the_api_roles_serve_the_broker() {
+        assert!(Role::Converged.serves_broker());
+        assert!(Role::Api.serves_broker());
+        for role in [
+            Role::Scheduler,
+            Role::Executor,
+            Role::Webhook,
+            Role::Workspace,
+        ] {
+            assert!(!role.serves_broker(), "{role:?}");
+        }
+    }
+
+    #[test]
+    fn no_login_provider_may_mint_plugin_principal_ids() {
+        assert!(!is_provider_id("plugin"));
+        assert!(is_provider_id("plugins"));
+    }
+
+    /// ADR-0073 §10: the break-glass is a server-binary subcommand that
+    /// needs only the database URL — given before or after the subcommand.
+    #[test]
+    fn the_break_glass_parses_with_only_a_database_url() {
+        let cli = Cli::try_parse_from([
+            "scarab-server",
+            "admin",
+            "reset-passkeys",
+            "--principal",
+            "github:42",
+            "--reason",
+            "lost laptop",
+            "--database-url",
+            "postgres://db/scarab",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.command,
+            Some(ServerCommand::Admin {
+                command: AdminCommand::ResetPasskeys {
+                    principal: "github:42".into(),
+                    reason: Some("lost laptop".into()),
+                }
+            })
+        );
+        assert_eq!(cli.database_url.as_deref(), Some("postgres://db/scarab"));
+        // A principal is mandatory.
+        assert!(Cli::try_parse_from(["scarab-server", "admin", "reset-passkeys"]).is_err());
+        // No subcommand: serve, as before.
+        assert_eq!(Cli::try_parse_from(["scarab-server"]).unwrap().command, None);
     }
 }

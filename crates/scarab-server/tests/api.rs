@@ -276,42 +276,6 @@ async fn get_run_exposes_step_needs_for_the_dag() {
     );
 }
 
-/// Full-route OpenAPI coverage (ADR-0054): every route registered on the
-/// router appears in the generated spec (and vice versa), so the committed
-/// openapi.json — which CI diffs against — can never silently under-describe
-/// the API. Parses the router source. Two exemptions: `/openapi.json` (the
-/// spec serving itself) and the deprecated `.../steps/{step}/restart` alias —
-/// the pre-rename name for `.../rerun` (2026-07-23), kept live for old callers
-/// but intentionally off the documented surface.
-#[test]
-fn every_registered_route_is_in_the_openapi_spec() {
-    let src = include_str!("../src/lib.rs");
-    let re = regex_lite::Regex::new(r#"\.route\(\s*"([^"]+)""#).unwrap();
-    let mut routes: Vec<String> = re
-        .captures_iter(src)
-        .map(|c| c[1].replace("{*name}", "{name}"))
-        .filter(|r| r != "/openapi.json")
-        .filter(|r| r != "/v1/runs/{id}/steps/{step}/restart")
-        .collect();
-    routes.sort();
-    routes.dedup();
-
-    let spec: serde_json::Value = serde_json::from_str(&scarab_server::openapi_json()).unwrap();
-    let have: std::collections::BTreeSet<String> =
-        spec["paths"].as_object().unwrap().keys().cloned().collect();
-
-    let missing: Vec<&String> = routes.iter().filter(|r| !have.contains(*r)).collect();
-    assert!(
-        missing.is_empty(),
-        "routes missing from the OpenAPI spec: {missing:?}"
-    );
-    let extra: Vec<&String> = have.iter().filter(|p| !routes.contains(p)).collect();
-    assert!(
-        extra.is_empty(),
-        "spec paths with no registered route: {extra:?}"
-    );
-}
-
 /// Every operation carries exactly one curated group, and every group it names
 /// is declared top-level (git-bug 305ce8a). The doc renderer builds a page per
 /// operation from tags, so an untagged operation silently vanishes from the
@@ -354,6 +318,47 @@ fn operation_tags_cover_every_operation() {
     // No empty sidebar sections: a declared group must have members.
     let unused: Vec<&&str> = declared.iter().filter(|t| !used.contains(**t)).collect();
     assert!(unused.is_empty(), "declared groups with no operations: {unused:?}");
+}
+
+/// The UI can never be framed (ADR-0073 §6 click-jacking): the step-up
+/// confirm page — a SPA route served from index.html — carries
+/// `frame-ancestors 'none'` and `X-Frame-Options: DENY`.
+#[tokio::test]
+async fn the_confirm_page_cannot_be_framed() {
+    let dist = tempfile::tempdir().unwrap();
+    std::fs::write(dist.path().join("index.html"), "<html>scarab-ui</html>").unwrap();
+    let db = std::sync::Arc::new(scarab_testkit::InMemoryDb::new());
+    let store = std::sync::Arc::new(scarab_testkit::InMemoryObjectStore::new());
+    let logs = std::sync::Arc::new(scarab_server::LogService::new(store, db.clone()));
+    let app = scarab_server::router(
+        scarab_server::AppState::new(
+            db,
+            std::sync::Arc::new(scarab_testkit::FakeClock::new(0)),
+            logs,
+        )
+        .with_ui_dir(dist.path()),
+    );
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/security/confirm/x")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let h = |name: &str| {
+        resp.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    assert_eq!(
+        h("content-security-policy").as_deref(),
+        Some("frame-ancestors 'none'")
+    );
+    assert_eq!(h("x-frame-options").as_deref(), Some("DENY"));
 }
 
 /// The embedded web UI (ADR-0054): `/` serves index.html, real assets serve

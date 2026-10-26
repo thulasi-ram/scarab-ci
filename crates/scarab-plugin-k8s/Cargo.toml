@@ -1,0 +1,38 @@
+[package]
+name = "scarab-plugin-k8s"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+# The Kubernetes adapter of the plugin runtime (ADR-0072 §9, §11): the
+# `scarab-plugins` namespace baseline (Pod Security + NetworkPolicy), one
+# ServiceAccount + Deployment per PluginInstallation, the fail-closed
+# isolation probe, and TokenReview behind `scarab_plugin::PluginTokenVerifier`.
+# Pairs the `scarab-plugin` domain with exactly one infra crate (kube).
+[dependencies]
+scarab-plugin = { workspace = true }
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# The TokenReview verdict cache is keyed by SHA-256(token): the cache never
+# holds a usable token.
+sha2 = { workspace = true }
+# A per-probe nonce, so a probe's Pods never collide with a crashed one's.
+uuid = { workspace = true }
+# The local JWT precheck in front of TokenReview (shape, aud, exp).
+base64 = { workspace = true }
+
+[dev-dependencies]
+# The live tier (tests/cluster.rs) always cleans its namespaces up, even when
+# an assertion fails: `catch_unwind` around the body, then cleanup, then
+# re-raise.
+futures = { workspace = true }
+# The live tier builds a kube client (rustls) in a crate graph that links more
+# than one rustls CryptoProvider, so rustls cannot pick one and panics on the
+# first TLS handshake. tests/cluster.rs installs `ring` first, exactly as the
+# server's composition root does.
+rustls = { workspace = true }

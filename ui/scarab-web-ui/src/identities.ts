@@ -29,12 +29,20 @@ export type LoginChoice = { href: string; label: string; primary: boolean };
  * button each, the default one first and primary — the one an unnamed login
  * would have used anyway.
  */
-export function loginChoices(providers: ProviderLike[]): LoginChoice[] {
+export function loginChoices(providers: ProviderLike[], next?: string): LoginChoice[] {
+  // Where to land after the callback (ADR-0073): a deep link — a step-up
+  // confirmation link above all — must survive the sign-in it triggered.
+  // Only a relative path the server would accept; `/` is the default anyway.
+  const land = next && next !== "/" && safeNext(next) ? `next=${encodeURIComponent(next)}` : "";
+  const href = (provider?: string) => {
+    const q = [provider ? `provider=${encodeURIComponent(provider)}` : "", land].filter(Boolean);
+    return q.length ? `/v1/auth/login?${q.join("&")}` : "/v1/auth/login";
+  };
   if (providers.length <= 1) {
     const only = providers[0];
     return [
       {
-        href: only ? `/v1/auth/login?provider=${encodeURIComponent(only.id)}` : "/v1/auth/login",
+        href: href(only?.id),
         label: "Sign in",
         primary: true,
       },
@@ -43,10 +51,29 @@ export function loginChoices(providers: ProviderLike[]): LoginChoice[] {
   return [...providers]
     .sort((a, b) => Number(b.default) - Number(a.default))
     .map((p, i) => ({
-      href: `/v1/auth/login?provider=${encodeURIComponent(p.id)}`,
+      href: href(p.id),
       label: `Sign in with ${p.name}`,
       primary: i === 0,
     }));
+}
+
+/** The longest `next` the server accepts (`oauth::MAX_NEXT_LEN`, bytes). */
+export const MAX_NEXT_LEN = 512;
+
+/**
+ * The server's `safe_next`, mirrored: a relative path starting with `/`, not
+ * `//`, with no `\` and no control character, at most 512 bytes. The server
+ * answers 400 to anything else — so a `next` that fails here is dropped
+ * rather than sent, and the sign-in still works.
+ */
+export function safeNext(next: string): boolean {
+  return (
+    next.startsWith("/") &&
+    !next.startsWith("//") &&
+    !next.includes("\\") &&
+    !/[\u0000-\u001f\u007f-\u009f]/.test(next) &&
+    new TextEncoder().encode(next).length <= MAX_NEXT_LEN
+  );
 }
 
 /**

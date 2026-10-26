@@ -19,7 +19,7 @@ use scarab_db_postgres::PostgresDb;
 use scarab_engine::{Clock, Db, Executor};
 use scarab_executor_k8s::{K8sExecutor, PlacementConfig, ResultsEgress, WorkspaceFetch};
 use scarab_executor_local::LocalExecutor;
-use scarab_server::config::{Cli, Config, ExecutorKind, Role, StoreConfig};
+use scarab_server::config::{Cli, Config, ExecutorKind, Role, StepUpMode, StoreConfig};
 use scarab_server::{
     converged, router, AppState, LogService, SecretInjectingExecutor, SystemClock,
 };
@@ -110,6 +110,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // Operator break-glass (ADR-0073 §10): straight at the database, before
+    // the config gate — it needs nothing but the database URL, and it never
+    // migrates. There is no route for this, and no `scarab` CLI command.
+    if let Some(scarab_server::config::ServerCommand::Admin {
+        command: scarab_server::config::AdminCommand::ResetPasskeys { principal, reason },
+    }) = &cli.command
+    {
+        let Some(url) = cli.database_url.as_deref() else {
+            eprintln!(
+                "scarab-server admin reset-passkeys: set --database-url or SCARAB_DATABASE_URL"
+            );
+            std::process::exit(2);
+        };
+        let pg = PostgresDb::connect(url).await?;
+        let operator = scarab_server::step_up::admin::OperatorInfo::current();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or_default();
+        match scarab_server::step_up::admin::reset_passkeys(
+            &pg,
+            principal,
+            reason.as_deref(),
+            &operator,
+            now,
+        )
+        .await
+        {
+            Ok(done) => {
+                println!(
+                    "break-glass: removed {} passkey(s) of `{}` and revoked {} standing \
+                     step-up confirmation(s); recorded as passkey.break_glass_reset \
+                     (host {}, user {}). Their next passkey needs a fresh browser login.",
+                    done.removed,
+                    done.subject,
+                    done.windows_revoked,
+                    operator.host,
+                    operator.os_user
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("scarab-server admin reset-passkeys: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     // The startup gate: refuse to boot on invalid configuration, before any
     // socket binds or connection is made (ADR-0048).
     let config = match Config::resolve(&cli) {
@@ -170,8 +218,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Durable store — mandatory, already guaranteed by the config gate.
     let pg = PostgresDb::connect(&database_url).await?;
     pg.migrate().await?;
-    // Keep a typed handle so the same Postgres adapter can back both the `Db`
-    // port and the `EnvironmentStore` port (it implements both).
+    // Keep a typed handle so the same Postgres adapter can back the `Db` port
+    // and every store port it implements (environments, governance, …).
     let pg = Arc::new(pg);
     let db: Arc<dyn Db> = pg.clone();
 
@@ -329,7 +377,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             scarab_secrets_postgres::MasterKeySet::single(key)
         }
     };
-    let secrets: Arc<dyn scarab_secrets::SecretProvider> = {
+    // Kept concrete as well: the same KEK envelope seals pending step-up
+    // requests and derives the step-up digest key (ADR-0073 §5).
+    let pg_secrets: Arc<scarab_secrets_postgres::PostgresSecrets> = {
         let s = scarab_secrets_postgres::PostgresSecrets::connect(&database_url, master_keys)
             .await?;
         s.migrate().await?;
@@ -357,6 +407,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Arc::new(s)
     };
+    let secrets: Arc<dyn scarab_secrets::SecretProvider> = pg_secrets.clone();
 
     // Retention sweeper (ADR-0050): leader-gated, prunes terminal runs' log
     // blobs + index past the class TTL. Non-terminal (incl. gate-suspended)
@@ -389,6 +440,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Arc::new(DepotDurableProbe(c.clone()))
                         as Arc<dyn scarab_server::retention::DepotDurableIndex>
                 }),
+            // Plugin report receipts (ADR-0072 §11): a 7-day idempotency window.
+            Some(pg.clone() as Arc<dyn scarab_plugin::PluginStore>),
+            // Step-up rows (ADR-0073): expired challenges and confirmations,
+            // settled requests after 30 days. Never the security event log.
+            Some((
+                pg.clone() as Arc<dyn scarab_identity::ChallengeStore>,
+                pg.clone() as Arc<dyn scarab_identity::StepUpStore>,
+            )),
             Duration::from_secs(300),
         );
         tracing::info!(
@@ -664,7 +723,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Inject env-scoped secrets into deploy-run pods at launch
             // (ADR-0037).
             let mut secret_exec =
-                SecretInjectingExecutor::new(executor, db.clone(), secrets.clone(), logs.clone());
+                SecretInjectingExecutor::new(executor, db.clone(), secrets.clone(), logs.clone())
+                    // ADR-0071 §2: re-admit a deploy step at the point its
+                    // Environment's credentials would be used.
+                    .with_environment_governance(pg.clone());
             // Per-attempt OIDC federation tokens (ADR-0015), tmpfs-delivered.
             if let (Some(issuer), Some(oidc_cfg)) = (oidc_issuer.clone(), &config.oidc) {
                 secret_exec = secret_exec.with_oidc(
@@ -709,6 +771,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(Arc::new(scarab_server::retention::CasSnapshots(
                     widening_cas.clone().unwrap_or_else(|| workspace_cas.clone()),
                 ))),
+                // DeploymentGates (ADR-0070 §8): core resolves them from the
+                // Deployment input log, with the deadline the run's Project
+                // has in its Environment (ADR-0071 §3).
+                Some(scarab_server::deployment_gates::ServerDeploymentGates::new(
+                    db.clone(),
+                    pg.clone(),
+                    Some(pg.clone()),
+                )),
                 Some(forge.clone()),
                 // Feed the log pipeline from the executor's live tail (ADR-0013).
                 Some(logs.clone()),
@@ -722,17 +792,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let mut state = AppState::new(db, clock, logs)
+    let mut state = AppState::new(db.clone(), clock.clone(), logs)
         // How the outside world reaches this server (SCARAB_PUBLIC_URL).
         // UNCONDITIONAL, and it must stay that way: every webhook Scarab
         // registers posts to `{public_url}/webhooks/{forge}`, so gating this on
         // any other feature (it used to ride on `with_oauth_login`) makes every
         // hook in a login-less deployment point at localhost and die silently.
         .with_public_url(config.public_url.clone())
-        // Environments + deployment history: the Postgres adapter is the store.
-        // Enables /v1/environments/* and admission enforcement for
-        // env-targeting runs (ADR-0024).
+        // The legacy approval history (ADR-0024, ADR-0070 §1), still written
+        // on every gate release.
         .with_environments(pg.clone())
+        // Org-level Environment governance (ADR-0071): what admits and governs
+        // every Deploy Run. ALWAYS wired here — an unwired store would admit
+        // deploys with no rules, which only a hand-built test state may do.
+        .with_environment_governance(pg.clone())
+        // The Deployment record's input log (ADR-0070): the Environment board
+        // and the Deployments view fold it on every read.
+        .with_deployments(pg.clone())
+        // Org-level Environments (ADR-0071): their admin API, and the
+        // per-Environment deadline that fold stalls by.
+        .with_org_environments(pg.clone())
+        // The PluginInstallation registry (ADR-0072). Wired whatever
+        // SCARAB_PLUGINS says: it is data — an operator who turned plugins
+        // off can still list, kill and uninstall — and every org Environment
+        // source is checked against it (c-min F1). The policy decides whether
+        // installs are accepted.
+        .with_plugins(
+            pg.clone(),
+            scarab_server::plugins::PluginPolicy::from_config(&config.plugins),
+        )
         // The ForgeConnection registry (ADR-0046): RepoRef→Project resolution,
         // installation auto-registration, webhook replay dedup.
         .with_forge_connections(pg.clone())
@@ -860,6 +948,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!(
             "authn: OAuth/OIDC login + PG sessions + scoped RBAC + issued API tokens wired (ADR-0049)"
         );
+        // Step-up confirmation (ADR-0073): with a human to confirm (login
+        // wired) and the mode enforce, every crown jewel needs a passkey.
+        if config.step_up == StepUpMode::Enforce {
+            let rp = scarab_webauthn::RelyingParty::from_public_url(&config.public_url, "Scarab")
+                .map_err(|e| format!("SCARAB_PUBLIC_URL: {e}"))?;
+            state = state.with_step_up(scarab_server::step_up::StepUpService::new(
+                pg.clone(),
+                pg.clone(),
+                pg.clone(),
+                pg.clone(),
+                pg_secrets.clone(),
+                rp,
+            ));
+            // "step-up enforced; N admins have no passkey" (ADR-0073 §8):
+            // every Admin/Owner binding holder plus the Principals the
+            // bootstrap owners entries name, minus those holding a usable
+            // passkey. An entry that only matches a verified email is
+            // reported on its own line, never counted (git-bug 08d676d).
+            let mut admins = pg.admin_subjects().await.unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "step-up: could not list admins for the boot count");
+                Default::default()
+            });
+            let entries: Vec<String> = config
+                .oauth
+                .iter()
+                .flat_map(|p| p.owners.iter().cloned())
+                .collect();
+            let owners = scarab_server::step_up::resolve_owner_entries(
+                Some(pg.as_ref() as &dyn scarab_identity::IdentityStore),
+                &entries,
+            )
+            .await;
+            admins.extend(owners.principals);
+            let admins: Vec<String> = admins.into_iter().collect();
+            let without =
+                scarab_server::step_up::admins_without_passkey(pg.as_ref(), &admins)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "step-up: could not read passkeys for the boot count");
+                        admins.clone()
+                    })
+                    .len();
+            let line = scarab_server::step_up::step_up_boot_line(without);
+            tracing::info!("startup: {line}");
+            println!("startup: {line}");
+            if let Some(line) =
+                scarab_server::step_up::step_up_owner_matchers_line(owners.email_matchers.len())
+            {
+                tracing::info!("startup: {line}");
+                println!("startup: {line}");
+            }
+        }
+    }
+    // Fail-closed composition (ADR-0073 §8): outside the dev escape hatch,
+    // login wired means step-up wired. Config already refuses every other
+    // mode; this catches a future wiring slip — in release builds too.
+    scarab_server::step_up::check_step_up_composition(
+        config.dev_insecure,
+        !config.oauth.is_empty(),
+        state.step_up.is_enforced(),
+    )?;
+    if config.step_up == StepUpMode::Enforce && !state.step_up.is_enforced() {
+        tracing::warn!(
+            "step-up: SCARAB_STEP_UP=enforce but no login is configured; nothing is enforced"
+        );
     }
     // OIDC issuer for keyless federation (ADR-0014): serve JWKS + discovery so a
     // cloud provider can verify Scarab-minted tokens. The signing key is loaded
@@ -876,6 +1029,120 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         state = state.with_ui_dir(&ui_dir);
         tracing::info!(dir = %ui_dir, "web UI embedded (same-origin, ADR-0054)");
     }
+    // Broker tokens (ADR-0072 §11). Static dev tokens, when configured (the
+    // config gate admitted them only under SCARAB_DEV_INSECURE), stand in for
+    // TokenReview — the proc-mode path for a plugin run as a host process,
+    // which has no projected token. Otherwise TokenReview, below, once a
+    // cluster is reachable. With neither, every broker call is a 401.
+    if !config.plugins.dev_tokens.is_empty() {
+        state = state.with_plugin_tokens(Arc::new(scarab_server::broker::DevPluginTokens::new(
+            config.plugins.namespace.clone(),
+            config
+                .plugins
+                .dev_tokens
+                .iter()
+                .map(|(id, token)| (id.clone(), token.expose().to_string()))
+                .collect(),
+        )));
+    }
+    // The plugin runtime (ADR-0072 §9): only with SCARAB_PLUGINS=on, in a
+    // role that serves the broker, and with a cluster to run Plugins in. The
+    // reconcile loop runs under the `plugin-runtime` lease, so with several
+    // api replicas exactly one of them manages the workloads.
+    if config.plugins.enabled && config.role.serves_broker() {
+        match scarab_plugin_k8s::default_client().await {
+            Ok(client) => {
+                if config.plugins.dev_tokens.is_empty() {
+                    state = state.with_plugin_tokens(Arc::new(
+                        scarab_plugin_k8s::TokenReviewVerifier::new(client.clone()),
+                    ));
+                    tracing::info!(
+                        "plugin broker tokens: TokenReview (audience {})",
+                        scarab_plugin::BROKER_TOKEN_AUDIENCE
+                    );
+                }
+                let broker_port = config
+                    .plugins
+                    .broker_addr
+                    .parse::<std::net::SocketAddr>()
+                    .map_err(|e| format!("SCARAB_BROKER_ADDR: {e}"))?
+                    .port();
+                // Validated at boot (config.rs); `None` = unset, and the
+                // runtime then refuses its baseline — loudly, every pass.
+                let broker_peer = config
+                    .plugins
+                    .broker_peer
+                    .as_deref()
+                    .map(scarab_plugin_k8s::BrokerPeer::parse)
+                    .transpose()
+                    .map_err(|e| format!("SCARAB_PLUGIN_BROKER_PEER: {e}"))?;
+                let runtime = scarab_plugin_k8s::K8sPluginRuntime::new(
+                    client,
+                    scarab_plugin_k8s::PluginRuntimeConfig {
+                        namespace: config.plugins.namespace.clone(),
+                        broker_url: config.plugins.broker_url.clone(),
+                        broker_peer,
+                        broker_port,
+                        probe_image: config.plugins.probe_image.clone().unwrap_or_else(|| {
+                            scarab_plugin_k8s::probe::DEFAULT_PROBE_IMAGE.to_string()
+                        }),
+                    },
+                );
+                scarab_server::plugin_runtime::PluginRuntimeLoop::new(
+                    db.clone(),
+                    pg.clone(),
+                    Arc::new(runtime),
+                    clock.clone(),
+                    replica_id.clone(),
+                )
+                .spawn();
+                tracing::info!(
+                    namespace = %config.plugins.namespace,
+                    "plugin runtime: reconcile loop started (lease {})",
+                    scarab_server::plugin_runtime::PLUGIN_RUNTIME_LEASE
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "plugin runtime OFF: no cluster reachable — installations stay pending and \
+                     broker tokens can only be dev tokens"
+                );
+            }
+        }
+    }
+    // The CredentialBroker (ADR-0072 §11): its OWN listener, so a plugin
+    // Pod — whose network reaches only this port — never reaches the public
+    // API or the UI. Only with SCARAB_PLUGINS=on, and only in a role that
+    // serves the API (api, converged): the chart's broker Service selects
+    // those Pods, and a scheduler or executor has no business accepting
+    // plugin traffic.
+    let mut broker_handle: Option<tokio::task::JoinHandle<()>> = None;
+    if config.plugins.enabled && config.role.serves_broker() {
+        // Its own small pool (red-team F-1): a plugin flood exhausts THIS
+        // one — answered 503 — never the pool the API, the engine and an
+        // admin's kill switch use.
+        let broker_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(scarab_server::broker::BROKER_POOL_MAX_CONNECTIONS)
+            .acquire_timeout(scarab_server::broker::BROKER_POOL_ACQUIRE_TIMEOUT)
+            .connect_lazy(&database_url)
+            .map_err(|e| format!("broker pool: {e}"))?;
+        let broker = scarab_server::broker::router(
+            state
+                .clone()
+                .with_broker_plugin_store(Arc::new(PostgresDb::with_pool(broker_pool))),
+        );
+        let listener = tokio::net::TcpListener::bind(&config.plugins.broker_addr).await?;
+        println!("broker listening on {}", config.plugins.broker_addr);
+        broker_handle = Some(tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, broker)
+                .with_graceful_shutdown(shutdown_signal())
+                .await
+            {
+                tracing::error!(error = %e, "broker listener failed");
+            }
+        }));
+    }
     let app = router(state);
 
     let listener = tokio::net::TcpListener::bind(&config.addr).await?;
@@ -886,6 +1153,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    if let Some(handle) = broker_handle {
+        // It got the same signal; give it its own drain, then stop waiting.
+        let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
+    }
     if let Some(handle) = driver_handle {
         tracing::info!("shutdown: stopping the converged driver");
         handle.abort();

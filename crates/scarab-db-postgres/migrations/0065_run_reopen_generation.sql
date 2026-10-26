@@ -1,0 +1,15 @@
+-- Red team A1/A7 (AFK run 20261024-1951): how many times a run has been
+-- reopened out of a terminal state (a rerun or retry of a settled run). The
+-- engine scopes the idempotency keys of its once-per-occurrence outbox
+-- intents to it — the CANCEL_RUN teardown (`cancel:{run}:g{n}`) and the
+-- RUN_STATUS_CHANGED post (`status:{run}:g{n}:{to}`). Outbox keys are unique
+-- forever, so a per-run key silently dropped a second cancel after a rerun
+-- (its Pod orphaned, its DeploymentTarget unheld) and a repeated status
+-- (Succeeded -> Failed -> Succeeded left the forge on Failed).
+--
+-- Bumped by the guarded run-status CAS itself when it moves a run OUT of a
+-- terminal status, so the counter and the reopen are one write.
+--
+-- Forward-only, additive (expand-contract, ADR-0003): an old binary never
+-- names the column, and every existing run starts at generation 0.
+ALTER TABLE runs ADD COLUMN reopen_generation BIGINT NOT NULL DEFAULT 0;

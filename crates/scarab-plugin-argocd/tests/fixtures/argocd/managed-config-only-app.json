@@ -1,0 +1,30 @@
+{
+  "items": [
+    {
+      "group": "",
+      "kind": "ConfigMap",
+      "namespace": "web",
+      "name": "web-config",
+      "targetState": "{\"apiVersion\":\"v1\",\"kind\":\"ConfigMap\",\"metadata\":{\"name\":\"web-config\",\"namespace\":\"web\"},\"data\":{\"LOG_LEVEL\":\"info\"}}",
+      "liveState": "{\"apiVersion\":\"v1\",\"kind\":\"ConfigMap\",\"metadata\":{\"name\":\"web-config\",\"namespace\":\"web\"},\"data\":{\"LOG_LEVEL\":\"info\"}}",
+      "normalizedLiveState": "{\"apiVersion\":\"v1\",\"kind\":\"ConfigMap\",\"metadata\":{\"name\":\"web-config\",\"namespace\":\"web\"},\"data\":{\"LOG_LEVEL\":\"info\"}}",
+      "predictedLiveState": "{\"apiVersion\":\"v1\",\"kind\":\"ConfigMap\",\"metadata\":{\"name\":\"web-config\",\"namespace\":\"web\"},\"data\":{\"LOG_LEVEL\":\"info\"}}",
+      "hook": false,
+      "modified": false,
+      "resourceVersion": "48211001"
+    },
+    {
+      "group": "",
+      "kind": "Service",
+      "namespace": "web",
+      "name": "web",
+      "targetState": "{\"apiVersion\":\"v1\",\"kind\":\"Service\",\"metadata\":{\"name\":\"web\",\"namespace\":\"web\"},\"spec\":{\"ports\":[{\"port\":80}]}}",
+      "liveState": "null",
+      "normalizedLiveState": "null",
+      "predictedLiveState": "{\"apiVersion\":\"v1\",\"kind\":\"Service\",\"metadata\":{\"name\":\"web\",\"namespace\":\"web\"},\"spec\":{\"ports\":[{\"port\":80}]}}",
+      "hook": false,
+      "modified": true,
+      "resourceVersion": "48211001"
+    }
+  ]
+}

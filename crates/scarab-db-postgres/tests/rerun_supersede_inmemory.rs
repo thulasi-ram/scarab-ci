@@ -9,7 +9,7 @@ use scarab_engine::ports::ExecHandle;
 use scarab_engine::{
     cancel_run_request, rerun_step, retry_step, Attempt, AttemptId, AttemptOutcome, Db,
     EventPayload, FailureKind, OutboxId, OutboxMessage, RerunError, RunId, RunStatus, Scheduler,
-    StepId, StepSpec, StepStatus, SupersedeTeardown, SupersededAttempt, Timestamp, LAUNCH_STEP,
+    StepId, StepSpec, StepStatus, AttemptTeardown, TeardownAttempt, Timestamp, LAUNCH_STEP,
     MAX_DELIVERY_ATTEMPTS, SUPERSEDE_TEARDOWN,
 };
 use scarab_testkit::{FakeClock, FakeExecutor, InMemoryDb};
@@ -443,7 +443,7 @@ async fn rerun_captures_descendant_that_raced_into_running() {
     let captured: Vec<(String, String)> = msgs
         .iter()
         .flat_map(|m| {
-            serde_json::from_value::<SupersedeTeardown>(m.payload.clone())
+            serde_json::from_value::<AttemptTeardown>(m.payload.clone())
                 .unwrap()
                 .attempts
                 .into_iter()
@@ -665,8 +665,8 @@ async fn superseded_attempt_survives_teardown_induced_lost() {
 
 /// Regression — the CANCEL-path mirror of
 /// `superseded_attempt_survives_teardown_induced_lost`. Cancelling a run stamps
-/// its in-flight step `Cancelled` and SIGTERMs that step's Pod (the `CANCEL_RUN`
-/// teardown); the dying Pod is then reported `Lost`. `a1`'s launch intent was
+/// its in-flight step `Cancelled` and SIGTERMs that step's Pod (the `CANCEL_ATTEMPT`
+/// teardown naming a1); the dying Pod is then reported `Lost`. `a1`'s launch intent was
 /// never dispatched, so it lingers on the outbox and `reconcile` re-polls it —
 /// observing `Lost`. Unlike a supersede, a cancel mints NO successor attempt, so
 /// the cancelled attempt is STILL the step's frontier — the "only the frontier
@@ -723,7 +723,7 @@ async fn cancelled_attempt_survives_teardown_induced_lost() {
     db.seed_run(&run, RunStatus::Running);
 
     // The human cancels the run: c → Cancelled, a1 stamped Cancelled, run →
-    // Cancelled, and a CANCEL_RUN teardown is enqueued for a1's Pod.
+    // Cancelled, and a CANCEL_ATTEMPT teardown naming a1 is enqueued.
     let clock = FakeClock::new(1_000);
     let cancelled = cancel_run_request(&db, &clock, &run, Some("alice".to_string()))
         .await
@@ -993,8 +993,8 @@ async fn seed_supersede_teardown(db: &InMemoryDb, run_name: &str) -> (RunId, Str
         id: OutboxId(0),
         run: run.clone(),
         kind: SUPERSEDE_TEARDOWN.to_string(),
-        payload: serde_json::to_value(SupersedeTeardown {
-            attempts: vec![SupersededAttempt {
+        payload: serde_json::to_value(AttemptTeardown {
+            attempts: vec![TeardownAttempt {
                 step: c.0.clone(),
                 attempt: a1.0.clone(),
             }],
@@ -1117,6 +1117,69 @@ async fn supersede_teardown_dead_letters_after_max_delivery_attempts() {
         db.run_status(&run).await.unwrap(),
         Some(RunStatus::Running),
         "an abandoned teardown never changes the run's own state"
+    );
+}
+
+/// The TeardownAbandoned reasons of `run`'s event log.
+async fn abandoned_reasons(db: &InMemoryDb, run: &RunId) -> Vec<String> {
+    db.events(run)
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventPayload::Raw(v)
+                if v.get("event").and_then(|x| x.as_str()) == Some("TeardownAbandoned") =>
+            {
+                v.get("reason").and_then(|r| r.as_str()).map(str::to_string)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A unit that is merely STILL TERMINATING (every cancel accepted, the Pod
+/// just never gone) is abandoned at the same bound — but its diagnostic says
+/// so, rather than reporting a teardown that "failed" when every delivery
+/// succeeded (review correctness LOW `cancel_until_gone`). A cancel the
+/// backend genuinely refused keeps the failure wording.
+#[tokio::test]
+async fn a_unit_still_terminating_at_the_bound_is_not_reported_as_failed() {
+    let db = InMemoryDb::new();
+    let (run, _handle) = seed_supersede_teardown(&db, "run-lingering").await;
+    let clock = FakeClock::new(1_000);
+    let exec = FakeExecutor::new();
+    exec.linger_after_cancel(u32::MAX); // every cancel lands; the unit never goes
+    let sched = Scheduler::new(&db, &clock, &exec, "drv").with_outbox_visibility_ms(0);
+    for _ in 0..MAX_DELIVERY_ATTEMPTS {
+        sched.reconcile_supersessions().await.expect("reconcile");
+    }
+    assert_eq!(
+        db.outbox_depth().await.unwrap(),
+        0,
+        "abandoned at the bound"
+    );
+    let reasons = abandoned_reasons(&db, &run).await;
+    assert_eq!(reasons.len(), 1, "{reasons:?}");
+    assert!(
+        reasons[0].contains("still terminating") && !reasons[0].contains("failed"),
+        "a lingering unit is not a failed teardown: {}",
+        reasons[0]
+    );
+
+    let db = InMemoryDb::new();
+    let (run, _handle) = seed_supersede_teardown(&db, "run-refused").await;
+    let exec = FakeExecutor::new();
+    exec.fail_cancels(u32::MAX);
+    let sched = Scheduler::new(&db, &clock, &exec, "drv").with_outbox_visibility_ms(0);
+    for _ in 0..MAX_DELIVERY_ATTEMPTS {
+        sched.reconcile_supersessions().await.expect("reconcile");
+    }
+    let reasons = abandoned_reasons(&db, &run).await;
+    assert_eq!(reasons.len(), 1, "{reasons:?}");
+    assert!(
+        reasons[0].contains("failed"),
+        "a refused cancel keeps the failure wording: {}",
+        reasons[0]
     );
 }
 

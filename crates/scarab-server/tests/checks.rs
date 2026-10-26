@@ -216,3 +216,49 @@ async fn rejected_status_posts_are_retried_then_dead_lettered_not_silently_dropp
         "each poisoned status message increments the dead-letter counter"
     );
 }
+
+/// Red team R2-E5, within one generation: delivery is at-least-once, so the
+/// run's `Running` post can fail at the forge, its terminal post land, and
+/// the `Running` post be redelivered after its lease — leaving a finished
+/// Run's required check `pending` for good. A non-terminal post whose run
+/// has since settled, and whose terminal post is already delivered, is
+/// retired unposted; the in-order drain above still posts both.
+#[tokio::test]
+async fn a_redelivered_start_post_never_lands_after_the_runs_verdict() {
+    let healthy = Arc::new(FakeForge::new().with_file(".scarab/ci.yaml", CI_YAML));
+    let flaky = FakeForge::new().failing_status();
+    let db = InMemoryDb::new();
+    let clock = FakeClock::new(1_000);
+    let run = trigger_run_from_event(healthy.as_ref(), &db, &clock, None, &push())
+        .await
+        .unwrap()
+        .pop()
+        .expect("push starts a run");
+    let exec = FakeExecutor::new();
+    exec.script_outcome(ExecState::Succeeded);
+    drive(&db, &clock, &exec, &run).await;
+    assert_eq!(
+        db.run_status(&run).await.unwrap(),
+        Some(RunStatus::Succeeded)
+    );
+
+    let lease = 300;
+    // The oldest post (Running) hits a forge blip and stays leased…
+    drain_forge_statuses(&flaky, &db, "d", 1, lease, "http://scarab.test")
+        .await
+        .unwrap();
+    // …while the verdict is delivered.
+    let posted = drain_forge_statuses(healthy.as_ref(), &db, "d", 32, lease, "http://scarab.test")
+        .await
+        .unwrap();
+    assert_eq!(posted, 1);
+    // The Running post's lease lapses and it is redelivered.
+    tokio::time::sleep(std::time::Duration::from_millis(lease as u64 + 200)).await;
+    let late = drain_forge_statuses(healthy.as_ref(), &db, "d", 32, lease, "http://scarab.test")
+        .await
+        .unwrap();
+    assert_eq!(late, 0, "the superseded start post is retired unposted");
+    let states: Vec<StatusState> = healthy.statuses().iter().map(|s| s.state).collect();
+    assert_eq!(states, vec![StatusState::Success]);
+    assert_eq!(db.outbox_depth().await.unwrap(), 0, "and never redelivered");
+}

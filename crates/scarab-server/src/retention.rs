@@ -82,6 +82,98 @@ pub async fn sweep_retention(
     Ok(pruned)
 }
 
+/// Prune plugin report receipts older than
+/// [`REPORT_RECEIPT_RETENTION_MS`](scarab_plugin::REPORT_RECEIPT_RETENTION_MS)
+/// (ADR-0072 §11), under the same leader lease as the log sweep. A receipt
+/// only makes a prompt retry answer `duplicate`; once it is gone the
+/// target's cursor still drops the repeat as `stale`, so pruning never
+/// lets a fact in twice.
+pub async fn sweep_plugin_receipts(
+    db: &Arc<dyn Db>,
+    plugins: &dyn scarab_plugin::PluginStore,
+    clock: &Arc<dyn Clock>,
+    owner: &str,
+) -> Result<u64, String> {
+    let lease = db
+        .lease(RETENTION_LEASE, owner, RETENTION_LEASE_TTL_MS)
+        .await
+        .map_err(|e| e.to_string())?;
+    if lease.owner != owner {
+        return Ok(0);
+    }
+    let cutoff = clock.now().await.0 - scarab_plugin::REPORT_RECEIPT_RETENTION_MS;
+    plugins
+        .prune_report_receipts(cutoff)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Prune CredentialBroker journal entries older than
+/// [`BROKER_JOURNAL_RETENTION_MS`](scarab_plugin::BROKER_JOURNAL_RETENTION_MS)
+/// (ADR-0072 §5; owner default 9: 14 days), under the same leader lease as
+/// the log sweep.
+pub async fn sweep_plugin_broker_journal(
+    db: &Arc<dyn Db>,
+    plugins: &dyn scarab_plugin::PluginStore,
+    clock: &Arc<dyn Clock>,
+    owner: &str,
+) -> Result<u64, String> {
+    let lease = db
+        .lease(RETENTION_LEASE, owner, RETENTION_LEASE_TTL_MS)
+        .await
+        .map_err(|e| e.to_string())?;
+    if lease.owner != owner {
+        return Ok(0);
+    }
+    let cutoff = clock.now().await.0 - scarab_plugin::BROKER_JOURNAL_RETENTION_MS;
+    plugins
+        .prune_broker_journal(cutoff)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// How long a settled — or expired — StepUpConfirmationRequest row is kept
+/// (ADR-0073 §6). Its evidence lives on in the OrgSecurityEventLog, which no
+/// sweep ever touches.
+pub const STEP_UP_REQUEST_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+
+/// Step-up housekeeping (ADR-0073), under the same leader lease as the log
+/// sweep: expired WebAuthn challenges and StepUpConfirmations go (they can
+/// never be answered or stand for anything again), an expired request's
+/// sealed body goes at once, and requests settled or expired more than
+/// [`STEP_UP_REQUEST_RETENTION_MS`] ago go. **Never the event log.**
+pub async fn sweep_step_up(
+    db: &Arc<dyn Db>,
+    challenges: &dyn scarab_identity::ChallengeStore,
+    step_up: &dyn scarab_identity::StepUpStore,
+    clock: &Arc<dyn Clock>,
+    owner: &str,
+) -> Result<u64, String> {
+    let lease = db
+        .lease(RETENTION_LEASE, owner, RETENTION_LEASE_TTL_MS)
+        .await
+        .map_err(|e| e.to_string())?;
+    if lease.owner != owner {
+        return Ok(0);
+    }
+    let now = clock.now().await.0;
+    let challenges = challenges
+        .reap_expired(now)
+        .await
+        .map_err(|e| e.to_string())?;
+    let rows = step_up
+        .reap(now, now - STEP_UP_REQUEST_RETENTION_MS)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(challenges + rows)
+}
+
+/// The step-up stores the sweeper reaps (ADR-0073).
+pub type StepUpStores = (
+    Arc<dyn scarab_identity::ChallengeStore>,
+    Arc<dyn scarab_identity::StepUpStore>,
+);
+
 /// Delete one run's log blobs, then its index. Body deletion is best-effort
 /// per key (a missing blob is already gone); the index drop only happens
 /// after the pass over the bodies, so a partial failure re-sweeps.
@@ -629,6 +721,8 @@ pub fn spawn_sweeper(
     cfg: RetentionConfig,
     gc: GcConfig,
     depot: Option<Arc<dyn DepotDurableIndex>>,
+    plugins: Option<Arc<dyn scarab_plugin::PluginStore>>,
+    step_up: Option<StepUpStores>,
     interval: std::time::Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -637,6 +731,29 @@ pub fn spawn_sweeper(
                 Ok(0) => {}
                 Ok(n) => tracing::info!(runs = n, "retention sweep pass complete"),
                 Err(e) => tracing::warn!(error = %e, "retention sweep pass failed"),
+            }
+            if let Some(plugins) = &plugins {
+                match sweep_plugin_receipts(&db, plugins.as_ref(), &clock, &owner).await {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        tracing::info!(receipts = n, "retention: pruned plugin report receipts")
+                    }
+                    Err(e) => tracing::warn!(error = %e, "plugin receipt prune failed"),
+                }
+                match sweep_plugin_broker_journal(&db, plugins.as_ref(), &clock, &owner).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(entries = n, "retention: pruned broker journal"),
+                    Err(e) => tracing::warn!(error = %e, "broker journal prune failed"),
+                }
+            }
+            if let Some((challenges, step_up)) = &step_up {
+                match sweep_step_up(&db, challenges.as_ref(), step_up.as_ref(), &clock, &owner)
+                    .await
+                {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(rows = n, "retention: reaped step-up rows"),
+                    Err(e) => tracing::warn!(error = %e, "step-up reap failed"),
+                }
             }
             if let Err(e) =
                 sweep_cas(&db, &cas, &store, &clock, &owner, gc, depot.as_deref()).await

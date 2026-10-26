@@ -33,16 +33,30 @@ pub enum SecretScope {
         org: String,
         repo: String,
     },
-    Environment {
+    /// One Project within one Environment — ADR-0071 §6's
+    /// **EnvironmentProjectSecretScope**, which is ADR-0037's per-repo
+    /// environment scope renamed now that the Environment is org-level.
+    ///
+    /// The rename is **name-only**: adapters keep encoding it exactly as they
+    /// encoded `Environment { org, repo, environment }` (Postgres:
+    /// `env:{org}/{project}/{environment}`, also the AEAD associated data),
+    /// so no stored ciphertext moves and no value changes visibility. The
+    /// serde aliases read the old wire form (`Environment`, `repo`) — the
+    /// shape every pre-ADR-0071 stored `ProtectionRules.secret_scope` holds.
+    #[serde(alias = "Environment")]
+    EnvironmentProject {
         org: String,
-        repo: String,
+        /// The Project's name — its repo's forge name (1:1 in v1).
+        #[serde(alias = "repo")]
+        project: String,
         environment: String,
     },
 }
 
 impl SecretScope {
     /// The lookup chain from most to least specific (ADR-0014, 0037): an
-    /// `Environment` scope falls back to its `Repo` then `Org`; a `Repo` scope
+    /// `EnvironmentProject` scope falls back to its Project's `Repo` scope,
+    /// then `Org`; a `Repo` scope
     /// falls back to its `Org`. `resolve` walks this in order, first hit wins,
     /// so a value shared across environments lives once at the repo/org level.
     pub fn resolution_chain(&self) -> Vec<SecretScope> {
@@ -51,7 +65,9 @@ impl SecretScope {
             SecretScope::Repo { org, .. } => {
                 vec![self.clone(), SecretScope::Org { org: org.clone() }]
             }
-            SecretScope::Environment { org, repo, .. } => vec![
+            SecretScope::EnvironmentProject {
+                org, project: repo, ..
+            } => vec![
                 self.clone(),
                 SecretScope::Repo {
                     org: org.clone(),
@@ -105,6 +121,29 @@ pub trait SecretProvider: Send + Sync {
     }
 }
 
+/// Seals small, short-lived payloads under the deployment's
+/// key-encryption key (ADR-0073 §5: a StepUpConfirmationRequest's parked
+/// request body), and derives purpose-bound keys from it.
+///
+/// `aad` binds a seal to its row (`"step-up-request:" + id`): the same bytes
+/// open only under the same `aad`, so a sealed body cannot be replayed onto
+/// another request. An adapter seals the way it seals secrets — a fresh data
+/// key per payload, wrapped by the active key-encryption key — so a key
+/// rotation leaves every outstanding seal openable.
+///
+/// Synchronous on purpose: sealing is computation, never I/O.
+pub trait Sealer: Send + Sync {
+    /// Seal `plaintext`, bound to `aad`.
+    fn seal(&self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, SecretError>;
+    /// Open what [`seal`](Sealer::seal) produced under the same `aad`. A
+    /// different `aad`, a tampered seal or an unknown key is an error.
+    fn open(&self, sealed: &[u8], aad: &[u8]) -> Result<Vec<u8>, SecretError>;
+    /// A 32-byte key for `label`, derived from (and only as secret as) the
+    /// active key-encryption key: HMAC-SHA256(active key, label). It changes
+    /// when the active key rotates.
+    fn derive_key(&self, label: &str) -> [u8; 32];
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,9 +151,9 @@ mod tests {
     use std::sync::Mutex;
 
     fn env(environment: &str) -> SecretScope {
-        SecretScope::Environment {
+        SecretScope::EnvironmentProject {
             org: "acme".into(),
-            repo: "web".into(),
+            project: "web".into(),
             environment: environment.into(),
         }
     }
@@ -151,9 +190,9 @@ mod tests {
         match s {
             SecretScope::Org { org } => format!("org:{org}"),
             SecretScope::Repo { org, repo } => format!("repo:{org}/{repo}"),
-            SecretScope::Environment {
+            SecretScope::EnvironmentProject {
                 org,
-                repo,
+                project: repo,
                 environment,
             } => format!("env:{org}/{repo}/{environment}"),
         }
@@ -179,6 +218,17 @@ mod tests {
         async fn delete(&self, _: &SecretScope, _: &str) -> Result<(), SecretError> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn the_old_environment_wire_form_still_deserialises() {
+        // Every pre-ADR-0071 `ProtectionRules.secret_scope` was stored as
+        // `Environment { org, repo, environment }` (ADR-0071 §6 rename).
+        let old: SecretScope = serde_json::from_value(serde_json::json!({
+            "Environment": { "org": "acme", "repo": "web", "environment": "prod" }
+        }))
+        .unwrap();
+        assert_eq!(old, env("prod"));
     }
 
     #[tokio::test]

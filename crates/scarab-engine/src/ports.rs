@@ -82,6 +82,171 @@ pub trait WorkspaceSnapshots: Send + Sync {
     async fn file_blob_hash(&self, root: &str, path: &str) -> Result<Option<String>, String>;
 }
 
+/// A DeploymentGate's verdict as its oracle reached it (ADR-0070 §8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentGateDecision {
+    /// `true`: the gate passes; `false`: it fails with
+    /// [`FailureKind::Gate`](crate::FailureKind::Gate).
+    pub passed: bool,
+    /// The human line journalled on `GateResolved` (and, on a failure, the
+    /// Attempt's `failure_detail`): the decisive report's label, "superseded
+    /// by <version>", "stalled: not live within <deadline>".
+    pub reason: String,
+    /// The public id (creating seq) of the Deployment the gate waited on.
+    pub deployment: Option<u64>,
+}
+
+/// The gate Attempt a DeploymentGate verdict is asked for (ADR-0070 §8), and
+/// where its window opens.
+///
+/// Two instants of the deploy Step are kept apart. Its request's **effective
+/// time** — the start of its FIRST Attempt in the current Take — is
+/// attribution: what explains a Deployment (INV-DEP-11). The gate's **first
+/// wait** opens later when the deploy Step was retried: at the start of the
+/// Attempt that **succeeded** and recorded the request
+/// ([`deploy_attempt_started_at`](Self::deploy_attempt_started_at)), so a
+/// report received while an earlier, failed Attempt ran does not decide the
+/// gate, and its stall deadline runs from the Attempt that did the deploy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeploymentGateWait {
+    /// The Attempt's frozen `started_at`. No verdict is reached for an
+    /// instant before it: the oracle answers `None` while its `now` (or the
+    /// `now` its fold was read at) is earlier.
+    pub started_at: Timestamp,
+    /// This wait **waits afresh**: an earlier wait of the same gate already
+    /// resolved while this same request stood (a Retry, or a Rerun that
+    /// re-armed the gate but not its requester). Its window then opens at
+    /// the later of the request's effective time and `started_at` (the
+    /// floor), so the verdict the earlier wait reached is history to it.
+    /// `false` — the gate's first wait on this request, including one after
+    /// an upstream Rerun made a new request — opens at the deploy Step's
+    /// succeeding Attempt (see [`window_floor`](Self::window_floor)), so a
+    /// report received while that Attempt still ran counts.
+    pub afresh: bool,
+    /// The `started_at` of the deploy Step's Attempt that **succeeded** and
+    /// recorded the request — its latest `Succeeded` Attempt, read from the
+    /// step's durable Attempt rows. `None` when it has none (a hand-seeded
+    /// run): the first wait then opens at the request's effective time.
+    pub deploy_attempt_started_at: Option<Timestamp>,
+}
+
+impl DeploymentGateWait {
+    /// The window floor of this wait on a request effective at
+    /// `effective_at`, when it has one:
+    ///
+    /// - waits afresh: the gate Attempt's own `started_at`;
+    /// - a first wait: the deploy Step's succeeding Attempt's start, **only
+    ///   when it is later than `effective_at`** (the deploy Step was retried
+    ///   in its Take). A single-Attempt deploy Step has no floor — its window
+    ///   is the request's own mark, exactly as before the split.
+    ///
+    /// A floor only ever narrows the window (INV-DEP-13): it never makes a
+    /// verdict arrive sooner or land earlier than the floor-free one.
+    pub fn window_floor(&self, effective_at: Timestamp) -> Option<Timestamp> {
+        if self.afresh {
+            return Some(self.started_at);
+        }
+        self.deploy_attempt_started_at
+            .filter(|s| s.0 > effective_at.0)
+    }
+}
+
+/// The **DeploymentGate oracle** (slice b, criterion 2; ADR-0070 §8): what a
+/// `gate: deployment` step's verdict is read from. Core resolves a
+/// DeploymentGate — never a plugin — by folding its Environment's Deployment
+/// record, which lives behind the server's stores (the input log, the
+/// Environment's deadline and the Project's overlay), so the pure engine asks
+/// through this port.
+///
+/// The engine asks only for a gate that is **waiting** (Pending, reached, an
+/// open Attempt), passing that Attempt as a [`DeploymentGateWait`]: a first
+/// wait opens at the start of the deploy Step's Attempt that succeeded (the
+/// request's effective time for a deploy Step that was not retried); a wait
+/// that waits afresh at the later of the request's effective time and its
+/// own Attempt's start ([`DeploymentGateWait::window_floor`]). Whatever the
+/// oracle answers is journalled once, per Attempt, and never asked again
+/// (INV-DEP-10): a terminal gate is never re-evaluated, and a Retry is a new
+/// Attempt that waits afresh from its own start.
+///
+/// `Ok(None)` = still waiting. `Err` = the oracle could not decide this tick
+/// (a store read failed, a row would not parse): the engine takes **no
+/// decision** and asks again next tick — it neither fails the gate nor counts
+/// it as a tick failure, so one unreadable row in an Environment's log cannot
+/// dead-letter every Deploy Run waiting there (ADR-0059). The implementation
+/// logs it; `gate_expires_after`, evaluated by the engine, still bounds the
+/// wait.
+///
+/// With **no oracle wired** ([`Scheduler::with_deployments`] not called) a
+/// DeploymentGate makes no decision of its own: it waits until a human
+/// rejects it, its `gate_expires_after` fires, or the Run is cancelled.
+///
+/// [`Scheduler::with_deployments`]: crate::Scheduler::with_deployments
+#[async_trait]
+pub trait DeploymentGates: Send + Sync {
+    async fn deployment_gate_verdict(
+        &self,
+        run: &RunId,
+        gate: &StepId,
+        request: &crate::RunDeploymentRequest,
+        wait: DeploymentGateWait,
+        now: Timestamp,
+    ) -> Result<Option<DeploymentGateDecision>, String>;
+
+    /// The **per-DeploymentTarget concurrency hold** (slice b, criterion 4;
+    /// ADR-0071 §9) for deploy Step `step` of `run`, whose needs have all
+    /// Succeeded and which makes `requests` on success: `Some` = hold it
+    /// `Pending` this pass (never fail it), `None` = it may be promoted.
+    ///
+    /// A target is at its limit when the Runs **other than `run`** in flight
+    /// on it ([`Db::deployment_requesting_runs`]) number the effective
+    /// `deployment_concurrency` of `run`'s Project in the Environment; `None`
+    /// limit = never held. The engine asks only from its promotion loop —
+    /// never at admission — and asks again every pass while the step waits.
+    ///
+    /// `now` is the control plane's clock: a Run whose only outstanding
+    /// DeploymentGates on the request are **not reached** stops counting once
+    /// the Environment's baseline deadline has elapsed since the requesting
+    /// Step's latest Attempt started — the Attempt that succeeded, where a
+    /// first wait of its gates opens (see [`Db::deployment_requesting_runs`]'s
+    /// `unreached_gate_cutoff`) — so two Runs holding targets in opposite
+    /// orders cannot hold each other forever.
+    ///
+    /// `Err` = the oracle could not decide: the engine **holds** the step this
+    /// pass (fail closed — a hold is never an over-admission) and asks again
+    /// next pass. The implementation logs it.
+    async fn deployment_concurrency_hold(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        requests: &[crate::RunDeploymentRequest],
+        now: Timestamp,
+    ) -> Result<Option<DeploymentConcurrencyHold>, String>;
+}
+
+/// Why a deploy Step is held `Pending` by per-DeploymentTarget concurrency
+/// (slice b, criterion 4): the first of its targets at its limit, as counted
+/// when the hold was decided. Derivable at any time (nothing is journalled
+/// per pass), so a view recomputes it rather than reading it back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentConcurrencyHold {
+    pub target_source: String,
+    pub target_id: String,
+    /// Other Runs in flight on the target ([`Db::deployment_requesting_runs`]).
+    pub in_flight: u32,
+    /// The effective `deployment_concurrency` limit in force.
+    pub limit: u32,
+}
+
+impl DeploymentConcurrencyHold {
+    /// The line a run page shows for the held Step.
+    pub fn reason(&self) -> String {
+        format!(
+            "held: waiting for deployment concurrency on `{}`/`{}` ({}/{} in flight)",
+            self.target_source, self.target_id, self.in_flight, self.limit
+        )
+    }
+}
+
 /// Opaque handle to a launched unit of execution (a pod, a local process…).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecHandle(pub String);
@@ -291,6 +456,24 @@ pub trait Db: Send + Sync {
         results: &std::collections::BTreeMap<String, serde_json::Value>,
     ) -> Result<(), DbError>;
 
+    /// [`set_step_results`](Db::set_step_results) for results that arrive
+    /// from OUTSIDE the engine — the k8s results-egress sidecar's POST
+    /// (ADR-0042) — written only while `attempt` is the step's **frontier**
+    /// (its latest Attempt) and the step is still `Running`: the window in
+    /// which the engine has not yet read them. Otherwise
+    /// [`DbError::Conflict`], nothing written (review safety S1): a POST that
+    /// lands after the verdict was released — the drain bound of git-bug
+    /// f02588d can release it while the sidecar still retries — or from a
+    /// superseded attempt would overwrite results dependents already
+    /// consumed. The check and the write are one commit.
+    async fn ingest_attempt_results(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        results: &std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> Result<(), DbError>;
+
     /// A step's named results, or an empty map if it emitted none (or is unknown).
     /// Latest-evidence read; per-attempt history is [`attempt_results`](Db::attempt_results).
     async fn step_results(
@@ -339,6 +522,30 @@ pub trait Db: Send + Sync {
         step: &StepId,
         attempt: &AttemptId,
     ) -> Result<std::collections::BTreeMap<String, String>, DbError>;
+
+    /// Record the ordered upstream steps behind this attempt's workspace
+    /// input roots, as resolved at LAUNCH ([`crate::workspace_input_steps`]
+    /// — the index space of the fetcher's root list). Overwrites: a
+    /// re-driven launch re-resolves, and the last write is what launched.
+    /// Settle resolves a collision sample's root indices against it (git-bug
+    /// b6b8510), never against a settle-time re-derivation.
+    async fn set_attempt_workspace_input_steps(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        steps: &[StepId],
+    ) -> Result<(), DbError>;
+
+    /// The list [`set_attempt_workspace_input_steps`](Db::set_attempt_workspace_input_steps)
+    /// recorded, or `None` if none was (no workspace inputs, or an attempt
+    /// launched before the column existed).
+    async fn attempt_workspace_input_steps(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<Option<Vec<StepId>>, DbError>;
 
     /// Record (or clear, with `None`) the **input signature** a step consumed on
     /// the attempt that is about to run — a deterministic digest of its `needs`'
@@ -425,6 +632,15 @@ pub trait Db: Send + Sync {
 
     /// The run's owning tenant, if stamped.
     async fn run_tenant(&self, run: &RunId) -> Result<Option<(String, String)>, DbError>;
+
+    /// [`Self::run_tenant`] for many runs in one round trip: each stamped run
+    /// maps to its `(org, project)`; an unknown or unstamped run is absent. For
+    /// a read that annotates a list (the Deployment record's requester links),
+    /// where one query per run grows with history.
+    async fn run_tenants(
+        &self,
+        runs: &[RunId],
+    ) -> Result<std::collections::HashMap<RunId, (String, String)>, DbError>;
 
     /// Allocate and stamp this run's **per-repo run number** (ADR-0057
     /// amendment), returning the assigned `#N`. Called once, right after the
@@ -572,6 +788,22 @@ pub trait Db: Send + Sync {
     /// Current status of a run, or `None` if it does not exist.
     async fn run_status(&self, run: &RunId) -> Result<Option<RunStatus>, DbError>;
 
+    /// How many times `run` has been reopened out of a terminal status (a
+    /// rerun or retry of a settled run); `0` for a run never reopened, or
+    /// unknown. The guarded run-status CAS bumps it in the same write that
+    /// moves the run out of a terminal status
+    /// ([`record_transition`](Db::record_transition),
+    /// [`commit_run_transition`](Db::commit_run_transition)).
+    ///
+    /// Outbox idempotency keys are unique forever, so a status post that
+    /// may recur on one run — the second `Succeeded` after a `Failed` rerun
+    /// — is keyed to this generation (red team A7), and carries it, so the
+    /// forge-status drainer can drop a redelivered post an older generation
+    /// left behind (red team R2-E5). A run transition commits only against
+    /// the generation its caller read ([`commit_run_transition`](Db::commit_run_transition)),
+    /// so the generation a post names is the one its transition happened in.
+    async fn run_reopen_generation(&self, run: &RunId) -> Result<u64, DbError>;
+
     /// Ids of all non-terminal runs — the work list a converged scheduler drives.
     async fn active_runs(&self) -> Result<Vec<RunId>, DbError>;
 
@@ -614,6 +846,16 @@ pub trait Db: Send + Sync {
     /// the scheduler folds to decide admission and completion.
     async fn steps_of_run(&self, run: &RunId) -> Result<Vec<StepRun>, DbError>;
 
+    /// [`Self::steps_of_run`] for many runs in a fixed number of round trips
+    /// (review fit-F8 / safety S9): each run with steps maps to exactly what
+    /// `steps_of_run` returns for it; a run with none (or unknown) is absent.
+    /// For a read that annotates a list — the polled run lists' waiting gates
+    /// — where one query per run grows with the page.
+    async fn steps_of_runs(
+        &self,
+        runs: &[RunId],
+    ) -> Result<std::collections::HashMap<RunId, Vec<StepRun>>, DbError>;
+
     /// The durable launch spec for a step, or `None` if unset. Stored at run
     /// creation so a resumed run can re-launch the same step after a crash.
     async fn step_spec(&self, run: &RunId, step: &StepId) -> Result<Option<StepSpec>, DbError>;
@@ -626,6 +868,32 @@ pub trait Db: Send + Sync {
         to: RunStatus,
     ) -> Result<(), DbError>;
 
+    /// One run transition as ONE commit (review correctness F4, the run-level
+    /// residual of git-bug 586187a): the guarded `from → to` CAS (exactly
+    /// [`record_transition`](Db::record_transition), and ALSO requiring the
+    /// run's [`reopen generation`](Db::run_reopen_generation) still to be
+    /// `generation`, the one the caller read — so a run cancelled, rerun and
+    /// back in `from` between the read and the commit is a
+    /// [`DbError::Conflict`], never a status post or intent keyed to a
+    /// generation it does not belong to: red team R2-E3's ABA at run grain),
+    /// then — only if it won —
+    /// every one of `events` and every one of `outbox` (each idempotent on its
+    /// key, as [`enqueue_outbox`](Db::enqueue_outbox)), in order. All of it
+    /// lands or none of it does: a lost CAS is [`DbError::Conflict`] with
+    /// nothing written; any later failure rolls the CAS back, leaving the run
+    /// in `from` for the caller's re-drive. Separately, a crash after the CAS
+    /// left a terminal run with no `RunTransitioned` and no forge status post,
+    /// and nothing could ever write them: the re-driven CAS conflicts.
+    async fn commit_run_transition(
+        &self,
+        run: &RunId,
+        from: RunStatus,
+        to: RunStatus,
+        generation: u64,
+        events: &[EventKind],
+        outbox: &[OutboxMessage],
+    ) -> Result<(), DbError>;
+
     /// Record a step status transition (guarded by optimistic concurrency on
     /// `from`, so a duplicate/stale writer is rejected rather than double-applied).
     async fn record_step_transition(
@@ -636,7 +904,45 @@ pub trait Db: Send + Sync {
         to: StepStatus,
     ) -> Result<(), DbError>;
 
-    /// Persist an attempt (idempotent on its id — restart-safe).
+    /// One step transition as ONE commit (git-bug 586187a): the guarded
+    /// `from → to` CAS (exactly [`record_step_transition`](Db::record_step_transition),
+    /// plus the `frontier` requirement on the step's latest Attempt), then —
+    /// only if it won — `stamp` on its Attempt, every one of `events`, in
+    /// order, and every one of `outbox` (each idempotent on its key, as
+    /// [`enqueue_outbox`](Db::enqueue_outbox)). The outbox carries the
+    /// attempt-scoped teardown intent a cancel or a supersession owes the
+    /// unit this transition abandons (red team A3/A6, R2-E1): written in a
+    /// separate, earlier commit, an intent could outlive a transition that
+    /// then failed — and kill a live attempt of a Run nobody cancelled. All
+    /// of it lands or none of it does:
+    ///
+    /// - the step is no longer in `from`, or its latest Attempt is not what
+    ///   `frontier` names → [`DbError::Conflict`], nothing written (the
+    ///   duplicate/stale finalizer writes no events);
+    /// - any later write fails → an error, and the CAS rolls back with it: the
+    ///   step stays in `from` for the caller's re-drive.
+    ///
+    /// The separate CAS-then-append it replaces could crash in between and
+    /// leave a terminal step with no journal entry — and no re-drive could
+    /// ever write one, because its CAS now conflicts.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_step_transition(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        from: StepStatus,
+        to: StepStatus,
+        frontier: crate::AttemptFrontier<'_>,
+        stamp: Option<(&AttemptId, &crate::AttemptStamp)>,
+        events: &[EventKind],
+        outbox: &[OutboxMessage],
+    ) -> Result<(), DbError>;
+
+    /// Persist an attempt (idempotent on its id — restart-safe). Serialized
+    /// against [`commit_step_transition`](Db::commit_step_transition) on the
+    /// same step (Postgres: it holds the step row `FOR SHARE`), so a
+    /// transition's [`AttemptFrontier`](crate::AttemptFrontier) check never
+    /// misses an Attempt minted concurrently with its commit.
     async fn record_attempt(
         &self,
         run: &RunId,
@@ -699,8 +1005,165 @@ pub trait Db: Send + Sync {
         outcome: crate::AttemptOutcome,
     ) -> Result<(), DbError>;
 
+    /// Record a Run's resolved DeploymentRequests (slice b, criterion 1;
+    /// ADR-0070 §7), once, at Run creation — every Step's, in one call.
+    async fn set_run_deployment_requests(
+        &self,
+        run: &RunId,
+        requests: &[crate::RunDeploymentRequest],
+    ) -> Result<(), DbError>;
+
+    /// The DeploymentRequests `step` of `run` makes on success, by ordinal.
+    /// Empty for a Step that makes none (every ordinary Step).
+    async fn run_deployment_requests(
+        &self,
+        run: &RunId,
+        step: &StepId,
+    ) -> Result<Vec<crate::RunDeploymentRequest>, DbError>;
+
+    /// How many Runs **other than `excluding`** are in flight on the
+    /// DeploymentTarget `(source, id)` of `org`'s `environment` (slice b,
+    /// criterion 4) — what the per-target concurrency hold counts. Runs, not
+    /// Deployments: two Runs requesting the same version count 2.
+    ///
+    /// Run R is in flight on the target iff R is not terminal and one of its
+    /// [`RunDeploymentRequest`](crate::RunDeploymentRequest)s for the target
+    /// belongs to a Step that is `Ready`/`Running` (promoted, not yet
+    /// finished), or that `Succeeded` (the request recorded) while a
+    /// DeploymentGate in that request's `gate_steps` is not yet terminal (its
+    /// verdict outstanding) and either
+    ///
+    /// - some such gate is **reached** (every one of its `needs` Succeeded):
+    ///   it counts until its verdict, which the gate's deadline bounds; or
+    /// - the requesting Step's **latest Attempt** `started_at` — the Attempt
+    ///   that succeeded and recorded the request, where a first wait of its
+    ///   DeploymentGates opens; NOT the request's effective time, which is
+    ///   the Step's first Attempt in its Take and can be earlier — or the
+    ///   Run's `created_at` if it has none, is after `unreached_gate_cutoff`
+    ///   (the caller passes `now − the Environment's baseline deadline`). A
+    ///   gate that is not reached has no clock of its own, so without this
+    ///   bound two Runs that acquired two targets in opposite orders, each
+    ///   gate needing both deploys, would hold each other forever (R3). A
+    ///   gate's first wait has its deadline (never longer than the baseline)
+    ///   run from that same start, so once reached it is decided no later
+    ///   than this cutoff; past it an unreached gate stops the Run counting.
+    ///
+    /// A Step that is still `Pending` (itself held, or not reached) does not
+    /// count; one that failed made no request.
+    ///
+    /// R is also in flight — **whatever its status** — while an
+    /// attempt-scoped teardown of one of the requesting Step's own Attempts
+    /// is pending (git-bug f22056d, red team R2-E1/E2b): a
+    /// [`CANCEL_ATTEMPT`](crate::CANCEL_ATTEMPT) or
+    /// [`SUPERSEDE_TEARDOWN`](crate::SUPERSEDE_TEARDOWN) whose payload names
+    /// an Attempt of the Step. A cancel or a rerun makes the Step terminal or
+    /// `Pending` at once, while its unit (a Pod in its termination grace) may
+    /// still be acting on the target. Pending = neither dispatched (the
+    /// scheduler retires it only once [`Executor::torn_down`] says the unit
+    /// is gone, and never while that Attempt's launch is still in flight) nor
+    /// dead-lettered (abandoned after the delivery ceiling, with a
+    /// diagnostic). The Run-level [`CANCEL_RUN`](crate::CANCEL_RUN) — shared
+    /// services only — never counts: it names no unit of the Step.
+    async fn deployment_requesting_runs(
+        &self,
+        org: &str,
+        environment: &str,
+        source: &str,
+        id: &str,
+        excluding: &RunId,
+        unreached_gate_cutoff: Timestamp,
+    ) -> Result<u32, DbError>;
+
+    /// A Deploy Step's success **and** the DeploymentRequests it made, as one
+    /// commit (slice b, criterion 1; ADR-0070 §7, §8): the guarded
+    /// `Running → Succeeded` step transition, `attempt`'s `Succeeded` outcome,
+    /// and one append per `inputs` entry to `org`'s Deployment input log as
+    /// received at `received_at` (the control plane's clock, read right before
+    /// the call). Either all of it lands or none of it does:
+    ///
+    /// - the step is no longer `Running` (a peer finalized it) →
+    ///   [`DbError::Conflict`], nothing appended — exactly-once, as
+    ///   [`record_step_transition`](Db::record_step_transition);
+    /// - an append is refused (a `received_at` too far ahead of the store's
+    ///   clock) or fails → an error, and the step stays `Running`: no success
+    ///   without its request, no request without its success.
+    ///
+    /// - a request's DeploymentTarget is homed in another Environment, read
+    ///   under the Org's Deployment counter lock (current routing, else the
+    ///   Environment of its newest input — the recorded facts only) →
+    ///   `Ok(TargetHomedElsewhere)`
+    ///   ([`crate::DeployStepFinish::TargetHomedElsewhere`]), nothing lands
+    ///   and the step stays `Running` for the caller to fail (git-bug
+    ///   9e66f2c: two Runs in different Environments admitted before either
+    ///   recorded a never-seen target — the first to record it homes it).
+    ///
+    /// `events` (the finalization's `AttemptFinished` + `StepTransitioned`)
+    /// are appended in the same commit (git-bug 586187a): a success never
+    /// lands without its journal entry.
+    ///
+    /// Postgres runs it in ONE READ COMMITTED transaction, taking the Org's
+    /// Deployment counter row last (see `append_deployment_input`) — and
+    /// re-reading each target's home only once it holds it, so no other
+    /// append can land between the check and its own.
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_step_with_deployment_requests(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        org: &str,
+        inputs: &[scarab_deployment::DeploymentInput],
+        received_at: Timestamp,
+        events: &[EventKind],
+    ) -> Result<crate::DeployStepFinish, DbError>;
+
     /// Append one entry to the run's append-only event log.
     async fn append_event(&self, event: &EventKind) -> Result<(), DbError>;
+
+    /// Open gate `step`'s wait (slice b, criterion 3), atomically: with the
+    /// step row locked, `None` when the gate is no longer `Pending`; the open
+    /// Attempt as-is when its last Attempt is still `Running` (no write);
+    /// otherwise mint `a{n+1}` `Running` with `started_at` (clamped to no
+    /// later than `at`) and append its `AttemptStarted` at `at` — in one
+    /// transaction. The step-row lock is what serialises a mint against a
+    /// concurrent [`resolve_gate_wait`](Db::resolve_gate_wait) or cancel: a
+    /// mint can never land on a gate that already resolved.
+    async fn open_gate_wait(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        started_at: Timestamp,
+        at: Timestamp,
+    ) -> Result<Option<Attempt>, DbError>;
+
+    /// End gate `step`'s wait per `res`, in ONE transaction: lock the step
+    /// row (`None` unless it is `Pending`); close the fenced Attempt
+    /// (`res.fence = Some(a)`: only while `a` is still `Running`, else `None`
+    /// and nothing is written) or, unfenced, whichever Attempt is `Running` —
+    /// minting one already closed when none is; CAS the step to
+    /// `Succeeded|Failed`; and append
+    /// [`gate_resolution_events`](crate::gate_resolution_events). Returns the
+    /// closed Attempt's id when this call resolved the gate. A crash leaves
+    /// either all of it or none of it.
+    async fn resolve_gate_wait(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        res: &crate::GateResolution,
+    ) -> Result<Option<AttemptId>, DbError>;
+
+    /// Close `attempt` with `outcome` only while it is still `Running`, and
+    /// then (same transaction) append `event` when given. Returns whether it
+    /// was closed: `false` means someone else already ended it (a concurrent
+    /// resolve, supersede or cancel), and `event` was NOT appended.
+    async fn close_running_attempt(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        outcome: crate::AttemptOutcome,
+        event: Option<&EventKind>,
+    ) -> Result<bool, DbError>;
 
     /// Enqueue a message on the transactional outbox. Enqueuing the same
     /// `idempotency_key` twice is a no-op (the effect is enqueued exactly once).
@@ -725,6 +1188,13 @@ pub trait Db: Send + Sync {
 
     /// Mark a claimed outbox message dispatched, so it is never redelivered.
     async fn mark_dispatched(&self, id: OutboxId) -> Result<(), DbError>;
+
+    /// Whether the outbox message with `idempotency_key` exists and is
+    /// still pending — neither dispatched nor dead-lettered. A teardown asks
+    /// it of an Attempt's `launch:` intent before calling an Attempt with no
+    /// recorded handle gone: while that intent is pending a launch may be
+    /// creating its unit right now.
+    async fn outbox_key_pending(&self, idempotency_key: &str) -> Result<bool, DbError>;
 
     /// Record one failed delivery of an outbox message (ADR-0047 poison
     /// handling) and return the total failures so far. Benign redeliveries of
@@ -892,6 +1362,40 @@ pub trait Executor: Send + Sync {
     async fn poll(&self, handle: &ExecHandle) -> Result<ExecState, ExecError>;
     async fn cancel(&self, handle: &ExecHandle) -> Result<(), ExecError>;
 
+    /// The handle [`launch`](Self::launch) creates (or adopts) for `step`'s
+    /// fenced attempt, derived WITHOUT launching — `None` when this backend's
+    /// units are not addressable before `launch` returns.
+    ///
+    /// A launch can create its unit and still return `Err` (k8s: the Pod
+    /// create was accepted, then the per-Pod Secret upsert failed, or the
+    /// create response was lost), and a control plane can die between a
+    /// successful launch and recording the handle. Either way no handle is
+    /// durable, and if the attempt then stops being wanted the redelivered
+    /// launch is refused — so the engine tears down THIS handle instead,
+    /// or the unit is orphaned and its DeploymentTarget hold ends while it
+    /// runs (git-bug 333d389). Cancelling a unit that was never created is a
+    /// no-op, so answering `Some` costs one idempotent cancel.
+    ///
+    /// Required, never defaulted, for the same reason as
+    /// [`torn_down`](Self::torn_down): a decorator falling back to a `None`
+    /// default would silently reopen the orphan. Decorators forward it.
+    fn unit_handle(&self, step: &StepRun) -> Option<ExecHandle>;
+
+    /// Whether the unit behind `handle` is **gone** after a
+    /// [`cancel`](Self::cancel) — not merely told to stop. A teardown intent
+    /// is retired only once this is `true` (git-bug f22056d): until then the
+    /// cancelled or superseded Step still holds its DeploymentTarget for the
+    /// per-target concurrency limit, because its unit may still be acting on
+    /// the target (on Kubernetes a deleted Pod runs on through its
+    /// termination grace). A missing unit is `true`.
+    ///
+    /// Required, never defaulted: a default answer would be `true` for every
+    /// backend that did not think about it, and a decorator falling back to
+    /// it would retire teardowns early and silently reopen the overlap (the
+    /// defaulted-method-on-decorators evidence drop). Decorators forward it;
+    /// a backend whose `cancel` leaves nothing running answers `true`.
+    async fn torn_down(&self, handle: &ExecHandle) -> Result<bool, ExecError>;
+
     /// The content-addressed output workspace snapshot the (successfully
     /// finished) unit produced — the CAS merkle-root hash the orchestrator
     /// records so a dependent can materialize it (ADR-0029). `None` when the unit
@@ -934,6 +1438,31 @@ pub trait Executor: Send + Sync {
     ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, ExecError> {
         Ok(std::collections::BTreeMap::new())
     }
+
+    /// How the backend **failed to deliver** a finished execution's results,
+    /// or `Ok(None)` when it did not fail (delivered, nothing to deliver, or a
+    /// backend that hands results over in-process through
+    /// [`results`](Self::results)). A short clause naming the failure, e.g.
+    /// "the results sidecar `scarab-results-egress` exited 1 (Error)".
+    ///
+    /// Read only when an exit-0 Step's DeploymentRequest cannot be completed
+    /// from its results (git-bug `0cb5895`): the Step still fails
+    /// DeploymentRequest incomplete and is never auto-retried, but the reason
+    /// then says the results were lost in delivery — the author's step may
+    /// be fine — instead of telling them to write `/scarab/results/<name>.json`.
+    /// `Err` = it **could not be checked** (a backend error, or the
+    /// execution's unit is already gone): the reason then says so and blames
+    /// neither the author nor the delivery. Never answer `Ok(None)` for "I
+    /// could not look" — that reads as "delivered", and blames the author.
+    ///
+    /// **Deliberately REQUIRED — no default**, for the reason spelled out on
+    /// [`workspace_provisioning`](Self::workspace_provisioning): a defaulted
+    /// evidence method answers the default through a decorator instead of the
+    /// executor it wraps, and nothing fails. Every impl must visibly decide.
+    async fn results_delivery_failure(
+        &self,
+        handle: &ExecHandle,
+    ) -> Result<Option<String>, ExecError>;
 
     /// The **artifacts** a finished execution published to `/scarab/artifacts/`
     /// (ADR-0052): collected post-step by the backend, blobs already in the

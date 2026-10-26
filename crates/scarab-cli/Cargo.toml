@@ -14,3 +14,20 @@ tokio = { workspace = true }
 reqwest = { workspace = true }
 scarab-pipeline = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+# ADR-0073 C8: `tests/security.rs` drives the real `scarab` binary against
+# the REAL server router (in process, on an ephemeral port) with in-memory
+# stores and step-up enforced. scarab-server is not a workspace dep (it is the
+# composition root), hence the path, as in scarab-workspace-client.
+scarab-server = { path = "../scarab-server" }
+scarab-testkit = { workspace = true }
+scarab-identity = { workspace = true }
+scarab-forge = { workspace = true }
+# A software passkey: the authenticator is the one true external.
+scarab-webauthn = { workspace = true, features = ["soft-authenticator"] }
+axum = { workspace = true }
+# The production KEK sealer (ADR-0073 §5) for the enforced server: sealing is
+# pure computation over a lazy pool that never connects.
+scarab-secrets-postgres = { workspace = true }
+sqlx = { workspace = true }

@@ -24,6 +24,8 @@ export function describeEvent(e: RunEvent): string {
         : `${s(v.step)} — attempt finished`;
     case "GateReleased":
       return `${s(v.step)} — gate released`;
+    case "GateResolved":
+      return `${s(v.step)} — ${gateResolvedSummary(v)}`;
     case "StepSkipped":
       return `${s(v.step)} — skipped (${s(v.reason)})`;
     case "RunRerunRequested":
@@ -54,6 +56,15 @@ export function describeEvent(e: RunEvent): string {
     default:
       return tag;
   }
+}
+
+/** The human line for a GateResolved payload, step omitted: the journalled
+ * verdict of one gate wait — passed or failed, with its reason, and who
+ * rejected it when a human (or an external gate's token) did. */
+function gateResolvedSummary(v: Record<string, unknown>): string {
+  const reason = v.reason ? ` — ${String(v.reason)}` : "";
+  if (v.passed) return `gate passed${reason}`;
+  return `gate ${v.by ? `rejected by ${String(v.by)}` : "failed"}${reason}`;
 }
 
 /** The human line for a WorkspaceInputCollisions payload, step omitted:
@@ -104,6 +115,8 @@ export function eventParts(e: RunEvent): { step: string | null; text: string } {
       return { step, text: v.failure ? `attempt failed (${s(v.failure)})` : "attempt finished" };
     case "GateReleased":
       return { step, text: "gate released" };
+    case "GateResolved":
+      return { step, text: gateResolvedSummary(v) };
     case "StepSkipped":
       return { step, text: `skipped (${s(v.reason)})` };
     case "AttemptReadopted":
@@ -145,6 +158,8 @@ export function eventCategory(e: RunEvent): EventCat {
       return v.failure ? "err" : "ok";
     case "GateReleased":
       return "gate";
+    case "GateResolved":
+      return v.passed ? "gate" : "err";
     case "RunRerunRequested":
       return "take";
     case "StepRetryRequested":

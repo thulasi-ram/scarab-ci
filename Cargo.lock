@@ -539,6 +539,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "core_detect"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f8f80099a98041a3d1622845c271458a2d73e688351bf3cb999266764b81d48"
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1775,6 +1781,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
+name = "minicbor"
+version = "2.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7244eafd1e09e7c4e33043881997aa6ab6dffff3ed2cee3395a278980481d6e"
+
+[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2186,6 +2198,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "proptest"
+version = "1.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8530004ccb15eae51c7e40009fbe317f341f804db54dc033eec1c50be28cfa0"
+dependencies = [
+ "bitflags 2.13.0",
+ "chacha20",
+ "core_detect",
+ "num-traits",
+ "rand 0.10.2",
+ "rand_xorshift",
+ "regex-syntax",
+ "unarray",
+]
+
+[[package]]
 name = "quick-xml"
 version = "0.40.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2359,6 +2387,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rand_xorshift"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60aa6af80be32871323012e02e6e65f8a7cc7890931ae421d217ad8fe0df2ccf"
+dependencies = [
+ "rand_core 0.10.1",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2398,12 +2435,6 @@ dependencies = [
  "memchr",
  "regex-syntax",
 ]
-
-[[package]]
-name = "regex-lite"
-version = "0.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cab834c73d247e67f4fae452806d17d3c7501756d98c8808d7c9c7aa7d18f973"
 
 [[package]]
 name = "regex-syntax"
@@ -2616,10 +2647,18 @@ dependencies = [
 name = "scarab-cli"
 version = "0.1.1"
 dependencies = [
+ "axum",
  "clap",
  "reqwest",
+ "scarab-forge",
+ "scarab-identity",
  "scarab-pipeline",
+ "scarab-secrets-postgres",
+ "scarab-server",
+ "scarab-testkit",
+ "scarab-webauthn",
  "serde_json",
+ "sqlx",
  "tokio",
 ]
 
@@ -2628,10 +2667,12 @@ name = "scarab-db-postgres"
 version = "0.1.1"
 dependencies = [
  "async-trait",
+ "scarab-deployment",
  "scarab-engine",
  "scarab-forge",
  "scarab-identity",
  "scarab-pipeline",
+ "scarab-plugin",
  "scarab-project",
  "scarab-storage",
  "scarab-storage-s3",
@@ -2639,6 +2680,15 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "scarab-deployment"
+version = "0.1.1"
+dependencies = [
+ "async-trait",
+ "proptest",
 ]
 
 [[package]]
@@ -2661,6 +2711,7 @@ name = "scarab-engine"
 version = "0.1.1"
 dependencies = [
  "async-trait",
+ "scarab-deployment",
  "scarab-pipeline",
  "serde",
  "serde_json",
@@ -2678,6 +2729,7 @@ dependencies = [
  "futures",
  "k8s-openapi",
  "kube",
+ "rustls",
  "scarab-engine",
  "scarab-forge-github",
  "scarab-pipeline",
@@ -2769,10 +2821,63 @@ dependencies = [
 ]
 
 [[package]]
+name = "scarab-plugin"
+version = "0.1.1"
+dependencies = [
+ "async-trait",
+ "scarab-deployment",
+ "scarab-project",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "scarab-plugin-argocd"
+version = "0.1.1"
+dependencies = [
+ "async-trait",
+ "axum",
+ "futures",
+ "reqwest",
+ "scarab-db-postgres",
+ "scarab-plugin",
+ "scarab-server",
+ "scarab-testkit",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "scarab-plugin-k8s"
+version = "0.1.1"
+dependencies = [
+ "async-trait",
+ "base64",
+ "futures",
+ "k8s-openapi",
+ "kube",
+ "rustls",
+ "scarab-plugin",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "scarab-project"
 version = "0.1.1"
 dependencies = [
  "async-trait",
+ "proptest",
  "scarab-forge",
  "scarab-secrets",
  "serde",
@@ -2786,6 +2891,7 @@ version = "0.1.1"
 dependencies = [
  "async-trait",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
 ]
@@ -2796,6 +2902,7 @@ version = "0.1.1"
 dependencies = [
  "aes-gcm",
  "async-trait",
+ "hmac",
  "rand 0.8.7",
  "scarab-secrets",
  "sha2",
@@ -2815,14 +2922,15 @@ dependencies = [
  "filetime",
  "flate2",
  "futures",
+ "hmac",
  "jsonwebtoken",
  "libc",
  "rand 0.8.7",
- "regex-lite",
  "reqwest",
  "rsa",
  "rustls",
  "scarab-db-postgres",
+ "scarab-deployment",
  "scarab-engine",
  "scarab-executor-k8s",
  "scarab-executor-local",
@@ -2831,12 +2939,15 @@ dependencies = [
  "scarab-forge-github",
  "scarab-identity",
  "scarab-pipeline",
+ "scarab-plugin",
+ "scarab-plugin-k8s",
  "scarab-project",
  "scarab-secrets",
  "scarab-secrets-postgres",
  "scarab-storage",
  "scarab-storage-s3",
  "scarab-testkit",
+ "scarab-webauthn",
  "scarab-workspace-client",
  "serde",
  "serde_json",
@@ -2890,14 +3001,33 @@ name = "scarab-testkit"
 version = "0.1.1"
 dependencies = [
  "async-trait",
+ "scarab-deployment",
  "scarab-engine",
  "scarab-forge",
  "scarab-identity",
  "scarab-pipeline",
+ "scarab-project",
  "scarab-secrets",
  "scarab-storage",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "scarab-webauthn"
+version = "0.1.1"
+dependencies = [
+ "base64",
+ "minicbor",
+ "num-bigint",
+ "rand 0.8.7",
+ "ring",
+ "rsa",
+ "scarab-webauthn",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -3841,6 +3971,12 @@ name = "ucd-trie"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2896d95c02a80c6d6a5d6e953d479f5ddf2dfdb6a244441010e373ac0fb88971"
+
+[[package]]
+name = "unarray"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eaea85b334db583fe3274d12b4cd1880032beab409c0d774be044d4480ab9a94"
 
 [[package]]
 name = "unicode-bidi"

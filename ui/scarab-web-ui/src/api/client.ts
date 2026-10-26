@@ -4,6 +4,7 @@ import createClient from "openapi-fetch";
 import { createSignal } from "solid-js";
 import type { paths, components } from "./schema";
 import type { ParamSpec } from "../params";
+import { askStepUp, errorMessage, shareCeremony, withStepUp } from "../step-up";
 
 export type RunStatus = components["schemas"]["RunStatusResponse"];
 export type CreateRunRequest = components["schemas"]["CreateRunRequest"];
@@ -81,6 +82,39 @@ api.use({
       request.headers.set("x-csrf-token", csrf);
     }
     return request;
+  },
+});
+
+// Step-up confirmation (ADR-0073). A crown-jewel operation answers
+// `403 step_up_required` until this browser session holds a fresh passkey
+// confirmation; this turns that 403 into the StepUpDialog, a passkey prompt, a
+// `POST /v1/me/step-up`, and the SAME request again — so no call site in the
+// app has to know step-up exists.
+//
+// Registered LAST, which matters twice over:
+// - its `onRequest` runs after the CSRF middleware above, so the copy it
+//   stashes already carries `x-csrf-token` and the retry passes the same
+//   double-submit check the original did;
+// - openapi-fetch runs `onResponse` in REVERSE order, so this one sees the 403
+//   first and the 401 middleware above sees whatever the retry answered.
+//
+// The copy is taken before sending because a sent Request's body is spent: the
+// retry needs a fresh clone of the original, once per round. A WeakMap keyed by
+// the request object frees each stash with its request.
+const stashedRequests = new WeakMap<Request, Request>();
+/** One dialog at a time, shared by every request refused while it is open. */
+const stepUpCeremony = shareCeremony(askStepUp);
+
+api.use({
+  onRequest({ request }) {
+    stashedRequests.set(request, request.clone());
+    return undefined;
+  },
+  async onResponse({ request, response }) {
+    if (response.status !== 403) return response;
+    const original = stashedRequests.get(request);
+    if (!original) return response;
+    return withStepUp(response, () => fetch(original.clone()), stepUpCeremony);
   },
 });
 
@@ -256,15 +290,19 @@ async function send(path: string, method: string, body?: unknown): Promise<Respo
   const headers: Record<string, string> = { "content-type": "application/json" };
   const csrf = csrfToken();
   if (csrf) headers["x-csrf-token"] = csrf;
-  const res = await fetch(path, {
+  const init: RequestInit = {
     method,
     headers,
     body: body === undefined ? undefined : JSON.stringify(body),
-  });
+  };
+  // Several of these are crown jewels (role bindings, identity links): the
+  // same step-up retry the `api` middleware does. The body is a string, so
+  // re-sending the same init is the same request.
+  const res = await withStepUp(await fetch(path, init), () => fetch(path, init), stepUpCeremony);
   if (res.status === 401) setUnauthenticated(true);
   if (!res.ok) {
-    const text = (await res.text().catch(() => "")).trim();
-    throw new Error(text || `${method} ${path} failed (${res.status})`);
+    const text = await res.text().catch(() => "");
+    throw new Error(errorMessage(text, `${method} ${path} failed (${res.status})`));
   }
   return res;
 }
@@ -442,53 +480,69 @@ export function workspaceFileUrl(
   return attempt ? `${base}&attempt=${encodeURIComponent(attempt)}` : base;
 }
 
-// --- Environments (ADR-0024/0037). The generated schema types these responses
-// opaquely (no body declared), so they're plain-fetched — same pattern as the
-// secret parity matrix below — and hand-typed against the server's serialized
-// `scarab_project::Environment` / `Deployment` shapes. ---
+// --- A repository's Environments (ADR-0071). Since the migration an
+// Environment is org-level; a repository sees the ones its Project may deploy
+// into (or holds an overlay or grant in), each with the org's BASELINE, the
+// Project's own tighten-only OVERLAY, and the EFFECTIVE rules admission
+// enforces — merged by the server, never here. The old per-repo
+// `PUT/DELETE …/environments/{name}` answer 410. ---
 
-/** An environment's protection rules, as serialized by the server. */
-export type ProtectionRules = {
-  approvers: string[];
-  wait_timer: number;
-  allowed_refs: string[];
-  concurrency: number;
-  /** Require a reason for human dispatches (manual/api) into this environment
-   *  (ADR-0057 §3). Optional/omittable — the server defaults it off (fail-open).
-   *  Administer-only to set, like the rest of the rules. */
-  require_reason?: boolean;
-};
-export type RepoEnvironment = { name: string; protection: ProtectionRules };
+/** One Environment as this Project sees it. */
+export type ProjectEnvironment = components["schemas"]["ProjectEnvironmentDto"];
+/** One rules layer (a baseline or an overlay's rules). */
+export type EnvironmentRules = components["schemas"]["EnvironmentProtectionRulesDto"];
+/** The merged rules admission enforces. */
+export type EffectiveRules = components["schemas"]["EffectiveProtectionDto"];
+/** A Project's overlay as stored. */
+export type EnvironmentOverlay = components["schemas"]["EnvironmentProjectOverlayDto"];
+/** The overlay PUT body. */
+export type PutOverlayRequest = components["schemas"]["PutEnvironmentProjectOverlayRequest"];
 
-/** List a repo's environments (`GET …/environments`). */
-export async function listEnvironments(org: string, repo: string): Promise<RepoEnvironment[]> {
+/** The Environments this repository's Project sees (`GET …/environments`). */
+export async function listEnvironments(org: string, repo: string): Promise<ProjectEnvironment[]> {
+  // Plain fetch: the spec declares this route's response but not its path
+  // parameters, so the typed client cannot address it.
   const res = await fetch(
     `/v1/repos/${encodeURIComponent(org)}/${encodeURIComponent(repo)}/environments`,
   );
-  if (!res.ok) throw new Error("failed to list environments");
-  return (await res.json()) as RepoEnvironment[];
+  if (res.status === 401) setUnauthenticated(true);
+  if (!res.ok) throw new Error(`failed to list environments (${res.status})`);
+  return (await res.json()) as ProjectEnvironment[];
 }
 
-/** Create or replace an environment's protection rules
- *  (`PUT …/environments/{name}`, ADR-0037; requires Administer). */
-export async function putEnvironment(
+const envPath = (org: string, env: string) =>
+  `/v1/orgs/${encodeURIComponent(org)}/environments/${encodeURIComponent(env)}`;
+const projectPath = (org: string, env: string, project: string) =>
+  `${envPath(org, env)}/projects/${encodeURIComponent(project)}`;
+
+/** Tighten an Environment for one Project — create or replace its overlay
+ *  (Administer on the Project or Org). Through `send`: the server's 400
+ *  (an approver who is not a Scarab user) and 409 (not eligible) are the
+ *  answer to "why will this not save", shown verbatim. */
+export async function putEnvironmentOverlay(
   org: string,
-  repo: string,
-  name: string,
-  protection: ProtectionRules,
-): Promise<void> {
-  // Through `send`: Administer-gated, so a cookie session needs the CSRF
-  // token (this raw `fetch` used to omit it and 403 under real login), and an
-  // unknown approver comes back with the server's explanation (ADR-0069 §3).
-  await send(
-    `/v1/repos/${encodeURIComponent(org)}/${encodeURIComponent(repo)}/environments/${encodeURIComponent(name)}`,
-    "PUT",
-    protection,
-  );
+  env: string,
+  project: string,
+  body: PutOverlayRequest,
+): Promise<EnvironmentOverlay> {
+  const res = await send(`${projectPath(org, env, project)}/overlay`, "PUT", body);
+  return (await res.json()) as EnvironmentOverlay;
 }
 
-/** A recorded deployment into an environment (`at` is epoch millis). */
-export type Deployment = {
+/** Remove a Project's overlay: its deploys fall back to the baseline. */
+export async function deleteEnvironmentOverlay(
+  org: string,
+  env: string,
+  project: string,
+): Promise<void> {
+  await send(`${projectPath(org, env, project)}/overlay`, "DELETE");
+}
+
+/** One approval recorded when a run into an environment was admitted (`at` is
+ *  epoch millis). The LEGACY `…/environments/{name}/deployments` route: it
+ *  records what was *approved*, not what went live — that is the Deployment
+ *  record below (ADR-0070), which this route predates. */
+export type ApprovalRecord = {
   org: string;
   project: string;
   environment: string;
@@ -498,17 +552,430 @@ export type Deployment = {
   at: number;
 };
 
-/** An environment's deployment history, most recent first (`GET …/deployments`). */
-export async function listDeployments(
+/** An environment's approval history, most recent first (legacy
+ *  `GET /v1/repos/{org}/{repo}/environments/{name}/deployments`). */
+export async function listApprovalHistory(
   org: string,
   repo: string,
   name: string,
-): Promise<Deployment[]> {
+): Promise<ApprovalRecord[]> {
   const res = await fetch(
     `/v1/repos/${encodeURIComponent(org)}/${encodeURIComponent(repo)}/environments/${encodeURIComponent(name)}/deployments`,
   );
-  if (!res.ok) throw new Error("failed to list deployments");
-  return (await res.json()) as Deployment[];
+  if (!res.ok) throw new Error("failed to list approval history");
+  return (await res.json()) as ApprovalRecord[];
+}
+
+// --- Deployments (ADR-0070) — what is live on each DeploymentTarget, and how
+// it got there. Org-scoped: an Environment's Deployments span every Project
+// that deploys into it. ---
+
+/** One Deployment: a version made (or asked to be made) live on a target. */
+export type Deployment = components["schemas"]["DeploymentDto"];
+export type DeploymentStatus = components["schemas"]["DeploymentStatusDto"];
+/** One stage of a Deployment as its source reported it. */
+export type DeploymentReport = components["schemas"]["DeploymentStatusReportDto"];
+/** The Deploy Run step that asked for a Deployment. */
+export type DeploymentRequester = components["schemas"]["DeploymentRequesterDto"];
+export type DeploymentTarget = components["schemas"]["DeploymentTargetDto"];
+/** One target's line on the Environment board: what is live, what is newest. */
+export type BoardRow = components["schemas"]["EnvironmentBoardRowDto"];
+
+/** The caller may not read this org's Deployment record (403). Reading needs
+ *  Read on the Org; a member bound only to a Project is refused until
+ *  Environment eligibility (ADR-0071) says who may read an Environment. */
+export class DeploymentsForbiddenError extends Error {
+  constructor(readonly org: string) {
+    super(`no read access to ${org}'s deployments`);
+    this.name = "DeploymentsForbiddenError";
+  }
+}
+
+/**
+ * The Environment board (`GET /v1/orgs/{org}/board`), every Environment with
+ * any Deployment unless `environment` narrows it.
+ *
+ * `null` when the server has no Deployment record wired (a 404 before it
+ * authorizes anything) — "this server does not track deployments", which is
+ * not the same answer as "nothing has deployed".
+ */
+export async function getEnvironmentBoard(
+  org: string,
+  environment?: string,
+): Promise<BoardRow[] | null> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/board", {
+    params: { path: { org }, query: environment ? { environment } : {} },
+  });
+  if (response.status === 404) return null;
+  if (response.status === 403) throw new DeploymentsForbiddenError(org);
+  if (error || !data) {
+    throw new Error(errorText(error) || "failed to load the environment board");
+  }
+  return data;
+}
+
+/** An Environment's Deployments, newest first, optionally one target's only.
+ *  `null` = deployments not configured on this server (as above). */
+export async function listEnvironmentDeployments(
+  org: string,
+  env: string,
+  target?: { source: string; id: string },
+): Promise<Deployment[] | null> {
+  const { data, error, response } = await api.GET(
+    "/v1/orgs/{org}/environments/{env}/deployments",
+    {
+      params: {
+        path: { org, env },
+        query: target ? { target_source: target.source, target_id: target.id } : {},
+      },
+    },
+  );
+  if (response.status === 404) return null;
+  if (response.status === 403) throw new DeploymentsForbiddenError(org);
+  if (error || !data) {
+    throw new Error(errorText(error) || `failed to list deployments in ${env}`);
+  }
+  return data;
+}
+
+// --- Org-level Environments (ADR-0071) — the place deployments land in: its
+// deadline and reporting sources (the whole-Environment PUT), and — each with
+// its own write, so that PUT can never reset them — its baseline protection,
+// its eligibility, and each Project's privilege grant. Org admins only. ---
+
+/** An org-level Environment. */
+export type OrgEnvironment = components["schemas"]["OrgEnvironmentDto"];
+/** A (PluginInstallation, vendor grouping) allowed to report into one. */
+export type EnvironmentDeploymentSource = components["schemas"]["EnvironmentDeploymentSourceDto"];
+/** The PUT body: the whole Environment, replaced. */
+export type PutOrgEnvironmentRequest = components["schemas"]["PutOrgEnvironmentRequest"];
+
+/** The caller may not read this org's Environments (403): reading needs Read
+ *  on the Org, as for the Deployment record. */
+export class OrgEnvironmentsForbiddenError extends Error {
+  constructor(readonly org: string) {
+    super(`no read access to ${org}'s environments`);
+    this.name = "OrgEnvironmentsForbiddenError";
+  }
+}
+
+/**
+ * The org's Environments, by name (`GET /v1/orgs/{org}/environments`).
+ *
+ * `null` when the server has no org-Environment store (a 404, answered once
+ * the caller is authorized) — "this server has no org Environments", not
+ * "none registered".
+ */
+export async function listOrgEnvironments(org: string): Promise<OrgEnvironment[] | null> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/environments", {
+    params: { path: { org } },
+  });
+  if (response.status === 404) return null;
+  if (response.status === 403) throw new OrgEnvironmentsForbiddenError(org);
+  if (error || !data) {
+    throw new Error(errorText(error) || "failed to load the org's environments");
+  }
+  return data;
+}
+
+/**
+ * Create or replace an Environment (`PUT /v1/orgs/{org}/environments/{env}`),
+ * org admins only. A full replace: send every field. The server's 400 (which
+ * rule broke) and 409 (which Environment already lists a source) are passed
+ * through verbatim — they are the answer to "why will this not save".
+ */
+export async function putOrgEnvironment(
+  org: string,
+  env: string,
+  body: PutOrgEnvironmentRequest,
+): Promise<OrgEnvironment> {
+  const { data, error, response } = await api.PUT("/v1/orgs/{org}/environments/{env}", {
+    params: { path: { org, env } },
+    body,
+  });
+  if (error || !data) {
+    throw new Error(errorText(error) || `could not save ${env} (${response.status})`);
+  }
+  return data;
+}
+
+/** Delete an Environment (`DELETE /v1/orgs/{org}/environments/{env}`), org
+ *  admins only. Refused (409) once it has Deployments. */
+export async function deleteOrgEnvironment(org: string, env: string): Promise<void> {
+  const { error, response } = await api.DELETE("/v1/orgs/{org}/environments/{env}", {
+    params: { path: { org, env } },
+  });
+  if (error) {
+    throw new Error(errorText(error) || `could not delete ${env} (${response.status})`);
+  }
+}
+
+/** The baseline PUT body. */
+export type PutProtectionRequest = components["schemas"]["PutEnvironmentProtectionRequest"];
+/** Which Projects may deploy into an Environment. */
+export type EnvironmentEligibility = components["schemas"]["EnvironmentEligibilityDto"];
+/** A Project's standing in one Environment: eligible, overlay, grant. */
+export type EnvironmentProject = components["schemas"]["EnvironmentProjectDto"];
+/** A Project's privileges in one Environment. */
+export type PrivilegeGrant = components["schemas"]["EnvironmentProjectPrivilegeGrantDto"];
+export type PutPrivilegeGrantRequest =
+  components["schemas"]["PutEnvironmentProjectPrivilegeGrantRequest"];
+/** One line of the migration's split report. */
+export type MigrationReportLine = components["schemas"]["EnvironmentMigrationReportDto"];
+
+/** Replace an Environment's baseline. Returns the Environment as stored. */
+export async function putEnvironmentProtection(
+  org: string,
+  env: string,
+  body: PutProtectionRequest,
+): Promise<OrgEnvironment> {
+  const res = await send(`${envPath(org, env)}/protection`, "PUT", body);
+  return (await res.json()) as OrgEnvironment;
+}
+
+/** Replace an Environment's eligibility. */
+export async function putEnvironmentEligibility(
+  org: string,
+  env: string,
+  body: EnvironmentEligibility,
+): Promise<EnvironmentEligibility> {
+  const res = await send(`${envPath(org, env)}/eligibility`, "PUT", body);
+  return (await res.json()) as EnvironmentEligibility;
+}
+
+/** Every Project holding an overlay or grant in an Environment. */
+export async function listEnvironmentProjects(
+  org: string,
+  env: string,
+): Promise<EnvironmentProject[]> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/environments/{env}/projects", {
+    params: { path: { org, env } },
+  });
+  if (error || !data) {
+    throw new Error(errorText(error) || `failed to list ${env}'s projects (${response.status})`);
+  }
+  return data;
+}
+
+/** Grant a Project privileges in an Environment (replaces any grant). */
+export async function putPrivilegeGrant(
+  org: string,
+  env: string,
+  project: string,
+  body: PutPrivilegeGrantRequest,
+): Promise<PrivilegeGrant> {
+  const res = await send(`${projectPath(org, env, project)}/privilege-grant`, "PUT", body);
+  return (await res.json()) as PrivilegeGrant;
+}
+
+/** Withdraw a Project's privilege grant. */
+export async function deletePrivilegeGrant(org: string, env: string, project: string): Promise<void> {
+  await send(`${projectPath(org, env, project)}/privilege-grant`, "DELETE");
+}
+
+/** The migration's split report. `null` when the caller may not read it
+ *  (403 — it needs Administer on the org) or the server has no governance
+ *  store (404): the panel then simply does not show. */
+export async function getMigrationReport(org: string): Promise<MigrationReportLine[] | null> {
+  const { data, response } = await api.GET("/v1/orgs/{org}/environment-migration-report", {
+    params: { path: { org } },
+  });
+  if (response.status === 403 || response.status === 404) return null;
+  if (!data) throw new Error(`failed to load the migration report (${response.status})`);
+  return data;
+}
+
+/** Mark one split-report line reviewed (the first acknowledgement stands). */
+export async function acknowledgeMigrationReport(
+  org: string,
+  env: string,
+): Promise<MigrationReportLine> {
+  const res = await send(
+    `/v1/orgs/${encodeURIComponent(org)}/environment-migration-report/${encodeURIComponent(env)}/acknowledge`,
+    "POST",
+  );
+  return (await res.json()) as MigrationReportLine;
+}
+
+// --- Plugins (ADR-0072, Deployments MMP d1) — an org's PluginInstallations:
+// approvals of one pinned digest of a first-party plugin, with a kill switch.
+// Every write's refusal text (403 third-party / 409 name taken or retired) is
+// passed through verbatim — it is the answer to "why will this not install". ---
+
+/** A plugin this Scarab can install (first-party only, today). */
+export type PluginCatalogEntry = components["schemas"]["PluginCatalogEntryDto"];
+/** An org's approval to run one pinned digest of a plugin. */
+export type PluginInstallation = components["schemas"]["PluginInstallationDto"];
+/** What an uninstall removed with it. */
+export type UninstalledPlugin = components["schemas"]["UninstalledPluginDto"];
+/** A grouping an installation reports on that no Environment lists. */
+export type UnmappedGrouping = components["schemas"]["UnmappedGroupingDto"];
+/** A DeploymentTarget a source reports into an Environment, with its owners. */
+export type DeploymentSourceTarget = components["schemas"]["DeploymentSourceTargetDto"];
+
+/** The installable plugins (`GET …/plugin-catalog`); `null` = this server
+ *  runs no plugins (404). */
+export async function listPluginCatalog(org: string): Promise<PluginCatalogEntry[] | null> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/plugin-catalog", {
+    params: { path: { org } },
+  });
+  if (response.status === 404) return null;
+  if (error || !data) throw new Error(errorText(error) || "failed to load the plugin catalog");
+  return data;
+}
+
+/** The org's installations (`GET …/plugins`); `null` = plugins not
+ *  configured on this server (404) — not "none installed". */
+export async function listPlugins(org: string): Promise<PluginInstallation[] | null> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/plugins", {
+    params: { path: { org } },
+  });
+  if (response.status === 404) return null;
+  if (error || !data) throw new Error(errorText(error) || "failed to load the org's plugins");
+  return data;
+}
+
+/** Install a first-party plugin pinned by digest (`POST …/plugins`). */
+export async function installPlugin(
+  org: string,
+  body: components["schemas"]["InstallPluginRequest"],
+): Promise<PluginInstallation> {
+  const { data, error, response } = await api.POST("/v1/orgs/{org}/plugins", {
+    params: { path: { org } },
+    body,
+  });
+  if (error || !data) {
+    throw new Error(errorText(error) || `could not install ${body.name} (${response.status})`);
+  }
+  return data;
+}
+
+/** Kill an installation at once (`POST …/plugins/{name}/kill`): its reports
+ *  and broker calls are refused from the next request on. */
+export async function killPlugin(org: string, name: string): Promise<PluginInstallation> {
+  const { data, error, response } = await api.POST("/v1/orgs/{org}/plugins/{name}/kill", {
+    params: { path: { org, name } },
+  });
+  if (error || !data) throw new Error(errorText(error) || `could not kill ${name} (${response.status})`);
+  return data;
+}
+
+/** Re-enable a killed installation (`POST …/plugins/{name}/enable`). */
+export async function enablePlugin(org: string, name: string): Promise<PluginInstallation> {
+  const { data, error, response } = await api.POST("/v1/orgs/{org}/plugins/{name}/enable", {
+    params: { path: { org, name } },
+  });
+  if (error || !data) throw new Error(errorText(error) || `could not enable ${name} (${response.status})`);
+  return data;
+}
+
+/** Uninstall (`DELETE …/plugins/{name}`). The name is retired for good, and
+ *  the Environment sources that named it are removed with it. */
+export async function uninstallPlugin(org: string, name: string): Promise<UninstalledPlugin> {
+  const { data, error, response } = await api.DELETE("/v1/orgs/{org}/plugins/{name}", {
+    params: { path: { org, name } },
+  });
+  if (error || !data) throw new Error(errorText(error) || `could not uninstall ${name} (${response.status})`);
+  return data;
+}
+
+/** One connection slot of an installation and what is bound to it — never
+ *  the credential (ADR-0072 §5). */
+export type PluginConnection = components["schemas"]["PluginConnectionDto"];
+
+/** An installation's connection slots, in manifest order
+ *  (`GET …/plugins/{name}/connections`). */
+export async function listPluginConnections(org: string, name: string): Promise<PluginConnection[]> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/plugins/{name}/connections", {
+    params: { path: { org, name } },
+  });
+  if (error || !data) {
+    throw new Error(errorText(error) || `failed to load ${name}'s connections (${response.status})`);
+  }
+  return data;
+}
+
+/** Bind a slot's destination and credential, replacing the previous binding
+ *  whole (`PUT …/connections/{slot}`). The credential is write-only. */
+export async function putPluginConnection(
+  org: string,
+  name: string,
+  slot: string,
+  body: components["schemas"]["PutPluginConnectionRequest"],
+): Promise<PluginConnection> {
+  const { data, error, response } = await api.PUT("/v1/orgs/{org}/plugins/{name}/connections/{slot}", {
+    params: { path: { org, name, slot } },
+    body,
+  });
+  if (error || !data) {
+    throw new Error(errorText(error) || `could not bind ${slot} (${response.status})`);
+  }
+  return data;
+}
+
+/** Unbind a slot and delete its credential (`DELETE …/connections/{slot}`). */
+export async function deletePluginConnection(org: string, name: string, slot: string): Promise<void> {
+  const { error, response } = await api.DELETE("/v1/orgs/{org}/plugins/{name}/connections/{slot}", {
+    params: { path: { org, name, slot } },
+  });
+  if (error || !response.ok) {
+    throw new Error(errorText(error) || `could not unbind ${slot} (${response.status})`);
+  }
+}
+
+/** A list endpoint's page size. The server pages by key (the next page
+ *  starts after the last row), so a page shorter than this is the last. */
+const PAGE_LIMIT = 500;
+/** A bound on how many pages one read follows — far past any real org (an
+ *  installation is capped at 10,000 targets), never an endless loop. */
+const MAX_PAGES = 50;
+
+/** The groupings `name` reports on that no Environment lists — reports for
+ *  them are dropped (`GET …/plugins/{name}/unmapped-groupings`, every page). */
+export async function listUnmappedGroupings(org: string, name: string): Promise<UnmappedGrouping[]> {
+  const all: UnmappedGrouping[] = [];
+  let after: string | undefined;
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const { data, error, response } = await api.GET("/v1/orgs/{org}/plugins/{name}/unmapped-groupings", {
+      params: { path: { org, name }, query: { after, limit: PAGE_LIMIT } },
+    });
+    if (error || !data) {
+      throw new Error(errorText(error) || `failed to load ${name}'s unmapped groupings (${response.status})`);
+    }
+    all.push(...data);
+    if (data.length < PAGE_LIMIT) break;
+    after = data[data.length - 1]!.vendor_grouping;
+  }
+  return all;
+}
+
+/** An Environment's reported DeploymentTargets and their owners, every page.
+ *  `null` when the caller cannot read them (403) or plugins are not
+ *  configured (404) — the board then shows no owners rather than an error. */
+export async function listDeploymentTargets(
+  org: string,
+  env: string,
+): Promise<DeploymentSourceTarget[] | null> {
+  const all: DeploymentSourceTarget[] = [];
+  let after: { source: string; id: string } | undefined;
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const { data, error, response } = await api.GET(
+      "/v1/orgs/{org}/environments/{env}/deployment-targets",
+      {
+        params: {
+          path: { org, env },
+          query: { after_source: after?.source, after_target_id: after?.id, limit: PAGE_LIMIT },
+        },
+      },
+    );
+    if (response.status === 403 || response.status === 404) return null;
+    if (error || !data) throw new Error(errorText(error) || `failed to load ${env}'s targets`);
+    all.push(...data);
+    if (data.length < PAGE_LIMIT) break;
+    const last = data[data.length - 1]!;
+    after = { source: last.source, id: last.target_id };
+  }
+  return all;
 }
 
 /** Fetch a run's status + steps (dogfoods `GET /v1/runs/{id}`). */
@@ -647,6 +1114,10 @@ export async function dispatchRun(
 function errorText(error: unknown): string {
   if (error == null) return "";
   if (typeof error === "string") return error;
+  // A JSON error (`{code, message}` — a step-up refusal the human cancelled, a
+  // WebAuthn ceremony error) reads as its message, not as a JSON dump.
+  const message = (error as { message?: unknown }).message;
+  if (typeof message === "string" && message) return message;
   try {
     return JSON.stringify(error);
   } catch {
@@ -926,6 +1397,22 @@ export async function approveGate(id: string, step: string): Promise<GateApprova
   return data as unknown as GateApproval;
 }
 
+/** Reject a waiting gate — fail it with a reason (`POST …/gates/{step}/reject`,
+ * ADR-0070 §9). Any gate kind (`manual`/`timer`/`external`/`deployment`) that is
+ * pending and reached. The gate's Attempt fails with the reason and who
+ * rejected it, its dependents are skipped, and the run ends `failed`. The
+ * server's own words come back on failure: 400 for a missing/over-long reason,
+ * 409 for a gate that is not rejectable, not pending, or not reached yet. */
+export async function rejectGate(id: string, step: string, reason: string): Promise<void> {
+  const { error, response } = await api.POST("/v1/runs/{id}/gates/{step}/reject", {
+    params: { path: { id, step } },
+    body: { reason },
+  });
+  if (error !== undefined || !response.ok) {
+    throw new Error(errorText(error) || `could not reject gate ${step} (${response.status})`);
+  }
+}
+
 /** Whether a run status is terminal (no further updates will stream). */
 export function isTerminal(status: string): boolean {
   return status === "succeeded" || status === "failed" || status === "cancelled";
@@ -1185,4 +1672,204 @@ export async function setSecretCellSilenced(
       "DELETE",
     );
   }
+}
+
+// --- Step-up confirmation (ADR-0073): passkeys, confirmations, the event log,
+// and the StepUpConfirmationRequest a machine raises for its human. ---
+//
+// Every governed call here goes through `api`, so a refusal is handled by the
+// step-up middleware above like any other: removing a passkey or adding a
+// second one is always-ask, and the dialog appears in the middle of the call.
+
+export type MeSecurity = components["schemas"]["MeSecurityResponse"];
+export type Passkey = components["schemas"]["PasskeyDto"];
+export type SecurityEvent = components["schemas"]["SecurityEventDto"];
+export type SecurityEvents = components["schemas"]["SecurityEventsResponse"];
+export type OrgSecuritySummary = components["schemas"]["OrgSecuritySummary"];
+export type StepUpRequestInfo = components["schemas"]["StepUpRequestDto"];
+export type StepUpRequestResult = components["schemas"]["StepUpRequestResultDto"];
+export type PasskeyReset = components["schemas"]["PasskeyResetDto"];
+export type WebauthnChallenge = components["schemas"]["WebauthnChallengeDto"];
+
+/**
+ * A `403 fresh_login_required`: a FIRST passkey needs a browser login from
+ * the last 5 minutes. Carries where to log in again (a login that lands back
+ * on enrollment).
+ */
+export class FreshLoginRequiredError extends Error {
+  constructor(
+    message: string,
+    readonly loginUrl: string,
+  ) {
+    super(message);
+    this.name = "FreshLoginRequiredError";
+  }
+}
+
+/** A refusal with its HTTP status, for the pages that word each status
+ * differently (the confirm page's 404/409/410). */
+export class HttpError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly body: string,
+  ) {
+    super(message);
+    this.name = "HttpError";
+  }
+}
+
+/** `error` as openapi-fetch hands it back (parsed JSON, or the raw text), as
+ * the text it was. */
+function bodyText(error: unknown): string {
+  if (error == null) return "";
+  return typeof error === "string" ? error : JSON.stringify(error);
+}
+
+/** My passkeys and step-up state (`GET /v1/me/security`). */
+export async function getMySecurity(): Promise<MeSecurity> {
+  const { data, error } = await api.GET("/v1/me/security");
+  if (error || !data) throw new Error(errorText(error) || "failed to load your security settings");
+  return data;
+}
+
+/** My own security events (`GET /v1/me/security/events`), newest first. */
+export async function listMySecurityEvents(before?: number): Promise<SecurityEvents> {
+  const { data, error } = await api.GET("/v1/me/security/events", {
+    params: { query: { before, limit: 50 } },
+  });
+  if (error || !data) throw new Error(errorText(error) || "failed to load your security events");
+  return data;
+}
+
+/**
+ * Begin enrolling a passkey (`POST /v1/me/passkeys/registration/options`).
+ * A first passkey needs a fresh login (→ `FreshLoginRequiredError`); a later
+ * one is always-ask, which the middleware confirms in-line.
+ */
+export async function beginPasskeyRegistration(label?: string): Promise<WebauthnChallenge> {
+  const { data, error, response } = await api.POST("/v1/me/passkeys/registration/options", {
+    body: { label: label ?? null },
+  });
+  if (error || !data) {
+    const e = error as { code?: unknown; message?: unknown; login_url?: unknown } | undefined;
+    if (e && e.code === "fresh_login_required" && typeof e.login_url === "string") {
+      throw new FreshLoginRequiredError(
+        typeof e.message === "string" ? e.message : "Log in again to enroll your first passkey.",
+        e.login_url,
+      );
+    }
+    if (response.status === 404) throw new Error("Step-up is off on this server: passkeys are not in use.");
+    throw new Error(errorText(error) || `could not start enrolling (${response.status})`);
+  }
+  return data;
+}
+
+/** Finish enrolling (`POST /v1/me/passkeys/registration`) with the browser's
+ * `RegistrationResponseJSON`. */
+export async function finishPasskeyRegistration(
+  challengeId: string,
+  credential: Record<string, unknown>,
+): Promise<Passkey> {
+  const { data, error, response } = await api.POST("/v1/me/passkeys/registration", {
+    body: { challenge_id: challengeId, credential: credential as Record<string, never> },
+  });
+  if (error || !data) throw new Error(errorText(error) || `could not enroll the passkey (${response.status})`);
+  return data;
+}
+
+/** Remove one of my passkeys (`DELETE /v1/me/passkeys/{id}`) — always-ask. */
+export async function removePasskey(id: string): Promise<void> {
+  const { error, response } = await api.DELETE("/v1/me/passkeys/{id}", {
+    params: { path: { id } },
+  });
+  if (error) throw new Error(errorText(error) || `could not remove the passkey (${response.status})`);
+}
+
+/** Answer a step-up challenge (`POST /v1/me/step-up`) with the browser's
+ * `AuthenticationResponseJSON`. The caller then retries what was refused. */
+export async function confirmStepUp(
+  challengeId: string,
+  credential: Record<string, unknown>,
+): Promise<components["schemas"]["StepUpConfirmResponse"]> {
+  const { data, error, response } = await api.POST("/v1/me/step-up", {
+    body: { challenge_id: challengeId, credential: credential as Record<string, never> },
+  });
+  if (error || !data) throw new Error(errorText(error) || `the confirmation failed (${response.status})`);
+  return data;
+}
+
+/** An Org's step-up posture (`GET /v1/orgs/{org}/security/summary`); `null`
+ * when the caller may not see it (not an admin there) or the server has no
+ * such route — the banner simply does not show. */
+export async function getOrgSecuritySummary(org: string): Promise<OrgSecuritySummary | null> {
+  const { data, response } = await api.GET("/v1/orgs/{org}/security/summary", {
+    params: { path: { org } },
+  });
+  if (!response.ok || !data) return null;
+  return data;
+}
+
+/** An Org's security event log (`GET /v1/orgs/{org}/security/events`). */
+export async function listOrgSecurityEvents(
+  org: string,
+  opts: { kind?: string; before?: number; limit?: number } = {},
+): Promise<SecurityEvents> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/security/events", {
+    params: {
+      path: { org },
+      query: { kind: opts.kind || undefined, before: opts.before, limit: opts.limit ?? 50 },
+    },
+  });
+  if (error || !data) throw new Error(errorText(error) || `failed to load security events (${response.status})`);
+  return data;
+}
+
+/** An Owner resets a member's passkeys
+ * (`POST /v1/orgs/{org}/members/{subject}/passkeys/reset`) — always-ask. */
+export async function resetMemberPasskeys(org: string, subject: string): Promise<PasskeyReset> {
+  const { data, error, response } = await api.POST("/v1/orgs/{org}/members/{subject}/passkeys/reset", {
+    params: { path: { org, subject } },
+  });
+  if (error || !data) throw new Error(errorText(error) || `could not reset passkeys (${response.status})`);
+  return data;
+}
+
+/** A StepUpConfirmationRequest (`GET /v1/step-up/requests/{id}`). */
+export async function getStepUpRequest(id: string): Promise<StepUpRequestInfo> {
+  const { data, error, response } = await api.GET("/v1/step-up/requests/{id}", {
+    params: { path: { id } },
+  });
+  if (error || !data) {
+    throw new HttpError(errorText(error) || "failed to load the request", response.status, bodyText(error));
+  }
+  return data;
+}
+
+/** Begin confirming a request (`POST /v1/step-up/requests/{id}/options`). */
+export async function beginRequestConfirmation(id: string): Promise<WebauthnChallenge> {
+  const { data, error, response } = await api.POST("/v1/step-up/requests/{id}/options", {
+    params: { path: { id } },
+  });
+  if (error || !data) {
+    throw new HttpError(errorText(error) || "could not start confirming", response.status, bodyText(error));
+  }
+  return data;
+}
+
+/** Confirm a request (`POST /v1/step-up/requests/{id}/confirm`): it runs
+ * once, and its result body is returned this once and never stored. */
+export async function confirmStepUpRequest(
+  id: string,
+  challengeId: string,
+  credential: Record<string, unknown>,
+): Promise<StepUpRequestResult> {
+  const { data, error, response } = await api.POST("/v1/step-up/requests/{id}/confirm", {
+    params: { path: { id } },
+    body: { challenge_id: challengeId, credential: credential as Record<string, never> },
+  });
+  if (error || !data) {
+    throw new HttpError(errorText(error) || "the confirmation failed", response.status, bodyText(error));
+  }
+  return data;
 }

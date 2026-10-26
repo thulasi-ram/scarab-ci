@@ -45,9 +45,11 @@ pub const MAX_DELIVERY_ATTEMPTS: u32 = 10;
 /// and the grace keeps the two from racing in the normal case.
 const TIMEOUT_BACKSTOP_GRACE_MS: i64 = 60_000;
 use crate::{
-    ports::WorkspaceSnapshots, Attempt, AttemptId, AttemptOutcome, Clock, ConcurrencyPolicy, Db,
-    DbError, EventKind, EventPayload, ExecError, Executor, FailureKind, OutboxMessage, RunId,
-    RunStatus, StepId, StepRun, StepSpec, StepStatus, Timestamp, TransitionError, EVENT_VERSION,
+    ports::{DeploymentGateWait, DeploymentGates, WorkspaceSnapshots},
+    Attempt, AttemptFrontier, AttemptId, AttemptOutcome, AttemptStamp, Clock, ConcurrencyPolicy,
+    Db, DbError, EventKind, EventPayload, ExecError, Executor, FailureKind, GateResolution,
+    OutboxMessage, RunId, RunStatus, StepId, StepRun, StepSpec, StepStatus, Timestamp,
+    TransitionError, EVENT_VERSION,
 };
 
 /// Outbox `kind` for "launch this step".
@@ -59,33 +61,94 @@ pub const LAUNCH_STEP: &str = "launch_step";
 /// same transition enqueues exactly one post.
 pub const RUN_STATUS_CHANGED: &str = "run_status_changed";
 
-/// Outbox message kind: tear down a cancelled run's in-flight executions
-/// (ADR-0054). The durable Cancelled state is written by
-/// [`cancel_run_request`]; the driver (which owns the executor) processes
-/// this message and deletes the Pods — API replicas never touch the cluster.
+/// Outbox message kind: tear down a cancelled Run's **shared services**
+/// (ADR-0058) — Run-scoped units that are not steps, so no Attempt names
+/// them. Written by the Run's own `→ Cancelled` commit ([`cancel_run_request`],
+/// [`Scheduler::cancel_run`]); the driver (which owns the executor)
+/// processes it — API replicas never touch the cluster. It **never touches a
+/// step's unit**: every in-flight Attempt a cancel stops is named by its own
+/// [`CANCEL_ATTEMPT`] (red team R2-E1: a Run-scoped intent that tore down
+/// "every step's latest attempt" at drain time killed a rerun's live `a2`).
 pub const CANCEL_RUN: &str = "cancel_run";
+
+/// Outbox message kind: tear down the units of named Attempts a cancel
+/// stopped (ADR-0054). Each step's `→ Cancelled` commit writes one naming
+/// exactly the in-flight Attempt it stamped `Cancelled`, keyed by that
+/// Attempt (`cancel:{run}:{step}/{attempt}`), so a cancel that spans several
+/// commits, a cancel after a rerun, and a cancel by an old binary each write
+/// their own and none can be retired by, or retire, another's (red team
+/// R2-E1/E2b/E3/E8). Also written for an Attempt whose unit was created after
+/// it stopped being wanted (red team A2). Payload: [`AttemptTeardown`].
+pub const CANCEL_ATTEMPT: &str = "cancel_attempt";
 
 /// Outbox message kind: tear down the Pods of in-flight steps a Rerun just
 /// superseded (ADR-0056 amendment). [`rerun_step`] re-arms an in-flight
 /// descendant Running→Pending; its old attempt is now *superseded*, and its
 /// input is being replaced, so it can never honestly finish — without this its
 /// Pod runs on as an orphan (fencing keeps the late verdict harmless, but the
-/// compute is wasted). Unlike [`CANCEL_RUN`] this is **scoped to named
+/// compute is wasted). Like [`CANCEL_ATTEMPT`] it is **scoped to named
 /// (step, attempt) handles** — the run itself stays alive. Processed by the
-/// driver (which owns the executor).
+/// driver (which owns the executor). Payload: [`AttemptTeardown`].
 pub const SUPERSEDE_TEARDOWN: &str = "supersede_teardown";
 
-/// Payload of a [`SUPERSEDE_TEARDOWN`] message: the specific attempts to cancel.
+/// Payload of an attempt-scoped teardown ([`CANCEL_ATTEMPT`],
+/// [`SUPERSEDE_TEARDOWN`]): the specific attempts whose units to tear down.
+/// The drain tears down exactly these — never whatever a step's latest
+/// attempt happens to be when it runs.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct SupersedeTeardown {
-    pub attempts: Vec<SupersededAttempt>,
+pub struct AttemptTeardown {
+    pub attempts: Vec<TeardownAttempt>,
 }
 
-/// One superseded in-flight attempt whose Pod the driver should cancel.
+/// One attempt whose unit the driver should tear down.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct SupersededAttempt {
+pub struct TeardownAttempt {
     pub step: String,
     pub attempt: String,
+}
+
+/// What one pass of a teardown message over its units reached (git-bug
+/// f22056d; review correctness LOW `cancel_until_gone`). A genuine failure
+/// outranks a unit still terminating, which outranks every unit gone.
+enum TeardownPass {
+    /// Every unit is gone: the message is retired.
+    Gone,
+    /// Every cancel was delivered, but the unit behind this handle is still
+    /// terminating (a k8s Pod in its grace): retried, not a failure.
+    StillTerminating(String),
+    /// A named attempt has no unit recorded yet, but its launch intent (this
+    /// key) is still pending — a unit may be being created right now:
+    /// retried, not a failure.
+    Launching(String),
+    /// A cancel (or a shared-service teardown) the backend refused.
+    Failed(ExecError),
+}
+
+impl TeardownPass {
+    /// Fold one unit's [`Scheduler::cancel_until_gone`] answer in.
+    fn absorb(&mut self, unit: Result<bool, ExecError>, handle: &ExecHandle) {
+        match unit {
+            Ok(true) => {}
+            Ok(false) => {
+                if matches!(self, Self::Gone) {
+                    *self = Self::StillTerminating(handle.0.clone());
+                }
+            }
+            Err(e) => *self = Self::Failed(e),
+        }
+    }
+
+    /// Fold in an attempt whose launch (intent `launch`) is still in flight.
+    fn launching(&mut self, launch: &str) {
+        if matches!(self, Self::Gone) {
+            *self = Self::Launching(launch.to_string());
+        }
+    }
+}
+
+/// The idempotency key of an attempt's [`LAUNCH_STEP`] intent.
+fn launch_key(run: &RunId, step: &StepId, attempt: &AttemptId) -> String {
+    format!("launch:{}/{}/{}", run.0, step.0, attempt.0)
 }
 
 /// The payload of a [`LAUNCH_STEP`] outbox message — the step's fence.
@@ -144,6 +207,22 @@ pub enum RerunError {
     /// governed environment, a false deployment record). Mapped to 409.
     #[error("gate {step:?} is not awaiting approval (is {status:?})")]
     GateNotPending { step: StepId, status: StepStatus },
+    /// Gate approval, release or reject refused: the gate is `Pending` but not
+    /// yet **reached** — a need has not Succeeded, so no wait is open to act
+    /// on. Releasing it early would run its dependents before (or beside) the
+    /// work it guards. Mapped to 409.
+    #[error("gate {step:?} is not reached yet: a step it needs has not succeeded")]
+    GateNotReached { step: StepId },
+    /// Gate reject refused: the step is not a `manual`, `timer` or `external`
+    /// gate (a plain step, or a gate kind that decides its own verdict).
+    /// Mapped to 409.
+    #[error("step {0:?} is not a gate that can be rejected")]
+    NotARejectableGate(StepId),
+    /// Gate release refused: the step is a `deployment` gate, which core
+    /// resolves from the Deployment record (ADR-0070 §8) — no approval or
+    /// token may pass it. A reject is still allowed. Mapped to 409.
+    #[error("gate {0:?} is a deployment gate: core resolves it from the Deployment record")]
+    NotAReleasableGate(StepId),
 }
 
 /// One expired input on a rerun: the Workspace Snapshot `consumer` would have
@@ -796,45 +875,34 @@ async fn rearm_invalidation_set(
 
     // Re-arm each invalidated step (terminal or in-flight) to Pending. A peer
     // that already moved it is a benign Conflict. An in-flight step re-armed
-    // here has its running attempt SUPERSEDED (ADR-0056 amendment): its Pod is
-    // collected for teardown so it does not orphan, its attempt is stamped
-    // `Superseded` (never a green `failed:false`), and an `AttemptSuperseded`
-    // event records the fact.
-    let mut superseded: Vec<SupersededAttempt> = Vec::new();
+    // here has its running attempt SUPERSEDED (ADR-0056 amendment): its Pod's
+    // teardown intent, its attempt stamped `Superseded` (never a green
+    // `failed:false`), and an `AttemptSuperseded` event all land in the same
+    // commit as the re-arm and its `StepTransitioned` (git-bug 586187a,
+    // [`commit_rearm`]).
     for s in steps {
-        if invalid.contains(&s.step) && s.status != StepStatus::Pending {
-            match db
-                .record_step_transition(run, &s.step, s.status, StepStatus::Pending)
-                .await
-            {
-                Ok(()) => {
-                    let now = clock.now().await;
-                    db.append_event(&EventKind {
-                        version: EVENT_VERSION,
-                        run: run.clone(),
-                        kind: EventPayload::StepTransitioned {
-                            step: s.step.clone(),
-                            from: s.status,
-                            to: StepStatus::Pending,
-                        },
-                        at: now,
-                    })
-                    .await?;
-                    if s.status == StepStatus::Running {
-                        if let Some(a) = s.attempts.last() {
-                            mark_superseded(
-                                db,
-                                clock,
-                                run,
-                                &s.step,
-                                &a.id,
-                                by.as_deref(),
-                                &mut superseded,
-                            )
-                            .await?;
-                        }
-                    }
+        // A gate still WAITING (Pending, open Attempt) is not re-armed by the
+        // status loop below — it is already Pending — but its wait's premise
+        // is gone (its upstream, or the gate itself, is being re-run). Close
+        // the open Attempt so the next wait is a new Attempt with a fresh
+        // clock and its own approvals (slice b, criterion 3). A gate has no
+        // Pod, so nothing joins the teardown intent.
+        if invalid.contains(&s.step) && s.status == StepStatus::Pending {
+            if let Some(a) = open_gate_attempt(s) {
+                let closed =
+                    supersede_gate_attempt(db, clock, run, &s.step, &a.id, by.as_deref()).await?;
+                if !closed {
+                    // The wait ended under us — the gate resolved between the
+                    // snapshot and now (or a cancel closed it). A resolved gate
+                    // is terminal, so re-arm it from its LIVE status, exactly
+                    // like a step that raced past the snapshot.
+                    rearm_raced_step(db, clock, run, target, &s.step, by.as_deref()).await?;
                 }
+            }
+        }
+        if invalid.contains(&s.step) && s.status != StepStatus::Pending {
+            match commit_rearm(db, clock, run, target, s, by.as_deref()).await {
+                Ok(()) => {}
                 // TOCTOU (orphan fix): the optimistic `from` came from a stale
                 // snapshot. A descendant may have raced Pending/Ready→Running
                 // between the snapshot and now, so the guarded UPDATE matched 0
@@ -843,84 +911,138 @@ async fn rearm_invalidation_set(
                 // Re-read the live row and re-arm from its ACTUAL status,
                 // capturing an in-flight attempt for teardown.
                 Err(DbError::Conflict) => {
-                    rearm_raced_step(db, clock, run, &s.step, by.as_deref(), &mut superseded)
-                        .await?;
+                    rearm_raced_step(db, clock, run, target, &s.step, by.as_deref()).await?;
                 }
                 Err(e) => return Err(e.into()),
             }
         }
     }
-
-    // One teardown intent for every superseded in-flight attempt. The driver
-    // (which owns the executor) SIGTERMs their Pods; the run itself stays alive.
-    if !superseded.is_empty() {
-        let now = clock.now().await;
-        // The idempotency key must be distinct per distinct supersession
-        // (collision fix): the old `supersede:{run}:{tick}` collided for two
-        // reruns landing in the same clock tick, deduping one teardown away and
-        // orphaning its Pod. Key on the rerun target plus the specific
-        // superseded (step, attempt) handles, so distinct supersessions never
-        // collapse while an identical re-enqueue still dedups exactly-once.
-        let mut disc: Vec<String> = superseded
-            .iter()
-            .map(|a| format!("{}/{}", a.step, a.attempt))
-            .collect();
-        disc.sort();
-        db.enqueue_outbox(&OutboxMessage {
-            id: crate::OutboxId(0),
-            run: run.clone(),
-            kind: SUPERSEDE_TEARDOWN.to_string(),
-            payload: serde_json::to_value(SupersedeTeardown {
-                attempts: superseded,
-            })
-            .unwrap_or(serde_json::Value::Null),
-            idempotency_key: format!("supersede:{}:{}:{}", run.0, target.0, disc.join(",")),
-            at: now,
-        })
-        .await?;
-    }
     Ok(())
 }
 
-/// Record one superseded in-flight attempt (ADR-0056 amendment): enqueue it for
-/// Pod teardown, stamp its attempt row `Superseded` (so the abandoned attempt
-/// never renders as a green `failed:false`), and append an [`AttemptSuperseded`]
-/// event — promoting the previously-invisible supersession into a recorded fact.
-async fn mark_superseded(
+/// The [`SUPERSEDE_TEARDOWN`] intent for one superseded attempt. The driver
+/// (which owns the executor) SIGTERMs its Pod; the run itself stays alive.
+fn supersede_teardown_intent(
+    run: &RunId,
+    target: &StepId,
+    superseded: TeardownAttempt,
+    now: Timestamp,
+) -> OutboxMessage {
+    // The idempotency key must be distinct per distinct supersession
+    // (collision fix): the old `supersede:{run}:{tick}` collided for two
+    // reruns landing in the same clock tick, deduping one teardown away and
+    // orphaning its Pod. An attempt is superseded at most once (its re-arm
+    // CAS out of `Running` wins once), so keying on the specific (step,
+    // attempt) never collapses two supersessions, while an identical
+    // re-enqueue still dedups exactly-once.
+    let key = format!(
+        "supersede:{}:{}:{}/{}",
+        run.0, target.0, superseded.step, superseded.attempt
+    );
+    OutboxMessage {
+        id: crate::OutboxId(0),
+        run: run.clone(),
+        kind: SUPERSEDE_TEARDOWN.to_string(),
+        payload: serde_json::to_value(AttemptTeardown {
+            attempts: vec![superseded],
+        })
+        .unwrap_or(serde_json::Value::Null),
+        idempotency_key: key,
+        at: now,
+    }
+}
+
+/// Re-arm `s` from the status it was read in to `Pending`, as ONE commit
+/// (git-bug 586187a): the guarded CAS, its `StepTransitioned`, and — when it
+/// was `Running` on an in-flight attempt — that attempt stamped `Superseded`
+/// with an [`AttemptSuperseded`](EventPayload::AttemptSuperseded) fact
+/// (ADR-0056 amendment) and its [`SUPERSEDE_TEARDOWN`] intent. `Conflict`
+/// when `s` is no longer in that status, or (a `Running` step) no longer on
+/// the attempt `s` read ([`AttemptFrontier`], red team R2-E3) — nothing
+/// written.
+///
+/// The intent rides this commit (red team A6), not one before it: it is what
+/// keeps a superseded deploy Step holding its DeploymentTarget until its Pod
+/// is gone (`Db::deployment_requesting_runs`, git-bug f22056d), so the Step
+/// may not leave `Running` without it (review MED2); and written on its own
+/// ahead of a re-arm that then failed, it killed the still-current attempt
+/// and that self-inflicted `Lost` settled as a real failure.
+async fn commit_rearm(
     db: &dyn Db,
     clock: &dyn Clock,
     run: &RunId,
-    step: &StepId,
-    attempt: &AttemptId,
+    target: &StepId,
+    s: &StepRun,
     by: Option<&str>,
-    superseded: &mut Vec<SupersededAttempt>,
-) -> Result<(), RerunError> {
-    superseded.push(SupersededAttempt {
-        step: step.0.clone(),
-        attempt: attempt.0.clone(),
-    });
-    db.set_attempt_outcome(run, step, attempt, AttemptOutcome::Superseded)
-        .await?;
+) -> Result<(), DbError> {
     let now = clock.now().await;
-    db.append_event(&EventKind {
-        version: EVENT_VERSION,
-        run: run.clone(),
-        kind: EventPayload::AttemptSuperseded {
-            step: step.clone(),
-            attempt: attempt.clone(),
-            by: by.map(str::to_string),
+    let mut events = vec![event(
+        run,
+        EventPayload::StepTransitioned {
+            step: s.step.clone(),
+            from: s.status,
+            to: StepStatus::Pending,
         },
-        at: now,
-    })
-    .await?;
-    Ok(())
+        now,
+    )];
+    let superseded = AttemptStamp::Outcome(AttemptOutcome::Superseded);
+    let mut stamp = None;
+    let mut intent = Vec::new();
+    let mut frontier = AttemptFrontier::Any;
+    if s.status == StepStatus::Running {
+        frontier = AttemptFrontier::Is(s.attempts.last().map(|a| &a.id));
+        if let Some(a) = in_flight_attempt(s) {
+            stamp = Some((&a.id, &superseded));
+            intent.push(supersede_teardown_intent(
+                run,
+                target,
+                TeardownAttempt {
+                    step: s.step.0.clone(),
+                    attempt: a.id.0.clone(),
+                },
+                now,
+            ));
+            events.push(event(
+                run,
+                EventPayload::AttemptSuperseded {
+                    step: s.step.clone(),
+                    attempt: a.id.clone(),
+                    by: by.map(str::to_string),
+                },
+                now,
+            ));
+        }
+    }
+    db.commit_step_transition(
+        run,
+        &s.step,
+        s.status,
+        StepStatus::Pending,
+        frontier,
+        stamp,
+        &events,
+        &intent,
+    )
+    .await
+}
+
+/// The attempt of a `Running` step whose unit may be alive: its latest
+/// attempt, if that one is still `Running` (not stamped `Cancelled`,
+/// `Superseded`, or a verdict). A step just claimed `Running` whose new
+/// attempt is not minted yet has none — its latest attempt is an older,
+/// finished one, which a cancel or a supersession must neither restamp (that
+/// would overwrite its recorded verdict) nor tear down again.
+fn in_flight_attempt(s: &StepRun) -> Option<&Attempt> {
+    s.attempts
+        .last()
+        .filter(|a| a.outcome == AttemptOutcome::Running)
 }
 
 /// Recover a re-arm that hit [`DbError::Conflict`] because the invalidation-set
 /// snapshot was stale (the TOCTOU orphan fix). Re-read the live row and re-arm
-/// from its ACTUAL status; if the step raced into `Running` (an in-flight Pod
-/// the snapshot missed) capture it via [`mark_superseded`] so it is torn down
-/// rather than orphaned. A step a peer already re-armed to `Pending`, or one now
+/// from its ACTUAL status; a step that raced into `Running` (an in-flight Pod
+/// the snapshot missed) is re-armed with its teardown in the same commit
+/// ([`commit_rearm`]), so it is torn down rather than orphaned. A step a peer already re-armed to `Pending`, or one now
 /// terminal with no live attempt, is genuinely benign. Bounded re-read/retry:
 /// each competing transition moves the step toward `Pending` or a terminal sink,
 /// so this converges in a couple of passes — the bound only guards a
@@ -929,9 +1051,9 @@ async fn rearm_raced_step(
     db: &dyn Db,
     clock: &dyn Clock,
     run: &RunId,
+    target: &StepId,
     step: &StepId,
     by: Option<&str>,
-    superseded: &mut Vec<SupersededAttempt>,
 ) -> Result<(), RerunError> {
     for _ in 0..8 {
         let live = db.steps_of_run(run).await?;
@@ -941,30 +1063,8 @@ async fn rearm_raced_step(
         if s.status == StepStatus::Pending {
             return Ok(());
         }
-        match db
-            .record_step_transition(run, step, s.status, StepStatus::Pending)
-            .await
-        {
-            Ok(()) => {
-                let now = clock.now().await;
-                db.append_event(&EventKind {
-                    version: EVENT_VERSION,
-                    run: run.clone(),
-                    kind: EventPayload::StepTransitioned {
-                        step: step.clone(),
-                        from: s.status,
-                        to: StepStatus::Pending,
-                    },
-                    at: now,
-                })
-                .await?;
-                if s.status == StepStatus::Running {
-                    if let Some(a) = s.attempts.last() {
-                        mark_superseded(db, clock, run, step, &a.id, by, superseded).await?;
-                    }
-                }
-                return Ok(());
-            }
+        match commit_rearm(db, clock, run, target, s, by).await {
+            Ok(()) => return Ok(()),
             Err(DbError::Conflict) => continue,
             Err(e) => return Err(e.into()),
         }
@@ -975,8 +1075,19 @@ async fn rearm_raced_step(
 /// Release a gate `step`: mark it Succeeded and resume its suspended run so the
 /// DAG continues (ADR-0008, 0011). Needs only the [`Db`] + [`Clock`] ports (no
 /// executor), so the API role calls it directly. Exactly-once — a second
-/// release finds the step already terminal (a no-op Conflict) and the run
-/// already Running, so it neither double-completes the gate nor double-resumes.
+/// release finds the step already terminal (a no-op) and resumes nothing.
+///
+/// The gate must be **reached** — every need Succeeded — or this is
+/// [`RerunError::GateNotReached`]: releasing it earlier would run its
+/// dependents before, or beside, the work it guards. Its open wait is closed
+/// `Succeeded` and the verdict journalled ([`resolve_gate`]). A reached gate
+/// with **no** open Attempt — a run suspended before gate Attempts existed, or
+/// one the scheduler has not visited since its needs finished — still
+/// releases: the Attempt is minted already closed, its `started_at` derived
+/// exactly as [`wait_began_at`] would have.
+///
+/// The run reopens `Suspended → Running` only when something is runnable
+/// after the release; one that leaves only other gate waits stays suspended.
 pub async fn release_gate(
     db: &dyn Db,
     clock: &dyn Clock,
@@ -984,38 +1095,559 @@ pub async fn release_gate(
     step: &StepId,
 ) -> Result<(), RerunError> {
     // The target must be a known gate step.
-    let is_gate = db
-        .steps_of_run(run)
-        .await?
-        .iter()
-        .any(|s| &s.step == step && s.is_gate());
-    if !is_gate {
+    let steps = db.steps_of_run(run).await?;
+    let Some(gate) = steps.iter().find(|s| &s.step == step && s.is_gate()) else {
         return Err(RerunError::StepNotFound(step.clone()));
+    };
+    // A DeploymentGate passes only on the Deployment record's say-so
+    // (ADR-0070 §8): defence in depth behind the API's own kind checks.
+    if gate.gate_kind.as_deref() == Some("deployment") {
+        return Err(RerunError::NotAReleasableGate(step.clone()));
+    }
+    if gate.status == StepStatus::Pending && !gate_reached(gate, &steps) {
+        return Err(RerunError::GateNotReached { step: step.clone() });
     }
 
-    match db
-        .record_step_transition(run, step, StepStatus::Pending, StepStatus::Succeeded)
-        .await
+    let verdict = GateVerdict {
+        passed: true,
+        reason: "released".to_string(),
+        expired: false,
+        deployment: None,
+    };
+    // Already resolved (or never gated) — exactly-once: do not resume again.
+    if !resolve_gate(db, clock, run, gate, &verdict, None, None).await? {
+        return Ok(());
+    }
+    reopen_if_runnable(db, clock, run).await
+}
+
+/// Reject gate `step`: fail its wait **with a reason** (slice b, criterion 3;
+/// ADR-0070 §9 "a rejected approval asks again"). Returns whether this call
+/// resolved it (`false`: a racing resolver got there first).
+///
+/// Any gate kind can be rejected ([`RerunError::NotARejectableGate`] for a
+/// plain step), a `deployment` gate included: a reject only ever stops a
+/// deploy — the same as cancelling the Run, which any writer can — so a human
+/// may give up on a Deployment that is taking too long without waiting out
+/// its deadline. (What a DeploymentGate refuses is a *release*: only the
+/// Deployment record passes it.) Only while it waits: `Pending`
+/// ([`RerunError::GateNotPending`]) and reached
+/// ([`RerunError::GateNotReached`]).
+///
+/// The wait's Attempt fails with [`FailureKind::Gate`] and the detail
+/// `rejected by {by}: {reason}`; `GateResolved { passed: false, reason, by }`
+/// and `StepTransitioned → Failed` are journalled. The gate's dependents are
+/// Skipped on the next pass and the Run settles `Failed` — a verdict, never
+/// `DeadLettered`, never auto-retried. The wait's approvals stay in the log;
+/// a [`retry_step`] of the gate opens a new wait with a fresh clock and none
+/// of them.
+pub async fn reject_gate(
+    db: &dyn Db,
+    clock: &dyn Clock,
+    run: &RunId,
+    step: &StepId,
+    by: &str,
+    reason: &str,
+) -> Result<bool, RerunError> {
+    let steps = db.steps_of_run(run).await?;
+    let Some(gate) = steps.iter().find(|s| &s.step == step) else {
+        return Err(RerunError::StepNotFound(step.clone()));
+    };
+    if !matches!(
+        gate.gate_kind.as_deref(),
+        Some("manual") | Some("timer") | Some("external") | Some("deployment")
+    ) {
+        return Err(RerunError::NotARejectableGate(step.clone()));
+    }
+    if gate.status != StepStatus::Pending {
+        return Err(RerunError::GateNotPending {
+            step: step.clone(),
+            status: gate.status,
+        });
+    }
+    if !gate_reached(gate, &steps) {
+        return Err(RerunError::GateNotReached { step: step.clone() });
+    }
+    let verdict = GateVerdict {
+        passed: false,
+        reason: reason.to_string(),
+        expired: false,
+        deployment: None,
+    };
+    let resolved = resolve_gate(db, clock, run, gate, &verdict, Some(by.to_string()), None).await?;
+    if resolved {
+        reopen_if_runnable(db, clock, run).await?;
+    }
+    Ok(resolved)
+}
+
+/// Reopen a `Suspended` run once something besides gate waits is outstanding
+/// (a gate just resolved). A run that still has only gate waits stays
+/// suspended — it bills no budget — and the next tick reopens it if needed.
+async fn reopen_if_runnable(db: &dyn Db, clock: &dyn Clock, run: &RunId) -> Result<(), RerunError> {
+    if db.run_status(run).await? == Some(RunStatus::Suspended)
+        && !only_gate_waits_outstanding(&db.steps_of_run(run).await?)
     {
-        Ok(()) => {
-            let now = clock.now().await;
-            db.append_event(&EventKind {
-                version: EVENT_VERSION,
-                run: run.clone(),
-                kind: EventPayload::GateReleased { step: step.clone() },
-                at: now,
-            })
-            .await?;
-        }
-        // Already released (or never gated) — exactly-once: do not resume again.
-        Err(DbError::Conflict) => return Ok(()),
-        Err(e) => return Err(e.into()),
-    }
-
-    if db.run_status(run).await? == Some(RunStatus::Suspended) {
         reopen(db, clock, run, RunStatus::Suspended, RunStatus::Running).await?;
     }
     Ok(())
+}
+
+/// Is gate `gate` **reached** — has every one of its needs Succeeded?
+fn gate_reached(gate: &StepRun, steps: &[StepRun]) -> bool {
+    gate.needs.iter().all(|n| {
+        steps
+            .iter()
+            .any(|s| &s.step == n && s.status == StepStatus::Succeeded)
+    })
+}
+
+/// How one gate wait resolved (slice b, criterion 3).
+struct GateVerdict {
+    /// `true` → the gate step goes `Succeeded`; `false` → `Failed` with
+    /// [`FailureKind::Gate`].
+    passed: bool,
+    /// The human line journalled on `GateResolved` (and, on a failure, the
+    /// Attempt's `failure_detail`).
+    reason: String,
+    /// The failure is a `gate_expires_after` deadline — also emit the legacy
+    /// `GateExpired` fact.
+    expired: bool,
+    /// A DeploymentGate's verdict: the Deployment it waited on.
+    deployment: Option<u64>,
+}
+
+/// A gate's settings that live only in the run's IR (see
+/// `Scheduler::gate_settings`).
+#[derive(Debug, Clone, Default)]
+struct GateSettings {
+    /// `gate_expires_after`, seconds.
+    expires_after_secs: Option<i64>,
+    /// A DeploymentGate's `deployment.step`: the step whose request it waits on.
+    deployment_step: Option<String>,
+}
+
+/// The gate's open wait: its last Attempt while that Attempt is still
+/// `Running`. A gate's step status stays `Pending` while it waits, so the open
+/// Attempt — not the status — is what distinguishes "waiting" from "not yet
+/// reached". `None` for a non-gate step.
+fn open_gate_attempt(step: &StepRun) -> Option<&Attempt> {
+    if !step.is_gate() {
+        return None;
+    }
+    step.attempts
+        .last()
+        .filter(|a| a.outcome == AttemptOutcome::Running)
+}
+
+/// Is `kind` a **re-arm** of gate `step` — the boundary between two wait
+/// episodes? The gate itself went back to `Pending` (a Retry/Rerun of a
+/// resolved gate), its still-open Attempt was superseded (a Rerun of an
+/// upstream, or of the gate, while it waited), or a Rerun named it in its
+/// invalidation set — which also covers a gate that was reached but had no
+/// Attempt yet, so neither of the other two was written for it.
+fn is_gate_rearm(kind: &EventPayload, step: &StepId) -> bool {
+    match kind {
+        EventPayload::StepTransitioned {
+            step: s,
+            to: StepStatus::Pending,
+            ..
+        } => s == step,
+        EventPayload::AttemptSuperseded { step: s, .. } => s == step,
+        EventPayload::RunRerunRequested { invalidated, .. } => invalidated.contains(step),
+        _ => false,
+    }
+}
+
+/// Whether DeploymentGate `gate`'s open wait `current` **waits afresh**
+/// (ADR-0070 §8): an earlier wait of the gate already resolved against the
+/// request `requester` stands on now. Judged by event *position*, never by
+/// time. The request now standing was recorded by `requester`'s latest
+/// **executed** success — its `Running → Succeeded`, in the same commit as
+/// the request — so a `GateResolved` of `gate` after that success was decided
+/// while this same request stood: this wait is a Retry (or a Rerun of the gate
+/// alone) and waits afresh from its own start. None after it: the first wait
+/// on this request — including the one after a Rerun of the deploy Step made
+/// a new request — which opens at the start of the deploy Step's succeeding
+/// Attempt ([`DeploymentGateWait::window_floor`]).
+///
+/// A re-arm of `requester` is not a boundary, and neither is a
+/// skip-if-unchanged (`Pending → Succeeded`, no Attempt): neither records a
+/// request, so the old one still stands. A log with no executed success of
+/// `requester` (a hand-seeded run, or a finish whose event was never
+/// written) treats any earlier verdict of the gate as one on this request: a
+/// floor only ever narrows the window (INV-DEP-13), so the doubt never makes a
+/// gate fail sooner.
+pub fn deployment_gate_waits_afresh(
+    events: &[EventKind],
+    gate: &StepId,
+    current: &AttemptId,
+    requester: &StepId,
+) -> bool {
+    let from = events
+        .iter()
+        .rposition(|e| {
+            matches!(
+                &e.kind,
+                EventPayload::StepTransitioned {
+                    step,
+                    from: StepStatus::Running,
+                    to: StepStatus::Succeeded,
+                } if step == requester
+            )
+        })
+        .map_or(0, |i| i + 1);
+    events[from..].iter().any(|e| {
+        matches!(
+            &e.kind,
+            EventPayload::GateResolved { step, attempt, .. } if step == gate && attempt != current
+        )
+    })
+}
+
+/// The [`DeploymentGateWait`] of DeploymentGate `gate`'s open Attempt
+/// `attempt`, on the request deploy Step `requester` recorded — the ONE
+/// computation both the scheduler asks the oracle with and the run view shows
+/// the gate's deadline from (git-bug `ec84c5d`):
+///
+/// - `started_at`: the gate Attempt's frozen start;
+/// - `afresh`: [`deployment_gate_waits_afresh`] over `events` (the run's
+///   journal) — only when `gate` has an Attempt other than `attempt`, since
+///   only an earlier Attempt can have resolved; a caller may pass `&[]` for a
+///   gate with one Attempt;
+/// - `deploy_attempt_started_at`: the start of `requester`'s latest
+///   `Succeeded` Attempt in `steps` — the Attempt that recorded the request,
+///   where a first wait opens (and its stall clock starts) — not the deploy
+///   Step's first Attempt, whose start is the request's effective time.
+pub fn deployment_gate_wait(
+    gate: &StepRun,
+    attempt: &Attempt,
+    requester: &StepId,
+    steps: &[StepRun],
+    events: &[EventKind],
+) -> DeploymentGateWait {
+    let afresh = gate.attempts.iter().any(|a| a.id != attempt.id)
+        && deployment_gate_waits_afresh(events, &gate.step, &attempt.id, requester);
+    let deploy_attempt_started_at = steps
+        .iter()
+        .find(|s| &s.step == requester)
+        .and_then(|s| {
+            s.attempts
+                .iter()
+                .rev()
+                .find(|a| a.outcome == AttemptOutcome::Succeeded)
+        })
+        .map(|a| a.started_at);
+    DeploymentGateWait {
+        started_at: attempt.started_at,
+        afresh,
+        deploy_attempt_started_at,
+    }
+}
+
+/// The Attempt whose start is a succeeding deploy Step's DeploymentRequest
+/// **effective time** (ADR-0070 §2, §7; git-bug `2b5d9d9`): the step's
+/// **first** Attempt in its current Take — the first `AttemptStarted` of
+/// `step` after the latest `RunRerunRequested` that re-armed it (its
+/// `invalidated` names `step`), or since the Run began if none did. Judged by
+/// event *position*, never by time.
+///
+/// Takes are a derived lens (ADR-0056: no Take is stored; the UI splits the
+/// log at every `RunRerunRequested`), so "the current Take" here means
+/// "since the step's latest re-arm by a Rerun": an automatic retry and an
+/// operator **Retry** (`StepRetryRequested`, not a Take boundary) stay in it,
+/// so a change pushed by `a1` before it died is explained by the request `a2`
+/// records. A Rerun that re-arms the step opens a new window, so its request
+/// gets its own, later effective time and never launders a change made
+/// between the two. A Rerun of an unrelated step (one that does not re-arm
+/// this one) is no boundary for it: the step's own execution went on
+/// untouched.
+///
+/// `None` when the log holds no such `AttemptStarted` (a hand-seeded run, or
+/// an Attempt row whose event a crash lost); the caller then falls back to the
+/// succeeding Attempt's own start, the later and so the conservative time (a
+/// claim rather than an explanation).
+pub fn deployment_request_first_attempt(events: &[EventKind], step: &StepId) -> Option<AttemptId> {
+    let from = events
+        .iter()
+        .rposition(|e| {
+            matches!(
+                &e.kind,
+                EventPayload::RunRerunRequested { invalidated, .. } if invalidated.contains(step)
+            )
+        })
+        .map_or(0, |i| i + 1);
+    events[from..].iter().find_map(|e| match &e.kind {
+        EventPayload::AttemptStarted { step: s, attempt } if s == step => Some(attempt.clone()),
+        _ => None,
+    })
+}
+
+/// The distinct principals who approved gate `step` **in its current wait**,
+/// in approval order (ADR-0037; ADR-0070 §9 "a rejected approval asks
+/// again"). Only `GateApproved` events appended after the gate's latest re-arm
+/// count — by event *position*, never by time, so two facts in the same
+/// millisecond still order correctly. An approval given to a wait that expired
+/// and was retried does not carry into the retry.
+///
+/// The single definition both the engine's dedup and the server's quorum read.
+pub fn gate_approvers(events: &[EventKind], step: &StepId) -> Vec<String> {
+    let from = events
+        .iter()
+        .rposition(|e| is_gate_rearm(&e.kind, step))
+        .map_or(0, |i| i + 1);
+    let mut seen: Vec<String> = Vec::new();
+    for e in &events[from..] {
+        if let EventPayload::GateApproved { step: s, by } = &e.kind {
+            if s == step && !seen.contains(by) {
+                seen.push(by.clone());
+            }
+        }
+    }
+    seen
+}
+
+/// When gate `gate`'s current wait began — the per-gate clock start (slice b,
+/// criterion 3), never later than `now`: the later of
+///
+/// - its needs' finishes, taken **per need**: each need's latest finish
+///   (`StepTransitioned → Succeeded`, `GateReleased`, or
+///   `GateResolved { passed: true }`) since that need's own latest re-arm to
+///   `Pending`. A need with no such finish in the log — it is Succeeded in
+///   the rows, but its finish event was never written (a crash between a CAS
+///   and its journal) — counts as `now`, so the clock can only ever start
+///   late, never early: a wait is never shortened;
+/// - the latest **re-arm** of the gate itself (see [`is_gate_rearm`]), so a
+///   Retry/Rerun starts a fresh clock;
+/// - for a gate with **no** needs only, the run's first `→ Running`.
+///
+/// A pure function of the event log, computed once when the gate's Attempt
+/// is minted and then frozen on `Attempt::started_at` — so it survives a
+/// crash and is identical on every re-tick. `now` when the log holds none of
+/// these (a hand-seeded run).
+pub fn wait_began_at(events: &[EventKind], gate: &StepRun, now: Timestamp) -> Timestamp {
+    let mut first_running: Option<i64> = None;
+    let mut rearmed: Option<i64> = None;
+    let mut finished: HashMap<&StepId, Option<i64>> =
+        gate.needs.iter().map(|n| (n, None)).collect();
+    for e in events {
+        let at = e.at.0;
+        match &e.kind {
+            EventPayload::RunTransitioned {
+                to: RunStatus::Running,
+                ..
+            } => {
+                first_running.get_or_insert(at);
+            }
+            EventPayload::StepTransitioned {
+                step,
+                to: StepStatus::Succeeded,
+                ..
+            }
+            | EventPayload::GateReleased { step }
+            | EventPayload::GateResolved {
+                step, passed: true, ..
+            } => {
+                if let Some(f) = finished.get_mut(step) {
+                    *f = Some(f.map_or(at, |l| l.max(at)));
+                }
+            }
+            // A need re-armed: its earlier finish belongs to an earlier episode.
+            EventPayload::StepTransitioned {
+                step,
+                to: StepStatus::Pending,
+                ..
+            } => {
+                if let Some(f) = finished.get_mut(step) {
+                    *f = None;
+                }
+            }
+            _ => {}
+        }
+        if is_gate_rearm(&e.kind, &gate.step) {
+            rearmed = Some(rearmed.map_or(at, |l| l.max(at)));
+        }
+    }
+    let needs_finished = if gate.needs.is_empty() {
+        first_running
+    } else if finished.values().any(Option::is_none) {
+        Some(now.0)
+    } else {
+        finished.values().flatten().copied().max()
+    };
+    let start = match (needs_finished, rearmed) {
+        (Some(f), Some(r)) => f.max(r),
+        (Some(t), None) | (None, Some(t)) => t,
+        (None, None) => now.0,
+    };
+    Timestamp(start.min(now.0))
+}
+
+/// Resolve gate `gate` per `verdict` — the ONE place a gate wait ends, shared
+/// by the scheduler's per-gate evaluation (`fence = Some(open attempt)`) and
+/// the API's [`release_gate`] / [`reject_gate`] (`fence = None`). A thin
+/// wrapper over [`Db::resolve_gate_wait`], which does all of it in one
+/// transaction: close the wait's Attempt (or, unfenced with none open, mint
+/// one already closed), CAS the gate `Pending → Succeeded|Failed`, and journal
+/// [`gate_resolution_events`](crate::gate_resolution_events). A racing
+/// resolver, a superseded or cancelled fence, or a gate no longer `Pending`
+/// writes nothing.
+///
+/// Returns whether this call resolved it.
+async fn resolve_gate(
+    db: &dyn Db,
+    clock: &dyn Clock,
+    run: &RunId,
+    gate: &StepRun,
+    verdict: &GateVerdict,
+    by: Option<String>,
+    fence: Option<AttemptId>,
+) -> Result<bool, DbError> {
+    let now = clock.now().await;
+    // Only an unfenced resolve can mint a closed Attempt; it gets the clock
+    // start the scheduler would have frozen on the wait.
+    let legacy_started_at = match fence {
+        Some(_) => now,
+        None => wait_began_at(&db.events(run).await?, gate, now),
+    };
+    let res = GateResolution {
+        passed: verdict.passed,
+        reason: verdict.reason.clone(),
+        expired: verdict.expired,
+        by,
+        deployment: verdict.deployment,
+        fence,
+        legacy_started_at,
+        at: now,
+    };
+    Ok(db.resolve_gate_wait(run, &gate.step, &res).await?.is_some())
+}
+
+/// Close a gate's still-open wait as `Superseded` (no Pod to tear down — a
+/// gate launches none). Used when the wait's premise is gone: an upstream (or
+/// the gate itself) was re-armed while it waited. The `AttemptSuperseded`
+/// event is a re-arm boundary ([`is_gate_rearm`]), so the next wait is a new
+/// Attempt with a fresh clock and its own approvals. It is appended in the
+/// same transaction, and only when this call closed the wait: `false` means
+/// the wait had already ended (a concurrent resolve or cancel).
+async fn supersede_gate_attempt(
+    db: &dyn Db,
+    clock: &dyn Clock,
+    run: &RunId,
+    step: &StepId,
+    attempt: &AttemptId,
+    by: Option<&str>,
+) -> Result<bool, DbError> {
+    let now = clock.now().await;
+    let event = EventKind {
+        version: EVENT_VERSION,
+        run: run.clone(),
+        kind: EventPayload::AttemptSuperseded {
+            step: step.clone(),
+            attempt: attempt.clone(),
+            by: by.map(str::to_string),
+        },
+        at: now,
+    };
+    db.close_running_attempt(run, step, attempt, AttemptOutcome::Superseded, Some(&event))
+        .await
+}
+
+/// Stamp a cancelled gate's open wait `Cancelled`, so a gate cancelled while
+/// waiting never shows a forever-`running` Attempt. A no-op for a non-gate or
+/// a gate with no open wait. Call it AFTER the step's cancel CAS: it reads the
+/// Attempts fresh, so a wait minted concurrently (before the CAS — the mint
+/// holds the step row) is seen and closed, and one attempted after it finds
+/// the gate `Cancelled` and mints nothing.
+async fn cancel_open_gate_attempt(db: &dyn Db, run: &RunId, step: &StepRun) -> Result<(), DbError> {
+    if !step.is_gate() {
+        return Ok(());
+    }
+    let attempts = db.attempts_of_step(run, &step.step).await?;
+    if let Some(a) = attempts
+        .last()
+        .filter(|a| a.outcome == AttemptOutcome::Running)
+    {
+        db.close_running_attempt(run, &step.step, &a.id, AttemptOutcome::Cancelled, None)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Suspend predicate (slice b, criterion 3) with no concurrency holds known —
+/// see [`only_waits_outstanding`]. Used off the scheduler pass (an API gate
+/// resolution reopening a run), where not knowing a hold only ever reopens a
+/// run the next pass re-suspends: never a wrong suspend.
+fn only_gate_waits_outstanding(steps: &[StepRun]) -> bool {
+    only_waits_outstanding(steps, &std::collections::HashSet::new())
+}
+
+/// Suspend predicate (slice b, criteria 3 and 4): the run may suspend iff at
+/// least one step is **waiting** — a gate that is Pending with every need
+/// Succeeded, or a deploy Step in `concurrency_held` (Pending, needs met, held
+/// by per-DeploymentTarget concurrency this pass) — no step is
+/// `Ready`/`Running`, and every other non-terminal step is transitively behind
+/// a waiting one. A step held for any other reason — a `uses:` readiness hold,
+/// a Pending step a dead upstream will Skip next pass — keeps the run
+/// `Running`: only a gate wait or a concurrency hold is a near-zero-cost
+/// durable wait (each is re-evaluated every pass, Suspended or not).
+fn only_waits_outstanding(
+    steps: &[StepRun],
+    concurrency_held: &std::collections::HashSet<StepId>,
+) -> bool {
+    let by_id: HashMap<&StepId, &StepRun> = steps.iter().map(|s| (&s.step, s)).collect();
+    let succeeded = |id: &StepId| by_id.get(id).map(|s| s.status) == Some(StepStatus::Succeeded);
+    let waiting: std::collections::HashSet<&StepId> = steps
+        .iter()
+        .filter(|s| {
+            s.status == StepStatus::Pending
+                && s.needs.iter().all(succeeded)
+                && (s.is_gate() || concurrency_held.contains(&s.step))
+        })
+        .map(|s| &s.step)
+        .collect();
+    if waiting.is_empty() {
+        return false;
+    }
+    let mut memo: HashMap<&StepId, bool> = HashMap::new();
+    for s in steps {
+        if s.status.is_terminal() || waiting.contains(&s.step) {
+            continue;
+        }
+        if s.status != StepStatus::Pending {
+            return false; // Ready or Running: real work is in flight.
+        }
+        if !behind_waiting_gate(&s.step, &by_id, &waiting, &mut memo) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Is `id` transitively behind a waiting gate — some need is one, or is a
+/// non-terminal step that itself is? Memoised; a (never-valid) cycle reads as
+/// "not behind", which keeps the run Running rather than wrongly suspending.
+fn behind_waiting_gate<'a>(
+    id: &'a StepId,
+    by_id: &HashMap<&'a StepId, &'a StepRun>,
+    waiting: &std::collections::HashSet<&'a StepId>,
+    memo: &mut HashMap<&'a StepId, bool>,
+) -> bool {
+    if let Some(&b) = memo.get(id) {
+        return b;
+    }
+    memo.insert(id, false);
+    let Some(step) = by_id.get(id).copied() else {
+        return false;
+    };
+    let behind = step.needs.iter().any(|n| {
+        waiting.contains(n)
+            || by_id.get(n).is_some_and(|ns| {
+                !ns.status.is_terminal() && behind_waiting_gate(&ns.step, by_id, waiting, memo)
+            })
+    });
+    memo.insert(id, behind);
+    behind
 }
 
 /// Record a single approval against a `manual` gate `step` by principal `by`
@@ -1057,14 +1689,20 @@ pub async fn record_gate_approval(
             status: gate.status,
         });
     }
+    // ... and is reached: an approval counts toward a wait, and there is no
+    // wait until every need has Succeeded.
+    if !gate_reached(gate, &steps) {
+        return Err(RerunError::GateNotReached { step: step.clone() });
+    }
 
-    // Best-effort dedup: skip if this principal already approved this gate. The
-    // authoritative dedup is distinct-subject counting at read time, so a race
-    // here is harmless — it can only append a duplicate the reader collapses.
-    let already = db.events(run).await?.into_iter().any(|e| {
-        matches!(e.kind, EventPayload::GateApproved { step: s, by: b }
-            if &s == step && b == by)
-    });
+    // Best-effort dedup: skip if this principal already approved this gate's
+    // CURRENT wait (an approval of an earlier, expired-then-retried wait does
+    // not count — [`gate_approvers`]). The authoritative dedup is
+    // distinct-subject counting at read time, so a race here is harmless — it
+    // can only append a duplicate the reader collapses.
+    let already = gate_approvers(&db.events(run).await?, step)
+        .iter()
+        .any(|b| b == by);
     if already {
         return Ok(());
     }
@@ -1083,13 +1721,12 @@ pub async fn record_gate_approval(
     Ok(())
 }
 
-/// Move a run `from -> to` and append the transition event (used to reopen a
-/// settled run on restart).
 /// Cancel a run from the API (ADR-0054): drive its non-terminal steps and
 /// the run itself to `Cancelled` durably, release its concurrency slot, and
-/// enqueue a [`CANCEL_RUN`] outbox message so the driver tears down any
-/// in-flight Pods (SIGTERM + grace — the executor's `cancel`). Returns
-/// `Ok(false)` when the run is unknown or already terminal (nothing to do).
+/// leave the driver an attempt-scoped [`CANCEL_ATTEMPT`] per in-flight unit
+/// (SIGTERM + grace — the executor's `cancel`) and a [`CANCEL_RUN`] for the
+/// Run's shared services. Returns `Ok(false)` when the run is unknown or
+/// already terminal (nothing to do).
 pub async fn cancel_run_request(
     db: &dyn Db,
     clock: &dyn Clock,
@@ -1103,6 +1740,18 @@ pub async fn cancel_run_request(
         return Ok(false);
     }
     let now = clock.now().await;
+    // Every teardown intent — processed by the driver, which owns the
+    // executor — rides IN THE SAME COMMIT as the transition it guards (red
+    // team A3), and names exactly what that transition stops (red team
+    // R2-E1): each Step's `→ Cancelled` carries the [`CANCEL_ATTEMPT`] of the
+    // in-flight Attempt it stamps `Cancelled` ([`cancel_step`]), the Run's
+    // `→ Cancelled` the [`CANCEL_RUN`] of its shared services. An intent is
+    // what keeps a cancelled deploy Step holding its DeploymentTarget until
+    // its unit is gone (`Db::deployment_requesting_runs`, git-bug f22056d),
+    // so no Step may go `Cancelled` without its own (review MED1); nor may
+    // one exist without its transition (a cancel that then failed must not
+    // tear down a live attempt of a Run that was never cancelled).
+    //
     // Attribution (ADR-0054): record the operator's cancel request FIRST, so an
     // operator cancel carries the acting principal and is distinguishable in the
     // durable log from the system's concurrency auto-cancel (which drives the
@@ -1115,89 +1764,189 @@ pub async fn cancel_run_request(
     })
     .await?;
     for step in db.steps_of_run(run).await? {
-        if step.status.is_terminal() {
-            continue;
-        }
-        match db
-            .record_step_transition(run, &step.step, step.status, StepStatus::Cancelled)
-            .await
-        {
-            Ok(()) => {
-                db.append_event(&EventKind {
-                    version: EVENT_VERSION,
-                    run: run.clone(),
-                    kind: EventPayload::StepTransitioned {
-                        step: step.step.clone(),
-                        from: step.status,
-                        to: StepStatus::Cancelled,
-                    },
-                    at: now,
-                })
-                .await?;
-                // Stamp the in-flight attempt `Cancelled` (mirrors the superseded
-                // fix). Only a `Running` step has a live Pod / frontier attempt;
-                // cancelling tears that Pod down, and the backend then reports the
-                // dying Pod `Lost`. Without a recorded terminal outcome that
-                // self-inflicted `Lost` would settle onto the attempt row as
-                // `failed`/`lost` and render an intentionally-cancelled attempt as
-                // a failure. No extra event: the `StepTransitioned`→Cancelled above
-                // and the `RunTransitioned`→Cancelled below already record the
-                // boundary in the immutable log.
-                if step.status == StepStatus::Running {
-                    if let Some(a) = step.attempts.last() {
-                        db.set_attempt_outcome(run, &step.step, &a.id, AttemptOutcome::Cancelled)
-                            .await?;
-                    }
-                }
-            }
-            Err(DbError::Conflict) => {}
-            Err(e) => return Err(e.into()),
-        }
+        cancel_step(db, run, step, now).await?;
     }
-    match db
-        .record_transition(run, current, RunStatus::Cancelled)
-        .await
+    match commit_run_transition(
+        db,
+        run,
+        current,
+        RunStatus::Cancelled,
+        now,
+        true,
+        &[cancel_services_intent(db, run, now).await?],
+    )
+    .await
     {
-        Ok(()) => {
-            db.append_event(&EventKind {
-                version: EVENT_VERSION,
-                run: run.clone(),
-                kind: EventPayload::RunTransitioned {
-                    from: current,
-                    to: RunStatus::Cancelled,
-                },
-                at: now,
-            })
-            .await?;
-            db.enqueue_outbox(&OutboxMessage {
-                id: crate::OutboxId(0),
-                run: run.clone(),
-                kind: RUN_STATUS_CHANGED.to_string(),
-                payload: serde_json::json!({ "to": RunStatus::Cancelled }),
-                idempotency_key: format!("status:{}:Cancelled", run.0),
-                at: now,
-            })
-            .await?;
-        }
-        Err(DbError::Conflict) => {}
+        Ok(()) | Err(DbError::Conflict) => {}
         Err(e) => return Err(e.into()),
     }
-    // The teardown intent — processed by the driver, which owns the executor.
-    db.enqueue_outbox(&OutboxMessage {
-        id: crate::OutboxId(0),
-        run: run.clone(),
-        kind: CANCEL_RUN.to_string(),
-        payload: serde_json::Value::Null,
-        idempotency_key: format!("cancel:{}", run.0),
-        at: now,
-    })
-    .await?;
     if let Some((group, _)) = db.run_concurrency(run).await? {
         db.release_slot(&group, run).await?;
     }
     Ok(true)
 }
 
+/// The [`CANCEL_ATTEMPT`] intent for one attempt of `step` whose unit must
+/// go: the driver tears down exactly that attempt's unit, until it is gone.
+///
+/// Keyed by the attempt: an attempt is stamped `Cancelled` at most once (its
+/// step leaves `Running` with that commit, and a rerun mints a new attempt),
+/// so no two cancels share a key — not the several commits of one cancel
+/// (red team R2-E2b: one shared key retired by a drain between them made a
+/// later step's insert a no-op), not a cancel after a rerun (R2-E1/E3), not
+/// a cancel by a binary that never bumped the reopen generation (R2-E8).
+fn cancel_attempt_intent(
+    run: &RunId,
+    step: &StepId,
+    attempt: &AttemptId,
+    now: Timestamp,
+) -> OutboxMessage {
+    OutboxMessage {
+        id: crate::OutboxId(0),
+        run: run.clone(),
+        kind: CANCEL_ATTEMPT.to_string(),
+        payload: serde_json::to_value(AttemptTeardown {
+            attempts: vec![TeardownAttempt {
+                step: step.0.clone(),
+                attempt: attempt.0.clone(),
+            }],
+        })
+        .unwrap_or(serde_json::Value::Null),
+        idempotency_key: format!("cancel:{}:{}/{}", run.0, step.0, attempt.0),
+        at: now,
+    }
+}
+
+/// The [`CANCEL_RUN`] intent of a Run's `→ Cancelled` commit: tear down its
+/// shared services (ADR-0058), which no Attempt names. It names no step
+/// unit and the drain touches none.
+///
+/// It names the newest service Take the cancel stops (`through_take`, git-bug
+/// 8335544), the services twin of an attempt-scoped intent: a cancel whose
+/// services teardown is still pending when the Run is rerun must not tear
+/// down the rerun's fresh Take — the drain spares every later Take while the
+/// Run is live again.
+///
+/// Its key needs no determinism — it rides the Run's status CAS, which one
+/// writer wins, so it lands exactly once per cancel — but it must be unique
+/// per cancel: a deterministic per-run (or per-generation) key collided with
+/// an earlier cancel's dispatched row and silently wrote nothing (red team
+/// A1, R2-E8). A per-call random nonce never does.
+async fn cancel_services_intent(
+    db: &dyn Db,
+    run: &RunId,
+    now: Timestamp,
+) -> Result<OutboxMessage, DbError> {
+    let through_take = Scheduler::current_service_take(&db.run_services(run).await?);
+    Ok(cancel_services_intent_through(run, through_take, now))
+}
+
+fn cancel_services_intent_through(run: &RunId, through_take: i64, now: Timestamp) -> OutboxMessage {
+    use std::hash::{BuildHasher, Hasher};
+    // `RandomState` is seeded randomly per process and advanced per
+    // instance: a dependency-free nonce.
+    let mut nonce = std::collections::hash_map::RandomState::new().build_hasher();
+    nonce.write_i64(now.0);
+    OutboxMessage {
+        id: crate::OutboxId(0),
+        run: run.clone(),
+        kind: CANCEL_RUN.to_string(),
+        payload: serde_json::json!({ "services": true, "through_take": through_take }),
+        idempotency_key: format!("cancel:{}:services:{:016x}", run.0, nonce.finish()),
+        at: now,
+    }
+}
+
+/// Drive one step of a Run being cancelled to `Cancelled`, in ONE commit
+/// with its in-flight attempt stamped `Cancelled` and that attempt's
+/// [`CANCEL_ATTEMPT`] (git-bug 586187a). A step already terminal is left
+/// alone.
+///
+/// Only a `Running` step has a live Pod / frontier attempt; cancelling tears
+/// that Pod down, and the backend then reports the dying Pod `Lost`. Without
+/// a recorded terminal outcome that self-inflicted `Lost` would settle onto
+/// the attempt row as `failed`/`lost` and render an intentionally-cancelled
+/// attempt as a failure. No extra event: the `StepTransitioned`→Cancelled and
+/// the Run's `RunTransitioned`→Cancelled record the boundary in the immutable
+/// log.
+///
+/// The CAS also requires the `Running` step still to be on the attempt this
+/// read saw ([`AttemptFrontier`], red team R2-E3): status alone is ABA-blind
+/// — a step cancelled, rerun and claimed again between the read and the
+/// commit is `Running` once more, on a NEW attempt this cancel would leave
+/// running, unstamped and owned by nothing.
+///
+/// A CAS that conflicts is re-read and retried from the step's LIVE status
+/// and attempt until the step is terminal (red team A5): a step claimed
+/// between the snapshot and the CAS (`Pending`/`Ready` → `Running`) was
+/// skipped before, left `Running` inside a `Cancelled` Run — half-cancelled
+/// limbo, its Pod alive and nothing holding its DeploymentTarget. Each
+/// competing write moves the step forward toward a terminal sink, so this
+/// converges in a couple of passes; the bound only guards a pathological
+/// write storm.
+async fn cancel_step(
+    db: &dyn Db,
+    run: &RunId,
+    mut step: StepRun,
+    now: Timestamp,
+) -> Result<(), DbError> {
+    for _ in 0..8 {
+        if step.status.is_terminal() {
+            return Ok(());
+        }
+        let cancelled = AttemptStamp::Outcome(AttemptOutcome::Cancelled);
+        let (frontier, live) = match step.status {
+            StepStatus::Running => (
+                AttemptFrontier::Is(step.attempts.last().map(|a| &a.id)),
+                in_flight_attempt(&step),
+            ),
+            _ => (AttemptFrontier::Any, None),
+        };
+        let intent: Vec<OutboxMessage> = live
+            .map(|a| cancel_attempt_intent(run, &step.step, &a.id, now))
+            .into_iter()
+            .collect();
+        let transitioned = event(
+            run,
+            EventPayload::StepTransitioned {
+                step: step.step.clone(),
+                from: step.status,
+                to: StepStatus::Cancelled,
+            },
+            now,
+        );
+        match db
+            .commit_step_transition(
+                run,
+                &step.step,
+                step.status,
+                StepStatus::Cancelled,
+                frontier,
+                live.map(|a| (&a.id, &cancelled)),
+                std::slice::from_ref(&transitioned),
+                &intent,
+            )
+            .await
+        {
+            Ok(()) => {
+                // A gate cancelled mid-wait: its open Attempt is cancelled too.
+                return cancel_open_gate_attempt(db, run, &step).await;
+            }
+            Err(DbError::Conflict) => {
+                let live = db.steps_of_run(run).await?;
+                match live.into_iter().find(|s| s.step == step.step) {
+                    Some(s) => step = s,
+                    None => return Ok(()),
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Move a run `from -> to` with its transition event (used to reopen a
+/// settled run on restart).
 async fn reopen(
     db: &dyn Db,
     clock: &dyn Clock,
@@ -1205,21 +1954,71 @@ async fn reopen(
     from: RunStatus,
     to: RunStatus,
 ) -> Result<(), RerunError> {
-    match db.record_transition(run, from, to).await {
-        Ok(()) => {
-            let now = clock.now().await;
-            db.append_event(&EventKind {
-                version: EVENT_VERSION,
-                run: run.clone(),
-                kind: EventPayload::RunTransitioned { from, to },
-                at: now,
-            })
-            .await?;
-            Ok(())
-        }
-        Err(DbError::Conflict) => Ok(()),
+    let now = clock.now().await;
+    // A reopen out of a terminal status tells the forge the run is going
+    // again (red team A7): left at the settled run's verdict, a required
+    // check read green — or red — for the whole rerun. Suspended → Running
+    // (a gate released) is not news to the forge: both are `pending`.
+    let notify = from.is_terminal();
+    match commit_run_transition(db, run, from, to, now, notify, &[]).await {
+        Ok(()) | Err(DbError::Conflict) => Ok(()),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Move `run` `from → to` with its `RunTransitioned` — and, when `notify`,
+/// the exactly-once [`RUN_STATUS_CHANGED`] post for external observers (e.g.
+/// forge commit statuses) — as ONE commit
+/// ([`Db::commit_run_transition`]), with any `intents` the transition owes
+/// (a cancel's services teardown). `Conflict` = a peer already moved it, or
+/// the run was reopened since this read its generation — nothing written.
+async fn commit_run_transition(
+    db: &dyn Db,
+    run: &RunId,
+    from: RunStatus,
+    to: RunStatus,
+    now: Timestamp,
+    notify: bool,
+    intents: &[OutboxMessage],
+) -> Result<(), DbError> {
+    let events = [event(run, EventPayload::RunTransitioned { from, to }, now)];
+    let mut outbox: Vec<OutboxMessage> = intents.to_vec();
+    // The commit is guarded on this read (red team R2-E3 at run grain): a
+    // run cancelled, rerun and back in `from` in between conflicts, so the
+    // generation the post names is the one its transition happens in.
+    let generation = db.run_reopen_generation(run).await?;
+    if notify {
+        // Exactly once per transition: the post rides the CAS's commit, so
+        // only the winner's lands. The key is unique per (run, generation,
+        // state) — the generation this transition leaves the run in (a reopen
+        // out of a terminal status opens the next one). Keyed per (run,
+        // state) alone, a state the run reached again after a rerun
+        // (Succeeded → Failed → Succeeded) collapsed onto its first post and
+        // the forge's last word was the stale one (red team A7). The payload
+        // carries the generation too, so a stale generation's post that is
+        // redelivered late is dropped, not posted over a newer verdict (red
+        // team R2-E5).
+        let posted = generation + u64::from(from.is_terminal());
+        outbox.push(OutboxMessage {
+            id: crate::OutboxId(0),
+            run: run.clone(),
+            kind: RUN_STATUS_CHANGED.to_string(),
+            payload: serde_json::json!({ "to": to, "generation": posted }),
+            idempotency_key: run_status_post_key(run, posted, to),
+            at: now,
+        });
+    }
+    db.commit_run_transition(run, from, to, generation, &events, &outbox)
+        .await
+}
+
+/// The idempotency key of the [`RUN_STATUS_CHANGED`] post a transition of
+/// `run` into `to` writes in reopen generation `generation` — one per
+/// (run, generation, state). The forge-status drainer asks for the key of a
+/// settled run's terminal post to tell whether a redelivered non-terminal
+/// post of the same generation is already superseded (red team R2-E5).
+pub fn run_status_post_key(run: &RunId, generation: u64, to: RunStatus) -> String {
+    format!("status:{}:g{generation}:{to:?}", run.0)
 }
 
 /// Configuration knobs (sane slice-1 defaults via [`Scheduler::new`]).
@@ -1341,6 +2140,11 @@ pub struct Scheduler<'a> {
     /// through it. `None` (the local executor) disables the cache — correct
     /// there, because there are no snapshots to key on.
     snapshots: Option<&'a dyn WorkspaceSnapshots>,
+    /// The DeploymentGate oracle (slice b, criteria 2 and 4), when the
+    /// deployment has one. `None`: a `gate: deployment` step makes no decision
+    /// of its own and no deploy Step is ever held by per-target concurrency —
+    /// see [`DeploymentGates`].
+    deployments: Option<&'a dyn DeploymentGates>,
     owner: String,
     cfg: Config,
     /// See [`Supervision`]. Defaults to a fresh set (fine when the Scheduler
@@ -1363,6 +2167,7 @@ impl<'a> Scheduler<'a> {
             clock,
             executor,
             snapshots: None,
+            deployments: None,
             owner: owner.into(),
             supervised: Supervision::new(),
             health: TickHealth::new(),
@@ -1384,6 +2189,17 @@ impl<'a> Scheduler<'a> {
     /// correct degradation for deployments with no workspace CAS.
     pub fn with_snapshots(mut self, snapshots: Option<&'a dyn WorkspaceSnapshots>) -> Self {
         self.snapshots = snapshots;
+        self
+    }
+
+    /// Wire the DeploymentGate oracle (slice b, criterion 2; ADR-0070 §8): a
+    /// waiting `gate: deployment` step is resolved from what it answers.
+    /// Without it such a gate waits for a human reject, its
+    /// `gate_expires_after`, or a cancel ([`DeploymentGates`]). The same oracle
+    /// decides the per-DeploymentTarget concurrency hold (criterion 4);
+    /// without it nothing is held.
+    pub fn with_deployments(mut self, deployments: Option<&'a dyn DeploymentGates>) -> Self {
+        self.deployments = deployments;
         self
     }
 
@@ -1582,30 +2398,14 @@ impl<'a> Scheduler<'a> {
         if status.is_terminal() {
             return Ok(());
         }
-        // A suspended run is waiting on a gate. A `timer` gate releases itself
-        // once its wait has elapsed (ADR-0008); an opt-in `gate_expires_after`
-        // fails a still-unapproved gate at its deadline (ADR-0047; default =
-        // indefinite); everything else waits for an explicit release. Either
-        // way, do no admission this pass — the resumed run is picked up next
-        // tick.
-        if status == RunStatus::Suspended {
-            self.auto_release_elapsed_timer(run).await?;
-            self.expire_elapsed_gate(run).await?;
-            return Ok(());
-        }
-
-        // Opt-in run budget (ADR-0047): active time only — gate-suspended time
-        // never counts (a run suspended weeks on a gate is the wedge, not a
-        // hang). Exhaustion cancels in-flight steps and fails the run.
-        if self.enforce_run_budget(run).await? {
-            return Ok(());
-        }
-
         // Start a Pending run — subject to its concurrency group (ADR-0011,
         // 0032). If the group's slot is held by another active run, `queue`
         // waits (retry next tick) and `cancel-in-progress` cancels the holder
         // first (this run then acquires once the holder releases). A run that
         // has already started holds its slot, so we only gate on entry.
+        //
+        // Before the gate evaluation below: a run still queued has not begun,
+        // so none of its gates may start a wait (and their clocks) yet.
         if status == RunStatus::Pending {
             // Newest-wins (ADR-0011, 0032): this run auto-cancels older in-flight
             // runs sharing its supersede key. Deploy runs carry no key and so
@@ -1637,6 +2437,39 @@ impl<'a> Scheduler<'a> {
                 .await?;
         }
 
+        // Per-gate waits (slice b, criterion 3) — evaluated whether the run is
+        // Running or Suspended: every reached gate gets an Attempt whose
+        // `started_at` is its own clock start, and each is checked against its
+        // own timer / `gate_expires_after`. Before any promotion, so a gate
+        // that resolves now unblocks (or Skips) its dependents this same pass.
+        self.evaluate_waiting_gates(run).await?;
+
+        // A suspended run is one whose only outstanding work is gate waits and
+        // concurrency holds. It reopens as soon as that stops being true — a
+        // gate resolved, a hold lifted, a rerun re-armed a sibling — and
+        // admission continues in this same pass. Its holds (slice b,
+        // criterion 4) are judged from the SAME snapshot as the waits: a set
+        // from an older read could miss a Step whose need finished since.
+        // Reopening is never a promotion — the loop below asks the oracle
+        // again, from its own snapshot, before any `Pending → Ready`.
+        if status == RunStatus::Suspended {
+            let steps = self.db.steps_of_run(run).await?;
+            let held = self.deployment_concurrency_holds(run, &steps).await?;
+            if only_waits_outstanding(&steps, &held) {
+                return Ok(());
+            }
+            self.transition_run(run, RunStatus::Suspended, RunStatus::Running)
+                .await?;
+        }
+
+        // Opt-in run budget (ADR-0047): active time only — gate-suspended time
+        // never counts (a run suspended weeks on a gate is the wedge, not a
+        // hang). Exhaustion cancels in-flight steps and fails the run. A gate
+        // waiting while siblings still run DOES bill: the run is active.
+        if self.enforce_run_budget(run).await? {
+            return Ok(());
+        }
+
         // Dependency-aware admission (ADR-0006, 0011): promote a Pending step to
         // Ready only once ALL its `needs` have Succeeded — emergent parallelism
         // falls out (steps with satisfied/empty needs promote together). If a
@@ -1659,22 +2492,18 @@ impl<'a> Scheduler<'a> {
             })
         };
 
-        // Gate pre-pass (ADR-0008): a Pending gate whose deps are satisfied
-        // suspends the whole run — a durable, near-zero-cost wait for approval /
-        // timer / external event. It launches no Pod; `release_gate` resumes.
-        // A gate whose deps can never succeed can never be approved, so skip it
-        // here: the non-gate skip loop below `continue`s past gates (line ~778),
-        // so without this a dead-upstream gate lingers Pending, `advance` never
-        // sees an all-terminal DAG, and the run hangs Running until its budget
-        // (a liveness backstop) eventually fails it.
+        // Gate pre-pass (ADR-0008): a waiting gate no longer suspends the whole
+        // run — it holds only the steps that need it (they stay Pending because
+        // the gate is not Succeeded), and the run suspends below only once
+        // nothing else is runnable (slice b, criterion 3). A gate whose deps
+        // can never succeed can never be approved, so skip it here: the
+        // non-gate skip loop below `continue`s past gates, so without this a
+        // dead-upstream gate lingers Pending, `advance` never sees an
+        // all-terminal DAG, and the run hangs Running until its budget (a
+        // liveness backstop) eventually fails it.
         for step in &steps {
             if step.status != StepStatus::Pending || !step.is_gate() {
                 continue;
-            }
-            if deps_satisfied(step) {
-                self.transition_run(run, RunStatus::Running, RunStatus::Suspended)
-                    .await?;
-                return Ok(());
             }
             if dep_dead(step) {
                 self.transition_step(run, &step.step, StepStatus::Pending, StepStatus::Skipped)
@@ -1714,6 +2543,10 @@ impl<'a> Scheduler<'a> {
             .map(|r| (r.name.as_str(), r.status))
             .collect();
 
+        // The deploy Steps this pass holds `Pending` by per-DeploymentTarget
+        // concurrency (slice b, criterion 4), for the suspend check below.
+        let mut concurrency_held: std::collections::HashSet<StepId> =
+            std::collections::HashSet::new();
         for step in &steps {
             if step.status != StepStatus::Pending || step.is_gate() {
                 continue;
@@ -1741,7 +2574,6 @@ impl<'a> Scheduler<'a> {
                         .map(String::as_str)
                         .collect();
                     if !failed.is_empty() {
-                        let now = self.clock.now().await;
                         let reason = format!(
                             "unbound dependency: shared service(s) {} never became ready",
                             failed
@@ -1750,20 +2582,15 @@ impl<'a> Scheduler<'a> {
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         );
-                        self.append(
-                            run,
-                            EventPayload::StepServicesUnready {
-                                step: step.step.clone(),
-                                reason,
-                            },
-                            now,
-                        )
-                        .await?;
-                        self.transition_step(
+                        self.transition_step_with(
                             run,
                             &step.step,
                             StepStatus::Pending,
                             StepStatus::Failed,
+                            vec![EventPayload::StepServicesUnready {
+                                step: step.step.clone(),
+                                reason,
+                            }],
                         )
                         .await?;
                         continue;
@@ -1778,6 +2605,20 @@ impl<'a> Scheduler<'a> {
                         // Hold the step Pending — the durable readiness suspend.
                         continue;
                     }
+                }
+                // Per-DeploymentTarget concurrency (slice b, criterion 4): a
+                // deploy Step whose target is at its limit stays Pending —
+                // held, never failed — and is asked about again next pass.
+                // Asked HERE, at the promotion point, for a Step whose needs
+                // succeeded in this very snapshot: a hold decided from any
+                // other read could miss a need that finished in between and
+                // let the Step past the limit unasked (R3). Before
+                // skip-if-unchanged on purpose: a skip marks the Step
+                // Succeeded with its DeploymentGates outstanding, which is
+                // itself "in flight" on the target.
+                if self.deployment_concurrency_held(run, &step.step).await? {
+                    concurrency_held.insert(step.step.clone());
+                    continue;
                 }
                 // Skip-if-unchanged (ADR-0027): a re-armed step whose input
                 // signature matches the one it last consumed, and which produced
@@ -1796,8 +2637,17 @@ impl<'a> Scheduler<'a> {
                     &signature_of,
                 );
                 let prev = self.db.step_input(run, &step.step).await?;
+                // Never for a deploy Step (git-bug d880466): skipping marks
+                // it `Succeeded` with no Attempt and no DeploymentRequest, so
+                // a rerun that re-arms it would silently deploy nothing. Its
+                // effect is the request, not its output; it always re-runs.
                 let unchanged = signature_of.contains_key(&step.step)
-                    && prev.as_deref() == Some(cur.as_str());
+                    && prev.as_deref() == Some(cur.as_str())
+                    && self
+                        .db
+                        .run_deployment_requests(run, &step.step)
+                        .await?
+                        .is_empty();
                 if unchanged {
                     self.skip_unchanged(run, &step.step).await?;
                 } else {
@@ -1846,7 +2696,7 @@ impl<'a> Scheduler<'a> {
                 step: claimed.step.0.clone(),
                 attempt: attempt.0.clone(),
             };
-            let key = format!("launch:{}/{}/{}", intent.run, intent.step, intent.attempt);
+            let key = launch_key(&claimed.run, &claimed.step, &attempt);
             self.db
                 .enqueue_outbox(&OutboxMessage {
                     id: crate::OutboxId(0),
@@ -1857,6 +2707,26 @@ impl<'a> Scheduler<'a> {
                     idempotency_key: key,
                     at: now,
                 })
+                .await?;
+        }
+
+        // Suspend only when nothing else is runnable (slice b, criteria 3, 4):
+        // no step Ready/Running, and every outstanding step is a waiting gate,
+        // a concurrency-held deploy Step, or behind one. Suspended time bills
+        // no budget; the next pass reopens the run the moment a gate resolves
+        // or a hold lifts.
+        // `steps` is this pass's snapshot: with no Pending gate in it and no
+        // hold, nothing can be waiting, so skip the re-read. The re-read is
+        // conservative: a Step whose need finished after the loop's snapshot
+        // was never asked, so it is not in `concurrency_held`, not waiting,
+        // and keeps the run Running one more pass — never a wrong suspend.
+        let any_pending_gate = steps
+            .iter()
+            .any(|s| s.is_gate() && s.status == StepStatus::Pending);
+        if (any_pending_gate || !concurrency_held.is_empty())
+            && only_waits_outstanding(&self.db.steps_of_run(run).await?, &concurrency_held)
+        {
+            self.transition_run(run, RunStatus::Running, RunStatus::Suspended)
                 .await?;
         }
         Ok(())
@@ -1900,14 +2770,21 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
-    /// Drain cancel-teardown intents (ADR-0054): for each cancelled run, delete
-    /// every recorded in-flight execution (the executor's `cancel` — SIGTERM +
-    /// grace period) **and** tear down the run's shared services (ADR-0058),
-    /// which are not steps and so are reached by neither the step loop nor any
-    /// later tick. The message is retired only once every Pod reached the
-    /// desired end state; a genuinely failed cancel is retried rather than
-    /// silently orphaning the Pod (see [`settle_teardown`](Self::settle_teardown)).
+    /// Drain cancel-teardown intents (ADR-0054): every [`CANCEL_ATTEMPT`]
+    /// tears down exactly the attempts it names
+    /// ([`drain_attempt_teardowns`](Self::drain_attempt_teardowns)), and
+    /// every [`CANCEL_RUN`] the cancelled Run's shared services (ADR-0058),
+    /// which are not steps and so are reached by no attempt intent and by no
+    /// later tick. A message is retired only once everything it names reached
+    /// the desired end state; a genuinely failed teardown is retried rather
+    /// than silently orphaning the unit (see
+    /// [`settle_teardown`](Self::settle_teardown)).
+    ///
+    /// Nothing here reads "the step's latest attempt" at drain time (red team
+    /// R2-E1): a cancel's intent still pending when the Run is rerun would
+    /// otherwise tear down the rerun's fresh, live attempt.
     pub async fn reconcile_cancellations(&self) -> Result<(), SchedulerError> {
+        self.drain_attempt_teardowns(CANCEL_ATTEMPT).await?;
         let msgs = self
             .db
             .claim_outbox(
@@ -1923,42 +2800,66 @@ impl<'a> Scheduler<'a> {
             // and a permanently failing one — a poison row — would stall the
             // fleet on every cycle forever.
             let processed = async {
-                // Attempt every recorded Pod's teardown, remembering whether any
-                // cancel genuinely failed (an already-gone Pod is `Ok`). Keep going
-                // past a failure so the reachable Pods still die this tick; the whole
-                // message is retried idempotently if any cancel failed.
-                let mut outcome: Result<(), ExecError> = Ok(());
-                for step in self.db.steps_of_run(&msg.run).await? {
-                    if let Some(attempt) = step.attempts.last() {
-                        if let Some(h) = self
-                            .db
-                            .attempt_handle(&msg.run, &step.step, &attempt.id)
-                            .await?
+                let mut outcome = TeardownPass::Gone;
+                // Rolling upgrade: a `cancel_run` written by an older binary
+                // has a `null` payload and was its cancel's ONLY teardown of
+                // step units. Honour it for what that cancel provably stopped
+                // — a step's latest attempt stamped `Cancelled` — never an
+                // attempt still `Running` (a rerun's), which is what made the
+                // run-scoped drain unsafe.
+                if msg.payload.is_null() {
+                    for step in self.db.steps_of_run(&msg.run).await? {
+                        let Some(a) = step
+                            .attempts
+                            .last()
+                            .filter(|a| a.outcome == AttemptOutcome::Cancelled)
+                        else {
+                            continue;
+                        };
+                        if let Some(h) = self.db.attempt_handle(&msg.run, &step.step, &a.id).await?
                         {
-                            if let Err(e) = self.executor.cancel(&ExecHandle(h)).await {
-                                outcome = Err(e);
-                            }
+                            let h = ExecHandle(h);
+                            let gone = self.cancel_until_gone(&h).await;
+                            outcome.absorb(gone, &h);
                         }
                     }
                 }
                 // Run-scoped shared services (ADR-0058) are NOT steps — they
-                // live in `run_services`, not `steps_of_run` — so the loop above
-                // never reaches them. Without this an operator cancel tore down
-                // every step Pod and left the run's services running forever:
-                // `reconcile_services`' terminal-teardown arm only visits runs in
-                // the ACTIVE set, and a cancelled run has already left it, so no
-                // later tick would collect them. The automated cancel paths
-                // (concurrency auto-cancel / supersede, via `cancel_run`) call
-                // `teardown_services` inline, which is why only this one leaked.
+                // live in `run_services`, not `steps_of_run` — so no attempt
+                // intent reaches them. Without this an operator cancel tore
+                // down every step Pod and left the run's services running
+                // forever: `reconcile_services`' terminal-teardown arm only
+                // visits runs in the ACTIVE set, and a cancelled run has
+                // already left it, so no later tick would collect them. The
+                // concurrency auto-cancel (`cancel_run`) also tries
+                // `teardown_services` inline, once, and writes this same
+                // intent so a failed try is retried here.
                 //
                 // Deliberately not that helper: it `?`s on an executor error,
                 // which would abort the message body and fall through to
                 // `abandon_poison_message`, bypassing `settle_teardown` — the
                 // accounting that retries a genuinely failed teardown. Folding
                 // the error into `outcome` keeps the promise in this function's
-                // doc comment. Steps first, then the services they depend on.
+                // doc comment.
+                //
+                // Take-scoped (git-bug 8335544): once the Run is live again
+                // (rerun), only the Takes this cancel stopped are torn down;
+                // a later Take is the rerun's own. A Run still terminal keeps
+                // nothing alive, so every Take goes — which also covers a
+                // rerun that birthed a Take between the cancel's read and its
+                // commit. A payload without `through_take` (an older binary)
+                // keeps the old run-wide drain.
+                let through_take = msg.payload.get("through_take").and_then(|t| t.as_i64());
+                let reopened = self
+                    .db
+                    .run_status(&msg.run)
+                    .await?
+                    .is_some_and(|s| !s.is_terminal());
                 for svc in self.db.run_services(&msg.run).await? {
                     if svc.status.is_terminal() {
+                        continue;
+                    }
+                    if reopened && through_take.is_some_and(|t| svc.take > t) {
                         continue;
                     }
                     if let Some(h) = &svc.handle {
@@ -1968,7 +2869,7 @@ impl<'a> Scheduler<'a> {
                             // re-attempts it. Marking `TornDown` optimistically
                             // would lose the Pod permanently — the very bug this
                             // closes, just moved.
-                            outcome = Err(e);
+                            outcome.absorb(Err(e), &ExecHandle(h.clone()));
                             continue;
                         }
                     }
@@ -1994,14 +2895,32 @@ impl<'a> Scheduler<'a> {
 
     /// Drain supersede-teardown intents (ADR-0056 amendment): a Rerun re-armed
     /// in-flight descendants, so each superseded attempt's Pod is cancelled
-    /// (SIGTERM + grace) to stop it orphaning. Scoped to the named handles —
+    /// (SIGTERM + grace) to stop it orphaning. Scoped to the named attempts —
     /// the run stays alive and the re-armed steps relaunch under fresh fences.
     pub async fn reconcile_supersessions(&self) -> Result<(), SchedulerError> {
+        self.drain_attempt_teardowns(SUPERSEDE_TEARDOWN).await
+    }
+
+    /// Drain one kind of attempt-scoped teardown ([`CANCEL_ATTEMPT`],
+    /// [`SUPERSEDE_TEARDOWN`]): tear down the unit of each attempt the
+    /// payload names — exactly those, never another attempt of the same step
+    /// — until every one is gone.
+    ///
+    /// An attempt with no recorded handle has no unit yet. It is gone only if
+    /// its launch can no longer create one: while its `launch:` intent is
+    /// still pending a launch may be creating the unit right now (its
+    /// still-wanted check passed before the cancel), so the teardown is
+    /// retried until the launch settles — after which the handle is recorded
+    /// (and torn down here) or the launch was refused. Retired early as
+    /// "gone", the teardown — and the DeploymentTarget hold that counts it —
+    /// ended while that launch went on to create a live Pod (red team A2,
+    /// R2-E2b).
+    async fn drain_attempt_teardowns(&self, kind: &str) -> Result<(), SchedulerError> {
         let msgs = self
             .db
             .claim_outbox(
                 &self.owner,
-                Some(SUPERSEDE_TEARDOWN),
+                Some(kind),
                 self.cfg.outbox_batch,
                 self.cfg.outbox_visibility_ms,
             )
@@ -2012,20 +2931,27 @@ impl<'a> Scheduler<'a> {
             // every later run's tick on this and every future cycle — one
             // un-deserializable row could wedge the whole fleet indefinitely.
             let processed = async {
-                let payload: SupersedeTeardown = serde_json::from_value(msg.payload.clone())
+                let payload: AttemptTeardown = serde_json::from_value(msg.payload.clone())
                     .map_err(|e| SchedulerError::BadPayload(e.to_string()))?;
-                // Cancel every named Pod, remembering whether any cancel genuinely
-                // failed (an already-gone Pod is `Ok`). A later reconcile re-cancels
-                // the already-gone ones harmlessly and retries only those still up.
-                let mut outcome: Result<(), ExecError> = Ok(());
+                // Tear down every named unit, remembering whether any cancel
+                // genuinely failed (an already-gone unit is `Ok`). A later
+                // reconcile re-cancels the already-gone ones harmlessly and
+                // retries only those still up.
+                let mut outcome = TeardownPass::Gone;
                 for item in payload.attempts {
-                    if let Some(h) = self
-                        .db
-                        .attempt_handle(&msg.run, &StepId(item.step), &AttemptId(item.attempt))
-                        .await?
-                    {
-                        if let Err(e) = self.executor.cancel(&ExecHandle(h)).await {
-                            outcome = Err(e);
+                    let step = StepId(item.step);
+                    let attempt = AttemptId(item.attempt);
+                    match self.db.attempt_handle(&msg.run, &step, &attempt).await? {
+                        Some(h) => {
+                            let h = ExecHandle(h);
+                            let gone = self.cancel_until_gone(&h).await;
+                            outcome.absorb(gone, &h);
+                        }
+                        None => {
+                            let launch = launch_key(&msg.run, &step, &attempt);
+                            if self.db.outbox_key_pending(&launch).await? {
+                                outcome.launching(&launch);
+                            }
                         }
                     }
                 }
@@ -2037,6 +2963,20 @@ impl<'a> Scheduler<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Cancel the unit behind `handle` and answer whether it is **gone**
+    /// ([`Executor::torn_down`]), so a teardown message is retired only then
+    /// (git-bug f22056d). While it is still terminating (`Ok(false)`: a k8s
+    /// Pod in its grace) the message stays pending — and its Step keeps
+    /// holding its DeploymentTarget ([`Db::deployment_requesting_runs`]) —
+    /// through the same retry and poison ceiling as a failed cancel: a unit
+    /// that never goes is abandoned with a `TeardownAbandoned` diagnostic
+    /// after [`MAX_DELIVERY_ATTEMPTS`], which also ends its hold. `Err` is a
+    /// cancel (or check) the backend genuinely refused.
+    async fn cancel_until_gone(&self, handle: &ExecHandle) -> Result<bool, ExecError> {
+        self.executor.cancel(handle).await?;
+        self.executor.torn_down(handle).await
     }
 
     /// Count one failed *processing* attempt of a teardown message and, at
@@ -2094,41 +3034,172 @@ impl<'a> Scheduler<'a> {
     /// ceiling as launch intents (ADR-0047): at [`MAX_DELIVERY_ATTEMPTS`] the
     /// message dead-letters (stops redelivering) and a diagnostic lands on the
     /// run's event log, so an unreachable backend can't spin teardown forever.
-    /// Teardown is idempotent, so a redelivery after a partial success re-cancels
+    /// A unit that is merely still terminating ([`TeardownPass::StillTerminating`])
+    /// is retried the same way, and its diagnostic says so rather than calling
+    /// it a failed teardown. Teardown is idempotent, so a redelivery after a partial success re-cancels
     /// the already-gone Pods harmlessly. The run's own state is never touched —
     /// this is pure resource hygiene; fencing already keeps the durable state
     /// correct whether or not the stale Pod dies.
     async fn settle_teardown(
         &self,
         msg: &OutboxMessage,
-        outcome: Result<(), ExecError>,
+        outcome: TeardownPass,
     ) -> Result<(), SchedulerError> {
-        match outcome {
-            Ok(()) => self.db.mark_dispatched(msg.id).await?,
-            Err(e) => {
-                let failures = self.db.record_outbox_failure(msg.id).await?;
-                if failures >= MAX_DELIVERY_ATTEMPTS {
-                    self.db.dead_letter_outbox(msg.id).await?;
-                    let now = self.clock.now().await;
-                    self.append(
-                        &msg.run,
-                        EventPayload::Raw(serde_json::json!({
-                            "event": "TeardownAbandoned",
-                            "outbox_kind": msg.kind,
-                            "outbox_id": msg.id.0,
-                            "reason": format!(
-                                "Pod teardown failed {MAX_DELIVERY_ATTEMPTS} times and \
-                                 was abandoned; the backend unit may be orphaned \
-                                 (fencing keeps run state correct): {e}"
-                            ),
-                        })),
-                        now,
-                    )
-                    .await?;
-                }
+        let why = match outcome {
+            TeardownPass::Gone => {
+                self.db.mark_dispatched(msg.id).await?;
+                return Ok(());
             }
+            // Every cancel was delivered; the unit is just not gone yet. Not
+            // a failed teardown, but it rides the same ceiling so that its
+            // hold on a DeploymentTarget stays bounded — and if it never
+            // goes, the diagnostic says what was actually observed.
+            TeardownPass::StillTerminating(handle) => format!(
+                "`{handle}` was still terminating after {MAX_DELIVERY_ATTEMPTS} checks — every \
+                 cancel was accepted, but the backend never reported the unit gone (a \
+                 termination grace longer than the retry window, or an unreachable node); \
+                 the teardown is abandoned and its DeploymentTarget hold ends, so the unit \
+                 may still be running (fencing keeps run state correct)"
+            ),
+            TeardownPass::Launching(launch) => format!(
+                "`{launch}` was still pending after {MAX_DELIVERY_ATTEMPTS} checks — an attempt \
+                 to tear down had no unit recorded while its launch could still create one; \
+                 the teardown is abandoned and its DeploymentTarget hold ends, so a unit that \
+                 launch creates may run on (fencing keeps run state correct)"
+            ),
+            TeardownPass::Failed(e) => format!(
+                "Pod teardown failed {MAX_DELIVERY_ATTEMPTS} times and was abandoned; the \
+                 backend unit may be orphaned (fencing keeps run state correct): {e}"
+            ),
+        };
+        let failures = self.db.record_outbox_failure(msg.id).await?;
+        if failures >= MAX_DELIVERY_ATTEMPTS {
+            self.db.dead_letter_outbox(msg.id).await?;
+            let now = self.clock.now().await;
+            self.append(
+                &msg.run,
+                EventPayload::Raw(serde_json::json!({
+                    "event": "TeardownAbandoned",
+                    "outbox_kind": msg.kind,
+                    "outbox_id": msg.id.0,
+                    "reason": why,
+                })),
+                now,
+            )
+            .await?;
         }
         Ok(())
+    }
+
+    /// Whether `attempt` of `step` is still the unit to launch: the Run is not
+    /// terminal, and the step is `Running` with `attempt` its latest Attempt,
+    /// still in flight (not stamped `Cancelled`/`Superseded`). See
+    /// [`process_launch_intent`](Self::process_launch_intent).
+    async fn launch_still_wanted(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<bool, SchedulerError> {
+        let steps = self.db.steps_of_run(run).await?;
+        let step_wanted = steps.iter().find(|s| &s.step == step).is_some_and(|s| {
+            s.status == StepStatus::Running
+                && s.attempts
+                    .last()
+                    .is_some_and(|a| &a.id == attempt && a.outcome == AttemptOutcome::Running)
+        });
+        if !step_wanted {
+            return Ok(false);
+        }
+        Ok(self
+            .db
+            .run_status(run)
+            .await?
+            .is_some_and(|s| !s.is_terminal()))
+    }
+
+    /// The teardown of a unit launched for an attempt that stopped being
+    /// wanted while it launched ([`process_launch_intent`](Self::process_launch_intent)),
+    /// when nothing else owes it one.
+    ///
+    /// An attempt stamped `Cancelled` or `Superseded` is already owed: the
+    /// commit that stamped it carried an attempt-scoped intent naming it,
+    /// and that intent cannot have been retired while this launch was in
+    /// flight ([`drain_attempt_teardowns`](Self::drain_attempt_teardowns)
+    /// waits out a pending `launch:` intent, which is dispatched only after
+    /// this). Any other way an attempt stops being wanted before its unit
+    /// exists (its step finalized without it, its Run settled) wrote no
+    /// teardown, so this writes one: a [`CANCEL_ATTEMPT`] naming only that
+    /// attempt — never a Run-wide teardown, which would kill the Run's live
+    /// units. Keyed per attempt (`…:launch`): an attempt is launched for real
+    /// at most once.
+    async fn enqueue_late_launch_teardown(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<(), SchedulerError> {
+        let owed = self.db.attempts_of_step(run, step).await?.iter().any(|a| {
+            &a.id == attempt
+                && matches!(
+                    a.outcome,
+                    AttemptOutcome::Cancelled | AttemptOutcome::Superseded
+                )
+        });
+        if owed {
+            return Ok(());
+        }
+        let now = self.clock.now().await;
+        let mut msg = cancel_attempt_intent(run, step, attempt, now);
+        msg.idempotency_key.push_str(":launch");
+        self.db.enqueue_outbox(&msg).await?;
+        Ok(())
+    }
+
+    /// Record and tear down the unit an EARLIER delivery of a now-refused
+    /// launch may have created (git-bug 333d389).
+    ///
+    /// A launch can create its unit and still fail (k8s: Pod accepted, then
+    /// the Secret upsert failed, or the create response was lost), and a
+    /// replica can die between a launch and [`Db::set_attempt_handle`]. No
+    /// handle is durable then, the launch intent is redelivered — and if a
+    /// cancel, supersession or finalization landed meanwhile, the redelivery
+    /// is refused. Dispatched as-is, the attempt's teardown (which waits out
+    /// the pending `launch:` key) found no handle and retired as "gone":
+    /// the unit ran on, unowned, and its DeploymentTarget hold ended.
+    ///
+    /// So the backend's deterministic handle ([`Executor::unit_handle`]) is
+    /// recorded as the attempt's — BEFORE the launch intent is dispatched, so
+    /// a pending attempt teardown sees it on its next pass — and a teardown
+    /// is owed exactly as for a late launch. When no unit was ever created
+    /// this costs one idempotent cancel of a missing unit.
+    async fn adopt_unit_of_refused_launch(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<(), SchedulerError> {
+        let fenced = StepRun {
+            run: run.clone(),
+            step: step.clone(),
+            status: StepStatus::Running,
+            attempts: vec![Attempt {
+                id: attempt.clone(),
+                started_at: Timestamp(0),
+                failure: None,
+                failure_detail: None,
+                outcome: AttemptOutcome::Running,
+            }],
+            needs: Vec::new(),
+            gate_kind: None,
+        };
+        let Some(handle) = self.executor.unit_handle(&fenced) else {
+            return Ok(());
+        };
+        self.db
+            .set_attempt_handle(run, step, attempt, &handle.0)
+            .await?;
+        self.enqueue_late_launch_teardown(run, step, attempt).await
     }
 
     /// Process one launch intent: launch-or-adopt, poll, settle. Extracted so
@@ -2176,6 +3247,23 @@ impl<'a> Scheduler<'a> {
                     ExecHandle(h)
                 }
                 None => {
+                    // Launch only a unit that is still wanted (red team A2):
+                    // the step still `Running` on THIS attempt, in a Run not
+                    // terminal. A launch intent can outlive its claim — an
+                    // operator cancel, or a rerun superseding the attempt,
+                    // lands between the claim and this drain (another
+                    // replica's, or this one after a transient launch error
+                    // left the intent for redelivery) — and a cancel's
+                    // teardown that ran first found no handle and was retired
+                    // as "gone". Launched anyway, the Pod ran (a deploy acting
+                    // on its target) for a Cancelled step, never torn down
+                    // and holding nothing.
+                    if !self.launch_still_wanted(&run, &step, &attempt).await? {
+                        self.adopt_unit_of_refused_launch(&run, &step, &attempt)
+                            .await?;
+                        self.db.mark_dispatched(msg.id).await?;
+                        return Ok(());
+                    }
                     let spec = self
                         .db
                         .step_spec(&run, &step)
@@ -2210,6 +3298,27 @@ impl<'a> Scheduler<'a> {
                                 explicit_inputs.as_deref(),
                                 &output_of,
                             );
+                            // The steps behind those roots, in root order —
+                            // stamped so settle resolves a collision sample
+                            // against what was LAUNCHED (git-bug b6b8510):
+                            // an upstream gaining or losing an output before
+                            // settle would shift a re-derived index space.
+                            // Same function, same `output_of` as the roots.
+                            let input_steps = crate::workspace_input_steps(
+                                &me.needs,
+                                explicit_inputs.as_deref(),
+                                &output_of,
+                            );
+                            if !input_steps.is_empty() {
+                                self.db
+                                    .set_attempt_workspace_input_steps(
+                                        &run,
+                                        &step,
+                                        &attempt,
+                                        &input_steps,
+                                    )
+                                    .await?;
+                            }
 
                             // Consumption provenance (ADR-0056): stamp which
                             // upstream ATTEMPT this attempt builds on — the
@@ -2293,10 +3402,49 @@ impl<'a> Scheduler<'a> {
                         needs: Vec::new(),
                         gate_kind: None,
                     };
-                    let handle = self.executor.launch(&step_run, &spec).await?;
+                    let handle = match self.executor.launch(&step_run, &spec).await {
+                        Ok(handle) => handle,
+                        // A policy refusal (ADR-0071 §2: the Deploy Run's
+                        // Environment is gone or no longer admits its Project)
+                        // is a step verdict, not a scheduler error. Mapped
+                        // exactly like the interpolation failure above:
+                        // `Config` — pre-start, permanent until someone acts,
+                        // never auto-retried — with the reason as the
+                        // attempt's evidence. Propagating it with `?` instead
+                        // made it a per-run tick failure that spun for
+                        // `tick_failure_deadline_ms` and then dead-lettered the
+                        // whole Run with the reason buried.
+                        Err(ExecError::Refused(reason)) => {
+                            self.finalize_step(
+                                &run,
+                                &step,
+                                &attempt,
+                                StepStatus::Failed,
+                                Some(FailureKind::Config),
+                                Some(reason),
+                            )
+                            .await?;
+                            self.db.mark_dispatched(msg.id).await?;
+                            return Ok(());
+                        }
+                        Err(e) => return Err(e.into()),
+                    };
                     self.db
                         .set_attempt_handle(&run, &step, &attempt, &handle.0)
                         .await?;
+                    // The attempt stopped being wanted WHILE it launched
+                    // (red team A2): a cancel or supersession committed
+                    // between the check above and the handle — its teardown
+                    // may already have run and found nothing. Tear the unit
+                    // down with an intent of its own (the handle is recorded
+                    // first, so the teardown, and the DeploymentTarget hold
+                    // that counts it, see it) and stop supervising it.
+                    if !self.launch_still_wanted(&run, &step, &attempt).await? {
+                        self.enqueue_late_launch_teardown(&run, &step, &attempt)
+                            .await?;
+                        self.db.mark_dispatched(msg.id).await?;
+                        return Ok(());
+                    }
                     // We launched it — later re-polls by this instance are
                     // routine supervision, not adoption (ADR-0056).
                     self.supervised.first_contact(supervision_key);
@@ -2359,7 +3507,24 @@ impl<'a> Scheduler<'a> {
                     // overwrite is ADR-0007 semantics, this makes it loud.
                     self.record_workspace_collisions(&run, &step, &attempt, &handle)
                         .await;
-                    self.finalize_step(&run, &step, &attempt, StepStatus::Succeeded, None, None)
+                    // Exit 0: succeed the step — recording its
+                    // DeploymentRequests (if it makes any) in the same commit,
+                    // or failing it `DeploymentRequestIncomplete` when its
+                    // results cannot complete one (slice b, criterion 1).
+                    //
+                    // The results that complete a request are the attempt's
+                    // STORED results overlaid with the executor's map. On k8s
+                    // the executor map is empty (the port default): the
+                    // results-egress sidecar POSTs them to the results-ingest
+                    // API, which commits them with `set_step_results` under
+                    // this attempt's fence — and the k8s backend withholds
+                    // `Succeeded` until that sidecar has terminated (its
+                    // `curl -f` returned 2xx only after the commit), so the
+                    // read below sees them. The local/fake backends hand them
+                    // over in-process and were just written above.
+                    let mut completing = self.db.attempt_results(&run, &step, &attempt).await?;
+                    completing.extend(results);
+                    self.succeed_step(&run, &step, &attempt, &handle, &completing)
                         .await?;
                     self.db.mark_dispatched(msg.id).await?;
                 }
@@ -2494,11 +3659,14 @@ impl<'a> Scheduler<'a> {
     /// Fan-in collision evidence (ticket 2e1a458), read at settle: the
     /// backend's [`crate::ProvisioningReport`] (on k8s, the fetch init
     /// container's bounded termination summary) carries declared-order root
-    /// indices; this resolves them back to step ids through
+    /// indices; this resolves them back to step ids through the list
     /// [`crate::workspace_input_steps`] — THE one consumption function
     /// (consumed needs that produced an output, in order; ADR-0007's
-    /// one-function rule) — and appends
-    /// [`EventPayload::WorkspaceInputCollisions`].
+    /// one-function rule) — produced at LAUNCH and stamped on the attempt
+    /// (git-bug b6b8510), and appends
+    /// [`EventPayload::WorkspaceInputCollisions`]. Only an attempt with no
+    /// stamp (launched before the column existed) re-derives the list from
+    /// settle-time outputs, the pre-b6b8510 behaviour.
     ///
     /// Best-effort THROUGHOUT, mirroring `record_cache_saves`: every failure
     /// path is a silent return, because collision evidence must never fail a
@@ -2516,27 +3684,36 @@ impl<'a> Scheduler<'a> {
             Ok(Some(r)) if r.collisions > 0 => r,
             _ => return,
         };
-        let Ok(all) = self.db.steps_of_run(run).await else {
-            return;
-        };
-        let Some(me) = all.iter().find(|s| s.step == *step) else {
-            return;
-        };
-        let Ok(explicit_inputs) = self.db.step_inputs(run, step).await else {
-            return;
-        };
-        let mut output_of = HashMap::new();
-        for s in &all {
-            match self.db.step_output(run, &s.step).await {
-                Ok(Some(o)) => {
-                    output_of.insert(s.step.clone(), o);
+        let ordered = match self
+            .db
+            .attempt_workspace_input_steps(run, step, attempt)
+            .await
+        {
+            Ok(Some(launched)) => launched,
+            Ok(None) => {
+                let Ok(all) = self.db.steps_of_run(run).await else {
+                    return;
+                };
+                let Some(me) = all.iter().find(|s| s.step == *step) else {
+                    return;
+                };
+                let Ok(explicit_inputs) = self.db.step_inputs(run, step).await else {
+                    return;
+                };
+                let mut output_of = HashMap::new();
+                for s in &all {
+                    match self.db.step_output(run, &s.step).await {
+                        Ok(Some(o)) => {
+                            output_of.insert(s.step.clone(), o);
+                        }
+                        Ok(None) => {}
+                        Err(_) => return,
+                    }
                 }
-                Ok(None) => {}
-                Err(_) => return,
+                crate::workspace_input_steps(&me.needs, explicit_inputs.as_deref(), &output_of)
             }
-        }
-        let ordered =
-            crate::workspace_input_steps(&me.needs, explicit_inputs.as_deref(), &output_of);
+            Err(_) => return,
+        };
         let sample: Vec<crate::WorkspaceCollision> = report
             .sample
             .iter()
@@ -2818,23 +3995,44 @@ impl<'a> Scheduler<'a> {
     /// kill) is the executor's job on the k8s-live path; the durable terminal
     /// state recorded here is the guarantee the control plane owns.
     pub async fn cancel_run(&self, run: &RunId) -> Result<(), SchedulerError> {
+        // The same teardown an operator cancel leaves (review fit-F3), never
+        // a supersession: a cancel is not a Superseded attempt (CONTEXT.md).
+        // Each step's commit carries the [`CANCEL_ATTEMPT`] of the attempt it
+        // stamps, the Run's the [`CANCEL_RUN`] of its shared services
+        // ([`cancel_run_request`] says why). The best-effort cancel below
+        // only ASKS each unit to stop; an intent re-cancels until its unit is
+        // GONE, and until then keeps a deploy Step's DeploymentTarget held
+        // (git-bug f22056d) — so an inline cancel that fails is retried there
+        // (red team R2-E2b).
+        let now = self.clock.now().await;
         for step in self.db.steps_of_run(run).await? {
             if !step.status.is_terminal() {
                 // Tear down the in-flight execution first (best-effort —
                 // SIGTERM + grace via the backend), then settle durably.
-                if let Some(attempt) = step.attempts.last() {
+                if let Some(attempt) = in_flight_attempt(&step) {
                     if let Some(h) = self.db.attempt_handle(run, &step.step, &attempt.id).await? {
                         let _ = self.executor.cancel(&ExecHandle(h)).await;
                     }
                 }
-                self.transition_step(run, &step.step, step.status, StepStatus::Cancelled)
-                    .await?;
+                cancel_step(self.db, run, step, now).await?;
             }
         }
         if let Some(current) = self.db.run_status(run).await? {
             if !current.is_terminal() {
-                self.transition_run(run, current, RunStatus::Cancelled)
-                    .await?;
+                match commit_run_transition(
+                    self.db,
+                    run,
+                    current,
+                    RunStatus::Cancelled,
+                    now,
+                    true,
+                    &[cancel_services_intent(self.db, run, now).await?],
+                )
+                .await
+                {
+                    Ok(()) | Err(DbError::Conflict) => {}
+                    Err(e) => return Err(e.into()),
+                }
             }
         }
         // Tear down shared services (ADR-0058) on cancel too.
@@ -2845,117 +4043,342 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
-    /// Release a `timer` gate whose wait has elapsed and resume the run
-    /// (ADR-0008). The wait counts from when the run suspended (the latest
-    /// `RunTransitioned → Suspended` on the event log). A no-op when the active
-    /// gate is not a timer or the wait has not elapsed — so a manual/external gate
-    /// still waits for an explicit release.
-    async fn auto_release_elapsed_timer(&self, run: &RunId) -> Result<(), SchedulerError> {
-        let steps = self.db.steps_of_run(run).await?;
-        let done: HashMap<&StepId, StepStatus> =
-            steps.iter().map(|s| (&s.step, s.status)).collect();
-        // The gate blocking the run: a Pending timer gate whose deps are satisfied.
-        let Some(gate) = steps.iter().find(|s| {
-            s.status == StepStatus::Pending
-                && s.gate_kind.as_deref() == Some("timer")
-                && s.needs
-                    .iter()
-                    .all(|d| done.get(d).copied() == Some(StepStatus::Succeeded))
-        }) else {
-            return Ok(());
+    /// Whether deploy Step `step` of `run` is held `Pending` this pass by
+    /// **per-DeploymentTarget concurrency** (slice b, criterion 4; ADR-0071
+    /// §9). The caller asks only for a `Pending` non-gate Step whose needs
+    /// have all Succeeded **in the snapshot it is about to promote from**.
+    /// `true` when the Step makes DeploymentRequests and the
+    /// [`DeploymentGates`] oracle answers a hold — or cannot answer (fail
+    /// closed: a hold is never an over-admission). With no oracle wired
+    /// nothing is ever held and nothing is read.
+    ///
+    /// The hold lives at the point of use, never at admission: a held Step
+    /// stays `Pending` (it never fails), counts as waiting for the suspend
+    /// rule, and is asked about again every pass. Nothing is journalled per
+    /// pass; the reason is derivable from the same oracle.
+    ///
+    /// **Why it is asked at the promotion point.** The promotion loop
+    /// promotes a Step whose needs it read `Succeeded`; the hold must be
+    /// decided for that same read. A hold set computed from an earlier read
+    /// (R3) missed a Step whose need finished in between — an `/approve` on
+    /// another API task, a peer's reconcile — and the loop then promoted it
+    /// without the oracle ever being asked. A need finishing after the
+    /// loop's own read leaves the Step unpromoted this pass; the next pass
+    /// asks.
+    ///
+    /// **Why two Runs cannot both pass at the limit.** The count reads other
+    /// Runs' Steps, and only the promotion loop moves a Step `Pending →
+    /// Ready`. Admission runs on the single scheduler leader ([`Self::admit`]
+    /// returns early otherwise), and [`Self::tick_all`] admits Runs one after
+    /// another: Run A's promotion of its deploy Step is committed (`Ready`,
+    /// counted) before Run B's pass reads the count. Within one Run, its own
+    /// Steps are excluded from the count, so their order does not matter. The
+    /// same leader-serialisation already bounds the project and global run
+    /// caps; like them, it assumes a leader that lost its lease mid-pass does
+    /// not keep promoting (a lease shorter than a pause is the shared caveat).
+    async fn deployment_concurrency_held(
+        &self,
+        run: &RunId,
+        step: &StepId,
+    ) -> Result<bool, SchedulerError> {
+        let Some(oracle) = self.deployments else {
+            return Ok(false);
         };
-        let Some(wait_secs) = self.db.gate_timer_seconds(run, &gate.step).await? else {
-            return Ok(());
-        };
-
-        let Some(suspended_at) = self.suspended_at(run).await? else {
-            return Ok(());
-        };
-
+        let requests = self.db.run_deployment_requests(run, step).await?;
+        if requests.is_empty() {
+            return Ok(false);
+        }
         let now = self.clock.now().await;
-        if now.0 >= suspended_at + wait_secs.saturating_mul(1000) {
-            // Reuse the manual-release path: marks the gate Succeeded and resumes.
-            release_gate(self.db, self.clock, run, &gate.step)
-                .await
-                .map_err(|e| SchedulerError::Db(DbError::Other(e.to_string())))?;
+        let answer = oracle
+            .deployment_concurrency_hold(run, step, &requests, now)
+            .await;
+        // Held, or undecidable this pass (the oracle logged it).
+        Ok(!matches!(answer, Ok(None)))
+    }
+
+    /// The deploy Steps of `steps` (one snapshot of `run`) that
+    /// [`deployment_concurrency_held`](Self::deployment_concurrency_held)
+    /// holds: every `Pending` non-gate Step whose needs have all Succeeded
+    /// **in `steps`**. Only for deciding whether a Suspended run stays
+    /// suspended — judged from the same snapshot as its gate waits; the
+    /// promotion loop asks per Step from its own snapshot.
+    async fn deployment_concurrency_holds(
+        &self,
+        run: &RunId,
+        steps: &[StepRun],
+    ) -> Result<std::collections::HashSet<StepId>, SchedulerError> {
+        let mut held = std::collections::HashSet::new();
+        if self.deployments.is_none() {
+            return Ok(held);
+        }
+        let status_of: HashMap<&StepId, StepStatus> =
+            steps.iter().map(|s| (&s.step, s.status)).collect();
+        for step in steps {
+            if step.status != StepStatus::Pending
+                || step.is_gate()
+                || !step
+                    .needs
+                    .iter()
+                    .all(|n| status_of.get(n) == Some(&StepStatus::Succeeded))
+            {
+                continue;
+            }
+            if self.deployment_concurrency_held(run, &step.step).await? {
+                held.insert(step.step.clone());
+            }
+        }
+        Ok(held)
+    }
+
+    /// Evaluate **every** reached gate of `run` against its own clock (slice b,
+    /// criterion 3) — called at the top of admission for a Running *and* a
+    /// Suspended run, replacing the run-level `suspended_at` arithmetic (which
+    /// found ONE gate and timed it from when the whole run suspended).
+    ///
+    /// For each `Pending` gate:
+    ///
+    /// - **not reached** (a need is not Succeeded) — nothing to do, except
+    ///   closing a stale open Attempt left by a re-arm of its upstream (its
+    ///   wait's premise is gone; the next wait is a new Attempt);
+    /// - **reached** — ensure it has an open Attempt (mint `a{n}` with
+    ///   `started_at` = [`wait_began_at`], frozen), then ask
+    ///   [`gate_verdict`](Self::gate_verdict) and, on a decision, resolve it
+    ///   via the shared exactly-once path.
+    ///
+    /// A terminal gate is never re-evaluated. The gate step stays `Pending`
+    /// throughout its wait.
+    async fn evaluate_waiting_gates(&self, run: &RunId) -> Result<(), SchedulerError> {
+        let steps = self.db.steps_of_run(run).await?;
+        if !steps
+            .iter()
+            .any(|s| s.is_gate() && s.status == StepStatus::Pending)
+        {
+            return Ok(());
+        }
+        let status_by_id: HashMap<&StepId, StepStatus> =
+            steps.iter().map(|s| (&s.step, s.status)).collect();
+        // The event log is read at most once per pass, and only to mint; the
+        // IR at most once, and only once a reached gate needs its settings.
+        let mut events: Option<Vec<EventKind>> = None;
+        let mut settings: Option<HashMap<String, GateSettings>> = None;
+        for gate in steps
+            .iter()
+            .filter(|s| s.is_gate() && s.status == StepStatus::Pending)
+        {
+            let reached = gate
+                .needs
+                .iter()
+                .all(|d| status_by_id.get(d).copied() == Some(StepStatus::Succeeded));
+            if !reached {
+                if let Some(a) = open_gate_attempt(gate) {
+                    supersede_gate_attempt(self.db, self.clock, run, &gate.step, &a.id, None)
+                        .await?;
+                }
+                continue;
+            }
+            let attempt = match open_gate_attempt(gate) {
+                Some(a) => a.clone(),
+                None => {
+                    if events.is_none() {
+                        events = Some(self.db.events(run).await?);
+                    }
+                    let now = self.clock.now().await;
+                    let started = wait_began_at(events.as_deref().unwrap_or_default(), gate, now);
+                    // `None`: the gate left `Pending` under us (a release, a
+                    // reject, a cancel) — nothing to wait on.
+                    match self
+                        .db
+                        .open_gate_wait(run, &gate.step, started, now)
+                        .await?
+                    {
+                        Some(a) => a,
+                        None => continue,
+                    }
+                }
+            };
+            if settings.is_none() {
+                settings = Some(self.gate_settings(run).await?);
+            }
+            let gate_settings = settings
+                .as_ref()
+                .and_then(|m| m.get(gate.step.0.as_str()).cloned())
+                .unwrap_or_default();
+            let now = self.clock.now().await;
+            if let Some(verdict) = self
+                .gate_verdict(run, gate, &attempt, &gate_settings, &steps, now)
+                .await?
+            {
+                // Fenced on THIS wait: a wait superseded or cancelled since the
+                // snapshot takes no verdict.
+                resolve_gate(
+                    self.db,
+                    self.clock,
+                    run,
+                    gate,
+                    &verdict,
+                    None,
+                    Some(attempt.id.clone()),
+                )
+                .await?;
+            }
         }
         Ok(())
     }
 
-    /// Fail a still-unapproved gate that outlived its opt-in
-    /// `gate_expires_after` (ADR-0047). Default is indefinite — gates may wait
-    /// forever; only an authored expiry arms this. The failed gate makes its
-    /// dependents dep-dead (skipped) and the run settles `Failed` — a code
-    /// verdict ("nobody approved in time"), not a dead-letter.
-    async fn expire_elapsed_gate(&self, run: &RunId) -> Result<(), SchedulerError> {
-        // The timer auto-release above may have already resumed the run.
-        if self.db.run_status(run).await? != Some(RunStatus::Suspended) {
-            return Ok(());
+    /// The decision, if any, for a waiting gate at `now` — measured from ITS
+    /// Attempt's frozen `started_at`, never from the run's suspension.
+    ///
+    /// 1. The kind's own verdict first (so a timer that elapses at the same
+    ///    instant as its deadline passes): `timer` passes at
+    ///    `started_at + gate_after`; `deployment` asks the
+    ///    [`DeploymentGates`] oracle about this Attempt
+    ///    ([`deployment_gate_verdict`](Self::deployment_gate_verdict)).
+    ///    `manual` and `external` pass only by an explicit [`release_gate`].
+    /// 2. Then **expiry**, for any kind with `gate_expires_after`: failed at
+    ///    `started_at + gate_expires_after`.
+    async fn gate_verdict(
+        &self,
+        run: &RunId,
+        gate: &StepRun,
+        attempt: &Attempt,
+        settings: &GateSettings,
+        steps: &[StepRun],
+        now: Timestamp,
+    ) -> Result<Option<GateVerdict>, SchedulerError> {
+        let started = attempt.started_at.0;
+        match gate.gate_kind.as_deref() {
+            Some("timer") => {
+                if let Some(wait_secs) = self.db.gate_timer_seconds(run, &gate.step).await? {
+                    if now.0 >= started.saturating_add(wait_secs.saturating_mul(1000)) {
+                        return Ok(Some(GateVerdict {
+                            passed: true,
+                            reason: format!(
+                                "timer elapsed ({wait_secs}s after its needs finished)"
+                            ),
+                            expired: false,
+                            deployment: None,
+                        }));
+                    }
+                }
+            }
+            Some("deployment") => {
+                if let Some(verdict) = self
+                    .deployment_gate_verdict(run, gate, attempt, settings, steps, now)
+                    .await?
+                {
+                    return Ok(Some(verdict));
+                }
+            }
+            _ => {}
         }
-        let steps = self.db.steps_of_run(run).await?;
-        let done: HashMap<&StepId, StepStatus> =
-            steps.iter().map(|s| (&s.step, s.status)).collect();
-        let Some(gate) = steps.iter().find(|s| {
-            s.status == StepStatus::Pending
-                && s.is_gate()
-                && s.needs
-                    .iter()
-                    .all(|d| done.get(d).copied() == Some(StepStatus::Succeeded))
-        }) else {
-            return Ok(());
-        };
-        let Some(expiry_secs) = self.gate_expiry_secs(run, &gate.step).await? else {
-            return Ok(());
-        };
-        let Some(suspended_at) = self.suspended_at(run).await? else {
-            return Ok(());
-        };
+        if let Some(expiry_secs) = settings.expires_after_secs {
+            if now.0 >= started.saturating_add(expiry_secs.saturating_mul(1000)) {
+                return Ok(Some(GateVerdict {
+                    passed: false,
+                    reason: format!("not released within {expiry_secs}s of its needs finishing"),
+                    expired: true,
+                    deployment: None,
+                }));
+            }
+        }
+        Ok(None)
+    }
 
-        let now = self.clock.now().await;
-        if now.0 < suspended_at + expiry_secs.saturating_mul(1000) {
-            return Ok(());
-        }
-        match self
-            .db
-            .record_step_transition(run, &gate.step, StepStatus::Pending, StepStatus::Failed)
+    /// A waiting DeploymentGate's verdict (slice b, criterion 2; ADR-0070 §8).
+    ///
+    /// The request it waits on is the one Run creation recorded for it — the
+    /// `run_deployment_requests` row of its `deployment.step` (any step's,
+    /// for a run with no stored IR) whose `gate_steps` names it. A
+    /// DeploymentGate with **no** such row (its
+    /// reference was lost, or the Run was created before DeploymentGates
+    /// existed) fails at once, with that as its reason: the rows are written
+    /// before any step exists and never change, so waiting could only end in
+    /// its expiry or forever.
+    ///
+    /// Otherwise the [`DeploymentGates`] oracle is asked about this Attempt:
+    /// its first wait on the request opens at the start of the deploy Step's
+    /// Attempt that **succeeded** and recorded it — its latest `Succeeded`
+    /// Attempt in `steps` (the pass's snapshot; durable rows, so a restart
+    /// reads the same start) — which is the request's effective time unless
+    /// the deploy Step was retried (attribution stays at its first Attempt in
+    /// the Take; ADR-0070 §8). A wait after an earlier one already resolved
+    /// on that same request waits afresh, its `started_at` the window floor
+    /// ([`deployment_gate_waits_afresh`]; the journal is read only when the
+    /// gate has an earlier Attempt). No oracle wired, or an oracle error, is
+    /// **no decision** this tick (see [`DeploymentGates`]).
+    async fn deployment_gate_verdict(
+        &self,
+        run: &RunId,
+        gate: &StepRun,
+        attempt: &Attempt,
+        settings: &GateSettings,
+        steps: &[StepRun],
+        now: Timestamp,
+    ) -> Result<Option<GateVerdict>, SchedulerError> {
+        let Some(oracle) = self.deployments else {
+            return Ok(None);
+        };
+        let request = match &settings.deployment_step {
+            Some(requester) => self
+                .db
+                .run_deployment_requests(run, &StepId(requester.clone()))
+                .await?
+                .into_iter()
+                .find(|r| r.gate_steps.contains(&gate.step)),
+            // No IR to name the step (a hand-built run): look through every
+            // step's requests for the one recorded for this gate.
+            None => {
+                let mut found = None;
+                for step in steps {
+                    if step.is_gate() {
+                        continue;
+                    }
+                    found = self
+                        .db
+                        .run_deployment_requests(run, &step.step)
+                        .await?
+                        .into_iter()
+                        .find(|r| r.gate_steps.contains(&gate.step));
+                    if found.is_some() {
+                        break;
+                    }
+                }
+                found
+            }
+        };
+        let Some(request) = request else {
+            return Ok(Some(GateVerdict {
+                passed: false,
+                reason: format!(
+                    "no DeploymentRequest of step `{}` was recorded for this deployment gate",
+                    settings.deployment_step.as_deref().unwrap_or("?")
+                ),
+                expired: false,
+                deployment: None,
+            }));
+        };
+        // Only an earlier Attempt can have resolved: the first wait never
+        // reads the journal.
+        let events = if gate.attempts.iter().any(|a| a.id != attempt.id) {
+            self.db.events(run).await?
+        } else {
+            Vec::new()
+        };
+        let wait = deployment_gate_wait(gate, attempt, &request.step, steps, &events);
+        match oracle
+            .deployment_gate_verdict(run, &gate.step, &request, wait, now)
             .await
         {
-            Ok(()) => {
-                let now = self.clock.now().await;
-                self.append(
-                    run,
-                    EventPayload::GateExpired {
-                        step: gate.step.clone(),
-                    },
-                    now,
-                )
-                .await?;
-                self.append(
-                    run,
-                    EventPayload::StepTransitioned {
-                        step: gate.step.clone(),
-                        from: StepStatus::Pending,
-                        to: StepStatus::Failed,
-                    },
-                    now,
-                )
-                .await?;
-            }
-            // A racing release already settled the gate — exactly-once.
-            Err(DbError::Conflict) => return Ok(()),
-            Err(e) => return Err(e.into()),
+            Ok(Some(d)) => Ok(Some(GateVerdict {
+                passed: d.passed,
+                reason: d.reason,
+                expired: false,
+                deployment: d.deployment,
+            })),
+            // Still waiting, or the oracle could not decide this tick (it
+            // logs): ask again next tick.
+            Ok(None) | Err(_) => Ok(None),
         }
-        // Resume so the next admission skips dependents and settles the run.
-        reopen(
-            self.db,
-            self.clock,
-            run,
-            RunStatus::Suspended,
-            RunStatus::Running,
-        )
-        .await
-        .map_err(|e| SchedulerError::Db(DbError::Other(e.to_string())))?;
-        Ok(())
     }
 
     /// Enforce the run's opt-in active-time `budget:` (ADR-0047). Returns
@@ -3039,6 +4462,7 @@ impl<'a> Scheduler<'a> {
             }
             self.transition_step(run, &step.step, step.status, StepStatus::Cancelled)
                 .await?;
+            cancel_open_gate_attempt(self.db, run, &step).await?;
         }
         self.append(
             run,
@@ -3057,27 +4481,6 @@ impl<'a> Scheduler<'a> {
         Ok(true)
     }
 
-    /// When the run most recently suspended (the latest `→ Suspended`
-    /// transition on the event log), or `None` if it never has.
-    async fn suspended_at(&self, run: &RunId) -> Result<Option<i64>, SchedulerError> {
-        Ok(self
-            .db
-            .events(run)
-            .await?
-            .iter()
-            .filter(|e| {
-                matches!(
-                    &e.kind,
-                    EventPayload::RunTransitioned {
-                        to: RunStatus::Suspended,
-                        ..
-                    }
-                )
-            })
-            .map(|e| e.at.0)
-            .max())
-    }
-
     /// The run's opt-in `budget:` (seconds) from its stored IR, if any.
     async fn run_budget_secs(&self, run: &RunId) -> Result<Option<i64>, SchedulerError> {
         Ok(self
@@ -3088,24 +4491,38 @@ impl<'a> Scheduler<'a> {
             .map(|b| b as i64))
     }
 
-    /// The gate's opt-in `gate_expires_after` (seconds) from the stored IR.
-    async fn gate_expiry_secs(
+    /// Every gate's opt-in `gate_expires_after` (seconds) from the stored IR,
+    /// keyed by step id — one IR read for all of a pass's gates.
+    /// Every gate's settings that live only in the run's IR, by step id: its
+    /// `gate_expires_after` and, for a DeploymentGate, its `deployment.step`.
+    async fn gate_settings(
         &self,
         run: &RunId,
-        step: &StepId,
-    ) -> Result<Option<i64>, SchedulerError> {
+    ) -> Result<HashMap<String, GateSettings>, SchedulerError> {
         let Some(ir) = self.db.run_ir(run).await? else {
-            return Ok(None);
+            return Ok(HashMap::new());
         };
         Ok(ir
             .get("steps")
             .and_then(|s| s.as_array())
             .into_iter()
             .flatten()
-            .find(|s| s.get("id").and_then(|i| i.as_str()) == Some(step.0.as_str()))
-            .and_then(|s| s.get("gate_expires_after"))
-            .and_then(|t| t.as_u64())
-            .map(|t| t as i64))
+            .filter_map(|s| {
+                let id = s.get("id").and_then(|i| i.as_str())?;
+                let settings = GateSettings {
+                    expires_after_secs: s
+                        .get("gate_expires_after")
+                        .and_then(|t| t.as_u64())
+                        .map(|secs| secs as i64),
+                    deployment_step: s
+                        .get("deployment")
+                        .and_then(|d| d.get("step"))
+                        .and_then(|d| d.as_str())
+                        .map(str::to_string),
+                };
+                Some((id.to_string(), settings))
+            })
+            .collect())
     }
 
     // --- helpers -----------------------------------------------------------
@@ -3115,34 +4532,36 @@ impl<'a> Scheduler<'a> {
     /// surface the skip on the event log, minting no attempt. A peer that already
     /// moved it is a benign `Conflict`.
     async fn skip_unchanged(&self, run: &RunId, step: &StepId) -> Result<(), SchedulerError> {
+        // The CAS and its events are one commit (git-bug 586187a): a failure
+        // leaves the step re-armed (`Pending`) for the next pass to skip.
+        let now = self.clock.now().await;
+        let events = [
+            EventPayload::StepSkipped {
+                step: step.clone(),
+                reason: "inputs unchanged".to_string(),
+            },
+            EventPayload::StepTransitioned {
+                step: step.clone(),
+                from: StepStatus::Pending,
+                to: StepStatus::Succeeded,
+            },
+        ]
+        .map(|kind| event(run, kind, now));
         match self
             .db
-            .record_step_transition(run, step, StepStatus::Pending, StepStatus::Succeeded)
+            .commit_step_transition(
+                run,
+                step,
+                StepStatus::Pending,
+                StepStatus::Succeeded,
+                AttemptFrontier::Any,
+                None,
+                &events,
+                &[],
+            )
             .await
         {
-            Ok(()) => {
-                let now = self.clock.now().await;
-                self.append(
-                    run,
-                    EventPayload::StepSkipped {
-                        step: step.clone(),
-                        reason: "inputs unchanged".to_string(),
-                    },
-                    now,
-                )
-                .await?;
-                self.append(
-                    run,
-                    EventPayload::StepTransitioned {
-                        step: step.clone(),
-                        from: StepStatus::Pending,
-                        to: StepStatus::Succeeded,
-                    },
-                    now,
-                )
-                .await?;
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(DbError::Conflict) => Ok(()),
             Err(e) => Err(e.into()),
         }
@@ -3241,7 +4660,15 @@ impl<'a> Scheduler<'a> {
             // spec cannot re-create evicted content; the recovery is a
             // Rerun/Retry, whose planner widens to the producing steps
             // (ADR-0061 s5) — burning 3 attempts first was the bug.
-            FailureKind::Config | FailureKind::MissingInputs => 1,
+            // A gate verdict is final for its wait; a new wait is a human
+            // Retry (gates never route here today — belt and braces).
+            // A DeploymentRequest the Step's results cannot complete is
+            // finalized directly by `succeed_step` (never routed here) — also
+            // belt and braces: the same command writes the same results.
+            FailureKind::Config
+            | FailureKind::MissingInputs
+            | FailureKind::Gate
+            | FailureKind::DeploymentRequestIncomplete => 1,
             _ => configured.unwrap_or(1),
         };
 
@@ -3277,6 +4704,9 @@ impl<'a> Scheduler<'a> {
                 if !step.status.is_terminal() {
                     self.transition_step(run, &step.step, step.status, StepStatus::Cancelled)
                         .await?;
+                    // A gate dead-lettered mid-wait: close its open Attempt
+                    // too, as the other cancel paths do.
+                    cancel_open_gate_attempt(self.db, run, &step).await?;
                 }
             }
             // Shared services (ADR-0058) are NOT steps, so the loop above never
@@ -3334,36 +4764,40 @@ impl<'a> Scheduler<'a> {
         kind: FailureKind,
         cause: Option<String>,
     ) -> Result<(), SchedulerError> {
+        // The CAS and its events are one commit (git-bug 586187a).
+        let now = self.clock.now().await;
+        let events = [
+            EventPayload::AttemptFinished {
+                step: step.clone(),
+                attempt: attempt.clone(),
+                failure: Some(kind),
+                cause,
+            },
+            EventPayload::StepTransitioned {
+                step: step.clone(),
+                from: StepStatus::Running,
+                to: StepStatus::Ready,
+            },
+        ]
+        .map(|k| event(run, k, now));
         match self
             .db
-            .record_step_transition(run, step, StepStatus::Running, StepStatus::Ready)
+            .commit_step_transition(
+                run,
+                step,
+                StepStatus::Running,
+                StepStatus::Ready,
+                // Only while `attempt` is still the latest (git-bug 7f0744c):
+                // a status-only CAS would match a rerun's newer Running
+                // attempt and re-arm it on this attempt's stale failure.
+                AttemptFrontier::Is(Some(attempt)),
+                None,
+                &events,
+                &[],
+            )
             .await
         {
-            Ok(()) => {
-                let now = self.clock.now().await;
-                self.append(
-                    run,
-                    EventPayload::AttemptFinished {
-                        step: step.clone(),
-                        attempt: attempt.clone(),
-                        failure: Some(kind),
-                        cause,
-                    },
-                    now,
-                )
-                .await?;
-                self.append(
-                    run,
-                    EventPayload::StepTransitioned {
-                        step: step.clone(),
-                        from: StepStatus::Running,
-                        to: StepStatus::Ready,
-                    },
-                    now,
-                )
-                .await?;
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(DbError::Conflict) => Ok(()),
             Err(e) => Err(e.into()),
         }
@@ -3409,6 +4843,171 @@ impl<'a> Scheduler<'a> {
             .and_then(|r| serde_json::from_value(r.clone()).ok()))
     }
 
+    /// Finalize a step whose execution exited 0 (slice b, criterion 1;
+    /// ADR-0070 §7, §8). A step that makes no DeploymentRequest is plain
+    /// [`finalize_step`](Self::finalize_step)`(Succeeded)`. One that does
+    /// completes each request from `results` — this Attempt's own:
+    ///
+    /// - a request its results cannot complete fails the step
+    ///   [`FailureKind::DeploymentRequestIncomplete`] ("DeploymentRequest
+    ///   incomplete: …"), directly — never through the retry loop, so a
+    ///   `retry:` does not re-run a deploy Step that already pushed;
+    ///   When the backend reports that it failed to *deliver* the Attempt's
+    ///   results ([`Executor::results_delivery_failure`] — on Kubernetes the
+    ///   results-egress sidecar exited non-zero), the reason says so instead
+    ///   of telling the author to write `/scarab/results/<name>.json`
+    ///   (git-bug `0cb5895`), and when the backend cannot say, the reason says
+    ///   delivery could not be checked; every wording names the missing
+    ///   results; the class and the no-retry rule are unchanged;
+    /// - otherwise the success transition, the attempt outcome and one
+    ///   Deployment input per request land in ONE commit
+    ///   ([`Db::finish_step_with_deployment_requests`]), each request
+    ///   effective at the `started_at` of the step's **first Attempt in its
+    ///   current Take** ([`deployment_request_first_attempt`]; git-bug
+    ///   `2b5d9d9`) — when the change was first being made, on the
+    ///   control-plane clock — and received at `now`. A `Conflict` (a peer
+    ///   finalized the step) appends nothing and no events; any other error
+    ///   leaves the step `Running` for the next re-drive;
+    /// - a request whose DeploymentTarget the commit finds homed in another
+    ///   Environment ([`crate::DeployStepFinish::TargetHomedElsewhere`];
+    ///   git-bug 9e66f2c) records nothing and fails the step
+    ///   [`FailureKind::DeploymentRequestIncomplete`], naming the home.
+    ///
+    /// With the usual `AttemptFinished` + `StepTransitioned` events, exactly as
+    /// `finalize_step` writes them — in the same commit (git-bug 586187a).
+    async fn succeed_step(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        handle: &ExecHandle,
+        results: &BTreeMap<String, serde_json::Value>,
+    ) -> Result<(), SchedulerError> {
+        // The same stale-/torn-down-observation guard as
+        // `settle_failed_attempt`, before EITHER branch: an exit 0 observed for
+        // an attempt that is no longer the step's frontier (a successor runs
+        // under a higher fence) or that carries a terminal-by-intent outcome
+        // (`Superseded`, `Cancelled`) is not this step's verdict. It writes
+        // nothing — no step transition, no DeploymentRequest — and returns
+        // `Ok`, so the caller still retires the outbox message. The Db call
+        // re-checks "latest attempt" inside its commit (the window between
+        // this read and that commit).
+        let attempts = self.db.attempts_of_step(run, step).await?;
+        let is_frontier = attempts.last().map(|a| &a.id) == Some(attempt);
+        let torn_down = attempts.iter().find(|a| &a.id == attempt).is_some_and(|a| {
+            matches!(
+                a.outcome,
+                AttemptOutcome::Superseded | AttemptOutcome::Cancelled
+            )
+        });
+        if !is_frontier || torn_down {
+            return Ok(());
+        }
+        let requests = self.db.run_deployment_requests(run, step).await?;
+        let Some(org) = requests.first().map(|r| r.org.clone()) else {
+            return self
+                .finalize_step(run, step, attempt, StepStatus::Succeeded, None, None)
+                .await;
+        };
+        let started_at = attempts
+            .iter()
+            .find(|a| &a.id == attempt)
+            .map(|a| a.started_at)
+            .ok_or_else(|| {
+                DbError::Other(format!(
+                    "step `{}` attempt `{}`: no attempt row to take the \
+                     DeploymentRequest's effective time from",
+                    step.0, attempt.0
+                ))
+            })?;
+        // The effective time is the start of the step's FIRST Attempt in its
+        // current Take (git-bug 2b5d9d9): an `a1` that pushed the change and
+        // then died made it, so the request `a2` records must explain the
+        // Deployment the source reported in between. Never later than the
+        // succeeding Attempt's own start (the fallback when the log cannot
+        // name the first Attempt).
+        let effective_at = deployment_request_first_attempt(&self.db.events(run).await?, step)
+            .and_then(|first| attempts.iter().find(|a| a.id == first))
+            .map_or(started_at, |a| a.started_at.min(started_at));
+        let inputs =
+            match crate::complete_deployment_inputs(run, step, &requests, results, effective_at) {
+                Ok(inputs) => inputs,
+                Err(incomplete) => {
+                    let reason = self.incomplete_reason(handle, &incomplete).await;
+                    return self
+                        .finalize_step(
+                            run,
+                            step,
+                            attempt,
+                            StepStatus::Failed,
+                            Some(FailureKind::DeploymentRequestIncomplete),
+                            Some(reason),
+                        )
+                        .await;
+                }
+            };
+        // The receipt time is read right before the commit (see
+        // `append_deployment_input`): an early reading is monotone through the
+        // store's GREATEST, but needlessly early.
+        let received_at = self.clock.now().await;
+        let events = self
+            .finalize_events(run, step, attempt, StepStatus::Succeeded, None, None)
+            .await;
+        match self
+            .db
+            .finish_step_with_deployment_requests(
+                run,
+                step,
+                attempt,
+                &org,
+                &inputs,
+                received_at,
+                &events,
+            )
+            .await
+        {
+            Ok(crate::DeployStepFinish::Recorded) => Ok(()),
+            // Another Environment's Run recorded the target first (git-bug
+            // 9e66f2c): nothing of ours landed, so fail the Step — the same
+            // class as a request its results cannot complete (the Step ran,
+            // nothing is recorded, never auto-retried).
+            Ok(crate::DeployStepFinish::TargetHomedElsewhere(elsewhere)) => {
+                self.finalize_step(
+                    run,
+                    step,
+                    attempt,
+                    StepStatus::Failed,
+                    Some(FailureKind::DeploymentRequestIncomplete),
+                    Some(elsewhere.reason()),
+                )
+                .await
+            }
+            Err(DbError::Conflict) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The DeploymentRequest-incomplete reason, worded for what the backend
+    /// says about delivering the Attempt's results (git-bug `0cb5895`):
+    /// failed → the delivery is blamed; delivered (or nothing to deliver) →
+    /// the author-facing reason; **could not be checked** (a backend error,
+    /// or the execution's unit already gone) → it says so, blaming neither.
+    /// Every wording names the missing results. Best-effort, like the other
+    /// settle-time evidence reads: the verdict — incomplete, never
+    /// auto-retried — is the same either way; only its wording depends on
+    /// this.
+    async fn incomplete_reason(
+        &self,
+        handle: &ExecHandle,
+        incomplete: &crate::DeploymentRequestIncomplete,
+    ) -> String {
+        match self.executor.results_delivery_failure(handle).await {
+            Ok(Some(how)) => incomplete.undelivered_reason(&how),
+            Ok(None) => incomplete.author_reason(),
+            Err(e) => incomplete.unchecked_reason(&e.to_string()),
+        }
+    }
+
     async fn finalize_step(
         &self,
         run: &RunId,
@@ -3419,66 +5018,87 @@ impl<'a> Scheduler<'a> {
         cause: Option<String>,
     ) -> Result<(), SchedulerError> {
         // Optimistic guard: if a peer already finalized this step, our UPDATE
-        // matches zero rows (Conflict) — we skip the duplicate events but still
+        // matches zero rows (Conflict) — we write no duplicate events but still
         // let the caller retire the outbox message. Exactly-once step terminus.
+        //
+        // The CAS, the attempt's terminal stamp and the events are ONE commit
+        // (git-bug 586187a): a crash can no longer leave a terminal step with
+        // no journal entry (which no re-drive could ever write — its CAS would
+        // conflict). A failure leaves the step `Running` for the re-drive.
+        //
+        // Stamp the attempt's terminal outcome (ADR-0056 amendment) so it never
+        // renders as a green `failed:false` attempt. `Succeeded` here; on the
+        // Failed terminus record the classified failure — which also stamps
+        // `Failed` — covering the direct-finalize paths (e.g. a launch-time
+        // interpolation failure) that never routed through
+        // `settle_failed_attempt`. Idempotent when they did.
+        let stamp = match (to, failure) {
+            (StepStatus::Succeeded, _) => Some(AttemptStamp::Outcome(AttemptOutcome::Succeeded)),
+            (StepStatus::Failed, Some(kind)) => Some(AttemptStamp::Failure {
+                kind,
+                detail: cause.clone(),
+            }),
+            (StepStatus::Failed, None) => Some(AttemptStamp::Outcome(AttemptOutcome::Failed)),
+            _ => None,
+        };
+        let events = self
+            .finalize_events(run, step, attempt, to, failure, cause)
+            .await;
         match self
             .db
-            .record_step_transition(run, step, StepStatus::Running, to)
+            .commit_step_transition(
+                run,
+                step,
+                StepStatus::Running,
+                to,
+                // The verdict is `attempt`'s, so it may land only while that
+                // attempt is still the step's latest (git-bug 7f0744c). The
+                // callers read the frontier and then await more I/O; in that
+                // window the Run can be cancelled, rerun and the step claimed
+                // on a newer attempt, whose `Running` a status-only CAS would
+                // match — finalizing the rerun's step on a stale verdict.
+                AttemptFrontier::Is(Some(attempt)),
+                stamp.as_ref().map(|s| (attempt, s)),
+                &events,
+                &[],
+            )
             .await
         {
-            Ok(()) => {
-                // Stamp the attempt's terminal outcome (ADR-0056 amendment) so it
-                // never renders as a green `failed:false` attempt. `Succeeded`
-                // here; on the Failed terminus record the classified failure —
-                // which also stamps `Failed` — covering the direct-finalize paths
-                // (e.g. a launch-time interpolation failure) that never routed
-                // through `settle_failed_attempt`. Idempotent when they did.
-                match to {
-                    StepStatus::Succeeded => {
-                        self.db
-                            .set_attempt_outcome(run, step, attempt, AttemptOutcome::Succeeded)
-                            .await?;
-                    }
-                    StepStatus::Failed => {
-                        if let Some(kind) = failure {
-                            self.db
-                                .set_attempt_failure(run, step, attempt, kind, cause.as_deref())
-                                .await?;
-                        } else {
-                            self.db
-                                .set_attempt_outcome(run, step, attempt, AttemptOutcome::Failed)
-                                .await?;
-                        }
-                    }
-                    _ => {}
-                }
-                let now = self.clock.now().await;
-                self.append(
-                    run,
-                    EventPayload::AttemptFinished {
-                        step: step.clone(),
-                        attempt: attempt.clone(),
-                        failure,
-                        cause,
-                    },
-                    now,
-                )
-                .await?;
-                self.append(
-                    run,
-                    EventPayload::StepTransitioned {
-                        step: step.clone(),
-                        from: StepStatus::Running,
-                        to,
-                    },
-                    now,
-                )
-                .await?;
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(DbError::Conflict) => Ok(()),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// The events of a `Running → to` step finalization: `AttemptFinished`
+    /// then `StepTransitioned`, at one instant — written in the same commit
+    /// as the transition itself, so only the CAS winner's land.
+    async fn finalize_events(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        to: StepStatus,
+        failure: Option<FailureKind>,
+        cause: Option<String>,
+    ) -> Vec<EventKind> {
+        let at = self.clock.now().await;
+        [
+            EventPayload::AttemptFinished {
+                step: step.clone(),
+                attempt: attempt.clone(),
+                failure,
+                cause,
+            },
+            EventPayload::StepTransitioned {
+                step: step.clone(),
+                from: StepStatus::Running,
+                to,
+            },
+        ]
+        .into_iter()
+        .map(|kind| event(run, kind, at))
+        .collect()
     }
 
     /// The pipeline-level shared services declared in the run's stored IR
@@ -3741,31 +5361,17 @@ impl<'a> Scheduler<'a> {
         from: RunStatus,
         to: RunStatus,
     ) -> Result<(), SchedulerError> {
-        match self.db.record_transition(run, from, to).await {
-            Ok(()) => {
-                let now = self.clock.now().await;
-                self.append(run, EventPayload::RunTransitioned { from, to }, now)
-                    .await?;
-                // Notify external observers (e.g. forge commit-status posting)
-                // exactly-once via the outbox. The key is unique per (run, state),
-                // so a re-driven transition enqueues at most one post.
-                self.db
-                    .enqueue_outbox(&OutboxMessage {
-                        id: crate::OutboxId(0),
-                        run: run.clone(),
-                        kind: RUN_STATUS_CHANGED.to_string(),
-                        payload: serde_json::json!({ "to": to }),
-                        idempotency_key: format!("status:{}:{to:?}", run.0),
-                        at: now,
-                    })
-                    .await?;
-                Ok(())
-            }
-            Err(DbError::Conflict) => Ok(()),
+        // The CAS, its journal entry and the exactly-once notification of
+        // external observers (forge commit statuses) are one commit.
+        let now = self.clock.now().await;
+        match commit_run_transition(self.db, run, from, to, now, true, &[]).await {
+            Ok(()) | Err(DbError::Conflict) => Ok(()),
             Err(e) => Err(e.into()),
         }
     }
 
+    /// A guarded step transition and its `StepTransitioned` as one commit
+    /// (git-bug 586187a). A lost CAS is benign (`Ok`, nothing written).
     async fn transition_step(
         &self,
         run: &RunId,
@@ -3773,20 +5379,46 @@ impl<'a> Scheduler<'a> {
         from: StepStatus,
         to: StepStatus,
     ) -> Result<(), SchedulerError> {
-        match self.db.record_step_transition(run, step, from, to).await {
-            Ok(()) => {
-                let now = self.clock.now().await;
-                self.append(
-                    run,
-                    EventPayload::StepTransitioned {
-                        step: step.clone(),
-                        from,
-                        to,
-                    },
-                    now,
-                )
-                .await
-            }
+        self.transition_step_with(run, step, from, to, Vec::new())
+            .await
+    }
+
+    /// [`transition_step`](Self::transition_step), with `preceding` events
+    /// (e.g. the reason for the transition) journaled in the same commit,
+    /// before the `StepTransitioned`.
+    async fn transition_step_with(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        from: StepStatus,
+        to: StepStatus,
+        preceding: Vec<EventPayload>,
+    ) -> Result<(), SchedulerError> {
+        let now = self.clock.now().await;
+        let events: Vec<EventKind> = preceding
+            .into_iter()
+            .chain([EventPayload::StepTransitioned {
+                step: step.clone(),
+                from,
+                to,
+            }])
+            .map(|kind| event(run, kind, now))
+            .collect();
+        match self
+            .db
+            .commit_step_transition(
+                run,
+                step,
+                from,
+                to,
+                AttemptFrontier::Any,
+                None,
+                &events,
+                &[],
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
             Err(DbError::Conflict) => Ok(()),
             Err(e) => Err(e.into()),
         }
@@ -3807,5 +5439,15 @@ impl<'a> Scheduler<'a> {
             })
             .await?;
         Ok(())
+    }
+}
+
+/// An [`EventKind`] of this build's schema version.
+fn event(run: &RunId, kind: EventPayload, at: Timestamp) -> EventKind {
+    EventKind {
+        version: EVENT_VERSION,
+        run: run.clone(),
+        kind,
+        at,
     }
 }

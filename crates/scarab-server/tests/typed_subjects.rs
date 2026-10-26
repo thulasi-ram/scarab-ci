@@ -21,7 +21,7 @@ use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_engine::Db;
 use scarab_identity::{IdentityStore, ProviderIdentity, RbacStore, Role, Scope};
-use scarab_project::EnvironmentStore;
+use scarab_project::{EnvironmentGovernanceStore, OrgEnvironmentStore};
 use scarab_server::{router, AppState, LogService};
 use scarab_testkit::{FakeClock, InMemoryObjectStore};
 
@@ -36,6 +36,8 @@ fn app(pg: Arc<PostgresDb>) -> axum::Router {
     router(
         AppState::new(db, Arc::new(FakeClock::new(1_000)), logs)
             .with_environments(pg.clone())
+            .with_org_environments(pg.clone())
+            .with_environment_governance(pg.clone())
             .with_rbac(pg.clone())
             .with_identities(pg.clone()),
     )
@@ -148,42 +150,86 @@ async fn grants_and_approvers_must_name_an_existing_principal() {
     );
     assert_eq!(pg.role_of("okta:alice", &web).await.unwrap(), None);
 
-    // Approver lists: one unknown entry refuses the whole write…
-    let rules = |approvers: &[&str]| {
-        serde_json::json!({
-            "approvers": approvers, "wait_timer": 0, "allowed_refs": [], "concurrency": 1,
-        })
-    };
+    // Approver lists. The per-repo write that took them is retired (410,
+    // ADR-0071); approvers are written on an org Environment's baseline and
+    // on a Project's overlay, and both check them exactly as it did.
     let (status, msg) = send(
         &app,
         "PUT",
         "/v1/repos/acme/web/environments/prod",
-        Some(rules(&["github:alice", "github:mallory"])),
+        Some(serde_json::json!({
+            "approvers": ["github:mallory"], "wait_timer": 0, "allowed_refs": [], "concurrency": 1,
+        })),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{msg}");
-    assert!(msg.contains("github:mallory"), "{msg}");
-    assert!(pg
-        .get_environment("acme", "web", "prod")
-        .await
-        .unwrap()
-        .is_none());
-
-    // …and a merged entry is stored as the Principal it now is.
+    assert_eq!(status, StatusCode::GONE, "{msg}");
     let (status, msg) = send(
         &app,
         "PUT",
-        "/v1/repos/acme/web/environments/prod",
-        Some(rules(&["okta:alice"])),
+        "/v1/orgs/acme/environments/prod",
+        Some(serde_json::json!({ "deployment_sources": [] })),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{msg}");
-    let env = pg
-        .get_environment("acme", "web", "prod")
+    let (status, msg) = send(
+        &app,
+        "PUT",
+        "/v1/orgs/acme/environments/prod/eligibility",
+        Some(serde_json::json!({ "all_projects": false, "projects": ["web"] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{msg}");
+
+    let approvers = |approvers: &[&str]| serde_json::json!({ "approvers": approvers });
+    let overlay = "/v1/orgs/acme/environments/prod/projects/web/overlay";
+    let baseline = "/v1/orgs/acme/environments/prod/protection";
+
+    // …one unknown entry refuses the whole write, on either layer…
+    for uri in [overlay, baseline] {
+        let (status, msg) = send(
+            &app,
+            "PUT",
+            uri,
+            Some(approvers(&["github:alice", "github:mallory"])),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {msg}");
+        assert!(msg.contains("github:mallory"), "{uri}: {msg}");
+    }
+    let stored = pg
+        .deploy_governance("acme", "web", "prod")
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(env.protection.approvers, vec!["github:alice"]);
+    assert!(stored.overlay.is_none(), "nothing written");
+    assert!(
+        stored.environment.protection.approvers.is_empty(),
+        "nothing written"
+    );
+
+    // …and a merged entry is stored as the Principal it now is.
+    for uri in [overlay, baseline] {
+        let (status, msg) = send(&app, "PUT", uri, Some(approvers(&["okta:alice"]))).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {msg}");
+    }
+    let stored = pg
+        .deploy_governance("acme", "web", "prod")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.overlay.unwrap().rules.approvers,
+        vec!["github:alice"]
+    );
+    assert_eq!(
+        pg.get_org_environment("acme", "prod")
+            .await
+            .unwrap()
+            .unwrap()
+            .protection
+            .approvers,
+        vec!["github:alice"]
+    );
 
     // The typeahead: by handle prefix, by display-name fragment, never merged
     // ids, and LIKE wildcards are literal.

@@ -14,6 +14,40 @@ use scarab_forge::RepoRef;
 use scarab_secrets::SecretScope;
 use serde::{Deserialize, Serialize};
 
+/// The org-level Environment (ADR-0071). Since the full migration (c-full c2)
+/// it alone governs Deploy Runs; the per-Project [`Environment`] below is the
+/// legacy shape the migration reads.
+mod org_environment;
+pub use org_environment::{
+    validate_org_environment_name, EnvironmentDeploymentDeadline, EnvironmentDeploymentSource,
+    OrgEnvironment, OrgEnvironmentError, OrgEnvironmentStore,
+    MAX_ENVIRONMENT_DEPLOYMENT_DEADLINE_MS, MAX_ENVIRONMENT_DEPLOYMENT_SOURCES,
+    MAX_INSTALLATION_NAME_CHARS, MAX_ORG_ENVIRONMENT_DESCRIPTION_CHARS, MAX_VENDOR_GROUPING_CHARS,
+    MIN_ENVIRONMENT_DEPLOYMENT_DEADLINE_MS,
+};
+
+/// The org-level Environment's governance model and its pure resolution
+/// (ADR-0071 §2, §3, §8, §10): baseline, tighten-only overlay, eligibility,
+/// per-Project privilege grant, the migration from the per-Project
+/// [`Environment`], and the store admission reads them through.
+mod environment_governance;
+pub use environment_governance::{
+    effective_protection, migrate_legacy_environment, AllowedRefConstraint, DeployGovernance,
+    DeploymentTargetHome, EffectiveProtection, EnvironmentGovernanceStore,
+    EnvironmentMigrationAcknowledgement, EnvironmentMigrationReport,
+    EnvironmentMigrationReportProject, EnvironmentProjectEligibility, EnvironmentProjectOverlay,
+    EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord, EnvironmentProtectionRules,
+    LegacyRuleField,
+};
+
+/// Which Environment governance edits loosen it (ADR-0073 §3): the pure,
+/// fail-closed rules that decide whether a conditional write needs a step-up.
+mod step_up_loosening;
+pub use step_up_loosening::{
+    deployment_source_additions, eligibility_loosenings, glob_subsumes, overlay_loosenings,
+    privilege_grant_loosenings, protection_loosenings, Loosening,
+};
+
 /// A top-level tenant. Owns Projects. The Scarab tenancy boundary — **not**
 /// the forge's `owner` namespace (one Org may span a GitHub org *and* a
 /// Forgejo instance).
@@ -55,7 +89,13 @@ impl Project {
     }
 }
 
-/// A deployment environment with its protection rules.
+/// A deployment environment with its protection rules — the **legacy**
+/// per-Project ADR-0037 shape. Since ADR-0071's migration (c-full c2) nothing
+/// admits a Run by it: the migration turned each one into an
+/// [`EnvironmentProjectOverlay`] (and, where it carried privileges, an
+/// [`EnvironmentProjectPrivilegeGrant`]) via [`migrate_legacy_environment`].
+/// Kept to deserialise the frozen `legacy_project_environments` rows and as
+/// the oracle the migration's golden tests decide against.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Environment {
     pub name: String,
@@ -241,58 +281,72 @@ impl ProtectionRules {
         image: &str,
         locked_out: bool,
     ) -> Result<AdmittedGrants, Vec<String>> {
-        let mut admitted = AdmittedGrants::default();
-        let mut violations = Vec::new();
+        admit_grants_against_whitelist(&self.privileged_images, req, image, locked_out)
+    }
+}
 
-        // run-as-root: self-service, sandbox-bound.
-        admitted.run_as_root = req.run_as_root;
+/// The ADR-0039 grant decision against one privilege whitelist — the body
+/// [`ProtectionRules::admit_grants`] and ADR-0071's
+/// [`EnvironmentProjectPrivilegeGrant::admit_grants`] share, so the per-Project
+/// grant that replaces the per-Project whitelist decides **identically** by
+/// construction (ADR-0071 §8, §10 step 5) rather than by a copy kept in step.
+/// See [`ProtectionRules::admit_grants`] for the rules.
+fn admit_grants_against_whitelist(
+    whitelist: &[ImageGrant],
+    req: &GrantRequest,
+    image: &str,
+    locked_out: bool,
+) -> Result<AdmittedGrants, Vec<String>> {
+    let mut admitted = AdmittedGrants::default();
+    let mut violations = Vec::new();
 
-        let wants_governed = req.privileged || !req.add_capabilities.is_empty();
-        if wants_governed {
-            if locked_out {
-                return Err(vec![
-                    "fork-PR run is locked out of governed grants (add-capabilities/privileged)"
-                        .to_string(),
-                ]);
-            }
-            let digest = image_digest(image);
-            let entry =
-                digest.and_then(|d| self.privileged_images.iter().find(|g| g.image_digest == d));
-            match (digest, entry) {
-                (None, _) => violations.push(format!(
-                    "image `{image}` requests a governed grant but is not pinned to a digest (repo@sha256:…)"
-                )),
-                (Some(d), None) => violations.push(format!(
-                    "image digest `{d}` is not whitelisted for governed grants in this environment"
-                )),
-                (Some(_), Some(entry)) => {
-                    if req.privileged {
-                        if entry.privileged {
-                            admitted.privileged = true;
-                        } else {
-                            violations.push(
-                                "`privileged` is not granted to this image digest".to_string(),
-                            );
-                        }
+    // run-as-root: self-service, sandbox-bound.
+    admitted.run_as_root = req.run_as_root;
+
+    let wants_governed = req.privileged || !req.add_capabilities.is_empty();
+    if wants_governed {
+        if locked_out {
+            return Err(vec![
+                "fork-PR run is locked out of governed grants (add-capabilities/privileged)"
+                    .to_string(),
+            ]);
+        }
+        let digest = image_digest(image);
+        let entry = digest.and_then(|d| whitelist.iter().find(|g| g.image_digest == d));
+        match (digest, entry) {
+            (None, _) => violations.push(format!(
+                "image `{image}` requests a governed grant but is not pinned to a digest (repo@sha256:…)"
+            )),
+            (Some(d), None) => violations.push(format!(
+                "image digest `{d}` is not whitelisted for governed grants in this environment"
+            )),
+            (Some(_), Some(entry)) => {
+                if req.privileged {
+                    if entry.privileged {
+                        admitted.privileged = true;
+                    } else {
+                        violations.push(
+                            "`privileged` is not granted to this image digest".to_string(),
+                        );
                     }
-                    for cap in &req.add_capabilities {
-                        if entry.capabilities.iter().any(|c| c == cap) {
-                            admitted.add_capabilities.push(cap.clone());
-                        } else {
-                            violations.push(format!(
-                                "capability `{cap}` is not granted to this image digest"
-                            ));
-                        }
+                }
+                for cap in &req.add_capabilities {
+                    if entry.capabilities.iter().any(|c| c == cap) {
+                        admitted.add_capabilities.push(cap.clone());
+                    } else {
+                        violations.push(format!(
+                            "capability `{cap}` is not granted to this image digest"
+                        ));
                     }
                 }
             }
         }
+    }
 
-        if violations.is_empty() {
-            Ok(admitted)
-        } else {
-            Err(violations)
-        }
+    if violations.is_empty() {
+        Ok(admitted)
+    } else {
+        Err(violations)
     }
 }
 
@@ -328,8 +382,14 @@ pub enum ProjectError {
     Store(String),
 }
 
-/// Durable store for environments (with their protection rules) and the
-/// deployment history recorded against them. Keyed by the owning
+/// Durable store for the **legacy** per-Project environments and the legacy
+/// approval history recorded against them (ADR-0070 §1). Since ADR-0071's
+/// migration the environment half reads and writes the frozen
+/// `legacy_project_environments` table, which nothing in the server writes
+/// any more (the per-repo write API answers 410) and admission never reads;
+/// it survives for the golden tests and the split report. The history half
+/// (`record_deployment` / `deployments`) is still written on every gate
+/// release. Keyed by the owning
 /// [`Project`]'s natural key `(org, project)` (ADR-0046) — the project name
 /// is its repo's forge name (1:1 in v1), the key a run knows from its
 /// trigger (ADR-0037).

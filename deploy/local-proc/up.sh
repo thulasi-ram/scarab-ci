@@ -109,8 +109,10 @@ export KUBECONFIG="$kubeconfig"
 # workspace service has two audiences with different views of the network. The
 # host reaches it over loopback. A Pod cannot — `localhost` inside a Pod is the
 # Pod — and `kind.yaml` provides no route, no `extraPortMappings`, no
-# `extraMounts`. (`SCARAB_RESULTS_API_URL` has exactly this problem and is simply
-# unset here, which is why results egress is off in proc mode.)
+# `extraMounts`. (`SCARAB_RESULTS_API_URL` has exactly this problem. Results
+# egress stays OFF by default in proc mode; a caller that turns it on — by
+# setting SCARAB_RESULTS_TOKEN_SECRET in its overlay, as `just plugin-verify`
+# can — gets a URL derived from the SAME probed host below, never a guess.)
 #
 # The obvious answer is WRONG on this platform, and it fails silently, so it is
 # worth writing down: "use the kind docker network's gateway" assumes the gateway
@@ -324,6 +326,28 @@ fi
 echo "    a Pod reached the workspace service at http://$ws_host:$ws_port"
 export SCARAB_WORKSPACE_URL="http://$ws_host:$ws_port"
 
+# Results egress (ADR-0042), only when the caller turned it on (overlay sets
+# SCARAB_RESULTS_TOKEN_SECRET). The step Pod's sidecar POSTs to the CONTROL
+# PLANE's API port — a host process, so the same routing problem as the
+# workspace service, and the same answer: the host a Pod was just proven to
+# reach. Unlike a plugin Pod a step Pod has cluster DNS, so the name is fine.
+# A loopback-bound API is unreachable from any Pod: fatal, not a silent drop
+# (the sidecar's failed POST does not fail the step — the results would just
+# never arrive).
+if [ -n "${SCARAB_RESULTS_TOKEN_SECRET:-}" ] && [ -z "${SCARAB_RESULTS_API_URL:-}" ]; then
+  case "$addr" in
+    127.*|localhost:*|\[::1\]:*)
+      echo "error: results egress is on (SCARAB_RESULTS_TOKEN_SECRET) but SCARAB_ADDR=$addr is" >&2
+      echo "  loopback-bound: no Pod can reach it. Bind 0.0.0.0 in the overlay." >&2
+      rm -f "$here/workspace.pid"
+      kill "$workspace_pid" 2>/dev/null || true
+      exit 1
+      ;;
+  esac
+  export SCARAB_RESULTS_API_URL="http://$ws_host:${addr##*:}"
+  echo "    results egress on: step sidecars POST to $SCARAB_RESULTS_API_URL"
+fi
+
 # The workspace helper image (ADR-0061): the s3-feed fetcher init container AND
 # the egress hold/drain sidecar. kind cannot pull from the host's docker daemon,
 # so proc mode builds it and `kind load`s it — the same reason the clone image
@@ -343,6 +367,80 @@ if [ "${SCARAB_WSFETCH_SKIP_BUILD:-0}" != 1 ]; then
   echo "==> building + loading the workspace fetcher image ($SCARAB_WSFETCH_IMAGE)"
   docker build -q -t "$SCARAB_WSFETCH_IMAGE" -f "$root/docker/wsfetch/Dockerfile" "$root" >/dev/null
   kind load docker-image "$SCARAB_WSFETCH_IMAGE" --name "$cluster" >/dev/null
+fi
+
+# ---------------------------------------------------------------------------
+# Plugins (ADR-0072): the plugin namespace, and how a plugin Pod reaches the
+# CredentialBroker.
+#
+# The namespace is created every run (idempotent, cheap) with Pod Security
+# `restricted` — the plugin runtime only READS that label and refuses to run
+# anything without it, so this script (the operator, in proc mode) sets it.
+#
+# The broker is the server's second listener (SCARAB_BROKER_ADDR, :8090), so in
+# proc mode it is a HOST process exactly like the workspace service — same
+# routing problem, same answer. It is not probed directly: the server must know
+# the URL and the NetworkPolicy peer at BOOT, before its broker listens. The
+# host is the one a Pod was just proven to reach ($ws_host), taken AS A POD
+# RESOLVES IT ($broker_ip) for BOTH the peer (a NetworkPolicy ipBlock needs an
+# IP) and the URL: a plugin Pod has no DNS at all (its egress allows the broker
+# and nothing else — a resolver would be a tunnel out), and the server, a host
+# process, could not resolve the name the way a Pod does anyway (on darwin the
+# host's own idea of its address is the wrong one). Whether the broker then
+# actually answers a plugin is the isolation probe's job — it checks the
+# broker's healthz from a plugin-labelled Pod and fails closed.
+#
+# Only with SCARAB_PLUGINS=on (it costs one more throwaway Pod). A peer that
+# cannot be resolved is a warning, not fatal: the server then reports
+# "broker peer UNSET" at boot and the runtime refuses to start any plugin.
+plugins_ns="${SCARAB_PLUGIN_NAMESPACE:-scarab-plugins}"
+echo "==> ensuring plugin namespace '$plugins_ns' (Pod Security: restricted)"
+kubectl create namespace "$plugins_ns" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+kubectl label namespace "$plugins_ns" --overwrite \
+  pod-security.kubernetes.io/enforce=restricted \
+  pod-security.kubernetes.io/audit=restricted \
+  pod-security.kubernetes.io/warn=restricted >/dev/null
+export SCARAB_PLUGIN_NAMESPACE="$plugins_ns"
+broker_url=""
+broker_peer=""
+if [ "${SCARAB_PLUGINS:-off}" = on ]; then
+  broker_addr="${SCARAB_BROKER_ADDR:-0.0.0.0:8090}"
+  broker_port="${broker_addr##*:}"
+  case "$ws_host" in
+    *[!0-9.]*)
+      echo "==> resolving the broker host '$ws_host' as a Pod sees it"
+      # busybox nslookup prints the server's `Address:` BEFORE `Name:`; the
+      # answer's IPv4 `Address:` lines come after it.
+      resolve_script='nslookup "$H" 2>/dev/null | sed -n "/^Name:/,\$ s/^Address:[[:space:]]*\([0-9.]*\)\$/SCARAB_BROKER_IP=\1/p" | head -n 1'
+      resolve_pod="broker-resolve-$$"
+      kubectl delete pod "$resolve_pod" -n scarab --ignore-not-found --wait=false >/dev/null 2>&1 || true
+      kubectl run "$resolve_pod" -n scarab --image=busybox:1.36 --restart=Never \
+        --env="H=$ws_host" --command -- sh -c "$resolve_script" >/dev/null 2>&1 || true
+      for _ in $(seq 1 30); do
+        phase="$(kubectl get pod "$resolve_pod" -n scarab -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+        case "$phase" in Succeeded|Failed) break ;; esac
+        sleep 2
+      done
+      broker_ip="$(kubectl logs "$resolve_pod" -n scarab 2>/dev/null \
+                   | sed -n 's/^SCARAB_BROKER_IP=//p' | tr -d '\r' | head -n 1)"
+      kubectl delete pod "$resolve_pod" -n scarab --ignore-not-found --wait=false >/dev/null 2>&1 || true
+      ;;
+    *) broker_ip="$ws_host" ;;
+  esac
+  broker_url="${SCARAB_PLUGIN_BROKER_URL:-http://${broker_ip:-$ws_host}:$broker_port}"
+  if [ -n "${SCARAB_PLUGIN_BROKER_PEER:-}" ]; then
+    broker_peer="$SCARAB_PLUGIN_BROKER_PEER"
+  elif [ -n "${broker_ip:-}" ]; then
+    broker_peer="cidr:$broker_ip/32"
+  else
+    echo "    warning: could not resolve '$ws_host' from a Pod; SCARAB_PLUGIN_BROKER_PEER stays" >&2
+    echo "    unset and the plugin runtime will refuse to start any plugin." >&2
+  fi
+  export SCARAB_PLUGIN_BROKER_URL="$broker_url"
+  if [ -n "$broker_peer" ]; then
+    export SCARAB_PLUGIN_BROKER_PEER="$broker_peer"
+  fi
+  echo "    plugins reach the broker at $broker_url (NetworkPolicy peer: ${broker_peer:-UNSET})"
 fi
 
 # ---------------------------------------------------------------------------
@@ -375,7 +473,19 @@ SCARAB_TEST_WSFETCH_IMAGE=$SCARAB_WSFETCH_IMAGE
 # is reused rather than guessed a second time.
 SCARAB_TEST_HOST_IP=$ws_host
 SCARAB_TEST_KUBE_NS=${SCARAB_NAMESPACE:-scarab}
+# Plugins (ADR-0072): the plugin namespace, and — with SCARAB_PLUGINS=on — how a
+# plugin Pod reaches the broker (both discovered above, not guessed).
+SCARAB_PLUGIN_NAMESPACE=$plugins_ns
 EOF
+if [ -n "$broker_url" ]; then
+  echo "SCARAB_PLUGIN_BROKER_URL=$broker_url" >> "$generated"
+fi
+if [ -n "$broker_peer" ]; then
+  echo "SCARAB_PLUGIN_BROKER_PEER=$broker_peer" >> "$generated"
+fi
+if [ -n "${SCARAB_RESULTS_TOKEN_SECRET:-}" ] && [ -n "${SCARAB_RESULTS_API_URL:-}" ]; then
+  echo "SCARAB_RESULTS_API_URL=$SCARAB_RESULTS_API_URL" >> "$generated"
+fi
 echo "    live-tier env written to deploy/local-proc/.env.generated ('just kube-tests' reads it)"
 
 echo "==> starting scarab-server (converged) in the background"
@@ -391,6 +501,37 @@ fail_with_log() {
   exit 1
 }
 
+# ADR-0071 (c-full c2): a Deploy Run is admitted only into an org Environment
+# that exists AND lists its Project as eligible — a pipeline naming any other
+# `environment:` is refused (the webhook skips it; a dispatch answers 403).
+# The dogfood pipeline (.scarab/dogfood.yaml) deploys to `production`, so seed
+# that Environment, eligible for every Project, in the dogfood org. Only when
+# it is MISSING: the Environment PUT is a whole replace and the eligibility
+# PUT a replace too, so re-running `just up` must not undo what someone
+# configured since. Override the org with SCARAB_DEV_ORG.
+seed_environments() {
+  local org="${SCARAB_DEV_ORG:-thulasi-ram}" env_name="production" code
+  code="$(curl -s -o /dev/null -w '%{http_code}' "$base/v1/orgs/$org/environments/$env_name")"
+  case "$code" in
+    200)
+      echo "==> org Environment $org/$env_name exists; leaving it as configured"
+      return 0
+      ;;
+    404) ;;
+    *)
+      echo "warning: could not read org Environment $org/$env_name (HTTP $code); not seeding it" >&2
+      return 0
+      ;;
+  esac
+  curl -sf -X PUT "$base/v1/orgs/$org/environments/$env_name" -H 'content-type: application/json' \
+    -d '{"description":"seeded by just up (local-proc) for the dogfood pipeline","deployment_sources":[]}' \
+    >/dev/null || fail_with_log "seeding org Environment $org/$env_name failed"
+  curl -sf -X PUT "$base/v1/orgs/$org/environments/$env_name/eligibility" \
+    -H 'content-type: application/json' -d '{"all_projects":true}' >/dev/null \
+    || fail_with_log "making every project eligible for $org/$env_name failed"
+  echo "==> seeded org Environment $org/$env_name (eligible: all projects; permissive baseline)"
+}
+
 echo "==> waiting for the API (/healthz) from pid $server_pid"
 # The port was proven free above and this child is proven alive below, so a
 # /healthz that answers can only be answered by the server WE started. Both
@@ -402,6 +543,7 @@ for _ in $(seq 1 30); do
     fail_with_log "scarab-server (pid $server_pid) exited during startup; it never served $base"
   fi
   if curl -sf "$base/healthz" >/dev/null 2>&1; then
+    seed_environments
     echo "==> scarab-server is up on $base (pid $server_pid, logs: deploy/local-proc/server.log)"
     echo "    workspace service: $SCARAB_WORKSPACE_URL from a Pod, http://127.0.0.1:$ws_port from the host"
     echo "    run 'just demo' to submit a pipeline and watch it complete."

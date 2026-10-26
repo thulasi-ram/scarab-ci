@@ -687,8 +687,29 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   color: var(--muted);
   font-variant-numeric: tabular-nums;
 }
-/* Push the action to the trailing edge, matching .run-toolbar's alignment. */
-.gate-row .btn { margin-left: auto; }
+/* Push the actions to the trailing edge, matching .run-toolbar's alignment. */
+.gate-row { flex-wrap: wrap; }
+.gate-kind { font-size: 11px; color: var(--muted-sage); }
+.gate-hint { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gate-actions, .gate-reject {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.gate-reject .input { width: 18rem; max-width: 50vw; padding: 3px 8px; font-size: 12px; }
+/* A gate verdict / DeploymentGate wait / concurrency hold (slice b, crit. 5):
+ * the step pane's status line and the DAG node's meta tint. */
+.gate-status {
+  padding: 2px 12px 8px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--muted-sage);
+  overflow-wrap: anywhere;
+}
+.gate-status.passed, .dnode-meta.gnote.passed { color: var(--emerald); }
+.gate-status.failed, .dnode-meta.gnote.failed { color: var(--danger); }
+.gate-status.held, .dnode-meta.gnote.held { color: var(--copper); }
 .run-toolbar .btn-sm {
   display: inline-flex;
   align-items: center;
@@ -1670,8 +1691,20 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .env-panel .env-body { padding: 14px 16px; }
 .env-rules { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--sage); margin-bottom: 12px; }
 .env-history { display: flex; flex-direction: column; gap: 6px; }
+/* ADR-0071: baseline / overlay / privileges, one line each, above the history. */
+.env-layers { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
+.env-layers .env-h-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .env-h-row { font-size: 12px; color: var(--sage); }
 .ok-mark { color: var(--ok); margin: 0 4px; }
+/* The legacy approval list is labelled as such, and the panel header links to
+   the Deployment record (ADR-0070) — what is actually live. */
+.env-h-meta { display: inline-flex; align-items: center; gap: 12px; }
+.env-h-title { font-size: 10.5px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted-sage); }
+.env-deploy-link {
+  display: inline-flex; align-items: center; gap: 5px;
+  color: var(--sage); text-decoration: none;
+}
+.env-deploy-link:hover { color: var(--emerald); }
 
 /* ---- settings / secrets bodies ---- */
 .settings-body, .secrets-body { padding: 16px; display: flex; flex-direction: column; gap: 12px; }
@@ -3206,6 +3239,49 @@ h1, .crumb-head, .run-title {
 .tok-life-unit { font-size: 12px; color: var(--muted-sage); margin-right: 4px; }
 .tok-preset-on { border-color: var(--emerald); color: var(--emerald); }
 
+/* ---- org Environments (ADR-0071) ---- */
+/* Rows reuse the token block's rhythm (.tok/.tok-head/.tok-facts); only what a
+   token has no equivalent for is here: two actions, a description, a source
+   list, and the editable source rows in the dialog. */
+.oenv-actions { margin-left: auto; display: inline-flex; gap: 6px; }
+/* ADR-0071 §10 step 8: the split report above the Environment list. */
+.oenv-report { border: 1px dashed var(--line, currentColor); border-radius: 8px; padding: 10px 12px; margin-bottom: 12px; }
+.oenv-report-h { display: flex; align-items: center; gap: 8px; font-size: 12.5px; }
+.oenv-report-h .btn { margin-left: auto; }
+.oenv-report-projects { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
+.oenv-desc { font-size: 12.5px; color: var(--sage); }
+.oenv-sources { display: inline-flex; gap: 10px; flex-wrap: wrap; }
+.oenv-rows { display: grid; gap: 6px; }
+.oenv-row { display: grid; grid-template-columns: 1fr 1fr auto; gap: 6px; align-items: center; }
+@media (max-width: 560px) {
+  .oenv-row { grid-template-columns: 1fr auto; }
+  .oenv-row > :nth-child(2) { grid-column: 1; }
+}
+/* ---- Plugins (ADR-0072) ---- */
+/* Same block rhythm again; a plugin row adds a runtime line, the kill state,
+   and an expandable list of the groupings whose reports are being dropped. */
+.plg-enabled { color: var(--emerald); }
+.plg-killed { color: var(--danger); }
+.plg-msg { color: var(--sage); }
+.plg-toggle { margin-left: auto; }
+.plg-unmapped {
+  display: grid; gap: 7px;
+  margin-left: 6px; padding: 4px 0 2px 12px;
+  border-left: 1px dotted var(--border);
+}
+.plg-unmapped .empty, .plg-unmapped .error { margin: 0; }
+.plg-unmapped-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 12px; }
+.plg-grouping { color: var(--soft-white); font-size: 12.5px; }
+.plg-add { margin-left: auto; display: inline-flex; gap: 6px; align-items: center; }
+.plg-add select.input { width: auto; padding-top: 3px; padding-bottom: 3px; font-size: 12px; }
+.plg-caps { display: flex; gap: 6px; flex-wrap: wrap; }
+/* A board target's owners, under its label (ADR-0072 ownership reports). */
+.dep-owners { font-size: 11px; color: var(--muted-sage); margin-top: 2px; }
+
+/* A name the Deployment record carries with no org Environment behind it. */
+.fpill.oenv-unregistered { border-style: dashed; }
+.fpill.oenv-unregistered:not(.on) { color: var(--muted-sage); }
+
 /* ---- the one-time reveal ---- */
 /* Deliberately loud. This is the only moment the plaintext exists outside the
    holder's hands, and a quiet panel is one people close without reading. */
@@ -3269,3 +3345,93 @@ h1, .crumb-head, .run-title {
   font-size: 10.5px; color: var(--sage);
   border: 1px dotted var(--border); border-radius: 3px; padding: 0 5px;
 }
+
+/* ---- Deployments (ADR-0070) ---- */
+/* Tables sit inside a .panel, which already draws the frame. */
+.dep-table { border: none; border-radius: 0; }
+.dep-pad { padding: 12px 16px; margin: 0; }
+.dep-envs { margin-top: 8px; }
+.dep-cell { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.dep-table td .dep-target,
+.dep-table td.dep-target,
+.dep-table td.dep-version,
+.dep-table td .dep-version { color: var(--soft-white); }
+.dep-chev { width: 28px; padding-right: 0 !important; color: var(--muted-sage); }
+.dep-run { color: var(--sage); text-decoration: none; border-bottom: 1px dotted var(--border); }
+.dep-run[href]:hover { color: var(--emerald); border-bottom-color: var(--emerald); }
+/* Display terms, edged not filled — they annotate a status, never replace it. */
+.dep-tag {
+  font-family: var(--font-mono); font-size: 9.5px;
+  text-transform: uppercase; letter-spacing: 0.7px;
+  border: 1px dotted currentColor; border-radius: 3px; padding: 1px 5px;
+  white-space: nowrap;
+}
+.dep-tag-warn { color: var(--copper); }
+.dep-tag-muted { color: var(--muted-sage); }
+.dep-table tbody tr.dep-reports-row { cursor: default; }
+.dep-table tbody tr.dep-reports-row:hover { background: none; }
+.dep-table tbody tr.dep-reports-row td { padding-top: 0; }
+.dep-reports {
+  display: grid; gap: 7px;
+  margin-left: 28px; padding: 10px 12px;
+  border-left: 1px dotted var(--border);
+}
+.dep-report { display: flex; align-items: center; gap: 10px; font-size: 13px; flex-wrap: wrap; }
+.dep-label { color: var(--soft-white); }
+.dep-link { font-size: 11.5px; color: var(--sage); text-decoration: none; }
+.dep-link:hover { color: var(--emerald); }
+.dep-at { margin-left: auto; font-size: 11.5px; }
+
+/* ════════════════════════════════════════════════════════════════════════
+   Step-up confirmation (ADR-0073) — the confirm dialog, Account → Security,
+   Settings → Security, the confirm page, the app banner
+   ════════════════════════════════════════════════════════════════════════ */
+
+.step-up-modal { width: min(520px, 92vw); }
+/* What is being confirmed: the server's own summary, laid out as label/value
+   so the target and every change line read as data, not prose. */
+.step-up-summary {
+  display: grid; grid-template-columns: max-content 1fr; gap: 6px 14px; margin: 0;
+  font-size: 13px;
+}
+.step-up-summary dt {
+  font-family: var(--font-mono); font-size: 10.5px; text-transform: uppercase;
+  letter-spacing: 1px; color: var(--muted-sage); padding-top: 2px;
+}
+.step-up-summary dd { margin: 0; color: var(--soft-white); word-break: break-word; }
+.step-up-changes { list-style: none; margin: 0; padding: 0; display: grid; gap: 3px; font-size: 12px; }
+
+.sec-sub {
+  font-family: var(--font-mono); font-size: 11px; font-weight: 500; text-transform: uppercase;
+  letter-spacing: 1px; color: var(--muted-sage); margin: 18px 0 8px;
+}
+.sec-table { font-size: 12.5px; }
+.sec-table td { vertical-align: top; }
+.sec-table td:first-child, .sec-table td:nth-child(3) { white-space: nowrap; }
+.sec-kind { white-space: nowrap; }
+.sec-danger { color: var(--danger); }
+.sec-warn { color: var(--copper); }
+.sec-ok { color: var(--ok); }
+.sec-plain { color: var(--sage); }
+.sec-add, .sec-filter { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.sec-add .input { flex: 1 1 220px; max-width: 340px; }
+.sec-filter .input { max-width: 280px; }
+.sec-chips { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+.sec-chips li {
+  font-size: 12px; color: var(--copper); border: 1px dashed var(--border-copper);
+  border-radius: var(--radius-sm); padding: 2px 8px;
+}
+.sec-result { display: grid; gap: 10px; margin-top: 10px; }
+.sec-result-body {
+  margin: 0; background: var(--terminal); color: var(--terminal-ink);
+  border: 1px solid var(--terminal-line); border-radius: var(--radius-sm);
+  padding: 12px 14px; font-size: 12px; overflow-x: auto; max-height: 320px;
+}
+
+/* App-wide: admins without a passkey are refused every crown jewel. */
+.sec-banner {
+  display: flex; align-items: center; gap: 8px; padding: 7px 16px;
+  font-family: var(--font-mono); font-size: 12px; color: var(--copper);
+  border-bottom: 1px dashed var(--border-copper); background: var(--carapace-black);
+}
+.sec-banner-link { color: var(--emerald); margin-left: auto; }

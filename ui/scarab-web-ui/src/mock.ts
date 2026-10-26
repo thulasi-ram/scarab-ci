@@ -17,8 +17,23 @@
 import type { components } from "./api/schema";
 
 type RunStatusDto = components["schemas"]["RunStatusResponse"];
+type RunSummaryDto = components["schemas"]["RunSummaryDto"];
 type ArtifactDto = components["schemas"]["ArtifactDto"];
 type ServiceStatusDto = components["schemas"]["ServiceStatusDto"];
+type DeploymentDto = components["schemas"]["DeploymentDto"];
+type BoardRowDto = components["schemas"]["EnvironmentBoardRowDto"];
+type OrgEnvironmentDto = components["schemas"]["OrgEnvironmentDto"];
+type RulesDto = components["schemas"]["EnvironmentProtectionRulesDto"];
+type OverlayDto = components["schemas"]["EnvironmentProjectOverlayDto"];
+type GrantDto = components["schemas"]["EnvironmentProjectPrivilegeGrantDto"];
+type ProjectEnvironmentDto = components["schemas"]["ProjectEnvironmentDto"];
+type EnvironmentProjectDto = components["schemas"]["EnvironmentProjectDto"];
+type MigrationReportDto = components["schemas"]["EnvironmentMigrationReportDto"];
+type PluginCatalogEntryDto = components["schemas"]["PluginCatalogEntryDto"];
+type PluginInstallationDto = components["schemas"]["PluginInstallationDto"];
+type UnmappedGroupingDto = components["schemas"]["UnmappedGroupingDto"];
+type DeploymentSourceTargetDto = components["schemas"]["DeploymentSourceTargetDto"];
+type PluginConnectionDto = components["schemas"]["PluginConnectionDto"];
 
 const now = Date.now();
 const ago = (ms: number) => now - ms;
@@ -29,6 +44,12 @@ const RUN_ID = "0190f8a2000071fb8c0011223344aabb";
 // RunRerunRequested boundary with superseded/shadowed attempts), a shared
 // service + a docked sidecar (ADR-0058), a pending manual gate, an artifact.
 const RICH_RUN_ID = "0190f8a2000071fb8c0099887766ccdd";
+// The DEPLOY run (slice b, criterion 5): one Deploy Run showing every
+// DeploymentGate state — waiting (on Deployment #16, linked from the
+// Deployments page), passed, failed — and a deploy step HELD by
+// per-DeploymentTarget concurrency. Reached from /deployments (edge-gateway's
+// in-flight row) at /acme/edge-gateway/runs/<id>.
+const DEPLOY_RUN_ID = "0190f8a2000071fb8c00d3e9107a1616";
 
 // ── /v1/me ────────────────────────────────────────────────────────────────
 // An Owner of the one implicit org (ADR-0060), so the Settings gear renders.
@@ -102,8 +123,10 @@ const projects = [
   proj("scarab-infra", null),
 ];
 
-// ── /v1/runs (dashboard inbox = 2 suspended) ────────────────────────────────
-const summary = (o: Record<string, unknown>) => ({
+// ── /v1/runs (dashboard inbox = 2 suspended + 1 running with a reached gate) ─
+const summary = (
+  o: Partial<RunSummaryDto> & Pick<RunSummaryDto, "id" | "status">,
+): RunSummaryDto => ({
   duration_ms: 0,
   created_at: ago(60000),
   ...o,
@@ -115,6 +138,7 @@ const runs = [
     org: "acme",
     project: "scarab",
     created_at: ago(12 * 60000),
+    waiting_gates: [{ step: "approve", kind: "manual", since: ago(10 * 60000) }],
   }),
   summary({
     id: "01984f22bb334d8e9a1122cd44ef6600",
@@ -122,8 +146,29 @@ const runs = [
     org: "acme",
     project: "billing",
     created_at: ago(27 * 60000),
+    waiting_gates: [{ step: "release", kind: "manual", since: ago(20 * 60000) }],
+  }),
+  // git-bug c489346: a gate holds only its dependents, so this run is still
+  // `running` (its `version` sibling runs) while its `approve` gate waits.
+  summary({
+    id: "01984f35cc445e9fab2233de55f07711",
+    status: "running",
+    org: "acme",
+    project: "orders-api",
+    created_at: ago(6 * 60000),
+    waiting_gates: [{ step: "approve", kind: "manual", since: ago(4 * 60000) }],
+  }),
+  // A running run with no reached gate: not in the inbox.
+  summary({
+    id: "01984f40dd556fa0bc3344ef66018822",
+    status: "running",
+    org: "acme",
+    project: "inventory-svc",
+    created_at: ago(2 * 60000),
   }),
 ];
+/** The `/v1/runs` fixture, for no-DOM tests of what the dashboard derives. */
+export { runs as mockRuns };
 
 // ── per-repo run strips (dashboard cards) — status+duration_ms drive bars ────
 // Tune succeeded/failed ratios to the "N% pass" shown per card.
@@ -385,38 +430,9 @@ const testLogLines = [
 ];
 
 // ── environments / secrets ───────────────────────────────────────────────────
-const environments = [
-  {
-    name: "production",
-    protection: {
-      approvers: ["ops-lead", "j.lee"],
-      wait_timer: 300,
-      allowed_refs: ["main"],
-      concurrency: 1,
-      require_reason: true,
-    },
-  },
-  {
-    name: "staging",
-    protection: {
-      approvers: ["ops-lead"],
-      wait_timer: 0,
-      allowed_refs: ["main", "release/*"],
-      concurrency: 1,
-      require_reason: false,
-    },
-  },
-  {
-    name: "preview",
-    protection: {
-      approvers: [],
-      wait_timer: 0,
-      allowed_refs: [],
-      concurrency: 1,
-      require_reason: false,
-    },
-  },
-];
+// A repository's Environments are org Environments now (ADR-0071): see
+// `orgEnvironments`, `overlays` and `projectEnvironments` below. This is the
+// legacy approval history per name.
 const deployments: Record<string, unknown[]> = {
   production: [
     {
@@ -441,6 +457,709 @@ const deployments: Record<string, unknown[]> = {
   staging: [],
   preview: [],
 };
+
+// ── the DEPLOY run (slice b, criterion 5) ───────────────────────────────────
+//   bump        ✓ → live        DeploymentGate WAITING on #16 (in progress)
+//   bump-canary ✓ → live-canary DeploymentGate PASSED (Healthy · Synced)
+//   bump-eu     ✓ → live-eu     DeploymentGate FAILED (the source's label)
+//   bump-docs   HELD — `argocd`/`docs` is at its concurrency limit
+//   smoke       needs live (not reached)
+const deployGate = (id: string, needs: string, status: string, a1: number, outcome: string) => ({
+  id,
+  status,
+  attempts: 1,
+  needs: [needs],
+  gate: "deployment",
+  attempt_list: [
+    {
+      id: "a1",
+      started_at: ago(a1),
+      failed: outcome === "failed",
+      ...(outcome === "failed"
+        ? { failure: "gate", failure_detail: "ImagePullBackOff: sha-a1b2c3d not found in registry" }
+        : {}),
+      outcome,
+    },
+  ],
+});
+const deployBump = (id: string, at: number) => ({
+  id,
+  status: "succeeded",
+  attempts: 1,
+  needs: [],
+  attempt_list: [{ id: "a1", started_at: ago(at), failed: false, outcome: "succeeded" }],
+});
+const deployRunStatus: RunStatusDto = {
+  id: DEPLOY_RUN_ID,
+  status: "suspended",
+  run_number: 58,
+  pipeline: "deploy",
+  trigger_title: "Deploy sha-a1b2c3d to production",
+  origin_pr_base: null,
+  params: {},
+  snapshot_retention: { retention_days: 14, expired: false, pinned: false },
+  steps: [
+    deployBump("bump", 5 * min),
+    {
+      ...deployGate("live", "bump", "pending", 4 * min, "running"),
+      deployment_gate: {
+        environment: "production",
+        target_source: "argocd",
+        target_id: "edge-gateway",
+        deployment_id: 16,
+        deployment_status: "in_progress",
+        // The gate's own clock: `bump`'s start + the Project's 15 min gate deadline.
+        fails_at: ago(5 * min) + 15 * min,
+        version: "sha-a1b2c3d",
+        latest_label: "sync wave 3: rollout",
+      },
+    },
+    deployBump("bump-canary", 5 * min),
+    {
+      ...deployGate("live-canary", "bump-canary", "succeeded", 4 * min, "succeeded"),
+      gate_resolution: {
+        passed: true,
+        reason: "sha-a1b2c3d live on `argocd`/`edge-canary`: Healthy · Synced",
+        at: ago(3 * min),
+        attempt: "a1",
+        deployment_id: 17,
+      },
+    },
+    deployBump("bump-eu", 5 * min),
+    {
+      ...deployGate("live-eu", "bump-eu", "failed", 4 * min, "failed"),
+      gate_resolution: {
+        passed: false,
+        reason: "ImagePullBackOff: sha-a1b2c3d not found in registry",
+        at: ago(2 * min),
+        attempt: "a1",
+        deployment_id: 18,
+      },
+    },
+    {
+      id: "bump-docs",
+      status: "pending",
+      attempts: 0,
+      needs: [],
+      attempt_list: [],
+      held: "held: waiting for deployment concurrency on `argocd`/`docs` (1/1 in flight)",
+    },
+    { id: "smoke", status: "pending", attempts: 0, needs: ["live"], attempt_list: [] },
+  ],
+};
+const dev = sse(DEPLOY_RUN_ID);
+const deployEventsBody = [
+  dev(ago(5 * min + 5000), {
+    Raw: {
+      trigger: {
+        event: {
+          kind: "manual",
+          actor: "a.kim",
+          branch: "main",
+          ref: "refs/heads/main",
+          sha: "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+          repo: { owner: "acme", name: "edge-gateway" },
+        },
+      },
+    },
+  }),
+  ...["bump", "bump-canary", "bump-eu"].flatMap((s) => [
+    dev(ago(5 * min), { AttemptStarted: { step: s, attempt: "a1" } }),
+    dev(ago(4 * min + 10000), { AttemptFinished: { step: s, attempt: "a1" } }),
+    dev(ago(4 * min + 9000), { StepTransitioned: { step: s, from: "running", to: "succeeded" } }),
+  ]),
+  ...["live", "live-canary", "live-eu"].map((s) =>
+    dev(ago(4 * min), { AttemptStarted: { step: s, attempt: "a1" } }),
+  ),
+  dev(ago(3 * min), { AttemptFinished: { step: "live-canary", attempt: "a1" } }),
+  dev(ago(3 * min), {
+    GateResolved: {
+      step: "live-canary",
+      attempt: "a1",
+      passed: true,
+      reason: "sha-a1b2c3d live on `argocd`/`edge-canary`: Healthy · Synced",
+      deployment: 17,
+    },
+  }),
+  dev(ago(2 * min), { AttemptFinished: { step: "live-eu", attempt: "a1", failure: "gate" } }),
+  dev(ago(2 * min), {
+    GateResolved: {
+      step: "live-eu",
+      attempt: "a1",
+      passed: false,
+      reason: "ImagePullBackOff: sha-a1b2c3d not found in registry",
+      deployment: 18,
+    },
+  }),
+].join("");
+
+// ── Deployment record (ADR-0070) — /deployments and the Environment board ──
+// Org-scoped ids (the org's input sequence) — so a higher id was created later,
+// exactly as the server's receipt-time stamps make it. production covers every
+// row shape the page distinguishes: a requested rollout reported in stages up
+// to live; an Unexplained live (Argo selfHeal reverted it, no Deploy Run asked)
+// that a later run named — a claim, not an explanation; a stalled rollout
+// behind an older live; an Unconfirmed request on a brand-new target; and
+// superseded rows that were, and never were, live. staging has one live. The
+// board sends `newest: null` when the newest is the live one, as the server
+// does.
+const argo = (environment: string, id: string) => ({ environment, source: "argocd", id });
+const req = (run: string, project: string | null, at: number, claim = false) => ({
+  run,
+  step: "deploy",
+  effective_at: at,
+  project,
+  claim,
+  evidence: [] as string[],
+});
+const report = (
+  status: "in_progress" | "live" | "failed",
+  label: string,
+  at: number,
+  link: string | null = null,
+) => ({ status, label, at, source_at: at - 1500, link });
+const ARGO_UI = "https://argocd.acme.example/applications";
+
+const depOrders13: DeploymentDto = {
+  id: 13,
+  target: argo("production", "orders-api"),
+  version: "sha-4f2a1c9",
+  status: "live",
+  requesters: [req(RUN_ID, "orders-api", ago(42 * min))],
+  reports: [
+    report("in_progress", "sync wave 1: config", ago(41 * min), `${ARGO_UI}/orders-api`),
+    report("in_progress", "sync wave 5: migrate", ago(39 * min), `${ARGO_UI}/orders-api`),
+    report("live", "Healthy · Synced", ago(36 * min), `${ARGO_UI}/orders-api`),
+  ],
+  created_at: ago(42 * min),
+  was_ever_live: true,
+  unexplained: false,
+  unconfirmed: false,
+};
+const depOrders9: DeploymentDto = {
+  id: 9,
+  target: argo("production", "orders-api"),
+  version: "sha-1b7e300",
+  status: "superseded",
+  requesters: [req("01984d00bb11", "orders-api", ago(26 * 60 * min))],
+  reports: [report("live", "Healthy · Synced", ago(26 * 60 * min - 4 * min))],
+  created_at: ago(26 * 60 * min),
+  // Live until #13 was reported live, not when #13 was requested.
+  superseded_at: ago(36 * min),
+  was_ever_live: true,
+  unexplained: false,
+  unconfirmed: false,
+};
+const depOrders10: DeploymentDto = {
+  id: 10,
+  target: argo("production", "orders-api"),
+  version: "sha-2c0d4e1",
+  status: "superseded",
+  requesters: [req("01984e00aa22", "orders-api", ago(20 * 60 * min))],
+  reports: [
+    report("in_progress", "sync wave 5: migrate", ago(20 * 60 * min - 2 * min)),
+    report("failed", "migration 0042 timed out", ago(20 * 60 * min - 9 * min)),
+  ],
+  created_at: ago(20 * 60 * min),
+  superseded_at: ago(42 * min),
+  was_ever_live: false,
+  unexplained: false,
+  unconfirmed: false,
+};
+const depGateway14: DeploymentDto = {
+  id: 14,
+  target: argo("production", "edge-gateway"),
+  version: "sha-9c0ffee",
+  status: "live",
+  // A run that only started after Argo showed the revert named the same
+  // version: listed as a claim, and the Deployment stays Unexplained.
+  requesters: [req("01984f20ab99", "edge-gateway", ago(10 * min), true)],
+  reports: [report("live", "selfHeal: reverted to git", ago(18 * min), `${ARGO_UI}/edge-gateway`)],
+  created_at: ago(18 * min),
+  was_ever_live: true,
+  unexplained: true,
+  unconfirmed: false,
+};
+const depGateway8: DeploymentDto = {
+  id: 8,
+  target: argo("production", "edge-gateway"),
+  version: "sha-ab12cd3",
+  status: "superseded",
+  requesters: [req("01984c00cc33", "edge-gateway", ago(3 * 24 * 60 * min))],
+  reports: [report("live", "Healthy · Synced", ago(3 * 24 * 60 * min - 3 * min))],
+  created_at: ago(3 * 24 * 60 * min),
+  superseded_at: ago(18 * min),
+  was_ever_live: true,
+  unexplained: false,
+  unconfirmed: false,
+};
+const depInventory12: DeploymentDto = {
+  id: 12,
+  target: argo("production", "inventory-svc"),
+  version: "sha-77ab001",
+  status: "stalled",
+  // A requester whose run is not stamped with a project: shown, not linked.
+  requesters: [req("01984f00dd44", null, ago(95 * min))],
+  reports: [report("in_progress", "sync wave 2: waiting for healthy", ago(93 * min))],
+  created_at: ago(95 * min),
+  was_ever_live: false,
+  unexplained: false,
+  unconfirmed: false,
+};
+const depInventory7: DeploymentDto = {
+  id: 7,
+  target: argo("production", "inventory-svc"),
+  version: "sha-5d5d5d5",
+  status: "live",
+  requesters: [req("01984b00ee55", "inventory-svc", ago(4 * 24 * 60 * min))],
+  reports: [report("live", "Healthy · Synced", ago(4 * 24 * 60 * min - 5 * min))],
+  created_at: ago(4 * 24 * 60 * min),
+  was_ever_live: true,
+  unexplained: false,
+  unconfirmed: false,
+};
+const depMessaging15: DeploymentDto = {
+  id: 15,
+  target: argo("production", "messaging"),
+  version: "sha-e1e1e10",
+  status: "requested",
+  requesters: [req("01984f30ff66", "messaging", ago(6 * min))],
+  reports: [],
+  created_at: ago(6 * min),
+  was_ever_live: false,
+  unexplained: false,
+  unconfirmed: true,
+};
+// A rollout in flight, requested by the DEPLOY run's `bump` — its `live`
+// DeploymentGate waits on it.
+const depGateway16: DeploymentDto = {
+  id: 16,
+  target: argo("production", "edge-gateway"),
+  version: "sha-a1b2c3d",
+  status: "in_progress",
+  requesters: [{ ...req(DEPLOY_RUN_ID, "edge-gateway", ago(4 * min)), step: "bump" }],
+  reports: [
+    report("in_progress", "sync wave 1: config", ago(3 * min), `${ARGO_UI}/edge-gateway`),
+    report("in_progress", "sync wave 3: rollout", ago(2 * min), `${ARGO_UI}/edge-gateway`),
+  ],
+  created_at: ago(4 * min),
+  was_ever_live: false,
+  unexplained: false,
+  unconfirmed: false,
+};
+const depStagingOrders11: DeploymentDto = {
+  id: 11,
+  target: argo("staging", "orders-api"),
+  version: "sha-4f2a1c9",
+  status: "live",
+  requesters: [req("01984f05aa77", "orders-api", ago(3 * 60 * min))],
+  reports: [report("live", "Healthy · Synced", ago(3 * 60 * min - 2 * min))],
+  created_at: ago(3 * 60 * min),
+  was_ever_live: true,
+  unexplained: false,
+  unconfirmed: false,
+};
+
+/** Each Environment's Deployments, newest first (the list endpoint's order). */
+const envDeployments: Record<string, DeploymentDto[]> = {
+  production: [
+    depGateway16,
+    depMessaging15,
+    depGateway14,
+    depOrders13,
+    depInventory12,
+    depOrders10,
+    depOrders9,
+    depGateway8,
+    depInventory7,
+  ],
+  staging: [depStagingOrders11],
+};
+// staging's orders-api is Moved (ADR-0070 §3): no Environment lists argocd's
+// `staging` grouping any more (it is among argocd's unmapped groupings
+// below), so its reports are dropped — the row keeps its history and says so.
+const board: BoardRowDto[] = [
+  { target: depOrders13.target, live: depOrders13, newest: null, moved_away: null },
+  { target: depGateway14.target, live: depGateway14, newest: depGateway16, moved_away: null },
+  { target: depInventory12.target, live: depInventory7, newest: depInventory12, moved_away: null },
+  { target: depMessaging15.target, live: null, newest: depMessaging15, moved_away: null },
+  {
+    target: depStagingOrders11.target,
+    live: depStagingOrders11,
+    newest: null,
+    moved_away: { now: null },
+  },
+];
+
+// ── Org-level Environments (ADR-0071) — Settings › Environments, and the
+// Deployments page's pills. production is registered with two sources; qa is
+// registered with nothing deployed yet (a pill with an empty list); staging
+// has Deployments but no org Environment, so its pill reads "unregistered ·
+// default deadline". Writes echo back and persist nothing.
+const orgEnvironments: OrgEnvironmentDto[] = [
+  {
+    org: "acme",
+    name: "production",
+    description: "customer-facing, eu-west-1 + us-east-1",
+    deployment_deadline_ms: 30 * min,
+    deployment_sources: [
+      { installation: "argocd", vendor_grouping: "production" },
+      { installation: "argocd-us", vendor_grouping: "production" },
+    ],
+    protection: {
+      approvers: ["ops-lead"],
+      allowed_refs: ["refs/heads/main"],
+      wait_timer_s: 0,
+      require_reason: false,
+      deployment_concurrency: null,
+    },
+    eligibility: { all_projects: true, projects: [] },
+    created_at: ago(40 * 24 * 60 * min),
+    updated_at: ago(3 * 24 * 60 * min),
+    updated_by: "a.kim",
+  },
+  {
+    org: "acme",
+    name: "qa",
+    description: "",
+    deployment_deadline_ms: 60 * min,
+    deployment_sources: [{ installation: "argocd", vendor_grouping: "qa" }],
+    // Still the permissive baseline the migration gave it — the report flags it.
+    protection: {
+      approvers: [],
+      allowed_refs: [],
+      wait_timer_s: 0,
+      require_reason: false,
+      deployment_concurrency: null,
+    },
+    eligibility: { all_projects: false, projects: ["scarab", "web-*"] },
+    created_at: ago(2 * 60 * min),
+    updated_at: ago(2 * 60 * min),
+    updated_by: "j.lee",
+  },
+];
+
+// Per-project overlays and grants (ADR-0071 §3, §8), keyed environment →
+// project. scarab tightens production (an extra approver, a reason, a wait);
+// it holds a grant for one privileged image there.
+const overlays: Record<string, Record<string, OverlayDto>> = {
+  production: {
+    scarab: {
+      approvers: ["j.lee"],
+      allowed_refs: [],
+      wait_timer_s: 300,
+      require_reason: true,
+      deployment_concurrency: null,
+      deployment_gate_deadline_ms: 15 * min,
+    },
+  },
+};
+const grants: Record<string, Record<string, GrantDto>> = {
+  production: {
+    scarab: {
+      privileged_images: [
+        {
+          image_digest: "sha256:4b1c0f9e2d7a8c3e5f6a1b2c3d4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5a6",
+          privileged: true,
+          capabilities: [],
+        },
+      ],
+      permit_k8s_overlay: false,
+    },
+  },
+};
+
+/** The server's merge (ADR-0071 §3), so the fixtures' `effective` blocks are
+ *  what the server would answer: approvers union, ref layers ANDed, the
+ *  stricter wait/limit/deadline, reason if either sets it. */
+function effectiveOf(env: OrgEnvironmentDto, overlay: OverlayDto | undefined) {
+  const b: RulesDto = env.protection;
+  const limits = [b.deployment_concurrency, overlay?.deployment_concurrency].filter(
+    (n): n is number => n != null,
+  );
+  return {
+    approvers: [...new Set([...b.approvers, ...(overlay?.approvers ?? [])])],
+    allowed_ref_layers: overlay ? [b.allowed_refs, overlay.allowed_refs] : [b.allowed_refs],
+    wait_timer_s: Math.max(b.wait_timer_s, overlay?.wait_timer_s ?? 0),
+    require_reason: b.require_reason || (overlay?.require_reason ?? false),
+    deployment_concurrency: limits.length ? Math.min(...limits) : null,
+    deployment_gate_deadline_ms: Math.min(
+      env.deployment_deadline_ms,
+      overlay?.deployment_gate_deadline_ms ?? Infinity,
+    ),
+  };
+}
+
+const eligible = (env: OrgEnvironmentDto, project: string) =>
+  env.eligibility.all_projects ||
+  (env.eligibility.projects ?? []).some((p) =>
+    new RegExp(`^${p.split("*").map((x) => x.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*")}$`).test(project),
+  );
+
+/** `GET /v1/repos/{org}/{repo}/environments`: the org Environments the
+ *  project may deploy into or holds an overlay/grant in, by name. */
+function projectEnvironments(project: string): ProjectEnvironmentDto[] {
+  return orgEnvironments
+    .map((env) => {
+      const overlay = overlays[env.name]?.[project];
+      return {
+        name: env.name,
+        eligible: eligible(env, project),
+        baseline: env.protection,
+        deployment_deadline_ms: env.deployment_deadline_ms,
+        overlay: overlay
+          ? {
+              approvers: overlay.approvers,
+              allowed_refs: overlay.allowed_refs,
+              wait_timer_s: overlay.wait_timer_s,
+              require_reason: overlay.require_reason,
+              deployment_concurrency: overlay.deployment_concurrency,
+            }
+          : null,
+        overlay_deployment_gate_deadline_ms: overlay?.deployment_gate_deadline_ms ?? null,
+        effective: effectiveOf(env, overlay),
+        privilege_grant: grants[env.name]?.[project] ?? null,
+      };
+    })
+    .filter((e) => e.eligible || e.overlay || e.privilege_grant)
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** `GET …/environments/{env}/projects`: who holds an overlay or grant. */
+function environmentProjects(env: OrgEnvironmentDto): EnvironmentProjectDto[] {
+  const names = new Set([
+    ...Object.keys(overlays[env.name] ?? {}),
+    ...Object.keys(grants[env.name] ?? {}),
+  ]);
+  return [...names].sort().map((project) => ({
+    project,
+    eligible: eligible(env, project),
+    overlay: overlays[env.name]?.[project] ?? null,
+    privilege_grant: grants[env.name]?.[project] ?? null,
+  }));
+}
+
+// The migration's split report (ADR-0071 §10 step 8): production was merged
+// from scarab's and web-app's per-repo environments (they disagreed on
+// approvers and require_reason); qa was only ever named, so it was opened to
+// all projects and still has a permissive baseline — reviewed already.
+const migrationReport: MigrationReportDto[] = [
+  {
+    environment: "production",
+    merged_projects: ["scarab", "web-app"],
+    referenced_only: false,
+    referencing_projects: [],
+    differing_rules: ["approvers", "require_reason"],
+    environment_exists: true,
+    permissive_baseline: false,
+    projects: [
+      {
+        project: "scarab",
+        legacy: {
+          approvers: ["ops-lead", "j.lee"],
+          allowed_refs: ["refs/heads/main"],
+          wait_timer: 300,
+          concurrency: 1,
+          require_reason: true,
+          privileged_images: grants.production!.scarab!.privileged_images,
+          permit_k8s_overlay: false,
+        },
+        overlay: overlays.production!.scarab!,
+      },
+      {
+        project: "web-app",
+        legacy: {
+          approvers: ["ops-lead"],
+          allowed_refs: ["refs/heads/main"],
+          wait_timer: 300,
+          concurrency: 1,
+          require_reason: false,
+          privileged_images: [],
+          permit_k8s_overlay: false,
+        },
+        overlay: null,
+      },
+    ],
+    created_at: ago(3 * 24 * 60 * min),
+    acknowledged_at: null,
+    acknowledged_by: null,
+  },
+  {
+    environment: "qa",
+    merged_projects: [],
+    referenced_only: true,
+    referencing_projects: ["scarab"],
+    differing_rules: [],
+    environment_exists: true,
+    permissive_baseline: true,
+    projects: [{ project: "scarab", legacy: null, overlay: null }],
+    created_at: ago(3 * 24 * 60 * min),
+    acknowledged_at: ago(2 * 24 * 60 * min),
+    acknowledged_by: "a.kim",
+  },
+];
+
+// ── Plugins (ADR-0072) — Settings › Plugins, the Environment dialog's
+// installation picker, and the board's owners line. Consistent with the
+// org Environments above: `argocd` is running and feeds production + qa;
+// `argocd-us` (production's second source) is killed. `argocd` also reports
+// on two groupings no Environment lists. Writes echo a record and persist
+// nothing.
+const ARGOCD_REPO = "ghcr.io/thulasi-ram/scarab-plugin-argocd";
+const argocdManifest: PluginCatalogEntryDto["manifest"] = {
+  plugin: "argocd",
+  capabilities: ["report_deployments", "use_connection"],
+  connections: [
+    {
+      name: "argocd",
+      auth_schemes: ["bearer"],
+      read_rules: [
+        { method: "GET", path: "/api/version", query: [] },
+        { method: "GET", path: "/api/v1/applications", query: ["projects", "selector", "appNamespace"] },
+        { method: "GET", path: "/api/v1/applications/*", query: ["appNamespace", "project"] },
+        { method: "GET", path: "/api/v1/applications/*/managed-resources", query: ["appNamespace", "project"] },
+        {
+          method: "GET",
+          path: "/api/v1/stream/applications",
+          query: ["resourceVersion", "appNamespace", "projects", "name", "selector"],
+        },
+      ],
+    },
+  ],
+  config_keys: ["ARGOCD_UI_URL", "OWNER_ANNOTATION"],
+};
+const pluginCatalog: PluginCatalogEntryDto[] = [
+  {
+    plugin: "argocd",
+    description:
+      "Reports Argo CD Application syncs into the Deployment record (first-party; ADR-0070 §11's reference reporter).",
+    image_repository: ARGOCD_REPO,
+    manifest: argocdManifest,
+    first_party: true,
+  },
+];
+const pluginInstallation = (
+  name: string,
+  digest: string,
+  o: Partial<PluginInstallationDto>,
+): PluginInstallationDto => ({
+  id: name === "argocd" ? "4f2a1c9e7b" : "9c0d33a1e5",
+  org: "acme",
+  name,
+  plugin: "argocd",
+  principal: `plugin:${name}`,
+  image: `${ARGOCD_REPO}@sha256:${digest.padEnd(64, "0")}`,
+  manifest_sha256: "b7e3".padEnd(64, "9"),
+  config: { ARGOCD_UI_URL: "https://argocd.acme.example" },
+  state: "enabled",
+  runtime_status: "running",
+  runtime_message: "",
+  probe_passed_at: ago(6 * 60 * min),
+  approved_by: "a.kim",
+  approved_at: ago(12 * 24 * 60 * min),
+  killed_at: null,
+  killed_by: null,
+  manifest: argocdManifest,
+  deployment_sources: [],
+  usage: { targets: 0, max_targets: 10000, unmapped_groupings: 0, max_unmapped_groupings: 1000 },
+  ...o,
+});
+const plugins: PluginInstallationDto[] = [
+  pluginInstallation("argocd", "4f2a1c9e7b3d", {
+    runtime_message: "watching 6 applications",
+    usage: { targets: 4, max_targets: 10000, unmapped_groupings: 2, max_unmapped_groupings: 1000 },
+    deployment_sources: [
+      { environment: "production", vendor_grouping: "production" },
+      { environment: "qa", vendor_grouping: "qa" },
+    ],
+  }),
+  pluginInstallation("argocd-us", "d81e6b02c4aa", {
+    state: "killed",
+    runtime_status: "stopped",
+    runtime_message: "scaled to zero by the kill switch",
+    killed_by: "j.lee",
+    killed_at: ago(90 * min),
+    approved_at: ago(5 * 24 * 60 * min),
+    deployment_sources: [{ environment: "production", vendor_grouping: "production" }],
+  }),
+];
+// Connections (ADR-0072 §5): `argocd` is bound over https; `argocd-us` was
+// bound to an in-cluster Service over plain http (the flagged case). The
+// credential itself is never part of any response.
+const pluginConnection = (
+  slot: string,
+  o: Partial<PluginConnectionDto>,
+): PluginConnectionDto => ({
+  slot,
+  auth_schemes: ["bearer"],
+  read_rules: argocdManifest.connections[0]!.read_rules,
+  configured: true,
+  base_url: "https://argocd.acme.example",
+  auth_scheme: "bearer",
+  credential_set: true,
+  ca_pem: null,
+  insecure_http: false,
+  updated_by: "a.kim",
+  updated_at: ago(12 * 24 * 60 * min),
+  ...o,
+});
+const pluginConnections: Record<string, PluginConnectionDto[]> = {
+  argocd: [pluginConnection("argocd", {})],
+  "argocd-us": [
+    pluginConnection("argocd", {
+      base_url: "http://argocd-server.argocd.svc:80",
+      insecure_http: true,
+      updated_by: "j.lee",
+    }),
+  ],
+};
+const unmappedGroupings: Record<string, UnmappedGroupingDto[]> = {
+  argocd: [
+    {
+      vendor_grouping: "staging",
+      reports: 14,
+      first_at: ago(3 * 24 * 60 * min),
+      last_at: ago(25 * min),
+      last_target_id: "orders-api",
+    },
+    {
+      vendor_grouping: "preview",
+      reports: 2,
+      first_at: ago(5 * 60 * min),
+      last_at: ago(4 * 60 * min),
+      last_target_id: "pr-218-web",
+    },
+  ],
+};
+const sourceTarget = (
+  environment: string,
+  target_id: string,
+  owner_projects: string[],
+  last_version: string,
+): DeploymentSourceTargetDto & { environment: string } => ({
+  environment,
+  source: "argocd",
+  principal: "plugin:argocd",
+  target_id,
+  vendor_grouping: environment,
+  version_scheme: "argocd.target-images.v1",
+  owner_projects,
+  owners_reported_at: owner_projects.length ? ago(6 * 60 * min) : null,
+  last_version,
+  last_status: "live",
+  last_label: "Healthy · Synced",
+  resend: false,
+  last_sequence: 42,
+  updated_at: ago(36 * min),
+});
+const deploymentTargets = [
+  sourceTarget("production", "orders-api", ["acme/orders-api"], "sha-4f2a1c9"),
+  sourceTarget("production", "edge-gateway", ["acme/edge-gateway", "acme/platform"], "sha-9c0ffee"),
+  sourceTarget("production", "inventory-svc", ["acme/inventory"], "sha-5d5d5d5"),
+  // messaging is absent: it is Unconfirmed on the board — its source has
+  // never reported on it — so there is no target row and no owners line.
+  // staging has none: argocd's `staging` grouping is unmapped (Moved row).
+];
 
 const secretNames = { names: ["GHCR_TOKEN", "DATABASE_URL", "SLACK_WEBHOOK_URL"] };
 // Org scope (no `repo=`) holds the org-wide base of the inheritance chain — the
@@ -514,24 +1233,26 @@ const availableRepos = [
 // The coverage matrix is now the repo/environment secret EDITOR (ADR-0060), so
 // the fixture carries the repo-default column ("") and inheritance origins:
 // GHCR_TOKEN comes from the org, DATABASE_URL is a repo default overridden in
-// both environments, SLACK_WEBHOOK_URL is production-only with staging silenced.
+// both environments, SLACK_WEBHOOK_URL is production-only with qa silenced.
+// Its environment columns are the org Environments the project may deploy
+// into (ADR-0071) — production and qa, as `projectEnvironments` lists them.
 const secretMatrix = {
-  columns: ["", "staging", "production"],
-  environments: ["staging", "production"],
+  columns: ["", "production", "qa"],
+  environments: ["production", "qa"],
   keys: [
     {
       key: "GHCR_TOKEN",
-      status: { "": "inherited", staging: "inherited", production: "inherited" },
-      inherited_from: { "": "org", staging: "org", production: "org" },
+      status: { "": "inherited", qa: "inherited", production: "inherited" },
+      inherited_from: { "": "org", qa: "org", production: "org" },
     },
     {
       key: "DATABASE_URL",
-      status: { "": "set", staging: "set", production: "set" },
+      status: { "": "set", qa: "set", production: "set" },
       inherited_from: {},
     },
     {
       key: "SLACK_WEBHOOK_URL",
-      status: { "": "unset", staging: "silenced", production: "set" },
+      status: { "": "unset", qa: "silenced", production: "set" },
       inherited_from: {},
     },
   ],
@@ -599,6 +1320,114 @@ const apiTokens = [
   },
 ];
 
+// ── step-up (ADR-0073) ────────────────────────────────────────────────────
+// Enforced, one admin (j.lee) without a passkey so the banner and the Settings
+// panel have something to say; a.kim holds two passkeys (one synced, one
+// device-bound). A pending confirmation request lives at
+// /security/confirm/req-demo-1. The ceremony endpoints are not mocked: a mock
+// server cannot verify a passkey, and pretending to would be the lie.
+type SecurityEventDto = components["schemas"]["SecurityEventDto"];
+const secEvent = (
+  seq: number,
+  kind: string,
+  minsAgo: number,
+  o: Partial<SecurityEventDto> = {},
+): SecurityEventDto => ({
+  seq,
+  id: `ev-${seq}`,
+  at: ago(minsAgo * min),
+  kind,
+  subject: "a.kim",
+  caller: "session:cookie",
+  org: "acme",
+  detail: {} as Record<string, never>,
+  ...o,
+});
+const securityEvents: SecurityEventDto[] = [
+  secEvent(12, "op.completed", 6, { op: "secret.put", target: "acme/orders-api/production/DB_PASSWORD" }),
+  secEvent(11, "step_up.confirmed", 7, { detail: { kind: "window" } as unknown as Record<string, never> }),
+  secEvent(10, "step_up.refused", 7, {
+    op: "secret.put",
+    target: "acme/orders-api/production/DB_PASSWORD",
+    detail: { mode: "window", reason: "not confirmed" } as unknown as Record<string, never>,
+  }),
+  secEvent(9, "request.raised", 40, {
+    subject: "a.kim",
+    caller: "api_token:9f2c1d84",
+    op: "token.create",
+    target: "acme",
+    request_id: "req-demo-1",
+  }),
+  secEvent(8, "step_up.refused", 95, {
+    subject: "j.lee",
+    op: "binding.put",
+    target: "acme",
+    detail: { mode: "enroll", reason: "no passkey" } as unknown as Record<string, never>,
+  }),
+  secEvent(7, "passkey.enrolled", 3 * 24 * 60, { org: null, passkey_id: "pk-2" }),
+];
+const meSecurity: components["schemas"]["MeSecurityResponse"] = {
+  subject: "a.kim",
+  step_up: "enforce",
+  has_passkey: true,
+  usable_passkey_count: 2,
+  passkeys_hidden: false,
+  can_enroll_first: false,
+  fresh_login_until: null,
+  fresh_login_url: "/v1/auth/login?next=/account/security%3Fenroll%3D1",
+  window_expires_at: now + 3 * min,
+  passkeys: [
+    {
+      id: "pk-1",
+      label: "MacBook Touch ID",
+      created_at: ago(40 * day),
+      last_used_at: ago(7 * min),
+      backup_eligible: true,
+      backup_state: true,
+      clone_suspected: false,
+      transports: ["internal", "hybrid"],
+    },
+    {
+      id: "pk-2",
+      label: "YubiKey 5C",
+      created_at: ago(3 * day),
+      last_used_at: null,
+      backup_eligible: false,
+      backup_state: false,
+      clone_suspected: false,
+      transports: ["usb", "nfc"],
+    },
+  ],
+};
+const orgSecuritySummary: components["schemas"]["OrgSecuritySummary"] = {
+  enforced: true,
+  caller_role: "owner",
+  admins_without_passkey: ["j.lee"],
+  admins_total: 2,
+  unresolved_owner_entries: 0,
+  recent_refusals: securityEvents.filter((e) => e.kind === "step_up.refused"),
+  pending_requests: 1,
+};
+const stepUpRequest: components["schemas"]["StepUpRequestDto"] = {
+  id: "req-demo-1",
+  state: "pending",
+  op: "token.create",
+  org: "acme",
+  method: "POST",
+  path: "/v1/orgs/acme/tokens",
+  query: "",
+  summary: {
+    operation: "Create an API token",
+    target: "acme",
+    changes: ["expires_in_days = 90", "name = release-bot-2", "role = member"],
+  },
+  requested_by: "API token “release-bot” (9f2c1d84)",
+  requested_via: "api_token",
+  for_human: "a.kim",
+  created_at: ago(40 * min),
+  expires_at: now + 20 * min,
+};
+
 // ── router ────────────────────────────────────────────────────────────────
 function json(body: unknown, init?: ResponseInit) {
   return new Response(JSON.stringify(body), {
@@ -608,12 +1437,41 @@ function json(body: unknown, init?: ResponseInit) {
   });
 }
 
-// `method` matters for exactly one surface so far — minting a token POSTs to
-// the same path the list GETs — so it is threaded through rather than having
-// the token route guess from the body.
+// `method` matters where one path serves several verbs — minting a token POSTs
+// to the path the list GETs; an org Environment is GET/PUT/DELETE on one path —
+// so it is threaded through rather than having a route guess from the body.
 function route(pathname: string, search: string, method: string): Response | null {
   const p = pathname;
   if (p === "/v1/me") return json(me);
+  if (p === "/v1/me/security") return json(meSecurity);
+  if (p === "/v1/me/security/events") {
+    return json({ events: securityEvents.filter((e) => e.subject === "a.kim") });
+  }
+  if (/^\/v1\/orgs\/[^/]+\/security\/summary$/.test(p)) return json(orgSecuritySummary);
+  if (/^\/v1\/orgs\/[^/]+\/security\/events$/.test(p)) {
+    const kinds = new URLSearchParams(search).get("kind")?.split(",").filter(Boolean) ?? [];
+    return json({ events: securityEvents.filter((e) => !kinds.length || kinds.includes(e.kind)) });
+  }
+  if (p === "/v1/step-up/requests/req-demo-1") return json(stepUpRequest);
+  // Removing a passkey is always-ask: answer with the refusal so the step-up
+  // dialog can be eyeballed (Cancel returns the 403 to the page).
+  if (/^\/v1\/me\/passkeys\/[^/]+$/.test(p) && method === "DELETE") {
+    return json(
+      {
+        code: "step_up_required",
+        message: "This needs a step-up confirmation: confirm with your passkey.",
+        mode: "action",
+        op: "passkey.remove",
+        summary: { operation: "Remove a passkey", target: p.split("/").pop(), changes: [] },
+        challenge: {
+          id: "mock-challenge",
+          public_key: { challenge: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", rpId: "localhost", allowCredentials: [], userVerification: "required" },
+          expires_at: Date.now() + 2 * min,
+        },
+      },
+      { status: 403 },
+    );
+  }
   if (p === "/v1/auth/providers") return json(authProviders);
   // Linking: no provider to bounce through, so "authorize" straight back to
   // the Account page with the outcome a real callback would carry.
@@ -648,7 +1506,15 @@ function route(pathname: string, search: string, method: string): Response | nul
     return json(repoRuns[m[1]] ?? strip("ooooooooooooo"));
   }
   // /v1/repos/{org}/{repo}/environments
-  if (/^\/v1\/repos\/[^/]+\/[^/]+\/environments$/.test(p)) return json(environments);
+  if ((m = p.match(/^\/v1\/repos\/[^/]+\/([^/]+)\/environments$/))) {
+    return json(projectEnvironments(decodeURIComponent(m[1]!)));
+  }
+  // The retired per-repo writes (ADR-0071 §10): 410, as the server answers.
+  if (/^\/v1\/repos\/[^/]+\/[^/]+\/environments\/[^/]+$/.test(p) && method !== "GET") {
+    return new Response("per-repo environments were replaced by org-level Environments", {
+      status: 410,
+    });
+  }
   // /v1/repos/{org}/{repo}/environments/{name}/deployments
   if ((m = p.match(/^\/v1\/repos\/[^/]+\/[^/]+\/environments\/([^/]+)\/deployments$/))) {
     return json(deployments[m[1]] ?? []);
@@ -682,6 +1548,154 @@ function route(pathname: string, search: string, method: string): Response | nul
   }
   if (/^\/v1\/orgs\/[^/]+\/tokens\/[^/]+$/.test(p)) return json({}, { status: 204 });
 
+  // Org-level Environments (ADR-0071): list, one, and echoing writes.
+  if (/^\/v1\/orgs\/[^/]+\/environments$/.test(p)) return json(orgEnvironments);
+  if ((m = p.match(/^\/v1\/orgs\/([^/]+)\/environments\/([^/]+)$/))) {
+    const name = decodeURIComponent(m[2]!);
+    const found = orgEnvironments.find((e) => e.name === name);
+    if (method === "DELETE") return new Response(null, { status: found ? 204 : 404 });
+    if (method === "PUT") {
+      // The body is not visible here; echo the stored record (or a fresh one).
+      return json(
+        found ?? {
+          org: decodeURIComponent(m[1]!),
+          name,
+          description: "",
+          deployment_deadline_ms: 60 * min,
+          deployment_sources: [],
+          // A new Environment: permissive baseline, no eligible project.
+          protection: {
+            approvers: [],
+            allowed_refs: [],
+            wait_timer_s: 0,
+            require_reason: false,
+            deployment_concurrency: null,
+          },
+          eligibility: { all_projects: false, projects: [] },
+          created_at: now,
+          updated_at: now,
+          updated_by: "a.kim",
+        },
+      );
+    }
+    return found ? json(found) : new Response("not found", { status: 404 });
+  }
+  // Governance (ADR-0071): baseline, eligibility, projects, overlays,
+  // grants. Bodies are not visible here, so writes echo what is stored.
+  if ((m = p.match(/^\/v1\/orgs\/[^/]+\/environments\/([^/]+)\/(protection|eligibility|projects)$/))) {
+    const env = orgEnvironments.find((e) => e.name === decodeURIComponent(m![1]!));
+    if (!env) return new Response("not found", { status: 404 });
+    if (m[2] === "projects") return json(environmentProjects(env));
+    if (m[2] === "protection") return json(method === "PUT" ? env : env.protection);
+    return json(env.eligibility);
+  }
+  if (
+    (m = p.match(
+      /^\/v1\/orgs\/[^/]+\/environments\/([^/]+)\/projects\/([^/]+)\/(overlay|privilege-grant)$/,
+    ))
+  ) {
+    const [env, project] = [decodeURIComponent(m[1]!), decodeURIComponent(m[2]!)];
+    const stored = (m[3] === "overlay" ? overlays : grants)[env]?.[project];
+    if (method === "DELETE") return new Response(null, { status: stored ? 204 : 404 });
+    if (method === "PUT") {
+      return json(
+        stored ??
+          (m[3] === "overlay"
+            ? {
+                approvers: [],
+                allowed_refs: [],
+                wait_timer_s: 0,
+                require_reason: false,
+                deployment_concurrency: null,
+                deployment_gate_deadline_ms: null,
+              }
+            : { privileged_images: [], permit_k8s_overlay: false }),
+      );
+    }
+    return stored ? json(stored) : new Response("not found", { status: 404 });
+  }
+  if (/^\/v1\/orgs\/[^/]+\/environment-migration-report$/.test(p)) return json(migrationReport);
+  if ((m = p.match(/^\/v1\/orgs\/[^/]+\/environment-migration-report\/([^/]+)\/acknowledge$/))) {
+    const line = migrationReport.find((l) => l.environment === decodeURIComponent(m![1]!));
+    if (!line) return new Response("not found", { status: 404 });
+    return json({ ...line, acknowledged_at: line.acknowledged_at ?? now, acknowledged_by: line.acknowledged_by ?? "a.kim" });
+  }
+
+  // Plugins (ADR-0072): catalog, installations, kill/enable, uninstall,
+  // unmapped groupings, and an Environment's reported targets + owners.
+  if (/^\/v1\/orgs\/[^/]+\/plugin-catalog$/.test(p)) return json(pluginCatalog);
+  if (/^\/v1\/orgs\/[^/]+\/plugins$/.test(p)) {
+    if (method === "POST") {
+      // The body is not visible here; echo a fresh, still-pending install.
+      return json(
+        pluginInstallation("argocd-staging", "0a1b2c3d4e5f", {
+          id: "1d2e3f4a5b",
+          state: "enabled",
+          runtime_status: "pending",
+          runtime_message: "",
+          probe_passed_at: null,
+          approved_at: now,
+          deployment_sources: [],
+        }),
+        { status: 201 },
+      );
+    }
+    return json(plugins);
+  }
+  if ((m = p.match(/^\/v1\/orgs\/[^/]+\/plugins\/([^/]+)\/connections(?:\/([^/]+))?$/))) {
+    const found = plugins.find((x) => x.name === decodeURIComponent(m![1]!));
+    if (!found) return new Response("no such installation", { status: 404 });
+    const list = pluginConnections[found.name] ?? [];
+    if (!m[2]) return json(list);
+    const slot = decodeURIComponent(m[2]);
+    if (method === "DELETE") return new Response(null, { status: 204 });
+    // The body is not visible here; echo the slot as bound.
+    return json(list.find((c) => c.slot === slot) ?? pluginConnection(slot, {}));
+  }
+  if ((m = p.match(/^\/v1\/orgs\/[^/]+\/plugins\/([^/]+)(?:\/(kill|enable|unmapped-groupings))?$/))) {
+    const found = plugins.find((x) => x.name === decodeURIComponent(m![1]!));
+    if (!found) return new Response("no such installation", { status: 404 });
+    if (m[2] === "unmapped-groupings") return json(unmappedGroupings[found.name] ?? []);
+    // Kill and enable flip `state` only, as the server does: the runtime
+    // (slice d2) reports what it observes, later.
+    if (m[2] === "kill") {
+      return json({ ...found, state: "killed", killed_by: "a.kim", killed_at: now });
+    }
+    if (m[2] === "enable") {
+      return json({ ...found, state: "enabled", killed_by: null, killed_at: null });
+    }
+    if (method === "DELETE") {
+      return json({ name: found.name, removed_deployment_sources: found.deployment_sources });
+    }
+    return json(found);
+  }
+  if ((m = p.match(/^\/v1\/orgs\/[^/]+\/environments\/([^/]+)\/deployment-targets$/))) {
+    const env = decodeURIComponent(m[1]!);
+    return json(
+      deploymentTargets.filter((t) => t.environment === env).map(({ environment: _, ...t }) => t),
+    );
+  }
+
+  // Deployment record (ADR-0070): the board, an env's list, one Deployment.
+  if (/^\/v1\/orgs\/[^/]+\/board$/.test(p)) {
+    const env = new URLSearchParams(search).get("environment");
+    return json(env ? board.filter((r) => r.target.environment === env) : board);
+  }
+  if ((m = p.match(/^\/v1\/orgs\/[^/]+\/environments\/([^/]+)\/deployments$/))) {
+    const q = new URLSearchParams(search);
+    const src = q.get("target_source");
+    const tid = q.get("target_id");
+    return json(
+      (envDeployments[decodeURIComponent(m[1]!)] ?? []).filter(
+        (d) => (!src || d.target.source === src) && (!tid || d.target.id === tid),
+      ),
+    );
+  }
+  if ((m = p.match(/^\/v1\/orgs\/[^/]+\/environments\/([^/]+)\/deployments\/(\d+)$/))) {
+    const d = (envDeployments[decodeURIComponent(m[1]!)] ?? []).find((x) => x.id === Number(m![2]));
+    return d ? json(d) : new Response(null, { status: 404 });
+  }
+
   if (p === "/v1/connections") return json(connections);
   if (/^\/v1\/connections\/[^/]+\/available-repos$/.test(p)) return json(availableRepos);
   if (/^\/v1\/connections\/[^/]+\/preflight$/.test(p)) return json(connectionPreflight);
@@ -700,6 +1714,20 @@ function route(pathname: string, search: string, method: string): Response | nul
     });
   if (p === `/v1/runs/${RUN_ID}/artifacts`) return json([]);
   if (p === `/v1/runs/${RUN_ID}/services`) return json([]);
+
+  // the DEPLOY run (DeploymentGates + a concurrency hold)
+  if (p === `/v1/runs/${DEPLOY_RUN_ID}`) return json(deployRunStatus);
+  if (p === `/v1/runs/${DEPLOY_RUN_ID}/events`)
+    return new Response(deployEventsBody, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  if (p === `/v1/runs/${DEPLOY_RUN_ID}/artifacts`) return json([]);
+  if (p === `/v1/runs/${DEPLOY_RUN_ID}/services`) return json([]);
+  // Reject a gate (ADR-0070 §9): the fixture is static, so it only answers.
+  if (method === "POST" && /^\/v1\/runs\/[^/]+\/gates\/[^/]+\/reject$/.test(p)) {
+    return json({ rejected: true }, { status: 202 });
+  }
 
   // the RICH run (Playwright walkthrough fixture)
   if (p === `/v1/runs/${RICH_RUN_ID}`) return json(richRunStatus);

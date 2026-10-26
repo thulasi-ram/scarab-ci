@@ -37,7 +37,7 @@ use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 
 use async_trait::async_trait;
-use scarab_secrets::{Secret, SecretError, SecretProvider, SecretScope};
+use scarab_secrets::{Sealer, Secret, SecretError, SecretProvider, SecretScope};
 
 /// The key identity: hex of the first 8 bytes of SHA-256(raw key bytes)
 /// (16 chars). Derived, not operator-assigned, so it is self-verifying — an
@@ -642,15 +642,112 @@ impl SecretProvider for PostgresSecrets {
     }
 }
 
+/// The version byte every [`Sealer`] seal from this adapter starts with.
+const SEAL_VERSION: u8 = 1;
+
+/// Domain separation for [`Sealer`] seals: prefixed to the caller's AAD, so a
+/// sealed payload can never open as a `secrets` row (whose AAD is
+/// `scope_text || 0x00 || key`, and no scope text starts with this) or vice
+/// versa.
+const SEAL_AAD_PREFIX: &[u8] = b"scarab-sealer/v1\0";
+
+/// Fingerprints are 16 lowercase hex characters ([`fingerprint`]).
+const FINGERPRINT_LEN: usize = 16;
+/// AES-256-GCM nonce and tag widths.
+const NONCE_LEN: usize = 12;
+const TAG_LEN: usize = 16;
+/// A wrapped 32-byte data key: ciphertext plus tag.
+const WRAPPED_KEY_LEN: usize = 32 + TAG_LEN;
+
+fn seal_aad(aad: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(SEAL_AAD_PREFIX.len() + aad.len());
+    out.extend_from_slice(SEAL_AAD_PREFIX);
+    out.extend_from_slice(aad);
+    out
+}
+
+/// ADR-0073 §5: the same envelope as a secret row — a fresh data key per
+/// payload, wrapped by the ACTIVE master key, the wrapping key's fingerprint
+/// carried with it so a rotation (`[new, old]`) still opens it. Layout:
+///
+/// `version(1) || fingerprint(16) || key_nonce(12) || wrapped_key(48) ||
+/// value_nonce(12) || ciphertext`
+///
+/// Both seals bind `"scarab-sealer/v1\0" || aad`.
+impl Sealer for PostgresSecrets {
+    fn seal(&self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, SecretError> {
+        let (active_fp, active_key) = self.keys.active();
+        let aad = seal_aad(aad);
+        let data_key: [u8; 32] = random_bytes();
+        let (ciphertext, value_nonce) = encrypt(&data_key, plaintext, &aad)?;
+        let (wrapped_key, key_nonce) = encrypt(active_key, &data_key, &aad)?;
+        debug_assert_eq!(active_fp.len(), FINGERPRINT_LEN);
+        debug_assert_eq!(wrapped_key.len(), WRAPPED_KEY_LEN);
+        let mut out = Vec::with_capacity(
+            1 + FINGERPRINT_LEN + NONCE_LEN + WRAPPED_KEY_LEN + NONCE_LEN + ciphertext.len(),
+        );
+        out.push(SEAL_VERSION);
+        out.extend_from_slice(active_fp.as_bytes());
+        out.extend_from_slice(&key_nonce);
+        out.extend_from_slice(&wrapped_key);
+        out.extend_from_slice(&value_nonce);
+        out.extend_from_slice(&ciphertext);
+        Ok(out)
+    }
+
+    fn open(&self, sealed: &[u8], aad: &[u8]) -> Result<Vec<u8>, SecretError> {
+        let corrupt = || SecretError::Backend("sealed payload is malformed".into());
+        let (&version, rest) = sealed.split_first().ok_or_else(corrupt)?;
+        if version != SEAL_VERSION {
+            return Err(SecretError::Backend(format!(
+                "sealed payload has unknown version {version}"
+            )));
+        }
+        if rest.len() < FINGERPRINT_LEN + NONCE_LEN + WRAPPED_KEY_LEN + NONCE_LEN + TAG_LEN {
+            return Err(corrupt());
+        }
+        let (fp, rest) = rest.split_at(FINGERPRINT_LEN);
+        let (key_nonce, rest) = rest.split_at(NONCE_LEN);
+        let (wrapped_key, rest) = rest.split_at(WRAPPED_KEY_LEN);
+        let (value_nonce, ciphertext) = rest.split_at(NONCE_LEN);
+        let fp = std::str::from_utf8(fp).map_err(|_| corrupt())?;
+        let Some((_, master)) = self.keys.keys.iter().find(|(f, _)| f == fp) else {
+            return Err(SecretError::Backend(format!(
+                "sealed payload is sealed under master key {fp}, which is not configured — \
+                 configured master keys: [{}]",
+                self.keys.configured_list()
+            )));
+        };
+        let aad = seal_aad(aad);
+        let data_key = key32(decrypt(master, key_nonce, wrapped_key, &aad)?)?;
+        decrypt(&data_key, value_nonce, ciphertext, &aad)
+    }
+
+    fn derive_key(&self, label: &str) -> [u8; 32] {
+        use hmac::{Hmac, Mac};
+        let (_, active_key) = self.keys.active();
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(active_key)
+            .expect("HMAC accepts a key of any length");
+        mac.update(label.as_bytes());
+        mac.finalize().into_bytes().into()
+    }
+}
+
 /// Encode a scope to its stored string. Distinct scopes never collide, so a
 /// lookup at the wrong scope simply misses (access is scoped, ADR-0032).
+///
+/// `EnvironmentProject` keeps the `env:` prefix of the scope it renamed
+/// (ADR-0071 §6): this string is the row's lookup key **and** its AEAD
+/// associated data, so changing it would orphan every stored environment
+/// secret (a miss) and fail the tag on any that were re-keyed (pinned by
+/// `environment_project_scope_key_and_aad_are_byte_identical_to_the_old_environment_scope`).
 fn scope_key(scope: &SecretScope) -> String {
     match scope {
         SecretScope::Org { org } => format!("org:{org}"),
         SecretScope::Repo { org, repo } => format!("repo:{org}/{repo}"),
-        SecretScope::Environment {
+        SecretScope::EnvironmentProject {
             org,
-            repo,
+            project: repo,
             environment,
         } => format!("env:{org}/{repo}/{environment}"),
     }
@@ -736,6 +833,107 @@ mod tests {
         let (legacy_ct, legacy_nonce) = encrypt(&key, b"old", b"").unwrap();
         assert_eq!(decrypt(&key, &legacy_nonce, &legacy_ct, b"").unwrap(), b"old");
         assert!(decrypt(&key, &legacy_nonce, &legacy_ct, &aad).is_err());
+    }
+
+    /// ADR-0071 §6 renamed `SecretScope::Environment { org, repo, environment }`
+    /// to `EnvironmentProject { org, project, environment }` **without moving
+    /// a byte**: the stored scope string and the AAD a row was sealed under
+    /// are exactly what the old variant produced, so every existing secret
+    /// still resolves at, and only at, the same scope.
+    #[test]
+    fn environment_project_scope_key_and_aad_are_byte_identical_to_the_old_environment_scope() {
+        let scope = SecretScope::EnvironmentProject {
+            org: "acme".into(),
+            project: "web".into(),
+            environment: "prod".into(),
+        };
+        assert_eq!(scope_key(&scope), "env:acme/web/prod");
+        assert_eq!(
+            row_aad(&scope_key(&scope), "TOKEN"),
+            b"env:acme/web/prod\0TOKEN".to_vec()
+        );
+        // A value sealed under the pre-rename encoding opens under the new one.
+        let key = [7u8; 32];
+        let (ct, nonce) = encrypt(&key, b"v", &row_aad("env:acme/web/prod", "TOKEN")).unwrap();
+        assert_eq!(
+            decrypt(&key, &nonce, &ct, &row_aad(&scope_key(&scope), "TOKEN")).unwrap(),
+            b"v"
+        );
+    }
+
+    fn sealer(keys: Vec<[u8; 32]>) -> PostgresSecrets {
+        // A lazy pool never connects: sealing is pure computation.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@localhost/unused")
+            .expect("lazy pool");
+        PostgresSecrets::with_keys(pool, MasterKeySet::new(keys).unwrap())
+    }
+
+    /// ADR-0073 §5: a seal opens under its own AAD only, survives a rotation
+    /// (`[new, old]`), and fails once its sealing key is gone.
+    #[tokio::test]
+    async fn a_seal_opens_only_under_its_aad_and_survives_rotation() {
+        let old = sealer(vec![[1u8; 32]]);
+        let sealed = old
+            .seal(b"{\"value\":\"s3cr3t\"}", b"step-up-request:r1")
+            .unwrap();
+        assert_eq!(sealed[0], SEAL_VERSION);
+        assert_eq!(
+            &sealed[1..1 + FINGERPRINT_LEN],
+            fingerprint(&[1u8; 32]).as_bytes()
+        );
+        assert!(
+            !sealed.windows(6).any(|w| w == b"s3cr3t"),
+            "no plaintext in the seal"
+        );
+        assert_eq!(
+            old.open(&sealed, b"step-up-request:r1").unwrap(),
+            b"{\"value\":\"s3cr3t\"}"
+        );
+        assert!(
+            old.open(&sealed, b"step-up-request:r2").is_err(),
+            "AAD binds"
+        );
+        assert!(old.open(&sealed, b"").is_err());
+
+        let mut tampered = sealed.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(old.open(&tampered, b"step-up-request:r1").is_err());
+        assert!(old.open(&sealed[..20], b"step-up-request:r1").is_err());
+
+        let rotated = sealer(vec![[2u8; 32], [1u8; 32]]);
+        assert_eq!(
+            rotated.open(&sealed, b"step-up-request:r1").unwrap(),
+            b"{\"value\":\"s3cr3t\"}"
+        );
+        let dropped = sealer(vec![[2u8; 32]]);
+        let err = dropped
+            .open(&sealed, b"step-up-request:r1")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&fingerprint(&[1u8; 32])), "{err}");
+    }
+
+    /// A seal can never be opened as a secret row's value, nor the reverse:
+    /// the sealer's AAD is domain-separated from `row_aad`.
+    #[test]
+    fn seal_aad_is_domain_separated_from_secret_rows() {
+        assert_ne!(seal_aad(b"repo:a\0K"), row_aad("repo:a", "K"));
+        assert!(seal_aad(b"x").starts_with(SEAL_AAD_PREFIX));
+    }
+
+    #[tokio::test]
+    async fn derived_keys_are_label_bound_and_follow_the_active_key() {
+        let a = sealer(vec![[1u8; 32]]);
+        let k = a.derive_key("scarab-step-up-digest/v1");
+        assert_eq!(k, a.derive_key("scarab-step-up-digest/v1"), "deterministic");
+        assert_ne!(k, a.derive_key("other"));
+        assert_ne!(k, [1u8; 32], "never the key itself");
+        assert_ne!(
+            k,
+            sealer(vec![[2u8; 32], [1u8; 32]]).derive_key("scarab-step-up-digest/v1"),
+            "the ACTIVE key derives"
+        );
     }
 
     /// The NUL separator keeps (scope, key) pairs from colliding.

@@ -453,6 +453,125 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/me/passkeys/registration": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Finish enrolling a passkey (ADR-0073 §2) */
+        post: operations["passkey_registration"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/me/passkeys/registration/options": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Begin enrolling a passkey (ADR-0073 §2) */
+        post: operations["passkey_registration_options"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/me/passkeys/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Remove a passkey (ADR-0073 §2; always-ask step-up) */
+        delete: operations["remove_passkey"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/me/security": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** My passkeys and step-up state (ADR-0073) */
+        get: operations["me_security"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/me/security/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** My security events (ADR-0073 §7) */
+        get: operations["my_security_events"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/me/step-up": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Confirm a step-up with a passkey (ADR-0073 §4) */
+        post: operations["step_up_confirm"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/me/step-up/options": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Begin a step-up: a challenge that opens a 5-minute window (ADR-0073 §4) */
+        post: operations["step_up_options"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/orgs/{org}/bindings": {
         parameters: {
             query?: never;
@@ -472,6 +591,418 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/orgs/{org}/board": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The Environment board: what is live on each DeploymentTarget (ADR-0070) */
+        get: operations["get_environment_board"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/environment-migration-report": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The ADR-0071 migration's split report (ADR-0071 §10 step 8) */
+        get: operations["get_environment_migration_report"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/environment-migration-report/{env}/acknowledge": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Acknowledge a split-report line (ADR-0071 §10 step 8) */
+        post: operations["acknowledge_environment_migration_report"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/environments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List an org's Environments (ADR-0071) */
+        get: operations["list_org_environments"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/environments/{env}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** One org Environment (ADR-0071) */
+        get: operations["get_org_environment"];
+        /** Create or replace an org Environment (ADR-0071) */
+        put: operations["put_org_environment"];
+        post?: never;
+        /**
+         * Delete an org Environment with no Deployments (ADR-0071)
+         * @description Refused (409) while any Project holds an overlay or privilege grant in
+         *     it (ADR-0071 §3, §8: those are never dropped as a side effect), and while
+         *     the Deployment record holds anything for the name:
+         *     the record is keyed by name, so deleting and re-creating the Environment
+         *     would silently re-adopt that history under whatever the new one says.
+         */
+        delete: operations["delete_org_environment"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/environments/{env}/deployment-targets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** An Environment's reported DeploymentTargets and their owners (ADR-0072) */
+        get: operations["environment_deployment_targets"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/environments/{env}/deployments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** An Environment's Deployments, newest first (ADR-0070) */
+        get: operations["list_environment_deployments"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/environments/{env}/deployments/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** One Deployment and its stages (ADR-0070) */
+        get: operations["get_deployment"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/environments/{env}/eligibility": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Which projects may deploy into an org Environment (ADR-0071 §2) */
+        get: operations["get_environment_eligibility"];
+        /** Replace which projects may deploy into an org Environment (ADR-0071 §2) */
+        put: operations["put_environment_eligibility"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/environments/{env}/projects": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Projects with an overlay or privilege grant in an org Environment (ADR-0071 §3, §8) */
+        get: operations["list_environment_projects"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/environments/{env}/projects/{project}/overlay": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** A project's tighten-only overlay in an org Environment (ADR-0071 §3) */
+        get: operations["get_environment_project_overlay"];
+        /**
+         * Tighten an org Environment for one project (ADR-0071 §3)
+         * @description Refused (409) for a Project the Environment does not admit and which
+         *     holds no overlay there yet: a Project that may not deploy here has
+         *     nothing to tighten, and an overlay pins the Environment against deletion
+         *     (ON DELETE RESTRICT), so a stray one would let any Project admin block an
+         *     org admin's delete. An existing overlay stays editable after eligibility
+         *     is withdrawn.
+         */
+        put: operations["put_environment_project_overlay"];
+        post?: never;
+        /** Remove a project's overlay in an org Environment (ADR-0071 §3) */
+        delete: operations["delete_environment_project_overlay"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/environments/{env}/projects/{project}/privilege-grant": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** A project's privilege grant in an org Environment (ADR-0071 §8) */
+        get: operations["get_environment_project_privilege_grant"];
+        /** Grant a project privileges in an org Environment (ADR-0071 §8) */
+        put: operations["put_environment_project_privilege_grant"];
+        post?: never;
+        /** Withdraw a project's privilege grant in an org Environment (ADR-0071 §8) */
+        delete: operations["delete_environment_project_privilege_grant"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/environments/{env}/protection": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** An org Environment's baseline protection rules (ADR-0071 §1) */
+        get: operations["get_environment_protection"];
+        /** Replace an org Environment's baseline protection rules (ADR-0071 §1) */
+        put: operations["put_environment_protection"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/members/{subject}/passkeys/reset": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Reset a member's passkeys (ADR-0073 §10; Owner, always-ask step-up) */
+        post: operations["reset_member_passkeys"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/plugin-catalog": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The installable (first-party) plugins (ADR-0072) */
+        get: operations["plugin_catalog"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/plugins": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List an org's plugin installations (ADR-0072) */
+        get: operations["list_plugins"];
+        put?: never;
+        /**
+         * Install a first-party plugin (ADR-0072)
+         * @description Third-party installs are off (403), and so are installs while
+         *     `SCARAB_PLUGINS=off` (409). The response lists any Environment source
+         *     that already named this installation — written before it existed — which
+         *     it now feeds.
+         */
+        post: operations["install_plugin"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/plugins/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** One plugin installation (ADR-0072) */
+        get: operations["get_plugin"];
+        put?: never;
+        post?: never;
+        /** Uninstall a plugin; its name is retired (ADR-0072) */
+        delete: operations["uninstall_plugin"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/plugins/{name}/connections": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** A plugin's connection slots and their bindings (ADR-0072 §5) */
+        get: operations["list_plugin_connections"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/plugins/{name}/connections/{slot}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Bind a plugin connection's destination and credential (ADR-0072 §5)
+         * @description The credential is written through to the secret store under a fresh
+         *     server-minted key and is never readable back; the previous binding's
+         *     credential is deleted once the new binding is stored. A response stream
+         *     the plugin has open on the old binding is cut within seconds.
+         */
+        put: operations["put_plugin_connection"];
+        post?: never;
+        /** Unbind a plugin connection and delete its credential (ADR-0072 §5) */
+        delete: operations["delete_plugin_connection"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/plugins/{name}/enable": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Re-enable a killed plugin installation (ADR-0072) */
+        post: operations["enable_plugin"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/plugins/{name}/kill": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Kill a plugin installation at once (ADR-0072) */
+        post: operations["kill_plugin"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/plugins/{name}/unmapped-groupings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** A plugin's vendor groupings no Environment lists (ADR-0071 §5) */
+        get: operations["unmapped_groupings"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/orgs/{org}/principals": {
         parameters: {
             query?: never;
@@ -481,6 +1012,40 @@ export interface paths {
         };
         /** Search users for a grant or approver entry (ADR-0069) */
         get: operations["search_principals"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/security/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** An Org's security event log (ADR-0073 §7) */
+        get: operations["org_security_events"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/security/summary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** An Org's step-up posture: admins without a passkey, recent refusals (ADR-0073 §8) */
+        get: operations["org_security_summary"];
         put?: never;
         post?: never;
         delete?: never;
@@ -605,7 +1170,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List a repo's environments */
+        /** The environments this project may deploy into, with baseline/overlay/effective rules (ADR-0071) */
         get: operations["list_environments"];
         put?: never;
         post?: never;
@@ -622,12 +1187,12 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** One environment's protection rules */
+        /** One environment as this project sees it: baseline, overlay, effective (ADR-0071) */
         get: operations["get_environment"];
-        /** Create/replace a protected environment (ADR-0024/0037) */
+        /** Retired: per-repo environments are org-level Environments now (ADR-0071) */
         put: operations["put_environment"];
         post?: never;
-        /** Delete an environment (idempotent) */
+        /** Retired: per-repo environments are org-level Environments now (ADR-0071) */
         delete: operations["delete_environment"];
         options?: never;
         head?: never;
@@ -641,7 +1206,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** An environment's deployment history (ADR-0037) */
+        /** Legacy approval history (ADR-0070 §1) */
         get: operations["list_deployments"];
         put?: never;
         post?: never;
@@ -919,11 +1484,43 @@ export interface paths {
          * Approve a `manual` gate (ADR-0008, 0037). The authenticated principal's
          *     approval is recorded on the event log (append-only, idempotent). For a
          *     **deploy** run (one with a target environment), the gate is released only
-         *     once the accumulated approvers satisfy the environment's protection rules
-         *     (`admits`); on release the deployment is written to history. A plain gate (no
+         *     once the accumulated approvers satisfy the Environment's effective rules for
+         *     the run's Project (ADR-0071 §3, `admits`); on release the deployment is
+         *     written to the legacy history. If the Environment no longer exists or no
+         *     longer admits the Project, the gate does not release (409). A plain gate (no
          *     environment) releases on the first approval. Authz'd as a write.
          */
         post: operations["approve_gate"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/runs/{id}/gates/{step}/reject": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Reject a waiting gate: fail it with a reason (ADR-0070 §9).
+         * @description For any gate — `manual`, `timer`, `external` or `deployment` — that is
+         *     pending and reached (every step it needs has succeeded; slice b, criteria 2
+         *     and 3). A deployment gate can only be rejected, never approved or
+         *     released: core passes it from the Deployment record. The gate's Attempt fails with
+         *     the reason and the rejecting principal, its dependents are skipped, and the
+         *     run ends `failed`; retrying the gate opens a new wait that asks again.
+         *
+         *     Authz'd as a run write, the same as approve. A reject only ever stops a
+         *     deploy — any writer can already cancel the run — so it does NOT consult the
+         *     Environment's approver rules, and it works when the Environment is gone or
+         *     no longer admits the project: the clean way out of a held gate.
+         */
+        post: operations["reject_gate"];
         delete?: never;
         options?: never;
         head?: never;
@@ -945,7 +1542,14 @@ export interface paths {
          *     interactive approval. The token is `HMAC-SHA256(secret, "{run}:{step}")`
          *     (`sha256=<hex>`), verified in constant time; no per-gate storage. The endpoint
          *     is 404 when no token secret is configured, and only releases gates of kind
-         *     `external` (manual gates stay approval-only).
+         *     `external` (manual gates stay approval-only). In a Deploy Run, the gate is
+         *     held (409) when the run's Environment no longer exists or no longer admits
+         *     its Project (ADR-0071 §2) — the same check `approve_gate` makes. The token
+         *     proves who is releasing, not that the deploy is still allowed.
+         * @description The same token can instead **fail** the gate with a reason: a body of
+         *     `{"passed": false, "reason": "…"}` rejects it (journalled `by
+         *     external:{step}`). A fail is never held — it only stops the deploy — so it
+         *     skips the Environment check. No body, or `"passed": true`, is a release.
          */
         post: operations["release_gate_external"];
         delete?: never;
@@ -1209,8 +1813,9 @@ export interface paths {
          *     token, and the control plane persists them to `step_runs.results`. The
          *     untrusted step never calls this — only the sidecar holds the token.
          * @description 404 when no token secret is configured; 401 on a bad/missing token; 404 for
-         *     an unknown step; 413 for an over-large body. The write is idempotent on the
-         *     fence (a re-drive overwrites deterministically, ADR-0021).
+         *     an unknown step; 413 for an over-large body; 409 when the attempt is no
+         *     longer the step's running frontier. The write is idempotent on the fence
+         *     (a re-drive overwrites deterministically, ADR-0021).
          */
         post: operations["ingest_step_results"];
         delete?: never;
@@ -1300,6 +1905,74 @@ export interface paths {
         post: operations["put_secret"];
         /** Delete a secret at a scope (ADR-0014). Idempotent. */
         delete: operations["delete_secret"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/security/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The install-wide security event log (ADR-0073 §7) */
+        get: operations["security_events"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/step-up/requests/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** A step-up confirmation request (ADR-0073 §6) */
+        get: operations["get_request"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/step-up/requests/{id}/confirm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Confirm a step-up confirmation request: it runs once (ADR-0073 §6) */
+        post: operations["confirm_request"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/step-up/requests/{id}/options": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Begin confirming a step-up confirmation request (ADR-0073 §6) */
+        post: operations["request_options"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -1413,7 +2086,12 @@ export interface components {
             /**
              * @description Coarse failure kind when `failed`: `infra` | `step` | `timeout` | `lost`
              *     | `config` | `missing-inputs` (an input snapshot gone from every tier —
-             *     Rerun/Retry regenerates it; ticket e140121).
+             *     Rerun/Retry regenerates it; ticket e140121) | `gate` (a gate's wait
+             *     resolved failed — e.g. not released within `gate_expires_after`; the
+             *     reason is in `failure_detail`) | `deployment-request-incomplete` (the
+             *     step exited 0 but its results could not complete a DeploymentRequest
+             *     it declares; never auto-retried; what is missing is in
+             *     `failure_detail`).
              */
             failure?: string | null;
             /**
@@ -1663,6 +2341,12 @@ export interface components {
             owner: string;
             project: string;
         };
+        /** @description A named external system the plugin reaches through the broker. */
+        ConnectionSlotDto: {
+            auth_schemes: string[];
+            name: string;
+            read_rules: components["schemas"]["RequestRuleDto"][];
+        };
         /**
          * @description What an attempt consumed (ADR-0056): the map `upstream step id → attempt
          *     id` stamped at its launch — the durable answer to "which generation of
@@ -1737,6 +2421,193 @@ export interface components {
             id: string;
         };
         /**
+         * @description One Deployment: a DeploymentVersion made (or asked to be made) live on a
+         *     DeploymentTarget, and what was reported about it since (ADR-0070 §2).
+         */
+        DeploymentDto: {
+            /**
+             * Format: int64
+             * @description Unix-ms.
+             */
+            created_at: number;
+            /**
+             * Format: int64
+             * @description Org-scoped and stable: the sequence number of the input that created
+             *     it.
+             */
+            id: number;
+            /** @description The stages, oldest first. */
+            reports: components["schemas"]["DeploymentStatusReportDto"][];
+            /**
+             * @description In the order their requests arrived, claims included. Who made it
+             *     live is the requesters that are not claims; `unexplained` says
+             *     whether there is one.
+             */
+            requesters: components["schemas"]["DeploymentRequesterDto"][];
+            status: components["schemas"]["DeploymentStatusDto"];
+            /**
+             * Format: int64
+             * @description Unix-ms a newer Deployment took its place, if one has.
+             */
+            superseded_at?: number | null;
+            target: components["schemas"]["DeploymentTargetDto"];
+            /**
+             * @description Display term: requested on a DeploymentTarget its source has never
+             *     reported on.
+             */
+            unconfirmed: boolean;
+            /**
+             * @description Display term: no Deploy Run's request explains it — a change made
+             *     outside Scarab. It may still carry claims.
+             */
+            unexplained: boolean;
+            /** @description Opaque, in the source's scheme; compared only for equality. */
+            version: string;
+            /** @description Whether it was ever reported live. */
+            was_ever_live: boolean;
+        };
+        /**
+         * @description A waiting DeploymentGate: the DeploymentTarget it waits on and, once its
+         *     requester's DeploymentRequest is in the record, where that Deployment
+         *     stands (as the Deployments view folds it).
+         */
+        DeploymentGateDto: {
+            /**
+             * Format: int64
+             * @description The Deployment the requester's current request landed on.
+             */
+            deployment_id?: number | null;
+            deployment_status?: null | components["schemas"]["DeploymentStatusDto"];
+            environment: string;
+            /**
+             * Format: int64
+             * @description When this gate fails `stalled` if nothing decisive is reported first
+             *     (epoch millis): its wait's window opening plus its Project's effective
+             *     gate deadline — the engine's own computation (git-bug `ec84c5d`).
+             *     Absent when unknown (no Deployment, or the deadline could not be read).
+             */
+            fails_at?: number | null;
+            /** @description The latest source report's label, when it has one. */
+            latest_label?: string | null;
+            /**
+             * @description `true` when the Deployment record could not be read for this view (a
+             *     store error, logged): the Deployment fields are then absent because
+             *     they are unknown, not because no Deployment is recorded. Omitted when
+             *     `false`.
+             */
+            record_unreadable?: boolean;
+            target_id: string;
+            target_source: string;
+            /** @description The DeploymentVersion asked for. */
+            version?: string | null;
+        };
+        /** @description A Deploy Run step that requested a Deployment. */
+        DeploymentRequesterDto: {
+            /**
+             * @description Only a claim: the request joined a Deployment a source report created,
+             *     and its Step started after Scarab first saw that Deployment — so it
+             *     did not make it live and does not explain it (ADR-0070 §2).
+             */
+            claim: boolean;
+            /**
+             * Format: int64
+             * @description Unix-ms the requesting Step started.
+             */
+            effective_at: number;
+            /**
+             * @description What the Step offered as evidence for the change — image digests,
+             *     typically — read from its results (ADR-0070 §7). Shown, never used to
+             *     correlate; empty when it declared none.
+             */
+            evidence: string[];
+            /**
+             * @description The Project the run belongs to, when it is stamped and in this Org —
+             *     what a link to the run (`/{org}/{project}/runs/{run}`) needs.
+             */
+            project?: string | null;
+            run: string;
+            step: string;
+        };
+        /**
+         * @description A DeploymentTarget a source reports into an Environment — one whose
+         *     grouping the Environment lists NOW: who reports it, its owners and
+         *     declared version scheme, and its last status as reported HERE.
+         */
+        DeploymentSourceTargetDto: {
+            last_label?: string | null;
+            /** Format: int64 */
+            last_sequence: number;
+            /** @description `in_progress` / `live` / `failed`, as last reported here. */
+            last_status?: string | null;
+            /**
+             * @description The last status reported into THIS Environment; absent when its last
+             *     status went elsewhere (or nowhere) — a status recorded in another
+             *     Environment is never shown as this one's.
+             */
+            last_version?: string | null;
+            /** @description Projects (`org/repo`) that own the target, as the source last said. */
+            owner_projects: string[];
+            /**
+             * Format: int64
+             * @description Unix-ms the owners were last reported.
+             */
+            owners_reported_at?: number | null;
+            /** @description `plugin:<name>`. */
+            principal: string;
+            /**
+             * @description Its source owes a re-send here: the grouping was mapped or moved into
+             *     this Environment after its last status. A running reporter re-sends
+             *     within about a minute (ADR-0070 §11), and it appears on the board.
+             */
+            resend: boolean;
+            /** @description The reporting installation's name — the target's `source`. */
+            source: string;
+            target_id: string;
+            /**
+             * Format: int64
+             * @description Unix-ms.
+             */
+            updated_at: number;
+            vendor_grouping: string;
+            version_scheme?: string | null;
+        };
+        /**
+         * @description A Deployment's fixed, vendor-neutral status (ADR-0070 §5).
+         * @enum {string}
+         */
+        DeploymentStatusDto: "requested" | "in_progress" | "live" | "failed" | "stalled" | "superseded";
+        /** @description One stage of a Deployment as its source reported it. */
+        DeploymentStatusReportDto: {
+            /**
+             * Format: int64
+             * @description Unix-ms Scarab received the report — the time the record is ordered by.
+             */
+            at: number;
+            /** @description Free-form; shown, never interpreted. */
+            label: string;
+            /**
+             * @description Where the source shows this stage. Only an `http`/`https` URL is
+             *     passed on; any other scheme reads as absent.
+             */
+            link?: string | null;
+            /**
+             * Format: int64
+             * @description Unix-ms the source stamped on it, by its own clock. Display only.
+             *     Present on every recorded report.
+             */
+            source_at?: number | null;
+            status: components["schemas"]["SourceAssertedStatusDto"];
+        };
+        /**
+         * @description The smallest unit a Deployment can independently succeed or fail on.
+         *     `source` + `id` are opaque and source-supplied.
+         */
+        DeploymentTargetDto: {
+            environment: string;
+            id: string;
+            source: string;
+        };
+        /**
          * @description Which trigger a dispatch opts into: a human [`Manual`](DispatchKind::Manual)
          *     dispatch (the default) or its programmatic [`Api`](DispatchKind::Api) sibling
          *     (ADR-0043 §4). The named pipeline must declare the matching `on:` trigger to
@@ -1781,6 +2652,162 @@ export interface components {
              */
             ref: string;
         };
+        /**
+         * @description The rules admission enforces for one Project in one Environment: the
+         *     baseline merged with the Project's overlay (ADR-0071 §3), computed by the
+         *     server so no client re-implements the merge.
+         */
+        EffectiveProtectionDto: {
+            /**
+             * @description One list per layer (baseline first, then overlay): a ref must match
+             *     **every** non-empty layer. Never pre-intersected — `[main]` and
+             *     `[tags/*]` intersect to `[]`, which would read as "any ref".
+             */
+            allowed_ref_layers: string[][];
+            /** @description Baseline approvers, then the overlay's not already listed — all required. */
+            approvers: string[];
+            /** Format: int32 */
+            deployment_concurrency?: number | null;
+            /**
+             * Format: int64
+             * @description The deadline this Project's DeploymentGates use.
+             */
+            deployment_gate_deadline_ms: number;
+            require_reason: boolean;
+            /** Format: int32 */
+            wait_timer_s: number;
+        };
+        /** @description One DeploymentTarget's line on the Environment board. */
+        EnvironmentBoardRowDto: {
+            live?: null | components["schemas"]["DeploymentDto"];
+            moved_away?: null | components["schemas"]["MovedAwayDto"];
+            newest?: null | components["schemas"]["DeploymentDto"];
+            target: components["schemas"]["DeploymentTargetDto"];
+        };
+        /** @description A source allowed to report into an Environment (ADR-0071 §5). */
+        EnvironmentDeploymentSourceDto: {
+            /**
+             * @description The PluginInstallation's name: a DNS-1123 label (lowercase letters,
+             *     digits, `-`; at most 63), installed in this org — a PUT naming one
+             *     that is not is refused (400).
+             */
+            installation: string;
+            /**
+             * @description The vendor's grouping that maps into this Environment (an Argo CD
+             *     project, say). Opaque; matched exactly, no wildcards. No leading or
+             *     trailing whitespace (refused, never trimmed).
+             */
+            vendor_grouping: string;
+        };
+        /**
+         * @description Which Projects may run Deploy Runs into an Environment (ADR-0071 §2):
+         *     every Project in the org, or exactly those matching one of `projects`
+         *     (project-name globs, `*` wildcards).
+         */
+        EnvironmentEligibilityDto: {
+            /** @description Every Project in the org. `projects` must then be empty. */
+            all_projects: boolean;
+            /**
+             * @description Project-name globs. An empty list with `all_projects: false` admits
+             *     **no** Project — eligibility starts closed.
+             */
+            projects?: string[];
+        };
+        /**
+         * @description One line of the split report: an Environment name merged across several
+         *     Projects, or created with eligibility *all projects* because no Project
+         *     defined it. If the merged Projects really meant different places (one
+         *     `prod` that is `prod-eu`), the split is a YAML change: those Projects
+         *     rename their `environment:` and an org admin creates the new
+         *     Environment — nothing is renamed for them.
+         */
+        EnvironmentMigrationReportDto: {
+            /**
+             * Format: int64
+             * @description Unix-ms; absent until an admin acknowledges the line.
+             */
+            acknowledged_at?: number | null;
+            acknowledged_by?: string | null;
+            /**
+             * Format: int64
+             * @description Unix-ms.
+             */
+            created_at: number;
+            /**
+             * @description The legacy rules the merged Projects disagreed on, by ADR-0037 field
+             *     name (`approvers`, `allowed_refs`, `wait_timer`, `require_reason`,
+             *     `privileged_images`, `permit_k8s_overlay`). Lists compare as sets.
+             */
+            differing_rules: string[];
+            environment: string;
+            /** @description The Environment still exists. */
+            environment_exists: boolean;
+            merged_projects: string[];
+            /**
+             * @description Its baseline is still the permissive one the migration gave it:
+             *     nothing org-wide protects it yet — set a baseline.
+             */
+            permissive_baseline: boolean;
+            projects: components["schemas"]["EnvironmentMigrationReportProjectDto"][];
+            /** @description No Project defined it: migrated with eligibility *all projects*. */
+            referenced_only: boolean;
+            /** @description Projects whose Runs named it without defining it. */
+            referencing_projects: string[];
+        };
+        /** @description One Project in a split-report line: what it had, and what it has now. */
+        EnvironmentMigrationReportProjectDto: {
+            legacy?: null | components["schemas"]["LegacyProtectionRulesDto"];
+            overlay?: null | components["schemas"]["EnvironmentProjectOverlayDto"];
+            project: string;
+        };
+        /** @description One Project's standing in one Environment, for the Environment's admin. */
+        EnvironmentProjectDto: {
+            /** @description Whether the Environment's eligibility admits it now. */
+            eligible: boolean;
+            overlay?: null | components["schemas"]["EnvironmentProjectOverlayDto"];
+            privilege_grant?: null | components["schemas"]["EnvironmentProjectPrivilegeGrantDto"];
+            project: string;
+        };
+        /** @description A Project's overlay as stored. */
+        EnvironmentProjectOverlayDto: {
+            allowed_refs: string[];
+            approvers: string[];
+            /** Format: int32 */
+            deployment_concurrency?: number | null;
+            /** Format: int64 */
+            deployment_gate_deadline_ms?: number | null;
+            require_reason: boolean;
+            /** Format: int32 */
+            wait_timer_s: number;
+        };
+        /** @description The privileges one Project holds within one Environment (ADR-0071 §8). */
+        EnvironmentProjectPrivilegeGrantDto: {
+            permit_k8s_overlay: boolean;
+            privileged_images: components["schemas"]["ImageGrantDto"][];
+        };
+        /**
+         * @description Protection rules as one layer holds them — an Environment's baseline or a
+         *     Project's overlay (ADR-0071 §1, §3).
+         */
+        EnvironmentProtectionRulesDto: {
+            /** @description Ref globs a deploy's symbolic ref must match; empty = any ref. */
+            allowed_refs: string[];
+            /** @description Principal ids; every one must approve (AND). */
+            approvers: string[];
+            /**
+             * Format: int32
+             * @description In-flight Deployments per DeploymentTarget; absent = no limit.
+             *     Enforced once deployment requests ship (ADR-0071 §9).
+             */
+            deployment_concurrency?: number | null;
+            /** @description A human dispatch must carry a reason (ADR-0057 §3). */
+            require_reason: boolean;
+            /**
+             * Format: int32
+             * @description Seconds. Carried and merged, not yet enforced (git-bug 2b94989).
+             */
+            wait_timer_s: number;
+        };
         /** @description One expired Workspace Snapshot behind a widened rerun (ADR-0061 s5). */
         ExpiredInputDto: {
             /** @description The step whose input workspace is incomplete. */
@@ -1790,10 +2817,112 @@ export interface components {
             /** @description The CAS merkle root the store no longer holds. */
             root: string;
         };
+        /**
+         * @description Optional `POST /v1/runs/{id}/gates/{step}/release` body: an external gate's
+         *     verdict. Absent (or `passed: true`) releases the gate; `passed: false`
+         *     fails it with `reason`.
+         */
+        ExternalGateVerdict: {
+            /** @description `false` fails the gate; `true` (the default) releases it. */
+            passed?: boolean;
+            /**
+             * @description Why the gate failed — required (1 to 1024 bytes, trimmed) with
+             *     `passed: false`; ignored on a release.
+             */
+            reason?: string | null;
+        };
+        /** @description How a gate's wait resolved: its `GateResolved` journal entry. */
+        GateResolutionDto: {
+            /**
+             * Format: int64
+             * @description Unix-ms the verdict was journalled.
+             */
+            at: number;
+            /** @description The gate Attempt the verdict closed (`a1`, `a2`, …). */
+            attempt: string;
+            /**
+             * @description Who rejected it, for a rejection by request (`external:{step}` for an
+             *     external gate's token). Absent for a verdict the engine reached.
+             */
+            by?: string | null;
+            /**
+             * Format: int64
+             * @description The Deployment a DeploymentGate's verdict was read from (its
+             *     Org-scoped id, as the Deployments view shows it).
+             */
+            deployment_id?: number | null;
+            /** @description `true`: the gate passed and its dependents may run. */
+            passed: boolean;
+            /**
+             * @description Why — a timer elapsing, a DeploymentGate's "v1 live on …", the
+             *     source's failure label, a rejection's reason.
+             */
+            reason?: string | null;
+        };
         /** @description A permission the forge reports as granted. */
         GrantedPermissionDto: {
             level: string;
             name: string;
+        };
+        /** @description One entry of a privilege whitelist (ADR-0039). */
+        ImageGrantDto: {
+            /** @description The Linux capabilities it may add. */
+            capabilities?: string[];
+            /**
+             * @description `sha256:…` — the digest a step's image must be pinned to
+             *     (`repo@sha256:…`). Matched exactly.
+             */
+            image_digest: string;
+            /** @description May run as a privileged container. */
+            privileged?: boolean;
+        };
+        /** @description `POST /v1/orgs/{org}/plugins`. */
+        InstallPluginRequest: {
+            /** @description Values for the manifest's `config_keys`; omitted = none. */
+            config?: {
+                [key: string]: string;
+            };
+            /** @description `<catalog image_repository>@sha256:<64 hex>`. */
+            image: string;
+            /**
+             * @description The installation's name: a DNS-1123 label, unique in the org and
+             *     never reused once uninstalled.
+             */
+            name: string;
+            /** @description The catalog plugin (`argocd`). */
+            plugin: string;
+        };
+        /** @description An Environment source that routes one of the installation's groupings. */
+        InstallationDeploymentSourceDto: {
+            environment: string;
+            vendor_grouping: string;
+        };
+        /**
+         * @description Whether an installation's reports and broker calls are accepted.
+         * @enum {string}
+         */
+        InstallationStateDto: "enabled" | "killed";
+        /**
+         * @description A Project's ADR-0037 per-repo rules as the migration found them. The
+         *     canonical `secret_scope` / `oidc_subject` are left out: the server always
+         *     derived them from the coordinates, so they never differed by choice.
+         */
+        LegacyProtectionRulesDto: {
+            allowed_refs: string[];
+            approvers: string[];
+            /**
+             * Format: int32
+             * @description Stored but never read; not carried by the migration (§10 step 3).
+             */
+            concurrency: number;
+            permit_k8s_overlay: boolean;
+            privileged_images: components["schemas"]["ImageGrantDto"][];
+            require_reason: boolean;
+            /**
+             * Format: int32
+             * @description Seconds.
+             */
+            wait_timer: number;
         };
         /** @description `POST /v1/me/identities/link` body. */
         LinkIdentityRequest: {
@@ -1848,6 +2977,47 @@ export interface components {
             /** @description Stable, forge-agnostic identity subject. */
             subject: string;
         };
+        /** @description `GET /v1/me/security`. */
+        MeSecurityResponse: {
+            /**
+             * @description No usable passkey yet, and this browser session's login is fresh
+             *     enough to enroll the first one.
+             */
+            can_enroll_first: boolean;
+            /**
+             * Format: int64
+             * @description Until when this session's login is fresh (a browser login only).
+             */
+            fresh_login_until?: number | null;
+            /**
+             * @description Where this human logs in again — through the login provider they sign
+             *     in with — landing on enrollment (a relative URL). The one place the
+             *     provider is chosen: `scarab security setup` prints this.
+             */
+            fresh_login_url: string;
+            /** @description Holds at least one usable (not clone-flagged) passkey. */
+            has_passkey: boolean;
+            /** @description The passkeys — empty for an API-token caller (see `passkeys_hidden`). */
+            passkeys: components["schemas"]["PasskeyDto"][];
+            /**
+             * @description The caller is an API token: a token, scoped to one Org or Project,
+             *     never reads its owner's passkey list (only whether one is held).
+             */
+            passkeys_hidden: boolean;
+            /** @description `enforce` or `off`. */
+            step_up: string;
+            subject: string;
+            /**
+             * Format: int64
+             * @description How many usable (not clone-flagged) passkeys are held.
+             */
+            usable_passkey_count: number;
+            /**
+             * Format: int64
+             * @description This browser session's open window, if any (unix ms).
+             */
+            window_expires_at?: number | null;
+        };
         /**
          * @description `POST /v1/orgs/{org}/tokens` body. Every field is required on purpose: a
          *     credential with no verb and no expiry is the shape this repo already learned
@@ -1886,6 +3056,135 @@ export interface components {
              *     or by any later API call: a lost token is re-minted, never re-read.
              */
             token: string;
+        };
+        /** @description Where a moved DeploymentTarget's reports go now. */
+        MovedAwayDto: {
+            /**
+             * @description The Environment that lists its source's grouping now; absent = none
+             *     does (unmapped — its reports are dropped).
+             */
+            now?: string | null;
+        };
+        /**
+         * @description What a human is asked to confirm: the server-rendered, redacted
+         *     description of one operation (shown in the 403, on the confirm page and
+         *     in the event log).
+         */
+        OpSummary: {
+            /** @description What changes, one line each. Redacted fields read `(hidden)`. */
+            changes: string[];
+            /** @description What is being done ("Write a secret"). */
+            operation: string;
+            /** @description What it is done to ("acme/web/prod/DB_PASSWORD"). */
+            target: string;
+        };
+        /** @description An org-level Environment in its minimal shape (ADR-0071, MMP step 1). */
+        OrgEnvironmentDto: {
+            /**
+             * Format: int64
+             * @description Unix-ms.
+             */
+            created_at: number;
+            /**
+             * Format: int64
+             * @description The EnvironmentDeploymentDeadline: how long a Deployment here may stay
+             *     `requested` or `in_progress` before it reads `stalled`.
+             */
+            deployment_deadline_ms: number;
+            /** @description Sorted by installation, then vendor grouping. */
+            deployment_sources: components["schemas"]["EnvironmentDeploymentSourceDto"][];
+            description: string;
+            /**
+             * @description Which Projects may deploy here. Read-only here: written through
+             *     `…/eligibility`.
+             */
+            eligibility: components["schemas"]["EnvironmentEligibilityDto"];
+            name: string;
+            org: string;
+            /**
+             * @description The baseline every Project's Deploy Runs obey. Read-only here:
+             *     written through `…/protection`, never by the whole-Environment PUT.
+             */
+            protection: components["schemas"]["EnvironmentProtectionRulesDto"];
+            /**
+             * Format: int64
+             * @description Unix-ms.
+             */
+            updated_at: number;
+            /** @description Who last wrote it (a Principal subject). */
+            updated_by: string;
+        };
+        /** @description `GET /v1/orgs/{org}/security/summary`. */
+        OrgSecuritySummary: {
+            /** Format: int64 */
+            admins_total: number;
+            /**
+             * @description Admins of the Org (Admin/Owner bindings on the Org, and — for a
+             *     global administrator only — the bootstrap owners) who hold no usable
+             *     passkey: every crown jewel is refused for them until they enroll one.
+             */
+            admins_without_passkey: string[];
+            /** @description Your role in the Org (`owner`, `admin`, …). */
+            caller_role?: string | null;
+            /** @description Step-up is enforced on this install. */
+            enforced: boolean;
+            /**
+             * Format: int64
+             * @description StepUpConfirmationRequests waiting for a human in this Org.
+             */
+            pending_requests: number;
+            /** @description The last 20 refusals in the Org, from the last 24 hours. */
+            recent_refusals: components["schemas"]["SecurityEventDto"][];
+            /**
+             * Format: int64
+             * @description Bootstrap owners entries that match only a verified email at login
+             *     and name no Principal: not counted above, since no passkey is ever
+             *     stored under one (a global administrator's view; 0 otherwise).
+             */
+            unresolved_owner_entries: number;
+        };
+        /** @description One of the caller's passkeys. */
+        PasskeyDto: {
+            /** @description The credential may be synced to other devices (BE). */
+            backup_eligible: boolean;
+            /** @description It is backed up / synced, as last seen (BS). */
+            backup_state: boolean;
+            /** @description Its signature counter went backwards: it is never accepted again. */
+            clone_suspected: boolean;
+            /** Format: int64 */
+            created_at: number;
+            id: string;
+            label: string;
+            /** Format: int64 */
+            last_used_at?: number | null;
+            transports: string[];
+        };
+        /** @description `POST /v1/me/passkeys/registration/options`. */
+        PasskeyRegistrationOptionsRequest: {
+            /** @description A name for the passkey ("MacBook Touch ID"). Default `Passkey`. */
+            label?: string | null;
+        };
+        /** @description `POST /v1/me/passkeys/registration`. */
+        PasskeyRegistrationRequest: {
+            challenge_id: string;
+            /** @description `RegistrationResponseJSON` — `PublicKeyCredential.toJSON()`. */
+            credential: Record<string, never>;
+        };
+        /** @description What a passkey reset removed. */
+        PasskeyResetDto: {
+            /**
+             * Format: int64
+             * @description How many passkeys were removed.
+             */
+            removed: number;
+            /** @description The principal whose passkeys were reset. */
+            subject: string;
+            /**
+             * Format: int64
+             * @description How many standing step-up confirmations (windows, unconsumed action
+             *     confirmations) were revoked.
+             */
+            windows_revoked: number;
         };
         /**
          * @description `GET /v1/repos/{org}/{repo}/pipelines?ref=` body: the manually-dispatchable
@@ -1971,6 +3270,142 @@ export interface components {
             /** @description The step that re-runs (a gate re-arms and pauses instead of running). */
             step: string;
         };
+        /**
+         * @description One entry of the closed PluginCapability vocabulary (ADR-0072 §2).
+         * @enum {string}
+         */
+        PluginCapabilityDto: "report_deployments" | "subscribe_events" | "offer_actions" | "use_connection" | "contribute_ui" | "approve_gates";
+        /** @description A plugin this Scarab can install. */
+        PluginCatalogEntryDto: {
+            description: string;
+            /** @description Always true today: third-party installs are off. */
+            first_party: boolean;
+            /** @description Install as `<image_repository>@sha256:<digest>`. */
+            image_repository: string;
+            manifest: components["schemas"]["PluginManifestDto"];
+            /** @description The catalog key `POST …/plugins` names as `plugin`. */
+            plugin: string;
+        };
+        /**
+         * @description One connection slot of an installation and what an admin bound to it
+         *     (ADR-0072 §5). Never carries the credential, nor its secret key.
+         */
+        PluginConnectionDto: {
+            auth_scheme?: string | null;
+            /** @description The schemes the manifest allows; `bearer` is the only one today. */
+            auth_schemes: string[];
+            /** @description Where every request on it goes — and nowhere else. */
+            base_url?: string | null;
+            /**
+             * @description The CA certificates (PEM) that are the ONLY trust anchors for
+             *     `base_url`; absent = the platform's roots. Certificates are public.
+             */
+            ca_pem?: string | null;
+            /**
+             * @description Whether an admin has bound it. Unbound, the broker answers the
+             *     plugin's requests on it with 409.
+             */
+            configured: boolean;
+            /**
+             * @description Whether the credential is present in the secret store. Write-only:
+             *     no endpoint returns it.
+             */
+            credential_set: boolean;
+            /**
+             * @description `base_url` is plain `http://`: the credential crosses the network in
+             *     the clear. Allowed (an in-cluster Service, say); the UI warns.
+             */
+            insecure_http: boolean;
+            /** @description What the plugin may send through it: reads only. */
+            read_rules: components["schemas"]["RequestRuleDto"][];
+            /** @description The manifest's slot name. */
+            slot: string;
+            /**
+             * Format: int64
+             * @description Unix-ms.
+             */
+            updated_at?: number | null;
+            updated_by?: string | null;
+        };
+        /** @description A PluginInstallation (ADR-0072 §10). */
+        PluginInstallationDto: {
+            /**
+             * Format: int64
+             * @description Unix-ms.
+             */
+            approved_at: number;
+            approved_by: string;
+            config: {
+                [key: string]: string;
+            };
+            /**
+             * @description The Environment sources that name this installation — at install,
+             *     the ones written before it existed, which it now feeds.
+             */
+            deployment_sources: components["schemas"]["InstallationDeploymentSourceDto"][];
+            /** @description Server-minted, 10 hex; names the installation's ServiceAccount. */
+            id: string;
+            image: string;
+            /**
+             * Format: int64
+             * @description Unix-ms.
+             */
+            killed_at?: number | null;
+            killed_by?: string | null;
+            manifest: components["schemas"]["PluginManifestDto"];
+            manifest_sha256: string;
+            /**
+             * @description Unique in the org and never reused; reports carry it as their
+             *     DeploymentTarget `source`.
+             */
+            name: string;
+            org: string;
+            /** @description The catalog plugin. */
+            plugin: string;
+            /** @description `plugin:<name>` — what it acts as in audit. */
+            principal: string;
+            /**
+             * Format: int64
+             * @description Unix-ms the isolation probe last passed.
+             */
+            probe_passed_at?: number | null;
+            runtime_message: string;
+            runtime_status: components["schemas"]["RuntimeStatusDto"];
+            state: components["schemas"]["InstallationStateDto"];
+            usage: components["schemas"]["PluginUsageDto"];
+        };
+        /**
+         * @description What the plugin asks for — exactly what an admin approves with the
+         *     digest (ADR-0072 §1-2).
+         */
+        PluginManifestDto: {
+            capabilities: components["schemas"]["PluginCapabilityDto"][];
+            config_keys: string[];
+            connections: components["schemas"]["ConnectionSlotDto"][];
+            plugin: string;
+        };
+        /**
+         * @description How much of its per-installation caps an installation uses: past one, a
+         *     report about a NEW target (or a new unmapped grouping) is rejected; known
+         *     targets keep reporting.
+         */
+        PluginUsageDto: {
+            /** Format: int64 */
+            max_targets: number;
+            /** Format: int64 */
+            max_unmapped_groupings: number;
+            /**
+             * Format: int64
+             * @description DeploymentTargets it has reported on.
+             */
+            targets: number;
+            /**
+             * Format: int64
+             * @description Groupings counted as reported on with no Environment listing them
+             *     (one an Environment lists since stays counted until its next report).
+             */
+            unmapped_groupings: number;
+        };
         /** @description A Principal, as the grant/approver typeahead offers it (ADR-0069 §3). */
         PrincipalDto: {
             /** @description `false` = created by a forge import, not signed into yet. */
@@ -2007,6 +3442,137 @@ export interface components {
              *     host, which differs from the web host on GitHub).
              */
             repo_url: string;
+        };
+        /**
+         * @description An org-level Environment as one Project sees it (ADR-0071): the read
+         *     model behind `GET /v1/repos/{org}/{repo}/environments`, which until
+         *     ADR-0071 returned the repo's own per-repo environments.
+         */
+        ProjectEnvironmentDto: {
+            /** @description The Environment's baseline, set by an org admin. */
+            baseline: components["schemas"]["EnvironmentProtectionRulesDto"];
+            /**
+             * Format: int64
+             * @description The Environment's EnvironmentDeploymentDeadline.
+             */
+            deployment_deadline_ms: number;
+            /** @description What admission enforces: the baseline merged with the overlay. */
+            effective: components["schemas"]["EffectiveProtectionDto"];
+            /**
+             * @description Whether this Project may deploy here now (EnvironmentProjectEligibility).
+             *     `false` only for an Environment the Project still holds an overlay or
+             *     grant in after an admin made it ineligible.
+             */
+            eligible: boolean;
+            name: string;
+            overlay?: null | components["schemas"]["EnvironmentProtectionRulesDto"];
+            /**
+             * Format: int64
+             * @description The overlay's tighter deadline for this Project's DeploymentGates.
+             */
+            overlay_deployment_gate_deadline_ms?: number | null;
+            privilege_grant?: null | components["schemas"]["EnvironmentProjectPrivilegeGrantDto"];
+        };
+        /**
+         * @description A Project overlay (`…/projects/{project}/overlay`) body: the baseline's
+         *     five rules, which can only **tighten** (ADR-0071 §3), plus a tighter
+         *     deadline for this Project's DeploymentGates. Replaced whole, omitted =
+         *     permissive default, unknown fields refused — as for the baseline.
+         */
+        PutEnvironmentProjectOverlayRequest: {
+            allowed_refs?: string[];
+            approvers?: string[];
+            /** Format: int32 */
+            deployment_concurrency?: number | null;
+            /**
+             * Format: int64
+             * @description 60000 to 604800000; applies to this Project's DeploymentGates only,
+             *     and only when shorter than the Environment's. Omitted = none.
+             */
+            deployment_gate_deadline_ms?: number | null;
+            require_reason?: boolean;
+            /** Format: int32 */
+            wait_timer_s?: number;
+        };
+        /**
+         * @description A Project's privilege grant (`…/projects/{project}/privilege-grant`)
+         *     body, replaced whole.
+         */
+        PutEnvironmentProjectPrivilegeGrantRequest: {
+            /** @description May the Project's steps here set a raw `k8s_overlay` (ADR-0055). */
+            permit_k8s_overlay?: boolean;
+            /** @description The ADR-0039 whitelist; each digest listed once. */
+            privileged_images?: components["schemas"]["ImageGrantDto"][];
+        };
+        /**
+         * @description A baseline (`…/protection`) body: the five rules, replaced whole. Every
+         *     field is optional and an omitted one takes the **permissive** default —
+         *     never the stored value — so `{}` resets the baseline to permissive.
+         *     Unknown fields are refused, so the retired per-repo shape (`wait_timer`,
+         *     `concurrency`) is a 400, not a silently ignored rule.
+         */
+        PutEnvironmentProtectionRequest: {
+            /** @description Ref globs (`refs/heads/main`, `refs/tags/*`); empty = any ref. */
+            allowed_refs?: string[];
+            /**
+             * @description Principal ids (ADR-0069): each must name an existing Principal; a
+             *     merged id is stored as the Principal it now is. All must approve.
+             */
+            approvers?: string[];
+            /**
+             * Format: int32
+             * @description In-flight Deployments per DeploymentTarget, at least 1; omitted or
+             *     `null` = no limit. Enforced once deployment requests ship (§9).
+             */
+            deployment_concurrency?: number | null;
+            /** @description A human dispatch must carry a reason (ADR-0057 §3). Omitted = off. */
+            require_reason?: boolean;
+            /**
+             * Format: int32
+             * @description Seconds. Carried and merged, not yet enforced (git-bug 2b94989).
+             */
+            wait_timer_s?: number;
+        };
+        /**
+         * @description `PUT /v1/orgs/{org}/environments/{env}`: the whole Environment, replaced.
+         *     An omitted optional field takes its default — it does not keep the stored
+         *     value. Unknown fields are refused, so a misspelt field is a 4xx rather
+         *     than a silently reset deadline.
+         */
+        PutOrgEnvironmentRequest: {
+            /**
+             * Format: int64
+             * @description 60000 (1 minute) to 604800000 (7 days); omitted = the server default
+             *     (one hour).
+             */
+            deployment_deadline_ms?: number | null;
+            /** @description The complete list; it replaces the stored one. `[]` clears it. */
+            deployment_sources: components["schemas"]["EnvironmentDeploymentSourceDto"][];
+            /** @description Free text; omitted = empty. */
+            description?: string | null;
+        };
+        /**
+         * @description `PUT /v1/orgs/{org}/plugins/{name}/connections/{slot}`: bind the slot's
+         *     destination and credential, replacing any previous binding whole.
+         */
+        PutPluginConnectionRequest: {
+            /**
+             * @description `https://host[:port][/prefix]` (or `http://`, warned about). Every
+             *     request the plugin sends on this slot goes here; it cannot pick
+             *     another host.
+             */
+            base_url: string;
+            /**
+             * @description PEM CA certificates to trust INSTEAD of the platform roots, for an
+             *     internal CA (https only). There is no skip-verify.
+             */
+            ca_pem?: string | null;
+            /**
+             * @description The bearer token the broker adds upstream. Required on every bind —
+             *     a new destination never inherits a credential entered for another —
+             *     and never readable back.
+             */
+            credential: string;
         };
         /**
          * @description `POST /v1/secrets` body: define (or overwrite) a secret at a scope. The
@@ -2046,6 +3612,27 @@ export interface components {
         RefsResponse: {
             /** @description Branches first, then tags; each group name-sorted. */
             refs: components["schemas"]["RefDto"][];
+        };
+        /** @description `POST /v1/runs/{id}/gates/{step}/reject` body: why the gate is failed. */
+        RejectGateRequest: {
+            /**
+             * @description The human reason, journalled on the gate's verdict and its Attempt.
+             *     Required: 1 to 1024 bytes once trimmed.
+             */
+            reason: string;
+        };
+        /**
+         * @description An allowed read on a connection: method + path pattern (`*` = one
+         *     segment) + the query keys it may carry.
+         */
+        RequestRuleDto: {
+            method: string;
+            path: string;
+            /**
+             * @description The query keys a request under this rule may carry, each at most
+             *     once; empty = no query. Anything else is refused by the broker.
+             */
+            query: string[];
         };
         /**
          * @description `GET …/steps/{step}/rerun-plan` body: what a rerun/retry of this step would
@@ -2216,7 +3803,22 @@ export interface components {
              *     trigger carried no headline and on runs created before headline-stamping.
              */
             trigger_title?: string | null;
+            /**
+             * @description The run's **waiting gates** (git-bug `c489346`): gate steps that are
+             *     `Pending`, reached (every need `Succeeded`) and have an open Attempt —
+             *     the engine's "waiting gate". Since a waiting gate holds only its
+             *     dependents (ADR-0070 §9), a Run with one can still be `running` while
+             *     independent steps run, so this — not `status == suspended` — is what
+             *     says a Run waits on a gate. Omitted when empty (and always for a
+             *     terminal or queued Run).
+             */
+            waiting_gates?: components["schemas"]["WaitingGateDto"][];
         };
+        /**
+         * @description What the plugin runtime last observed of the workload.
+         * @enum {string}
+         */
+        RuntimeStatusDto: "pending" | "probing" | "running" | "probe_failed" | "error" | "stopped";
         /**
          * @description `GET /v1/secrets` body: the secret **names** at a scope. Values are never
          *     listed.
@@ -2265,6 +3867,55 @@ export interface components {
             status: {
                 [key: string]: string;
             };
+        };
+        /** @description One OrgSecurityEventLog row. */
+        SecurityEventDto: {
+            /**
+             * Format: int64
+             * @description Unix ms.
+             */
+            at: number;
+            /**
+             * @description `session:cookie`, `session:bearer`, `api_token:<id>` or
+             *     `operator:break-glass`.
+             */
+            caller: string;
+            /** @description The StepUpConfirmation it was authorised by / that it records. */
+            confirmation_id?: string | null;
+            detail: Record<string, never>;
+            id: string;
+            /**
+             * @description `step_up.confirmed`, `step_up.refused`, `op.authorised`,
+             *     `op.completed`, `request.raised|confirmed|executed|failed`,
+             *     `passkey.enrolled|removed|reset|break_glass_reset|clone_suspected`,
+             *     `guard.not_consulted`.
+             */
+            kind: string;
+            op?: string | null;
+            /** @description `None`: not bound to one Org (a passkey, a confirmation). */
+            org?: string | null;
+            passkey_id?: string | null;
+            /** @description The StepUpConfirmationRequest it belongs to. */
+            request_id?: string | null;
+            /**
+             * Format: int64
+             * @description Orders the log; pass the last one's as `before` to page.
+             */
+            seq: number;
+            /** @description SHA-256 of the session (never the session id). */
+            session_hash?: string | null;
+            /** @description The human/principal it is about. */
+            subject: string;
+            target?: string | null;
+        };
+        /** @description A page of the log. */
+        SecurityEventsResponse: {
+            events: components["schemas"]["SecurityEventDto"][];
+            /**
+             * Format: int64
+             * @description Pass as `before` for the next page; absent on the last.
+             */
+            next_before?: number | null;
         };
         /**
          * @description A **shared service** instance of a run (ADR-0058) — the evidence a shared
@@ -2346,6 +3997,12 @@ export interface components {
              */
             retention_days: number;
         };
+        /**
+         * @description The statuses a source may assert in a report (INV-DEP-6) — a subset of
+         *     [`DeploymentStatusDto`], typed apart so the wire says so too.
+         * @enum {string}
+         */
+        SourceAssertedStatusDto: "in_progress" | "live" | "failed";
         /** @description One step (IR subset): the step contract is an OCI `image` + `command`. */
         StepDto: {
             command?: string[];
@@ -2451,11 +4108,21 @@ export interface components {
              */
             attempt_list?: components["schemas"]["AttemptDto"][];
             attempts: number;
+            deployment_gate?: null | components["schemas"]["DeploymentGateDto"];
             /**
-             * @description `manual`/`timer`/`external` if this step is a gate (ADR-0008), else absent.
-             *     Gates launch no pod and suspend the run until released.
+             * @description `manual`/`timer`/`external`/`deployment` if this step is a gate
+             *     (ADR-0008, ADR-0070 §8), else absent. Gates launch no pod; a waiting
+             *     gate holds only the steps that need it.
              */
             gate?: string | null;
+            gate_resolution?: null | components["schemas"]["GateResolutionDto"];
+            /**
+             * @description Why this deploy Step is held `pending` by per-DeploymentTarget
+             *     concurrency (ADR-0071 §9), e.g. "held: waiting for deployment
+             *     concurrency on `argocd`/`web` (1/1 in flight)". Derived each read
+             *     (nothing is journalled per scheduler pass). Absent when not held.
+             */
+            held?: string | null;
             id: string;
             /**
              * @description Upstream step ids this step depends on — the DAG in-edges (ADR-0006). The
@@ -2475,6 +4142,170 @@ export interface components {
              *     (ADR-0058) — the DAG's service edges. Empty for a step that uses none.
              */
             uses?: string[];
+        };
+        /** @description `POST /v1/me/step-up`. */
+        StepUpConfirmRequest: {
+            challenge_id: string;
+            /** @description `AuthenticationResponseJSON` — `PublicKeyCredential.toJSON()`. */
+            credential: Record<string, never>;
+        };
+        /** @description A StepUpConfirmation just made. */
+        StepUpConfirmResponse: {
+            confirmation_id: string;
+            /** Format: int64 */
+            confirmed_at: number;
+            /**
+             * Format: int64
+             * @description Fixed at `confirmed_at` + 5 minutes; never extended.
+             */
+            expires_at: number;
+            /** @description `window` or `action`. */
+            kind: string;
+        };
+        /** @description The body of a `403 step_up_required` (ADR-0073 §5). */
+        StepUpRefusal: {
+            challenge?: null | components["schemas"]["WebauthnChallengeDto"];
+            /** @description Always `step_up_required`. */
+            code: string;
+            /**
+             * @description An API token or Bearer-session caller: the one-time link its human
+             *     confirms this exact operation at (ADR-0073 §6).
+             */
+            confirmation_url?: string | null;
+            /** @description Mode `enroll`: where to enroll a passkey. */
+            enroll_url?: string | null;
+            /** Format: int64 */
+            expires_at?: number | null;
+            /**
+             * Format: int64
+             * @description Mode `enroll`: until when this session's login is fresh enough to
+             *     enroll a first passkey (absent = it is not; log in again).
+             */
+            fresh_login_until?: number | null;
+            message: string;
+            /**
+             * @description `window` (a 5-minute window will do), `action` (confirm this exact
+             *     action) or `enroll` (no passkey yet).
+             */
+            mode: string;
+            /** @description The operation id (`secret.put`). */
+            op: string;
+            request_id?: string | null;
+            /** @description What is being confirmed, redacted. */
+            summary: components["schemas"]["OpSummary"];
+        };
+        /**
+         * @description A StepUpConfirmationRequest as its human (or its polling requester)
+         *     sees it.
+         */
+        StepUpRequestDto: {
+            /** Format: int64 */
+            confirmed_at?: number | null;
+            confirmed_by?: string | null;
+            /** Format: int64 */
+            created_at: number;
+            /** Format: int64 */
+            executed_at?: number | null;
+            /**
+             * Format: int64
+             * @description A pending request past this can no longer be confirmed.
+             */
+            expires_at: number;
+            /** @description The only human who can confirm it. */
+            for_human: string;
+            id: string;
+            method: string;
+            /** @description The operation id (`secret.put`). */
+            op: string;
+            org?: string | null;
+            path: string;
+            /**
+             * @description The raw query string the operation runs with (empty = none) — part
+             *     of what runs, so the confirm page shows it.
+             */
+            query: string;
+            /** @description Who asked: `API token “ci-bot” (<id>)` or `a CLI session (Bearer)`. */
+            requested_by: string;
+            /** @description `api_token` or `bearer_session`. */
+            requested_via: string;
+            /**
+             * Format: int32
+             * @description The replayed operation's HTTP status, once it ran.
+             */
+            result_status?: number | null;
+            /** @description `pending`, `executing`, `executed`, `failed` or `expired`. */
+            state: string;
+            /** @description What would run, redacted (secret values read `(hidden)`). */
+            summary: components["schemas"]["OpSummary"];
+        };
+        /** @description What a confirmed request did. */
+        StepUpRequestResultDto: {
+            request_id: string;
+            /**
+             * @description The operation's response body (JSON, or a string), returned once
+             *     and never stored — a minted token's plaintext shows only here.
+             */
+            result_body: Record<string, never>;
+            /**
+             * Format: int32
+             * @description The operation's HTTP status.
+             */
+            result_status?: number | null;
+            /** @description `executed` (the operation answered 2xx) or `failed`. */
+            state: string;
+        };
+        /** @description What an uninstall removed. */
+        UninstalledPluginDto: {
+            name: string;
+            /** @description The Environment sources that named it — removed with it. */
+            removed_deployment_sources: components["schemas"]["InstallationDeploymentSourceDto"][];
+        };
+        /** @description A grouping the installation reports on that no Environment lists. */
+        UnmappedGroupingDto: {
+            /**
+             * Format: int64
+             * @description Unix-ms.
+             */
+            first_at: number;
+            /**
+             * Format: int64
+             * @description Unix-ms.
+             */
+            last_at: number;
+            last_target_id: string;
+            /**
+             * Format: int64
+             * @description Reports dropped for it so far.
+             */
+            reports: number;
+            vendor_grouping: string;
+        };
+        /** @description One waiting gate of a run in the list view ([`RunSummaryDto::waiting_gates`]). */
+        WaitingGateDto: {
+            /** @description The gate kind: `manual` / `timer` / `external` / `deployment`. */
+            kind: string;
+            /**
+             * Format: int64
+             * @description When its wait opened (epoch millis): its open Attempt's start.
+             */
+            since: number;
+            /** @description The gate step's id. */
+            step: string;
+        };
+        /** @description A WebAuthn challenge ready for `navigator.credentials.*`. */
+        WebauthnChallengeDto: {
+            /**
+             * Format: int64
+             * @description Unix ms after which the challenge is refused.
+             */
+            expires_at: number;
+            /** @description Pass back with the credential. */
+            id: string;
+            /**
+             * @description `PublicKeyCredentialRequestOptionsJSON` (or `…CreationOptionsJSON`
+             *     for enrollment) — feed it to `parse*OptionsFromJSON`.
+             */
+            public_key: Record<string, never>;
         };
         /**
          * @description One entry in a workspace directory listing — the merkle-tree children under a
@@ -2635,7 +4466,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description session + CSRF cookies set; redirect to / */
+            /** @description session + CSRF cookies set; redirect to the login's `next`, else / */
             302: {
                 headers: {
                     [name: string]: unknown;
@@ -2656,6 +4487,8 @@ export interface operations {
             query?: {
                 /** @description login provider id (ADR-0069); default = the only, or the unqualified_ids, provider */
                 provider?: string;
+                /** @description a relative path to land on after the callback (ADR-0073); default `/` */
+                next?: string;
             };
             header?: never;
             path?: never;
@@ -2670,7 +4503,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description unknown provider, or several and none named */
+            /** @description unknown provider, several and none named, or a `next` that is not a relative path */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -2817,12 +4650,14 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description requires Administer on the org */
+            /** @description requires Administer on the org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
             };
             /** @description no connection registry or secret store wired */
             404: {
@@ -2833,6 +4668,13 @@ export interface operations {
             };
             /** @description a connection to that forge and base URL already exists */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2862,12 +4704,14 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description requires Administer on the org */
+            /** @description requires Administer on the org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
             };
             /** @description no such connection, or no registry wired */
             404: {
@@ -2878,6 +4722,13 @@ export interface operations {
             };
             /** @description the connection still has bound repos (Projects) */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2995,12 +4846,14 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description requires Administer on the org */
+            /** @description requires Administer on the org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
             };
             /** @description no such connection, or no registry wired */
             404: {
@@ -3011,6 +4864,13 @@ export interface operations {
             };
             /** @description the repo is already bound to a different connection */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3041,15 +4901,24 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description requires Administer on the org */
+            /** @description requires Administer on the org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description no such connection, or the repo is not bound to it */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content?: never;
             };
-            /** @description no such connection, or the repo is not bound to it */
-            404: {
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3124,6 +4993,15 @@ export interface operations {
                     "application/json": components["schemas"]["ResyncResultDto"];
                 };
             };
+            /** @description `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
             /** @description no such connection, or no registry/forge wired */
             404: {
                 headers: {
@@ -3133,6 +5011,13 @@ export interface operations {
             };
             /** @description the connection is managed by configuration (read-only) */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3194,8 +5079,17 @@ export interface operations {
                     "application/json": components["schemas"]["LinkIdentityResponse"];
                 };
             };
-            /** @description not a browser session */
+            /** @description not a browser session — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3219,8 +5113,317 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
             /** @description not linked, or the only way to sign in */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    passkey_registration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PasskeyRegistrationRequest"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PasskeyDto"];
+                };
+            };
+            /** @description challenge unknown/used/expired, or the credential failed verification (`code` names the check) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description step-up is off */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description this credential is already registered */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    passkey_registration_options: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PasskeyRegistrationOptionsRequest"];
+            };
+        };
+        responses: {
+            /** @description PublicKeyCredentialCreationOptionsJSON under `public_key` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebauthnChallengeDto"];
+                };
+            };
+            /** @description `fresh_login_required` (a first passkey needs a browser login from the last 5 minutes), `step_up_required` (a later passkey is always-ask), or not a browser session */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description step-up is off */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the governed state changed between this request's read and its write (reload and retry), or the request conflicts with the current state */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    remove_passkey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description passkey id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `step_up_required` (mode `action`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description no such passkey of yours, or step-up is off */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    me_security: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MeSecurityResponse"];
+                };
+            };
+            /** @description not signed in */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    my_security_events: {
+        parameters: {
+            query?: {
+                /** @description comma-separated event kinds */
+                kind?: string;
+                /** @description only events with seq below this (paging) */
+                before?: number;
+                /** @description page size (default 50, max 200) */
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SecurityEventsResponse"];
+                };
+            };
+            /** @description not signed in */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token: it never reads its owner's security history */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    step_up_confirm: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["StepUpConfirmRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpConfirmResponse"];
+                };
+            };
+            /** @description challenge unknown/used/expired/another session's, unknown credential, or the assertion failed verification (`code` names the check) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `clone_suspected`: the passkey's counter went backwards and it is now refused for good; or not a browser session */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description step-up is off */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    step_up_options: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description PublicKeyCredentialRequestOptionsJSON under `public_key` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebauthnChallengeDto"];
+                };
+            };
+            /** @description `no_passkey`: enroll one first */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a browser session */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description step-up is off */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3270,6 +5473,22 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     delete_binding: {
@@ -3283,6 +5502,1546 @@ export interface operations {
         responses: {
             /** @description revoked */
             204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_environment_board: {
+        parameters: {
+            query?: {
+                /**
+                 * @description Only this Environment's rows; omitted = every Environment with any
+                 *     Deployment.
+                 */
+                environment?: string;
+            };
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EnvironmentBoardRowDto"][];
+                };
+            };
+            /** @description no Read on the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description deployments not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_environment_migration_report: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EnvironmentMigrationReportDto"][];
+                };
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    acknowledge_environment_migration_report: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description environment name */
+                env: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EnvironmentMigrationReportDto"];
+                };
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no report line for that name, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_org_environments: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrgEnvironmentDto"][];
+                };
+            };
+            /** @description no Read on the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description org Environments not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_org_environment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description environment name */
+                env: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrgEnvironmentDto"];
+                };
+            };
+            /** @description no Read on the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such Environment, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    put_org_environment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description environment name */
+                env: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PutOrgEnvironmentRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrgEnvironmentDto"];
+                };
+            };
+            /** @description invalid name, deadline or source, or a source naming no installation in the org */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description org Environments not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a source is already listed by another Environment */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_org_environment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description environment name */
+                env: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description no such Environment, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the Environment has Deployments, or project overlays or grants */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    environment_deployment_targets: {
+        parameters: {
+            query?: {
+                /**
+                 * @description Start after this target — the last row of the previous page: its
+                 *     `source` …
+                 */
+                after_source?: string;
+                /** @description … and its `target_id`. Both or neither. */
+                after_target_id?: string;
+                /**
+                 * @description Page size: default 500, at most 1000. A page shorter than this is
+                 *     the last.
+                 */
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description environment name */
+                env: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeploymentSourceTargetDto"][];
+                };
+            };
+            /** @description no Read on the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description plugins not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_environment_deployments: {
+        parameters: {
+            query?: {
+                target_source?: string;
+                target_id?: string;
+                /**
+                 * @description At most this many, newest first (default 200, capped at 1000). Bounds
+                 *     the response only: the server still folds the Environment's whole log
+                 *     to derive each status.
+                 */
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description environment name */
+                env: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeploymentDto"][];
+                };
+            };
+            /** @description no Read on the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description deployments not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_deployment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description environment name */
+                env: string;
+                /** @description Deployment id */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeploymentDto"];
+                };
+            };
+            /** @description no Read on the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such Deployment in this Environment */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_environment_eligibility: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description environment name */
+                env: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EnvironmentEligibilityDto"];
+                };
+            };
+            /** @description no Read on the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such Environment, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    put_environment_eligibility: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description environment name */
+                env: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EnvironmentEligibilityDto"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EnvironmentEligibilityDto"];
+                };
+            };
+            /** @description an empty or duplicated pattern, or patterns with all_projects */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description no such Environment, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the governed state changed between this request's read and its write (reload and retry), or the request conflicts with the current state */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_environment_projects: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description environment name */
+                env: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EnvironmentProjectDto"][];
+                };
+            };
+            /** @description no Read on the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such Environment, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_environment_project_overlay: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description environment name */
+                env: string;
+                /** @description project (repo) name */
+                project: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EnvironmentProjectOverlayDto"];
+                };
+            };
+            /** @description no Read on the project */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such Environment, no overlay, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    put_environment_project_overlay: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description environment name */
+                env: string;
+                /** @description project (repo) name */
+                project: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PutEnvironmentProjectOverlayRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EnvironmentProjectOverlayDto"];
+                };
+            };
+            /** @description an approver who is not a Scarab user, an empty entry, a zero concurrency or an out-of-range deadline */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an admin of the project or org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description no such Environment, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the project is not eligible for the Environment */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_environment_project_overlay: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description environment name */
+                env: string;
+                /** @description project (repo) name */
+                project: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an admin of the project or org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description no overlay, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_environment_project_privilege_grant: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description environment name */
+                env: string;
+                /** @description project (repo) name */
+                project: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EnvironmentProjectPrivilegeGrantDto"];
+                };
+            };
+            /** @description no Read on the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such Environment, no grant, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    put_environment_project_privilege_grant: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description environment name */
+                env: string;
+                /** @description project (repo) name */
+                project: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PutEnvironmentProjectPrivilegeGrantRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EnvironmentProjectPrivilegeGrantDto"];
+                };
+            };
+            /** @description a digest that is not `sha256:…`, or one listed twice */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description no such Environment, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the governed state changed between this request's read and its write (reload and retry), or the request conflicts with the current state */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_environment_project_privilege_grant: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description environment name */
+                env: string;
+                /** @description project (repo) name */
+                project: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description withdrawn */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no grant, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_environment_protection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description environment name */
+                env: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EnvironmentProtectionRulesDto"];
+                };
+            };
+            /** @description no Read on the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such Environment, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    put_environment_protection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description environment name */
+                env: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PutEnvironmentProtectionRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrgEnvironmentDto"];
+                };
+            };
+            /** @description an approver who is not a Scarab user, an empty entry, or a zero concurrency */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description no such Environment, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the governed state changed between this request's read and its write (reload and retry), or the request conflicts with the current state */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    reset_member_passkeys: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description the member's principal id */
+                subject: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PasskeyResetDto"];
+                };
+            };
+            /** @description `step_up_required` (mode `action`); not an Owner of the Org; or the member also belongs to an Org you do not own (not named) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description not a member of the Org, or step-up is off */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    plugin_catalog: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PluginCatalogEntryDto"][];
+                };
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description plugins not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_plugins: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PluginInstallationDto"][];
+                };
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description plugins not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    install_plugin: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InstallPluginRequest"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PluginInstallationDto"];
+                };
+            };
+            /** @description invalid name or config */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin, or not a first-party plugin pinned by digest — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description plugins not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the name is taken or retired, or plugins are off */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_plugin: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description installation name */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PluginInstallationDto"];
+                };
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such installation, or plugins not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    uninstall_plugin: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description installation name */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UninstalledPluginDto"];
+                };
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such installation, or plugins not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_plugin_connections: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description installation name */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PluginConnectionDto"][];
+                };
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such installation, or plugins not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    put_plugin_connection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description installation name */
+                name: string;
+                /** @description the manifest's connection slot */
+                slot: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PutPluginConnectionRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PluginConnectionDto"];
+                };
+            };
+            /** @description unknown slot, or a malformed base URL, credential or CA */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description no such installation, or plugins or the secret store not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_plugin_connection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description installation name */
+                name: string;
+                /** @description the manifest's connection slot */
+                slot: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description unbound */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description unknown slot */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such installation or binding, or plugins not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    enable_plugin: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description installation name */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PluginInstallationDto"];
+                };
+            };
+            /** @description not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description no such installation, or plugins not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    kill_plugin: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description installation name */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PluginInstallationDto"];
+                };
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such installation, or plugins not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    unmapped_groupings: {
+        parameters: {
+            query?: {
+                /** @description Start after this grouping — the last one of the previous page. */
+                after?: string;
+                /**
+                 * @description Page size: default 500, at most 1000. A page shorter than this is
+                 *     the last.
+                 */
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description installation name */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnmappedGroupingDto"][];
+                };
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such installation, or plugins not configured */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3311,6 +7070,85 @@ export interface operations {
                 };
             };
             /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    org_security_events: {
+        parameters: {
+            query?: {
+                /** @description comma-separated event kinds */
+                kind?: string;
+                /** @description only events with seq below this (paging) */
+                before?: number;
+                /** @description page size (default 50, max 200) */
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SecurityEventsResponse"];
+                };
+            };
+            /** @description not signed in */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an admin of the Org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    org_security_summary: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrgSecuritySummary"];
+                };
+            };
+            /** @description not signed in */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an admin of the Org */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -3386,15 +7224,24 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description not an admin of the target scope, or the caller is itself a token */
+            /** @description not an admin of the target scope, or the caller is itself a token — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description API tokens not configured */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content?: never;
             };
-            /** @description API tokens not configured */
-            404: {
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3475,8 +7322,24 @@ export interface operations {
                     "application/json": components["schemas"]["BindingDto"][];
                 };
             };
+            /** @description `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
             /** @description no login provider is associated with this repo's forge */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3518,23 +7381,36 @@ export interface operations {
                     "application/json": components["schemas"]["CreateRunResponse"];
                 };
             };
+            /** @description the caller may not dispatch, or the pipeline's Environment does not exist in the org or does not admit this project (ADR-0071); the body says what an org admin must do. No run is created */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     list_environments: {
         parameters: {
             query?: never;
             header?: never;
-            path?: never;
+            path: {
+                /** @description repo owner */
+                org: string;
+                /** @description repo name */
+                repo: string;
+            };
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description the environments */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["ProjectEnvironmentDto"][];
+                };
             };
         };
     };
@@ -3542,19 +7418,27 @@ export interface operations {
         parameters: {
             query?: never;
             header?: never;
-            path?: never;
+            path: {
+                /** @description repo owner */
+                org: string;
+                /** @description repo name */
+                repo: string;
+                /** @description Environment name */
+                name: string;
+            };
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description the environment */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["ProjectEnvironmentDto"];
+                };
             };
-            /** @description unknown */
+            /** @description unknown, or not this project's */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -3567,13 +7451,20 @@ export interface operations {
         parameters: {
             query?: never;
             header?: never;
-            path?: never;
+            path: {
+                /** @description repo owner */
+                org: string;
+                /** @description repo name */
+                repo: string;
+                /** @description Environment name */
+                name: string;
+            };
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description stored */
-            200: {
+            /** @description gone; the body says where it went */
+            410: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3585,13 +7476,20 @@ export interface operations {
         parameters: {
             query?: never;
             header?: never;
-            path?: never;
+            path: {
+                /** @description repo owner */
+                org: string;
+                /** @description repo name */
+                repo: string;
+                /** @description Environment name */
+                name: string;
+            };
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description deleted */
-            204: {
+            /** @description gone; the body says where it went */
+            410: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3603,7 +7501,14 @@ export interface operations {
         parameters: {
             query?: never;
             header?: never;
-            path?: never;
+            path: {
+                /** @description repo owner */
+                org: string;
+                /** @description repo name */
+                repo: string;
+                /** @description Environment name */
+                name: string;
+            };
             cookie?: never;
         };
         requestBody?: never;
@@ -4036,8 +7941,79 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
             /** @description no such run or gate */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an approvable gate (not a manual gate, not pending, or not reached yet), or the run's Environment no longer exists or no longer admits its project */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    reject_gate: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description run id */
+                id: string;
+                /** @description gate step id */
+                step: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RejectGateRequest"];
+            };
+        };
+        responses: {
+            /** @description this call rejected the gate: `{"rejected": true}` */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description missing, empty or over-long reason */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such run or step */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a rejectable gate, not pending, or not reached yet */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -4057,10 +8033,22 @@ export interface operations {
             };
             cookie?: never;
         };
-        requestBody?: never;
+        /** @description optional: `{"passed": false, "reason": "…"}` fails the gate instead of releasing it */
+        requestBody?: {
+            content: {
+                "application/json": null | components["schemas"]["ExternalGateVerdict"];
+            };
+        };
         responses: {
-            /** @description gate released */
+            /** @description gate released (or, with a fail body, failed) */
             202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description malformed body, or a fail without a 1..1024-byte reason */
+            400: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -4075,6 +8063,13 @@ export interface operations {
             };
             /** @description no such external gate, or token release disabled */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the gate is not pending or not reached yet, or (a release) the run's Environment no longer exists or no longer admits its project */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -4498,6 +8493,13 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description the attempt is not the step's running frontier */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     retry_step: {
@@ -4663,8 +8665,24 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
             /** @description secrets not configured */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -4697,8 +8715,220 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
             /** @description secrets not configured */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    security_events: {
+        parameters: {
+            query?: {
+                /** @description comma-separated event kinds */
+                kind?: string;
+                /** @description only events with seq below this (paging) */
+                before?: number;
+                /** @description page size (default 50, max 200) */
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SecurityEventsResponse"];
+                };
+            };
+            /** @description not signed in */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a global administrator */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_request: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description request id (from `confirmation_url`) */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRequestDto"];
+                };
+            };
+            /** @description not signed in */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such request, or you are neither its human nor its requester; or step-up is off */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    confirm_request: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description request id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["StepUpConfirmRequest"];
+            };
+        };
+        responses: {
+            /** @description it ran; `state` says whether the operation succeeded */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRequestResultDto"];
+                };
+            };
+            /** @description challenge unknown/used/expired/for another request, or the assertion failed verification (`code` names the check) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a browser session, or `clone_suspected` */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such request of yours, or step-up is off */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description already confirmed — it ran (or is running) once */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description expired */
+            410: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    request_options: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description request id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description PublicKeyCredentialRequestOptionsJSON under `public_key` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebauthnChallengeDto"];
+                };
+            };
+            /** @description `no_passkey`: enroll one first */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a browser session */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such request of yours, or step-up is off */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description already confirmed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description expired */
+            410: {
                 headers: {
                     [name: string]: unknown;
                 };

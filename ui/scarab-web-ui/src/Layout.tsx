@@ -2,15 +2,25 @@
 // the signed-in user. Page context lives in the big page header (and, on a run,
 // a header-sized breadcrumb) — not in the top bar. Rendered as the Router root
 // so it persists across navigations (docs/DESIGN.md §4).
-import { type ParentProps } from "solid-js";
+import { Show, createResource, type ParentProps } from "solid-js";
 import { A } from "@solidjs/router";
 import Icon from "./components/Icon";
 import UserMenu from "./components/UserMenu";
 import CommandPalette from "./components/CommandPalette";
+import StepUpDialog from "./components/StepUpDialog";
 import { setPaletteOpen } from "./palette";
+import { me } from "./session";
+import { getOrgSecuritySummary } from "./api/client";
+import { bannerText } from "./security";
 import emblemGold from "./assets/brand/scarab-emblem-dark.svg";
 
 export default function Layout(props: ParentProps) {
+  // Step-up posture for callers who administer an Org (ADR-0073): a crown
+  // jewel is refused for every admin with no passkey, so say so app-wide
+  // until it is fixed. Nobody else is asked for the summary at all.
+  const [security] = createResource(() => me()?.admin_orgs[0], getOrgSecuritySummary);
+  const banner = () => bannerText(security());
+
   return (
     <div class="app">
       <nav class="topbar">
@@ -39,6 +49,10 @@ export default function Layout(props: ParentProps) {
             to sit here; they moved into the user menu, which is where
             per-account controls belong and where they stop competing with
             these two for the eye. */}
+        {/* What is live where (ADR-0070) — an in-app route, so a router link. */}
+        <A class="topbar-link" href="/deployments">
+          Deployments
+        </A>
         <a
           class="topbar-link"
           href="https://thulasi-ram.github.io/scarab-ci/"
@@ -52,7 +66,19 @@ export default function Layout(props: ParentProps) {
         </a>
         <UserMenu />
       </nav>
+      <Show when={banner()}>
+        <div class="sec-banner" role="status">
+          <Icon icon="shield-check" size={13} />
+          <span>{banner()}</span>
+          <A href="/settings" class="sec-banner-link">
+            review
+          </A>
+        </div>
+      </Show>
       <CommandPalette />
+      {/* The one step-up dialog (ADR-0073): the API client opens it whenever
+          a request is refused with `step_up_required`. */}
+      <StepUpDialog />
       {props.children}
     </div>
   );
