@@ -42,9 +42,10 @@
 #   k8s — a kind Pod with the ADR-0042 results sidecar POSTing to the API
 #     (SCARAB_RESULTS_API_URL derived by up.sh from its probe). Results arrive
 #     through the sidecar and are overlaid at the step's success (f3004a1), so
-#     the DeploymentRequest is completed from the ingested rows. Live status:
-#     the last k8s-mode run (at 1eb7dc5) saw Run A's `bump` not reach a
-#     terminal status within 240 s — this mode is NOT yet proven green.
+#     the DeploymentRequest is completed from the ingested rows. Proven green
+#     live once the control plane read the workspace service on its own URL
+#     (SCARAB_WORKSPACE_CONTROL_URL, git-bug 021b6bc); before that every
+#     workspace Pod's drain was unreadable from the host and `bump` hung.
 #     SECURITY: this mode binds the API, which runs with SCARAB_DEV_INSECURE
 #     (no authentication), on 0.0.0.0 — every interface — because a Pod must
 #     reach it and up.sh discovers only the hostname a Pod uses (e.g.

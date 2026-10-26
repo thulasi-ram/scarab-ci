@@ -9418,6 +9418,7 @@ mod tests {
             workspace: Some(crate::config::WorkspaceServiceConfig {
                 token_secret: b"test-secret".to_vec(),
                 url: "http://127.0.0.1:0".into(),
+                control_url: "http://127.0.0.1:0".into(),
                 data_dir: warm.path().to_string_lossy().into_owned(),
                 fetcher_image: "ghcr.io/example/wsfetch:test".into(),
                 warm_budget_bytes: None,

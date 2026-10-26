@@ -325,6 +325,11 @@ if [ -z "$ws_host" ] || [ "$ws_host" = none ]; then
 fi
 echo "    a Pod reached the workspace service at http://$ws_host:$ws_port"
 export SCARAB_WORKSPACE_URL="http://$ws_host:$ws_port"
+# The control plane is a HOST process: it dials the service on loopback, not on
+# the Pod-facing name (which the host cannot resolve on darwin). Without this the
+# server's own Depot client used the Pod URL, so a drain a Pod completed could
+# never be read back and every workspace step wedged (git-bug 021b6bc).
+export SCARAB_WORKSPACE_CONTROL_URL="http://127.0.0.1:$ws_port"
 
 # Results egress (ADR-0042), only when the caller turned it on (overlay sets
 # SCARAB_RESULTS_TOKEN_SECRET). The step Pod's sidecar POSTs to the CONTROL

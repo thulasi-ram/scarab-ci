@@ -268,7 +268,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let secret = ws.token_secret.clone();
             Arc::new(
                 scarab_workspace_client::WorkspaceClient::with_minted_token_tuned(
-                    ws.url.clone(),
+                    // The control plane's own address for the service — NOT
+                    // the Pod-facing `url` (git-bug 021b6bc).
+                    ws.control_url.clone(),
                     move || {
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -339,7 +341,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let workspace_cas: Arc<dyn scarab_storage::Cas> = match &depot_client {
         Some(client) => {
             tracing::info!(
-                url = %config.workspace.as_ref().map(|ws| ws.url.as_str()).unwrap_or_default(),
+                url = %config.workspace.as_ref().map(|ws| ws.control_url.as_str()).unwrap_or_default(),
                 "workspace snapshots: warm = the workspace service (cache-only leg), cold = \
                  the object store, direct (ADR-0061 D1.6 reads fall through to cold; drains \
                  are in-Pod into the Depot's packs — ADR-0067, no flush pass)"
