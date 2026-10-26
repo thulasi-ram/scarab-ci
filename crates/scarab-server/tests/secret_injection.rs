@@ -55,6 +55,13 @@ impl Executor for CapturingExec {
     async fn cancel(&self, _h: &ExecHandle) -> Result<(), ExecError> {
         Ok(())
     }
+    fn unit_handle(
+        &self,
+        _step: &scarab_engine::StepRun,
+    ) -> Option<scarab_engine::ports::ExecHandle> {
+        None // nothing is created behind this stub's launches
+    }
+
     async fn torn_down(&self, _h: &ExecHandle) -> Result<bool, ExecError> {
         Ok(true) // nothing runs behind this stub's handles
     }
@@ -271,6 +278,13 @@ impl Executor for SpecCapturingExec {
     async fn cancel(&self, _h: &ExecHandle) -> Result<(), ExecError> {
         Ok(())
     }
+    fn unit_handle(
+        &self,
+        _step: &scarab_engine::StepRun,
+    ) -> Option<scarab_engine::ports::ExecHandle> {
+        None // nothing is created behind this stub's launches
+    }
+
     async fn torn_down(&self, _h: &ExecHandle) -> Result<bool, ExecError> {
         Ok(true) // nothing runs behind this stub's handles
     }
@@ -469,6 +483,13 @@ impl Executor for ConditionExec {
     async fn cancel(&self, _handle: &ExecHandle) -> Result<(), ExecError> {
         Ok(())
     }
+    fn unit_handle(
+        &self,
+        _step: &scarab_engine::StepRun,
+    ) -> Option<scarab_engine::ports::ExecHandle> {
+        None // nothing is created behind this stub's launches
+    }
+
     async fn torn_down(&self, _h: &ExecHandle) -> Result<bool, ExecError> {
         Ok(true) // nothing runs behind this stub's handles
     }

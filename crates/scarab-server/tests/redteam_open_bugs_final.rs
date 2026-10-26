@@ -125,6 +125,13 @@ impl Executor for SeamExec {
     async fn cancel(&self, handle: &ExecHandle) -> Result<(), ExecError> {
         self.inner.cancel(handle).await
     }
+    fn unit_handle(
+        &self,
+        step: &scarab_engine::StepRun,
+    ) -> Option<scarab_engine::ports::ExecHandle> {
+        self.inner.unit_handle(step)
+    }
+
     async fn torn_down(&self, handle: &ExecHandle) -> Result<bool, ExecError> {
         self.inner.torn_down(handle).await
     }
@@ -527,8 +534,7 @@ async fn a_unit_created_by_a_failed_launch_is_torn_down_after_a_cancel(w: World)
 }
 both!(
     a_unit_created_by_a_failed_launch_is_torn_down_after_a_cancel,
-    Some(1),
-    ignore = "redteam: BROKE F1 — refused launch redelivery writes no teardown for a unit a failed launch created"
+    Some(1)
 );
 
 // ---------------------------------------------------------------------------

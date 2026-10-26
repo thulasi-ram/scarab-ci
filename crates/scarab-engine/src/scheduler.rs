@@ -3124,6 +3124,52 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
+    /// Record and tear down the unit an EARLIER delivery of a now-refused
+    /// launch may have created (git-bug 333d389).
+    ///
+    /// A launch can create its unit and still fail (k8s: Pod accepted, then
+    /// the Secret upsert failed, or the create response was lost), and a
+    /// replica can die between a launch and [`Db::set_attempt_handle`]. No
+    /// handle is durable then, the launch intent is redelivered — and if a
+    /// cancel, supersession or finalization landed meanwhile, the redelivery
+    /// is refused. Dispatched as-is, the attempt's teardown (which waits out
+    /// the pending `launch:` key) found no handle and retired as "gone":
+    /// the unit ran on, unowned, and its DeploymentTarget hold ended.
+    ///
+    /// So the backend's deterministic handle ([`Executor::unit_handle`]) is
+    /// recorded as the attempt's — BEFORE the launch intent is dispatched, so
+    /// a pending attempt teardown sees it on its next pass — and a teardown
+    /// is owed exactly as for a late launch. When no unit was ever created
+    /// this costs one idempotent cancel of a missing unit.
+    async fn adopt_unit_of_refused_launch(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<(), SchedulerError> {
+        let fenced = StepRun {
+            run: run.clone(),
+            step: step.clone(),
+            status: StepStatus::Running,
+            attempts: vec![Attempt {
+                id: attempt.clone(),
+                started_at: Timestamp(0),
+                failure: None,
+                failure_detail: None,
+                outcome: AttemptOutcome::Running,
+            }],
+            needs: Vec::new(),
+            gate_kind: None,
+        };
+        let Some(handle) = self.executor.unit_handle(&fenced) else {
+            return Ok(());
+        };
+        self.db
+            .set_attempt_handle(run, step, attempt, &handle.0)
+            .await?;
+        self.enqueue_late_launch_teardown(run, step, attempt).await
+    }
+
     /// Process one launch intent: launch-or-adopt, poll, settle. Extracted so
     /// [`reconcile`](Self::reconcile) can fault-isolate each message
     /// (ADR-0047 poison handling).
@@ -3181,6 +3227,8 @@ impl<'a> Scheduler<'a> {
                     // on its target) for a Cancelled step, never torn down
                     // and holding nothing.
                     if !self.launch_still_wanted(&run, &step, &attempt).await? {
+                        self.adopt_unit_of_refused_launch(&run, &step, &attempt)
+                            .await?;
                         self.db.mark_dispatched(msg.id).await?;
                         return Ok(());
                     }

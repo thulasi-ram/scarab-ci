@@ -314,6 +314,10 @@ impl Executor for LocalExecutor {
         Ok(())
     }
 
+    fn unit_handle(&self, step: &StepRun) -> Option<ExecHandle> {
+        Some(Self::handle_for(step))
+    }
+
     /// `cancel` SIGKILLs the process (`start_kill`) — there is no termination
     /// grace in which it could go on acting — and drops its slot, whose
     /// `kill_on_drop` reaps it. So once `cancel` returned, nothing of the

@@ -159,6 +159,13 @@ impl scarab_engine::Executor for RefusingExec {
     ) -> Result<(), scarab_engine::ExecError> {
         Ok(())
     }
+    fn unit_handle(
+        &self,
+        _step: &scarab_engine::StepRun,
+    ) -> Option<scarab_engine::ports::ExecHandle> {
+        None // nothing is created behind this stub's launches
+    }
+
     async fn torn_down(
         &self,
         _handle: &scarab_engine::ports::ExecHandle,

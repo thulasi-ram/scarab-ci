@@ -1362,6 +1362,25 @@ pub trait Executor: Send + Sync {
     async fn poll(&self, handle: &ExecHandle) -> Result<ExecState, ExecError>;
     async fn cancel(&self, handle: &ExecHandle) -> Result<(), ExecError>;
 
+    /// The handle [`launch`](Self::launch) creates (or adopts) for `step`'s
+    /// fenced attempt, derived WITHOUT launching — `None` when this backend's
+    /// units are not addressable before `launch` returns.
+    ///
+    /// A launch can create its unit and still return `Err` (k8s: the Pod
+    /// create was accepted, then the per-Pod Secret upsert failed, or the
+    /// create response was lost), and a control plane can die between a
+    /// successful launch and recording the handle. Either way no handle is
+    /// durable, and if the attempt then stops being wanted the redelivered
+    /// launch is refused — so the engine tears down THIS handle instead,
+    /// or the unit is orphaned and its DeploymentTarget hold ends while it
+    /// runs (git-bug 333d389). Cancelling a unit that was never created is a
+    /// no-op, so answering `Some` costs one idempotent cancel.
+    ///
+    /// Required, never defaulted, for the same reason as
+    /// [`torn_down`](Self::torn_down): a decorator falling back to a `None`
+    /// default would silently reopen the orphan. Decorators forward it.
+    fn unit_handle(&self, step: &StepRun) -> Option<ExecHandle>;
+
     /// Whether the unit behind `handle` is **gone** after a
     /// [`cancel`](Self::cancel) — not merely told to stop. A teardown intent
     /// is retired only once this is `true` (git-bug f22056d): until then the

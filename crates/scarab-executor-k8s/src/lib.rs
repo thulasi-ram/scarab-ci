@@ -2983,6 +2983,12 @@ impl Executor for K8sExecutor {
         }
     }
 
+    /// The deterministic fence-named Pod (`pod_name`) — the Pod a launch
+    /// creates or adopts, whether or not that launch returned `Ok`.
+    fn unit_handle(&self, step: &StepRun) -> Option<ExecHandle> {
+        Some(ExecHandle(pod_name(step)))
+    }
+
     /// Gone = the Pod object no longer exists. A deleted Pod keeps running
     /// through its termination grace (up to `CANCEL_GRACE_SECS`) with a
     /// `deletionTimestamp` set — still acting on whatever it deploys to — so

@@ -302,6 +302,13 @@ impl Executor for SecretInjectingExecutor {
         self.inner.cancel(handle).await
     }
 
+    fn unit_handle(
+        &self,
+        step: &scarab_engine::StepRun,
+    ) -> Option<scarab_engine::ports::ExecHandle> {
+        self.inner.unit_handle(step)
+    }
+
     async fn torn_down(&self, handle: &ExecHandle) -> Result<bool, ExecError> {
         self.inner.torn_down(handle).await
     }

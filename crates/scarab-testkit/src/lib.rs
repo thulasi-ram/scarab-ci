@@ -2996,6 +2996,10 @@ impl Executor for FakeExecutor {
         Ok(())
     }
 
+    fn unit_handle(&self, step: &StepRun) -> Option<ExecHandle> {
+        Some(Self::handle_for(step))
+    }
+
     async fn torn_down(&self, _handle: &ExecHandle) -> Result<bool, ExecError> {
         let mut st = self.inner.lock().unwrap();
         if st.lingering_checks > 0 {
