@@ -4707,7 +4707,10 @@ impl<'a> Scheduler<'a> {
                 step,
                 StepStatus::Running,
                 StepStatus::Ready,
-                AttemptFrontier::Any,
+                // Only while `attempt` is still the latest (git-bug 7f0744c):
+                // a status-only CAS would match a rerun's newer Running
+                // attempt and re-arm it on this attempt's stale failure.
+                AttemptFrontier::Is(Some(attempt)),
                 None,
                 &events,
                 &[],
@@ -4968,7 +4971,13 @@ impl<'a> Scheduler<'a> {
                 step,
                 StepStatus::Running,
                 to,
-                AttemptFrontier::Any,
+                // The verdict is `attempt`'s, so it may land only while that
+                // attempt is still the step's latest (git-bug 7f0744c). The
+                // callers read the frontier and then await more I/O; in that
+                // window the Run can be cancelled, rerun and the step claimed
+                // on a newer attempt, whose `Running` a status-only CAS would
+                // match — finalizing the rerun's step on a stale verdict.
+                AttemptFrontier::Is(Some(attempt)),
                 stamp.as_ref().map(|s| (attempt, s)),
                 &events,
                 &[],

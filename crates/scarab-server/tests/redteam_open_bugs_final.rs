@@ -707,11 +707,7 @@ async fn a_stale_verdict_cannot_finalize_the_reruns_step(w: World) {
     );
     w.finish().await;
 }
-both!(
-    a_stale_verdict_cannot_finalize_the_reruns_step,
-    None,
-    ignore = "redteam: BROKE F4 — finalize_step CASes with AttemptFrontier::Any (ABA)"
-);
+both!(a_stale_verdict_cannot_finalize_the_reruns_step, None);
 
 // ---------------------------------------------------------------------------
 // F5 — the R2-E1 class for SHARED SERVICES. The services-only CANCEL_RUN
