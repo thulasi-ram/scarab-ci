@@ -34,24 +34,64 @@ jobs:
   # `github.event_name != 'pull_request'` below — stated once, so each downstream
   # job reads as a plain `== 'true'`.
   #
+  # ONE EXCEPTION: a tree that was already validated. When a PR run passes its
+  # gates, `record-validated-tree` (bottom of this file) uploads an artifact
+  # named after the exact git TREE it tested (the PR's merge ref). If the push to
+  # main produced a byte-identical tree — main did not move between that PR run
+  # and the merge, the common case — re-running the same jobs over the same bytes
+  # buys nothing (Actions minutes are limited), so they skip. A tree that differs
+  # by one byte gets the full run, exactly as before.
+  #
   # This job is `required` in `.github/required-checks.txt` precisely because it
   # always runs: it is the anchor that stops a PR whose every other check is
   # correctly skipped from passing the gate having validated nothing.
   changes:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
       pull-requests: read
+      actions: read # the validated-tree artifact lookup
     # One output per GATED JOB, named after it — not one per filter. The filter
     # file also defines `cargo` / `rust` / `ui_src`, which exist only as shared
     # anchors the others build on; emitting an output nothing reads is how a
     # dead gate goes unnoticed.
     outputs:
-      test_and_coverage: ${{ github.event_name != 'pull_request' || steps.filter.outputs.test_and_coverage == 'true' }}
-      ui: ${{ github.event_name != 'pull_request' || steps.filter.outputs.ui == 'true' }}
-      contracts: ${{ github.event_name != 'pull_request' || steps.filter.outputs.contracts == 'true' }}
+      test_and_coverage: ${{ (github.event_name != 'pull_request' && steps.validated.outputs.hit != 'true') || steps.filter.outputs.test_and_coverage == 'true' }}
+      ui: ${{ (github.event_name != 'pull_request' && steps.validated.outputs.hit != 'true') || steps.filter.outputs.ui == 'true' }}
+      contracts: ${{ (github.event_name != 'pull_request' && steps.validated.outputs.hit != 'true') || steps.filter.outputs.contracts == 'true' }}
     steps:
       - uses: actions/checkout@v4
+      # Non-PR only: has a passing PR run already validated this exact tree?
+      - name: Was this exact tree already validated?
+        id: validated
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          tree=$(git rev-parse 'HEAD^{tree}')
+          n=$(gh api "repos/$REPO/actions/artifacts?name=ci-validated-$tree" \
+                -q '[.artifacts[] | select(.expired == false)] | length')
+          echo "tree $tree: validated by $n passing PR run(s)" | tee -a "$GITHUB_STEP_SUMMARY"
+          # Never skip a push that moves the rust-cache key (lockfile, manifests,
+          # toolchain): PRs cannot read each other's caches, only main's, so a
+          # skipped main run there would leave every later PR compiling cold.
+          key_moved=false
+          if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            # Captured first: under pipefail, `gh … | grep -q` can report a MATCH
+            # as failure (grep exits early, gh dies of SIGPIPE) — the unsafe way.
+            files=$(gh api "repos/$REPO/compare/$BEFORE...$GITHUB_SHA" -q '.files[].filename')
+            if grep -qxE 'Cargo\.lock|rust-toolchain\.toml|(.*/)?Cargo\.toml' <<< "$files"; then
+              key_moved=true
+            fi
+          else
+            key_moved=true
+          fi
+          echo "rust-cache key moved since $BEFORE: $key_moved" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ "$n" -gt 0 ] && [ "$key_moved" = false ]; then echo "hit=true" >> "$GITHUB_OUTPUT"; fi
       # PRs only: the action reads the PR's file list from the API, so it needs
       # no history. On a push we do not filter at all (see above), so there is
       # nothing here to compute against `github.event.before` — which is also
@@ -90,6 +130,7 @@ jobs:
   # is precisely how this job would start going green with failing tests.
   test-and-coverage:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: changes
     if: needs.changes.outputs.test_and_coverage == 'true'
     services:
@@ -122,10 +163,18 @@ jobs:
       # exhausts the runner's disk (ENOSPC on first run).
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
-      - name: Free runner disk space
+      # ONLY WHEN SHORT. The cleanup is slow (deleting ~30 GB of small files: 1.5-4
+      # billed minutes a run), and today's runner images are 145 GB disks (113 GB
+      # free AFTER this cleanup, measured 2026-10). Below 40 GB free it still runs
+      # in full — the ENOSPC history is real; the step logs the before figure.
+      - name: Free runner disk space (only if short)
         run: |
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup "$AGENT_TOOLSDIRECTORY"
-          sudo docker system prune -af >/dev/null 2>&1 || true
+          avail=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
+          echo "free before: ${avail}G"
+          if [ "$avail" -lt 40 ]; then
+            sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup "$AGENT_TOOLSDIRECTORY"
+            sudo docker system prune -af >/dev/null 2>&1 || true
+          fi
           df -h /
       - uses: actions/checkout@v4
       # MinIO is a plain step, not a `services:` container: GitHub's service
@@ -189,6 +238,7 @@ jobs:
   # duplicate — which was also the ungated one — is the one that went.
   ui-tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     needs: changes
     if: needs.changes.outputs.ui == 'true'
     steps:
@@ -213,6 +263,7 @@ jobs:
   # deal as the `kind` job (git-bug a0b42ad).
   ui-e2e:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: changes
     if: needs.changes.outputs.ui == 'true'
     continue-on-error: true
@@ -234,6 +285,7 @@ jobs:
 
   openapi-drift:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: changes
     if: needs.changes.outputs.contracts == 'true'
     steps:
@@ -266,3 +318,27 @@ jobs:
             echo '::error::the generated TS client is stale — run: npm run gen in ui/scarab-web-ui'
             exit 1
           }
+
+  # The other half of the validated-tree skip (see `changes`): a PR run whose
+  # gates all passed — or were correctly skipped by the path filter — records
+  # the exact tree it tested. Expires in 7 days; a merge older than that just
+  # gets the full run. `ui-e2e` is advisory and not waited on, as in the gate.
+  record-validated-tree:
+    needs: [changes, test-and-coverage, ui-tests, openapi-drift]
+    if: >-
+      always() && github.event_name == 'pull_request' &&
+      !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Name the tested tree
+        id: tree
+        run: |
+          echo "tree=$(git rev-parse 'HEAD^{tree}')" >> "$GITHUB_OUTPUT"
+          echo "${{ github.event.pull_request.head.sha }}" > validated-head.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ci-validated-${{ steps.tree.outputs.tree }}
+          path: validated-head.txt
+          retention-days: 7

@@ -206,9 +206,12 @@ struct WorkspaceFixture {
     /// The Depot client, concrete — `with_workspace_depot`: the drain-record
     /// GET (the in-Pod helper posts it) and the awaited archival `flush`.
     depot: std::sync::Arc<scarab_workspace_client::WorkspaceClient>,
-    /// COLD ONLY — no warm tier, no fall-through. For durability assertions:
-    /// what this handle cannot read, no flush made durable.
-    cold: std::sync::Arc<dyn scarab_storage::Cas>,
+    /// COLD ONLY — no warm tier, no fall-through — held CONCRETELY, because
+    /// since ADR-0067 durable content lives in PACKS, which only the
+    /// adapter's pack primitives (`list_objects` / `pack_index` /
+    /// `get_range`) can read: the `Cas` port's `tree_entries`/`get_blob` see
+    /// loose objects only, and a drain writes none.
+    cold: std::sync::Arc<scarab_storage_s3::S3Storage>,
     /// What the Step Pod's fetcher is told.
     fetch: scarab_executor_k8s::WorkspaceFetch,
 }
@@ -226,7 +229,7 @@ struct WorkspaceFixture {
 ///
 /// Only ever called once the tier is opted in, so a partial S3 config is a
 /// wiring bug and panics ([`tier_var`]) — never a silent skip.
-fn depot_cold_store() -> std::sync::Arc<dyn scarab_storage::Cas> {
+fn depot_cold_store() -> std::sync::Arc<scarab_storage_s3::S3Storage> {
     match std::env::var("SCARAB_S3_BUCKET").ok().filter(|v| !v.is_empty()) {
         Some(bucket) => {
             let endpoint = std::env::var("SCARAB_S3_ENDPOINT").unwrap_or_default();
@@ -318,7 +321,7 @@ fn workspace_fixture() -> Option<WorkspaceFixture> {
     let depot = std::sync::Arc::new(scarab_workspace_client::WorkspaceClient::new(&url, token));
     let cold = depot_cold_store();
     let cas: std::sync::Arc<dyn scarab_storage::Cas> = std::sync::Arc::new(
-        scarab_storage::tiered::TieredCas::new(depot.clone(), cold.clone())
+        scarab_storage::tiered::TieredCas::new(depot.clone(), cold.clone() as _)
             .fall_through_on_warm_error(),
     );
     Some(WorkspaceFixture {
@@ -753,23 +756,29 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
 /// against Pod fixtures. This pins the *ordering* against the real thing, which is
 /// what the rule is about — and since ADR-0061 s3-drain the real thing goes
 /// through the HELPER: the control plane execs `scarab-wsfetch drain` in the
-/// egress container, the helper ingests warm-first from inside the Pod and
-/// posts a DrainRecord to the Depot, and `drive_workspace` — record-first —
-/// awaits the archival `flush` (ADR-0064), patches `scarab.io/workspace-root`,
-/// and only then releases the egress barrier. So the first `Succeeded` a
-/// caller can see is already backed by content COLD holds. A green verdict
-/// whose snapshot is not yet (or never) durable is a claim the durable record
-/// cannot back (CONTEXT.md §2).
+/// egress container, the helper uploads from inside the Pod and the Depot
+/// streams every durable member into the fence's PACKS as it arrives, seals
+/// them and writes the fence's COMMIT PACK last (ADR-0067 parts 4 and 8 — the
+/// ADR-0064 flush RPC is deleted); `drive_workspace` — record-first — reads
+/// the drain record back, patches `scarab.io/workspace-root`, and only then
+/// releases the egress barrier. So the first `Succeeded` a caller can see is
+/// already backed by content the BUCKET holds. A green verdict whose snapshot
+/// is not yet (or never) durable is a claim the durable record cannot back
+/// (CONTEXT.md §2).
 ///
 /// Deliberately asserted on the FIRST terminal observation, not after a settle
 /// loop: polling until the root appears would test nothing at all. And
-/// deliberately read back through a **cold-only** handle, not the tiered one:
-/// the helper's PUTs land in the Depot's warm cache, so a tiered (or client)
-/// readback is satisfied by warm and proves presence, not durability.
-/// Mutations this kills: reorder the flush after the annotation patch, drop
-/// the fixture's `with_workspace_depot` wiring, or release a verdict off the
-/// exec's exit code with no record behind it — either way the closure is not
-/// in cold at the instant of green and the cold-only walk fails.
+/// deliberately read back off the **bucket alone** (ADR-0067 part 11), never
+/// through the Depot: the Depot also caches, so a readback through it proves
+/// presence, not durability. Since ADR-0067 durable content is never written
+/// loose — a cold `tree_entries`/`get_blob` would 404 on a perfectly durable
+/// snapshot — so the walk resolves every address through the commit packs'
+/// member rows and re-hashes the ranged bytes against the address.
+/// Mutations this kills: report a verdict before the commit pack is written,
+/// drop the fixture's `with_workspace_depot` wiring, label the published
+/// closure `cache-only`, or release a verdict off the exec's exit code with no
+/// record behind it — either way the closure is not in the bucket at the
+/// instant of green and the walk fails.
 #[tokio::test]
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn a_green_attempt_is_backed_by_a_durable_snapshot_at_the_instant_it_goes_green() {
@@ -839,28 +848,85 @@ async fn a_green_attempt_is_backed_by_a_durable_snapshot_at_the_instant_it_goes_
         .expect("output")
         .expect("Succeeded must carry a workspace snapshot root");
 
-    // 2. And the root is really THERE — in the DURABLE tier, not merely named
-    //    and not merely sitting in the Depot's warm cache. Walk the whole
-    //    published closure through the COLD-ONLY handle (no warm, no
-    //    fall-through): every tree must parse and every blob must come back,
-    //    or the flush that licensed this `Succeeded` did not do its job.
-    let mut frontier = vec![scarab_storage::TreeHash(root.clone())];
+    // 2. The fence's RECEIPT is in the bucket: its commit pack exists (ADR-0067
+    //    part 8 — "did this Attempt's drain finish?" IS "does its commit pack
+    //    exist") and names exactly the root the verdict carries.
+    use scarab_storage::ObjectStore as _;
+    let fence_key =
+        scarab_workspace_client::drain_fence_key(&step.run.0, &step.step.0, &step.attempts[0].id.0);
+    let commit_key = format!("packs/{fence_key}/commit.pack");
+    let commit: serde_json::Value = serde_json::from_slice(&ws.cold.get(&commit_key).await.expect(
+        "a green Attempt's commit pack must be in the BUCKET at the instant \
+             Succeeded is first observed (ADR-0061 part 4 / ADR-0067 parts 4+8)",
+    ))
+    .expect("the commit pack parses");
+    let tagged_root = format!("sha256:{root}");
+    assert_eq!(
+        commit["published_root"].as_str(),
+        Some(tagged_root.as_str()),
+        "the receipt must name the root the verdict carries: {commit}"
+    );
+
+    // 3. Every member of the published closure is IN the bucket. Resolve
+    //    addresses through every committed pack's FOOTER (read off the bucket
+    //    by `pack_index`, not taken on the receipt's word) — every commit pack,
+    //    not only this fence's, because a durable member another fence already
+    //    packed is legitimately deduped (`/have`), never re-uploaded.
+    let mut where_is: std::collections::HashMap<String, (String, u64, u64)> =
+        std::collections::HashMap::new();
+    let listed = ws.cold.list_objects("packs/").await.expect("list packs");
+    for obj in listed.iter().filter(|o| o.key.ends_with("/commit.pack")) {
+        let doc: serde_json::Value =
+            serde_json::from_slice(&ws.cold.get(&obj.key).await.expect("read commit pack"))
+                .expect("a commit pack parses");
+        for pack in doc["packs"].as_array().into_iter().flatten() {
+            let key = pack["key"].as_str().expect("pack key").to_string();
+            for m in ws
+                .cold
+                .pack_index(&key)
+                .await
+                .expect("a committed pack's footer reads")
+            {
+                where_is
+                    .entry(m.address)
+                    .or_insert_with(|| (key.clone(), m.offset, m.len));
+            }
+        }
+    }
+    let read_member = |hex: String| {
+        let at = where_is.get(&format!("sha256:{hex}")).cloned();
+        let cold = ws.cold.clone();
+        async move {
+            let (key, offset, len) = at.unwrap_or_else(|| {
+                panic!(
+                    "{hex} is in a green Attempt's published closure but in no committed \
+                     pack at the instant Succeeded is first observed (ADR-0067)"
+                )
+            });
+            let bytes = cold
+                .get_range(&key, offset, len)
+                .await
+                .expect("ranged member read");
+            assert_eq!(
+                scarab_storage::sha256_hex(&bytes),
+                hex,
+                "the bytes at {key}@{offset}+{len} must BE the content they are filed as"
+            );
+            bytes
+        }
+    };
+    let mut frontier = vec![root.clone()];
     let mut saw_dist = false;
     let mut blobs_in_cold = 0u32;
     while let Some(tree) = frontier.pop() {
-        let entries = ws.cold.tree_entries(&tree).await.expect(
-            "a tree in a green Attempt's published closure must be in COLD at the \
-             instant Succeeded is first observed (ADR-0061 part 4 / ADR-0064)",
-        );
+        let entries: Vec<scarab_storage::TreeEntry> =
+            serde_json::from_slice(&read_member(tree).await).expect("a packed tree parses");
         for entry in entries {
             saw_dist |= entry.name == "dist";
             match entry.target {
-                scarab_storage::TreeTarget::Tree(t) => frontier.push(t),
+                scarab_storage::TreeTarget::Tree(t) => frontier.push(t.0),
                 scarab_storage::TreeTarget::Blob(b) => {
-                    ws.cold.get_blob(&b).await.expect(
-                        "a blob in a green Attempt's published closure must be in COLD \
-                         at the instant Succeeded is first observed",
-                    );
+                    read_member(b.0).await;
                     blobs_in_cold += 1;
                 }
             }
@@ -882,9 +948,12 @@ async fn a_green_attempt_is_backed_by_a_durable_snapshot_at_the_instant_it_goes_
 /// This is only reachable now. The `busybox` doorstop the fetcher replaced could
 /// not fail — it spun on a marker file — so a missing input was discovered by the
 /// control plane and mapped to `DriveErr::InputMissing`. The discovery moved into
-/// the Pod, and this test is what proves the replacement classification is
-/// equivalent: `Infra { never_started: true }` (the step's process never ran, so
-/// no side effect is possible; bounded auto-retry then dead-letters).
+/// the Pod, and this test is what proves the real fetcher's verdict reaches the
+/// executor classified per the e140121 fetch exit table (491b27d): a root gone
+/// from every tier is fetch exit 2 → `MissingInputs` — NOT `Infra` (re-launching
+/// the identical spec cannot re-create evicted content, so burning the infra
+/// auto-retry budget and dead-lettering would blame an operator who can fix
+/// nothing), with a cause that names the exit and the Rerun/Retry remedy.
 ///
 /// Kind-tier and not unit-testable: the *unit* test pins `pod_state`'s reading of
 /// a Pod fixture, but that a real fetcher exits non-zero, and that the kubelet
@@ -943,18 +1012,21 @@ async fn a_missing_input_snapshot_fails_the_attempt_instead_of_hanging() {
     };
 
     let h = exec.launch(&step, &spec).await.expect("launch");
-    assert_eq!(
-        poll_to_terminal(&exec, &h, 120).await,
+    match poll_to_terminal(&exec, &h, 120).await {
         Some(ExecState::Failed {
             exit_code: None,
-            class: FailureClass::Infra {
-                never_started: true
-            },
-            cause: None,
-        }),
-        "a fetch that cannot find its input must fail the attempt fast — the old \
-         doorstop would have waited for a feed that never came"
-    );
+            class: FailureClass::MissingInputs,
+            cause: Some(cause),
+        }) => assert!(
+            cause.contains("fetch exit 2") && cause.contains("Rerun/Retry"),
+            "the cause must name the fetcher's exit and the remedy: {cause}"
+        ),
+        other => panic!(
+            "a fetch that cannot find its input must fail the attempt fast as \
+             MissingInputs (fetch exit 2) — the old doorstop would have waited for a \
+             feed that never came; got {other:?}"
+        ),
+    }
     exec.cancel(&h).await.expect("cleanup");
 }
 
@@ -967,8 +1039,16 @@ async fn a_missing_input_snapshot_fails_the_attempt_instead_of_hanging() {
 /// thing this product may not do (CONTEXT.md §2). There is deliberately no
 /// fallback to the deleted control-plane feed (ADR-0061 D2.3).
 ///
-/// No cluster work happens here beyond connecting, but it lives in this tier
-/// because it asserts on the real `Executor::launch`.
+/// Since ADR-0061 s3-drain (2a60d74) the gate covers EVERY workspace Step, not
+/// only those with inputs: the egress helper drains each workspace Pod to the
+/// Depot under the workspace token, so without a service even a first step
+/// would mount a token Secret nothing creates (FailedMount forever) and could
+/// never publish. The positive control is therefore an executor that differs
+/// ONLY by having the service: it launches the same step, which pins the
+/// refusal to the missing service rather than to anything else in the spec.
+///
+/// No cluster work happens here beyond connecting and the control's one Pod,
+/// but it lives in this tier because it asserts on the real `Executor::launch`.
 #[tokio::test]
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn a_step_with_inputs_is_refused_when_no_workspace_service_is_configured() {
@@ -1018,32 +1098,49 @@ async fn a_step_with_inputs_is_refused_when_no_workspace_service_is_configured()
         uses: Vec::new(),
         matrix_values: Default::default(),
     };
-    let err = exec
-        .launch(&step, &spec)
-        .await
-        .expect_err("must refuse, not create a Pod with an empty workspace");
-    assert!(
-        format!("{err:?}").contains("no workspace service is configured"),
-        "{err:?}"
-    );
-    // No Pod was created — the refusal is BEFORE any effect.
     let pods: kube::Api<k8s_openapi::api::core::v1::Pod> = kube::Api::namespaced(
         kube::Client::try_default().await.expect("kube client"),
         &std::env::var("SCARAB_TEST_KUBE_NS").unwrap_or_else(|_| "default".to_string()),
     );
-    assert!(
-        pods.get_opt(&pod_name(&step))
+    // With inputs (/workspace would be silently empty), then with none (the
+    // snapshot could never drain): both refused, both BEFORE any effect.
+    for (shape, inputs) in [
+        ("with inputs", vec!["a".repeat(64)]),
+        ("without inputs", vec![]),
+    ] {
+        spec.workspace_inputs = inputs;
+        let err = exec
+            .launch(&step, &spec)
             .await
-            .expect("get pod")
-            .is_none(),
-        "a refused launch must leave nothing behind"
-    );
+            .expect_err("must refuse, not create a Pod whose workspace cannot be served");
+        assert!(
+            format!("{err:?}").contains("no workspace service is configured"),
+            "{shape}: {err:?}"
+        );
+        assert!(
+            pods.get_opt(&pod_name(&step))
+                .await
+                .expect("get pod")
+                .is_none(),
+            "{shape}: a refused launch must leave nothing behind"
+        );
+    }
 
-    // The same step with no inputs launches fine — every `clone` step and every
-    // first step in a pipeline has this shape, and they must not need a service.
-    spec.workspace_inputs = vec![];
-    let h = exec.launch(&step, &spec).await.expect("launch without inputs");
-    exec.cancel(&h).await.expect("cleanup");
+    // The control: the SAME step and spec, on an executor that differs only by
+    // having the service, launches.
+    let ws = workspace_fixture().expect("the tier is opted in, so the fixture is wired");
+    let configured = K8sExecutor::with_client(
+        std::env::var("SCARAB_TEST_KUBE_NS").unwrap_or_else(|_| "default".to_string()),
+        kube::Client::try_default().await.expect("kube client"),
+    )
+    .with_workspace_cas(ws.cas.clone())
+    .with_workspace_depot(ws.depot.clone())
+    .with_workspace_service(ws.fetch.clone());
+    let h = configured
+        .launch(&step, &spec)
+        .await
+        .expect("with a service configured the same step launches");
+    configured.cancel(&h).await.expect("cleanup");
 }
 
 /// LIVE per-path publishing (`outputs:`, ADR-0007): the drain prunes the
@@ -1171,15 +1268,23 @@ async fn declared_outputs_publish_only_those_paths_through_the_cas() {
         )
         .await
         .expect("launch C");
-    assert_eq!(
-        poll_to_terminal(&exec, &hc, 90).await,
+    // Since f463ad3 ("failures that say why") the verdict carries its cause —
+    // which must name the path the author declared and never produced, or the
+    // red step is undiagnosable from the run page.
+    match poll_to_terminal(&exec, &hc, 90).await {
         Some(ExecState::Failed {
             exit_code: None,
             class: scarab_engine::ports::FailureClass::Config,
-            cause: None,
-        }),
-        "an undeclared-but-missing output is a developer verdict, not infra churn"
-    );
+            cause: Some(cause),
+        }) => assert!(
+            cause.contains("not produced") && cause.contains("coverage"),
+            "the cause must name the missing declared path: {cause}"
+        ),
+        other => panic!(
+            "a declared-but-missing output is a developer verdict (Config), not \
+             infra churn; got {other:?}"
+        ),
+    }
 
     for h in [ha, hb, hc] {
         exec.cancel(&h).await.expect("cleanup");
@@ -1499,17 +1604,18 @@ async fn clone_depth_full_exposes_history() {
 #[tokio::test]
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn clone_vanished_sha_fails_fast_with_source_unavailable() {
-    use scarab_storage::Cas;
     let Some(ns) = opted_in() else { return };
     let clone_image = tier_var("SCARAB_TEST_CLONE_IMAGE");
 
+    // A clone step is a workspace Step (it publishes the checkout), so since
+    // ADR-0061 s3-drain it launches only with a workspace service configured.
+    let ws = workspace_fixture().expect("the tier is opted in, so the fixture is wired");
+
     let client = kube::Client::try_default().await.expect("kube client");
-    let tmp = tempfile::tempdir().expect("cas dir");
-    let cas: std::sync::Arc<dyn Cas> = std::sync::Arc::new(
-        scarab_storage_s3::S3Storage::local(tmp.path().to_str().unwrap()).expect("local cas"),
-    );
     let exec = K8sExecutor::with_client(ns, client)
-        .with_workspace_cas(cas)
+        .with_workspace_cas(ws.cas.clone())
+        .with_workspace_depot(ws.depot.clone())
+        .with_workspace_service(ws.fetch.clone())
         .with_clone_image(&clone_image);
 
     let step = StepRun {
@@ -1944,8 +2050,17 @@ async fn artifacts_are_harvested_post_step() {
     let storage = std::sync::Arc::new(
         scarab_storage_s3::S3Storage::local(tmp.path().to_str().unwrap()).expect("local store"),
     );
+    // The harvest execs into the egress container, which exists only on the
+    // workspace flow — and since ADR-0061 s3-drain a workspace Step is refused
+    // at launch without a workspace service (every Pod drains to the Depot).
+    // So the flow is wired exactly as production wires it; the ARTIFACT store
+    // stays a separate local store, as ADR-0052 makes it (an independent
+    // lifecycle, not the CAS).
+    let ws = workspace_fixture().expect("the tier is opted in, so the fixture is wired");
     let exec = K8sExecutor::with_client(ns, client)
-        .with_workspace_cas(storage.clone())
+        .with_workspace_cas(ws.cas.clone())
+        .with_workspace_depot(ws.depot.clone())
+        .with_workspace_service(ws.fetch.clone())
         .with_artifact_store(storage.clone());
 
     let step = StepRun {
@@ -2030,8 +2145,17 @@ async fn artifacts_are_harvested_from_a_failed_step() {
     let storage = std::sync::Arc::new(
         scarab_storage_s3::S3Storage::local(tmp.path().to_str().unwrap()).expect("local store"),
     );
+    // The harvest execs into the egress container, which exists only on the
+    // workspace flow — and since ADR-0061 s3-drain a workspace Step is refused
+    // at launch without a workspace service (every Pod drains to the Depot).
+    // So the flow is wired exactly as production wires it; the ARTIFACT store
+    // stays a separate local store, as ADR-0052 makes it (an independent
+    // lifecycle, not the CAS).
+    let ws = workspace_fixture().expect("the tier is opted in, so the fixture is wired");
     let exec = K8sExecutor::with_client(ns, client)
-        .with_workspace_cas(storage.clone())
+        .with_workspace_cas(ws.cas.clone())
+        .with_workspace_depot(ws.depot.clone())
+        .with_workspace_service(ws.fetch.clone())
         .with_artifact_store(storage.clone());
 
     let step = step_run_of(&run_id, "emit-and-fail");

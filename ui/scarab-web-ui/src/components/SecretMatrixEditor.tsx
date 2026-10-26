@@ -42,12 +42,22 @@ const columnLabel = (column: string) =>
 
 type Editing = { key: string; column: string };
 
-export default function SecretMatrixEditor(props: { org: string; repo: string }) {
-  const key = () => ({ org: props.org, repo: props.repo, epoch: epoch() });
+export default function SecretMatrixEditor(props: {
+  org: string;
+  repo: string;
+  /** Bumping this refetches — the repo-scope panel above added or deleted a key. */
+  epoch?: number;
+  /** Called after a cell write, so the repo-scope panel can refresh too. */
+  onChange?: () => void;
+}) {
+  const key = () => ({ org: props.org, repo: props.repo, epoch: epoch(), outer: props.epoch ?? 0 });
   const [epoch, setEpoch] = createSignal(0);
   const [matrix] = createResource(key, ({ org, repo }) => fetchSecretMatrix(org, repo));
   const [editing, setEditing] = createSignal<Editing | null>(null);
-  const reload = () => setEpoch((e) => e + 1);
+  const reload = () => {
+    setEpoch((e) => e + 1);
+    props.onChange?.();
+  };
 
   const rowOf = (k: string) => matrix()?.keys.find((r) => r.key === k);
   const statusOf = (k: string, column: string): SecretCellStatus =>

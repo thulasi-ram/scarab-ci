@@ -18,9 +18,20 @@ export default function ScopedSecrets(props: {
   emptyLabel?: string;
   /** Bumping this opens the add-secret dialog (a header CTA elsewhere owns it). */
   focusPing?: number;
+  /** Bumping this refetches — another panel wrote to the same scope. */
+  epoch?: number;
+  /** Called after this panel writes, so a sibling view of the scope can refresh. */
+  onChange?: () => void;
 }) {
   const scope = () => props.scope;
-  const [names, { refetch }] = createResource(scope, listSecrets);
+  const [names, { refetch }] = createResource(
+    () => ({ scope: props.scope, epoch: props.epoch ?? 0 }),
+    (k) => listSecrets(k.scope),
+  );
+  const changed = () => {
+    refetch();
+    props.onChange?.();
+  };
   const [showDialog, setShowDialog] = createSignal(false);
 
   // The header "New secret" CTA pings us to open the add-secret modal. Guard on
@@ -46,7 +57,7 @@ export default function ScopedSecrets(props: {
                     <code class="mono">{n}</code>
                     <button
                       class="btn btn-danger btn-sm"
-                      onClick={async () => { await deleteSecret(scope(), n); refetch(); }}
+                      onClick={async () => { await deleteSecret(scope(), n); changed(); }}
                     >
                       delete
                     </button>
@@ -68,7 +79,7 @@ export default function ScopedSecrets(props: {
           scope={scope()}
           existing={names() ?? []}
           onClose={() => setShowDialog(false)}
-          onSaved={() => refetch()}
+          onSaved={changed}
         />
       </Show>
     </div>
