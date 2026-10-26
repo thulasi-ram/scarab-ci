@@ -52,6 +52,14 @@ helm upgrade --install scarab deploy/helm/scarab -n scarab \
   --set secrets.existingSecret=scarab-env --set scarab.s3.bucket=scarab-logs
 ```
 
+On EKS you can drop the S3 keys entirely: leave `SCARAB_S3_ACCESS_KEY` /
+`SCARAB_S3_SECRET_KEY` unset and Scarab uses AWS's ambient credential chain
+(IRSA, Pod Identity, instance role). Annotate both ServiceAccounts with the
+role, because the server and the workspace StatefulSet both reach the bucket:
+`serviceAccount.annotations` and `workspace.serviceAccount.annotations`, e.g.
+`eks.amazonaws.com/role-arn: arn:aws:iam::<acct>:role/scarab`. Step Pods run
+under neither ServiceAccount, so they do not inherit the role.
+
 ## Login (`scarab.oauth`, ADR-0049)
 
 Scarab authenticates operators against a **forge-agnostic OAuth/OIDC provider**:

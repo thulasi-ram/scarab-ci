@@ -156,6 +156,17 @@ scarab:
   # (`mc admin config get <alias> api` → stale_uploads_expiry=24h, swept
   # every stale_uploads_cleanup_interval=6h by default), and its mc ships no
   # abort-incomplete-multipart ILM flag at all.
+  #
+  # CREDENTIALS: secrets.s3AccessKey + secrets.s3SecretKey (both, or neither).
+  # With neither, the server uses AWS's ambient credential chain — on EKS that
+  # is IRSA (or Pod Identity): annotate BOTH ServiceAccounts with the role,
+  # since the control plane and the workspace StatefulSet each talk to the
+  # bucket:
+  #
+  #   serviceAccount.annotations:
+  #     eks.amazonaws.com/role-arn: arn:aws:iam::<acct>:role/scarab
+  #   workspace.serviceAccount.annotations:
+  #     eks.amazonaws.com/role-arn: arn:aws:iam::<acct>:role/scarab
   s3:
     bucket: ""
     endpoint: ""       # e.g. http://minio.scarab.svc:9000 ; empty => AWS S3
@@ -259,7 +270,8 @@ secrets:
   # --- inline (rendered into a chart-managed Secret when existingSecret is "") ---
   # Postgres URL. MANDATORY (ADR-0048): scarab-server refuses to boot without it.
   databaseUrl: ""
-  # S3/MinIO credentials (needed when scarab.s3.bucket is set).
+  # S3/MinIO static credentials. Set both, or leave both empty to use AWS's
+  # ambient credentials (IRSA / Pod Identity — see scarab.s3 above).
   s3AccessKey: ""
   s3SecretKey: ""
   # base64 32-byte key so encrypted secrets survive restarts (ADR-0014).
@@ -437,6 +449,11 @@ workspace:
       memory: 2Gi
   nodeSelector: {}
   tolerations: []
+  # Annotations for the workspace ServiceAccount (it has its own — see
+  # templates/serviceaccount-workspace.yaml), e.g. the IRSA role it uses to
+  # reach the bucket when secrets.s3AccessKey/s3SecretKey are empty.
+  serviceAccount:
+    annotations: {}
 
 # Plugins (ADR-0072): long-lived vendor workloads (e.g. the first-party Argo CD
 # reporter) that Scarab runs in ONE shared namespace and talks to only through

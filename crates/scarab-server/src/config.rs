@@ -20,8 +20,8 @@
 //! | `SCARAB_S3_BUCKET` | env | selects S3/MinIO object store when set |
 //! | `SCARAB_S3_ENDPOINT` | env | S3 endpoint (empty = AWS) |
 //! | `SCARAB_S3_REGION` | env | S3 region (default `us-east-1`) |
-//! | `SCARAB_S3_ACCESS_KEY` | env | S3 access key |
-//! | `SCARAB_S3_SECRET_KEY` | env | S3 secret key |
+//! | `SCARAB_S3_ACCESS_KEY` | env | S3 access key; unset with the secret key = AWS ambient credentials (IRSA, Pod Identity, instance role) |
+//! | `SCARAB_S3_SECRET_KEY` | env | S3 secret key; set both or neither |
 //! | `SCARAB_CAS_CONCURRENCY` | env | in-flight object-store round-trips per workspace-CAS leg (ADR-0061 s2); default 32. The legs are latency-bound, so this is a *floor* for remote storage — raise it when the store is far away, lower it when blobs are large, because peak memory is roughly `concurrency × largest blob` |
 //! | `SCARAB_RESULTS_TOKEN_SECRET` | env | enables results-egress sidecar + ingest (ADR-0042) |
 //! | `SCARAB_RESULTS_API_URL` | env | base URL the sidecar posts results to |
@@ -248,8 +248,9 @@ pub struct S3Config {
     /// Empty = real AWS (the SDK default endpoint).
     pub endpoint: String,
     pub region: String,
-    pub access_key: String,
-    pub secret_key: String,
+    /// `(access_key, secret_key)`. `None` = AWS's ambient credential chain
+    /// (IRSA web identity, EKS Pod Identity, instance role, `AWS_*` keys).
+    pub static_keys: Option<(String, String)>,
 }
 
 /// Which object store backs logs/artifacts.
@@ -1133,12 +1134,12 @@ pub enum ConfigError {
     ConflictingMasterKeys { legacy: String, configured: String },
 
     #[error(
-        "SCARAB_S3_BUCKET is set but SCARAB_S3_ACCESS_KEY / SCARAB_S3_SECRET_KEY are \
-         empty (ADR-0048). Empty credentials would fail at first use, not at boot — \
-         set both, or unset SCARAB_S3_BUCKET and pass an explicit --object-dir /
-         SCARAB_OBJECT_DIR (a local-dir store, tests/dev)."
+        "only one of SCARAB_S3_ACCESS_KEY / SCARAB_S3_SECRET_KEY is set (ADR-0048). \
+         A half key pair would fail at first use, not at boot — set both for static \
+         keys, or neither to use AWS's ambient credentials (IRSA, Pod Identity, \
+         instance role)."
     )]
-    MissingS3Credentials,
+    PartialS3Credentials,
 
     #[error(
         "no object store configured (ADR-0067 part 1: Postgres AND an object \
@@ -1379,14 +1380,19 @@ impl Config {
                     bucket,
                     endpoint: env("SCARAB_S3_ENDPOINT").unwrap_or_default(),
                     region: env("SCARAB_S3_REGION").unwrap_or_else(|| "us-east-1".into()),
-                    access_key: env("SCARAB_S3_ACCESS_KEY").unwrap_or_default(),
-                    secret_key: env("SCARAB_S3_SECRET_KEY").unwrap_or_default(),
+                    // Both keys = static credentials; neither = AWS's ambient
+                    // chain. Half a pair is a typo, not a choice: refuse it
+                    // regardless of SCARAB_DEV_INSECURE. Empty = unset, as the
+                    // chart renders absent keys.
+                    static_keys: match (
+                        env("SCARAB_S3_ACCESS_KEY").filter(|k| !k.is_empty()),
+                        env("SCARAB_S3_SECRET_KEY").filter(|k| !k.is_empty()),
+                    ) {
+                        (Some(access), Some(secret)) => Some((access, secret)),
+                        (None, None) => None,
+                        _ => return Err(ConfigError::PartialS3Credentials),
+                    },
                 };
-                // Enabled-but-unsafe, and not a security downgrade the dev
-                // hatch covers: refuse regardless of SCARAB_DEV_INSECURE.
-                if s3.access_key.is_empty() || s3.secret_key.is_empty() {
-                    return Err(ConfigError::MissingS3Credentials);
-                }
                 StoreConfig::S3(s3)
             }
             // No bucket: a local-dir store is still a valid bucket stand-in
@@ -1770,11 +1776,20 @@ impl Config {
     /// logged by the composition root as they occur.
     pub fn startup_report(&self) -> Vec<String> {
         let store = match &self.store {
-            StoreConfig::S3(s3) if s3.endpoint.is_empty() => {
-                format!("s3 bucket={} region={}", s3.bucket, s3.region)
-            }
             StoreConfig::S3(s3) => {
-                format!("s3 bucket={} endpoint={}", s3.bucket, s3.endpoint)
+                let creds = if s3.static_keys.is_some() {
+                    "static"
+                } else {
+                    "ambient"
+                };
+                if s3.endpoint.is_empty() {
+                    format!("s3 bucket={} region={} creds={creds}", s3.bucket, s3.region)
+                } else {
+                    format!(
+                        "s3 bucket={} endpoint={} creds={creds}",
+                        s3.bucket, s3.endpoint
+                    )
+                }
             }
             StoreConfig::LocalDir(dir) => format!("local dir={dir}"),
         };
@@ -2629,10 +2644,26 @@ mod tests {
     }
 
     #[test]
-    fn s3_bucket_with_empty_creds_refuses_even_under_dev_insecure() {
-        let env = dev_env(&[("SCARAB_S3_BUCKET", "scarab-logs")]);
+    fn s3_bucket_with_half_a_key_pair_refuses_even_under_dev_insecure() {
+        let env = dev_env(&[
+            ("SCARAB_S3_BUCKET", "scarab-logs"),
+            ("SCARAB_S3_ACCESS_KEY", "k"),
+            ("SCARAB_S3_SECRET_KEY", ""),
+        ]);
         let err = Config::resolve_from(&cli(Some("postgres://l/scarab")), env).unwrap_err();
-        assert_eq!(err, ConfigError::MissingS3Credentials);
+        assert_eq!(err, ConfigError::PartialS3Credentials);
+    }
+
+    #[test]
+    fn s3_bucket_without_keys_uses_ambient_aws_credentials() {
+        let env = dev_env(&[("SCARAB_S3_BUCKET", "scarab-logs")]);
+        let cfg = Config::resolve_from(&cli(Some("postgres://l/scarab")), env).unwrap();
+        match &cfg.store {
+            StoreConfig::S3(s3) => assert_eq!(s3.static_keys, None),
+            other => panic!("expected S3 store, got {other:?}"),
+        }
+        let report = cfg.startup_report().join("\n");
+        assert!(report.contains("creds=ambient"), "{report}");
     }
 
     #[test]
@@ -2752,6 +2783,7 @@ mod tests {
                 assert_eq!(s3.bucket, "scarab-logs");
                 assert_eq!(s3.endpoint, "http://127.0.0.1:9000");
                 assert_eq!(s3.region, "us-east-1"); // default
+                assert_eq!(s3.static_keys, Some(("k".into(), "s".into())));
             }
             other => panic!("expected S3 store, got {other:?}"),
         }

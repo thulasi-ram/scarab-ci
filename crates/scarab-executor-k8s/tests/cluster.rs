@@ -265,8 +265,7 @@ fn depot_cold_store() -> std::sync::Arc<scarab_storage_s3::S3Storage> {
                     bucket,
                     &endpoint,
                     &region,
-                    &access_key,
-                    &secret_key,
+                    Some((&access_key, &secret_key)),
                 )
                 .expect("cold store handle (S3)"),
             )

@@ -156,27 +156,18 @@ impl S3Storage {
 
     /// An S3-compatible store (AWS S3 or MinIO). `endpoint` + `allow_http` make
     /// it point at the dev harness's MinIO; the same call reaches real S3 when
-    /// `endpoint` is empty and creds come from the environment.
+    /// `endpoint` is empty.
+    ///
+    /// `static_keys` is `(access_key_id, secret_access_key)`. See
+    /// [`s3_client`] for what `None` means.
     pub fn s3(
         bucket: impl Into<String>,
         endpoint: &str,
         region: &str,
-        access_key: &str,
-        secret_key: &str,
+        static_keys: Option<(&str, &str)>,
     ) -> Result<Self, StorageError> {
         let bucket = bucket.into();
-        let mut builder = object_store::aws::AmazonS3Builder::new()
-            .with_bucket_name(&bucket)
-            .with_region(region)
-            .with_access_key_id(access_key)
-            .with_secret_access_key(secret_key);
-        if !endpoint.is_empty() {
-            // MinIO / non-AWS endpoints are plain HTTP path-style.
-            builder = builder.with_endpoint(endpoint).with_allow_http(true);
-        }
-        let s3 = builder
-            .build()
-            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        let s3 = s3_client(&bucket, endpoint, region, static_keys)?;
         Ok(Self::with_backend(bucket, Arc::new(s3)))
     }
 
@@ -185,6 +176,40 @@ impl S3Storage {
             .as_ref()
             .ok_or_else(|| StorageError::Backend("no object-store backend wired".into()))
     }
+}
+
+/// Build the `object_store` S3 client behind [`S3Storage::s3`].
+///
+/// - **`Some(keys)`**: that static key pair, and nothing else. The builder
+///   starts from `new()`, not `from_env()`, so an ambient `AWS_SESSION_TOKEN`
+///   (or anything else `AWS_*`) cannot get mixed into the operator's keys.
+/// - **`None`**: AWS's ambient credential chain, via `from_env()` — the
+///   `AWS_ACCESS_KEY_ID` pair, then a web-identity token (IRSA sets
+///   `AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN`), then ECS task / EKS Pod
+///   Identity, then the instance metadata service. The bucket, region and
+///   endpoint below are still set explicitly, so they win over any `AWS_*`
+///   equivalents; an `AWS_ENDPOINT` is honoured only when `endpoint` is empty.
+fn s3_client(
+    bucket: &str,
+    endpoint: &str,
+    region: &str,
+    static_keys: Option<(&str, &str)>,
+) -> Result<object_store::aws::AmazonS3, StorageError> {
+    use object_store::aws::AmazonS3Builder;
+    let builder = match static_keys {
+        Some((access_key, secret_key)) => AmazonS3Builder::new()
+            .with_access_key_id(access_key)
+            .with_secret_access_key(secret_key),
+        None => AmazonS3Builder::from_env(),
+    };
+    let mut builder = builder.with_bucket_name(bucket).with_region(region);
+    if !endpoint.is_empty() {
+        // MinIO / non-AWS endpoints are plain HTTP path-style.
+        builder = builder.with_endpoint(endpoint).with_allow_http(true);
+    }
+    builder
+        .build()
+        .map_err(|e| StorageError::Backend(e.to_string()))
 }
 
 fn map_err(e: object_store::Error) -> StorageError {
@@ -1054,5 +1079,28 @@ impl Cas for S3Storage {
 
     async fn ingest(&self, path: &str) -> Result<Snapshot, StorageError> {
         self.ingest_tree(std::path::PathBuf::from(path)).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::s3_client;
+
+    /// The credential precedence an IRSA deployment depends on: operator keys
+    /// win even with a web identity in the environment, and with no keys the
+    /// web identity is what gets used. One test, because both halves read the
+    /// same process environment — no other test in this binary touches `AWS_*`.
+    #[test]
+    fn static_keys_win_else_the_ambient_chain_is_used() {
+        std::env::set_var("AWS_WEB_IDENTITY_TOKEN_FILE", "/var/run/secrets/token");
+        std::env::set_var("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/scarab");
+
+        let keyed = s3_client("b", "", "us-east-1", Some(("AKIA", "secret"))).unwrap();
+        let provider = format!("{:?}", keyed.credentials());
+        assert!(provider.contains("StaticCredentialProvider"), "{provider}");
+
+        let ambient = s3_client("b", "", "us-east-1", None).unwrap();
+        let provider = format!("{:?}", ambient.credentials());
+        assert!(provider.contains("WebIdentityProvider"), "{provider}");
     }
 }

@@ -46,8 +46,10 @@ fn live_store() -> Option<S3Storage> {
             get("SCARAB_TEST_S3_BUCKET"),
             &get("SCARAB_TEST_S3_ENDPOINT"),
             "us-east-1",
-            &get("SCARAB_TEST_S3_ACCESS_KEY"),
-            &get("SCARAB_TEST_S3_SECRET_KEY"),
+            Some((
+                &get("SCARAB_TEST_S3_ACCESS_KEY"),
+                &get("SCARAB_TEST_S3_SECRET_KEY"),
+            )),
         )
         .expect("live S3 store handle"),
     )
