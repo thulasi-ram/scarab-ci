@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1793008522,"nonce":"ztBCchP0c94ZHeBHZA82Q+RSipc=","message":"Closing as stale: AsciiScene computes the occupied box incl. r0 and offsets the bubble by it (e6cac2f); empty state resized.","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1793008522,"nonce":"KowmBiQ3zxMW/1IgLTW+V1UDlsI=","status":2}]}
