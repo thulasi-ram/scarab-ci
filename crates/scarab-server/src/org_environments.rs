@@ -27,20 +27,23 @@
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::Json;
+use axum::{Extension, Json};
 use scarab_engine::DbError;
 use scarab_identity::Action;
 use scarab_project::{
-    DeployGovernance, EffectiveProtection, EnvironmentDeploymentDeadline,
-    EnvironmentDeploymentSource, EnvironmentGovernanceStore, EnvironmentMigrationReport,
-    EnvironmentMigrationReportProject, EnvironmentProjectEligibility, EnvironmentProjectOverlay,
-    EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord, EnvironmentProtectionRules,
-    ImageGrant, OrgEnvironment, OrgEnvironmentError, ProtectionRules,
+    deployment_source_additions, eligibility_loosenings, overlay_loosenings,
+    privilege_grant_loosenings, protection_loosenings, DeployGovernance, EffectiveProtection,
+    EnvironmentDeploymentDeadline, EnvironmentDeploymentSource, EnvironmentGovernanceStore,
+    EnvironmentMigrationReport, EnvironmentMigrationReportProject, EnvironmentProjectEligibility,
+    EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord,
+    EnvironmentProtectionRules, ImageGrant, Loosening, OrgEnvironment, OrgEnvironmentError,
+    ProtectionRules,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use super::{authorize_scoped, rbac_scope, resolve_typed_subject, ApiError, AppState};
+use crate::step_up::GuardCtx;
 
 /// A source allowed to report into an Environment (ADR-0071 §5).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -284,6 +287,8 @@ pub(crate) fn org_environment_api_error(e: OrgEnvironmentError) -> ApiError {
         OrgEnvironmentError::NotFound { .. } => ApiError::NotFound,
         // ADR-0071 §3, §8: a Project's overlay or grant pins the Environment.
         in_use @ OrgEnvironmentError::InUse(_) => ApiError::Conflict(in_use.to_string()),
+        // ADR-0073 §3: an `…_expecting` write lost to a concurrent change.
+        OrgEnvironmentError::Conflict(m) => ApiError::Conflict(m),
         OrgEnvironmentError::Store(m) => ApiError::Db(DbError::Other(m)),
     }
 }
@@ -369,6 +374,7 @@ pub(crate) async fn get_org_environment(
 )]
 pub(crate) async fn put_org_environment(
     State(st): State<AppState>,
+    Extension(guard): Extension<GuardCtx>,
     headers: HeaderMap,
     Path((org, env)): Path<(String, String)>,
     Json(body): Json<PutOrgEnvironmentRequest>,
@@ -405,12 +411,29 @@ pub(crate) async fn put_org_environment(
         updated_by: principal.subject,
     };
     environment.validate().map_err(org_environment_api_error)?;
+    // ADR-0073 §3 rule E3: a deployment source added is a crown jewel (a new
+    // outside party whose reports this Environment accepts); a create reads
+    // as "no sources before". The write is conditional on the sources read
+    // here, so a change committed in between is a 409, never a loosening
+    // judged against a stale list.
+    let old_sources = store
+        .get_org_environment(&environment.org, &environment.name)
+        .await
+        .map_err(org_environment_api_error)?
+        .map(|e| e.deployment_sources)
+        .unwrap_or_default();
+    step_up_unless_tightening(
+        &st,
+        &guard,
+        deployment_source_additions(&old_sources, &environment.deployment_sources),
+    )
+    .await?;
     // F1 (c-min audit): the store refuses a source naming no installation in
     // this org, checked inside its write's transaction with the named
     // installations locked — a check here, before it, would race an
     // uninstall (red-team F-10).
     let stored = store
-        .put_org_environment(&environment)
+        .put_org_environment_expecting(&environment, Some(&old_sources))
         .await
         .map_err(org_environment_api_error)?;
     Ok(Json((&stored).into()))
@@ -553,16 +576,14 @@ pub(crate) async fn get_environment_eligibility(
 )]
 pub(crate) async fn put_environment_eligibility(
     State(st): State<AppState>,
+    Extension(guard): Extension<GuardCtx>,
     headers: HeaderMap,
     Path((org, env)): Path<(String, String)>,
     Json(body): Json<EnvironmentEligibilityDto>,
 ) -> Result<Json<EnvironmentEligibilityDto>, ApiError> {
     let scope = rbac_scope(&org, None);
     let principal = authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
-    let store = st
-        .environment_governance
-        .as_ref()
-        .ok_or(ApiError::NotFound)?;
+    let store = governance_store(&st)?;
     let eligibility = match (body.all_projects, body.projects.is_empty()) {
         (true, true) => EnvironmentProjectEligibility::AllProjects,
         // Both would be read as "all", silently dropping the list the caller
@@ -574,9 +595,25 @@ pub(crate) async fn put_environment_eligibility(
         }
         (false, _) => EnvironmentProjectEligibility::Projects(body.projects),
     };
+    eligibility.validate().map_err(org_environment_api_error)?;
+    // ADR-0073 §3 rule E2: widening who may deploy is a crown jewel.
+    let current = stored_environment(store, &org, &env).await?;
+    step_up_unless_tightening(
+        &st,
+        &guard,
+        eligibility_loosenings(&current.eligibility, &eligibility),
+    )
+    .await?;
     let now = st.clock.now().await.0;
     let stored = store
-        .put_environment_eligibility(&org, &env, &eligibility, &principal.subject, now)
+        .put_environment_eligibility_expecting(
+            &org,
+            &env,
+            &eligibility,
+            Some(&current.eligibility),
+            &principal.subject,
+            now,
+        )
         .await
         .map_err(org_environment_api_error)?;
     Ok(Json((&stored.eligibility).into()))
@@ -619,6 +656,41 @@ fn governance_store(st: &AppState) -> Result<&dyn EnvironmentGovernanceStore, Ap
     st.environment_governance
         .as_deref()
         .ok_or(ApiError::NotFound)
+}
+
+/// The Environment as `store` holds it now — what a conditional governance
+/// write judges its loosenings against and then writes conditionally on
+/// (ADR-0073 §3). Read from the store the write goes to, in its one
+/// snapshot, as the Environment itself — never through a Project's
+/// governance view, whose answer may depend on that Project (git-bug
+/// 0485f41). 404 when there is no such Environment.
+async fn stored_environment(
+    store: &dyn EnvironmentGovernanceStore,
+    org: &str,
+    env: &str,
+) -> Result<OrgEnvironment, ApiError> {
+    store
+        .org_environment(org, env)
+        .await
+        .map_err(org_environment_api_error)?
+        .ok_or(ApiError::NotFound)
+}
+
+/// ADR-0073 §3: a conditional crown jewel's one decision. A write that
+/// loosens nothing is exempt; one that loosens needs a step-up, and the
+/// human confirms exactly what loosens (the summary's changes).
+async fn step_up_unless_tightening(
+    st: &AppState,
+    guard: &GuardCtx,
+    loosenings: Vec<Loosening>,
+) -> Result<(), ApiError> {
+    if loosenings.is_empty() {
+        guard.exempt("tightening");
+        return Ok(());
+    }
+    guard
+        .require(st, loosenings.into_iter().map(|l| l.what).collect())
+        .await
 }
 
 /// A baseline (`…/protection`) body: the five rules, replaced whole. Every
@@ -827,6 +899,7 @@ pub(crate) async fn get_environment_protection(
 )]
 pub(crate) async fn put_environment_protection(
     State(st): State<AppState>,
+    Extension(guard): Extension<GuardCtx>,
     headers: HeaderMap,
     Path((org, env)): Path<(String, String)>,
     Json(body): Json<PutEnvironmentProtectionRequest>,
@@ -843,9 +916,24 @@ pub(crate) async fn put_environment_protection(
         body.deployment_concurrency,
     )
     .await?;
+    // ADR-0073 §3 rule E1: loosening the baseline is a crown jewel.
+    let current = stored_environment(store, &org, &env).await?;
+    step_up_unless_tightening(
+        &st,
+        &guard,
+        protection_loosenings(&current.protection, &rules),
+    )
+    .await?;
     let now = st.clock.now().await.0;
     let stored = store
-        .put_environment_protection(&org, &env, &rules, &principal.subject, now)
+        .put_environment_protection_expecting(
+            &org,
+            &env,
+            &rules,
+            Some(&current.protection),
+            &principal.subject,
+            now,
+        )
         .await
         .map_err(org_environment_api_error)?;
     Ok(Json((&stored).into()))
@@ -945,6 +1033,7 @@ pub(crate) async fn get_environment_project_overlay(
 )]
 pub(crate) async fn put_environment_project_overlay(
     State(st): State<AppState>,
+    Extension(guard): Extension<GuardCtx>,
     headers: HeaderMap,
     Path((org, env, project)): Path<(String, String, String)>,
     Json(body): Json<PutEnvironmentProjectOverlayRequest>,
@@ -984,9 +1073,22 @@ pub(crate) async fn put_environment_project_overlay(
         rules,
         deployment_gate_deadline,
     };
+    // ADR-0073 §3 rule E1 plus the gate deadline: loosening an overlay
+    // (toward the baseline) is a crown jewel; creating one never loosens.
+    step_up_unless_tightening(
+        &st,
+        &guard,
+        overlay_loosenings(governance.overlay.as_ref(), &overlay),
+    )
+    .await?;
     let now = st.clock.now().await.0;
     store
-        .put_environment_project_overlay(&overlay, &principal.subject, now)
+        .put_environment_project_overlay_expecting(
+            &overlay,
+            Some(governance.overlay.as_ref()),
+            &principal.subject,
+            now,
+        )
         .await
         .map_err(org_environment_api_error)?;
     Ok(Json((&overlay).into()))
@@ -1086,6 +1188,7 @@ pub(crate) async fn get_environment_project_privilege_grant(
 )]
 pub(crate) async fn put_environment_project_privilege_grant(
     State(st): State<AppState>,
+    Extension(guard): Extension<GuardCtx>,
     headers: HeaderMap,
     Path((org, env, project)): Path<(String, String, String)>,
     Json(body): Json<PutEnvironmentProjectPrivilegeGrantRequest>,
@@ -1119,6 +1222,14 @@ pub(crate) async fn put_environment_project_privilege_grant(
             capabilities: g.capabilities,
         });
     }
+    // ADR-0073 §3 rule E4: widening what this Project's steps may do is a
+    // crown jewel; a first grant reads as "nothing granted before".
+    let old = store
+        .deploy_governance(&org, &project, &env)
+        .await
+        .map_err(org_environment_api_error)?
+        .ok_or(ApiError::NotFound)?
+        .privilege_grant;
     let grant = EnvironmentProjectPrivilegeGrant {
         org,
         environment: env,
@@ -1126,9 +1237,20 @@ pub(crate) async fn put_environment_project_privilege_grant(
         privileged_images,
         permit_k8s_overlay: body.permit_k8s_overlay,
     };
+    step_up_unless_tightening(
+        &st,
+        &guard,
+        privilege_grant_loosenings(old.as_ref(), &grant),
+    )
+    .await?;
     let now = st.clock.now().await.0;
     store
-        .put_environment_project_privilege_grant(&grant, &principal.subject, now)
+        .put_environment_project_privilege_grant_expecting(
+            &grant,
+            Some(old.as_ref()),
+            &principal.subject,
+            now,
+        )
         .await
         .map_err(org_environment_api_error)?;
     Ok(Json((&grant).into()))

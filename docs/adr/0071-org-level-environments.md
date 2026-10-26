@@ -194,9 +194,13 @@ read at all.
   deliberate. Otherwise two Runs could pass the limit together while both deploy Steps
   run. A Run whose DeploymentGate on the request has **not been reached** (one of the
   gate's needs has not succeeded) stops counting once the Environment's baseline deadline
-  has elapsed since the request's effective time, the moment its Deployment reads
-  `stalled` on the record. A reached gate counts until its verdict, which the deadline
-  bounds. Without this bound, two Runs that acquired two targets in opposite orders, each
+  has elapsed since the requesting Step's **latest Attempt** started (`MAX(started_at)`):
+  the Attempt that succeeded and recorded the request, where a first wait of its gates
+  opens (ADR-0070 §8). That is not the request's effective time, which is the Step's first
+  Attempt in its Take and is earlier after a retry. A reached gate counts until its
+  verdict, which the deadline bounds; a first wait's deadline, never longer than the
+  baseline, runs from that same start, so a reached gate is decided no later than the
+  cutoff. Without this bound, two Runs that acquired two targets in opposite orders, each
   with gates needing both deploys, would hold each other forever (R3). With it, they wait
   at most one deadline, then proceed, and their superseded gates fail `superseded`.
 - **It holds, never rejects.** The check runs at the point of use, as a deploy Step is

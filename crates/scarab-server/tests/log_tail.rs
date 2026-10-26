@@ -142,6 +142,13 @@ impl GatedExec {
 
 #[async_trait]
 impl Executor for GatedExec {
+    async fn results_delivery_failure(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<String>, ExecError> {
+        Ok(None)
+    }
+
     async fn infra_condition(
         &self,
         _handle: &ExecHandle,
@@ -167,6 +174,16 @@ impl Executor for GatedExec {
     }
     async fn cancel(&self, _h: &ExecHandle) -> Result<(), ExecError> {
         Ok(())
+    }
+    fn unit_handle(
+        &self,
+        _step: &scarab_engine::StepRun,
+    ) -> Option<scarab_engine::ports::ExecHandle> {
+        None // nothing is created behind this stub's launches
+    }
+
+    async fn torn_down(&self, _h: &ExecHandle) -> Result<bool, ExecError> {
+        Ok(true) // nothing runs behind this stub's handles
     }
     // ADR-0064 s2: required (never defaulted) so the compiler makes every impl —
     // wrappers included — decide; this stub snapshots nothing, so no stamp.

@@ -302,6 +302,17 @@ impl Executor for SecretInjectingExecutor {
         self.inner.cancel(handle).await
     }
 
+    fn unit_handle(
+        &self,
+        step: &scarab_engine::StepRun,
+    ) -> Option<scarab_engine::ports::ExecHandle> {
+        self.inner.unit_handle(step)
+    }
+
+    async fn torn_down(&self, handle: &ExecHandle) -> Result<bool, ExecError> {
+        self.inner.torn_down(handle).await
+    }
+
     async fn output(&self, handle: &ExecHandle) -> Result<Option<String>, ExecError> {
         self.inner.output(handle).await
     }
@@ -325,6 +336,15 @@ impl Executor for SecretInjectingExecutor {
         // named-results capture (ADR-0041) must pass straight through, or a
         // secrets-wired deployment would silently drop every step's results.
         self.inner.results(handle).await
+    }
+
+    async fn results_delivery_failure(
+        &self,
+        handle: &ExecHandle,
+    ) -> Result<Option<String>, ExecError> {
+        // REQUIRED evidence method: forward, or a k8s results-sidecar failure
+        // behind this decorator reads as the author's missing result (0cb5895).
+        self.inner.results_delivery_failure(handle).await
     }
 
     async fn artifacts(

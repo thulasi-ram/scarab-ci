@@ -38,6 +38,10 @@ mod org_environments;
 /// `PluginStore` (ADR-0072): PluginInstallations, the kill switch, and report
 /// ingest into the Deployment record.
 mod plugins;
+/// Step-up confirmation (ADR-0073): `PasskeyStore`, `ChallengeStore`,
+/// `StepUpStore` and the append-only `SecurityEventLog`.
+mod step_up;
+pub use step_up::step_up_request_lock_key;
 
 /// The embedded, ordered set of forward-only migrations. `MIGRATOR.run(pool)`
 /// applies all pending ones (tracked in `_sqlx_migrations`); tests can also walk
@@ -116,16 +120,17 @@ impl PostgresDb {
             .transpose()
     }
 
-    /// All attempts of a step, in start order.
+    /// All attempts of a step, in mint order.
     ///
-    /// Deterministic tiebreak on the attempt id: `started_at` alone is not
-    /// unique (the test `FakeClock` ties, and fast real execution can mint two
-    /// attempts in the same millisecond), which would make attempt order — and
-    /// therefore `.last()`, the frontier that anchors `?attempt=` reads and the
-    /// settle-path frontier guard — nondeterministic. Attempt ids are minted
-    /// `a{n}` (`a1`,`a2`,…; monotonic — see the scheduler), so ties break on the
-    /// numeric suffix. It must be numeric, not lexical: lexical order puts `a10`
-    /// before `a2`. The in-memory `Db` (scarab-testkit) mirrors this exact order.
+    /// Ordered by the numeric `a{n}` id suffix ALONE (`a1`,`a2`,…; minted
+    /// monotonic under the step — see the scheduler), so `.last()` is the
+    /// frontier that anchors `?attempt=` reads and the settle-path frontier
+    /// guard. Never by `started_at` (git-bug 90d767d): it is not unique (the
+    /// test `FakeClock` ties, same-millisecond real minting), it can run
+    /// BACKWARDS across a leader failover (a retried `a2` stamped before
+    /// `a1`), and a gate-wait Attempt is minted with a frozen, earlier start by
+    /// design. It must be numeric, not lexical: lexical order puts `a10` before
+    /// `a2`. The in-memory `Db` (scarab-testkit) mirrors this exact order.
     pub async fn attempts(&self, run: &RunId, step: &StepId) -> Result<Vec<Attempt>, DbError> {
         attempts_on(self.pool(), run, step).await
     }
@@ -494,6 +499,62 @@ impl Db for PostgresDb {
         Ok(())
     }
 
+    async fn ingest_attempt_results(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        results: &std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> Result<(), DbError> {
+        let json = serde_json::to_value(results).map_err(|e| DbError::Other(e.to_string()))?;
+        // One transaction with the step row locked: a finalize's status CAS
+        // (which locks the same row) either committed first — the step is no
+        // longer `running` here — or waits for this write. An early return
+        // drops `tx`, which rolls it back.
+        let mut tx = self.pool().begin().await.map_err(db_err)?;
+        let status: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM step_runs WHERE run_id = $1 AND step_id = $2 FOR UPDATE",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        if status.as_deref() != Some(step_status_str(StepStatus::Running)) {
+            return Err(DbError::Conflict);
+        }
+        let frontier = attempts_on(&mut *tx, run, step).await?;
+        if frontier.last().map(|a| &a.id) != Some(attempt) {
+            return Err(DbError::Conflict);
+        }
+        sqlx::query(
+            "UPDATE step_runs
+             SET results = $3,
+                 evidence_attempt = $4,
+                 updated_at = (extract(epoch from now()) * 1000)::bigint
+             WHERE run_id = $1 AND step_id = $2",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(&json)
+        .bind(&attempt.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        sqlx::query(
+            "UPDATE attempts SET results = $4
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(&attempt.0)
+        .bind(&json)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)
+    }
+
     async fn step_results(
         &self,
         run: &RunId,
@@ -592,6 +653,53 @@ impl Db for PostgresDb {
         match row.and_then(|r| r.get::<Option<Value>, _>("consumed")) {
             Some(v) => serde_json::from_value(v).map_err(|e| DbError::Other(e.to_string())),
             None => Ok(std::collections::BTreeMap::new()),
+        }
+    }
+
+    async fn set_attempt_workspace_input_steps(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        steps: &[StepId],
+    ) -> Result<(), DbError> {
+        let ids: Vec<&str> = steps.iter().map(|s| s.0.as_str()).collect();
+        let json = serde_json::to_value(ids).map_err(|e| DbError::Other(e.to_string()))?;
+        sqlx::query(
+            "UPDATE attempts SET workspace_input_steps = $4
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(&attempt.0)
+        .bind(json)
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn attempt_workspace_input_steps(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<Option<Vec<StepId>>, DbError> {
+        let row = sqlx::query(
+            "SELECT workspace_input_steps FROM attempts
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(&attempt.0)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(db_err)?;
+        match row.and_then(|r| r.get::<Option<Value>, _>("workspace_input_steps")) {
+            Some(v) => serde_json::from_value::<Vec<String>>(v)
+                .map(|ids| Some(ids.into_iter().map(StepId).collect()))
+                .map_err(|e| DbError::Other(e.to_string())),
+            None => Ok(None),
         }
     }
 
@@ -1224,6 +1332,15 @@ impl Db for PostgresDb {
             .transpose()
     }
 
+    async fn run_reopen_generation(&self, run: &RunId) -> Result<u64, DbError> {
+        let row = sqlx::query("SELECT reopen_generation FROM runs WHERE id = $1")
+            .bind(&run.0)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(row.map_or(0, |r| r.get::<i64, _>("reopen_generation") as u64))
+    }
+
     async fn active_runs(&self) -> Result<Vec<RunId>, DbError> {
         // Priority order (higher first, then oldest) so the admission pass hands
         // scarce capacity to higher-priority work before lower (ADR-0011, 0032).
@@ -1329,6 +1446,65 @@ impl Db for PostgresDb {
         Ok(steps)
     }
 
+    async fn steps_of_runs(
+        &self,
+        runs: &[RunId],
+    ) -> Result<std::collections::HashMap<RunId, Vec<StepRun>>, DbError> {
+        let mut out: std::collections::HashMap<RunId, Vec<StepRun>> =
+            std::collections::HashMap::new();
+        if runs.is_empty() {
+            return Ok(out);
+        }
+        let ids: Vec<&str> = runs.iter().map(|r| r.0.as_str()).collect();
+        // Two queries for the whole page, in `steps_of_run`'s orders: steps by
+        // id, each step's attempts by their `a{n}` number.
+        let rows = sqlx::query(
+            "SELECT run_id, step_id, status, needs, gate_kind FROM step_runs
+             WHERE run_id = ANY($1) ORDER BY run_id, step_id",
+        )
+        .bind(&ids)
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?;
+        let attempt_rows = sqlx::query(
+            "SELECT run_id, step_id, attempt_id, started_at, failure, failure_detail, outcome
+             FROM attempts
+             WHERE run_id = ANY($1)
+             ORDER BY run_id, step_id, CAST(substring(attempt_id FROM 2) AS INTEGER)",
+        )
+        .bind(&ids)
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?;
+        let mut attempts: std::collections::HashMap<(String, String), Vec<Attempt>> =
+            std::collections::HashMap::new();
+        for r in &attempt_rows {
+            attempts
+                .entry((r.get::<String, _>("run_id"), r.get::<String, _>("step_id")))
+                .or_default()
+                .push(attempt_from_row(r)?);
+        }
+        for r in rows {
+            let run = r.get::<String, _>("run_id");
+            let step = r.get::<String, _>("step_id");
+            let status = step_status_from_str(r.get::<String, _>("status"))?;
+            let needs = needs_from_value(r.get::<Value, _>("needs"))?;
+            let gate_kind = r.get::<Option<String>, _>("gate_kind");
+            let step_attempts = attempts
+                .remove(&(run.clone(), step.clone()))
+                .unwrap_or_default();
+            out.entry(RunId(run.clone())).or_default().push(StepRun {
+                run: RunId(run),
+                step: StepId(step),
+                status,
+                attempts: step_attempts,
+                needs,
+                gate_kind,
+            });
+        }
+        Ok(out)
+    }
+
     async fn step_spec(&self, run: &RunId, step: &StepId) -> Result<Option<StepSpec>, DbError> {
         let row = sqlx::query("SELECT spec FROM step_runs WHERE run_id = $1 AND step_id = $2")
             .bind(&run.0)
@@ -1407,23 +1583,71 @@ impl Db for PostgresDb {
     ) -> Result<(), DbError> {
         // Optimistic guard, like record_transition: the UPDATE fires only if the
         // step is still in `from`, so a stale/duplicate finalize is a Conflict.
-        let affected = sqlx::query(
-            "UPDATE step_runs
-             SET status = $4, updated_at = (extract(epoch from now()) * 1000)::bigint
-             WHERE run_id = $1 AND step_id = $2 AND status = $3",
-        )
-        .bind(&run.0)
-        .bind(&step.0)
-        .bind(step_status_str(from))
-        .bind(step_status_str(to))
-        .execute(self.pool())
-        .await
-        .map_err(db_err)?
-        .rows_affected();
-        if affected == 0 {
+        if !cas_step_status(self.pool(), run, step, from, to).await? {
             return Err(DbError::Conflict);
         }
         Ok(())
+    }
+
+    async fn commit_step_transition(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        from: StepStatus,
+        to: StepStatus,
+        frontier: scarab_engine::AttemptFrontier<'_>,
+        stamp: Option<(&AttemptId, &scarab_engine::AttemptStamp)>,
+        events: &[EventKind],
+        outbox: &[OutboxMessage],
+    ) -> Result<(), DbError> {
+        // ONE transaction (git-bug 586187a): the CAS takes the step row's
+        // lock first, so a peer's competing CAS waits and then sees the
+        // committed status (Conflict) — or, if we roll back, the old one. An
+        // early return drops `tx`, which rolls everything back.
+        let mut tx = self.pool().begin().await.map_err(db_err)?;
+        if !cas_step_status(&mut *tx, run, step, from, to).await? {
+            tx.rollback().await.map_err(db_err)?;
+            return Err(DbError::Conflict);
+        }
+        // The frontier (red team R2-E3), read only now that the CAS holds
+        // the step row: `record_attempt` holds it `FOR SHARE` while it mints,
+        // so an attempt minted concurrently is either visible to this
+        // statement (READ COMMITTED: a fresh snapshot) or minted after this
+        // commit, under the status it writes.
+        if let scarab_engine::AttemptFrontier::Is(expected) = frontier {
+            let latest: Option<String> = sqlx::query_scalar(
+                "SELECT attempt_id FROM attempts
+                 WHERE run_id = $1 AND step_id = $2
+                 ORDER BY CAST(substring(attempt_id FROM 2) AS INTEGER) DESC
+                 LIMIT 1",
+            )
+            .bind(&run.0)
+            .bind(&step.0)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            if latest.as_deref() != expected.map(|a| a.0.as_str()) {
+                tx.rollback().await.map_err(db_err)?;
+                return Err(DbError::Conflict);
+            }
+        }
+        match stamp {
+            Some((attempt, scarab_engine::AttemptStamp::Outcome(outcome))) => {
+                update_attempt_outcome(&mut *tx, run, step, attempt, *outcome).await?;
+            }
+            Some((attempt, scarab_engine::AttemptStamp::Failure { kind, detail })) => {
+                update_attempt_failure(&mut *tx, run, step, attempt, *kind, detail.as_deref())
+                    .await?;
+            }
+            None => {}
+        }
+        for event in events {
+            insert_event(&mut *tx, event).await?;
+        }
+        for msg in outbox {
+            insert_outbox(&mut *tx, msg).await?;
+        }
+        tx.commit().await.map_err(db_err)
     }
 
     async fn record_attempt(
@@ -1443,6 +1667,17 @@ impl Db for PostgresDb {
         // authoritative evidence and nothing in this INSERT legitimately
         // refreshes (the launch handle is a separate column, written by
         // `set_attempt_handle`), so keep the existing row untouched.
+        //
+        // The mint holds the step row `FOR SHARE` (see the port): a step
+        // transition's frontier check either sees this attempt or commits
+        // first, so the attempt is minted under the status it wrote.
+        let mut tx = self.pool().begin().await.map_err(db_err)?;
+        sqlx::query("SELECT 1 FROM step_runs WHERE run_id = $1 AND step_id = $2 FOR SHARE")
+            .bind(&run.0)
+            .bind(&step.0)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
         sqlx::query(
             "INSERT INTO attempts
                  (run_id, step_id, attempt_id, started_at, failure, failure_detail, outcome)
@@ -1456,10 +1691,10 @@ impl Db for PostgresDb {
         .bind(attempt.failure.map(failure_str))
         .bind(attempt.failure_detail.as_deref())
         .bind(attempt.outcome.as_str())
-        .execute(self.pool())
+        .execute(&mut *tx)
         .await
         .map_err(db_err)?;
-        Ok(())
+        tx.commit().await.map_err(db_err)
     }
 
     async fn attempts_of_step(&self, run: &RunId, step: &StepId) -> Result<Vec<Attempt>, DbError> {
@@ -1523,22 +1758,7 @@ impl Db for PostgresDb {
         // verdict. Two `IS DISTINCT FROM` clauses (not `NOT IN`) keep NULL/other
         // outcomes writable — `outcome` is nullable and `NULL NOT IN (…)` is NULL,
         // which would wrongly refuse the legitimate write to a pre-outcome row.
-        sqlx::query(
-            "UPDATE attempts SET failure = $4, failure_detail = $5, outcome = $6
-             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3
-               AND outcome IS DISTINCT FROM 'superseded'
-               AND outcome IS DISTINCT FROM 'cancelled'",
-        )
-        .bind(&run.0)
-        .bind(&step.0)
-        .bind(&attempt.0)
-        .bind(failure_str(failure))
-        .bind(detail)
-        .bind(AttemptOutcome::Failed.as_str())
-        .execute(self.pool())
-        .await
-        .map_err(db_err)?;
-        Ok(())
+        update_attempt_failure(self.pool(), run, step, attempt, failure, detail).await
     }
 
     async fn set_run_deployment_requests(
@@ -1629,9 +1849,19 @@ impl Db for PostgresDb {
         // is promoted-and-unfinished, or Succeeded with a DeploymentGate on
         // the request not yet terminal that is either REACHED (no need of it
         // is anything but succeeded — a need with no row is not succeeded) or
-        // whose request's effective time (the requesting Step's latest
-        // Attempt start, else the Run's creation) is after the cutoff — see
-        // the port. Uses run_deployment_requests_target_idx.
+        // whose requesting Step's LATEST Attempt start (the Attempt that
+        // succeeded, where a first wait of its gates opens — not the
+        // request's effective time, which is its first Attempt in the Take),
+        // else the Run's creation, is after the cutoff — see the port. Uses
+        // run_deployment_requests_target_idx.
+        //
+        // OR — whatever the Run's or the Step's status — an attempt-scoped
+        // teardown of one of the requesting Step's OWN attempts is still
+        // pending (git-bug f22056d, red team R2-E1/E2b/E7): a
+        // `cancel_attempt` or `supersede_teardown` whose payload names the
+        // Step. Never the Run-level `cancel_run` (shared services only).
+        // Pending = neither dispatched (the unit is gone) nor dead-lettered
+        // (abandoned, with a diagnostic).
         let n: i64 = sqlx::query_scalar(
             "SELECT COUNT(DISTINCT r.run_id)
              FROM run_deployment_requests r
@@ -1640,7 +1870,7 @@ impl Db for PostgresDb {
              WHERE r.org = $1 AND r.environment = $2
                AND r.target_source = $3 AND r.target_id = $4
                AND r.run_id <> $5
-               AND runs.status IN ('pending', 'running', 'suspended')
+               AND ((runs.status IN ('pending', 'running', 'suspended')
                AND (s.status IN ('ready', 'running')
                     OR (s.status = 'succeeded' AND EXISTS (
                         SELECT 1 FROM step_runs g
@@ -1656,7 +1886,14 @@ impl Db for PostgresDb {
                                OR COALESCE(
                                    (SELECT MAX(a.started_at) FROM attempts a
                                     WHERE a.run_id = r.run_id AND a.step_id = r.step_id),
-                                   runs.created_at) > $6))))",
+                                   runs.created_at) > $6)))))
+                    OR EXISTS (
+                        SELECT 1 FROM outbox o
+                        WHERE o.run_id = r.run_id
+                          AND o.dispatched_at IS NULL AND o.dead_lettered_at IS NULL
+                          AND o.kind IN ($7, $8)
+                          AND o.payload -> 'attempts'
+                              @> jsonb_build_array(jsonb_build_object('step', r.step_id))))",
         )
         .bind(org)
         .bind(environment)
@@ -1664,6 +1901,8 @@ impl Db for PostgresDb {
         .bind(id)
         .bind(&excluding.0)
         .bind(unreached_gate_cutoff.0)
+        .bind(scarab_engine::CANCEL_ATTEMPT)
+        .bind(scarab_engine::SUPERSEDE_TEARDOWN)
         .fetch_one(self.pool())
         .await
         .map_err(db_err)?;
@@ -1678,7 +1917,8 @@ impl Db for PostgresDb {
         org: &str,
         inputs: &[scarab_deployment::DeploymentInput],
         received_at: Timestamp,
-    ) -> Result<(), DbError> {
+        events: &[EventKind],
+    ) -> Result<scarab_engine::DeployStepFinish, DbError> {
         // ONE transaction, READ COMMITTED (stated, not assumed: the counter
         // upsert in `append_deployment_input` waits-then-rereads only there;
         // under REPEATABLE READ it would fail 40001 instead). Lock order:
@@ -1713,7 +1953,7 @@ impl Db for PostgresDb {
         }
         // The attempt's outcome, as `set_attempt_outcome(Succeeded)` — AND
         // only while `attempt` is still the step's latest (the
-        // `attempts_on` order). The step row is `running` for a successor
+        // `attempts_on` order: the highest `a{n}`, never the latest clock). The step row is `running` for a successor
         // `a2` too, so the transition guard alone would let a superseded or
         // merely non-latest `a1`'s exit 0 succeed the step and record a
         // DeploymentRequest. The scheduler checks the frontier before calling;
@@ -1729,8 +1969,7 @@ impl Db for PostgresDb {
                AND attempt_id = (
                    SELECT latest.attempt_id FROM attempts latest
                    WHERE latest.run_id = $1 AND latest.step_id = $2
-                   ORDER BY latest.started_at DESC,
-                            CAST(substring(latest.attempt_id FROM 2) AS INTEGER) DESC
+                   ORDER BY CAST(substring(latest.attempt_id FROM 2) AS INTEGER) DESC
                    LIMIT 1)",
         )
         .bind(&run.0)
@@ -1747,12 +1986,69 @@ impl Db for PostgresDb {
         }
         // The requests, LAST (the counter lock). A refusal or failure here
         // rolls the transition back with it: no success without its request.
+        // The finalization's events, in the same commit (git-bug 586187a):
+        // no success without its journal entry. Before the requests, so the
+        // Org's counter is still taken LAST.
+        for event in events {
+            insert_event(&mut *tx, event).await?;
+        }
+        // The Org's counter, taken NOW and held to commit (git-bug 9e66f2c):
+        // a no-op upsert locks the row (inserting it, at seq 0, for a fresh
+        // Org — the append below still gets seq 1). Every other append in the
+        // Org takes this row first, so once we hold it no input can land
+        // between the home re-check and our own appends: READ COMMITTED
+        // re-reads per statement, so the check sees every append that
+        // committed while we waited. Still LAST in the lock order.
+        if !inputs.is_empty() {
+            sqlx::query(
+                "INSERT INTO deployment_input_counters (org, last_seq, last_at)
+                 VALUES ($1, 0, 0)
+                 ON CONFLICT (org) DO UPDATE SET last_seq = deployment_input_counters.last_seq",
+            )
+            .bind(org)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
+        // Run creation refused a target homed elsewhere, but two Runs in
+        // different Environments admitted before either recorded a
+        // never-seen target both pass that check. Re-read each target's home
+        // from the recorded facts (routing, else newest input): the first Run
+        // to record a target homes it; a rival is refused here, nothing lands.
+        let targets: Vec<(String, String)> = inputs
+            .iter()
+            .map(|i| (i.target().source.clone(), i.target().id.clone()))
+            .collect();
+        let homes = crate::environment_governance::target_homes_on(&mut tx, org, &targets, false)
+            .await
+            .map_err(db_err)?;
+        let elsewhere = inputs.iter().find_map(|input| {
+            let target = input.target();
+            let home = homes
+                .iter()
+                .find(|h| h.source == target.source && h.id == target.id)?;
+            (home.environment != target.environment).then(|| {
+                scarab_engine::DeploymentTargetHomedElsewhere {
+                    environment: target.environment.clone(),
+                    target_source: target.source.clone(),
+                    target_id: target.id.clone(),
+                    home: home.environment.clone(),
+                }
+            })
+        });
+        if let Some(elsewhere) = elsewhere {
+            tx.rollback().await.map_err(db_err)?;
+            return Ok(scarab_engine::DeployStepFinish::TargetHomedElsewhere(
+                elsewhere,
+            ));
+        }
         for input in inputs {
             append_deployment_input(&mut tx, org, input, received_at.0)
                 .await
                 .map_err(|e| DbError::Other(e.to_string()))?;
         }
-        tx.commit().await.map_err(db_err)
+        tx.commit().await.map_err(db_err)?;
+        Ok(scarab_engine::DeployStepFinish::Recorded)
     }
 
     async fn set_attempt_outcome(
@@ -1768,20 +2064,7 @@ impl Db for PostgresDb {
         // observation. Setting `Superseded`/`Cancelled` itself is still fine (the
         // row is `running` at that point). `IS DISTINCT FROM` (not `NOT IN`) keeps
         // the nullable pre-outcome rows writable.
-        sqlx::query(
-            "UPDATE attempts SET outcome = $4
-             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3
-               AND outcome IS DISTINCT FROM 'superseded'
-               AND outcome IS DISTINCT FROM 'cancelled'",
-        )
-        .bind(&run.0)
-        .bind(&step.0)
-        .bind(&attempt.0)
-        .bind(outcome.as_str())
-        .execute(self.pool())
-        .await
-        .map_err(db_err)?;
-        Ok(())
+        update_attempt_outcome(self.pool(), run, step, attempt, outcome).await
     }
 
     async fn record_transition(
@@ -1794,22 +2077,36 @@ impl Db for PostgresDb {
         // `from`. Zero rows affected means a concurrent/duplicate writer already
         // moved it (e.g. a crashed worker re-driving) → Conflict, not a second
         // advance. This is the state-table guard behind exactly-once admission.
-        let affected = sqlx::query(
-            "UPDATE runs
-             SET status = $3, updated_at = (extract(epoch from now()) * 1000)::bigint
-             WHERE id = $1 AND status = $2",
-        )
-        .bind(&run.0)
-        .bind(run_status_str(from))
-        .bind(run_status_str(to))
-        .execute(self.pool())
-        .await
-        .map_err(db_err)?
-        .rows_affected();
-        if affected == 0 {
+        if !cas_run_status(self.pool(), run, from, to, None).await? {
             return Err(DbError::Conflict);
         }
         Ok(())
+    }
+
+    async fn commit_run_transition(
+        &self,
+        run: &RunId,
+        from: RunStatus,
+        to: RunStatus,
+        generation: u64,
+        events: &[EventKind],
+        outbox: &[OutboxMessage],
+    ) -> Result<(), DbError> {
+        // ONE transaction: the CAS takes the run row's lock first, so a
+        // competing CAS waits and then sees the committed status (Conflict).
+        // An early return drops `tx`, which rolls everything back.
+        let mut tx = self.pool().begin().await.map_err(db_err)?;
+        if !cas_run_status(&mut *tx, run, from, to, Some(generation)).await? {
+            tx.rollback().await.map_err(db_err)?;
+            return Err(DbError::Conflict);
+        }
+        for event in events {
+            insert_event(&mut *tx, event).await?;
+        }
+        for msg in outbox {
+            insert_outbox(&mut *tx, msg).await?;
+        }
+        tx.commit().await.map_err(db_err)
     }
 
     async fn append_event(&self, event: &EventKind) -> Result<(), DbError> {
@@ -1986,22 +2283,7 @@ impl Db for PostgresDb {
     }
 
     async fn enqueue_outbox(&self, msg: &OutboxMessage) -> Result<(), DbError> {
-        // Unique idempotency_key: a retried enqueue collapses to the existing
-        // row, so the logical effect is enqueued exactly once.
-        sqlx::query(
-            "INSERT INTO outbox (run_id, kind, payload, idempotency_key, created_at)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (idempotency_key) DO NOTHING",
-        )
-        .bind(&msg.run.0)
-        .bind(&msg.kind)
-        .bind(&msg.payload)
-        .bind(&msg.idempotency_key)
-        .bind(msg.at.0)
-        .execute(self.pool())
-        .await
-        .map_err(db_err)?;
-        Ok(())
+        insert_outbox(self.pool(), msg).await
     }
 
     async fn claim_outbox(
@@ -2064,6 +2346,20 @@ impl Db for PostgresDb {
         .await
         .map_err(db_err)?;
         Ok(())
+    }
+
+    async fn outbox_key_pending(&self, idempotency_key: &str) -> Result<bool, DbError> {
+        let pending: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM outbox
+                 WHERE idempotency_key = $1
+                   AND dispatched_at IS NULL AND dead_lettered_at IS NULL)",
+        )
+        .bind(idempotency_key)
+        .fetch_one(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(pending)
     }
 
     async fn record_outbox_failure(&self, id: OutboxId) -> Result<u32, DbError> {
@@ -2503,7 +2799,7 @@ impl ForgeConnectionStore for PostgresDb {
         Ok(())
     }
 
-    async fn bind_repo(
+    async fn upsert_repo_binding(
         &self,
         connection_id: &str,
         repo: &RepoRef,
@@ -3373,7 +3669,7 @@ fn failure_from_str(s: &str) -> Result<FailureKind, DbError> {
 
 /// [`PostgresDb::attempts`] on any executor — the pool, or an open
 /// transaction (the gate-wait writes read a step's Attempts under its row
-/// lock). Same order: start time, then the numeric id suffix.
+/// lock). Same order: the numeric id suffix alone.
 async fn attempts_on<'e, E: sqlx::PgExecutor<'e>>(
     exec: E,
     run: &RunId,
@@ -3383,39 +3679,41 @@ async fn attempts_on<'e, E: sqlx::PgExecutor<'e>>(
         "SELECT attempt_id, started_at, failure, failure_detail, outcome
          FROM attempts
          WHERE run_id = $1 AND step_id = $2
-         ORDER BY started_at, CAST(substring(attempt_id FROM 2) AS INTEGER)",
+         ORDER BY CAST(substring(attempt_id FROM 2) AS INTEGER)",
     )
     .bind(&run.0)
     .bind(&step.0)
     .fetch_all(exec)
     .await
     .map_err(db_err)?;
-    rows.into_iter()
-        .map(|r| {
-            let failure = r
-                .get::<Option<String>, _>("failure")
-                .map(|s| failure_from_str(&s))
-                .transpose()?;
-            // Back-compat derivation lives at this storage boundary — the
-            // only place the NULL `outcome` column is observed — so the
-            // in-memory `Attempt.outcome` is authoritative for every
-            // consumer. A pre-migration row (NULL outcome) derives `Failed`
-            // when a failure was recorded, else `Running`.
-            let outcome = match r.get::<Option<String>, _>("outcome") {
-                Some(s) => AttemptOutcome::from_str(&s)
-                    .ok_or_else(|| DbError::Other(format!("unknown attempt outcome {s:?}")))?,
-                None if failure.is_some() => AttemptOutcome::Failed,
-                None => AttemptOutcome::Running,
-            };
-            Ok(Attempt {
-                id: AttemptId(r.get::<String, _>("attempt_id")),
-                started_at: Timestamp(r.get::<i64, _>("started_at")),
-                failure,
-                failure_detail: r.get::<Option<String>, _>("failure_detail"),
-                outcome,
-            })
-        })
-        .collect()
+    rows.iter().map(attempt_from_row).collect()
+}
+
+/// One `attempts` row (`attempt_id, started_at, failure, failure_detail,
+/// outcome`) as an [`Attempt`].
+fn attempt_from_row(r: &sqlx::postgres::PgRow) -> Result<Attempt, DbError> {
+    let failure = r
+        .get::<Option<String>, _>("failure")
+        .map(|s| failure_from_str(&s))
+        .transpose()?;
+    // Back-compat derivation lives at this storage boundary — the only place
+    // the NULL `outcome` column is observed — so the in-memory
+    // `Attempt.outcome` is authoritative for every consumer. A pre-migration
+    // row (NULL outcome) derives `Failed` when a failure was recorded, else
+    // `Running`.
+    let outcome = match r.get::<Option<String>, _>("outcome") {
+        Some(s) => AttemptOutcome::from_str(&s)
+            .ok_or_else(|| DbError::Other(format!("unknown attempt outcome {s:?}")))?,
+        None if failure.is_some() => AttemptOutcome::Failed,
+        None => AttemptOutcome::Running,
+    };
+    Ok(Attempt {
+        id: AttemptId(r.get::<String, _>("attempt_id")),
+        started_at: Timestamp(r.get::<i64, _>("started_at")),
+        failure,
+        failure_detail: r.get::<Option<String>, _>("failure_detail"),
+        outcome,
+    })
 }
 
 /// SQL predicate: the `attempts` row is still in flight. A pre-migration row
@@ -3423,7 +3721,140 @@ async fn attempts_on<'e, E: sqlx::PgExecutor<'e>>(
 /// derivation [`attempts_on`] applies on read.
 const ATTEMPT_IS_RUNNING: &str = "(outcome = 'running' OR (outcome IS NULL AND failure IS NULL))";
 
+/// The guarded run-status CAS on any executor: `true` iff the row was in
+/// `from` and is now `to`. Zero rows means a concurrent/duplicate writer
+/// already moved it. Moving a run OUT of a terminal status (a reopen) bumps
+/// its `reopen_generation` in the same write ([`Db::run_reopen_generation`]).
+async fn cas_run_status<'e, E: sqlx::PgExecutor<'e>>(
+    exec: E,
+    run: &RunId,
+    from: RunStatus,
+    to: RunStatus,
+    generation: Option<u64>,
+) -> Result<bool, DbError> {
+    // `generation`, when given, is the reopen generation the caller read:
+    // a run reopened since (and back in `from`) is a miss, not an ABA hit.
+    let affected = sqlx::query(
+        "UPDATE runs
+         SET status = $3, updated_at = (extract(epoch from now()) * 1000)::bigint,
+             reopen_generation = reopen_generation + CASE WHEN $4 THEN 1 ELSE 0 END
+         WHERE id = $1 AND status = $2
+           AND ($5::BIGINT IS NULL OR reopen_generation = $5)",
+    )
+    .bind(&run.0)
+    .bind(run_status_str(from))
+    .bind(run_status_str(to))
+    .bind(from.is_terminal())
+    .bind(generation.map(|g| g as i64))
+    .execute(exec)
+    .await
+    .map_err(db_err)?
+    .rows_affected();
+    Ok(affected > 0)
+}
+
+/// Enqueue one outbox message on any executor. Unique idempotency_key: a
+/// retried enqueue collapses to the existing row, so the logical effect is
+/// enqueued exactly once.
+async fn insert_outbox<'e, E: sqlx::PgExecutor<'e>>(
+    exec: E,
+    msg: &OutboxMessage,
+) -> Result<(), DbError> {
+    sqlx::query(
+        "INSERT INTO outbox (run_id, kind, payload, idempotency_key, created_at)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (idempotency_key) DO NOTHING",
+    )
+    .bind(&msg.run.0)
+    .bind(&msg.kind)
+    .bind(&msg.payload)
+    .bind(&msg.idempotency_key)
+    .bind(msg.at.0)
+    .execute(exec)
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
 /// Append one event on any executor (the pool, or an open transaction).
+/// The guarded step-status CAS on any executor: `true` iff the row was in
+/// `from` and is now `to`.
+async fn cas_step_status<'e, E: sqlx::PgExecutor<'e>>(
+    exec: E,
+    run: &RunId,
+    step: &StepId,
+    from: StepStatus,
+    to: StepStatus,
+) -> Result<bool, DbError> {
+    let affected = sqlx::query(
+        "UPDATE step_runs
+         SET status = $4, updated_at = (extract(epoch from now()) * 1000)::bigint
+         WHERE run_id = $1 AND step_id = $2 AND status = $3",
+    )
+    .bind(&run.0)
+    .bind(&step.0)
+    .bind(step_status_str(from))
+    .bind(step_status_str(to))
+    .execute(exec)
+    .await
+    .map_err(db_err)?
+    .rows_affected();
+    Ok(affected > 0)
+}
+
+/// [`Db::set_attempt_outcome`] on any executor (see it for the
+/// terminal-by-intent guard).
+async fn update_attempt_outcome<'e, E: sqlx::PgExecutor<'e>>(
+    exec: E,
+    run: &RunId,
+    step: &StepId,
+    attempt: &AttemptId,
+    outcome: AttemptOutcome,
+) -> Result<(), DbError> {
+    sqlx::query(
+        "UPDATE attempts SET outcome = $4
+         WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3
+           AND outcome IS DISTINCT FROM 'superseded'
+           AND outcome IS DISTINCT FROM 'cancelled'",
+    )
+    .bind(&run.0)
+    .bind(&step.0)
+    .bind(&attempt.0)
+    .bind(outcome.as_str())
+    .execute(exec)
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
+/// [`Db::set_attempt_failure`] on any executor (see it for the guard and
+/// why failure, cause and outcome move together).
+async fn update_attempt_failure<'e, E: sqlx::PgExecutor<'e>>(
+    exec: E,
+    run: &RunId,
+    step: &StepId,
+    attempt: &AttemptId,
+    failure: FailureKind,
+    detail: Option<&str>,
+) -> Result<(), DbError> {
+    sqlx::query(
+        "UPDATE attempts SET failure = $4, failure_detail = $5, outcome = $6
+         WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3
+           AND outcome IS DISTINCT FROM 'superseded'
+           AND outcome IS DISTINCT FROM 'cancelled'",
+    )
+    .bind(&run.0)
+    .bind(&step.0)
+    .bind(&attempt.0)
+    .bind(failure_str(failure))
+    .bind(detail)
+    .bind(AttemptOutcome::Failed.as_str())
+    .execute(exec)
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
 async fn insert_event<'e, E: sqlx::PgExecutor<'e>>(
     exec: E,
     event: &EventKind,
@@ -3530,6 +3961,10 @@ fn db_err(e: sqlx::Error) -> DbError {
 
 // ---------------------------------------------------------------------------
 // SessionStore (ADR-0049 C1): server-side login sessions in Postgres.
+//
+// Keyed by `session_id_hash(id)`, never the id; `csrf` holds the CSRF token's
+// hash (migration 0064, git-bug 51d6bcb). A row read from the table rides no
+// session.
 // ---------------------------------------------------------------------------
 
 #[async_trait]
@@ -3541,17 +3976,21 @@ impl scarab_identity::SessionStore for PostgresDb {
         let principal = serde_json::to_value(&session.principal)
             .map_err(|e| scarab_identity::IdentityError::Issuance(e.to_string()))?;
         sqlx::query(
-            "INSERT INTO sessions (id, principal, csrf, expires_at)
-             VALUES ($1, $2, $3, $4)
+            "INSERT INTO sessions (id, principal, csrf, expires_at, created_at, login_kind)
+             VALUES ($1, $2, $3, $4, $5, $6)
              ON CONFLICT (id) DO UPDATE SET
                  principal = EXCLUDED.principal,
                  csrf = EXCLUDED.csrf,
-                 expires_at = EXCLUDED.expires_at",
+                 expires_at = EXCLUDED.expires_at,
+                 created_at = EXCLUDED.created_at,
+                 login_kind = EXCLUDED.login_kind",
         )
-        .bind(&session.id)
+        .bind(scarab_identity::session_id_hash(&session.id))
         .bind(&principal)
-        .bind(&session.csrf)
+        .bind(&session.csrf_hash)
         .bind(session.expires_at)
+        .bind(session.created_at)
+        .bind(&session.login_kind)
         .execute(self.pool())
         .await
         .map_err(|e| scarab_identity::IdentityError::Issuance(e.to_string()))?;
@@ -3562,8 +4001,10 @@ impl scarab_identity::SessionStore for PostgresDb {
         &self,
         id: &str,
     ) -> Result<Option<scarab_identity::Session>, scarab_identity::IdentityError> {
-        let row = sqlx::query("SELECT principal, csrf, expires_at FROM sessions WHERE id = $1")
-            .bind(id)
+        let row = sqlx::query(
+            "SELECT principal, csrf, expires_at, created_at, login_kind FROM sessions WHERE id = $1",
+        )
+        .bind(scarab_identity::session_id_hash(id))
             .fetch_optional(self.pool())
             .await
             .map_err(|e| scarab_identity::IdentityError::Issuance(e.to_string()))?;
@@ -3574,14 +4015,16 @@ impl scarab_identity::SessionStore for PostgresDb {
         Ok(Some(scarab_identity::Session {
             id: id.to_string(),
             principal,
-            csrf: row.get::<String, _>("csrf"),
+            csrf_hash: row.get::<String, _>("csrf"),
             expires_at: row.get::<i64, _>("expires_at"),
+            created_at: row.get::<i64, _>("created_at"),
+            login_kind: row.get::<String, _>("login_kind"),
         }))
     }
 
     async fn delete(&self, id: &str) -> Result<(), scarab_identity::IdentityError> {
         sqlx::query("DELETE FROM sessions WHERE id = $1")
-            .bind(id)
+            .bind(scarab_identity::session_id_hash(id))
             .execute(self.pool())
             .await
             .map_err(|e| scarab_identity::IdentityError::Issuance(e.to_string()))?;
@@ -3601,7 +4044,7 @@ fn scope_cols(scope: &scarab_identity::Scope) -> (&str, &str) {
     }
 }
 
-fn role_str(role: scarab_identity::Role) -> &'static str {
+pub(crate) fn role_str(role: scarab_identity::Role) -> &'static str {
     match role {
         scarab_identity::Role::Viewer => "viewer",
         scarab_identity::Role::Member => "member",
@@ -3610,7 +4053,7 @@ fn role_str(role: scarab_identity::Role) -> &'static str {
     }
 }
 
-fn role_from_str(s: &str) -> Option<scarab_identity::Role> {
+pub(crate) fn role_from_str(s: &str) -> Option<scarab_identity::Role> {
     Some(match s {
         "viewer" => scarab_identity::Role::Viewer,
         "member" => scarab_identity::Role::Member,
@@ -3620,7 +4063,7 @@ fn role_from_str(s: &str) -> Option<scarab_identity::Role> {
     })
 }
 
-fn identity_err(e: sqlx::Error) -> scarab_identity::IdentityError {
+pub(crate) fn identity_err(e: sqlx::Error) -> scarab_identity::IdentityError {
     scarab_identity::IdentityError::Issuance(e.to_string())
 }
 
@@ -3718,6 +4161,25 @@ impl scarab_identity::RbacStore for PostgresDb {
             .max())
     }
 
+    async fn max_role(
+        &self,
+        subject: &str,
+    ) -> Result<Option<scarab_identity::Role>, scarab_identity::IdentityError> {
+        // Every scope, tombstones excluded. The max is taken here, on the
+        // typed role, not in SQL: the column is text and its order is not
+        // the role order. An unreadable role grants nothing.
+        let rows =
+            sqlx::query("SELECT role FROM rbac_bindings WHERE subject = $1 AND role IS NOT NULL")
+                .bind(subject)
+                .fetch_all(self.pool())
+                .await
+                .map_err(identity_err)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| role_from_str(&r.get::<String, _>("role")))
+            .max())
+    }
+
     async fn bindings(
         &self,
         org: &str,
@@ -3751,6 +4213,18 @@ impl scarab_identity::RbacStore for PostgresDb {
                 })
             })
             .collect())
+    }
+
+    async fn orgs_of(&self, subject: &str) -> Result<Vec<String>, scarab_identity::IdentityError> {
+        // Tombstones (role NULL) are no membership.
+        sqlx::query_scalar(
+            "SELECT DISTINCT org FROM rbac_bindings
+             WHERE subject = $1 AND role IS NOT NULL ORDER BY org",
+        )
+        .bind(subject)
+        .fetch_all(self.pool())
+        .await
+        .map_err(identity_err)
     }
 
     async fn import_seeds(
@@ -4449,6 +4923,20 @@ impl scarab_identity::ApiTokenStore for PostgresDb {
             "SELECT {API_TOKEN_COLS} FROM api_tokens WHERE token_hash = $1"
         ))
         .bind(hash)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(identity_err)?;
+        Ok(row.as_ref().and_then(api_token_from_row))
+    }
+
+    async fn by_id(
+        &self,
+        id: &str,
+    ) -> Result<Option<scarab_identity::ApiToken>, scarab_identity::IdentityError> {
+        let row = sqlx::query(&format!(
+            "SELECT {API_TOKEN_COLS} FROM api_tokens WHERE id = $1"
+        ))
+        .bind(id)
         .fetch_optional(self.pool())
         .await
         .map_err(identity_err)?;

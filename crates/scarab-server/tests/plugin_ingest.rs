@@ -516,6 +516,38 @@ async fn only_a_first_party_plugin_pinned_by_digest_installs() {
     tdb.cleanup().await;
 }
 
+/// git-bug 97223c7: no plugin is installed into a `_`-prefixed org —
+/// those are Scarab's own credential scopes, not Orgs.
+#[tokio::test]
+async fn a_plugin_is_not_installed_into_a_reserved_org() {
+    let Some((tdb, pg)) = migrated().await else {
+        return;
+    };
+    let apps = apps(pg);
+    for org in ["_plugin_connections", "_forge"] {
+        let (status, body) = call(
+            &apps.public,
+            "POST",
+            &format!("/v1/orgs/{org}/plugins"),
+            None,
+            Some(json!({ "name": "argocd", "plugin": "argocd", "image": image() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{org}: {body}");
+        assert!(body.to_string().contains("reserved"), "{body}");
+        let (_, list) = call(
+            &apps.public,
+            "GET",
+            &format!("/v1/orgs/{org}/plugins"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(list, json!([]), "{org}");
+    }
+    tdb.cleanup().await;
+}
+
 /// F1 (c-min audit): an Environment source must name an installation in the
 /// same org; an uninstall takes its sources and retires its name.
 #[tokio::test]
@@ -964,5 +996,90 @@ async fn a_moved_target_shows_on_the_old_board_and_is_re_sent_to_the_new() {
     )
     .await;
     assert_eq!(flagged["targets"], json!([]), "cleared");
+    tdb.cleanup().await;
+}
+
+/// `state` with step-up ENFORCED (ADR-0073), over in-memory step-up stores.
+fn enforced(st: AppState) -> AppState {
+    st.with_step_up(scarab_server::step_up::StepUpService::new(
+        Arc::new(scarab_testkit::InMemoryPasskeys::new()),
+        Arc::new(scarab_testkit::InMemoryChallenges::new()),
+        Arc::new(scarab_testkit::InMemoryStepUp::new()),
+        Arc::new(scarab_testkit::InMemorySecurityEvents::new()),
+        Arc::new(scarab_secrets_postgres::PostgresSecrets::with_keys(
+            // The production sealer; a lazy pool never connects.
+            sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://unused@localhost/unused")
+                .unwrap(),
+            scarab_secrets_postgres::MasterKeySet::new(vec![[7u8; 32]]).unwrap(),
+        )),
+        scarab_webauthn::RelyingParty::from_public_url("https://ci.example.com", "Scarab").unwrap(),
+    ))
+}
+
+/// ADR-0073 C5: with step-up ENFORCED the plugin's broker calls are exactly
+/// as before — the CredentialBroker is its own listener, a PluginPrincipal
+/// never meets the step-up guard — while the very same state's public API
+/// does enforce it.
+#[tokio::test]
+async fn under_enforced_step_up_the_broker_is_unchanged() {
+    let Some((tdb, pg)) = migrated().await else {
+        return;
+    };
+    let off = state(pg, true);
+    let on = enforced(off.clone());
+    assert!(on.step_up.is_enforced());
+    // The public API of the enforced state refuses the crown jewel …
+    let (status, body) = call(
+        &router(on.clone()),
+        "POST",
+        "/v1/orgs/acme/plugins",
+        None,
+        Some(json!({ "name": "argocd-prod", "plugin": "argocd", "image": image() })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["code"], json!("step_up_required"));
+    // … so the admin side is set up with it off (it is not under test).
+    let apps = Apps {
+        public: router(off),
+        broker: broker::router(on),
+    };
+    let token = install(&apps.public, "acme", "argocd-prod").await;
+    list_source(&apps.public, "acme", "prod", "argocd-prod", "prod").await;
+
+    let (status, whoami) = call(
+        &apps.broker,
+        "GET",
+        "/_scarab/plugin/v1/whoami",
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{whoami}");
+    assert_eq!(whoami["principal"], json!("plugin:argocd-prod"));
+    let (status, results) = report(&apps, &token, vec![status_item("k1", 1, "v1")]).await;
+    assert_eq!(status, StatusCode::OK, "{results}");
+    assert_eq!(results["results"][0]["outcome"], json!("accepted"));
+    let (_, targets) = call(
+        &apps.broker,
+        "GET",
+        "/_scarab/plugin/v1/targets",
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(targets["targets"][0]["last_sequence"], json!(1));
+    let (status, healthz) = call(
+        &apps.broker,
+        "GET",
+        "/_scarab/plugin/v1/healthz",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{healthz}");
+    let (_, board) = call(&apps.public, "GET", "/v1/orgs/acme/board", None, None).await;
+    assert_eq!(board[0]["live"]["version"], json!("v1"), "{board}");
     tdb.cleanup().await;
 }

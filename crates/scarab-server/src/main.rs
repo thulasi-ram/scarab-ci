@@ -19,7 +19,7 @@ use scarab_db_postgres::PostgresDb;
 use scarab_engine::{Clock, Db, Executor};
 use scarab_executor_k8s::{K8sExecutor, PlacementConfig, ResultsEgress, WorkspaceFetch};
 use scarab_executor_local::LocalExecutor;
-use scarab_server::config::{Cli, Config, ExecutorKind, Role, StoreConfig};
+use scarab_server::config::{Cli, Config, ExecutorKind, Role, StepUpMode, StoreConfig};
 use scarab_server::{
     converged, router, AppState, LogService, SecretInjectingExecutor, SystemClock,
 };
@@ -108,6 +108,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::fs::write(path, scarab_server::openapi_json())?;
         println!("wrote OpenAPI document to {path}");
         return Ok(());
+    }
+
+    // Operator break-glass (ADR-0073 §10): straight at the database, before
+    // the config gate — it needs nothing but the database URL, and it never
+    // migrates. There is no route for this, and no `scarab` CLI command.
+    if let Some(scarab_server::config::ServerCommand::Admin {
+        command: scarab_server::config::AdminCommand::ResetPasskeys { principal, reason },
+    }) = &cli.command
+    {
+        let Some(url) = cli.database_url.as_deref() else {
+            eprintln!(
+                "scarab-server admin reset-passkeys: set --database-url or SCARAB_DATABASE_URL"
+            );
+            std::process::exit(2);
+        };
+        let pg = PostgresDb::connect(url).await?;
+        let operator = scarab_server::step_up::admin::OperatorInfo::current();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or_default();
+        match scarab_server::step_up::admin::reset_passkeys(
+            &pg,
+            principal,
+            reason.as_deref(),
+            &operator,
+            now,
+        )
+        .await
+        {
+            Ok(done) => {
+                println!(
+                    "break-glass: removed {} passkey(s) of `{}` and revoked {} standing \
+                     step-up confirmation(s); recorded as passkey.break_glass_reset \
+                     (host {}, user {}). Their next passkey needs a fresh browser login.",
+                    done.removed,
+                    done.subject,
+                    done.windows_revoked,
+                    operator.host,
+                    operator.os_user
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("scarab-server admin reset-passkeys: {e}");
+                std::process::exit(1);
+            }
+        }
     }
 
     // The startup gate: refuse to boot on invalid configuration, before any
@@ -331,7 +379,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             scarab_secrets_postgres::MasterKeySet::single(key)
         }
     };
-    let secrets: Arc<dyn scarab_secrets::SecretProvider> = {
+    // Kept concrete as well: the same KEK envelope seals pending step-up
+    // requests and derives the step-up digest key (ADR-0073 §5).
+    let pg_secrets: Arc<scarab_secrets_postgres::PostgresSecrets> = {
         let s = scarab_secrets_postgres::PostgresSecrets::connect(&database_url, master_keys)
             .await?;
         s.migrate().await?;
@@ -359,6 +409,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Arc::new(s)
     };
+    let secrets: Arc<dyn scarab_secrets::SecretProvider> = pg_secrets.clone();
 
     // Retention sweeper (ADR-0050): leader-gated, prunes terminal runs' log
     // blobs + index past the class TTL. Non-terminal (incl. gate-suspended)
@@ -393,6 +444,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }),
             // Plugin report receipts (ADR-0072 §11): a 7-day idempotency window.
             Some(pg.clone() as Arc<dyn scarab_plugin::PluginStore>),
+            // Step-up rows (ADR-0073): expired challenges and confirmations,
+            // settled requests after 30 days. Never the security event log.
+            Some((
+                pg.clone() as Arc<dyn scarab_identity::ChallengeStore>,
+                pg.clone() as Arc<dyn scarab_identity::StepUpStore>,
+            )),
             Duration::from_secs(300),
         );
         tracing::info!(
@@ -892,6 +949,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_api_tokens(pg.clone());
         tracing::info!(
             "authn: OAuth/OIDC login + PG sessions + scoped RBAC + issued API tokens wired (ADR-0049)"
+        );
+        // Step-up confirmation (ADR-0073): with a human to confirm (login
+        // wired) and the mode enforce, every crown jewel needs a passkey.
+        if config.step_up == StepUpMode::Enforce {
+            let rp = scarab_webauthn::RelyingParty::from_public_url(&config.public_url, "Scarab")
+                .map_err(|e| format!("SCARAB_PUBLIC_URL: {e}"))?;
+            state = state.with_step_up(scarab_server::step_up::StepUpService::new(
+                pg.clone(),
+                pg.clone(),
+                pg.clone(),
+                pg.clone(),
+                pg_secrets.clone(),
+                rp,
+            ));
+            // "step-up enforced; N admins have no passkey" (ADR-0073 §8):
+            // every Admin/Owner binding holder plus the Principals the
+            // bootstrap owners entries name, minus those holding a usable
+            // passkey. An entry that only matches a verified email is
+            // reported on its own line, never counted (git-bug 08d676d).
+            let mut admins = pg.admin_subjects().await.unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "step-up: could not list admins for the boot count");
+                Default::default()
+            });
+            let entries: Vec<String> = config
+                .oauth
+                .iter()
+                .flat_map(|p| p.owners.iter().cloned())
+                .collect();
+            let owners = scarab_server::step_up::resolve_owner_entries(
+                Some(pg.as_ref() as &dyn scarab_identity::IdentityStore),
+                &entries,
+            )
+            .await;
+            admins.extend(owners.principals);
+            let admins: Vec<String> = admins.into_iter().collect();
+            let without =
+                scarab_server::step_up::admins_without_passkey(pg.as_ref(), &admins)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "step-up: could not read passkeys for the boot count");
+                        admins.clone()
+                    })
+                    .len();
+            let line = scarab_server::step_up::step_up_boot_line(without);
+            tracing::info!("startup: {line}");
+            println!("startup: {line}");
+            if let Some(line) =
+                scarab_server::step_up::step_up_owner_matchers_line(owners.email_matchers.len())
+            {
+                tracing::info!("startup: {line}");
+                println!("startup: {line}");
+            }
+        }
+    }
+    // Fail-closed composition (ADR-0073 §8): outside the dev escape hatch,
+    // login wired means step-up wired. Config already refuses every other
+    // mode; this catches a future wiring slip — in release builds too.
+    scarab_server::step_up::check_step_up_composition(
+        config.dev_insecure,
+        !config.oauth.is_empty(),
+        state.step_up.is_enforced(),
+    )?;
+    if config.step_up == StepUpMode::Enforce && !state.step_up.is_enforced() {
+        tracing::warn!(
+            "step-up: SCARAB_STEP_UP=enforce but no login is configured; nothing is enforced"
         );
     }
     // OIDC issuer for keyless federation (ADR-0014): serve JWKS + discovery so a

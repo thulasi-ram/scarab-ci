@@ -402,11 +402,14 @@ async fn outbox_claim_and_poison_semantics(db: &dyn Db) {
 contract_test!(outbox_poison, outbox_claim_and_poison_semantics);
 
 // ---------------------------------------------------------------------------
-// 6. Attempt-ordering determinism: attempts list back ordered by started_at,
-//    tie-broken NUMERICALLY on the `a{n}` id suffix (so `a2` < `a10`), no
-//    matter the insertion order — the frontier (`.last()`) that anchors
+// 6. Attempt-ordering determinism: attempts list back ordered by the
+//    NUMERIC `a{n}` id suffix alone (so `a2` < `a10`), no matter the insertion
+//    order or the `started_at` stamps — the frontier (`.last()`) that anchors
 //    `?attempt=` reads and the settle-path guard must be stable and identical
-//    across stores.
+//    across stores. `started_at` is NOT an order key (git-bug 90d767d): a
+//    backwards clock skew across a leader failover stamps a retried `a2`
+//    earlier than `a1`, and a gate-wait Attempt is minted with a frozen,
+//    earlier `started_at` by design; either would make `a1` the frontier.
 // ---------------------------------------------------------------------------
 
 async fn attempts_list_in_stable_defined_order(db: &dyn Db) {
@@ -414,12 +417,13 @@ async fn attempts_list_in_stable_defined_order(db: &dyn Db) {
     let step = StepId("s".into());
     seed_run_and_step(db, &run, &step).await;
 
-    // Insert out of order; a1/a2/a10 tie on started_at (the FakeClock case).
+    // Insert out of order; a1/a2/a10 tie on started_at (the FakeClock case),
+    // a7 and a2 are stamped by a clock that went backwards.
     for a in [
         attempt("a10", 500),
         attempt("a1", 500),
-        attempt("a7", 100), // earlier start: must sort first despite the id
-        attempt("a2", 500),
+        attempt("a7", 100), // skewed-early start: still sorts by its id
+        attempt("a2", 400), // a retried a2 on a lagging leader's clock
     ] {
         db.record_attempt(&run, &step, &a).await.unwrap();
     }
@@ -433,15 +437,331 @@ async fn attempts_list_in_stable_defined_order(db: &dyn Db) {
         .collect();
     assert_eq!(
         ids,
-        vec!["a7", "a1", "a2", "a10"],
-        "attempts must order by started_at, then numeric id suffix"
+        vec!["a1", "a2", "a7", "a10"],
+        "attempts must order by the numeric id suffix alone"
     );
 
     // The same order must come back through the DAG snapshot read.
     let steps = db.steps_of_run(&run).await.unwrap();
     let snapshot_ids: Vec<String> = steps[0].attempts.iter().map(|a| a.id.0.clone()).collect();
-    assert_eq!(snapshot_ids, vec!["a7", "a1", "a2", "a10"]);
+    assert_eq!(snapshot_ids, vec!["a1", "a2", "a7", "a10"]);
 }
 
 contract_test!(attempt_ordering, attempts_list_in_stable_defined_order);
 
+
+// ---------------------------------------------------------------------------
+// 7. Launch-time workspace input steps (git-bug b6b8510): an attempt's
+//    ordered root→step list round-trips in order, is absent (`None`) until
+//    stamped, and a re-driven launch's write replaces the earlier one.
+// ---------------------------------------------------------------------------
+
+async fn attempt_workspace_input_steps_round_trip(db: &dyn Db) {
+    let run = RunId("wis-run".into());
+    let step = StepId("e".into());
+    seed_run_and_step(db, &run, &step).await;
+    let a1 = AttemptId("a1".into());
+    db.record_attempt(&run, &step, &attempt("a1", 100))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        db.attempt_workspace_input_steps(&run, &step, &a1)
+            .await
+            .unwrap(),
+        None,
+        "nothing stamped yet"
+    );
+    let ids = |v: &[&str]| v.iter().map(|s| StepId((*s).into())).collect::<Vec<_>>();
+    db.set_attempt_workspace_input_steps(&run, &step, &a1, &ids(&["c", "b"]))
+        .await
+        .unwrap();
+    db.set_attempt_workspace_input_steps(&run, &step, &a1, &ids(&["c", "a", "b"]))
+        .await
+        .unwrap();
+    assert_eq!(
+        db.attempt_workspace_input_steps(&run, &step, &a1)
+            .await
+            .unwrap(),
+        Some(ids(&["c", "a", "b"])),
+        "declared order kept; the last launch's write wins"
+    );
+}
+
+contract_test!(
+    attempt_workspace_input_steps,
+    attempt_workspace_input_steps_round_trip
+);
+
+// ---------------------------------------------------------------------------
+// Results ingest (ADR-0042; review safety S1): externally POSTed results land
+// only on the step's RUNNING FRONTIER attempt; a superseded attempt's, or a
+// late one after the step settled, is a Conflict that writes nothing.
+// ---------------------------------------------------------------------------
+
+async fn ingested_results_land_only_on_the_running_frontier(db: &dyn Db) {
+    let (run, step) = (RunId("r-ingest".into()), StepId("s".into()));
+    seed_run_and_step(db, &run, &step).await;
+    let results =
+        |v: &str| std::collections::BTreeMap::from([("v".to_string(), serde_json::json!(v))]);
+    let (a1, a2) = (AttemptId("a1".into()), AttemptId("a2".into()));
+    db.record_attempt(&run, &step, &attempt("a1", 1))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            db.ingest_attempt_results(&run, &step, &a1, &results("pending"))
+                .await,
+            Err(DbError::Conflict)
+        ),
+        "not running yet"
+    );
+    db.record_step_transition(&run, &step, StepStatus::Pending, StepStatus::Running)
+        .await
+        .unwrap();
+    db.record_attempt(&run, &step, &attempt("a2", 2))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            db.ingest_attempt_results(&run, &step, &a1, &results("stale"))
+                .await,
+            Err(DbError::Conflict)
+        ),
+        "a1 is not the frontier"
+    );
+    db.ingest_attempt_results(&run, &step, &a2, &results("a2"))
+        .await
+        .unwrap();
+    assert_eq!(
+        db.attempt_results(&run, &step, &a2).await.unwrap(),
+        results("a2")
+    );
+    db.record_step_transition(&run, &step, StepStatus::Running, StepStatus::Succeeded)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            db.ingest_attempt_results(&run, &step, &a2, &results("late"))
+                .await,
+            Err(DbError::Conflict)
+        ),
+        "the step settled"
+    );
+    assert_eq!(db.step_results(&run, &step).await.unwrap(), results("a2"));
+    assert!(db
+        .attempt_results(&run, &step, &a1)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+contract_test!(
+    ingest_attempt_results_frontier,
+    ingested_results_land_only_on_the_running_frontier
+);
+
+// ---------------------------------------------------------------------------
+// Batched step read (review fit-F8): `steps_of_runs` is `steps_of_run` for a
+// whole page — the same steps, statuses, needs, gate kinds and attempt order
+// per run — with a run that has no steps (or is unknown) absent.
+// ---------------------------------------------------------------------------
+
+async fn steps_of_runs_is_steps_of_run_per_run(db: &dyn Db) {
+    let (r1, r2, empty) = (
+        RunId("r-batch-1".into()),
+        RunId("r-batch-2".into()),
+        RunId("r-batch-empty".into()),
+    );
+    for run in [&r1, &r2] {
+        db.create_run(run, 1, 1, Timestamp(0)).await.unwrap();
+        let (build, gate) = (StepId("build".into()), StepId("gate".into()));
+        db.create_step_run(run, &build, None, &[], Timestamp(0))
+            .await
+            .unwrap();
+        db.create_step_run(run, &gate, None, std::slice::from_ref(&build), Timestamp(0))
+            .await
+            .unwrap();
+        db.set_step_gate(run, &gate, "manual", None).await.unwrap();
+        db.record_step_transition(run, &build, StepStatus::Pending, StepStatus::Running)
+            .await
+            .unwrap();
+        // Out of insertion order, and `a10` after `a2` numerically.
+        for (id, at) in [("a10", 10), ("a1", 1), ("a2", 2)] {
+            db.record_attempt(run, &build, &attempt(id, at))
+                .await
+                .unwrap();
+        }
+    }
+    db.create_run(&empty, 1, 1, Timestamp(0)).await.unwrap();
+
+    let batched = db
+        .steps_of_runs(&[
+            r1.clone(),
+            r2.clone(),
+            empty.clone(),
+            RunId("r-batch-unknown".into()),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(batched.len(), 2, "only runs with steps");
+    for run in [&r1, &r2] {
+        assert_eq!(
+            format!("{:?}", batched[run]),
+            format!("{:?}", db.steps_of_run(run).await.unwrap()),
+            "{} batched like steps_of_run",
+            run.0
+        );
+    }
+    let ids: Vec<&str> = batched[&r1][0]
+        .attempts
+        .iter()
+        .map(|a| a.id.0.as_str())
+        .collect();
+    assert_eq!(ids, ["a1", "a2", "a10"]);
+    assert!(db.steps_of_runs(&[]).await.unwrap().is_empty());
+}
+
+contract_test!(steps_of_runs_batched, steps_of_runs_is_steps_of_run_per_run);
+
+// ---------------------------------------------------------------------------
+// Red team R2-E3: a transition that acts on a step's in-flight attempt names
+// it (`AttemptFrontier`), and a run transition names the reopen generation
+// its caller read — so a step or run that went round (cancelled, rerun,
+// back in the same status) between the read and the commit is a Conflict
+// with nothing written, never an ABA hit on the stale attempt/generation.
+// ---------------------------------------------------------------------------
+
+async fn transitions_are_guarded_by_frontier_and_generation(db: &dyn Db) {
+    use scarab_engine::{AttemptFrontier, AttemptStamp};
+    let run = RunId("aba-run".into());
+    let step = StepId("s".into());
+    seed_run_and_step(db, &run, &step).await;
+    db.record_step_transition(&run, &step, StepStatus::Pending, StepStatus::Running)
+        .await
+        .unwrap();
+    let (a1, a2, a10) = (
+        AttemptId("a1".into()),
+        AttemptId("a2".into()),
+        AttemptId("a10".into()),
+    );
+    db.record_attempt(&run, &step, &attempt("a1", 1))
+        .await
+        .unwrap();
+    let cancelled = AttemptStamp::Outcome(AttemptOutcome::Cancelled);
+    let to_cancelled = |frontier, stamp| {
+        db.commit_step_transition(
+            &run,
+            &step,
+            StepStatus::Running,
+            StepStatus::Cancelled,
+            frontier,
+            stamp,
+            &[],
+            &[],
+        )
+    };
+    // A frontier that names no attempt, or the wrong one, conflicts.
+    assert!(matches!(
+        to_cancelled(AttemptFrontier::Is(None), None).await,
+        Err(DbError::Conflict)
+    ));
+    // a2 minted after the read of a1: the read's frontier is stale.
+    db.record_attempt(&run, &step, &attempt("a2", 2))
+        .await
+        .unwrap();
+    assert!(matches!(
+        to_cancelled(AttemptFrontier::Is(Some(&a1)), Some((&a1, &cancelled))).await,
+        Err(DbError::Conflict)
+    ));
+    // Nothing of the loser landed: still Running, a1 unstamped.
+    let s = &db.steps_of_run(&run).await.unwrap()[0];
+    assert_eq!(s.status, StepStatus::Running);
+    assert_eq!(s.attempts[0].outcome, AttemptOutcome::Running);
+    // Latest by mint ORDER, numerically: a10 outranks a2.
+    db.record_attempt(&run, &step, &attempt("a10", 3))
+        .await
+        .unwrap();
+    assert!(matches!(
+        to_cancelled(AttemptFrontier::Is(Some(&a2)), None).await,
+        Err(DbError::Conflict)
+    ));
+    to_cancelled(AttemptFrontier::Is(Some(&a10)), Some((&a10, &cancelled)))
+        .await
+        .unwrap();
+    let s = &db.steps_of_run(&run).await.unwrap()[0];
+    assert_eq!(s.status, StepStatus::Cancelled);
+    assert_eq!(
+        s.attempts.last().map(|a| (&a.id, a.outcome)),
+        Some((&a10, AttemptOutcome::Cancelled))
+    );
+
+    // Run grain: the generation the caller read.
+    let run_to =
+        |from, to, generation| db.commit_run_transition(&run, from, to, generation, &[], &[]);
+    run_to(RunStatus::Pending, RunStatus::Running, 0)
+        .await
+        .unwrap();
+    run_to(RunStatus::Running, RunStatus::Cancelled, 0)
+        .await
+        .unwrap();
+    // The reopen bumps the generation…
+    run_to(RunStatus::Cancelled, RunStatus::Running, 0)
+        .await
+        .unwrap();
+    assert_eq!(db.run_reopen_generation(&run).await.unwrap(), 1);
+    // …so a writer that read generation 0 conflicts, though the status
+    // matches again (ABA), and nothing changes.
+    assert!(matches!(
+        run_to(RunStatus::Running, RunStatus::Cancelled, 0).await,
+        Err(DbError::Conflict)
+    ));
+    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Running));
+    run_to(RunStatus::Running, RunStatus::Cancelled, 1)
+        .await
+        .unwrap();
+}
+
+contract_test!(
+    transitions_guarded_by_frontier_and_generation,
+    transitions_are_guarded_by_frontier_and_generation
+);
+
+// ---------------------------------------------------------------------------
+// `outbox_key_pending`: an intent exists and is neither dispatched nor
+// dead-lettered — what an attempt teardown asks of a `launch:` intent before
+// it calls an attempt with no handle gone.
+// ---------------------------------------------------------------------------
+
+async fn outbox_key_pending_is_neither_dispatched_nor_dead(db: &dyn Db) {
+    let run = RunId("pending-run".into());
+    db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+    assert!(!db.outbox_key_pending("k-absent").await.unwrap());
+    for key in ["k-done", "k-dead"] {
+        db.enqueue_outbox(&msg(&run, "kind-p", key)).await.unwrap();
+        assert!(db.outbox_key_pending(key).await.unwrap(), "{key}");
+    }
+    let claimed = db
+        .claim_outbox("o", Some("kind-p"), 10, 60_000)
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 2);
+    assert!(
+        db.outbox_key_pending("k-done").await.unwrap(),
+        "claimed is still pending"
+    );
+    for m in claimed {
+        if m.idempotency_key == "k-done" {
+            db.mark_dispatched(m.id).await.unwrap();
+        } else {
+            db.dead_letter_outbox(m.id).await.unwrap();
+        }
+    }
+    assert!(!db.outbox_key_pending("k-done").await.unwrap());
+    assert!(!db.outbox_key_pending("k-dead").await.unwrap());
+}
+
+contract_test!(
+    outbox_key_pending_contract,
+    outbox_key_pending_is_neither_dispatched_nor_dead
+);

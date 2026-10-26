@@ -203,12 +203,15 @@ jobs:
       # once here dodges Docker Hub anonymous-pull throttling on the kubelet.
       # busybox:1.36 as well as :latest — the egress/helper container is pinned
       # to :1.36 (ADR-0039: :latest defaults to root and the kubelet refuses it).
+      # postgres:16 is the uid-pinned service sidecar case's image (git-bug
+      # 908f534); the job's own Postgres service already pulled it.
       - name: Load step images into kind
         run: |
           docker pull busybox:latest
           docker pull busybox:1.36
+          docker pull postgres:16
           kind load docker-image --name scarab-ci \
-            "$CLONE_IMAGE" "$SIDECAR_IMAGE" "$WSFETCH_IMAGE" busybox:latest busybox:1.36
+            "$CLONE_IMAGE" "$SIDECAR_IMAGE" "$WSFETCH_IMAGE" busybox:latest busybox:1.36 postgres:16
 
       # The `kind: build` live test pushes to an in-cluster plain-HTTP registry
       # (SCARAB_TEST_REGISTRY) and verifies its tag list from a Pod.

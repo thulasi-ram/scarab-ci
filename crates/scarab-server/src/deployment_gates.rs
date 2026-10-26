@@ -13,8 +13,26 @@
 //! 2. the Environment's log, folded ([`scarab_deployment::fold_ledger`]);
 //! 3. the Deployment the requester's current request landed on
 //!    ([`DeploymentLedger::request_of`](scarab_deployment::DeploymentLedger::request_of)),
-//!    and its verdict with the gate Attempt's start as the window floor
-//!    ([`Deployment::gate_decision_from`](scarab_deployment::Deployment::gate_decision_from)).
+//!    and its verdict over a window that opens
+//!    ([`DeploymentGateWait::window_floor`]):
+//!    - for the gate's **first wait** on the request, at the start of the
+//!      deploy Step's Attempt that **succeeded** and recorded the request, so
+//!      a report received while that Attempt still ran counts. For a deploy
+//!      Step that was not retried that is the request's own mark — its
+//!      effective time — and the window is unfloored
+//!      ([`Deployment::gate_decision`](scarab_deployment::Deployment::gate_decision));
+//!      for a retried one it is a floor later than the effective time
+//!      ([`Deployment::gate_decision_from`](scarab_deployment::Deployment::gate_decision_from)),
+//!      so neither a report received while an earlier, failed Attempt ran nor
+//!      the time the operator took to Retry decides the gate. The effective
+//!      time itself — the first Attempt in the Take — is attribution only
+//!      (INV-DEP-11): it explains the Deployment, it does not open the gate;
+//!    - for a wait that waits afresh (a Retry after a verdict on the same
+//!      request), at the gate Attempt's own start (a floor).
+//!
+//!    Either way no verdict is reached for an instant before the gate
+//!    Attempt's own start, and a `stalled` reason names the start its
+//!    deadline ran from.
 //!
 //! **Per tick.** Both reads are cached per tick ([`ServerDeploymentGates::for_tick`]):
 //! every waiting gate on one Environment shares one fold, instead of each
@@ -33,8 +51,8 @@
 //! **Errors** are logged here and returned, and the engine takes no decision
 //! that tick (plan Q6): one unreadable row must not dead-letter every Deploy
 //! Run waiting in its Environment — but only until the deadline. A record
-//! that still cannot be read once the deadline has elapsed since the window
-//! start fails the gate `stalled`, the read error in the reason, so the
+//! that still cannot be read once the deadline has elapsed since the gate
+//! Attempt's start fails the gate `stalled`, the read error in the reason, so the
 //! deadline bounds the wait even with no `gate_expires_after`. An error
 //! reading the deadline itself (governance store, deploy context) stays no
 //! decision.
@@ -50,20 +68,24 @@
 //! same tick must be counted. An error holds the Step (fail closed). A Run
 //! counted only through DeploymentGates that are not yet reached stops
 //! counting once the Environment's baseline deadline has elapsed since its
-//! request's effective time — the moment its Deployment reads `stalled` on
-//! the record — so opposite-order holds cannot deadlock two Runs (R3).
+//! requesting Step's **latest Attempt** started (`MAX(started_at)`: the
+//! Attempt that succeeded, where a first wait of its gates opens — not the
+//! request's effective time, which can be earlier after a retry), so
+//! opposite-order holds cannot deadlock two Runs (R3). A first wait's
+//! deadline, never longer than the baseline, runs from that same start, so a
+//! reached gate is decided no later than the cutoff.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use scarab_deployment::{
-    fold_ledger, DeploymentGateFailure, DeploymentGateVerdict, DeploymentRequester,
+    fold_ledger, Deployment, DeploymentGateFailure, DeploymentGateVerdict, DeploymentRequester,
     DeploymentStore, DeploymentTarget, FoldedLedger, Millis, DEFAULT_DEPLOYMENT_DEADLINE_MS,
 };
 use scarab_engine::{
-    Db, DeploymentConcurrencyHold, DeploymentGateDecision, DeploymentGates, RunDeploymentRequest,
-    RunId, StepId, Timestamp,
+    Db, DeploymentConcurrencyHold, DeploymentGateDecision, DeploymentGateWait, DeploymentGates,
+    RunDeploymentRequest, RunId, StepId, Timestamp,
 };
 use scarab_project::EnvironmentGovernanceStore;
 
@@ -238,7 +260,7 @@ impl ServerDeploymentGates {
     /// The first target at its limit, in request order. A Run counted
     /// through only unreached DeploymentGates stops counting once the
     /// Environment's baseline deadline has elapsed by `now` since its
-    /// request's effective time (the cutoff `now − baseline`).
+    /// requesting Step's latest Attempt started (the cutoff `now − baseline`).
     async fn concurrency_hold(
         &self,
         run: &RunId,
@@ -314,14 +336,17 @@ impl ServerDeploymentGates {
         self.concurrency_hold(run, &requests, now).await
     }
 
-    async fn decide(
+    /// The deadline `run`'s DeploymentGates on `request` use: its Project's
+    /// effective `deployment_gate_deadline` in the request's Environment, or
+    /// the default for a Run with no deploy context. The one value the
+    /// verdict ([`DeploymentGates::deployment_gate_verdict`]) and the run
+    /// view's `fails_at` are both computed from (git-bug `ec84c5d`).
+    pub async fn run_gate_deadline(
         &self,
         run: &RunId,
         request: &RunDeploymentRequest,
-        window_floor: Timestamp,
-        now: Timestamp,
-    ) -> Result<Option<DeploymentGateDecision>, String> {
-        let deadline = match self
+    ) -> Result<Millis, String> {
+        match self
             .db
             .run_deploy_context(run)
             .await
@@ -329,7 +354,7 @@ impl ServerDeploymentGates {
         {
             Some(ctx) => {
                 self.gate_deadline(&request.org, &ctx.project, &request.environment)
-                    .await?
+                    .await
             }
             None => {
                 // A Run with a DeploymentRequest is a Deploy Run, which has a
@@ -338,16 +363,26 @@ impl ServerDeploymentGates {
                     run = %run.0,
                     "deployment gate on a run with no deploy context; using the default deadline"
                 );
-                DEFAULT_DEPLOYMENT_DEADLINE_MS
+                Ok(DEFAULT_DEPLOYMENT_DEADLINE_MS)
             }
-        };
+        }
+    }
+
+    async fn decide(
+        &self,
+        run: &RunId,
+        request: &RunDeploymentRequest,
+        wait: DeploymentGateWait,
+        now: Timestamp,
+    ) -> Result<Option<DeploymentGateDecision>, String> {
+        let deadline = self.run_gate_deadline(run, request).await?;
         let tick_now = now;
         let (mut cached, mut from_cache) = match self
             .fold(&request.org, &request.environment, tick_now.0)
             .await
         {
             Ok(fold) => fold,
-            Err(e) => return unreadable_record(e, window_floor, tick_now, deadline),
+            Err(e) => return unreadable_record(e, wait.started_at, tick_now, deadline),
         };
         let target = DeploymentTarget {
             environment: request.environment.clone(),
@@ -360,8 +395,9 @@ impl ServerDeploymentGates {
         };
         let deployment = loop {
             let now = tick_now.0.min(cached.read_now);
-            if now < window_floor.0 {
-                // The fold predates the window: it cannot speak for it yet.
+            if now < wait.started_at.0 {
+                // The fold predates the gate's Attempt: it cannot speak for
+                // the wait yet (no verdict before the Attempt exists).
                 return Ok(None);
             }
             if let Some(deployment) = cached.folded.ledger().request_of(&requester, &target) {
@@ -377,7 +413,7 @@ impl ServerDeploymentGates {
                     .await
                 {
                     Ok(fresh) => fresh,
-                    Err(e) => return unreadable_record(e, window_floor, tick_now, deadline),
+                    Err(e) => return unreadable_record(e, wait.started_at, tick_now, deadline),
                 };
                 from_cache = false;
                 continue;
@@ -401,9 +437,25 @@ impl ServerDeploymentGates {
         };
         let now = tick_now.0.min(cached.read_now);
         let ledger = cached.folded.ledger();
-        let Some(decision) =
-            deployment.gate_decision_from(&requester, window_floor.0, now, deadline)
-        else {
+        // Where the window opens (ADR-0070 §8): a first wait at the deploy
+        // Step's succeeding Attempt — a floor only when that is later than
+        // the request's effective time (a retried deploy Step) — a wait that
+        // waits afresh at its own Attempt's start. `request_of` found the
+        // requester here, so its mark is present.
+        let floor = DeploymentGateWindow::verdict_floor(deployment, &requester, &wait);
+        let decision = match floor {
+            Some(floor) => deployment.gate_decision_from(&requester, floor.0, now, deadline),
+            None => deployment.gate_decision(&requester, now, deadline),
+        };
+        // What a `stalled` deadline ran from, named in its reason.
+        let window_from = if wait.afresh {
+            "this gate attempt starting".to_string()
+        } else if floor.is_some() {
+            format!("step `{}`'s succeeding attempt starting", request.step.0)
+        } else {
+            format!("step `{}` starting", request.step.0)
+        };
+        let Some(decision) = decision else {
             return Ok(None);
         };
         let on = format!("`{}`/`{}`", request.target_source, request.target_id);
@@ -445,7 +497,10 @@ impl ServerDeploymentGates {
                 ..
             } => (
                 false,
-                format!("stalled: not live within {}", deadline_text(deadline)),
+                format!(
+                    "stalled: not live within {} of {window_from}",
+                    deadline_text(deadline)
+                ),
             ),
         };
         Ok(Some(DeploymentGateDecision {
@@ -456,28 +511,91 @@ impl ServerDeploymentGates {
     }
 }
 
+/// Where a DeploymentGate's wait on a Deployment opens (ADR-0070 §8) — the
+/// one computation the verdict and the run view's `fails_at` share
+/// (git-bug `ec84c5d`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeploymentGateWindow {
+    /// The window floor, when the wait has one
+    /// ([`DeploymentGateWait::window_floor`]).
+    pub floor: Option<Timestamp>,
+    /// The instant the window opens: the later of the request's effective
+    /// time and the floor. The stall deadline runs from it.
+    pub opens_at: Millis,
+}
+
+impl DeploymentGateWindow {
+    /// The window of `wait` on `deployment`'s request from `requester`;
+    /// `None` when that requester's request did not land on `deployment` —
+    /// then there is no mark to measure a `fails_at` from, and none is shown
+    /// (the verdict floors itself at [`verdict_floor`](Self::verdict_floor)).
+    pub fn of(
+        deployment: &Deployment,
+        requester: &DeploymentRequester,
+        wait: &DeploymentGateWait,
+    ) -> Option<Self> {
+        let effective_at = deployment.requesters.get(requester)?.effective_at;
+        let floor = wait.window_floor(Timestamp(effective_at));
+        Some(Self {
+            floor,
+            opens_at: floor.map_or(effective_at, |f| f.0.max(effective_at)),
+        })
+    }
+
+    /// The floor the verdict decides from: the window's
+    /// ([`DeploymentGateWait::window_floor`]) — or, should the requester's
+    /// mark be absent from `deployment` (an invariant `request_of` is meant
+    /// to guarantee), the gate Attempt's own start (review safety S10). That
+    /// fails CLOSED: the narrowest window there is, so pre-retry evidence can
+    /// never decide an afresh wait, and an unknown mark never widens a window
+    /// a known one would have floored.
+    pub fn verdict_floor(
+        deployment: &Deployment,
+        requester: &DeploymentRequester,
+        wait: &DeploymentGateWait,
+    ) -> Option<Timestamp> {
+        match Self::of(deployment, requester, wait) {
+            Some(window) => window.floor,
+            None => Some(wait.started_at),
+        }
+    }
+
+    /// When the gate fails `stalled` if nothing decisive arrives first: the
+    /// window's opening plus the gate's `deadline`
+    /// ([`ServerDeploymentGates::run_gate_deadline`]) — the instant
+    /// [`Deployment::gate_decision_from`] stalls at.
+    pub fn fails_at(&self, deadline: Millis) -> Millis {
+        self.opens_at.saturating_add(deadline)
+    }
+}
+
 /// The Deployment record could not be read (the fold errored) — judge Q6 as
 /// amended: **no decision** (`Err`, logged by the caller) while the deadline
-/// has not elapsed since the window start; at or after it, the gate fails
+/// has not elapsed since the gate Attempt's start; at or after it, the gate fails
 /// `stalled` with the read error in the reason, so a persistent read error
 /// can never make the wait unbounded (criterion 2's deadline clause).
 ///
-/// The window start here is `window_floor`: the window opens at
-/// max(request effective_at, Attempt start), and the request's effective_at
-/// is the deploy Step Attempt's start, which precedes that Step's success,
-/// which is at or before this gate Attempt's start (`window_floor`). So the
-/// max is `window_floor` — known without the record.
+/// The deadline here runs from the gate Attempt's start (`wait_started`),
+/// the one window start known without the record. It is the window start of
+/// a wait that waits afresh (max(request effective_at, Attempt start), and the
+/// effective_at — the deploy Step's first Attempt start in its Take — precedes that Step's
+/// success, which is at or before the gate Attempt's start). A first wait's
+/// window opens earlier, at the start of the deploy Step's succeeding
+/// Attempt (itself before that success), so measured from the gate
+/// Attempt's start this stall comes no sooner than the record's would: an
+/// unreadable record never fails a gate earlier than a readable one.
 fn unreadable_record(
     error: String,
-    window_floor: Timestamp,
+    wait_started: Timestamp,
     now: Timestamp,
     deadline: Millis,
 ) -> Result<Option<DeploymentGateDecision>, String> {
-    if now.0 >= window_floor.0.saturating_add(deadline) {
+    if now.0 >= wait_started.0.saturating_add(deadline) {
         return Ok(Some(DeploymentGateDecision {
             passed: false,
             reason: format!(
-                "stalled: not live within {} (the Deployment record could not be read: {error})",
+                "stalled: not live within {} of this gate attempt starting (the Deployment \
+                 record could not be read: {error})",
                 deadline_text(deadline)
             ),
             deployment: None,
@@ -503,10 +621,10 @@ impl DeploymentGates for ServerDeploymentGates {
         run: &RunId,
         gate: &StepId,
         request: &RunDeploymentRequest,
-        window_floor: Timestamp,
+        wait: DeploymentGateWait,
         now: Timestamp,
     ) -> Result<Option<DeploymentGateDecision>, String> {
-        let res = self.decide(run, request, window_floor, now).await;
+        let res = self.decide(run, request, wait, now).await;
         if let Err(e) = &res {
             tracing::warn!(
                 run = %run.0, gate = %gate.0, error = %e,
@@ -537,6 +655,60 @@ impl DeploymentGates for ServerDeploymentGates {
 #[cfg(test)]
 mod tests {
     use super::deadline_text;
+    use super::DeploymentGateWindow;
+    use scarab_deployment::{
+        DeploymentInput, DeploymentLedger, DeploymentRequester, DeploymentTarget, DeploymentVersion,
+    };
+    use scarab_engine::ports::DeploymentGateWait;
+    use scarab_engine::Timestamp;
+
+    /// Review safety S10: with the requester's mark absent from the
+    /// Deployment (an invariant `request_of` is meant to guarantee), the
+    /// window must fail CLOSED — a wait that waits afresh keeps its own
+    /// Attempt's start as the floor, so pre-retry evidence can never decide
+    /// it — and no `fails_at` is claimed (there is no mark to measure from).
+    #[test]
+    fn a_window_without_the_requester_mark_fails_closed() {
+        let target = DeploymentTarget {
+            environment: "prod".into(),
+            source: "argocd".into(),
+            id: "web".into(),
+        };
+        let mut ledger = DeploymentLedger::new();
+        ledger.apply(DeploymentInput::Request {
+            target,
+            version: DeploymentVersion("v1".into()),
+            requester: DeploymentRequester {
+                run: "other".into(),
+                step: "bump".into(),
+            },
+            effective_at: 1_000,
+            at: 2_000,
+            evidence: Vec::new(),
+        });
+        let deployment = &ledger.deployments()[0];
+        let absent = DeploymentRequester {
+            run: "r1".into(),
+            step: "bump".into(),
+        };
+        for (afresh, deploy_attempt) in [(true, None), (false, Some(Timestamp(3_000)))] {
+            let wait = DeploymentGateWait {
+                started_at: Timestamp(5_000),
+                afresh,
+                deploy_attempt_started_at: deploy_attempt,
+            };
+            assert_eq!(
+                DeploymentGateWindow::verdict_floor(deployment, &absent, &wait),
+                Some(Timestamp(5_000)),
+                "afresh {afresh}: no evidence before this gate Attempt counts"
+            );
+            assert_eq!(
+                DeploymentGateWindow::of(deployment, &absent, &wait),
+                None,
+                "no fails_at"
+            );
+        }
+    }
 
     #[test]
     fn a_deadline_reads_in_seconds_when_whole() {

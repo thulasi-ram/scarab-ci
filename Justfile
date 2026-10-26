@@ -325,8 +325,10 @@ e2e:
     # code, and surface the server log first on a red run (down.sh removes it).
     trap 'code=$?; if [ "$code" -ne 0 ]; then echo "==> scarab-server log (suite failed):"; tail -n 200 deploy/local-proc/server.log 2>/dev/null || true; fi; bash deploy/local-proc/down.sh; exit "$code"' EXIT
     cargo build -p scarab-server -p scarab-cli
-    # The same env file the stack booted from — SCARAB_ADDR names the server.
-    set -a && source deploy/local-proc/.env && set +a
+    # The same env file the stack booted from — SCARAB_ADDR names the server —
+    # plus what up.sh DISCOVERED at boot (the Pod-facing workspace URL, the
+    # fetcher image), which a test that spawns its own server must reuse.
+    set -a && source deploy/local-proc/.env && source deploy/local-proc/.env.generated && set +a
     export SCARAB_E2E=1
     export SCARAB_E2E_URL="http://${SCARAB_ADDR/0.0.0.0/127.0.0.1}"
     export SCARAB_E2E_DATABASE_URL="$SCARAB_DATABASE_URL"
@@ -416,6 +418,20 @@ kube-tests filter="":
       echo "==> building $1"
       docker build -q -t "$1" "$2" >/dev/null
       kind load docker-image "$1" --name "$cluster" >/dev/null
+    done
+    # The service image the uid-pinned-service case runs (git-bug 908f534). A
+    # tagged image is IfNotPresent, so a kind-loaded copy is never pulled by the
+    # node — whose Docker Hub DNS has been flaky here. Loaded as a ONE-platform
+    # archive: `kind load docker-image` imports `--all-platforms` and fails on a
+    # multi-arch pull under the containerd image store (only one platform's
+    # layers are local).
+    platform="linux/$(docker version -f '{{{{.Server.Arch}}')"
+    for img in postgres:16; do
+      docker image inspect "$img" >/dev/null 2>&1 || docker pull -q --platform "$platform" "$img" >/dev/null
+      archive="$(mktemp -t scarab-kind-image).tar"
+      docker save --platform "$platform" -o "$archive" "$img"
+      kind load image-archive "$archive" --name "$cluster" >/dev/null
+      rm -f "$archive"
     done
     export SCARAB_TEST_CLONE_IMAGE=scarab-clone:kube-tests
     export SCARAB_TEST_SIDECAR_IMAGE=scarab-results-sidecar:kube-tests
@@ -537,7 +553,7 @@ ui-e2e:
 # Contract gate (mirrors the CI `openapi-drift` job, ADR-0054): regenerate the
 # OpenAPI spec and the generated TS client, then fail if either differs from
 # what is committed. Full-route coverage is asserted by the test suite
-# (every_registered_route_is_in_the_openapi_spec) — this gates DRIFT only.
+# (step_up_routes.rs: route_table_equals_the_openapi_spec) — this gates DRIFT only.
 openapi-drift:
     #!/usr/bin/env bash
     set -euo pipefail

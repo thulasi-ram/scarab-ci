@@ -365,6 +365,54 @@ steps:
     );
 }
 
+/// A `when:`-excluded step's `Pending → Skipped` at run creation and its
+/// journal entry are ONE commit (git-bug 586187a; review fit-F10). They were
+/// a CAS then a separate append: a crash between left a Skipped step no
+/// `StepTransitioned` explains. The crash is constructed by refusing that
+/// journal write.
+#[tokio::test]
+async fn a_when_excluded_skip_and_its_journal_entry_are_one_commit() {
+    use scarab_engine::{EventPayload, StepStatus};
+    const CI: &str = r#"
+on:
+  push: {}
+steps:
+  - { id: build, image: busybox }
+  - { id: deploy, image: busybox, needs: [build], when: "event.branch == 'main'" }
+"#;
+    let forge = FakeForge::new().with_file(".scarab/ci.yaml", CI);
+    let db = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+    db.fail_next_event_append(|p| {
+        matches!(
+            p,
+            EventPayload::StepTransitioned {
+                to: StepStatus::Skipped,
+                ..
+            }
+        )
+    });
+    let created =
+        trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &push("feature")).await;
+    assert!(created.is_err(), "the crash was injected");
+    assert!(!db.event_append_failure_armed());
+    for run in db.list_runs(100).await.unwrap() {
+        let events = db.events(&run.run).await.unwrap();
+        for s in db.steps_of_run(&run.run).await.unwrap() {
+            if s.status != StepStatus::Skipped {
+                continue;
+            }
+            assert!(
+                events.iter().any(|e| matches!(&e.kind,
+                    EventPayload::StepTransitioned { step, to: StepStatus::Skipped, .. }
+                        if *step == s.step)),
+                "step `{}` is Skipped with no journal entry explaining it",
+                s.step.0
+            );
+        }
+    }
+}
+
 /// Transitive skip (ADR-0033): a `when:`-guarded-off step and every descendant
 /// that (only) depended on it are skipped, and the run still succeeds.
 #[tokio::test]

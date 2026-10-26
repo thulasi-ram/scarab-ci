@@ -1,3 +1,5 @@
+import { absTime } from "./fmt";
+
 // Gate predicates (ADR-0008), shared so the DAG's label and the approve action
 // can never disagree about what "this gate is waiting" means.
 //
@@ -88,7 +90,13 @@ export type GateResolutionLike = {
 export type DeploymentGateLike = {
   target_source: string;
   target_id: string;
+  /** The Deployment's OWN status (its Environment's baseline deadline over
+   * its lifetime) — not the gate's clock: a retried gate waits afresh while
+   * this can already read `stalled`. */
   deployment_status?: string | null;
+  /** When the gate itself fails `stalled` (epoch ms), on the engine's clock:
+   * its wait's window plus its Project's effective deadline. */
+  fails_at?: number | null;
   latest_label?: string | null;
   /** The server could not read the Deployment record for this view: the
    * Deployment fields are absent because they are unknown. */
@@ -135,11 +143,22 @@ const holdReason = (held: string): string => held.replace(/^held:\s*/i, "").trim
  *   passed: <reason>                     a settled gate's verdict
  *   failed: <reason> (rejected by <who>) a settled gate's verdict
  *   waiting on <source/id> (<status>, "<label>")   a waiting DeploymentGate
+ *   waiting on <source/id> (Deployment: <status> · gate fails at <T>)
+ *                                        ... when the server knows the gate's own deadline
+ *
+ * The Deployment's status and the gate's deadline are two clocks: a retried
+ * gate waits afresh on a Deployment that already reads `stalled`, so when the
+ * server sends `fails_at` the line says whose status it is and when the GATE
+ * fails (git-bug ec84c5d). `fmtTime` renders that instant (absolute time by
+ * default; tests pass a fixed one).
  *
  * A waiting DeploymentGate whose record could not be read says exactly that —
  * never "no Deployment recorded yet", which would be false.
  */
-export function gateStatus(s: GateStatusLike): GateStatus | null {
+export function gateStatus(
+  s: GateStatusLike,
+  fmtTime: (ms: number) => string = absTime,
+): GateStatus | null {
   if (s.held) return { tone: "held", text: `held: ${holdReason(s.held)}` };
   if (!s.gate) return null;
   const r = currentResolution(s);
@@ -151,10 +170,15 @@ export function gateStatus(s: GateStatusLike): GateStatus | null {
   }
   const d = s.deployment_gate;
   if (d && isGateOpen(s)) {
-    const detail = d.deployment_status
+    const status = d.deployment_status
       ? [pretty(d.deployment_status), d.latest_label ? `"${d.latest_label}"` : null]
           .filter(Boolean)
           .join(", ")
+      : null;
+    const detail = status
+      ? d.fails_at != null
+        ? `Deployment: ${status} · gate fails at ${fmtTime(d.fails_at)}`
+        : status
       : d.record_unreadable
         ? "Deployment record could not be read"
         : "no Deployment recorded yet";
@@ -164,8 +188,11 @@ export function gateStatus(s: GateStatusLike): GateStatus | null {
 }
 
 /** {@link gateStatus}'s text alone. */
-export function gateStatusText(s: GateStatusLike): string | null {
-  return gateStatus(s)?.text ?? null;
+export function gateStatusText(
+  s: GateStatusLike,
+  fmtTime: (ms: number) => string = absTime,
+): string | null {
+  return gateStatus(s, fmtTime)?.text ?? null;
 }
 
 /** Can a human reject this gate right now? Any gate kind, while it waits on a
@@ -219,4 +246,42 @@ export function gateWaitHint(s: GateStatusLike, statusOf: (step: string) => stri
     default:
       return "waiting for a decision";
   }
+}
+
+// --- The dashboard's action inbox (git-bug c489346) --------------------------
+// A waiting gate holds only its dependents (ADR-0070 §9): a Run whose gate is
+// reached while an independent sibling still runs stays `running`. So "this
+// run waits on a gate" is the server's `waiting_gates` (gate steps Pending,
+// reached, with an open Attempt), never `status === "suspended"`.
+
+/** A run's waiting gate as the run list sends it (`WaitingGateDto`). */
+export type WaitingGateLike = { step: string; kind: string; since: number };
+
+/** The run-list shape the inbox needs (`RunSummaryDto`). */
+export type InboxRunLike = { status: string; waiting_gates?: WaitingGateLike[] | null };
+
+/** The runs that wait on a gate, in list order. A `suspended` run counts too —
+ * suspension means only gate waits remain, and an older server sends no
+ * `waiting_gates`. */
+export function inboxRuns<T extends InboxRunLike>(runs: readonly T[]): T[] {
+  return runs.filter((r) => (r.waiting_gates?.length ?? 0) > 0 || r.status === "suspended");
+}
+
+/** The inbox row's verb: `approve` when a manual gate waits (the one kind a
+ * human approves), else `review` (a rejectable timer/external/deployment
+ * wait). */
+export function inboxVerb(r: InboxRunLike): "approve" | "review" {
+  const gates = r.waiting_gates ?? [];
+  if (gates.length === 0) return "approve"; // suspended, gates unknown: as before
+  return gates.some((g) => g.kind === "manual") ? "approve" : "review";
+}
+
+/** The inbox row's detail line: which gates wait, and whether the run is
+ * still running beside them. */
+export function inboxDetail(r: InboxRunLike): string {
+  const gates = r.waiting_gates ?? [];
+  if (gates.length === 0) return "suspended on a gate · waiting for a decision";
+  const names = gates.map((g) => `${g.step} (${g.kind})`).join(", ");
+  const what = `${gates.length === 1 ? "gate" : "gates"} ${names} waiting`;
+  return r.status === "running" ? `${what} · other steps still running` : what;
 }

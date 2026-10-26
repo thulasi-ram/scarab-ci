@@ -10,7 +10,10 @@
 //! `Pending` with no Attempt, and its Run suspends (no budget billed) when
 //! nothing else is runnable. A DeploymentGate that is not yet reached stops
 //! counting once the Environment's baseline deadline has elapsed since the
-//! request's effective time; a reached one counts until its verdict (R3).
+//! requesting Step's latest Attempt started (the one that succeeded, where
+//! the gate's first wait opens); a reached one counts until its verdict (R3).
+//! A cancelled holder counts until its unit is gone (its teardown intent
+//! retired), not merely until its Step is terminal (git-bug f22056d).
 //!
 //! No kind: steps run on the `FakeExecutor`, reports go through
 //! `DeploymentStore::append`, the scheduler is ticked by hand with the
@@ -535,8 +538,13 @@ async fn no_limit_holds_nothing(w: World) {
 }
 both!(no_limit_holds_nothing, None);
 
-/// Cancelling the holder ends its interval: a terminal Run is never in
-/// flight.
+/// Cancelling the holder ends its interval — but only once its deploy
+/// Step's unit is GONE, not when the Step goes terminal (git-bug f22056d).
+/// The cancel makes `ra`'s Step `Cancelled` at once, while its Pod runs on
+/// through its termination grace, still acting on the target; releasing
+/// `rb` then would overlap two Pods on one target. So `ra` counts until its
+/// teardown intent is retired, and the intent is retired only when the
+/// backend says the unit is gone.
 async fn cancelling_the_holder_frees_the_held_run(w: World) {
     w.seed("ra", GATED).await;
     w.deploying("ra").await;
@@ -544,6 +552,8 @@ async fn cancelling_the_holder_frees_the_held_run(w: World) {
     w.ticks(3).await;
     w.assert_held("rb").await;
 
+    // `ra`'s Pod lingers through two teardown checks after the cancel.
+    w.exec.linger_after_cancel(2);
     assert!(
         cancel_run_request(&*w.db, &w.clock, &rid("ra"), Some("amy".into()))
             .await
@@ -551,6 +561,12 @@ async fn cancelling_the_holder_frees_the_held_run(w: World) {
     );
     w.ticks(3).await;
     assert_eq!(w.run_status("ra").await, RunStatus::Cancelled);
+    assert_eq!(w.step("ra", "bump").await.status, StepStatus::Cancelled);
+    w.assert_held("rb").await;
+
+    // The third check finds it gone: the intent is retired this tick, and
+    // the next one releases `rb`.
+    w.ticks(2).await;
     w.assert_released("rb").await;
     w.finish().await;
 }
@@ -678,11 +694,13 @@ both!(the_hold_journals_nothing, Some(1));
 
 /// The unreached-gate bound (R3) never lets a REACHED gate go early. A's
 /// deploy Step starts at T0 (its request's effective time) and succeeds 30 s
-/// later; its gate then waits from T0 + 30 s. At T0 + the baseline deadline
-/// the request is past the unreached cutoff, but the gate is reached and its
-/// own deadline (from T0 + 30 s) has not elapsed: A is still in flight, and
-/// B stays held.
-async fn a_reached_gate_still_counts_past_the_cutoff(w: World) {
+/// later; its gate then waits. A reached gate counts until its own verdict —
+/// and its first wait's window and stall deadline run from that same
+/// effective time (ADR-0070 §8, owner 2026-10-24), with a deadline never
+/// longer than the baseline. So one millisecond before the baseline has
+/// elapsed since T0 A still counts and B stays held; at it, A's gate stalls on
+/// its own (decided, not dropped by the cutoff) and B is released.
+async fn a_reached_gate_counts_until_its_own_stall(w: World) {
     w.seed("ra", GATED).await;
     w.deploying("ra").await;
     assert_eq!(
@@ -695,7 +713,7 @@ async fn a_reached_gate_still_counts_past_the_cutoff(w: World) {
 
     w.clock.advance(30_000);
     w.deployed_and_gates_waiting(&["ra"]).await;
-    w.clock.advance(w.baseline_ms - 30_000);
+    w.clock.advance(w.baseline_ms - 30_000 - 1);
     w.ticks(3).await;
     let live = w.step("ra", "live").await;
     assert_eq!(live.status, StepStatus::Pending, "A's gate still waits");
@@ -708,6 +726,24 @@ async fn a_reached_gate_still_counts_past_the_cutoff(w: World) {
         w.hold_reason("rb").await.as_deref(),
         Some("held: waiting for deployment concurrency on `argocd`/`web` (1/1 in flight)")
     );
+
+    w.clock.advance(1);
+    w.ticks(3).await;
+    let live = w.step("ra", "live").await;
+    assert_eq!(
+        live.status,
+        StepStatus::Failed,
+        "A's gate stalled at T0 + deadline"
+    );
+    assert!(
+        live.attempts
+            .last()
+            .and_then(|a| a.failure_detail.as_deref())
+            .is_some_and(|d| d.starts_with("stalled: not live within")),
+        "{:?}",
+        live.attempts.last()
+    );
+    w.assert_released("rb").await;
     w.finish().await;
 }
-both!(a_reached_gate_still_counts_past_the_cutoff, Some(1));
+both!(a_reached_gate_counts_until_its_own_stall, Some(1));

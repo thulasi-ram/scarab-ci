@@ -21,8 +21,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use futures::stream::{self, BoxStream, Stream, StreamExt};
 use futures::SinkExt;
 use serde::{Deserialize, Serialize};
@@ -82,6 +81,9 @@ pub mod plugin_runtime;
 /// concurrency-hold facts per step.
 mod run_gate_view;
 pub mod retention;
+mod routes;
+pub use routes::{route_table, RouteEntry};
+pub mod step_up;
 pub mod secret_executor;
 /// `--role workspace`: the ADR-0061 workspace service. Its own router, its own
 /// `/readyz`, and NO durable core — see the module docs.
@@ -281,6 +283,11 @@ pub struct AppState {
     /// [`with_snapshot_retention_days`](AppState::with_snapshot_retention_days)
     /// so the UI never quotes a different number than the sweeper enforces.
     pub snapshot_retention_days: u32,
+    /// Step-up confirmation (ADR-0073). [`AppState::new`] leaves it
+    /// [`Off`](step_up::StepUpPolicy::Off) — a hand-built state, or
+    /// `SCARAB_DEV_INSECURE`; production wires
+    /// [`with_step_up`](AppState::with_step_up) in `main.rs`.
+    pub step_up: step_up::StepUpPolicy,
 }
 
 impl AppState {
@@ -324,7 +331,16 @@ impl AppState {
             public_url: "http://localhost:8080".into(),
             credential_overrides: Arc::new(connections_config::CredentialOverrides::new()),
             snapshot_retention_days: DEFAULT_SNAPSHOT_RETENTION_DAYS,
+            step_up: step_up::StepUpPolicy::Off,
         }
+    }
+
+    /// Enforce step-up confirmation (ADR-0073): every crown-jewel route needs
+    /// a passkey StepUpConfirmation, and the passkey ceremony endpoints are
+    /// live.
+    pub fn with_step_up(mut self, service: step_up::StepUpService) -> Self {
+        self.step_up = step_up::StepUpPolicy::Enforce(Arc::new(service));
+        self
     }
 
     /// The cold-tier Workspace-Snapshot retention window the sweeper actually
@@ -628,6 +644,60 @@ impl AppState {
                         "several login providers are configured — name one with `provider`".into(),
                     )
                 }),
+        }
+    }
+
+    /// The login provider `subject` signs in again through (git-bug 584bd03),
+    /// `None` when there is no OAuth provider or none can be told.
+    ///
+    /// A fresh login must be THIS Principal's: an unnamed login answers 400
+    /// with several providers and no default, and with a default it would
+    /// send a non-default user through the default provider — signing them
+    /// in as someone else. So, among the configured providers:
+    /// 1. the providers the identity store has pinned to `subject` — the one
+    ///    its id is prefixed with if it is among them, else the first;
+    /// 2. without a store (or a pinned configured one): the id's
+    ///    `provider:` prefix (ADR-0069 §2 mints `provider:handle`);
+    /// 3. else the default — a bare id is the `unqualified_ids` provider's.
+    pub async fn login_provider_for(&self, subject: &str) -> Option<String> {
+        let configured = |id: &str| self.oauth_providers.iter().any(|p| p.provider_id() == id);
+        let prefix = subject
+            .split_once(':')
+            .map(|(p, _)| p)
+            .filter(|p| configured(p));
+        if let Some(store) = self.identities.as_ref() {
+            // A store error falls through to the id's spelling: this only
+            // picks where the login goes, never who it signs in as.
+            let pinned: Vec<String> = store
+                .identities_of(subject)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|i| i.provider)
+                .filter(|p| configured(p))
+                .collect();
+            if let Some(p) = prefix.filter(|p| pinned.iter().any(|q| q == p)) {
+                return Some(p.to_string());
+            }
+            if let Some(p) = pinned.into_iter().next() {
+                return Some(p);
+            }
+        }
+        if let Some(p) = prefix {
+            return Some(p.to_string());
+        }
+        self.oauth_provider(None)
+            .ok()
+            .flatten()
+            .map(|p| p.provider_id().to_string())
+    }
+
+    /// The `fresh_login_required` refusal's `login_url` for `subject`:
+    /// [`FRESH_LOGIN_URL`] naming the provider it signs in with.
+    pub async fn fresh_login_url(&self, subject: &str) -> String {
+        match self.login_provider_for(subject).await {
+            Some(p) => format!("{FRESH_LOGIN_URL}&provider={}", oauth::percent_encode(&p)),
+            None => FRESH_LOGIN_URL.to_string(),
         }
     }
 }
@@ -1054,6 +1124,68 @@ pub struct RunSummaryDto {
     /// deploy run, whose pipeline declared `environment:`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub environment: Option<String>,
+    /// The run's **waiting gates** (git-bug `c489346`): gate steps that are
+    /// `Pending`, reached (every need `Succeeded`) and have an open Attempt —
+    /// the engine's "waiting gate". Since a waiting gate holds only its
+    /// dependents (ADR-0070 §9), a Run with one can still be `running` while
+    /// independent steps run, so this — not `status == suspended` — is what
+    /// says a Run waits on a gate. Omitted when empty (and always for a
+    /// terminal or queued Run).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waiting_gates: Vec<WaitingGateDto>,
+}
+
+/// One waiting gate of a run in the list view ([`RunSummaryDto::waiting_gates`]).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct WaitingGateDto {
+    /// The gate step's id.
+    pub step: String,
+    /// The gate kind: `manual` / `timer` / `external` / `deployment`.
+    pub kind: String,
+    /// When its wait opened (epoch millis): its open Attempt's start.
+    pub since: i64,
+}
+
+/// The list view's runs, each with its waiting gates. Steps are read only for
+/// a `Running` or `Suspended` run — the only ones that can have a waiting gate.
+async fn run_summaries(
+    st: &AppState,
+    runs: Vec<scarab_engine::RunSummary>,
+) -> Result<Vec<RunSummaryDto>, ApiError> {
+    // Only an active run can wait on a gate. Their steps are read in ONE
+    // batched query for the page (review fit-F8): the list endpoints are
+    // polled, and one `steps_of_run` per active run grew with the page.
+    let active: Vec<RunId> = runs
+        .iter()
+        .filter(|r| matches!(r.status, RunStatus::Running | RunStatus::Suspended))
+        .map(|r| r.run.clone())
+        .collect();
+    let mut steps_by_run = if active.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        st.db.steps_of_runs(&active).await?
+    };
+    let mut out = Vec::with_capacity(runs.len());
+    for r in runs {
+        let active = matches!(r.status, RunStatus::Running | RunStatus::Suspended);
+        let run = r.run.clone();
+        let mut dto = RunSummaryDto::from(r);
+        if active {
+            let steps = steps_by_run.remove(&run).unwrap_or_default();
+            dto.waiting_gates = run_gate_view::waiting_gates(&steps)
+                .into_iter()
+                .filter_map(|s| {
+                    Some(WaitingGateDto {
+                        step: s.step.0.clone(),
+                        kind: s.gate_kind.clone()?,
+                        since: s.attempts.last()?.started_at.0,
+                    })
+                })
+                .collect();
+        }
+        out.push(dto);
+    }
+    Ok(out)
 }
 
 impl From<scarab_engine::RunSummary> for RunSummaryDto {
@@ -1078,6 +1210,7 @@ impl From<scarab_engine::RunSummary> for RunSummaryDto {
             pipeline: s.pipeline,
             trigger_title: s.trigger_title,
             environment: s.environment,
+            waiting_gates: Vec::new(),
         }
     }
 }
@@ -1251,8 +1384,18 @@ pub struct DeploymentGateDto {
     /// The Deployment the requester's current request landed on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deployment_id: Option<u64>,
+    /// The Deployment's own status — on its Environment's **baseline**
+    /// deadline, over the Deployment's lifetime, as the Deployments page
+    /// shows it. Not the gate's clock: a Retry waits afresh while this can
+    /// already read `stalled` (see `fails_at`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deployment_status: Option<DeploymentStatusDto>,
+    /// When this gate fails `stalled` if nothing decisive is reported first
+    /// (epoch millis): its wait's window opening plus its Project's effective
+    /// gate deadline — the engine's own computation (git-bug `ec84c5d`).
+    /// Absent when unknown (no Deployment, or the deadline could not be read).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fails_at: Option<i64>,
     /// The DeploymentVersion asked for.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
@@ -1401,6 +1544,29 @@ pub enum ApiError {
     /// the org-level Environment (ADR-0071).
     Gone(String),
     Db(DbError),
+    /// `403 step_up_required` (ADR-0073 §5): a crown-jewel operation without
+    /// a valid StepUpConfirmation. JSON body: [`step_up::StepUpRefusal`].
+    StepUpRequired(Box<step_up::StepUpRefusal>),
+    /// `403 fresh_login_required` (ADR-0073 §2): a FIRST passkey can be
+    /// enrolled only from a browser login made in the last 5 minutes.
+    /// `login_url` is that login, naming the caller's provider
+    /// ([`AppState::fresh_login_url`]).
+    FreshLoginRequired {
+        login_url: String,
+    },
+    /// A passkey / step-up ceremony was refused; `code` names the check.
+    /// JSON body `{code, message}`.
+    Ceremony {
+        status: StatusCode,
+        code: &'static str,
+        message: String,
+    },
+    /// Too many of something pending (429) — a requester's live
+    /// StepUpConfirmationRequests (ADR-0073 §6). The text says what.
+    TooManyRequests(String),
+    /// A dependency that must work for the request to be safe is down (503):
+    /// a crown jewel whose authorisation cannot be recorded does not run.
+    Unavailable(String),
     /// A log body read failed while the index says chunks exist — the bytes are
     /// gone or unreachable, and the reader must be told rather than handed a
     /// plausible blank pane (ADR-0063 part 5: absence is authoritative only when
@@ -1440,6 +1606,11 @@ impl From<DispatchError> for ApiError {
     }
 }
 
+/// Where a `fresh_login_required` refusal sends the browser: a fresh login
+/// that lands on passkey enrollment (ADR-0073 §2, §10). The refusal adds the
+/// caller's `provider` ([`AppState::fresh_login_url`]).
+pub const FRESH_LOGIN_URL: &str = "/v1/auth/login?next=/account/security%3Fenroll%3D1";
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         match self {
@@ -1461,6 +1632,28 @@ impl IntoResponse for ApiError {
                 format!("log storage read failed: {e}"),
             )
                 .into_response(),
+            ApiError::StepUpRequired(refusal) => refusal.into_response(),
+            ApiError::FreshLoginRequired { login_url } => (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "code": "fresh_login_required",
+                    "message": "Log in again to enroll your first passkey (within 5 minutes of \
+                                signing in).",
+                    "login_url": login_url,
+                })),
+            )
+                .into_response(),
+            ApiError::Ceremony {
+                status,
+                code,
+                message,
+            } => (
+                status,
+                Json(serde_json::json!({ "code": code, "message": message })),
+            )
+                .into_response(),
+            ApiError::Unavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m).into_response(),
+            ApiError::TooManyRequests(m) => (StatusCode::TOO_MANY_REQUESTS, m).into_response(),
         }
     }
 }
@@ -2011,7 +2204,7 @@ async fn list_runs(
         runs = visible;
     }
     Ok(Json(RunListResponse {
-        runs: runs.into_iter().map(RunSummaryDto::from).collect(),
+        runs: run_summaries(&st, runs).await?,
     }))
 }
 
@@ -3196,7 +3389,7 @@ async fn list_repo_runs(
     let limit = q.limit.unwrap_or(DEFAULT_RUNS_LIMIT).min(MAX_RUNS_LIMIT);
     let runs = st.db.list_runs_for_tenant(&org, &repo, limit).await?;
     Ok(Json(RunListResponse {
-        runs: runs.into_iter().map(RunSummaryDto::from).collect(),
+        runs: run_summaries(&st, runs).await?,
     }))
 }
 
@@ -4014,7 +4207,8 @@ pub async fn trigger_run_from_event(
 }
 
 /// A deploy pipeline a delivery did not run because its Environment does not
-/// exist in the Org or does not admit the Project (ADR-0071 §2, §10). Reported
+/// exist in the Org or does not admit the Project (ADR-0071 §2, §10), or its
+/// launch cannot bind a DeploymentTarget (git-bug 66171a0). Reported
 /// in the webhook delivery body: for a pipeline whose name the ADR-0071
 /// migration could never see (it had never run), this is the only place the
 /// refusal surfaces besides the server log.
@@ -4038,7 +4232,8 @@ pub struct TriggerOutcome {
 }
 
 /// [`trigger_run_from_event`], also reporting every deploy pipeline refused
-/// as `UnknownEnvironment` / `NotEligible` / `DeploymentTargetElsewhere`.
+/// as `UnknownEnvironment` / `NotEligible` / `DeploymentTargetElsewhere` /
+/// `DeploymentRequestUnresolved`.
 pub async fn trigger_runs_from_event(
     forge: &dyn scarab_forge::ForgePort,
     db: &dyn Db,
@@ -4115,10 +4310,15 @@ pub async fn trigger_runs_from_event(
             // Logged AND returned: the delivery body is where a forge's
             // "recent deliveries" view shows it, and for a name the migration
             // could not see (never run before ADR-0071) it is the first sign.
+            // A deploy target its launch cannot bind (git-bug 66171a0) is the
+            // same: that pipeline alone is skipped, the repo's CI still runs.
             Admission::Refused(
                 ref refusal @ (AdmissionRefusal::UnknownEnvironment { ref environment }
                 | AdmissionRefusal::NotEligible { ref environment }
                 | AdmissionRefusal::DeploymentTargetElsewhere {
+                    ref environment, ..
+                }
+                | AdmissionRefusal::DeploymentRequestUnresolved {
                     ref environment, ..
                 }),
             ) => {
@@ -4211,6 +4411,12 @@ enum AdmissionRefusal {
         target_id: String,
         home: String,
     },
+    /// A Step's DeploymentTarget does not resolve for this launch — it reads
+    /// an input the launch does not supply (a webhook Run supplies none, so a
+    /// required, default-less input never binds), resolves empty, or two
+    /// requests resolve to one target (git-bug 66171a0). Decided before
+    /// anything is persisted; `reason` names the step and the input.
+    DeploymentRequestUnresolved { environment: String, reason: String },
 }
 
 /// The outcome of admitting one compiled pipeline (ADR-0037, ADR-0071 §2):
@@ -4451,7 +4657,10 @@ async fn admit_and_create_run(
     // DeploymentTargets against the launch parameters, and refuse a Run that
     // requests a target homed in another Environment — before anything is
     // persisted, like every other refusal here.
-    let requests = resolve_deployment_requests(ir, repo, params)?;
+    let requests = match resolve_deployment_requests(ir, repo, params) {
+        Ok(requests) => requests,
+        Err(refusal) => return Ok(Admission::Refused(refusal)),
+    };
     if let (Some(store), RunGovernance::Governed { environment, .. }) = (governance, &gov) {
         if let Some(refusal) =
             deployment_target_elsewhere(store, &repo.owner, environment, &requests).await?
@@ -4481,13 +4690,14 @@ async fn admit_and_create_run(
 /// (`params`; for a webhook Run, which supplies none, the interface's
 /// defaults), and each carrying the DeploymentGates that wait on it
 /// (`gate_steps`, criterion 2). Fails closed: a target that does not resolve to a non-empty
-/// value is a pipeline error and no Run is created — the same rule the
-/// concurrency group follows.
+/// value is [`AdmissionRefusal::DeploymentRequestUnresolved`] and no Run is
+/// created — the webhook path skips that pipeline alone (git-bug 66171a0), a
+/// dispatch reports it as a pipeline error.
 fn resolve_deployment_requests(
     ir: &scarab_pipeline::PipelineIr,
     repo: &scarab_forge::RepoRef,
     params: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
-) -> Result<Vec<scarab_engine::RunDeploymentRequest>, TriggerError> {
+) -> Result<Vec<scarab_engine::RunDeploymentRequest>, AdmissionRefusal> {
     let Some(environment) = &ir.environment else {
         // Validation refuses `deployment_requests` without an `environment:`.
         return Ok(Vec::new());
@@ -4504,16 +4714,20 @@ fn resolve_deployment_requests(
             &defaults
         }
     };
+    let unresolved = |reason: String| AdmissionRefusal::DeploymentRequestUnresolved {
+        environment: environment.clone(),
+        reason,
+    };
     let mut out = Vec::new();
     for step in &ir.steps {
         for (ordinal, req) in step.deployment_requests.iter().enumerate() {
-            let bind = |part: &str, text: &str| -> Result<String, TriggerError> {
+            let bind = |part: &str, text: &str| -> Result<String, AdmissionRefusal> {
                 let value = match scarab_pipeline::deployment_target_input(text) {
                     Some(name) => inputs
                         .get(name)
                         .map(scarab_pipeline::params::stringify)
                         .ok_or_else(|| {
-                            TriggerError::Pipeline(format!(
+                            unresolved(format!(
                                 "step `{}`: deployment request target `{part}` reads \
                                  `inputs.{name}`, which this launch does not supply",
                                 step.id
@@ -4522,7 +4736,7 @@ fn resolve_deployment_requests(
                     None => text.to_string(),
                 };
                 if value.trim().is_empty() {
-                    return Err(TriggerError::Pipeline(format!(
+                    return Err(unresolved(format!(
                         "step `{}`: deployment request target `{part}` resolved empty",
                         step.id
                     )));
@@ -4557,7 +4771,7 @@ fn resolve_deployment_requests(
             r.target_source.as_str(),
             r.target_id.as_str(),
         )) {
-            return Err(TriggerError::Pipeline(format!(
+            return Err(unresolved(format!(
                 "step `{}`: two deployment requests resolve to `{}`/`{}`",
                 r.step.0, r.target_source, r.target_id
             )));
@@ -4758,6 +4972,7 @@ fn admission_refusal_message(refusal: &AdmissionRefusal, org: &str, project: &st
             target_id,
             home,
         } => deployment_target_elsewhere_message(environment, step, target_source, target_id, home),
+        AdmissionRefusal::DeploymentRequestUnresolved { reason, .. } => reason.clone(),
     }
 }
 
@@ -5000,6 +5215,11 @@ pub async fn dispatch_run(
             target_id,
             home,
         },
+        // A dispatch names its inputs: one that leaves a target unbound is
+        // the pipeline error it always was.
+        AdmissionRefusal::DeploymentRequestUnresolved { reason, .. } => {
+            DispatchError::Pipeline(reason)
+        }
     })
 }
 
@@ -5432,10 +5652,9 @@ async fn persist_run_from_ir(
 
         // A `when:`-excluded step is kept in the DAG (edges intact) but starts
         // Skipped, so the scheduler transitively skips its descendants (ADR-0033).
+        // The transition and its journal entry are one commit (git-bug 586187a).
         if excluded.iter().any(|e| e == &step.id) {
-            db.record_step_transition(run, &step_id, StepStatus::Pending, StepStatus::Skipped)
-                .await?;
-            db.append_event(&EventKind {
+            let transitioned = EventKind {
                 version: EVENT_VERSION,
                 run: run.clone(),
                 kind: EventPayload::StepTransitioned {
@@ -5444,7 +5663,17 @@ async fn persist_run_from_ir(
                     to: StepStatus::Skipped,
                 },
                 at: now,
-            })
+            };
+            db.commit_step_transition(
+                run,
+                &step_id,
+                StepStatus::Pending,
+                StepStatus::Skipped,
+                scarab_engine::AttemptFrontier::Any,
+                None,
+                std::slice::from_ref(&transitioned),
+                &[],
+            )
             .await?;
         }
     }
@@ -5486,6 +5715,18 @@ pub async fn drain_forge_statuses(
             db.mark_dispatched(msg.id).await?; // malformed payload → drop, don't loop
             continue;
         };
+        // A superseded post is retired unposted (red team R2-E5): delivery
+        // is at-least-once, so a post that failed and is redelivered after
+        // its lease can land AFTER a newer verdict and leave the forge on the
+        // old one — a green rerun's required check stuck red. A post with no
+        // generation (written before it was carried) cannot be ordered, and
+        // is posted as before.
+        if let Some(generation) = msg.payload.get("generation").and_then(|g| g.as_u64()) {
+            if status_post_superseded(db, &msg.run, generation, to).await? {
+                db.mark_dispatched(msg.id).await?;
+                continue;
+            }
+        }
         let status = scarab_forge::Status {
             context: "scarab".into(),
             state: run_status_to_forge(to),
@@ -5536,6 +5777,40 @@ pub async fn drain_forge_statuses(
         }
     }
     Ok(posted)
+}
+
+/// Whether a `to` post of `run` from reopen generation `generation` is
+/// superseded by a newer verdict the forge already has (red team R2-E5):
+///
+/// - it is from an older generation than the run's current one — the run
+///   was reopened since, and the newer generation's posts own the forge; or
+/// - it is a non-terminal post of the current generation, the run has
+///   settled in it, and that settle's terminal post is no longer pending
+///   (delivered, or dead-lettered): a run goes non-terminal → terminal once
+///   per generation, so the terminal post is the newer word. While the
+///   terminal post is still pending the non-terminal one is posted first —
+///   the ordinary in-order drain.
+async fn status_post_superseded(
+    db: &dyn Db,
+    run: &RunId,
+    generation: u64,
+    to: RunStatus,
+) -> Result<bool, DbError> {
+    let current = db.run_reopen_generation(run).await?;
+    if generation < current {
+        return Ok(true);
+    }
+    if to.is_terminal() || generation != current {
+        return Ok(false);
+    }
+    match db.run_status(run).await? {
+        Some(settled) if settled.is_terminal() => Ok(!db
+            .outbox_key_pending(&scarab_engine::run_status_post_key(
+                run, generation, settled,
+            ))
+            .await?),
+        _ => Ok(false),
+    }
 }
 
 /// Map a run's lifecycle status to a forge commit-status state (ADR-0010).
@@ -5880,7 +6155,9 @@ async fn login(
         ApiError::Unauthorized
     })?;
     let now = st.clock.now().await.0;
-    let session = mint_session(principal.clone(), now);
+    // An API/CLI exchange: never a fresh browser login (ADR-0073 §2), even
+    // though it also sets the browser cookies.
+    let (session, csrf) = mint_session(principal.clone(), now, scarab_identity::LOGIN_KIND_API);
     sessions
         .put(&session)
         .await
@@ -5891,35 +6168,47 @@ async fn login(
         Json(LoginResponse {
             session: session.id.clone(),
             subject: principal.subject,
-            csrf: session.csrf.clone(),
+            csrf: csrf.clone(),
         }),
     )
         .into_response();
-    set_session_cookies(resp.headers_mut(), &session);
+    set_session_cookies(resp.headers_mut(), &session, &csrf);
     Ok(resp)
 }
 
-/// Mint a fresh [`Session`] (opaque id + CSRF token, 24h TTL).
-fn mint_session(principal: Principal, now_ms: i64) -> Session {
-    Session {
+/// Mint a fresh [`Session`] (opaque id + CSRF token, 24h TTL), stamped with
+/// when the login completed and how (ADR-0073 §2): `login_kind` is
+/// [`scarab_identity::LOGIN_KIND_BROWSER`] for the OAuth callback and
+/// [`scarab_identity::LOGIN_KIND_API`] for the API/CLI exchange — only a
+/// fresh browser login may enroll a first passkey.
+///
+/// Returns the CSRF token beside the session: the session keeps only its hash
+/// (git-bug 51d6bcb), so this is the one place the plaintext exists — for the
+/// cookie and the login response.
+fn mint_session(principal: Principal, now_ms: i64, login_kind: &str) -> (Session, String) {
+    let csrf = Uuid::new_v4().to_string();
+    let session = Session {
         id: Uuid::new_v4().to_string(),
         principal,
         expires_at: now_ms + SESSION_TTL_MS,
-        csrf: Uuid::new_v4().to_string(),
-    }
+        csrf_hash: scarab_identity::csrf_hash(&csrf),
+        created_at: now_ms,
+        login_kind: login_kind.to_string(),
+    };
+    (session, csrf)
 }
 
 /// Append the login cookies (ADR-0049): the session cookie is `HttpOnly` +
 /// `Secure` + `SameSite=Lax` (script-unreadable); the CSRF cookie is
 /// deliberately script-READABLE — the UI double-submits it as `x-csrf-token`,
 /// which a cross-site attacker cannot do.
-fn set_session_cookies(headers: &mut HeaderMap, session: &Session) {
+fn set_session_cookies(headers: &mut HeaderMap, session: &Session, csrf: &str) {
     for cookie in [
         format!(
             "scarab_session={}; HttpOnly; Secure; Path=/; SameSite=Lax",
             session.id
         ),
-        format!("scarab_csrf={}; Secure; Path=/; SameSite=Lax", session.csrf),
+        format!("scarab_csrf={csrf}; Secure; Path=/; SameSite=Lax"),
     ] {
         if let Ok(v) = axum::http::HeaderValue::from_str(&cookie) {
             headers.append(axum::http::header::SET_COOKIE, v);
@@ -5938,7 +6227,7 @@ fn oauth_callback_url(st: &AppState) -> String {
 /// login secrets (`state` + PKCE verifier + OIDC nonce), keep them in one
 /// HttpOnly cookie (10 min), and redirect to the provider's authorize endpoint
 /// with the `state` echo and the S256 `code_challenge`.
-#[utoipa::path(get, path = "/v1/auth/login", summary = "Begin the browser OAuth flow (ADR-0049)", params(("provider" = Option<String>, Query, description = "login provider id (ADR-0069); default = the only, or the unqualified_ids, provider")), responses((status = 302, description = "redirect to the provider with a state cookie"), (status = 400, description = "unknown provider, or several and none named"), (status = 404, description = "OAuth not configured")))]
+#[utoipa::path(get, path = "/v1/auth/login", summary = "Begin the browser OAuth flow (ADR-0049)", params(("provider" = Option<String>, Query, description = "login provider id (ADR-0069); default = the only, or the unqualified_ids, provider"), ("next" = Option<String>, Query, description = "a relative path to land on after the callback (ADR-0073); default `/`")), responses((status = 302, description = "redirect to the provider with a state cookie"), (status = 400, description = "unknown provider, several and none named, or a `next` that is not a relative path"), (status = 404, description = "OAuth not configured")))]
 async fn oauth_login_redirect(
     State(st): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -5948,7 +6237,18 @@ async fn oauth_login_redirect(
     };
     // The provider rides in the state cookie, so every provider shares the one
     // registered callback URL (ADR-0069).
-    let flow = oauth::LoginFlow::generate().for_provider(provider.provider_id());
+    // `?next=` (ADR-0073 §10): where the browser lands after the callback —
+    // e.g. `scarab security setup` sends a fresh login straight to passkey
+    // enrollment. Only a same-origin relative path is kept; anything else
+    // is refused rather than silently dropped.
+    let next = match q.get("next").filter(|n| !n.is_empty()) {
+        Some(n) => oauth::safe_next(n)
+            .ok_or_else(|| ApiError::BadRequest("`next` must be a relative path".into()))?,
+        None => "",
+    };
+    let flow = oauth::LoginFlow::generate()
+        .for_provider(provider.provider_id())
+        .with_next(next);
     let location = provider.authorize_redirect(&oauth_callback_url(&st), &flow);
     let mut resp = (StatusCode::FOUND, ()).into_response();
     if let Ok(v) = axum::http::HeaderValue::from_str(&location) {
@@ -5969,7 +6269,7 @@ async fn oauth_login_redirect(
 /// `GET /v1/auth/callback?code&state` (ADR-0049): finish the browser OAuth
 /// flow — verify the `state` echo against the cookie, exchange the code for a
 /// [`Principal`], mint the PG session + CSRF token, and land on `/`.
-#[utoipa::path(get, path = "/v1/auth/callback", summary = "Finish the browser OAuth flow (ADR-0049)", responses((status = 302, description = "session + CSRF cookies set; redirect to /"), (status = 401, description = "state mismatch or bad code")))]
+#[utoipa::path(get, path = "/v1/auth/callback", summary = "Finish the browser OAuth flow (ADR-0049)", responses((status = 302, description = "session + CSRF cookies set; redirect to the login's `next`, else /"), (status = 401, description = "state mismatch or bad code")))]
 async fn oauth_callback(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -6013,18 +6313,25 @@ async fn oauth_callback(
         ApiError::Unauthorized
     })?;
     let now = st.clock.now().await.0;
-    let session = mint_session(principal, now);
+    let (session, csrf) = mint_session(principal, now, scarab_identity::LOGIN_KIND_BROWSER);
     sessions.put(&session).await.map_err(|e| {
         tracing::warn!(error = %e, "OAuth callback: could not store the new session");
         ApiError::Unauthorized
     })?;
 
+    // Land where the login was started for (`?next=` on `GET
+    // /v1/auth/login`, validated twice: when set and here), else `/`.
+    let landing = oauth::safe_next(&flow.next).unwrap_or("/");
     let mut resp = (StatusCode::FOUND, ()).into_response();
-    resp.headers_mut().insert(
-        axum::http::header::LOCATION,
-        axum::http::HeaderValue::from_static("/"),
-    );
-    set_session_cookies(resp.headers_mut(), &session);
+    if let Ok(v) = axum::http::HeaderValue::from_str(landing) {
+        resp.headers_mut().insert(axum::http::header::LOCATION, v);
+    } else {
+        resp.headers_mut().insert(
+            axum::http::header::LOCATION,
+            axum::http::HeaderValue::from_static("/"),
+        );
+    }
+    set_session_cookies(resp.headers_mut(), &session, &csrf);
     // The one-shot state cookie is spent.
     if let Ok(v) = axum::http::HeaderValue::from_str(
         "scarab_oauth_state=; HttpOnly; Secure; Path=/; SameSite=Lax; Max-Age=0",
@@ -6088,9 +6395,22 @@ async fn begin_link_identity(
     let provider = st
         .oauth_provider(Some(&req.provider))?
         .ok_or(ApiError::NotFound)?;
-    let flow = oauth::LoginFlow::generate()
-        .for_provider(provider.provider_id())
-        .for_link(&session_hash(&sid));
+    let flow = oauth::LoginFlow::generate().for_provider(provider.provider_id());
+    // The flow lives no longer than the step-up window that authorised it.
+    let expires_at = st.clock.now().await.0 + scarab_identity::STEP_UP_WINDOW_MS;
+    // Enforced: a binding only this (guarded) POST can mint, over the
+    // provider and the expiry too. Off: the bare session hash, as before —
+    // the POST is unguarded then anyway.
+    let link = match st.step_up.service() {
+        Some(svc) => svc.link_binding(
+            &flow.state,
+            &session_hash(&sid),
+            &flow.provider,
+            expires_at,
+        ),
+        None => session_hash(&sid),
+    };
+    let flow = flow.for_link(&link, expires_at);
     let mut resp = Json(LinkIdentityResponse {
         authorize_url: provider.authorize_redirect(&oauth_callback_url(&st), &flow),
     })
@@ -6117,7 +6437,37 @@ async fn link_callback(
     code: &str,
 ) -> Result<Response, ApiError> {
     let (sid, principal) = link_session(st, headers, Action::Read).await?;
-    if session_hash(&sid) != flow.link {
+    // The link component must be the one the guarded link POST minted for
+    // THIS flow, THIS session, THIS provider and THIS expiry (ADR-0073 §3:
+    // identity links are a crown jewel, and the state cookie is unsigned
+    // client input) — and the flow must not have outlived its step-up.
+    let now = st.clock.now().await.0;
+    let expires_at = flow.link_expires_at.unwrap_or(i64::MIN);
+    let expected = match st.step_up.service() {
+        Some(svc) => svc.link_binding(
+            &flow.state,
+            &session_hash(&sid),
+            &flow.provider,
+            expires_at,
+        ),
+        None => session_hash(&sid),
+    };
+    if now > expires_at || !scarab_identity::ct_eq(expected.as_bytes(), flow.link.as_bytes()) {
+        if let Some(svc) = st.step_up.service() {
+            let mut ev = step_up::event(
+                scarab_identity::security_event_kind::STEP_UP_REFUSED,
+                &principal.subject,
+                "session:cookie".to_string(),
+                None,
+                now,
+            );
+            ev.op = Some("identity.link".to_string());
+            ev.session_hash = Some(session_hash(&sid));
+            ev.detail = serde_json::json!({
+                "reason": "link flow not minted by the stepped-up POST, or expired",
+            });
+            svc.record(ev).await;
+        }
         return Err(ApiError::Unauthorized);
     }
     let store = st.identities.as_ref().ok_or(ApiError::NotFound)?;
@@ -6980,15 +7330,54 @@ struct Caller {
     principal: Principal,
     /// `Some` when an issued API token authenticated this request.
     grant: Option<scarab_identity::ApiToken>,
+    /// How the credential was presented. `None` only for the dev-insecure
+    /// synthetic Owner (no session store wired), which presented nothing.
+    via: Option<AuthVia>,
+    /// The session behind the request, when it was one (cookie or Bearer) —
+    /// what a StepUpConfirmation is bound to (ADR-0073 §4, §7).
+    session: Option<SessionFacts>,
+}
+
+/// What ADR-0073 needs to know about the session a request rode on.
+#[derive(Debug, Clone)]
+struct SessionFacts {
+    /// The session id itself — the bearer credential. Kept only so a
+    /// StepUpConfirmationRequest raised over a Bearer session can seal it and
+    /// re-check, at replay, that the session is still live. Never logged.
+    id: step_up::requests::SessionSecret,
+    /// Hex SHA-256 of the session id: confirmations are keyed by it, never
+    /// by the id itself.
+    id_hash: String,
+    /// Until when it counts as a fresh browser login (first-passkey rule).
+    fresh_login_until: Option<i64>,
 }
 
 impl Caller {
-    /// A caller with no token narrowing — a session, or the dev-insecure
-    /// synthetic Owner.
-    fn session(principal: Principal) -> Self {
+    /// A caller with no token narrowing and no session behind it — the
+    /// dev-insecure synthetic Owner.
+    fn dev_insecure_owner(principal: Principal) -> Self {
         Self {
             principal,
             grant: None,
+            via: None,
+            session: None,
+        }
+    }
+
+    /// May a window / action StepUpConfirmation stand for this caller? Only a
+    /// human's own browser: a cookie session, never a token or a session
+    /// presented as Bearer (ADR-0073 §7).
+    fn is_browser_session(&self) -> bool {
+        self.grant.is_none() && self.via == Some(AuthVia::Cookie) && self.session.is_some()
+    }
+
+    /// The `caller` column of an OrgSecurityEventLog row.
+    fn event_label(&self) -> String {
+        match (&self.grant, self.via) {
+            (Some(token), _) => format!("api_token:{}", token.id),
+            (None, Some(AuthVia::Cookie)) => "session:cookie".to_string(),
+            (None, Some(AuthVia::Bearer)) => "session:bearer".to_string(),
+            (None, None) => "dev:insecure".to_string(),
         }
     }
 
@@ -7091,8 +7480,17 @@ async fn authenticate(
     headers: &HeaderMap,
     action: Action,
 ) -> Result<Caller, ApiError> {
+    // A StepUpConfirmationRequest being replayed (ADR-0073 §6): the request
+    // carries no credential at all. The caller is rebuilt from what raised
+    // it — the token by id, or the Bearer session — re-checked as live NOW
+    // and narrowed to the human's live authority; headers are ignored, and
+    // CSRF has nothing to defend (no browser sent this request). The
+    // task-local is set only by the confirm endpoint around its replay.
+    if let Some(authority) = step_up::requests::replay_authority() {
+        return step_up::requests::replay_caller(st, &authority).await;
+    }
     let Some(sessions) = st.sessions.as_ref() else {
-        return Ok(Caller::session(Principal {
+        return Ok(Caller::dev_insecure_owner(Principal {
             subject: "anonymous".into(),
             display_name: None,
             roles: vec![scarab_identity::Role::Owner],
@@ -7119,11 +7517,21 @@ async fn authenticate(
     // requests (API/CLI) carry the credential explicitly; no CSRF surface.
     if action != Action::Read && via == AuthVia::Cookie {
         let presented = headers.get("x-csrf-token").and_then(|v| v.to_str().ok());
-        if session.csrf.is_empty() || presented != Some(session.csrf.as_str()) {
+        if !session.csrf_matches(presented) {
             return Err(ApiError::Forbidden);
         }
     }
-    Ok(Caller::session(session.principal))
+    let facts = SessionFacts {
+        id: step_up::requests::SessionSecret(session.id.clone()),
+        id_hash: session_hash(&session.id),
+        fresh_login_until: session.fresh_login_until(),
+    };
+    Ok(Caller {
+        principal: session.principal,
+        grant: None,
+        via: Some(via),
+        session: Some(facts),
+    })
 }
 
 /// Authenticate a `scarab_pat_…` bearer (ADR-0049 amendment): hash it, load the
@@ -7173,6 +7581,8 @@ async fn authenticate_api_token(
             roles,
         },
         grant: Some(token),
+        via: Some(via),
+        session: None,
     })
 }
 
@@ -7282,6 +7692,7 @@ fn gate_approvers(events: &[EventKind], step: &StepId) -> Vec<String> {
 )]
 async fn approve_gate(
     State(st): State<AppState>,
+    Extension(guard): Extension<crate::step_up::GuardCtx>,
     headers: HeaderMap,
     Path((id, step)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
@@ -7289,6 +7700,51 @@ async fn approve_gate(
     let scope = run_scope(&st, &run).await;
     let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
     let step = StepId(step);
+
+    // 0. The governing Environment's effective rules for this Project
+    //    (ADR-0071 §3), resolved NOW — before the approval is recorded,
+    //    because they decide whether recording it needs a step-up (ADR-0073
+    //    §3): an approval on a gate of an Environment with approvers is a
+    //    crown jewel. So is one whose Environment cannot be resolved (gone,
+    //    no longer admitting the Project, or a store error) while governance
+    //    is wired — fail-closed: the approval would count if it came back.
+    //    A plain gate, or an Environment with no approvers, is exempt. The
+    //    same snapshot then governs the release below, so the approval is
+    //    judged and released under one set of rules.
+    let ctx = st.db.run_deploy_context(&run).await.map_err(ApiError::Db)?;
+    // The approval stays recorded when the gate is held; it counts if the
+    // Environment is restored.
+    let governance = gate_release_governance(
+        &st,
+        ctx.as_ref(),
+        "approval recorded, but the gate cannot release",
+    )
+    .await;
+    match (&ctx, &governance) {
+        (Some(c), Ok(Some(p))) if !p.approvers.is_empty() => {
+            guard
+                .require(
+                    &st,
+                    vec![format!(
+                        "approves a deploy of `{}` into `{}`, which requires approvers",
+                        c.project, c.environment
+                    )],
+                )
+                .await?
+        }
+        (Some(c), Err(_)) => {
+            guard
+                .require(
+                    &st,
+                    vec![format!(
+                        "approves a deploy of `{}` into `{}`, whose rules cannot be resolved",
+                        c.project, c.environment
+                    )],
+                )
+                .await?
+        }
+        _ => guard.exempt("no approvers required"),
+    }
 
     // 1. Record this principal's approval — append-only, no resume, idempotent
     //    per (step, subject).
@@ -7335,20 +7791,12 @@ async fn approve_gate(
             .into_response());
     }
 
-    // 2. Gather the accumulated approvers and the governing Environment's
-    //    effective rules for this Project (ADR-0071 §3), resolved NOW rather
-    //    than at Run creation: an admin's change since — tightened rules, a
-    //    withdrawn eligibility, a deleted Environment — governs the release.
+    // 2. Gather the accumulated approvers; the governing Environment's rules
+    //    were resolved at 0., NOW rather than at Run creation: an admin's
+    //    change since — tightened rules, a withdrawn eligibility, a deleted
+    //    Environment — governs the release.
     let approvers = gate_approvers(&st.db.events(&run).await.map_err(ApiError::Db)?, &step);
-    let ctx = st.db.run_deploy_context(&run).await.map_err(ApiError::Db)?;
-    // The approval above stays recorded when the gate is held; it counts if
-    // the Environment is restored.
-    let protection = gate_release_governance(
-        &st,
-        ctx.as_ref(),
-        "approval recorded, but the gate cannot release",
-    )
-    .await?;
+    let protection = governance?;
 
     // 3. A protected deploy releases only when admits() passes over the
     //    accumulated approvers (every required approver, and the ref still
@@ -7706,8 +8154,9 @@ pub fn results_token_message(run: &str, step: &str, attempt: &str) -> String {
 /// untrusted step never calls this — only the sidecar holds the token.
 ///
 /// 404 when no token secret is configured; 401 on a bad/missing token; 404 for
-/// an unknown step; 413 for an over-large body. The write is idempotent on the
-/// fence (a re-drive overwrites deterministically, ADR-0021).
+/// an unknown step; 413 for an over-large body; 409 when the attempt is no
+/// longer the step's running frontier. The write is idempotent on the fence
+/// (a re-drive overwrites deterministically, ADR-0021).
 #[utoipa::path(
     post,
     path = "/v1/runs/{id}/steps/{step}/results",
@@ -7718,7 +8167,8 @@ pub fn results_token_message(run: &str, step: &str, attempt: &str) -> String {
     responses(
         (status = 202, description = "results recorded"),
         (status = 401, description = "bad or missing token"),
-        (status = 404, description = "no such step, or results ingest disabled")
+        (status = 404, description = "no such step, or results ingest disabled"),
+        (status = 409, description = "the attempt is not the step's running frontier")
     )
 )]
 async fn ingest_step_results(
@@ -7768,11 +8218,24 @@ async fn ingest_step_results(
 
     // The fence the token authenticated names the attempt — the ingested
     // results land on that attempt's immutable evidence row as well as the
-    // step's latest-evidence denormalization (ADR-0056).
-    st.db
-        .set_step_results(&run, &step, &AttemptId(attempt.to_string()), &results)
-        .await?;
-    Ok(StatusCode::ACCEPTED)
+    // step's latest-evidence denormalization (ADR-0056) — but only while that
+    // attempt is the step's frontier and the step still runs (review safety
+    // S1). A late POST after the verdict was released (the bounded drain,
+    // git-bug f02588d), or from a superseded attempt, would overwrite results
+    // dependents already consumed: 409, nothing written.
+    match st
+        .db
+        .ingest_attempt_results(&run, &step, &AttemptId(attempt.to_string()), &results)
+        .await
+    {
+        Ok(()) => Ok(StatusCode::ACCEPTED),
+        Err(DbError::Conflict) => Err(ApiError::Conflict(format!(
+            "attempt `{attempt}` of step `{}` is no longer running: its results were \
+             already settled",
+            step.0
+        ))),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Build a [`SecretScope`] from the flat org/repo/environment selector,
@@ -7840,6 +8303,7 @@ async fn put_secret(
 ) -> Result<StatusCode, ApiError> {
     let scope = rbac_scope(&req.org, req.repo.as_deref());
     authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
+    refuse_reserved_secret_org(&req.org)?;
     let secrets = st.secrets.as_ref().ok_or(ApiError::NotFound)?;
     if req.name.is_empty() {
         return Err(ApiError::BadRequest("name is required".into()));
@@ -7879,6 +8343,7 @@ async fn list_secrets(
 ) -> Result<Json<SecretListResponse>, ApiError> {
     let rscope = rbac_scope(&q.org, q.repo.as_deref());
     authorize_scoped(&st, &headers, Action::Administer, Some(&rscope)).await?;
+    refuse_reserved_secret_org(&q.org)?;
     let secrets = st.secrets.as_ref().ok_or(ApiError::NotFound)?;
     let scope = secret_scope(q.org, q.repo, q.environment)?;
     let names = secrets.list_scoped(&scope).await.map_err(secret_err)?;
@@ -7907,6 +8372,7 @@ async fn delete_secret(
 ) -> Result<StatusCode, ApiError> {
     let rscope = rbac_scope(&q.org, q.repo.as_deref());
     authorize_scoped(&st, &headers, Action::Administer, Some(&rscope)).await?;
+    refuse_reserved_secret_org(&q.org)?;
     let secrets = st.secrets.as_ref().ok_or(ApiError::NotFound)?;
     let name = q
         .name
@@ -8508,6 +8974,9 @@ async fn secret_matrix(
 ) -> Result<Json<SecretMatrix>, ApiError> {
     let scope = rbac_scope(&org, Some(&repo));
     authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
+    // The matrix is a read (and annotation) surface over the same scopes
+    // as `/v1/secrets`, so it is held to the same rule (redteam auth-4).
+    refuse_reserved_secret_org(&org)?;
     let governance = st
         .environment_governance
         .as_ref()
@@ -8652,6 +9121,9 @@ async fn silence_secret_cell(
 ) -> Result<StatusCode, ApiError> {
     let scope = rbac_scope(&org, Some(&repo));
     authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
+    // The matrix is a read (and annotation) surface over the same scopes
+    // as `/v1/secrets`, so it is held to the same rule (redteam auth-4).
+    refuse_reserved_secret_org(&org)?;
     let store = st.secret_coverage.as_ref().ok_or(ApiError::NotFound)?;
     if req.key.is_empty() {
         return Err(ApiError::BadRequest("key is required".into()));
@@ -8685,6 +9157,9 @@ async fn unsilence_secret_cell(
 ) -> Result<StatusCode, ApiError> {
     let scope = rbac_scope(&org, Some(&repo));
     authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
+    // The matrix is a read (and annotation) surface over the same scopes
+    // as `/v1/secrets`, so it is held to the same rule (redteam auth-4).
+    refuse_reserved_secret_org(&org)?;
     let store = st.secret_coverage.as_ref().ok_or(ApiError::NotFound)?;
     if q.key.is_empty() {
         return Err(ApiError::BadRequest("key is required".into()));
@@ -8802,6 +9277,37 @@ pub struct ResyncResultDto {
 /// within this scope; the material (GitHub App PEM / Forgejo token) is fetched
 /// here at use-time and never persisted on the connection.
 pub const FORGE_CREDENTIALS_ORG: &str = "_forge";
+
+/// Org names Scarab keeps for itself: every `_`-prefixed name. Its own
+/// credential scopes live there — [`FORGE_CREDENTIALS_ORG`] and
+/// [`plugins::PLUGIN_CONNECTION_CREDENTIALS_ORG`] — so no Project is homed in
+/// one (it would inherit those secrets; the registry's `bind_repo` refuses it
+/// on every path), no plugin is installed into one, and `/v1/secrets`
+/// reaches only `_forge` among them (git-bug 97223c7).
+pub use scarab_forge::is_reserved_org;
+
+/// `400` when `org` is reserved ([`is_reserved_org`]); `use_` names what it
+/// was refused for.
+pub(crate) fn refuse_reserved_org(org: &str, use_: &str) -> Result<(), ApiError> {
+    if is_reserved_org(org) {
+        return Err(ApiError::BadRequest(format!(
+            "`{org}` is a reserved org name (`_`-prefixed names are Scarab's own): \
+             it cannot {use_}"
+        )));
+    }
+    Ok(())
+}
+
+/// The orgs `/v1/secrets` may address: every real one and, of the reserved
+/// ones, only [`FORGE_CREDENTIALS_ORG`] — the forge App key is documented to
+/// be written there through this endpoint. Plugin connection credentials
+/// have their own API.
+fn refuse_reserved_secret_org(org: &str) -> Result<(), ApiError> {
+    if org == FORGE_CREDENTIALS_ORG {
+        return Ok(());
+    }
+    refuse_reserved_org(org, "hold secrets written through /v1/secrets")
+}
 
 /// The gate every `/v1/connections*` endpoint shares: `Administer` on the Org.
 ///
@@ -9311,6 +9817,17 @@ async fn resync_connection(
             confirmed += 1;
             continue;
         }
+        // A forge account named like one of Scarab's own Orgs is never homed
+        // there (the registry refuses it too); skipping it keeps one such
+        // repo from failing the whole re-sync.
+        if is_reserved_org(&repo.owner) {
+            tracing::warn!(
+                connection = %id,
+                repo = %format!("{}/{}", repo.owner, repo.name),
+                "re-sync skipped a repo whose owner is a reserved org name"
+            );
+            continue;
+        }
         // Project name = repo name, org = repo owner — the same 1:1 mapping
         // `apply_installation_sync` uses, so a re-synced Project is
         // indistinguishable from a webhook-registered one.
@@ -9699,6 +10216,7 @@ async fn bind_repo(
     if repo.owner.is_empty() || repo.name.is_empty() {
         return Err(ApiError::BadRequest("owner and name are required".into()));
     }
+    refuse_reserved_org(&repo.owner, "own a bound repo")?;
 
     // `bind_repo` upserts, so re-binding a repo owned by ANOTHER connection would
     // silently re-home a live Project onto a different forge account. A v1
@@ -10155,6 +10673,10 @@ fn tag_for_path(path: &str) -> Option<&'static str> {
         || path.starts_with("/v1/auth/")
         || path == "/v1/me"
         || path.starts_with("/v1/me/")
+        || path.starts_with("/v1/step-up/")
+        || path.starts_with("/v1/security/")
+        || path.contains("/security/")
+        || path.contains("/passkeys/")
         || path.contains("bindings")
         || path.contains("/principals")
         || path.contains("/tokens")
@@ -10315,10 +10837,81 @@ impl utoipa::Modify for SecuritySchemes {
     }
 }
 
+/// Documents the step-up guard (ADR-0073) on every operation it governs,
+/// from the route table itself — so the spec cannot drift from what the
+/// guard enforces: each crown jewel (and each conditional one) can answer
+/// `403 step_up_required` with a [`step_up::StepUpRefusal`] body, a machine
+/// caller `429` when it has too many requests waiting, and a conditional
+/// Environment write `409` when the state changed under it.
+struct StepUpResponses;
+
+impl utoipa::Modify for StepUpResponses {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        use axum::http::Method;
+        use utoipa::openapi::{ContentBuilder, Ref, RefOr, ResponseBuilder};
+        const STEP_UP: &str = "`step_up_required` (ADR-0073): a crown-jewel operation needs a \
+             fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` \
+             or `action`; `enroll` when there is no passkey yet). An API token or a Bearer \
+             session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its \
+             human confirms.";
+        const TOO_MANY: &str = "an API token or Bearer session already has 10 step-up \
+             confirmation requests waiting (ADR-0073 §6)";
+        const CHANGED: &str = "the governed state changed between this request's read and its \
+             write (reload and retry), or the request conflicts with the current state";
+        let plain = |d: &str| RefOr::T(ResponseBuilder::new().description(d).build());
+        for entry in route_table() {
+            let conditional = matches!(entry.op.class, step_up::Class::Conditional { .. });
+            if !(conditional || matches!(entry.op.class, step_up::Class::CrownJewel(_))) {
+                continue;
+            }
+            let Some(item) = openapi.paths.paths.get_mut(entry.path) else {
+                continue;
+            };
+            let op = match entry.method {
+                Method::POST => item.post.as_mut(),
+                Method::PUT => item.put.as_mut(),
+                Method::DELETE => item.delete.as_mut(),
+                _ => None,
+            };
+            let Some(op) = op else { continue };
+            let refusal = ContentBuilder::new()
+                .schema(Some(Ref::from_schema_name("StepUpRefusal")))
+                .build();
+            let responses = &mut op.responses.responses;
+            match responses.get_mut("403") {
+                Some(RefOr::T(resp)) => {
+                    if !resp.description.contains("step_up_required") {
+                        resp.description = format!("{} — or {STEP_UP}", resp.description);
+                    }
+                    resp.content
+                        .entry("application/json".to_string())
+                        .or_insert(refusal);
+                }
+                Some(RefOr::Ref(_)) => {}
+                None => {
+                    let resp = ResponseBuilder::new()
+                        .description(format!("{STEP_UP} Or the caller's role is insufficient."))
+                        .content("application/json", refusal)
+                        .build();
+                    responses.insert("403".to_string(), RefOr::T(resp));
+                }
+            }
+            responses
+                .entry("429".to_string())
+                .or_insert_with(|| plain(TOO_MANY));
+            if conditional {
+                responses
+                    .entry("409".to_string())
+                    .or_insert_with(|| plain(CHANGED));
+            }
+        }
+    }
+}
+
 /// The generated OpenAPI document. The pipeline request schema is the IR subset.
 #[derive(OpenApi)]
 #[openapi(
-    modifiers(&TagGroups, &SecuritySchemes),
+    modifiers(&TagGroups, &SecuritySchemes, &StepUpResponses),
     paths(
         healthz,
         readyz,
@@ -10426,7 +11019,21 @@ impl utoipa::Modify for SecuritySchemes {
         release_gate_external,
         put_secret,
         list_secrets,
-        delete_secret
+        delete_secret,
+        step_up::ceremony::me_security,
+        step_up::ceremony::passkey_registration_options,
+        step_up::ceremony::passkey_registration,
+        step_up::ceremony::remove_passkey,
+        step_up::ceremony::step_up_options,
+        step_up::ceremony::step_up_confirm,
+        step_up::requests::get_request,
+        step_up::requests::request_options,
+        step_up::requests::confirm_request,
+        step_up::events::my_security_events,
+        step_up::events::security_events,
+        step_up::events::org_security_events,
+        step_up::events::org_security_summary,
+        step_up::admin::reset_member_passkeys
     ),
     components(schemas(
         CreateRunRequest,
@@ -10442,6 +11049,7 @@ impl utoipa::Modify for SecuritySchemes {
         CreateRunResponse,
         RunListResponse,
         RunSummaryDto,
+        WaitingGateDto,
         RunStatusResponse,
         SnapshotRetentionDto,
         RerunPlanResponse,
@@ -10526,7 +11134,22 @@ impl utoipa::Modify for SecuritySchemes {
         plugins::UnmappedGroupingDto,
         plugins::DeploymentSourceTargetDto,
         plugins::PluginConnectionDto,
-        plugins::PutPluginConnectionRequest
+        plugins::PutPluginConnectionRequest,
+        step_up::OpSummary,
+        step_up::StepUpRefusal,
+        step_up::WebauthnChallengeDto,
+        step_up::ceremony::PasskeyDto,
+        step_up::ceremony::MeSecurityResponse,
+        step_up::ceremony::PasskeyRegistrationOptionsRequest,
+        step_up::ceremony::PasskeyRegistrationRequest,
+        step_up::ceremony::StepUpConfirmRequest,
+        step_up::ceremony::StepUpConfirmResponse,
+        step_up::requests::StepUpRequestDto,
+        step_up::requests::StepUpRequestResultDto,
+        step_up::events::SecurityEventDto,
+        step_up::events::SecurityEventsResponse,
+        step_up::events::OrgSecuritySummary,
+        step_up::admin::PasskeyResetDto
     ))
 )]
 pub struct ApiDoc;
@@ -10546,229 +11169,16 @@ pub fn router(state: AppState) -> Router {
 }
 
 fn router_inner(state: AppState) -> Router {
-    Router::new()
-        .route("/healthz", get(healthz))
-        .route("/readyz", get(readyz))
-        .route("/metrics", get(metrics))
-        .route("/openapi.json", get(openapi))
-        .route("/.well-known/jwks.json", get(jwks))
-        .route(
-            "/.well-known/openid-configuration",
-            get(openid_configuration),
-        )
-        .route("/v1/auth/login", post(login).get(oauth_login_redirect))
-        .route("/v1/auth/callback", get(oauth_callback))
-        .route("/v1/auth/providers", get(auth_providers))
-        .route("/v1/auth/logout", post(logout))
-        .route("/v1/me", get(me))
-        .route("/v1/me/identities/link", post(begin_link_identity))
-        .route("/v1/me/identities/{provider}", delete(unlink_identity))
-        .route(
-            "/v1/orgs/{org}/bindings",
-            get(list_bindings).put(put_binding).delete(delete_binding),
-        )
-        .route("/v1/orgs/{org}/principals", get(search_principals))
-        .route(
-            "/v1/orgs/{org}/tokens",
-            get(list_api_tokens).post(mint_api_token),
-        )
-        .route("/v1/orgs/{org}/tokens/{id}", delete(revoke_api_token))
-        .route(
-            "/v1/repos/{org}/{repo}/bindings/import",
-            post(import_bindings),
-        )
-        .route("/v1/repos", get(list_projects))
-        .route("/v1/repos/{org}/{repo}/runs", get(list_repo_runs))
-        .route("/v1/runs", post(create_run).get(list_runs))
-        .route("/v1/runs/{id}", get(get_run))
-        .route("/v1/runs/{id}/events", get(get_events))
-        .route("/v1/runs/{id}/logs", get(get_logs))
-        .route("/v1/runs/{id}/steps/{step}/rerun", post(rerun_step))
-        // Deprecated alias for pre-rename callers (restart→rerun, 2026-07-23):
-        // same handler, intentionally NOT in the OpenAPI surface.
-        .route("/v1/runs/{id}/steps/{step}/restart", post(rerun_step))
-        .route("/v1/runs/{id}/steps/{step}/retry", post(retry_step))
-        // The rerun PREVIEW (ADR-0061 s5): what the rerun would actually execute,
-        // read before the button is pressed so a widened scope is never a surprise.
-        .route("/v1/runs/{id}/steps/{step}/rerun-plan", get(rerun_plan))
-        // The manual Workspace-Snapshot pin (ADR-0061 s5) — one resource, two
-        // verbs, because pin and unpin are the same fact in two states.
-        .route(
-            "/v1/runs/{id}/snapshots-pin",
-            post(pin_run_snapshots).delete(unpin_run_snapshots),
-        )
-        .route("/v1/runs/{id}/cancel", post(cancel_run))
-        .route("/v1/runs/{id}/artifacts", get(list_artifacts))
-        .route("/v1/runs/{id}/artifacts/{*name}", get(download_artifact))
-        .route("/v1/runs/{id}/steps/{step}/logs", get(get_step_logs))
-        .route("/v1/runs/{id}/services", get(get_services))
-        .route(
-            "/v1/runs/{id}/services/{service}/logs",
-            get(get_service_logs),
-        )
-        .route("/v1/runs/{id}/steps/{step}/attach", get(attach_step))
-        .route("/v1/runs/{id}/steps/{step}/debug-pod", get(debug_pod_step))
-        .route("/v1/runs/{id}/steps/{step}/workspace", get(list_workspace))
-        .route(
-            "/v1/runs/{id}/steps/{step}/workspace/file",
-            get(get_workspace_file),
-        )
-        .route("/v1/runs/{id}/gates/{step}/approve", post(approve_gate))
-        .route("/v1/runs/{id}/gates/{step}/reject", post(reject_gate))
-        .route(
-            "/v1/runs/{id}/gates/{step}/release",
-            post(release_gate_external),
-        )
-        .route(
-            "/v1/runs/{id}/steps/{step}/results",
-            get(get_step_results).post(ingest_step_results),
-        )
-        .route(
-            "/v1/runs/{id}/steps/{step}/consumed",
-            get(get_attempt_consumed),
-        )
-        .route(
-            "/v1/secrets",
-            post(put_secret).get(list_secrets).delete(delete_secret),
-        )
-        .route(
-            "/v1/repos/{org}/{repo}/environments",
-            get(list_environments),
-        )
-        .route(
-            "/v1/repos/{org}/{repo}/environments/{name}",
-            axum::routing::put(put_environment)
-                .get(get_environment)
-                .delete(delete_environment),
-        )
-        .route(
-            "/v1/repos/{org}/{repo}/environments/{name}/deployments",
-            get(list_deployments),
-        )
-        .route(
-            "/v1/orgs/{org}/environments",
-            get(org_environments::list_org_environments),
-        )
-        .route(
-            "/v1/orgs/{org}/environments/{env}",
-            axum::routing::put(org_environments::put_org_environment)
-                .get(org_environments::get_org_environment)
-                .delete(org_environments::delete_org_environment),
-        )
-        .route(
-            "/v1/orgs/{org}/environments/{env}/eligibility",
-            axum::routing::put(org_environments::put_environment_eligibility)
-                .get(org_environments::get_environment_eligibility),
-        )
-        .route(
-            "/v1/orgs/{org}/environments/{env}/protection",
-            axum::routing::put(org_environments::put_environment_protection)
-                .get(org_environments::get_environment_protection),
-        )
-        .route(
-            "/v1/orgs/{org}/environments/{env}/projects",
-            get(org_environments::list_environment_projects),
-        )
-        .route(
-            "/v1/orgs/{org}/environments/{env}/projects/{project}/overlay",
-            axum::routing::put(org_environments::put_environment_project_overlay)
-                .get(org_environments::get_environment_project_overlay)
-                .delete(org_environments::delete_environment_project_overlay),
-        )
-        .route(
-            "/v1/orgs/{org}/environments/{env}/projects/{project}/privilege-grant",
-            axum::routing::put(org_environments::put_environment_project_privilege_grant)
-                .get(org_environments::get_environment_project_privilege_grant)
-                .delete(org_environments::delete_environment_project_privilege_grant),
-        )
-        .route(
-            "/v1/orgs/{org}/environment-migration-report",
-            get(org_environments::get_environment_migration_report),
-        )
-        .route(
-            "/v1/orgs/{org}/environment-migration-report/{env}/acknowledge",
-            post(org_environments::acknowledge_environment_migration_report),
-        )
-        .route(
-            "/v1/orgs/{org}/environments/{env}/deployment-targets",
-            get(plugins::environment_deployment_targets),
-        )
-        .route(
-            "/v1/orgs/{org}/plugin-catalog",
-            get(plugins::plugin_catalog),
-        )
-        .route(
-            "/v1/orgs/{org}/plugins",
-            get(plugins::list_plugins).post(plugins::install_plugin),
-        )
-        .route(
-            "/v1/orgs/{org}/plugins/{name}",
-            get(plugins::get_plugin).delete(plugins::uninstall_plugin),
-        )
-        .route(
-            "/v1/orgs/{org}/plugins/{name}/kill",
-            post(plugins::kill_plugin),
-        )
-        .route(
-            "/v1/orgs/{org}/plugins/{name}/enable",
-            post(plugins::enable_plugin),
-        )
-        .route(
-            "/v1/orgs/{org}/plugins/{name}/unmapped-groupings",
-            get(plugins::unmapped_groupings),
-        )
-        .route(
-            "/v1/orgs/{org}/plugins/{name}/connections",
-            get(plugins::list_plugin_connections),
-        )
-        .route(
-            "/v1/orgs/{org}/plugins/{name}/connections/{slot}",
-            axum::routing::put(plugins::put_plugin_connection)
-                .delete(plugins::delete_plugin_connection),
-        )
-        .route("/v1/orgs/{org}/board", get(get_environment_board))
-        .route(
-            "/v1/orgs/{org}/environments/{env}/deployments",
-            get(list_environment_deployments),
-        )
-        .route(
-            "/v1/orgs/{org}/environments/{env}/deployments/{id}",
-            get(get_deployment),
-        )
-        .route(
-            "/v1/connections",
-            get(list_connections).post(create_connection),
-        )
-        .route(
-            "/v1/connections/{id}",
-            axum::routing::delete(delete_connection),
-        )
-        .route("/v1/connections/{id}/resync", post(resync_connection))
-        .route("/v1/connections/{id}/preflight", get(connection_preflight))
-        .route("/v1/connections/{id}/available-repos", get(available_repos))
-        .route("/v1/connections/{id}/repos", post(bind_repo))
-        .route(
-            "/v1/connections/{id}/repos/{owner}/{name}",
-            axum::routing::delete(unbind_repo),
-        )
-        .route(
-            "/v1/connections/{id}/repos/{owner}/{name}/webhook",
-            post(register_repo_webhook),
-        )
-        .route("/v1/repos/{org}/{repo}/secrets/matrix", get(secret_matrix))
-        .route(
-            "/v1/repos/{org}/{repo}/secrets/matrix/silenced",
-            axum::routing::put(silence_secret_cell).delete(unsilence_secret_cell),
-        )
-        .route("/v1/repos/{org}/{repo}/refs", get(list_refs))
-        .route("/v1/repos/{org}/{repo}/pipelines", get(list_pipelines))
-        .route(
-            "/v1/repos/{org}/{repo}/pipelines/{name}/interface",
-            get(pipeline_interface),
-        )
-        .route("/v1/repos/{org}/{repo}/dispatch", post(dispatch))
-        .route("/webhooks/github", post(github_webhook))
-        .route("/webhooks/forgejo", post(forgejo_webhook))
+    // The single route list lives in `routes.rs`, each route registered with
+    // its ADR-0073 classification.
+    routes::governed_routes()
+        .router
+        // ADR-0073: the step-up guard runs on every matched route, deciding
+        // from the route's registered classification.
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            step_up::guard::guard,
+        ))
         // The embedded web UI (ADR-0054): everything no API route claimed
         // falls through here — a real file from dist/, else index.html (SPA
         // client routing). Same-origin by construction: no CORS anywhere.
@@ -10782,7 +11192,25 @@ fn router_inner(state: AppState) -> Router {
 /// gets it; anything else (a client-side route like `/acme/web/runs/…`) gets
 /// index.html. Path traversal is rejected by segment sanitization. With no
 /// UI dir configured (dev API-only), non-API paths are plain 404s.
+///
+/// Every answer forbids framing (`frame-ancestors 'none'`, `X-Frame-Options:
+/// DENY`): the step-up confirm page is a human's last look at what a token
+/// asked to run, and a framed one could be click-jacked (ADR-0073 §6).
 async fn serve_ui(State(st): State<AppState>, uri: axum::http::Uri) -> Response {
+    let mut resp = serve_ui_file(&st, &uri).await;
+    let headers = resp.headers_mut();
+    headers.insert(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        axum::http::HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    headers.insert(
+        axum::http::header::X_FRAME_OPTIONS,
+        axum::http::HeaderValue::from_static("DENY"),
+    );
+    resp
+}
+
+async fn serve_ui_file(st: &AppState, uri: &axum::http::Uri) -> Response {
     let Some(dir) = &st.ui_dir else {
         return StatusCode::NOT_FOUND.into_response();
     };

@@ -7,7 +7,11 @@
 //! - a deploy Step held by per-DeploymentTarget concurrency carries `held`,
 //!   the oracle's reason — never while its Run is still queued (`Pending`);
 //! - a Deployment record that cannot be read is said so
-//!   (`record_unreadable`), never shown as "no Deployment recorded yet".
+//!   (`record_unreadable`), never shown as "no Deployment recorded yet";
+//! - a waiting DeploymentGate says when it fails (`fails_at`), on the
+//!   engine's clock;
+//! - `GET /v1/runs` lists each Run's waiting gates (`waiting_gates`), even
+//!   while the Run is `running`.
 //!
 //! No kind: steps run on the `FakeExecutor`, reports go through
 //! `DeploymentStore::append`, the scheduler is ticked by hand with the
@@ -34,8 +38,8 @@ use scarab_deployment::{
 };
 use scarab_engine::ports::ExecState;
 use scarab_engine::{
-    AttemptOutcome, Clock, Db, DeployContext, RunDeploymentRequest, RunId, RunStatus, Scheduler,
-    StepId, StepRun, StepSpec, StepStatus,
+    retry_step, AttemptOutcome, Clock, Db, DeployContext, RunDeploymentRequest, RunId, RunStatus,
+    Scheduler, StepId, StepRun, StepSpec, StepStatus,
 };
 use scarab_project::{
     EnvironmentDeploymentDeadline, EnvironmentGovernanceStore, EnvironmentProjectEligibility,
@@ -67,6 +71,7 @@ fn spec() -> StepSpec {
 struct World {
     db: Arc<dyn Db>,
     store: Arc<dyn DeploymentStore>,
+    governance: Arc<dyn EnvironmentGovernanceStore>,
     oracle: ServerDeploymentGates,
     clock: Arc<FakeClock>,
     exec: FakeExecutor,
@@ -153,11 +158,12 @@ impl World {
         let app = router(
             AppState::new(db.clone(), clock.clone(), logs)
                 .with_deployments(store.clone())
-                .with_environment_governance(governance),
+                .with_environment_governance(governance.clone()),
         );
         World {
             db,
             store,
+            governance,
             oracle,
             clock,
             exec,
@@ -243,6 +249,12 @@ impl World {
         assert!(isolated.is_empty(), "{isolated:?}");
     }
 
+    async fn ticks(&self, n: usize) {
+        for _ in 0..n {
+            self.tick().await;
+        }
+    }
+
     async fn step(&self, run: &str, step: &str) -> StepRun {
         self.db
             .steps_of_run(&rid(run))
@@ -302,6 +314,33 @@ impl World {
             )
             .await
             .unwrap();
+    }
+
+    /// `run`'s row in `GET /v1/runs`.
+    async fn run_summary(&self, run: &str) -> Value {
+        let resp = self
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/runs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        body["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == run)
+            .unwrap_or_else(|| panic!("no run {run} in {body}"))
+            .clone()
     }
 
     /// `GET /v1/runs/{run}`'s DTO of `step`.
@@ -420,6 +459,133 @@ both!(
     a_resolved_deployment_gate_shows_its_verdict_and_reason,
     None
 );
+
+/// git-bug `ec84c5d`: a waiting DeploymentGate's `fails_at` is the ENGINE's
+/// clock — its wait's window plus its Project's effective gate deadline —
+/// not the Deployment's status clock (the Environment's baseline over the
+/// Deployment's lifetime). The Project's overlay tightens the gate deadline
+/// to 2 min. A first wait fails at the deploy Step's start + 2 min; after it
+/// stalls and is Retried long after, the Deployment reads `stalled` while the
+/// Retry validly waits afresh, and `fails_at` is the Retry's start + 2 min —
+/// the very instant the engine fails it.
+async fn a_retried_gate_fails_at_its_own_deadline_not_the_deployments(w: World) {
+    const GATE_DEADLINE: i64 = 2 * 60_000;
+    w.governance
+        .put_environment_project_overlay(
+            &EnvironmentProjectOverlay {
+                org: ORG.into(),
+                environment: ENV.into(),
+                project: PROJECT.into(),
+                rules: EnvironmentProtectionRules::default(),
+                deployment_gate_deadline: Some(
+                    EnvironmentDeploymentDeadline::new(GATE_DEADLINE).unwrap(),
+                ),
+            },
+            "amy",
+            2,
+        )
+        .await
+        .unwrap();
+    w.seed("ra").await;
+    w.deploying("ra").await;
+    let deploy_started = w.step("ra", "bump").await.attempts[0].started_at.0;
+    w.gate_waiting("ra").await;
+
+    let live = w.step_dto("ra", "live").await;
+    assert_eq!(
+        live["deployment_gate"]["fails_at"],
+        deploy_started + GATE_DEADLINE,
+        "a first wait runs from the deploy Step's start: {live}"
+    );
+
+    // Silence well past every baseline (5 min on pg, 1 h in memory): the
+    // gate stalls on its own 2 min; the Deployment itself stalls too.
+    w.clock.advance(2 * 60 * 60_000);
+    w.ticks(3).await;
+    assert_eq!(w.step("ra", "live").await.status, StepStatus::Failed);
+
+    let retried_at = w.clock.now().await.0;
+    retry_step(&*w.db, &*w.clock, &rid("ra"), &id("live"), None)
+        .await
+        .unwrap();
+    w.ticks(3).await;
+    let gate = w.step("ra", "live").await;
+    assert_eq!(gate.status, StepStatus::Pending, "the Retry waits afresh");
+    assert_eq!(
+        gate.attempts.last().unwrap().outcome,
+        AttemptOutcome::Running
+    );
+
+    let live = w.step_dto("ra", "live").await;
+    let waiting = &live["deployment_gate"];
+    assert_eq!(
+        waiting["deployment_status"], "stalled",
+        "the Deployment's own status is kept: {live}"
+    );
+    assert_eq!(
+        waiting["fails_at"],
+        retried_at + GATE_DEADLINE,
+        "the gate fails on its own clock: {live}"
+    );
+
+    // And the engine agrees: still waiting a millisecond before, failed at it.
+    w.clock.advance(GATE_DEADLINE - 1);
+    w.ticks(2).await;
+    assert_eq!(w.step("ra", "live").await.status, StepStatus::Pending);
+    w.clock.advance(1);
+    w.ticks(2).await;
+    assert_eq!(w.step("ra", "live").await.status, StepStatus::Failed);
+    w.finish().await;
+}
+both!(
+    a_retried_gate_fails_at_its_own_deadline_not_the_deployments,
+    None
+);
+
+/// git-bug `c489346`: a waiting gate holds only its dependents (ADR-0070 §9),
+/// so a manual gate reached while an independent sibling still runs leaves
+/// the Run `running`. The run list says it waits on that gate anyway —
+/// `waiting_gates` — which is what the dashboard's "waiting on you" inbox
+/// filters on, not `status == suspended`.
+async fn a_running_run_lists_the_gate_it_waits_on(w: World) {
+    let run = rid("rm");
+    let now = w.clock.now().await;
+    w.db.create_run(&run, 2, 1, now).await.unwrap();
+    w.db.create_step_run(&run, &id("slow"), Some(&spec()), &[], now)
+        .await
+        .unwrap();
+    w.db.create_step_run(&run, &id("approve"), None, &[], now)
+        .await
+        .unwrap();
+    w.db.set_step_gate(&run, &id("approve"), "manual", None)
+        .await
+        .unwrap();
+    // The unscripted FakeExecutor keeps `slow` Running.
+    w.ticks(3).await;
+    assert_eq!(w.step("rm", "slow").await.status, StepStatus::Running);
+    let gate = w.step("rm", "approve").await;
+    assert_eq!(gate.status, StepStatus::Pending);
+    let opened = gate
+        .attempts
+        .last()
+        .expect("the reached gate has an Attempt");
+    assert_eq!(opened.outcome, AttemptOutcome::Running);
+    assert_eq!(
+        w.db.run_status(&run).await.unwrap(),
+        Some(RunStatus::Running),
+        "the gate holds only its dependents; the run is not suspended"
+    );
+
+    let listed = w.run_summary("rm").await;
+    assert_eq!(listed["status"], "running", "{listed}");
+    assert_eq!(
+        listed["waiting_gates"],
+        json!([{ "step": "approve", "kind": "manual", "since": opened.started_at.0 }]),
+        "{listed}"
+    );
+    w.finish().await;
+}
+both!(a_running_run_lists_the_gate_it_waits_on, None);
 
 /// Limit 1: while A deploys to `argocd`/`web`, B's deploy step is held, and
 /// its DTO says why with the oracle's reason; A's is not held.

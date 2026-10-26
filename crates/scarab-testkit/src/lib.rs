@@ -28,6 +28,13 @@ use scarab_storage::{ObjectStore, StorageError};
 mod environment_governance;
 pub use environment_governance::InMemoryEnvironmentGovernance;
 
+/// In-memory step-up stores (ADR-0073) and a real-AEAD test `Sealer`, with
+/// the Postgres adapter's single-use, expiry and compare-and-swap semantics.
+mod step_up;
+pub use step_up::{
+    InMemoryChallenges, InMemoryPasskeys, InMemorySecurityEvents, InMemoryStepUp,
+};
+
 // ---------------------------------------------------------------------------
 // FakeClock — manually-advanced virtual time
 // ---------------------------------------------------------------------------
@@ -118,6 +125,8 @@ struct AttemptEvidenceRec {
     output: Option<String>,
     results: std::collections::BTreeMap<String, serde_json::Value>,
     consumed: std::collections::BTreeMap<String, String>,
+    /// The launch-time workspace input steps (git-bug b6b8510).
+    workspace_input_steps: Option<Vec<StepId>>,
 }
 
 /// Build a [`RunSummary`] from the in-memory state, projecting the stored
@@ -152,6 +161,8 @@ struct InMemoryState {
     events: Vec<EventKind>,
     /// Current run statuses — the "state table" the real store keeps.
     runs: HashMap<RunId, RunStatus>,
+    /// Per-run reopen generation ([`Db::run_reopen_generation`]); absent = 0.
+    run_reopen_generations: HashMap<RunId, u64>,
     /// Compiled IR stored per run (self-describing runs, ADR-0022).
     run_ir: HashMap<RunId, serde_json::Value>,
     /// Resolved launch parameters per run (ADR-0043).
@@ -238,6 +249,14 @@ struct InMemoryState {
     /// reads fail with a backend error, modelling a "poison run" — one whose
     /// tick work cannot complete. See [`InMemoryDb::poison_run`].
     poisoned_runs: std::collections::HashSet<RunId>,
+    /// Test-only one-shot crash injector (git-bug 586187a): the next event
+    /// write whose payload matches fails with a backend error. A standalone
+    /// [`append_event`](Db::append_event) fails alone; inside an atomic unit
+    /// ([`commit_step_transition`](Db::commit_step_transition),
+    /// [`finish_step_with_deployment_requests`](Db::finish_step_with_deployment_requests))
+    /// the whole unit fails with nothing landed — the Postgres rollback. See
+    /// [`InMemoryDb::fail_next_event_append`].
+    event_append_failure: Option<fn(&scarab_engine::EventPayload) -> bool>,
     /// Test-only one-shot interleaving (slice b1-fix): when armed for a gate,
     /// the next [`close_running_attempt`](Db::close_running_attempt) on it
     /// first resolves the gate (pass, unfenced, at the armed instant) — a
@@ -510,6 +529,21 @@ impl InMemoryDb {
         self.state.lock().unwrap().poisoned_runs.insert(run.clone());
     }
 
+    /// Arm a one-shot crash between a step's CAS and its journal (test seam
+    /// for git-bug 586187a): the next event write whose payload satisfies
+    /// `matches` fails. A store that writes the CAS and its events as one
+    /// unit loses both; one that writes them separately keeps the CAS and
+    /// loses the event — the crash-between window, constructed.
+    pub fn fail_next_event_append(&self, matches: fn(&scarab_engine::EventPayload) -> bool) {
+        self.state.lock().unwrap().event_append_failure = Some(matches);
+    }
+
+    /// Whether a [`fail_next_event_append`](Self::fail_next_event_append)
+    /// is still armed — `false` once it fired.
+    pub fn event_append_failure_armed(&self) -> bool {
+        self.state.lock().unwrap().event_append_failure.is_some()
+    }
+
     /// Clear a [`poison_run`](Self::poison_run) injection — the transient case,
     /// where a later tick simply succeeds.
     pub fn heal_run(&self, run: &RunId) {
@@ -533,6 +567,122 @@ fn attempt_number(a: &Attempt) -> u64 {
         .strip_prefix('a')
         .and_then(|n| n.parse::<u64>().ok())
         .unwrap_or(0)
+}
+
+/// Consume an armed [`InMemoryDb::fail_next_event_append`] if any of
+/// `events` matches it: `Err` = the write fails (nothing may land).
+fn take_event_append_failure(st: &mut InMemoryState, events: &[EventKind]) -> Result<(), DbError> {
+    if let Some(matches) = st.event_append_failure {
+        if events.iter().any(|e| matches(&e.kind)) {
+            st.event_append_failure = None;
+            return Err(DbError::Other(
+                "injected: event append failed (crash between CAS and journal)".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// [`Db::enqueue_outbox`] under the caller's lock. Idempotent on the key: a
+/// duplicate enqueue is a no-op.
+/// The run-status CAS's reopen bump (mirrors the Postgres `cas_run_status`):
+/// moving `run` out of a terminal `from` opens its next generation.
+fn bump_reopen_generation_locked(st: &mut InMemoryState, run: &RunId, from: RunStatus) {
+    if from.is_terminal() {
+        *st.run_reopen_generations.entry(run.clone()).or_default() += 1;
+    }
+}
+
+fn enqueue_outbox_locked(st: &mut InMemoryState, msg: &OutboxMessage) {
+    if st
+        .outbox
+        .iter()
+        .any(|e| e.msg.idempotency_key == msg.idempotency_key)
+    {
+        return;
+    }
+    let id = OutboxId(st.outbox.len() as i64 + 1);
+    let mut msg = msg.clone();
+    msg.id = id;
+    st.outbox.push(OutboxEntry {
+        msg,
+        claimed_until: None,
+        dispatched: false,
+        delivery_attempts: 0,
+        dead_lettered: false,
+    });
+}
+
+/// [`Db::set_attempt_outcome`] / [`Db::set_attempt_failure`] under the
+/// caller's lock, with their terminal-by-intent guard.
+fn stamp_attempt_locked(
+    st: &mut InMemoryState,
+    run: &RunId,
+    step: &StepId,
+    attempt: &AttemptId,
+    stamp: &scarab_engine::AttemptStamp,
+) {
+    let Some(rec) = st.steps.get_mut(&(run.clone(), step.clone())) else {
+        return;
+    };
+    let Some(a) = rec.attempts.iter_mut().find(|a| &a.id == attempt) else {
+        return;
+    };
+    // Defense in depth: never downgrade a terminal-by-intent outcome
+    // (`Superseded` from a rerun, `Cancelled` from a run cancel) — mirrors
+    // the postgres `IS DISTINCT FROM` guards.
+    if matches!(
+        a.outcome,
+        AttemptOutcome::Superseded | AttemptOutcome::Cancelled
+    ) {
+        return;
+    }
+    match stamp {
+        scarab_engine::AttemptStamp::Outcome(outcome) => a.outcome = *outcome,
+        scarab_engine::AttemptStamp::Failure { kind, detail } => {
+            // Failure, cause and outcome move together (ADR-0056
+            // amendment; 4cf03d7) — mirrors the single postgres UPDATE.
+            a.failure = Some(*kind);
+            a.failure_detail = detail.clone();
+            a.outcome = AttemptOutcome::Failed;
+        }
+    }
+}
+
+/// [`Db::record_step_transition`]'s guard under the caller's lock, with the
+/// [`InMemoryDb::arm_toctou_race`] seam: `Err(Conflict)` = the step is not in
+/// `from`; `Ok` = it is, and NOTHING has been written yet.
+fn check_step_transition_locked(
+    st: &mut InMemoryState,
+    run: &RunId,
+    step: &StepId,
+    from: StepStatus,
+) -> Result<(), DbError> {
+    // Test-only one-shot TOCTOU injector (see `arm_toctou_race`): fire before
+    // the guard so the caller sees a `Conflict` against a step that has just
+    // (as far as it can tell, concurrently) raced into `Running`.
+    if matches!(&st.toctou_race, Some((s, _)) if s == step) {
+        let (_, attempt) = st.toctou_race.take().unwrap();
+        if let Some(rec) = st.steps.get_mut(&(run.clone(), step.clone())) {
+            rec.status = Some(StepStatus::Running);
+            rec.attempts.push(Attempt {
+                id: attempt,
+                started_at: Timestamp(0),
+                failure: None,
+                failure_detail: None,
+                outcome: AttemptOutcome::Running,
+            });
+        }
+        return Err(DbError::Conflict);
+    }
+    let rec = st
+        .steps
+        .get(&(run.clone(), step.clone()))
+        .ok_or(DbError::Conflict)?;
+    if rec.status != Some(from) {
+        return Err(DbError::Conflict);
+    }
+    Ok(())
 }
 
 /// [`Db::resolve_gate_wait`] under the caller's lock — shared by the port and
@@ -614,19 +764,17 @@ impl Default for InMemoryDb {
 }
 
 /// Deterministic attempt ordering — mirrors the postgres `attempts()`
-/// `ORDER BY started_at, CAST(substring(attempt_id FROM 2) AS INTEGER)`: start
-/// time first, then mint order by the numeric id suffix (attempt ids are minted
-/// `a{n}` — `a1`,`a2`,…). Numeric, not lexical, so `a2` precedes `a10`. Every
-/// read path that returns attempts sorts by this key so `.last()` (the frontier
-/// / latest attempt) is stable and IDENTICAL to the postgres adapter, even when
-/// `started_at` ties (the `FakeClock` case, and same-millisecond real minting).
-fn attempt_order_key(a: &Attempt) -> (i64, u64) {
-    let seq =
-        a.id.0
-            .strip_prefix('a')
-            .and_then(|n| n.parse::<u64>().ok())
-            .unwrap_or(u64::MAX);
-    (a.started_at.0, seq)
+/// `ORDER BY CAST(substring(attempt_id FROM 2) AS INTEGER)`: mint order by the
+/// numeric id suffix ALONE (attempt ids are minted `a{n}` — `a1`,`a2`,…).
+/// Numeric, not lexical, so `a2` precedes `a10`. Every read path that returns
+/// attempts sorts by this key so `.last()` (the frontier / latest attempt) is
+/// stable and IDENTICAL to the postgres adapter. Never `started_at` (git-bug
+/// 90d767d): it ties, and it can run backwards across a leader failover.
+fn attempt_order_key(a: &Attempt) -> u64 {
+    a.id.0
+        .strip_prefix('a')
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(u64::MAX)
 }
 
 #[async_trait]
@@ -787,6 +935,33 @@ impl Db for InMemoryDb {
         Ok(())
     }
 
+    async fn ingest_attempt_results(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        results: &std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> Result<(), DbError> {
+        let mut st = self.state.lock().unwrap();
+        let rec = st
+            .steps
+            .get_mut(&(run.clone(), step.clone()))
+            .ok_or(DbError::Conflict)?;
+        // The frontier is the highest `a{n}`, as Postgres orders it — not the
+        // insertion-order last (red team A8': twin drift).
+        let frontier = rec.attempts.iter().max_by_key(|a| attempt_order_key(a));
+        if rec.status != Some(StepStatus::Running) || frontier.map(|a| &a.id) != Some(attempt) {
+            return Err(DbError::Conflict);
+        }
+        rec.results = results.clone();
+        rec.evidence_attempt = Some(attempt.clone());
+        st.attempt_evidence
+            .entry((run.clone(), step.clone(), attempt.clone()))
+            .or_default()
+            .results = results.clone();
+        Ok(())
+    }
+
     async fn attempt_results(
         &self,
         run: &RunId,
@@ -848,6 +1023,38 @@ impl Db for InMemoryDb {
             .get(&(run.clone(), step.clone(), attempt.clone()))
             .map(|e| e.consumed.clone())
             .unwrap_or_default())
+    }
+
+    async fn set_attempt_workspace_input_steps(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        steps: &[StepId],
+    ) -> Result<(), DbError> {
+        self.state
+            .lock()
+            .unwrap()
+            .attempt_evidence
+            .entry((run.clone(), step.clone(), attempt.clone()))
+            .or_default()
+            .workspace_input_steps = Some(steps.to_vec());
+        Ok(())
+    }
+
+    async fn attempt_workspace_input_steps(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<Option<Vec<StepId>>, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .attempt_evidence
+            .get(&(run.clone(), step.clone(), attempt.clone()))
+            .and_then(|e| e.workspace_input_steps.clone()))
     }
 
     async fn step_results(
@@ -1333,6 +1540,11 @@ impl Db for InMemoryDb {
         Ok(self.state.lock().unwrap().runs.get(run).copied())
     }
 
+    async fn run_reopen_generation(&self, run: &RunId) -> Result<u64, DbError> {
+        let st = self.state.lock().unwrap();
+        Ok(st.run_reopen_generations.get(run).copied().unwrap_or(0))
+    }
+
     async fn active_runs(&self) -> Result<Vec<RunId>, DbError> {
         let st = self.state.lock().unwrap();
         let mut out: Vec<RunId> = st
@@ -1464,6 +1676,17 @@ impl Db for InMemoryDb {
         Ok(out)
     }
 
+    async fn steps_of_runs(&self, runs: &[RunId]) -> Result<HashMap<RunId, Vec<StepRun>>, DbError> {
+        let mut out = HashMap::new();
+        for run in runs {
+            let steps = self.steps_of_run(run).await?;
+            if !steps.is_empty() {
+                out.insert(run.clone(), steps);
+            }
+        }
+        Ok(out)
+    }
+
     async fn step_spec(&self, run: &RunId, step: &StepId) -> Result<Option<StepSpec>, DbError> {
         Ok(self
             .state
@@ -1482,31 +1705,53 @@ impl Db for InMemoryDb {
         to: StepStatus,
     ) -> Result<(), DbError> {
         let mut st = self.state.lock().unwrap();
-        // Test-only one-shot TOCTOU injector (see `arm_toctou_race`): fire before
-        // the guard so the caller sees a `Conflict` against a step that has just
-        // (as far as it can tell, concurrently) raced into `Running`.
-        if matches!(&st.toctou_race, Some((s, _)) if s == step) {
-            let (_, attempt) = st.toctou_race.take().unwrap();
-            if let Some(rec) = st.steps.get_mut(&(run.clone(), step.clone())) {
-                rec.status = Some(StepStatus::Running);
-                rec.attempts.push(Attempt {
-                    id: attempt,
-                    started_at: Timestamp(0),
-                    failure: None,
-                    failure_detail: None,
-                    outcome: AttemptOutcome::Running,
-                });
-            }
-            return Err(DbError::Conflict);
-        }
-        let rec = st
-            .steps
+        check_step_transition_locked(&mut st, run, step, from)?;
+        st.steps
             .get_mut(&(run.clone(), step.clone()))
-            .ok_or(DbError::Conflict)?;
-        if rec.status != Some(from) {
-            return Err(DbError::Conflict);
+            .expect("checked above")
+            .status = Some(to);
+        Ok(())
+    }
+
+    async fn commit_step_transition(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        from: StepStatus,
+        to: StepStatus,
+        frontier: scarab_engine::AttemptFrontier<'_>,
+        stamp: Option<(&AttemptId, &scarab_engine::AttemptStamp)>,
+        events: &[EventKind],
+        outbox: &[OutboxMessage],
+    ) -> Result<(), DbError> {
+        // One lock = the Postgres transaction: every check (including the
+        // crash injector) runs before the first mutation, so a failure leaves
+        // nothing behind.
+        let mut st = self.state.lock().unwrap();
+        check_step_transition_locked(&mut st, run, step, from)?;
+        // The frontier (red team R2-E3) — the Postgres latest-attempt read.
+        if let scarab_engine::AttemptFrontier::Is(expected) = frontier {
+            let latest = st
+                .steps
+                .get(&(run.clone(), step.clone()))
+                .and_then(|rec| rec.attempts.iter().max_by_key(|a| attempt_order_key(a)))
+                .map(|a| a.id.clone());
+            if latest.as_ref() != expected {
+                return Err(DbError::Conflict);
+            }
         }
-        rec.status = Some(to);
+        take_event_append_failure(&mut st, events)?;
+        st.steps
+            .get_mut(&(run.clone(), step.clone()))
+            .expect("checked above")
+            .status = Some(to);
+        if let Some((attempt, stamp)) = stamp {
+            stamp_attempt_locked(&mut st, run, step, attempt, stamp);
+        }
+        st.events.extend(events.iter().cloned());
+        for msg in outbox {
+            enqueue_outbox_locked(&mut st, msg);
+        }
         Ok(())
     }
 
@@ -1579,25 +1824,19 @@ impl Db for InMemoryDb {
         failure: FailureKind,
         detail: Option<&str>,
     ) -> Result<(), DbError> {
+        // A self-inflicted teardown `Lost` must not clobber a terminal-by-
+        // intent outcome — the guard lives in `stamp_attempt_locked`.
         let mut st = self.state.lock().unwrap();
-        if let Some(rec) = st.steps.get_mut(&(run.clone(), step.clone())) {
-            if let Some(a) = rec.attempts.iter_mut().find(|a| &a.id == attempt) {
-                // Defense in depth: never downgrade a terminal-by-intent outcome
-                // (`Superseded` from a rerun, `Cancelled` from a run cancel) — a
-                // self-inflicted teardown `Lost` must not clobber it (mirrors the
-                // postgres `IS DISTINCT FROM` guards).
-                if !matches!(
-                    a.outcome,
-                    AttemptOutcome::Superseded | AttemptOutcome::Cancelled
-                ) {
-                    // Failure, cause and outcome move together (ADR-0056
-                    // amendment; 4cf03d7) — mirrors the single postgres UPDATE.
-                    a.failure = Some(failure);
-                    a.failure_detail = detail.map(str::to_string);
-                    a.outcome = AttemptOutcome::Failed;
-                }
-            }
-        }
+        stamp_attempt_locked(
+            &mut st,
+            run,
+            step,
+            attempt,
+            &scarab_engine::AttemptStamp::Failure {
+                kind: failure,
+                detail: detail.map(str::to_string),
+            },
+        );
         Ok(())
     }
 
@@ -1660,19 +1899,42 @@ impl Db for InMemoryDb {
                         .all(|n| status(run, n) == Some(StepStatus::Succeeded))
                 })
         };
-        // The request's effective time: the requesting Step's latest Attempt
-        // start, else the Run's creation.
-        let effective_at = |run: &RunId, step: &StepId| {
+        // Where the unreached-gate cutoff runs from: the requesting Step's
+        // LATEST Attempt start (the Attempt that succeeded, where a first
+        // wait of its gates opens — not the request's effective time, its
+        // first Attempt in the Take), else the Run's creation. The PG twin's
+        // `MAX(a.started_at)`.
+        let latest_attempt_start = |run: &RunId, step: &StepId| {
             st.steps
                 .get(&(run.clone(), step.clone()))
                 .and_then(|rec| rec.attempts.iter().map(|a| a.started_at).max())
                 .unwrap_or_else(|| st.run_created.get(run).copied().unwrap_or(Timestamp(0)))
         };
+        // An attempt-scoped teardown of one of the requesting Step's OWN
+        // attempts still pending (git-bug f22056d, red team R2-E1/E2b/E7),
+        // whatever the Run's or the Step's status: a `cancel_attempt` or
+        // `supersede_teardown` whose payload names the Step — never the
+        // Run-level `cancel_run` (shared services only). Pending = neither
+        // dispatched nor dead-lettered. The PG twin's `EXISTS`.
+        let tearing_down = |run: &RunId, step: &StepId| {
+            st.outbox.iter().any(|e| {
+                e.msg.run == *run
+                    && !e.dispatched
+                    && !e.dead_lettered
+                    && (e.msg.kind == scarab_engine::CANCEL_ATTEMPT
+                        || e.msg.kind == scarab_engine::SUPERSEDE_TEARDOWN)
+                    && e.msg.payload["attempts"].as_array().is_some_and(|a| {
+                        a.iter()
+                            .any(|x| x["step"].as_str() == Some(step.0.as_str()))
+                    })
+            })
+        };
         let mut runs: std::collections::HashSet<&RunId> = std::collections::HashSet::new();
         for ((run, step), rows) in &st.run_deployment_requests {
-            if run == excluding || !st.runs.get(run).is_some_and(|s| !s.is_terminal()) {
+            if run == excluding {
                 continue;
             }
+            let active = st.runs.get(run).is_some_and(|s| !s.is_terminal());
             for r in rows {
                 if r.org != org
                     || r.environment != environment
@@ -1691,11 +1953,11 @@ impl Db for InMemoryDb {
                             .collect();
                         !open.is_empty()
                             && (open.iter().any(|g| reached(run, g))
-                                || effective_at(run, step) > unreached_gate_cutoff)
+                                || latest_attempt_start(run, step) > unreached_gate_cutoff)
                     }
                     _ => false,
                 };
-                if in_flight {
+                if (active && in_flight) || tearing_down(run, step) {
                     runs.insert(run);
                 }
             }
@@ -1711,9 +1973,10 @@ impl Db for InMemoryDb {
         org: &str,
         inputs: &[scarab_deployment::DeploymentInput],
         received_at: Timestamp,
-    ) -> Result<(), DbError> {
-        // One lock = one transaction: the guard, the appends and the
-        // transition all land or none does.
+        events: &[EventKind],
+    ) -> Result<scarab_engine::DeployStepFinish, DbError> {
+        // One lock = one transaction: the guard, the appends, the events and
+        // the transition all land or none does.
         // Mirrors Postgres: the step must be `running` AND `attempt` its
         // latest (the `attempts_of_step` order) and not torn down by intent
         // (`Superseded`/`Cancelled`) — otherwise `Conflict`, nothing lands.
@@ -1738,6 +2001,32 @@ impl Db for InMemoryDb {
         if !finishable {
             return Err(DbError::Conflict);
         }
+        // The home re-check under the lock (git-bug 9e66f2c), as Postgres
+        // makes it under the Org's counter: the fake knows no routing, so a
+        // target's home is the Environment of its newest input.
+        if let Some(elsewhere) = inputs.iter().find_map(|input| {
+            let target = input.target();
+            let home = st
+                .deployment_inputs
+                .get(org)?
+                .iter()
+                .rev()
+                .map(|l| l.input.target())
+                .find(|t| t.source == target.source && t.id == target.id)?;
+            (home.environment != target.environment).then(|| {
+                scarab_engine::DeploymentTargetHomedElsewhere {
+                    environment: target.environment.clone(),
+                    target_source: target.source.clone(),
+                    target_id: target.id.clone(),
+                    home: home.environment.clone(),
+                }
+            })
+        }) {
+            return Ok(scarab_engine::DeployStepFinish::TargetHomedElsewhere(
+                elsewhere,
+            ));
+        }
+        take_event_append_failure(&mut st, events)?;
         append_deployment_inputs_locked(&mut st, org, inputs, received_at.0)
             .map_err(|e| DbError::Other(e.to_string()))?;
         let rec = st
@@ -1748,7 +2037,8 @@ impl Db for InMemoryDb {
         if let Some(a) = rec.attempts.iter_mut().find(|a| &a.id == attempt) {
             a.outcome = AttemptOutcome::Succeeded;
         }
-        Ok(())
+        st.events.extend(events.iter().cloned());
+        Ok(scarab_engine::DeployStepFinish::Recorded)
     }
 
     async fn set_attempt_outcome(
@@ -1758,20 +2048,17 @@ impl Db for InMemoryDb {
         attempt: &AttemptId,
         outcome: AttemptOutcome,
     ) -> Result<(), DbError> {
+        // Defense in depth (mirrors `set_attempt_failure`): a terminal-by-
+        // intent outcome (`Superseded`/`Cancelled`) is never overwritten by a
+        // later observation — the guard lives in `stamp_attempt_locked`.
         let mut st = self.state.lock().unwrap();
-        if let Some(rec) = st.steps.get_mut(&(run.clone(), step.clone())) {
-            if let Some(a) = rec.attempts.iter_mut().find(|a| &a.id == attempt) {
-                // Defense in depth (mirrors `set_attempt_failure`): a terminal-by-
-                // intent outcome (`Superseded`/`Cancelled`) is never overwritten by
-                // a later observation.
-                if !matches!(
-                    a.outcome,
-                    AttemptOutcome::Superseded | AttemptOutcome::Cancelled
-                ) {
-                    a.outcome = outcome;
-                }
-            }
-        }
+        stamp_attempt_locked(
+            &mut st,
+            run,
+            step,
+            attempt,
+            &scarab_engine::AttemptStamp::Outcome(outcome),
+        );
         Ok(())
     }
 
@@ -1790,11 +2077,43 @@ impl Db for InMemoryDb {
             return Err(DbError::Conflict);
         }
         st.runs.insert(run.clone(), to);
+        bump_reopen_generation_locked(&mut st, run, from);
+        Ok(())
+    }
+
+    async fn commit_run_transition(
+        &self,
+        run: &RunId,
+        from: RunStatus,
+        to: RunStatus,
+        generation: u64,
+        events: &[EventKind],
+        outbox: &[OutboxMessage],
+    ) -> Result<(), DbError> {
+        // One lock = the Postgres transaction: every check (including the
+        // crash injector) runs before the first mutation.
+        let mut st = self.state.lock().unwrap();
+        let current = st.runs.get(run).copied().unwrap_or(RunStatus::Pending);
+        // The Postgres CAS's generation guard: a run reopened since the
+        // caller read `generation` is a miss, never an ABA hit.
+        let current_generation = st.run_reopen_generations.get(run).copied().unwrap_or(0);
+        if current != from || current_generation != generation {
+            return Err(DbError::Conflict);
+        }
+        take_event_append_failure(&mut st, events)?;
+        st.runs.insert(run.clone(), to);
+        bump_reopen_generation_locked(&mut st, run, from);
+        st.events.extend(events.iter().cloned());
+        for msg in outbox {
+            enqueue_outbox_locked(&mut st, msg);
+        }
         Ok(())
     }
 
     async fn append_event(&self, event: &EventKind) -> Result<(), DbError> {
-        self.state.lock().unwrap().events.push(event.clone());
+        let mut st = self.state.lock().unwrap();
+        take_event_append_failure(&mut st, std::slice::from_ref(event))?;
+        st.events.push(event.clone());
         Ok(())
     }
 
@@ -1892,24 +2211,7 @@ impl Db for InMemoryDb {
 
     async fn enqueue_outbox(&self, msg: &OutboxMessage) -> Result<(), DbError> {
         let mut st = self.state.lock().unwrap();
-        // Idempotent on the key: a duplicate enqueue is a no-op.
-        if st
-            .outbox
-            .iter()
-            .any(|e| e.msg.idempotency_key == msg.idempotency_key)
-        {
-            return Ok(());
-        }
-        let id = OutboxId(st.outbox.len() as i64 + 1);
-        let mut msg = msg.clone();
-        msg.id = id;
-        st.outbox.push(OutboxEntry {
-            msg,
-            claimed_until: None,
-            dispatched: false,
-            delivery_attempts: 0,
-            dead_lettered: false,
-        });
+        enqueue_outbox_locked(&mut st, msg);
         Ok(())
     }
 
@@ -1951,6 +2253,14 @@ impl Db for InMemoryDb {
             e.dispatched = true;
         }
         Ok(())
+    }
+
+    async fn outbox_key_pending(&self, idempotency_key: &str) -> Result<bool, DbError> {
+        let st = self.state.lock().unwrap();
+        Ok(st
+            .outbox
+            .iter()
+            .any(|e| e.msg.idempotency_key == idempotency_key && !e.dispatched && !e.dead_lettered))
     }
 
     async fn record_outbox_failure(&self, id: OutboxId) -> Result<u32, DbError> {
@@ -2295,6 +2605,11 @@ struct FakeExecState {
     churning_roots: std::collections::HashSet<String>,
     /// Named results (ADR-0041) each *step* emits on success, keyed by step id.
     results: HashMap<String, std::collections::BTreeMap<String, serde_json::Value>>,
+    /// How each *step*'s results delivery failed, keyed by step id — what
+    /// `Executor::results_delivery_failure` answers (git-bug 0cb5895):
+    /// `Ok(how)` = it failed, `Err(why)` = it could not be checked. Absent =
+    /// delivered (the in-process default).
+    delivery_failures: HashMap<String, Result<String, String>>,
     /// Artifacts of record (ADR-0052) each *step* published, keyed by step id —
     /// the harvest the backend reports back once the blobs are in the object
     /// store, which the orchestrator must durably index.
@@ -2332,6 +2647,9 @@ struct FakeExecState {
     /// a Pod the backend can never reach (persistent failure → dead-letter); a
     /// small N models a transient API blip that clears on a later reconcile.
     cancel_failures: u32,
+    /// Remaining number of `torn_down` checks that answer `false` — a
+    /// cancelled unit still in its termination grace (git-bug f22056d).
+    lingering_checks: u32,
     /// The same budget for `teardown_service` — the shared-service half of the
     /// cancel teardown, which must retry rather than mark the row torn down over
     /// a Pod that is still up.
@@ -2345,14 +2663,33 @@ pub struct FakeExecutor {
     inner: Mutex<FakeExecState>,
     /// Handles `cancel` was called with (teardown assertions).
     cancelled: Mutex<Vec<String>>,
+    /// A one-shot hook the next `launch` awaits before it returns — see
+    /// [`during_next_launch`](Self::during_next_launch).
+    launch_hook: Mutex<Option<LaunchHook>>,
 }
+
+/// Work a test runs while a [`FakeExecutor::launch`] is in flight.
+pub type LaunchHook = Box<
+    dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send,
+>;
 
 impl FakeExecutor {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(FakeExecState::default()),
             cancelled: Mutex::new(Vec::new()),
+            launch_hook: Mutex::new(None),
         }
+    }
+
+    /// Run `hook` to completion INSIDE the next `launch`, before it returns
+    /// its handle (test seam): models a write another task commits while a
+    /// launch is in flight — e.g. a cancel landing, and another replica
+    /// draining its teardown, between the launch's last check and the
+    /// handle it records (red team A2). Constructs the interleaving instead
+    /// of scheduling it.
+    pub fn during_next_launch(&self, hook: LaunchHook) {
+        *self.launch_hook.lock().unwrap() = Some(hook);
     }
 
     /// The handles torn down via `cancel`, in call order.
@@ -2473,6 +2810,26 @@ impl FakeExecutor {
             .insert(step.to_string(), results);
     }
 
+    /// Script that `step`'s results delivery failed, `how` being the clause
+    /// a backend reports (on k8s: "the results sidecar … exited 1 (Error)").
+    pub fn set_results_delivery_failure(&self, step: &str, how: &str) {
+        self.inner
+            .lock()
+            .unwrap()
+            .delivery_failures
+            .insert(step.to_string(), Ok(how.to_string()));
+    }
+
+    /// Script that whether `step`'s results were delivered **could not be
+    /// checked** — the backend errors with `why` (on k8s: the Pod is gone).
+    pub fn set_results_delivery_unchecked(&self, step: &str, why: &str) {
+        self.inner
+            .lock()
+            .unwrap()
+            .delivery_failures
+            .insert(step.to_string(), Err(why.to_string()));
+    }
+
     /// Set the artifacts of record `step` (by id) published (ADR-0052) — what a
     /// backend reports from its post-step harvest, blobs already uploaded.
     pub fn set_artifacts(&self, step: &str, artifacts: Vec<scarab_engine::ArtifactMeta>) {
@@ -2564,6 +2921,13 @@ impl FakeExecutor {
         self.inner.lock().unwrap().cancel_failures = n;
     }
 
+    /// Make the next `n` `torn_down` checks answer `false` — the cancelled
+    /// unit is still terminating (a k8s Pod in its grace period; git-bug
+    /// f22056d) — before any answers `true`.
+    pub fn linger_after_cancel(&self, n: u32) {
+        self.inner.lock().unwrap().lingering_checks = n;
+    }
+
     /// Make the next `n` `teardown_service` calls return `Err` before any
     /// succeeds — the shared-service counterpart of [`fail_cancels`](Self::fail_cancels).
     pub fn fail_service_teardowns(&self, n: u32) {
@@ -2590,6 +2954,10 @@ impl Default for FakeExecutor {
 #[async_trait]
 impl Executor for FakeExecutor {
     async fn launch(&self, step: &StepRun, spec: &StepSpec) -> Result<ExecHandle, ExecError> {
+        let hook = self.launch_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
         let handle = Self::handle_for(step);
         let mut st = self.inner.lock().unwrap();
         *st.launches.entry(handle.0.clone()).or_insert(0) += 1;
@@ -2626,6 +2994,19 @@ impl Executor for FakeExecutor {
             )));
         }
         Ok(())
+    }
+
+    fn unit_handle(&self, step: &StepRun) -> Option<ExecHandle> {
+        Some(Self::handle_for(step))
+    }
+
+    async fn torn_down(&self, _handle: &ExecHandle) -> Result<bool, ExecError> {
+        let mut st = self.inner.lock().unwrap();
+        if st.lingering_checks > 0 {
+            st.lingering_checks -= 1;
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     async fn output(&self, handle: &ExecHandle) -> Result<Option<String>, ExecError> {
@@ -2699,6 +3080,20 @@ impl Executor for FakeExecutor {
         Ok(step
             .and_then(|s| self.inner.lock().unwrap().results.get(s).cloned())
             .unwrap_or_default())
+    }
+
+    async fn results_delivery_failure(
+        &self,
+        handle: &ExecHandle,
+    ) -> Result<Option<String>, ExecError> {
+        let Some((step, _)) = Self::step_and_attempt(handle) else {
+            return Ok(None);
+        };
+        match self.inner.lock().unwrap().delivery_failures.get(&step) {
+            None => Ok(None),
+            Some(Ok(how)) => Ok(Some(how.clone())),
+            Some(Err(why)) => Err(ExecError::Other(why.clone())),
+        }
     }
 
     async fn artifacts(
@@ -3094,7 +3489,7 @@ impl scarab_forge::ForgeConnectionStore for InMemoryDb {
         Ok(())
     }
 
-    async fn bind_repo(
+    async fn upsert_repo_binding(
         &self,
         connection_id: &str,
         repo: &scarab_forge::RepoRef,
@@ -3435,7 +3830,9 @@ impl Authenticator for FakeAuthenticator {
     }
 }
 
-/// An in-memory [`SessionStore`] for tests (the PG-backed store is a follow-up).
+/// An in-memory [`SessionStore`] with the Postgres adapter's semantics:
+/// keyed by `session_id_hash(id)`, the id itself never held (git-bug
+/// 51d6bcb); `get` hands back the id it was asked for.
 #[derive(Default)]
 pub struct InMemorySessions {
     sessions: Mutex<HashMap<String, Session>>,
@@ -3450,19 +3847,34 @@ impl InMemorySessions {
 #[async_trait]
 impl SessionStore for InMemorySessions {
     async fn put(&self, session: &Session) -> Result<(), IdentityError> {
+        let stored = Session {
+            id: String::new(),
+            ..session.clone()
+        };
         self.sessions
             .lock()
             .unwrap()
-            .insert(session.id.clone(), session.clone());
+            .insert(scarab_identity::session_id_hash(&session.id), stored);
         Ok(())
     }
 
     async fn get(&self, id: &str) -> Result<Option<Session>, IdentityError> {
-        Ok(self.sessions.lock().unwrap().get(id).cloned())
+        Ok(self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&scarab_identity::session_id_hash(id))
+            .map(|s| Session {
+                id: id.to_string(),
+                ..s.clone()
+            }))
     }
 
     async fn delete(&self, id: &str) -> Result<(), IdentityError> {
-        self.sessions.lock().unwrap().remove(id);
+        self.sessions
+            .lock()
+            .unwrap()
+            .remove(&scarab_identity::session_id_hash(id));
         Ok(())
     }
 }
@@ -3495,6 +3907,16 @@ impl scarab_identity::ApiTokenStore for InMemoryApiTokens {
 
     async fn by_hash(&self, hash: &str) -> Result<Option<scarab_identity::ApiToken>, IdentityError> {
         Ok(self.tokens.lock().unwrap().get(hash).cloned())
+    }
+
+    async fn by_id(&self, id: &str) -> Result<Option<scarab_identity::ApiToken>, IdentityError> {
+        Ok(self
+            .tokens
+            .lock()
+            .unwrap()
+            .values()
+            .find(|t| t.id == id)
+            .cloned())
     }
 
     async fn list(&self, org: &str) -> Result<Vec<scarab_identity::ApiToken>, IdentityError> {
@@ -3864,6 +4286,20 @@ impl scarab_identity::RbacStore for InMemoryRbac {
         Ok(exact.max(org))
     }
 
+    async fn max_role(
+        &self,
+        subject: &str,
+    ) -> Result<Option<scarab_identity::Role>, IdentityError> {
+        Ok(self
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((s, _, _), _)| s == subject)
+            .filter_map(|(_, (role, _))| *role)
+            .max())
+    }
+
     async fn bindings(&self, org: &str) -> Result<Vec<scarab_identity::Binding>, IdentityError> {
         let rows = self.rows.lock().unwrap();
         let mut out: Vec<scarab_identity::Binding> = rows
@@ -3884,6 +4320,18 @@ impl scarab_identity::RbacStore for InMemoryRbac {
             .collect();
         out.sort_by(|a, b| a.subject.cmp(&b.subject));
         Ok(out)
+    }
+
+    async fn orgs_of(&self, subject: &str) -> Result<Vec<String>, IdentityError> {
+        let orgs: std::collections::BTreeSet<String> = self
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((s, _, _), (role, _))| s == subject && role.is_some())
+            .map(|((_, org, _), _)| org.clone())
+            .collect();
+        Ok(orgs.into_iter().collect())
     }
 
     async fn import_seeds(

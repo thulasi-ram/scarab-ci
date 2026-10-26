@@ -55,6 +55,19 @@ pub struct InMemoryEnvironmentGovernance {
     state: Mutex<State>,
 }
 
+/// Eligibility as stored: patterns sorted (and, for comparison, deduped).
+fn sorted_eligibility(e: &EnvironmentProjectEligibility) -> EnvironmentProjectEligibility {
+    match e {
+        EnvironmentProjectEligibility::Projects(p) => {
+            let mut p = p.clone();
+            p.sort();
+            p.dedup();
+            EnvironmentProjectEligibility::Projects(p)
+        }
+        all => all.clone(),
+    }
+}
+
 fn not_found(org: &str, environment: &str) -> OrgEnvironmentError {
     OrgEnvironmentError::NotFound {
         org: org.to_string(),
@@ -263,6 +276,18 @@ impl InMemoryEnvironmentGovernance {
 
 #[async_trait]
 impl EnvironmentGovernanceStore for InMemoryEnvironmentGovernance {
+    async fn org_environment(
+        &self,
+        org: &str,
+        environment: &str,
+    ) -> Result<Option<OrgEnvironment>, OrgEnvironmentError> {
+        let state = self.state.lock().unwrap();
+        Ok(state
+            .environments
+            .get(&(org.to_string(), environment.to_string()))
+            .cloned())
+    }
+
     async fn deploy_governance(
         &self,
         org: &str,
@@ -291,11 +316,12 @@ impl EnvironmentGovernanceStore for InMemoryEnvironmentGovernance {
             .collect())
     }
 
-    async fn put_environment_protection(
+    async fn put_environment_protection_expecting(
         &self,
         org: &str,
         environment: &str,
         protection: &EnvironmentProtectionRules,
+        expected: Option<&EnvironmentProtectionRules>,
         updated_by: &str,
         updated_at: i64,
     ) -> Result<OrgEnvironment, OrgEnvironmentError> {
@@ -304,17 +330,21 @@ impl EnvironmentGovernanceStore for InMemoryEnvironmentGovernance {
             .environments
             .get_mut(&(org.to_string(), environment.to_string()))
             .ok_or_else(|| not_found(org, environment))?;
+        if expected.is_some_and(|e| e != &env.protection) {
+            return Err(OrgEnvironmentError::changed_concurrently());
+        }
         env.protection = protection.clone();
         env.updated_by = updated_by.to_string();
         env.updated_at = updated_at;
         Ok(env.clone())
     }
 
-    async fn put_environment_eligibility(
+    async fn put_environment_eligibility_expecting(
         &self,
         org: &str,
         environment: &str,
         eligibility: &EnvironmentProjectEligibility,
+        expected: Option<&EnvironmentProjectEligibility>,
         updated_by: &str,
         updated_at: i64,
     ) -> Result<OrgEnvironment, OrgEnvironmentError> {
@@ -324,22 +354,19 @@ impl EnvironmentGovernanceStore for InMemoryEnvironmentGovernance {
             .environments
             .get_mut(&(org.to_string(), environment.to_string()))
             .ok_or_else(|| not_found(org, environment))?;
-        env.eligibility = match eligibility {
-            EnvironmentProjectEligibility::Projects(p) => {
-                let mut p = p.clone();
-                p.sort();
-                EnvironmentProjectEligibility::Projects(p)
-            }
-            all => all.clone(),
-        };
+        if expected.is_some_and(|e| sorted_eligibility(e) != sorted_eligibility(&env.eligibility)) {
+            return Err(OrgEnvironmentError::changed_concurrently());
+        }
+        env.eligibility = sorted_eligibility(eligibility);
         env.updated_by = updated_by.to_string();
         env.updated_at = updated_at;
         Ok(env.clone())
     }
 
-    async fn put_environment_project_overlay(
+    async fn put_environment_project_overlay_expecting(
         &self,
         overlay: &EnvironmentProjectOverlay,
+        expected: Option<Option<&EnvironmentProjectOverlay>>,
         _updated_by: &str,
         _updated_at: i64,
     ) -> Result<(), OrgEnvironmentError> {
@@ -350,14 +377,21 @@ impl EnvironmentGovernanceStore for InMemoryEnvironmentGovernance {
         {
             return Err(not_found(&overlay.org, &overlay.environment));
         }
-        state.overlays.insert(
-            (
-                overlay.org.clone(),
-                overlay.environment.clone(),
-                overlay.project.clone(),
-            ),
-            overlay.clone(),
+        let key = (
+            overlay.org.clone(),
+            overlay.environment.clone(),
+            overlay.project.clone(),
         );
+        if let Some(expected) = expected {
+            let stored = state
+                .overlays
+                .get(&key)
+                .map(|o| (&o.rules, o.deployment_gate_deadline));
+            if stored != expected.map(|o| (&o.rules, o.deployment_gate_deadline)) {
+                return Err(OrgEnvironmentError::changed_concurrently());
+            }
+        }
+        state.overlays.insert(key, overlay.clone());
         Ok(())
     }
 
@@ -380,9 +414,10 @@ impl EnvironmentGovernanceStore for InMemoryEnvironmentGovernance {
             .is_some())
     }
 
-    async fn put_environment_project_privilege_grant(
+    async fn put_environment_project_privilege_grant_expecting(
         &self,
         grant: &EnvironmentProjectPrivilegeGrant,
+        expected: Option<Option<&EnvironmentProjectPrivilegeGrant>>,
         _updated_by: &str,
         _updated_at: i64,
     ) -> Result<(), OrgEnvironmentError> {
@@ -393,14 +428,21 @@ impl EnvironmentGovernanceStore for InMemoryEnvironmentGovernance {
         {
             return Err(not_found(&grant.org, &grant.environment));
         }
-        state.grants.insert(
-            (
-                grant.org.clone(),
-                grant.environment.clone(),
-                grant.project.clone(),
-            ),
-            grant.clone(),
+        let key = (
+            grant.org.clone(),
+            grant.environment.clone(),
+            grant.project.clone(),
         );
+        if let Some(expected) = expected {
+            let stored = state
+                .grants
+                .get(&key)
+                .map(|g| (&g.privileged_images, g.permit_k8s_overlay));
+            if stored != expected.map(|g| (&g.privileged_images, g.permit_k8s_overlay)) {
+                return Err(OrgEnvironmentError::changed_concurrently());
+            }
+        }
+        state.grants.insert(key, grant.clone());
         Ok(())
     }
 

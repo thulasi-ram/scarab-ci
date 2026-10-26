@@ -17,6 +17,7 @@
 import type { components } from "./api/schema";
 
 type RunStatusDto = components["schemas"]["RunStatusResponse"];
+type RunSummaryDto = components["schemas"]["RunSummaryDto"];
 type ArtifactDto = components["schemas"]["ArtifactDto"];
 type ServiceStatusDto = components["schemas"]["ServiceStatusDto"];
 type DeploymentDto = components["schemas"]["DeploymentDto"];
@@ -122,8 +123,10 @@ const projects = [
   proj("scarab-infra", null),
 ];
 
-// ── /v1/runs (dashboard inbox = 2 suspended) ────────────────────────────────
-const summary = (o: Record<string, unknown>) => ({
+// ── /v1/runs (dashboard inbox = 2 suspended + 1 running with a reached gate) ─
+const summary = (
+  o: Partial<RunSummaryDto> & Pick<RunSummaryDto, "id" | "status">,
+): RunSummaryDto => ({
   duration_ms: 0,
   created_at: ago(60000),
   ...o,
@@ -135,6 +138,7 @@ const runs = [
     org: "acme",
     project: "scarab",
     created_at: ago(12 * 60000),
+    waiting_gates: [{ step: "approve", kind: "manual", since: ago(10 * 60000) }],
   }),
   summary({
     id: "01984f22bb334d8e9a1122cd44ef6600",
@@ -142,8 +146,29 @@ const runs = [
     org: "acme",
     project: "billing",
     created_at: ago(27 * 60000),
+    waiting_gates: [{ step: "release", kind: "manual", since: ago(20 * 60000) }],
+  }),
+  // git-bug c489346: a gate holds only its dependents, so this run is still
+  // `running` (its `version` sibling runs) while its `approve` gate waits.
+  summary({
+    id: "01984f35cc445e9fab2233de55f07711",
+    status: "running",
+    org: "acme",
+    project: "orders-api",
+    created_at: ago(6 * 60000),
+    waiting_gates: [{ step: "approve", kind: "manual", since: ago(4 * 60000) }],
+  }),
+  // A running run with no reached gate: not in the inbox.
+  summary({
+    id: "01984f40dd556fa0bc3344ef66018822",
+    status: "running",
+    org: "acme",
+    project: "inventory-svc",
+    created_at: ago(2 * 60000),
   }),
 ];
+/** The `/v1/runs` fixture, for no-DOM tests of what the dashboard derives. */
+export { runs as mockRuns };
 
 // ── per-repo run strips (dashboard cards) — status+duration_ms drive bars ────
 // Tune succeeded/failed ratios to the "N% pass" shown per card.
@@ -483,6 +508,8 @@ const deployRunStatus: RunStatusDto = {
         target_id: "edge-gateway",
         deployment_id: 16,
         deployment_status: "in_progress",
+        // The gate's own clock: `bump`'s start + the Project's 15 min gate deadline.
+        fails_at: ago(5 * min) + 15 * min,
         version: "sha-a1b2c3d",
         latest_label: "sync wave 3: rollout",
       },
@@ -1293,6 +1320,114 @@ const apiTokens = [
   },
 ];
 
+// ── step-up (ADR-0073) ────────────────────────────────────────────────────
+// Enforced, one admin (j.lee) without a passkey so the banner and the Settings
+// panel have something to say; a.kim holds two passkeys (one synced, one
+// device-bound). A pending confirmation request lives at
+// /security/confirm/req-demo-1. The ceremony endpoints are not mocked: a mock
+// server cannot verify a passkey, and pretending to would be the lie.
+type SecurityEventDto = components["schemas"]["SecurityEventDto"];
+const secEvent = (
+  seq: number,
+  kind: string,
+  minsAgo: number,
+  o: Partial<SecurityEventDto> = {},
+): SecurityEventDto => ({
+  seq,
+  id: `ev-${seq}`,
+  at: ago(minsAgo * min),
+  kind,
+  subject: "a.kim",
+  caller: "session:cookie",
+  org: "acme",
+  detail: {} as Record<string, never>,
+  ...o,
+});
+const securityEvents: SecurityEventDto[] = [
+  secEvent(12, "op.completed", 6, { op: "secret.put", target: "acme/orders-api/production/DB_PASSWORD" }),
+  secEvent(11, "step_up.confirmed", 7, { detail: { kind: "window" } as unknown as Record<string, never> }),
+  secEvent(10, "step_up.refused", 7, {
+    op: "secret.put",
+    target: "acme/orders-api/production/DB_PASSWORD",
+    detail: { mode: "window", reason: "not confirmed" } as unknown as Record<string, never>,
+  }),
+  secEvent(9, "request.raised", 40, {
+    subject: "a.kim",
+    caller: "api_token:9f2c1d84",
+    op: "token.create",
+    target: "acme",
+    request_id: "req-demo-1",
+  }),
+  secEvent(8, "step_up.refused", 95, {
+    subject: "j.lee",
+    op: "binding.put",
+    target: "acme",
+    detail: { mode: "enroll", reason: "no passkey" } as unknown as Record<string, never>,
+  }),
+  secEvent(7, "passkey.enrolled", 3 * 24 * 60, { org: null, passkey_id: "pk-2" }),
+];
+const meSecurity: components["schemas"]["MeSecurityResponse"] = {
+  subject: "a.kim",
+  step_up: "enforce",
+  has_passkey: true,
+  usable_passkey_count: 2,
+  passkeys_hidden: false,
+  can_enroll_first: false,
+  fresh_login_until: null,
+  fresh_login_url: "/v1/auth/login?next=/account/security%3Fenroll%3D1",
+  window_expires_at: now + 3 * min,
+  passkeys: [
+    {
+      id: "pk-1",
+      label: "MacBook Touch ID",
+      created_at: ago(40 * day),
+      last_used_at: ago(7 * min),
+      backup_eligible: true,
+      backup_state: true,
+      clone_suspected: false,
+      transports: ["internal", "hybrid"],
+    },
+    {
+      id: "pk-2",
+      label: "YubiKey 5C",
+      created_at: ago(3 * day),
+      last_used_at: null,
+      backup_eligible: false,
+      backup_state: false,
+      clone_suspected: false,
+      transports: ["usb", "nfc"],
+    },
+  ],
+};
+const orgSecuritySummary: components["schemas"]["OrgSecuritySummary"] = {
+  enforced: true,
+  caller_role: "owner",
+  admins_without_passkey: ["j.lee"],
+  admins_total: 2,
+  unresolved_owner_entries: 0,
+  recent_refusals: securityEvents.filter((e) => e.kind === "step_up.refused"),
+  pending_requests: 1,
+};
+const stepUpRequest: components["schemas"]["StepUpRequestDto"] = {
+  id: "req-demo-1",
+  state: "pending",
+  op: "token.create",
+  org: "acme",
+  method: "POST",
+  path: "/v1/orgs/acme/tokens",
+  query: "",
+  summary: {
+    operation: "Create an API token",
+    target: "acme",
+    changes: ["expires_in_days = 90", "name = release-bot-2", "role = member"],
+  },
+  requested_by: "API token “release-bot” (9f2c1d84)",
+  requested_via: "api_token",
+  for_human: "a.kim",
+  created_at: ago(40 * min),
+  expires_at: now + 20 * min,
+};
+
 // ── router ────────────────────────────────────────────────────────────────
 function json(body: unknown, init?: ResponseInit) {
   return new Response(JSON.stringify(body), {
@@ -1308,6 +1443,35 @@ function json(body: unknown, init?: ResponseInit) {
 function route(pathname: string, search: string, method: string): Response | null {
   const p = pathname;
   if (p === "/v1/me") return json(me);
+  if (p === "/v1/me/security") return json(meSecurity);
+  if (p === "/v1/me/security/events") {
+    return json({ events: securityEvents.filter((e) => e.subject === "a.kim") });
+  }
+  if (/^\/v1\/orgs\/[^/]+\/security\/summary$/.test(p)) return json(orgSecuritySummary);
+  if (/^\/v1\/orgs\/[^/]+\/security\/events$/.test(p)) {
+    const kinds = new URLSearchParams(search).get("kind")?.split(",").filter(Boolean) ?? [];
+    return json({ events: securityEvents.filter((e) => !kinds.length || kinds.includes(e.kind)) });
+  }
+  if (p === "/v1/step-up/requests/req-demo-1") return json(stepUpRequest);
+  // Removing a passkey is always-ask: answer with the refusal so the step-up
+  // dialog can be eyeballed (Cancel returns the 403 to the page).
+  if (/^\/v1\/me\/passkeys\/[^/]+$/.test(p) && method === "DELETE") {
+    return json(
+      {
+        code: "step_up_required",
+        message: "This needs a step-up confirmation: confirm with your passkey.",
+        mode: "action",
+        op: "passkey.remove",
+        summary: { operation: "Remove a passkey", target: p.split("/").pop(), changes: [] },
+        challenge: {
+          id: "mock-challenge",
+          public_key: { challenge: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", rpId: "localhost", allowCredentials: [], userVerification: "required" },
+          expires_at: Date.now() + 2 * min,
+        },
+      },
+      { status: 403 },
+    );
+  }
   if (p === "/v1/auth/providers") return json(authProviders);
   // Linking: no provider to bounce through, so "authorize" straight back to
   // the Account page with the outcome a real callback would carry.

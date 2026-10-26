@@ -132,6 +132,48 @@ pub async fn sweep_plugin_broker_journal(
         .map_err(|e| e.to_string())
 }
 
+/// How long a settled — or expired — StepUpConfirmationRequest row is kept
+/// (ADR-0073 §6). Its evidence lives on in the OrgSecurityEventLog, which no
+/// sweep ever touches.
+pub const STEP_UP_REQUEST_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+
+/// Step-up housekeeping (ADR-0073), under the same leader lease as the log
+/// sweep: expired WebAuthn challenges and StepUpConfirmations go (they can
+/// never be answered or stand for anything again), an expired request's
+/// sealed body goes at once, and requests settled or expired more than
+/// [`STEP_UP_REQUEST_RETENTION_MS`] ago go. **Never the event log.**
+pub async fn sweep_step_up(
+    db: &Arc<dyn Db>,
+    challenges: &dyn scarab_identity::ChallengeStore,
+    step_up: &dyn scarab_identity::StepUpStore,
+    clock: &Arc<dyn Clock>,
+    owner: &str,
+) -> Result<u64, String> {
+    let lease = db
+        .lease(RETENTION_LEASE, owner, RETENTION_LEASE_TTL_MS)
+        .await
+        .map_err(|e| e.to_string())?;
+    if lease.owner != owner {
+        return Ok(0);
+    }
+    let now = clock.now().await.0;
+    let challenges = challenges
+        .reap_expired(now)
+        .await
+        .map_err(|e| e.to_string())?;
+    let rows = step_up
+        .reap(now, now - STEP_UP_REQUEST_RETENTION_MS)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(challenges + rows)
+}
+
+/// The step-up stores the sweeper reaps (ADR-0073).
+pub type StepUpStores = (
+    Arc<dyn scarab_identity::ChallengeStore>,
+    Arc<dyn scarab_identity::StepUpStore>,
+);
+
 /// Delete one run's log blobs, then its index. Body deletion is best-effort
 /// per key (a missing blob is already gone); the index drop only happens
 /// after the pass over the bodies, so a partial failure re-sweeps.
@@ -680,6 +722,7 @@ pub fn spawn_sweeper(
     gc: GcConfig,
     depot: Option<Arc<dyn DepotDurableIndex>>,
     plugins: Option<Arc<dyn scarab_plugin::PluginStore>>,
+    step_up: Option<StepUpStores>,
     interval: std::time::Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -701,6 +744,15 @@ pub fn spawn_sweeper(
                     Ok(0) => {}
                     Ok(n) => tracing::info!(entries = n, "retention: pruned broker journal"),
                     Err(e) => tracing::warn!(error = %e, "broker journal prune failed"),
+                }
+            }
+            if let Some((challenges, step_up)) = &step_up {
+                match sweep_step_up(&db, challenges.as_ref(), step_up.as_ref(), &clock, &owner)
+                    .await
+                {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(rows = n, "retention: reaped step-up rows"),
+                    Err(e) => tracing::warn!(error = %e, "step-up reap failed"),
                 }
             }
             if let Err(e) =

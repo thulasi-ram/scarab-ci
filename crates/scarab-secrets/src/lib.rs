@@ -121,6 +121,29 @@ pub trait SecretProvider: Send + Sync {
     }
 }
 
+/// Seals small, short-lived payloads under the deployment's
+/// key-encryption key (ADR-0073 §5: a StepUpConfirmationRequest's parked
+/// request body), and derives purpose-bound keys from it.
+///
+/// `aad` binds a seal to its row (`"step-up-request:" + id`): the same bytes
+/// open only under the same `aad`, so a sealed body cannot be replayed onto
+/// another request. An adapter seals the way it seals secrets — a fresh data
+/// key per payload, wrapped by the active key-encryption key — so a key
+/// rotation leaves every outstanding seal openable.
+///
+/// Synchronous on purpose: sealing is computation, never I/O.
+pub trait Sealer: Send + Sync {
+    /// Seal `plaintext`, bound to `aad`.
+    fn seal(&self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, SecretError>;
+    /// Open what [`seal`](Sealer::seal) produced under the same `aad`. A
+    /// different `aad`, a tampered seal or an unknown key is an error.
+    fn open(&self, sealed: &[u8], aad: &[u8]) -> Result<Vec<u8>, SecretError>;
+    /// A 32-byte key for `label`, derived from (and only as secret as) the
+    /// active key-encryption key: HMAC-SHA256(active key, label). It changes
+    /// when the active key rotates.
+    fn derive_key(&self, label: &str) -> [u8; 32];
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

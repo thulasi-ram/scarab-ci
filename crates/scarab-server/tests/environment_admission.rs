@@ -267,6 +267,90 @@ async fn webhook_deploys_once_the_project_is_eligible() {
     assert_eq!(runs.len(), 2, "CI and the deploy both ran");
 }
 
+/// git-bug 66171a0: a deploy whose target names a required, default-less
+/// input cannot bind on a push (a webhook supplies no parameters). That is
+/// an admission refusal of that pipeline alone — decided before anything is
+/// persisted — so the repo's ordinary CI still runs.
+#[tokio::test]
+async fn a_pipeline_that_cannot_run_is_refused_alone_and_the_rest_still_run() {
+    // Path-sorted before `ci.yaml`, so the loop must get past it.
+    let forge = forge().with_file(".scarab/a-deploy.yaml", UNBINDABLE_DEPLOY);
+    let db = InMemoryDb::new();
+    let governance = prod_for_everyone();
+    let outcome = trigger_runs_from_event(
+        &forge,
+        &db,
+        &FakeClock::new(1_000),
+        Some(&governance),
+        &push(),
+    )
+    .await
+    .expect("an unbindable deploy target never aborts the delivery");
+    let pipelines: Vec<&str> = outcome
+        .refused
+        .iter()
+        .map(|r| r.pipeline.as_str())
+        .collect();
+    assert_eq!(
+        pipelines,
+        [".scarab/a-deploy.yaml"],
+        "{:?}",
+        outcome.refused
+    );
+    assert_eq!(outcome.refused[0].environment, "prod");
+    assert!(
+        outcome.refused[0].reason.contains("inputs.app"),
+        "names the input: {:?}",
+        outcome.refused[0]
+    );
+    // ci.yaml and deploy.yaml both ran.
+    assert_eq!(outcome.runs.len(), 2, "{outcome:?}");
+    // Nothing of the refused pipeline was persisted.
+    let persisted = db.list_runs(100).await.unwrap();
+    assert_eq!(persisted.len(), 2, "{persisted:?}");
+}
+
+/// ADR-0009: a file that fails to compile fails the whole trigger — a repo's
+/// CI is all-or-nothing per delivery, never silently partial. Only the
+/// pre-persist deploy-target binding refusal above is per-pipeline.
+#[tokio::test]
+async fn a_pipeline_that_does_not_compile_still_fails_the_delivery() {
+    let forge = forge().with_file(".scarab/broken.yaml", "steps: [ { id: x, image");
+    let db = InMemoryDb::new();
+    let governance = prod_for_everyone();
+    let err = trigger_runs_from_event(
+        &forge,
+        &db,
+        &FakeClock::new(1_000),
+        Some(&governance),
+        &push(),
+    )
+    .await
+    .expect_err("a broken pipeline fails the delivery");
+    assert!(
+        matches!(err, scarab_server::TriggerError::Pipeline(_)),
+        "{err:?}"
+    );
+}
+
+/// A deploy whose target reads a required input with no default.
+const UNBINDABLE_DEPLOY: &str = r#"
+on:
+  push: {}
+environment: prod
+interface:
+  inputs:
+    - { name: app, type: string, required: true }
+steps:
+  - id: bump
+    image: busybox
+    command: ["true"]
+    results: [version]
+    deployment_requests:
+      - target: { source: argocd, id: "${{ inputs.app }}" }
+        version: version
+"#;
+
 // --- Run creation: dispatch ----------------------------------------------------
 
 #[tokio::test]
@@ -567,6 +651,13 @@ struct RecordingExec {
 
 #[async_trait]
 impl Executor for RecordingExec {
+    async fn results_delivery_failure(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<String>, ExecError> {
+        Ok(None)
+    }
+
     async fn infra_condition(
         &self,
         _handle: &ExecHandle,
@@ -588,6 +679,16 @@ impl Executor for RecordingExec {
     }
     async fn cancel(&self, _h: &ExecHandle) -> Result<(), ExecError> {
         Ok(())
+    }
+    fn unit_handle(
+        &self,
+        _step: &scarab_engine::StepRun,
+    ) -> Option<scarab_engine::ports::ExecHandle> {
+        None // nothing is created behind this stub's launches
+    }
+
+    async fn torn_down(&self, _h: &ExecHandle) -> Result<bool, ExecError> {
+        Ok(true) // nothing runs behind this stub's handles
     }
 }
 

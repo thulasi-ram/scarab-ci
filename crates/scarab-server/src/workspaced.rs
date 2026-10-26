@@ -9449,6 +9449,7 @@ mod tests {
             cas_concurrency: 4,
             connections: vec![],
             plugins: crate::config::PluginsConfig::off(),
+            step_up: crate::config::StepUpMode::Off,
         };
 
         let err = run(&config)

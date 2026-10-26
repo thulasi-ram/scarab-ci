@@ -21,16 +21,19 @@ pub mod ports;
 pub mod scheduler;
 
 pub use ports::{
-    Clock, Db, DeploymentConcurrencyHold, DeploymentGateDecision, DeploymentGates, Executor,
-    LogChunks, SnapshotRetention, WorkspaceSnapshots,
+    Clock, Db, DeploymentConcurrencyHold, DeploymentGateDecision, DeploymentGateWait,
+    DeploymentGates, Executor, LogChunks, SnapshotRetention, WorkspaceSnapshots,
 };
 pub use scheduler::{
-    cancel_run_request, gate_approvers, pin_run_snapshots, plan_rerun, record_gate_approval,
+    cancel_run_request, deployment_gate_wait, deployment_gate_waits_afresh,
+    deployment_request_first_attempt,
+    gate_approvers, pin_run_snapshots, plan_rerun, record_gate_approval,
     reject_gate, release_gate, wait_began_at,
-    rerun_step, rerun_step_widened, retry_step, retry_step_widened, unpin_run_snapshots,
+    rerun_step, rerun_step_widened, retry_step, retry_step_widened, run_status_post_key,
+    unpin_run_snapshots,
     ExpiredInput, PlanReason, PlannedStep, RerunError, RerunPlan, Scheduler, SchedulerError,
-    SupersedeTeardown, SupersededAttempt, Supervision, TickHealth, CANCEL_RUN, LAUNCH_STEP,
-    MAX_DELIVERY_ATTEMPTS,
+    AttemptTeardown, Supervision, TeardownAttempt, TickHealth, CANCEL_ATTEMPT, CANCEL_RUN,
+    LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS,
     RUN_STATUS_CHANGED, SUPERSEDE_TEARDOWN,
 };
 
@@ -367,6 +370,41 @@ impl AttemptOutcome {
             _ => return None,
         })
     }
+}
+
+/// What a won step transition stamps on one of the step's Attempts, in the
+/// SAME commit as the CAS and its events ([`Db::commit_step_transition`],
+/// git-bug 586187a). Both keep the terminal-by-intent guard of the
+/// standalone writes: a `Superseded`/`Cancelled` outcome is never
+/// overwritten.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttemptStamp {
+    /// As [`Db::set_attempt_outcome`].
+    Outcome(AttemptOutcome),
+    /// As [`Db::set_attempt_failure`]: the classification, its cause, and
+    /// the `Failed` outcome together.
+    Failure {
+        kind: FailureKind,
+        detail: Option<String>,
+    },
+}
+
+/// What a step transition's CAS requires of the step's **latest** Attempt,
+/// besides its status ([`Db::commit_step_transition`]).
+///
+/// A status-only CAS is ABA-blind (red team R2-E3): a step read `Running` on
+/// `a1` can be cancelled, rerun and claimed `Running` on `a2` before the
+/// reader's commit, which then still matches `Running` — and stamps, and
+/// tears down, the stale `a1` while `a2` runs on unowned. A transition that
+/// acts on the step's in-flight attempt names the one it read, so a frontier
+/// that moved is a [`DbError::Conflict`] and the caller re-reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptFrontier<'a> {
+    /// No requirement: the CAS is on the status alone.
+    Any,
+    /// The step's latest Attempt (by mint order) is exactly this one —
+    /// `None`: the step has no Attempt at all.
+    Is(Option<&'a AttemptId>),
 }
 
 /// How one gate wait ends — the verdict a [`Db::resolve_gate_wait`] writes in
@@ -1001,16 +1039,66 @@ pub struct RunDeploymentRequest {
     pub gate_steps: Vec<StepId>,
 }
 
+/// What [`Db::finish_step_with_deployment_requests`] did, when it did not
+/// conflict.
+///
+/// [`Db::finish_step_with_deployment_requests`]: crate::ports::Db::finish_step_with_deployment_requests
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeployStepFinish {
+    /// The success transition, the attempt outcome, the events and every
+    /// request landed, in one commit.
+    Recorded,
+    /// **Nothing** landed (git-bug 9e66f2c): re-checked under the Org's
+    /// Deployment counter lock, a request's DeploymentTarget is homed in
+    /// another Environment — another Run, admitted concurrently, recorded it
+    /// first (or its routing moved since admission). A DeploymentTarget
+    /// belongs to exactly one Environment, so this request is never recorded;
+    /// the caller fails the Step. The first such request, in input order.
+    TargetHomedElsewhere(DeploymentTargetHomedElsewhere),
+}
+
+/// A DeploymentRequest whose DeploymentTarget is homed in an Environment other
+/// than the requesting Run's ([`DeployStepFinish::TargetHomedElsewhere`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentTargetHomedElsewhere {
+    /// The requesting Run's Environment.
+    pub environment: String,
+    pub target_source: String,
+    pub target_id: String,
+    /// The Environment the target is homed in.
+    pub home: String,
+}
+
+impl DeploymentTargetHomedElsewhere {
+    /// The Step's failure detail. Worded as a DeploymentRequest that cannot
+    /// be completed — the class the Step fails with
+    /// ([`FailureKind::DeploymentRequestIncomplete`]): the Step ran, nothing
+    /// is recorded, and it is never auto-retried.
+    pub fn reason(&self) -> String {
+        format!(
+            "DeploymentRequest incomplete: DeploymentTarget `{}`/`{}` is homed in Environment \
+             `{}`, not this Run's `{}` (another Run recorded it there first, after this Run was \
+             admitted); a DeploymentTarget belongs to exactly one Environment, so nothing was \
+             recorded for this step",
+            self.target_source, self.target_id, self.home, self.environment
+        )
+    }
+}
+
 /// Complete a succeeding Step's DeploymentRequests from its own `results`
 /// (slice b, criterion 1; plan Q10): each request's DeploymentVersion is its
-/// version result, which must be a **non-empty JSON string**; its evidence is
+/// version result, which must be a **non-empty JSON string** with no
+/// leading or trailing whitespace (never trimmed: a version is opaque); its evidence is
 /// the concatenation of its evidence results, each a JSON string or an array
-/// of strings. Every request is effective at `effective_at` (the succeeding
-/// Attempt's start). `at` inside each input is set to `effective_at` too — the
+/// of strings. Every request is effective at `effective_at` (the start of the
+/// step's first Attempt in its current Take — see
+/// [`deployment_request_first_attempt`]). `at` inside each input is set to
+/// `effective_at` too — the
 /// store ignores it and stamps its own receipt time.
 ///
 /// `Err` is the whole failure detail, starting "DeploymentRequest incomplete:"
-/// and naming every problem, so the author fixes them in one round.
+/// and naming every problem, so the author fixes them in one round
+/// ([`DeploymentRequestIncomplete::author_reason`]).
 pub fn deployment_inputs(
     run: &RunId,
     step: &StepId,
@@ -1018,6 +1106,63 @@ pub fn deployment_inputs(
     results: &std::collections::BTreeMap<String, serde_json::Value>,
     effective_at: Timestamp,
 ) -> Result<Vec<scarab_deployment::DeploymentInput>, String> {
+    complete_deployment_inputs(run, step, requests, results, effective_at)
+        .map_err(|incomplete| incomplete.author_reason())
+}
+
+/// Why a succeeding Step's DeploymentRequests could not be completed from
+/// its results: every problem, each naming the result and the target it was
+/// for. How it is worded depends on whether the results were lost in
+/// delivery (git-bug `0cb5895`) — which only the backend can say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentRequestIncomplete {
+    pub problems: Vec<String>,
+}
+
+impl DeploymentRequestIncomplete {
+    /// The backend delivered the results (or has none to deliver): the
+    /// author's step did not write them.
+    pub fn author_reason(&self) -> String {
+        format!(
+            "DeploymentRequest incomplete: {} (the step exited 0, but a DeploymentRequest it \
+             declares is read from these results — write them to /scarab/results/<name>.json)",
+            self.problems.join("; ")
+        )
+    }
+
+    /// The backend failed to deliver the results — `how`, e.g. "the results
+    /// sidecar `scarab-results-egress` exited 1": the step's own output may
+    /// be fine.
+    pub fn undelivered_reason(&self, how: &str) -> String {
+        format!(
+            "DeploymentRequest incomplete: {} — {how}, so this step's results were not \
+             delivered; the step's own output may be fine — retry the step",
+            self.problems.join("; ")
+        )
+    }
+
+    /// Whether the backend delivered the results could not be checked
+    /// (`why`: a backend error, or the execution's unit is already gone):
+    /// neither the author nor the delivery is blamed.
+    pub fn unchecked_reason(&self, why: &str) -> String {
+        format!(
+            "DeploymentRequest incomplete: {} (the step exited 0; whether its results were \
+             delivered could not be checked: {why}. If the step writes them to \
+             /scarab/results/<name>.json, retry the step)",
+            self.problems.join("; ")
+        )
+    }
+}
+
+/// [`deployment_inputs`], its `Err` the problems themselves, so the caller
+/// can word them for what the backend says about delivery.
+pub fn complete_deployment_inputs(
+    run: &RunId,
+    step: &StepId,
+    requests: &[RunDeploymentRequest],
+    results: &std::collections::BTreeMap<String, serde_json::Value>,
+    effective_at: Timestamp,
+) -> Result<Vec<scarab_deployment::DeploymentInput>, DeploymentRequestIncomplete> {
     use scarab_deployment::{
         DeploymentInput, DeploymentRequester, DeploymentTarget, DeploymentVersion,
     };
@@ -1029,6 +1174,16 @@ pub fn deployment_inputs(
             None => {
                 problems.push(format!(
                     "result `{}` (the version for {target}) is missing",
+                    req.version_result
+                ));
+                None
+            }
+            // A DeploymentVersion is opaque and never trimmed: `"v1\n"` would
+            // be a Deployment apart from the plugin's `v1` (git-bug 5f03853).
+            Some(serde_json::Value::String(v)) if !v.trim().is_empty() && v.trim() != v => {
+                problems.push(format!(
+                    "result `{}` (the version for {target}): version has leading/trailing \
+                     whitespace ({v:?}); write it exactly, with nothing around it",
                     req.version_result
                 ));
                 None
@@ -1083,11 +1238,7 @@ pub fn deployment_inputs(
     if problems.is_empty() {
         Ok(inputs)
     } else {
-        Err(format!(
-            "DeploymentRequest incomplete: {} (the step exited 0, but a DeploymentRequest it \
-             declares is read from these results — write them to /scarab/results/<name>.json)",
-            problems.join("; ")
-        ))
+        Err(DeploymentRequestIncomplete { problems })
     }
 }
 
@@ -1097,7 +1248,9 @@ fn json_kind(v: &serde_json::Value) -> &'static str {
         serde_json::Value::Null => "null",
         serde_json::Value::Bool(_) => "a boolean",
         serde_json::Value::Number(_) => "a number",
-        serde_json::Value::String(_) => "an empty string",
+        serde_json::Value::String(s) if s.is_empty() => "an empty string",
+        serde_json::Value::String(s) if s.trim().is_empty() => "a blank string",
+        serde_json::Value::String(_) => "a string",
         serde_json::Value::Array(_) => "an array",
         serde_json::Value::Object(_) => "an object",
     }
@@ -2125,5 +2278,51 @@ mod tests {
         let json = serde_json::to_string(&payload).unwrap();
         let back: EventPayload = serde_json::from_str(&json).unwrap();
         assert_eq!(back, payload);
+    }
+
+    /// git-bug 5f03853: a DeploymentVersion is opaque, so it is never
+    /// trimmed — `"v1\n"` would be a Deployment apart from the plugin's `v1`.
+    /// Surrounding whitespace is refused instead, and a blank version is
+    /// called blank, not empty.
+    #[test]
+    fn a_version_with_surrounding_whitespace_is_refused_not_trimmed() {
+        let request = RunDeploymentRequest {
+            step: StepId("bump".into()),
+            ordinal: 0,
+            org: "acme".into(),
+            environment: "prod".into(),
+            target_source: "argocd".into(),
+            target_id: "web".into(),
+            version_result: "version".into(),
+            evidence_results: vec![],
+            gate_steps: vec![],
+        };
+        let complete = |version: &str| {
+            complete_deployment_inputs(
+                &RunId("r1".into()),
+                &StepId("bump".into()),
+                std::slice::from_ref(&request),
+                &std::collections::BTreeMap::from([(
+                    "version".to_string(),
+                    serde_json::Value::String(version.into()),
+                )]),
+                Timestamp(0),
+            )
+        };
+        for padded in ["v1\n", " v1", "v1\t"] {
+            let problems = complete(padded).unwrap_err().problems;
+            assert_eq!(problems.len(), 1, "{padded:?}: {problems:?}");
+            assert!(
+                problems[0].contains("version has leading/trailing whitespace"),
+                "{padded:?}: {problems:?}"
+            );
+        }
+        let blank = complete("  ").unwrap_err().problems;
+        assert!(blank[0].contains("got a blank string"), "{blank:?}");
+        let empty = complete("").unwrap_err().problems;
+        assert!(empty[0].contains("got an empty string"), "{empty:?}");
+        assert_eq!(complete("v1").unwrap().len(), 1);
+
+        assert_eq!(json_kind(&serde_json::json!("x")), "a string");
     }
 }

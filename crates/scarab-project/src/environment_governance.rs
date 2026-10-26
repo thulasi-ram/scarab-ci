@@ -682,8 +682,27 @@ impl EnvironmentMigrationReport {
 ///
 /// Every write naming an Environment that does not exist is refused with
 /// [`OrgEnvironmentError::NotFound`].
+///
+/// **Optimistic concurrency (ADR-0073 §3).** Each loosenable write has an
+/// `…_expecting` form taking what the caller read before deciding whether
+/// the write loosens (and so needs a step-up). `Some(old)` makes the write
+/// conditional, in the store's own transaction: if what is stored now is not
+/// `old`, nothing is written and the answer is
+/// [`OrgEnvironmentError::Conflict`] — so a concurrent change can never slip
+/// a loosening past a write that was judged a tightening. `None` writes
+/// unconditionally, exactly as the plain form (which is that, provided).
 #[async_trait]
 pub trait EnvironmentGovernanceStore: Send + Sync {
+    /// The Environment — baseline and eligibility included — read in one
+    /// consistent snapshot, with no Project lens: what a conditional
+    /// governance write judges its loosenings against. `None` when the Org
+    /// has no Environment by that name (exact, case-sensitive).
+    async fn org_environment(
+        &self,
+        org: &str,
+        environment: &str,
+    ) -> Result<Option<OrgEnvironment>, OrgEnvironmentError>;
+
     /// The governance of `project`'s Deploy Runs into `environment`, read in
     /// **one consistent snapshot**; `None` when the Org has no Environment by
     /// that name (exact, case-sensitive).
@@ -713,6 +732,29 @@ pub trait EnvironmentGovernanceStore: Send + Sync {
         protection: &EnvironmentProtectionRules,
         updated_by: &str,
         updated_at: i64,
+    ) -> Result<OrgEnvironment, OrgEnvironmentError> {
+        self.put_environment_protection_expecting(
+            org,
+            environment,
+            protection,
+            None,
+            updated_by,
+            updated_at,
+        )
+        .await
+    }
+
+    /// [`put_environment_protection`](Self::put_environment_protection),
+    /// refused with [`OrgEnvironmentError::Conflict`] unless the stored
+    /// baseline is `expected` (when given).
+    async fn put_environment_protection_expecting(
+        &self,
+        org: &str,
+        environment: &str,
+        protection: &EnvironmentProtectionRules,
+        expected: Option<&EnvironmentProtectionRules>,
+        updated_by: &str,
+        updated_at: i64,
     ) -> Result<OrgEnvironment, OrgEnvironmentError>;
 
     /// Replace an Environment's eligibility. Refuses an invalid list
@@ -725,12 +767,50 @@ pub trait EnvironmentGovernanceStore: Send + Sync {
         eligibility: &EnvironmentProjectEligibility,
         updated_by: &str,
         updated_at: i64,
+    ) -> Result<OrgEnvironment, OrgEnvironmentError> {
+        self.put_environment_eligibility_expecting(
+            org,
+            environment,
+            eligibility,
+            None,
+            updated_by,
+            updated_at,
+        )
+        .await
+    }
+
+    /// [`put_environment_eligibility`](Self::put_environment_eligibility),
+    /// refused with [`OrgEnvironmentError::Conflict`] unless the stored
+    /// eligibility is `expected` (when given; pattern order ignored).
+    async fn put_environment_eligibility_expecting(
+        &self,
+        org: &str,
+        environment: &str,
+        eligibility: &EnvironmentProjectEligibility,
+        expected: Option<&EnvironmentProjectEligibility>,
+        updated_by: &str,
+        updated_at: i64,
     ) -> Result<OrgEnvironment, OrgEnvironmentError>;
 
     /// Create or replace one Project's overlay.
     async fn put_environment_project_overlay(
         &self,
         overlay: &EnvironmentProjectOverlay,
+        updated_by: &str,
+        updated_at: i64,
+    ) -> Result<(), OrgEnvironmentError> {
+        self.put_environment_project_overlay_expecting(overlay, None, updated_by, updated_at)
+            .await
+    }
+
+    /// [`put_environment_project_overlay`](Self::put_environment_project_overlay),
+    /// refused with [`OrgEnvironmentError::Conflict`] unless the stored
+    /// overlay is `expected` (when given): `Some(None)` expects the Project
+    /// to hold none, `Some(Some(o))` expects `o`'s rules and deadline.
+    async fn put_environment_project_overlay_expecting(
+        &self,
+        overlay: &EnvironmentProjectOverlay,
+        expected: Option<Option<&EnvironmentProjectOverlay>>,
         updated_by: &str,
         updated_at: i64,
     ) -> Result<(), OrgEnvironmentError>;
@@ -747,6 +827,21 @@ pub trait EnvironmentGovernanceStore: Send + Sync {
     async fn put_environment_project_privilege_grant(
         &self,
         grant: &EnvironmentProjectPrivilegeGrant,
+        updated_by: &str,
+        updated_at: i64,
+    ) -> Result<(), OrgEnvironmentError> {
+        self.put_environment_project_privilege_grant_expecting(grant, None, updated_by, updated_at)
+            .await
+    }
+
+    /// [`put_environment_project_privilege_grant`](Self::put_environment_project_privilege_grant),
+    /// refused with [`OrgEnvironmentError::Conflict`] unless the stored grant
+    /// is `expected` (when given): `Some(None)` expects none, `Some(Some(g))`
+    /// expects `g`'s whitelist and overlay permission.
+    async fn put_environment_project_privilege_grant_expecting(
+        &self,
+        grant: &EnvironmentProjectPrivilegeGrant,
+        expected: Option<Option<&EnvironmentProjectPrivilegeGrant>>,
         updated_by: &str,
         updated_at: i64,
     ) -> Result<(), OrgEnvironmentError>;
@@ -781,8 +876,11 @@ pub trait EnvironmentGovernanceStore: Send + Sync {
     /// homed now ([`DeploymentTargetHome`]): the Environment its source's
     /// grouping routes to, when the source has reported the target and an
     /// Environment lists that grouping; otherwise the Environment of the
-    /// target's newest input in the Deployment record. A target neither knows
-    /// is absent — nothing claims it, so any Environment may request it first.
+    /// target's newest input in the Deployment record; otherwise the
+    /// Environment of the oldest non-terminal Run that already requests it
+    /// (git-bug 9e66f2c: an admitted Run's request claims the target before it
+    /// records anything). A target none of them knows is absent — nothing
+    /// claims it, so any Environment may request it first.
     ///
     /// Read at Run creation, never folded: a home is a routing fact, not a
     /// Deployment's status. Not an ownership check — admission never reads

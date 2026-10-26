@@ -593,3 +593,221 @@ async fn a_put_racing_an_uninstall_waits_for_it_and_is_refused() {
     );
     tdb.cleanup().await;
 }
+
+/// ADR-0073 §3: every loosenable governance write has an `…_expecting` form
+/// that writes only if what is stored is still what the caller judged the
+/// write against — otherwise `Conflict`, and nothing changes. `None` stays
+/// the unconditional write.
+#[tokio::test]
+async fn an_expecting_write_refuses_when_the_stored_value_moved() {
+    use std::num::NonZeroU32;
+
+    use scarab_project::{
+        EnvironmentGovernanceStore, EnvironmentProjectEligibility, EnvironmentProjectOverlay,
+        EnvironmentProjectPrivilegeGrant, EnvironmentProtectionRules, ImageGrant,
+    };
+
+    let Some((tdb, db)) = migrated().await else {
+        return;
+    };
+    fn conflict<T: std::fmt::Debug>(r: Result<T, OrgEnvironmentError>) {
+        assert!(
+            matches!(r, Err(OrgEnvironmentError::Conflict(_))),
+            "expected a conflict, got {r:?}"
+        )
+    }
+
+    // Sources: a create expects none; a stale expectation is refused and the
+    // replace (description included) rolled back.
+    let argo = source("argocd", "prod");
+    db.put_org_environment_expecting(
+        &org_environment("acme", "prod", 30, vec![argo.clone()], 1),
+        Some(&[]),
+    )
+    .await
+    .unwrap();
+    conflict(
+        db.put_org_environment_expecting(
+            &OrgEnvironment {
+                description: "changed".into(),
+                ..org_environment("acme", "prod", 30, vec![], 2)
+            },
+            Some(&[]),
+        )
+        .await,
+    );
+    let stored = db
+        .get_org_environment("acme", "prod")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.deployment_sources, vec![argo.clone()]);
+    assert_ne!(stored.description, "changed");
+    db.put_org_environment_expecting(
+        &org_environment("acme", "prod", 30, vec![], 3),
+        Some(&[argo]),
+    )
+    .await
+    .unwrap();
+
+    // Baseline protection.
+    let strict = EnvironmentProtectionRules {
+        approvers: vec!["amy".into()],
+        allowed_refs: vec!["refs/heads/main".into()],
+        wait_timer_s: 5,
+        require_reason: true,
+        deployment_concurrency: NonZeroU32::new(1),
+    };
+    let permissive = EnvironmentProtectionRules::default();
+    db.put_environment_protection_expecting("acme", "prod", &strict, Some(&permissive), "amy", 4)
+        .await
+        .unwrap();
+    conflict(
+        db.put_environment_protection_expecting(
+            "acme",
+            "prod",
+            &permissive,
+            Some(&permissive),
+            "amy",
+            5,
+        )
+        .await,
+    );
+    assert_eq!(
+        db.get_org_environment("acme", "prod")
+            .await
+            .unwrap()
+            .unwrap()
+            .protection,
+        strict,
+        "nothing changed"
+    );
+    assert!(matches!(
+        db.put_environment_protection_expecting("acme", "nope", &strict, Some(&strict), "amy", 5)
+            .await,
+        Err(OrgEnvironmentError::NotFound { .. })
+    ));
+
+    // Eligibility, compared as a set.
+    let two = EnvironmentProjectEligibility::Projects(vec!["web".into(), "api".into()]);
+    db.put_environment_eligibility_expecting(
+        "acme",
+        "prod",
+        &two,
+        Some(&EnvironmentProjectEligibility::Projects(vec![])),
+        "amy",
+        6,
+    )
+    .await
+    .unwrap();
+    conflict(
+        db.put_environment_eligibility_expecting(
+            "acme",
+            "prod",
+            &EnvironmentProjectEligibility::AllProjects,
+            Some(&EnvironmentProjectEligibility::Projects(vec!["web".into()])),
+            "amy",
+            7,
+        )
+        .await,
+    );
+    db.put_environment_eligibility_expecting(
+        "acme",
+        "prod",
+        &EnvironmentProjectEligibility::Projects(vec!["web".into()]),
+        Some(&EnvironmentProjectEligibility::Projects(vec![
+            "api".into(),
+            "web".into(),
+        ])),
+        "amy",
+        8,
+    )
+    .await
+    .unwrap();
+
+    // An overlay: expected-absent creates; a second expected-absent, or a
+    // stale expected value, is refused.
+    let overlay = EnvironmentProjectOverlay {
+        org: "acme".into(),
+        environment: "prod".into(),
+        project: "web".into(),
+        rules: strict.clone(),
+        deployment_gate_deadline: Some(EnvironmentDeploymentDeadline::new(2 * MINUTE_MS).unwrap()),
+    };
+    db.put_environment_project_overlay_expecting(&overlay, Some(None), "amy", 9)
+        .await
+        .unwrap();
+    conflict(
+        db.put_environment_project_overlay_expecting(&overlay, Some(None), "amy", 10)
+            .await,
+    );
+    let looser = EnvironmentProjectOverlay {
+        rules: permissive.clone(),
+        deployment_gate_deadline: None,
+        ..overlay.clone()
+    };
+    conflict(
+        db.put_environment_project_overlay_expecting(&looser, Some(Some(&looser)), "amy", 11)
+            .await,
+    );
+    db.put_environment_project_overlay_expecting(&looser, Some(Some(&overlay)), "amy", 12)
+        .await
+        .unwrap();
+    let g = db
+        .deploy_governance("acme", "web", "prod")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(g.overlay.unwrap().rules, permissive);
+
+    // A privilege grant, the same way.
+    let grant = EnvironmentProjectPrivilegeGrant {
+        org: "acme".into(),
+        environment: "prod".into(),
+        project: "web".into(),
+        privileged_images: vec![ImageGrant {
+            image_digest: "sha256:aa".into(),
+            privileged: false,
+            capabilities: vec!["NET_ADMIN".into()],
+        }],
+        permit_k8s_overlay: false,
+    };
+    db.put_environment_project_privilege_grant_expecting(&grant, Some(None), "amy", 13)
+        .await
+        .unwrap();
+    conflict(
+        db.put_environment_project_privilege_grant_expecting(&grant, Some(None), "amy", 14)
+            .await,
+    );
+    let wider = EnvironmentProjectPrivilegeGrant {
+        permit_k8s_overlay: true,
+        ..grant.clone()
+    };
+    conflict(
+        db.put_environment_project_privilege_grant_expecting(&wider, Some(Some(&wider)), "amy", 15)
+            .await,
+    );
+    db.put_environment_project_privilege_grant_expecting(&wider, Some(Some(&grant)), "amy", 16)
+        .await
+        .unwrap();
+    assert!(matches!(
+        db.put_environment_project_privilege_grant_expecting(
+            &EnvironmentProjectPrivilegeGrant {
+                environment: "nope".into(),
+                ..wider.clone()
+            },
+            Some(Some(&wider)),
+            "amy",
+            17,
+        )
+        .await,
+        Err(OrgEnvironmentError::NotFound { .. })
+    ));
+
+    // `None` is the unconditional write it always was.
+    db.put_environment_protection_expecting("acme", "prod", &permissive, None, "amy", 18)
+        .await
+        .unwrap();
+
+    tdb.cleanup().await;
+}

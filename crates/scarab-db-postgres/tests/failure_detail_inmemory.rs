@@ -122,6 +122,12 @@ const REFUSAL: &str = "project `web` is no longer eligible to deploy to environm
 
 #[async_trait::async_trait]
 impl scarab_engine::Executor for RefusingExec {
+    async fn results_delivery_failure(
+        &self,
+        _handle: &scarab_engine::ports::ExecHandle,
+    ) -> Result<Option<String>, scarab_engine::ExecError> {
+        Ok(None)
+    }
     async fn infra_condition(
         &self,
         _handle: &scarab_engine::ports::ExecHandle,
@@ -152,6 +158,19 @@ impl scarab_engine::Executor for RefusingExec {
         _handle: &scarab_engine::ports::ExecHandle,
     ) -> Result<(), scarab_engine::ExecError> {
         Ok(())
+    }
+    fn unit_handle(
+        &self,
+        _step: &scarab_engine::StepRun,
+    ) -> Option<scarab_engine::ports::ExecHandle> {
+        None // nothing is created behind this stub's launches
+    }
+
+    async fn torn_down(
+        &self,
+        _handle: &scarab_engine::ports::ExecHandle,
+    ) -> Result<bool, scarab_engine::ExecError> {
+        Ok(true) // a refused launch left nothing running
     }
 }
 

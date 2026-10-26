@@ -103,7 +103,7 @@
         "operationId": "oauth_callback",
         "responses": {
           "302": {
-            "description": "session + CSRF cookies set; redirect to /"
+            "description": "session + CSRF cookies set; redirect to the login's `next`, else /"
           },
           "401": {
             "description": "state mismatch or bad code"
@@ -128,6 +128,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "next",
+            "in": "query",
+            "description": "a relative path to land on after the callback (ADR-0073); default `/`",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -135,7 +144,7 @@
             "description": "redirect to the provider with a state cookie"
           },
           "400": {
-            "description": "unknown provider, or several and none named"
+            "description": "unknown provider, several and none named, or a `next` that is not a relative path"
           },
           "404": {
             "description": "OAuth not configured"
@@ -280,13 +289,23 @@
             "description": "unknown kind, non-creatable kind, or a malformed base URL"
           },
           "403": {
-            "description": "requires Administer on the org"
+            "description": "requires Administer on the org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
           },
           "404": {
             "description": "no connection registry or secret store wired"
           },
           "409": {
             "description": "a connection to that forge and base URL already exists"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
           }
         },
         "security": [
@@ -332,13 +351,23 @@
             "description": "connection deleted"
           },
           "403": {
-            "description": "requires Administer on the org"
+            "description": "requires Administer on the org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
           },
           "404": {
             "description": "no such connection, or no registry wired"
           },
           "409": {
             "description": "the connection still has bound repos (Projects)"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
           }
         },
         "security": [
@@ -495,13 +524,23 @@
             "description": "missing owner/name"
           },
           "403": {
-            "description": "requires Administer on the org"
+            "description": "requires Administer on the org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
           },
           "404": {
             "description": "no such connection, or no registry wired"
           },
           "409": {
             "description": "the repo is already bound to a different connection"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
           }
         },
         "security": [
@@ -556,10 +595,20 @@
             "description": "repo unbound"
           },
           "403": {
-            "description": "requires Administer on the org"
+            "description": "requires Administer on the org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
           },
           "404": {
             "description": "no such connection, or the repo is not bound to it"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
           }
         },
         "security": [
@@ -670,11 +719,24 @@
               }
             }
           },
+          "403": {
+            "description": "`step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
           "404": {
             "description": "no such connection, or no registry/forge wired"
           },
           "409": {
             "description": "the connection is managed by configuration (read-only)"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
           },
           "501": {
             "description": "this forge adapter cannot enumerate repos"
@@ -751,7 +813,17 @@
             }
           },
           "403": {
-            "description": "not a browser session"
+            "description": "not a browser session — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
           }
         },
         "security": [
@@ -775,8 +847,361 @@
           "204": {
             "description": "unlinked"
           },
+          "403": {
+            "description": "`step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
           "409": {
             "description": "not linked, or the only way to sign in"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/me/passkeys/registration": {
+      "post": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Finish enrolling a passkey (ADR-0073 §2)",
+        "operationId": "passkey_registration",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasskeyRegistrationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PasskeyDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "challenge unknown/used/expired, or the credential failed verification (`code` names the check)"
+          },
+          "404": {
+            "description": "step-up is off"
+          },
+          "409": {
+            "description": "this credential is already registered"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/me/passkeys/registration/options": {
+      "post": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Begin enrolling a passkey (ADR-0073 §2)",
+        "operationId": "passkey_registration_options",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasskeyRegistrationOptionsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "PublicKeyCredentialCreationOptionsJSON under `public_key`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebauthnChallengeDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`fresh_login_required` (a first passkey needs a browser login from the last 5 minutes), `step_up_required` (a later passkey is always-ask), or not a browser session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "step-up is off"
+          },
+          "409": {
+            "description": "the governed state changed between this request's read and its write (reload and retry), or the request conflicts with the current state"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/me/passkeys/{id}": {
+      "delete": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Remove a passkey (ADR-0073 §2; always-ask step-up)",
+        "operationId": "remove_passkey",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "passkey id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "removed"
+          },
+          "403": {
+            "description": "`step_up_required` (mode `action`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such passkey of yours, or step-up is off"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/me/security": {
+      "get": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "My passkeys and step-up state (ADR-0073)",
+        "operationId": "me_security",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MeSecurityResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "not signed in"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/me/security/events": {
+      "get": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "My security events (ADR-0073 §7)",
+        "operationId": "my_security_events",
+        "parameters": [
+          {
+            "name": "kind",
+            "in": "query",
+            "description": "comma-separated event kinds",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "description": "only events with seq below this (paging)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "page size (default 50, max 200)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecurityEventsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "not signed in"
+          },
+          "403": {
+            "description": "an API token: it never reads its owner's security history"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/me/step-up": {
+      "post": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Confirm a step-up with a passkey (ADR-0073 §4)",
+        "operationId": "step_up_confirm",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StepUpConfirmRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpConfirmResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "challenge unknown/used/expired/another session's, unknown credential, or the assertion failed verification (`code` names the check)"
+          },
+          "403": {
+            "description": "`clone_suspected`: the passkey's counter went backwards and it is now refused for good; or not a browser session"
+          },
+          "404": {
+            "description": "step-up is off"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/me/step-up/options": {
+      "post": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Begin a step-up: a challenge that opens a 5-minute window (ADR-0073 §4)",
+        "operationId": "step_up_options",
+        "responses": {
+          "200": {
+            "description": "PublicKeyCredentialRequestOptionsJSON under `public_key`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebauthnChallengeDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`no_passkey`: enroll one first"
+          },
+          "403": {
+            "description": "not a browser session"
+          },
+          "404": {
+            "description": "step-up is off"
           }
         },
         "security": [
@@ -832,6 +1257,19 @@
         "responses": {
           "204": {
             "description": "granted"
+          },
+          "403": {
+            "description": "`step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
           }
         },
         "security": [
@@ -852,6 +1290,19 @@
         "responses": {
           "204": {
             "description": "revoked"
+          },
+          "403": {
+            "description": "`step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
           }
         },
         "security": [
@@ -1180,13 +1631,23 @@
             "description": "invalid name, deadline or source, or a source naming no installation in the org"
           },
           "403": {
-            "description": "not an org admin"
+            "description": "not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
           },
           "404": {
             "description": "org Environments not configured"
           },
           "409": {
             "description": "a source is already listed by another Environment"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
           }
         },
         "security": [
@@ -1230,13 +1691,23 @@
             "description": "deleted"
           },
           "403": {
-            "description": "not an org admin"
+            "description": "not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
           },
           "404": {
             "description": "no such Environment, or not configured"
           },
           "409": {
             "description": "the Environment has Deployments, or project overlays or grants"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
           }
         },
         "security": [
@@ -1590,10 +2061,23 @@
             "description": "an empty or duplicated pattern, or patterns with all_projects"
           },
           "403": {
-            "description": "not an org admin"
+            "description": "not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
           },
           "404": {
             "description": "no such Environment, or not configured"
+          },
+          "409": {
+            "description": "the governed state changed between this request's read and its write (reload and retry), or the request conflicts with the current state"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
           }
         },
         "security": [
@@ -1788,13 +2272,23 @@
             "description": "an approver who is not a Scarab user, an empty entry, a zero concurrency or an out-of-range deadline"
           },
           "403": {
-            "description": "not an admin of the project or org"
+            "description": "not an admin of the project or org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
           },
           "404": {
             "description": "no such Environment, or not configured"
           },
           "409": {
             "description": "the project is not eligible for the Environment"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
           }
         },
         "security": [
@@ -1846,10 +2340,20 @@
             "description": "removed"
           },
           "403": {
-            "description": "not an admin of the project or org"
+            "description": "not an admin of the project or org — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
           },
           "404": {
             "description": "no overlay, or not configured"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
           }
         },
         "security": [
@@ -1985,10 +2489,23 @@
             "description": "a digest that is not `sha256:…`, or one listed twice"
           },
           "403": {
-            "description": "not an org admin"
+            "description": "not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
           },
           "404": {
             "description": "no such Environment, or not configured"
+          },
+          "409": {
+            "description": "the governed state changed between this request's read and its write (reload and retry), or the request conflicts with the current state"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
           }
         },
         "security": [
@@ -2161,10 +2678,88 @@
             "description": "an approver who is not a Scarab user, an empty entry, or a zero concurrency"
           },
           "403": {
-            "description": "not an org admin"
+            "description": "not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
           },
           "404": {
             "description": "no such Environment, or not configured"
+          },
+          "409": {
+            "description": "the governed state changed between this request's read and its write (reload and retry), or the request conflicts with the current state"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/members/{subject}/passkeys/reset": {
+      "post": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Reset a member's passkeys (ADR-0073 §10; Owner, always-ask step-up)",
+        "operationId": "reset_member_passkeys",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "subject",
+            "in": "path",
+            "description": "the member's principal id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PasskeyResetDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`step_up_required` (mode `action`); not an Owner of the Org; or the member also belongs to an Org you do not own (not named)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member of the Org, or step-up is off"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
           }
         },
         "security": [
@@ -2317,13 +2912,23 @@
             "description": "invalid name or config"
           },
           "403": {
-            "description": "not an org admin, or not a first-party plugin pinned by digest"
+            "description": "not an org admin, or not a first-party plugin pinned by digest — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
           },
           "404": {
             "description": "plugins not configured"
           },
           "409": {
             "description": "the name is taken or retired, or plugins are off"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
           }
         },
         "security": [
@@ -2564,10 +3169,20 @@
             "description": "unknown slot, or a malformed base URL, credential or CA"
           },
           "403": {
-            "description": "not an org admin"
+            "description": "not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
           },
           "404": {
             "description": "no such installation, or plugins or the secret store not configured"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
           }
         },
         "security": [
@@ -2677,10 +3292,20 @@
             }
           },
           "403": {
-            "description": "not an org admin"
+            "description": "not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
           },
           "404": {
             "description": "no such installation, or plugins not configured"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
           }
         },
         "security": [
@@ -2871,6 +3496,128 @@
         ]
       }
     },
+    "/v1/orgs/{org}/security/events": {
+      "get": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "An Org's security event log (ADR-0073 §7)",
+        "operationId": "org_security_events",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "kind",
+            "in": "query",
+            "description": "comma-separated event kinds",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "description": "only events with seq below this (paging)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "page size (default 50, max 200)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecurityEventsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "not signed in"
+          },
+          "403": {
+            "description": "not an admin of the Org"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/security/summary": {
+      "get": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "An Org's step-up posture: admins without a passkey, recent refusals (ADR-0073 §8)",
+        "operationId": "org_security_summary",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrgSecuritySummary"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "not signed in"
+          },
+          "403": {
+            "description": "not an admin of the Org"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/orgs/{org}/tokens": {
       "get": {
         "tags": [
@@ -2961,10 +3708,20 @@
             "description": "bad role, name, or lifetime, or the role exceeds the minter's"
           },
           "403": {
-            "description": "not an admin of the target scope, or the caller is itself a token"
+            "description": "not an admin of the target scope, or the caller is itself a token — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
           },
           "404": {
             "description": "API tokens not configured"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
           }
         },
         "security": [
@@ -3079,8 +3836,21 @@
               }
             }
           },
+          "403": {
+            "description": "`step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
           "409": {
             "description": "no login provider is associated with this repo's forge"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
           },
           "501": {
             "description": "the forge adapter cannot list collaborators"
@@ -4109,11 +4879,24 @@
           "202": {
             "description": "approval recorded (released or awaiting more approvals)"
           },
+          "403": {
+            "description": "`step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
           "404": {
             "description": "no such run or gate"
           },
           "409": {
             "description": "not an approvable gate (not a manual gate, not pending, or not reached yet), or the run's Environment no longer exists or no longer admits its project"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
           }
         },
         "security": [
@@ -4870,7 +5653,7 @@
           "Runs"
         ],
         "summary": "Ingest a step's named results (ADR-0040/0042): the trusted per-Pod egress\nsidecar POSTs `{ name: value, … }` here, authenticated by a fence-scoped\ntoken, and the control plane persists them to `step_runs.results`. The\nuntrusted step never calls this — only the sidecar holds the token.",
-        "description": "404 when no token secret is configured; 401 on a bad/missing token; 404 for\nan unknown step; 413 for an over-large body. The write is idempotent on the\nfence (a re-drive overwrites deterministically, ADR-0021).",
+        "description": "404 when no token secret is configured; 401 on a bad/missing token; 404 for\nan unknown step; 413 for an over-large body; 409 when the attempt is no\nlonger the step's running frontier. The write is idempotent on the fence\n(a re-drive overwrites deterministically, ADR-0021).",
         "operationId": "ingest_step_results",
         "parameters": [
           {
@@ -4901,6 +5684,9 @@
           },
           "404": {
             "description": "no such step, or results ingest disabled"
+          },
+          "409": {
+            "description": "the attempt is not the step's running frontier"
           }
         },
         "security": [
@@ -5181,8 +5967,21 @@
           "204": {
             "description": "secret stored"
           },
+          "403": {
+            "description": "`step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
           "404": {
             "description": "secrets not configured"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
           }
         },
         "security": [
@@ -5242,8 +6041,254 @@
           "204": {
             "description": "deleted (idempotent)"
           },
+          "403": {
+            "description": "`step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. Or the caller's role is insufficient.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
           "404": {
             "description": "secrets not configured"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/security/events": {
+      "get": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "The install-wide security event log (ADR-0073 §7)",
+        "operationId": "security_events",
+        "parameters": [
+          {
+            "name": "kind",
+            "in": "query",
+            "description": "comma-separated event kinds",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "description": "only events with seq below this (paging)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "page size (default 50, max 200)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecurityEventsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "not signed in"
+          },
+          "403": {
+            "description": "not a global administrator"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/step-up/requests/{id}": {
+      "get": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "A step-up confirmation request (ADR-0073 §6)",
+        "operationId": "get_request",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "request id (from `confirmation_url`)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRequestDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "not signed in"
+          },
+          "404": {
+            "description": "no such request, or you are neither its human nor its requester; or step-up is off"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/step-up/requests/{id}/confirm": {
+      "post": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Confirm a step-up confirmation request: it runs once (ADR-0073 §6)",
+        "operationId": "confirm_request",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "request id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StepUpConfirmRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "it ran; `state` says whether the operation succeeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRequestResultDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "challenge unknown/used/expired/for another request, or the assertion failed verification (`code` names the check)"
+          },
+          "403": {
+            "description": "not a browser session, or `clone_suspected`"
+          },
+          "404": {
+            "description": "no such request of yours, or step-up is off"
+          },
+          "409": {
+            "description": "already confirmed — it ran (or is running) once"
+          },
+          "410": {
+            "description": "expired"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/step-up/requests/{id}/options": {
+      "post": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Begin confirming a step-up confirmation request (ADR-0073 §6)",
+        "operationId": "request_options",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "request id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "PublicKeyCredentialRequestOptionsJSON under `public_key`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebauthnChallengeDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`no_passkey`: enroll one first"
+          },
+          "403": {
+            "description": "not a browser session"
+          },
+          "404": {
+            "description": "no such request of yours, or step-up is off"
+          },
+          "409": {
+            "description": "already confirmed"
+          },
+          "410": {
+            "description": "expired"
           }
         },
         "security": [
@@ -6016,12 +7061,21 @@
                 "type": "null"
               },
               {
-                "$ref": "#/components/schemas/DeploymentStatusDto"
+                "$ref": "#/components/schemas/DeploymentStatusDto",
+                "description": "The Deployment's own status — on its Environment's **baseline**\ndeadline, over the Deployment's lifetime, as the Deployments page\nshows it. Not the gate's clock: a Retry waits afresh while this can\nalready read `stalled` (see `fails_at`)."
               }
             ]
           },
           "environment": {
             "type": "string"
+          },
+          "fails_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When this gate fails `stalled` if nothing decisive is reported first\n(epoch millis): its wait's window opening plus its Project's effective\ngate deadline — the engine's own computation (git-bug `ec84c5d`).\nAbsent when unknown (no Deployment, or the deadline could not be read)."
           },
           "latest_label": {
             "type": [
@@ -7013,6 +8067,74 @@
           }
         }
       },
+      "MeSecurityResponse": {
+        "type": "object",
+        "description": "`GET /v1/me/security`.",
+        "required": [
+          "subject",
+          "step_up",
+          "has_passkey",
+          "usable_passkey_count",
+          "passkeys",
+          "passkeys_hidden",
+          "can_enroll_first",
+          "fresh_login_url"
+        ],
+        "properties": {
+          "can_enroll_first": {
+            "type": "boolean",
+            "description": "No usable passkey yet, and this browser session's login is fresh\nenough to enroll the first one."
+          },
+          "fresh_login_until": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Until when this session's login is fresh (a browser login only)."
+          },
+          "fresh_login_url": {
+            "type": "string",
+            "description": "Where this human logs in again — through the login provider they sign\nin with — landing on enrollment (a relative URL). The one place the\nprovider is chosen: `scarab security setup` prints this."
+          },
+          "has_passkey": {
+            "type": "boolean",
+            "description": "Holds at least one usable (not clone-flagged) passkey."
+          },
+          "passkeys": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PasskeyDto"
+            },
+            "description": "The passkeys — empty for an API-token caller (see `passkeys_hidden`)."
+          },
+          "passkeys_hidden": {
+            "type": "boolean",
+            "description": "The caller is an API token: a token, scoped to one Org or Project,\nnever reads its owner's passkey list (only whether one is held)."
+          },
+          "step_up": {
+            "type": "string",
+            "description": "`enforce` or `off`."
+          },
+          "subject": {
+            "type": "string"
+          },
+          "usable_passkey_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many usable (not clone-flagged) passkeys are held.",
+            "minimum": 0
+          },
+          "window_expires_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "This browser session's open window, if any (unix ms)."
+          }
+        }
+      },
       "MintTokenRequest": {
         "type": "object",
         "description": "`POST /v1/orgs/{org}/tokens` body. Every field is required on purpose: a\ncredential with no verb and no expiry is the shape this repo already learned\nnot to mint twice.",
@@ -7076,6 +8198,32 @@
           }
         }
       },
+      "OpSummary": {
+        "type": "object",
+        "description": "What a human is asked to confirm: the server-rendered, redacted\ndescription of one operation (shown in the 403, on the confirm page and\nin the event log).",
+        "required": [
+          "operation",
+          "target",
+          "changes"
+        ],
+        "properties": {
+          "changes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "What changes, one line each. Redacted fields read `(hidden)`."
+          },
+          "operation": {
+            "type": "string",
+            "description": "What is being done (\"Write a secret\")."
+          },
+          "target": {
+            "type": "string",
+            "description": "What it is done to (\"acme/web/prod/DB_PASSWORD\")."
+          }
+        }
+      },
       "OrgEnvironmentDto": {
         "type": "object",
         "description": "An org-level Environment in its minimal shape (ADR-0071, MMP step 1).",
@@ -7134,6 +8282,169 @@
           "updated_by": {
             "type": "string",
             "description": "Who last wrote it (a Principal subject)."
+          }
+        }
+      },
+      "OrgSecuritySummary": {
+        "type": "object",
+        "description": "`GET /v1/orgs/{org}/security/summary`.",
+        "required": [
+          "enforced",
+          "admins_without_passkey",
+          "admins_total",
+          "unresolved_owner_entries",
+          "recent_refusals",
+          "pending_requests"
+        ],
+        "properties": {
+          "admins_total": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "admins_without_passkey": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Admins of the Org (Admin/Owner bindings on the Org, and — for a\nglobal administrator only — the bootstrap owners) who hold no usable\npasskey: every crown jewel is refused for them until they enroll one."
+          },
+          "caller_role": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Your role in the Org (`owner`, `admin`, …)."
+          },
+          "enforced": {
+            "type": "boolean",
+            "description": "Step-up is enforced on this install."
+          },
+          "pending_requests": {
+            "type": "integer",
+            "format": "int64",
+            "description": "StepUpConfirmationRequests waiting for a human in this Org.",
+            "minimum": 0
+          },
+          "recent_refusals": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SecurityEventDto"
+            },
+            "description": "The last 20 refusals in the Org, from the last 24 hours."
+          },
+          "unresolved_owner_entries": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bootstrap owners entries that match only a verified email at login\nand name no Principal: not counted above, since no passkey is ever\nstored under one (a global administrator's view; 0 otherwise).",
+            "minimum": 0
+          }
+        }
+      },
+      "PasskeyDto": {
+        "type": "object",
+        "description": "One of the caller's passkeys.",
+        "required": [
+          "id",
+          "label",
+          "created_at",
+          "backup_eligible",
+          "backup_state",
+          "clone_suspected",
+          "transports"
+        ],
+        "properties": {
+          "backup_eligible": {
+            "type": "boolean",
+            "description": "The credential may be synced to other devices (BE)."
+          },
+          "backup_state": {
+            "type": "boolean",
+            "description": "It is backed up / synced, as last seen (BS)."
+          },
+          "clone_suspected": {
+            "type": "boolean",
+            "description": "Its signature counter went backwards: it is never accepted again."
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "last_used_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "transports": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "PasskeyRegistrationOptionsRequest": {
+        "type": "object",
+        "description": "`POST /v1/me/passkeys/registration/options`.",
+        "properties": {
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A name for the passkey (\"MacBook Touch ID\"). Default `Passkey`."
+          }
+        }
+      },
+      "PasskeyRegistrationRequest": {
+        "type": "object",
+        "description": "`POST /v1/me/passkeys/registration`.",
+        "required": [
+          "challenge_id",
+          "credential"
+        ],
+        "properties": {
+          "challenge_id": {
+            "type": "string"
+          },
+          "credential": {
+            "type": "object",
+            "description": "`RegistrationResponseJSON` — `PublicKeyCredential.toJSON()`."
+          }
+        }
+      },
+      "PasskeyResetDto": {
+        "type": "object",
+        "description": "What a passkey reset removed.",
+        "required": [
+          "subject",
+          "removed",
+          "windows_revoked"
+        ],
+        "properties": {
+          "removed": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many passkeys were removed.",
+            "minimum": 0
+          },
+          "subject": {
+            "type": "string",
+            "description": "The principal whose passkeys were reset."
+          },
+          "windows_revoked": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many standing step-up confirmations (windows, unconsumed action\nconfirmations) were revoked.",
+            "minimum": 0
           }
         }
       },
@@ -8243,6 +9554,13 @@
               "null"
             ],
             "description": "The run **Headline** (ADR-0057) — the one human line saying what this run\nis about (a push's commit subject; later a PR title / dispatch reason),\ndisambiguated by the trigger kind. Display/audit only; absent when the\ntrigger carried no headline and on runs created before headline-stamping."
+          },
+          "waiting_gates": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WaitingGateDto"
+            },
+            "description": "The run's **waiting gates** (git-bug `c489346`): gate steps that are\n`Pending`, reached (every need `Succeeded`) and have an open Attempt —\nthe engine's \"waiting gate\". Since a waiting gate holds only its\ndependents (ADR-0070 §9), a Run with one can still be `running` while\nindependent steps run, so this — not `status == suspended` — is what\nsays a Run waits on a gate. Omitted when empty (and always for a\nterminal or queued Run)."
           }
         }
       },
@@ -8334,6 +9652,118 @@
             "propertyNames": {
               "type": "string"
             }
+          }
+        }
+      },
+      "SecurityEventDto": {
+        "type": "object",
+        "description": "One OrgSecurityEventLog row.",
+        "required": [
+          "seq",
+          "id",
+          "at",
+          "kind",
+          "subject",
+          "caller",
+          "detail"
+        ],
+        "properties": {
+          "at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix ms."
+          },
+          "caller": {
+            "type": "string",
+            "description": "`session:cookie`, `session:bearer`, `api_token:<id>` or\n`operator:break-glass`."
+          },
+          "confirmation_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The StepUpConfirmation it was authorised by / that it records."
+          },
+          "detail": {
+            "type": "object"
+          },
+          "id": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "description": "`step_up.confirmed`, `step_up.refused`, `op.authorised`,\n`op.completed`, `request.raised|confirmed|executed|failed`,\n`passkey.enrolled|removed|reset|break_glass_reset|clone_suspected`,\n`guard.not_consulted`."
+          },
+          "op": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "org": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`None`: not bound to one Org (a passkey, a confirmation)."
+          },
+          "passkey_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "request_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The StepUpConfirmationRequest it belongs to."
+          },
+          "seq": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Orders the log; pass the last one's as `before` to page."
+          },
+          "session_hash": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "SHA-256 of the session (never the session id)."
+          },
+          "subject": {
+            "type": "string",
+            "description": "The human/principal it is about."
+          },
+          "target": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "SecurityEventsResponse": {
+        "type": "object",
+        "description": "A page of the log.",
+        "required": [
+          "events"
+        ],
+        "properties": {
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SecurityEventDto"
+            }
+          },
+          "next_before": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Pass as `before` for the next page; absent on the last."
           }
         }
       },
@@ -8681,6 +10111,259 @@
           }
         }
       },
+      "StepUpConfirmRequest": {
+        "type": "object",
+        "description": "`POST /v1/me/step-up`.",
+        "required": [
+          "challenge_id",
+          "credential"
+        ],
+        "properties": {
+          "challenge_id": {
+            "type": "string"
+          },
+          "credential": {
+            "type": "object",
+            "description": "`AuthenticationResponseJSON` — `PublicKeyCredential.toJSON()`."
+          }
+        }
+      },
+      "StepUpConfirmResponse": {
+        "type": "object",
+        "description": "A StepUpConfirmation just made.",
+        "required": [
+          "confirmation_id",
+          "kind",
+          "confirmed_at",
+          "expires_at"
+        ],
+        "properties": {
+          "confirmation_id": {
+            "type": "string"
+          },
+          "confirmed_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "expires_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Fixed at `confirmed_at` + 5 minutes; never extended."
+          },
+          "kind": {
+            "type": "string",
+            "description": "`window` or `action`."
+          }
+        }
+      },
+      "StepUpRefusal": {
+        "type": "object",
+        "description": "The body of a `403 step_up_required` (ADR-0073 §5).",
+        "required": [
+          "code",
+          "message",
+          "mode",
+          "op",
+          "summary"
+        ],
+        "properties": {
+          "challenge": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/WebauthnChallengeDto",
+                "description": "A cookie session with a passkey: the ready challenge to answer at\n`POST /v1/me/step-up`, then retry the request."
+              }
+            ]
+          },
+          "code": {
+            "type": "string",
+            "description": "Always `step_up_required`."
+          },
+          "confirmation_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An API token or Bearer-session caller: the one-time link its human\nconfirms this exact operation at (ADR-0073 §6)."
+          },
+          "enroll_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Mode `enroll`: where to enroll a passkey."
+          },
+          "expires_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "fresh_login_until": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Mode `enroll`: until when this session's login is fresh enough to\nenroll a first passkey (absent = it is not; log in again)."
+          },
+          "message": {
+            "type": "string"
+          },
+          "mode": {
+            "type": "string",
+            "description": "`window` (a 5-minute window will do), `action` (confirm this exact\naction) or `enroll` (no passkey yet)."
+          },
+          "op": {
+            "type": "string",
+            "description": "The operation id (`secret.put`)."
+          },
+          "request_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "summary": {
+            "$ref": "#/components/schemas/OpSummary",
+            "description": "What is being confirmed, redacted."
+          }
+        }
+      },
+      "StepUpRequestDto": {
+        "type": "object",
+        "description": "A StepUpConfirmationRequest as its human (or its polling requester)\nsees it.",
+        "required": [
+          "id",
+          "op",
+          "summary",
+          "requested_by",
+          "requested_via",
+          "for_human",
+          "method",
+          "path",
+          "query",
+          "state",
+          "created_at",
+          "expires_at"
+        ],
+        "properties": {
+          "confirmed_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "confirmed_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "executed_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "expires_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "A pending request past this can no longer be confirmed."
+          },
+          "for_human": {
+            "type": "string",
+            "description": "The only human who can confirm it."
+          },
+          "id": {
+            "type": "string"
+          },
+          "method": {
+            "type": "string"
+          },
+          "op": {
+            "type": "string",
+            "description": "The operation id (`secret.put`)."
+          },
+          "org": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "type": "string"
+          },
+          "query": {
+            "type": "string",
+            "description": "The raw query string the operation runs with (empty = none) — part\nof what runs, so the confirm page shows it."
+          },
+          "requested_by": {
+            "type": "string",
+            "description": "Who asked: `API token “ci-bot” (<id>)` or `a CLI session (Bearer)`."
+          },
+          "requested_via": {
+            "type": "string",
+            "description": "`api_token` or `bearer_session`."
+          },
+          "result_status": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The replayed operation's HTTP status, once it ran."
+          },
+          "state": {
+            "type": "string",
+            "description": "`pending`, `executing`, `executed`, `failed` or `expired`."
+          },
+          "summary": {
+            "$ref": "#/components/schemas/OpSummary",
+            "description": "What would run, redacted (secret values read `(hidden)`)."
+          }
+        }
+      },
+      "StepUpRequestResultDto": {
+        "type": "object",
+        "description": "What a confirmed request did.",
+        "required": [
+          "request_id",
+          "state",
+          "result_body"
+        ],
+        "properties": {
+          "request_id": {
+            "type": "string"
+          },
+          "result_body": {
+            "type": "object",
+            "description": "The operation's response body (JSON, or a string), returned once\nand never stored — a minted token's plaintext shows only here."
+          },
+          "result_status": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The operation's HTTP status."
+          },
+          "state": {
+            "type": "string",
+            "description": "`executed` (the operation answered 2xx) or `failed`."
+          }
+        }
+      },
       "UninstalledPluginDto": {
         "type": "object",
         "description": "What an uninstall removed.",
@@ -8733,6 +10416,54 @@
           },
           "vendor_grouping": {
             "type": "string"
+          }
+        }
+      },
+      "WaitingGateDto": {
+        "type": "object",
+        "description": "One waiting gate of a run in the list view ([`RunSummaryDto::waiting_gates`]).",
+        "required": [
+          "step",
+          "kind",
+          "since"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "The gate kind: `manual` / `timer` / `external` / `deployment`."
+          },
+          "since": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When its wait opened (epoch millis): its open Attempt's start."
+          },
+          "step": {
+            "type": "string",
+            "description": "The gate step's id."
+          }
+        }
+      },
+      "WebauthnChallengeDto": {
+        "type": "object",
+        "description": "A WebAuthn challenge ready for `navigator.credentials.*`.",
+        "required": [
+          "id",
+          "public_key",
+          "expires_at"
+        ],
+        "properties": {
+          "expires_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix ms after which the challenge is refused."
+          },
+          "id": {
+            "type": "string",
+            "description": "Pass back with the credential."
+          },
+          "public_key": {
+            "type": "object",
+            "description": "`PublicKeyCredentialRequestOptionsJSON` (or `…CreationOptionsJSON`\nfor enrollment) — feed it to `parse*OptionsFromJSON`."
           }
         }
       },

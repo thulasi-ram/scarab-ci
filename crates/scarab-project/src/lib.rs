@@ -40,6 +40,14 @@ pub use environment_governance::{
     LegacyRuleField,
 };
 
+/// Which Environment governance edits loosen it (ADR-0073 §3): the pure,
+/// fail-closed rules that decide whether a conditional write needs a step-up.
+mod step_up_loosening;
+pub use step_up_loosening::{
+    deployment_source_additions, eligibility_loosenings, glob_subsumes, overlay_loosenings,
+    privilege_grant_loosenings, protection_loosenings, Loosening,
+};
+
 /// A top-level tenant. Owns Projects. The Scarab tenancy boundary — **not**
 /// the forge's `owner` namespace (one Org may span a GitHub org *and* a
 /// Forgejo instance).

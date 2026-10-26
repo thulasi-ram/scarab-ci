@@ -127,6 +127,16 @@ fn state_of(status: std::process::ExitStatus) -> ExecState {
 
 #[async_trait]
 impl Executor for LocalExecutor {
+    async fn results_delivery_failure(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<String>, ExecError> {
+        // The local backend hands results over in-process (`results`): there
+        // is no delivery leg that could fail apart from the step. REQUIRED
+        // method, so this None is a decision the compiler saw.
+        Ok(None)
+    }
+
     async fn infra_condition(
         &self,
         _handle: &ExecHandle,
@@ -302,6 +312,18 @@ impl Executor for LocalExecutor {
             );
         }
         Ok(())
+    }
+
+    fn unit_handle(&self, step: &StepRun) -> Option<ExecHandle> {
+        Some(Self::handle_for(step))
+    }
+
+    /// `cancel` SIGKILLs the process (`start_kill`) — there is no termination
+    /// grace in which it could go on acting — and drops its slot, whose
+    /// `kill_on_drop` reaps it. So once `cancel` returned, nothing of the
+    /// unit runs on; an unknown handle has nothing running either.
+    async fn torn_down(&self, _handle: &ExecHandle) -> Result<bool, ExecError> {
+        Ok(true)
     }
 
     // `output` uses the port default (`None`): no workspace CAS locally (ADR-0036).

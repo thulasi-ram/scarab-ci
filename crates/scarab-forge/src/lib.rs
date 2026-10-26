@@ -771,6 +771,20 @@ pub struct ResolvedRepo {
 pub enum RegistryError {
     #[error("registry store error: {0}")]
     Store(String),
+    /// A repo may not be bound into a reserved Org ([`is_reserved_org`]).
+    #[error(
+        "`{0}` is a reserved org name (`_`-prefixed names are Scarab's own): it cannot own a \
+         bound repo"
+    )]
+    ReservedOrg(String),
+}
+
+/// Org names Scarab keeps for itself: every `_`-prefixed name. Its own
+/// credential scopes live there (`_forge`, `_plugin_connections`), so no
+/// Project is homed in one — it would inherit those secrets (git-bug
+/// 97223c7). [`ForgeConnectionStore::bind_repo`] refuses one on every path.
+pub fn is_reserved_org(org: &str) -> bool {
+    org.starts_with('_')
 }
 
 /// Durable store for [`ForgeConnection`]s and the [`RepoRef`]s they own —
@@ -795,7 +809,26 @@ pub trait ForgeConnectionStore: Send + Sync {
 
     /// Bind a repo owned by `connection_id` to its governed Project
     /// `(org, project)`. Upserts: re-binding an existing repo re-homes it.
+    /// Refuses a reserved `org` ([`RegistryError::ReservedOrg`]) — the one
+    /// check every bind path (manual bind, re-sync, installation sync,
+    /// declarative connections) goes through. Do not override.
     async fn bind_repo(
+        &self,
+        connection_id: &str,
+        repo: &RepoRef,
+        org: &str,
+        project: &str,
+    ) -> Result<(), RegistryError> {
+        if is_reserved_org(org) {
+            return Err(RegistryError::ReservedOrg(org.to_string()));
+        }
+        self.upsert_repo_binding(connection_id, repo, org, project)
+            .await
+    }
+
+    /// The adapter's raw upsert behind [`bind_repo`](Self::bind_repo). Call
+    /// `bind_repo`, never this.
+    async fn upsert_repo_binding(
         &self,
         connection_id: &str,
         repo: &RepoRef,

@@ -9,9 +9,11 @@
 //! racing a plugin's report ingest on the same Org's counter neither
 //! deadlocks nor leaves a seq gap (the lock order of migration 0055: the
 //! counter last, on both sides). The scheduler-driven case pins what the
-//! request carries: one input per request, effective at the succeeding
-//! Attempt's start, received at the engine clock, version and evidence from
-//! the Step's own results. Also: where a DeploymentTarget is homed for Run
+//! request carries: one input per request, effective at the start of the
+//! Step's FIRST Attempt in its current Take (git-bug 2b5d9d9: a retried
+//! Step's request explains the report its first Attempt caused; a Rerun's
+//! is effective at its own Take's first Attempt), received at the engine
+//! clock, version and evidence from the Step's own results. Also: where a DeploymentTarget is homed for Run
 //! creation's refusal (current routing first, else its newest input). Every
 //! test gets its own database. Skips cleanly when `SCARAB_TEST_DATABASE_URL`
 //! is unset.
@@ -165,8 +167,8 @@ fn wall_ms() -> i64 {
 }
 
 /// Criterion 1, end to end through the scheduler: a Step that exits 0 with
-/// its results records exactly ONE request input — effective at the
-/// succeeding Attempt's start (not at its success), received at the engine
+/// its results records exactly ONE request input — effective at its (first
+/// and only) Attempt's start (not at its success), received at the engine
 /// clock's reading at success, version and evidence from its own results —
 /// and the step is `Succeeded` with one `StepTransitioned`.
 #[tokio::test]
@@ -299,11 +301,11 @@ async fn a_conflict_appends_nothing() {
     let a1 = AttemptId("a1".into());
     let input = [request_input("bump", "web", 1_000)];
 
-    db.finish_step_with_deployment_requests(&run_id(), &step, &a1, ORG, &input, Timestamp(2_000))
+    db.finish_step_with_deployment_requests(&run_id(), &step, &a1, ORG, &input, Timestamp(2_000), &[])
         .await
         .unwrap();
     let again = db
-        .finish_step_with_deployment_requests(&run_id(), &step, &a1, ORG, &input, Timestamp(2_100))
+        .finish_step_with_deployment_requests(&run_id(), &step, &a1, ORG, &input, Timestamp(2_100), &[])
         .await;
     assert!(matches!(again, Err(DbError::Conflict)), "got {again:?}");
     assert_eq!(db.inputs(ORG, ENV).await.unwrap().len(), 1);
@@ -321,6 +323,7 @@ async fn a_conflict_appends_nothing() {
             ORG,
             &[request_input("later", "api", 1_000)],
             Timestamp(2_200),
+            &[],
         )
         .await;
     assert!(matches!(not_running, Err(DbError::Conflict)));
@@ -352,6 +355,7 @@ async fn a_refused_append_rolls_the_step_transition_back() {
             ORG,
             &input,
             Timestamp(wall_ms() + 10 * 60_000),
+            &[],
         )
         .await;
     assert!(
@@ -371,7 +375,7 @@ async fn a_refused_append_rolls_the_step_transition_back() {
         "the counter row never landed"
     );
 
-    db.finish_step_with_deployment_requests(&run_id(), &step, &a1, ORG, &input, Timestamp(2_000))
+    db.finish_step_with_deployment_requests(&run_id(), &step, &a1, ORG, &input, Timestamp(2_000), &[])
         .await
         .unwrap();
     assert_eq!(step_status(&db, "bump").await, StepStatus::Succeeded);
@@ -498,6 +502,7 @@ async fn concurrent_ingest_and_step_success_do_not_deadlock() {
                     ORG,
                     &[request_input(&step, &format!("web{i}"), 1_000)],
                     Timestamp(2_000),
+                    &[],
                 )
                 .await
                 .unwrap();
@@ -525,9 +530,17 @@ async fn concurrent_ingest_and_step_success_do_not_deadlock() {
 
 /// Where Run creation looks a DeploymentTarget's home up: the Environment its
 /// source's grouping routes to NOW wins over the record; with no routing, the
-/// Environment of its newest input; a target neither knows is absent.
+/// Environment of its newest input; with neither, the Environment of the
+/// oldest non-terminal Run that already requests it (git-bug 9e66f2c — an
+/// admitted Run's request is "known" before it records anything, and a
+/// terminal Run's is not); a target nothing knows is absent.
+///
+/// The record never names two Environments for one target here: the "newest
+/// input" leg used to be shown flipping between Environments, the very
+/// two-homes state 9e66f2c closes (the success re-check below refuses the
+/// second Environment's request).
 #[tokio::test]
-async fn a_target_is_homed_by_its_routing_else_by_its_newest_input() {
+async fn a_target_is_homed_by_its_routing_else_its_newest_input_else_an_admitted_run() {
     let Some((tdb, db)) = migrated().await else {
         return;
     };
@@ -538,19 +551,49 @@ async fn a_target_is_homed_by_its_routing_else_by_its_newest_input() {
     db.ingest_report("0000000001", &[live_report("k1", "svc")], 2_000)
         .await
         .unwrap();
-    // `web` is only in the record, last requested from staging.
+    // `web` is only in the record, requested from staging.
     let mut staged = request_input("bump", "web", 1_000);
     if let DeploymentInput::Request { target, .. } = &mut staged {
         target.environment = "staging".into();
     }
-    db.append(ORG, &request_input("bump", "web", 1_000), 2_100)
+    db.append(ORG, &staged, 2_200).await.unwrap();
+    // `queued` is in no record, but a non-terminal staging Run requests it
+    // (and a later prod Run, which only a race could have admitted); `done`
+    // only a terminal Run did, which homes nothing.
+    for (run, env, target, status) in [
+        ("r-staging", "staging", "queued", None),
+        ("r-prod", ENV, "queued", None),
+        (
+            "r-done",
+            "staging",
+            "done",
+            Some(scarab_engine::RunStatus::Failed),
+        ),
+    ] {
+        let run = RunId(run.into());
+        db.create_run(
+            &run,
+            2,
+            1,
+            Timestamp(if env == ENV { 2_000 } else { 1_000 }),
+        )
         .await
         .unwrap();
-    db.append(ORG, &staged, 2_200).await.unwrap();
+        if let Some(to) = status {
+            db.record_transition(&run, scarab_engine::RunStatus::Pending, to)
+                .await
+                .unwrap();
+        }
+        let mut req = requested("bump", target);
+        req.environment = env.into();
+        db.set_run_deployment_requests(&run, &[req]).await.unwrap();
+    }
 
     let targets = [
         ("argocd".to_string(), "svc".to_string()),
         ("argocd".to_string(), "web".to_string()),
+        ("argocd".to_string(), "queued".to_string()),
+        ("argocd".to_string(), "done".to_string()),
         ("argocd".to_string(), "never-seen".to_string()),
     ];
     let mut homes = db.deployment_target_homes(ORG, &targets).await.unwrap();
@@ -559,13 +602,103 @@ async fn a_target_is_homed_by_its_routing_else_by_its_newest_input() {
         .iter()
         .map(|h| (h.id.as_str(), h.environment.as_str()))
         .collect();
-    assert_eq!(got, vec![("svc", "prod"), ("web", "staging")]);
+    assert_eq!(
+        got,
+        vec![("queued", "staging"), ("svc", "prod"), ("web", "staging")]
+    );
     // Another Org sees none of it.
     assert!(db
         .deployment_target_homes("initech", &targets)
         .await
         .unwrap()
         .is_empty());
+    tdb.cleanup().await;
+}
+
+/// git-bug 9e66f2c, the race admission cannot see: a staging Run and this
+/// prod Run were both admitted before either recorded `argocd`/`web`, and the
+/// staging Run recorded it first. When this Run's deploy Step exits 0, the
+/// commit re-reads the home under the Org's counter lock and finds staging:
+/// the Step FAILS `DeploymentRequestIncomplete` naming the home, nothing is
+/// recorded in prod, no seq is spent, and the target keeps ONE home —
+/// before the fix it was recorded in prod too and its home flipped.
+#[tokio::test]
+async fn a_step_success_is_refused_when_another_environment_recorded_its_target_first() {
+    let Some((tdb, db)) = migrated().await else {
+        return;
+    };
+    let step = StepId("bump".into());
+    db.create_run(&run_id(), 2, 1, Timestamp(1_000))
+        .await
+        .unwrap();
+    db.create_step_run(&run_id(), &step, Some(&spec()), &[], Timestamp(1_000))
+        .await
+        .unwrap();
+    db.store_run_ir(
+        &run_id(),
+        &serde_json::json!({ "ir_version": 2, "environment": ENV,
+            "steps": [{ "id": "bump", "image": "img" }] }),
+    )
+    .await
+    .unwrap();
+    db.set_run_deployment_requests(&run_id(), &[requested("bump", "web")])
+        .await
+        .unwrap();
+
+    let clock = FakeClock::new(1_000);
+    let exec = FakeExecutor::new();
+    clock.advance(2_000);
+    tick(&db, &clock, &exec).await;
+    tick(&db, &clock, &exec).await;
+
+    // Meanwhile the staging Run's deploy step succeeded and recorded `web`.
+    let mut staged = request_input("bump", "web", 1_000);
+    if let DeploymentInput::Request {
+        target, requester, ..
+    } = &mut staged
+    {
+        target.environment = "staging".into();
+        requester.run = "r-staging".into();
+    }
+    db.append(ORG, &staged, 2_500).await.unwrap();
+    assert_eq!(counter(&tdb.pool).await, Some(1));
+
+    clock.advance(5_000);
+    exec.set_results(
+        "bump",
+        BTreeMap::from([
+            ("version".to_string(), serde_json::json!("v42")),
+            ("images".to_string(), serde_json::json!(["sha256:aaa"])),
+        ]),
+    );
+    exec.script_outcome(ExecState::Succeeded);
+    for _ in 0..3 {
+        tick(&db, &clock, &exec).await;
+    }
+
+    assert_eq!(step_status(&db, "bump").await, StepStatus::Failed);
+    let attempts = db.attempts_of_step(&run_id(), &step).await.unwrap();
+    assert_eq!(attempts.len(), 1, "never auto-retried: {attempts:?}");
+    assert_eq!(
+        attempts[0].failure,
+        Some(scarab_engine::FailureKind::DeploymentRequestIncomplete)
+    );
+    let detail = attempts[0].failure_detail.clone().unwrap_or_default();
+    assert!(
+        detail.contains("homed in Environment `staging`") && detail.contains("`argocd`/`web`"),
+        "the reason names the target and its home: {detail}"
+    );
+    assert!(
+        db.inputs(ORG, ENV).await.unwrap().is_empty(),
+        "nothing recorded in prod"
+    );
+    assert_eq!(counter(&tdb.pool).await, Some(1), "no seq spent");
+    let homes = db
+        .deployment_target_homes(ORG, &[("argocd".to_string(), "web".to_string())])
+        .await
+        .unwrap();
+    assert_eq!(homes.len(), 1);
+    assert_eq!(homes[0].environment, "staging", "the home did not flip");
     tdb.cleanup().await;
 }
 
@@ -598,7 +731,7 @@ async fn a_non_latest_attempt_cannot_finish_the_step() {
     let input = [request_input("bump", "web", 1_000)];
 
     let stale = db
-        .finish_step_with_deployment_requests(&run_id(), &step, &a1, ORG, &input, Timestamp(3_000))
+        .finish_step_with_deployment_requests(&run_id(), &step, &a1, ORG, &input, Timestamp(3_000), &[])
         .await;
     assert!(
         matches!(stale, Err(DbError::Conflict)),
@@ -608,7 +741,7 @@ async fn a_non_latest_attempt_cannot_finish_the_step() {
         .await
         .unwrap();
     let superseded = db
-        .finish_step_with_deployment_requests(&run_id(), &step, &a1, ORG, &input, Timestamp(3_100))
+        .finish_step_with_deployment_requests(&run_id(), &step, &a1, ORG, &input, Timestamp(3_100), &[])
         .await;
     assert!(
         matches!(superseded, Err(DbError::Conflict)),
@@ -624,10 +757,241 @@ async fn a_non_latest_attempt_cannot_finish_the_step() {
     assert_eq!(attempts[0].outcome, AttemptOutcome::Superseded);
     assert_eq!(attempts[1].outcome, AttemptOutcome::Running);
 
-    db.finish_step_with_deployment_requests(&run_id(), &step, &a2, ORG, &input, Timestamp(3_200))
+    db.finish_step_with_deployment_requests(&run_id(), &step, &a2, ORG, &input, Timestamp(3_200), &[])
         .await
         .unwrap();
     assert_eq!(step_status(&db, "bump").await, StepStatus::Succeeded);
     assert_eq!(db.inputs(ORG, ENV).await.unwrap().len(), 1);
+    tdb.cleanup().await;
+}
+
+/// The frontier is the highest `a{n}`, never the latest `started_at`
+/// (git-bug 90d767d): across a leader failover with a backwards clock skew,
+/// the retried `a2` is stamped EARLIER than `a1`. Its exit 0 must still
+/// finish the step, and `a1`'s must not.
+#[tokio::test]
+async fn the_frontier_is_the_attempt_number_not_its_clock() {
+    let Some((tdb, db)) = migrated().await else {
+        return;
+    };
+    seed_running(&db, &["bump"]).await; // a1 started at 1_000
+    let step = StepId("bump".into());
+    let (a1, a2) = (AttemptId("a1".into()), AttemptId("a2".into()));
+    db.record_attempt(
+        &run_id(),
+        &step,
+        &Attempt {
+            id: a2.clone(),
+            started_at: Timestamp(400), // the new leader's clock lags
+            failure: None,
+            failure_detail: None,
+            outcome: AttemptOutcome::Running,
+        },
+    )
+    .await
+    .unwrap();
+    let input = [request_input("bump", "web", 1_000)];
+
+    let stale = db
+        .finish_step_with_deployment_requests(&run_id(), &step, &a1, ORG, &input, Timestamp(3_000), &[])
+        .await;
+    assert!(
+        matches!(stale, Err(DbError::Conflict)),
+        "a1 is not the frontier: got {stale:?}"
+    );
+    db.finish_step_with_deployment_requests(&run_id(), &step, &a2, ORG, &input, Timestamp(3_100), &[])
+        .await
+        .expect("a2 is the frontier despite its earlier clock");
+    assert_eq!(step_status(&db, "bump").await, StepStatus::Succeeded);
+    assert_eq!(db.inputs(ORG, ENV).await.unwrap().len(), 1);
+    let ids: Vec<String> = db
+        .attempts_of_step(&run_id(), &step)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|a| a.id.0)
+        .collect();
+    assert_eq!(ids, vec!["a1", "a2"], "attempts read in mint order");
+    tdb.cleanup().await;
+}
+
+/// A one-step Deploy Run whose `bump` requests `argocd`/`web`, opted into
+/// `retry: { max: 3 }`.
+async fn seed_retrying_deploy(db: &PostgresDb) {
+    let step = StepId("bump".into());
+    db.create_run(&run_id(), 2, 1, Timestamp(1_000))
+        .await
+        .unwrap();
+    db.create_step_run(&run_id(), &step, Some(&spec()), &[], Timestamp(1_000))
+        .await
+        .unwrap();
+    db.store_run_ir(
+        &run_id(),
+        &serde_json::json!({ "ir_version": 2, "environment": ENV, "steps": [{
+            "id": "bump", "image": "img",
+            "retry": { "on": "failure", "max": 3 },
+            "results": ["version", "images"],
+        }] }),
+    )
+    .await
+    .unwrap();
+    db.set_run_deployment_requests(&run_id(), &[requested("bump", "web")])
+        .await
+        .unwrap();
+}
+
+fn complete_results() -> BTreeMap<String, serde_json::Value> {
+    BTreeMap::from([
+        ("version".to_string(), serde_json::json!("v42")),
+        ("images".to_string(), serde_json::json!("sha256:aaa")),
+    ])
+}
+
+fn step_failure() -> ExecState {
+    ExecState::Failed {
+        exit_code: Some(1),
+        class: scarab_engine::ports::FailureClass::Step,
+        cause: None,
+    }
+}
+
+/// Tick (advancing the clock 1 s each time) until `bump` has `n` attempts.
+async fn tick_until_attempts(
+    db: &PostgresDb,
+    clock: &FakeClock,
+    exec: &FakeExecutor,
+    n: usize,
+) -> Vec<Attempt> {
+    let step = StepId("bump".into());
+    for _ in 0..10 {
+        let attempts = db.attempts_of_step(&run_id(), &step).await.unwrap();
+        if attempts.len() >= n {
+            return attempts;
+        }
+        tick(db, clock, exec).await;
+        clock.advance(1_000);
+    }
+    panic!("`bump` never reached {n} attempts");
+}
+
+/// git-bug 2b5d9d9 against Postgres: `a1` starts at T1, the source reports
+/// the change at T2, `a1` dies, `a2` starts at T3 > T2 and succeeds. The
+/// request is effective at T1, so it EXPLAINS the report-created Deployment —
+/// under the old rule (the succeeding Attempt's start) it was a claim.
+#[tokio::test]
+async fn a_retried_deploy_step_is_effective_at_its_first_attempt_and_explains_the_report() {
+    let Some((tdb, db)) = migrated().await else {
+        return;
+    };
+    seed_retrying_deploy(&db).await;
+    let clock = FakeClock::new(1_000);
+    let exec = FakeExecutor::new();
+    exec.set_results("bump", complete_results());
+    clock.advance(2_000);
+    let a1 = tick_until_attempts(&db, &clock, &exec, 1).await[0].clone();
+
+    clock.advance(1_000);
+    let t2 = scarab_engine::Clock::now(&clock).await.0;
+    let report = DeploymentInput::Report {
+        target: DeploymentTarget {
+            environment: ENV.into(),
+            source: "argocd".into(),
+            id: "web".into(),
+        },
+        version: DeploymentVersion("v42".into()),
+        report: scarab_deployment::DeploymentStatusReport {
+            status: scarab_deployment::SourceAssertedStatus::InProgress,
+            label: "Progressing · OutOfSync".into(),
+            link: None,
+            at: t2,
+        },
+    };
+    db.append(ORG, &report, t2).await.unwrap();
+
+    clock.advance(1_000);
+    exec.script_outcome(step_failure());
+    let attempts = tick_until_attempts(&db, &clock, &exec, 2).await;
+    assert_eq!(attempts[0].outcome, AttemptOutcome::Failed, "a1 failed");
+    let a2 = attempts[1].clone();
+    assert!(a2.started_at.0 > t2, "a2 starts after the report");
+
+    exec.script_outcome(ExecState::Succeeded);
+    for _ in 0..3 {
+        tick(&db, &clock, &exec).await;
+    }
+    assert_eq!(step_status(&db, "bump").await, StepStatus::Succeeded);
+
+    let logged = db.inputs(ORG, ENV).await.unwrap();
+    assert_eq!(logged.len(), 2, "the report, then the request: {logged:?}");
+    let DeploymentInput::Request { effective_at, .. } = &logged[1].input else {
+        panic!("expected the request second, got {:?}", logged[1]);
+    };
+    assert_eq!(
+        *effective_at, a1.started_at.0,
+        "effective at the FIRST Attempt's start, not a2's"
+    );
+    let folded = scarab_deployment::fold_environment(
+        &logged,
+        scarab_engine::Clock::now(&clock).await.0,
+        600_000,
+    );
+    assert_eq!(folded.deployments.len(), 1);
+    let d = &folded.deployments[0];
+    assert!(!d.unexplained, "the retried Step's request explains it");
+    assert_eq!(d.requesters.len(), 1);
+    assert!(!d.requesters[0].claim, "made live by this Run, not a claim");
+    tdb.cleanup().await;
+}
+
+/// A Rerun opens a new Take: its request is effective at that Take's FIRST
+/// Attempt (`a2`, then auto-retried as `a3`), not at `a1` nor at `a3`.
+#[tokio::test]
+async fn a_rerun_is_effective_at_its_own_takes_first_attempt() {
+    let Some((tdb, db)) = migrated().await else {
+        return;
+    };
+    seed_retrying_deploy(&db).await;
+    let step = StepId("bump".into());
+    let clock = FakeClock::new(1_000);
+    let exec = FakeExecutor::new();
+    exec.set_results("bump", complete_results());
+    clock.advance(2_000);
+    let a1 = tick_until_attempts(&db, &clock, &exec, 1).await[0].clone();
+    exec.script_outcome(ExecState::Succeeded);
+    for _ in 0..3 {
+        tick(&db, &clock, &exec).await;
+    }
+    assert_eq!(step_status(&db, "bump").await, StepStatus::Succeeded);
+
+    clock.advance(5_000);
+    scarab_engine::rerun_step(&db, &clock, &run_id(), &step, None)
+        .await
+        .unwrap();
+    clock.advance(1_000);
+    let a2 = tick_until_attempts(&db, &clock, &exec, 2).await[1].clone();
+    exec.script_outcome(step_failure());
+    let a3 = tick_until_attempts(&db, &clock, &exec, 3).await[2].clone();
+    exec.script_outcome(ExecState::Succeeded);
+    for _ in 0..3 {
+        tick(&db, &clock, &exec).await;
+    }
+    assert_eq!(step_status(&db, "bump").await, StepStatus::Succeeded);
+
+    let effective: Vec<i64> = db
+        .inputs(ORG, ENV)
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|l| match &l.input {
+            DeploymentInput::Request { effective_at, .. } => Some(*effective_at),
+            DeploymentInput::Report { .. } => None,
+        })
+        .collect();
+    assert_eq!(
+        effective,
+        vec![a1.started_at.0, a2.started_at.0],
+        "Take 1 at a1; Take 2 at its own first Attempt a2"
+    );
+    assert!(a1.started_at.0 < a2.started_at.0 && a2.started_at.0 < a3.started_at.0);
     tdb.cleanup().await;
 }

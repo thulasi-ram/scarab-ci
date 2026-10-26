@@ -29,6 +29,9 @@
 //!    verdict — which the engine had journalled and never re-derives. The
 //!    oracle now reads below the store's horizon (`inputs_as_of`). These are
 //!    oracle- and store-level: the pure fold cannot know a reader's `now`.
+//!    `pg_a_first_wait_decider_waits_out_an_append_holding_the_counter` is
+//!    the Postgres one for the gate's unfloored FIRST wait (the others use a
+//!    wait that waits afresh).
 
 mod common;
 
@@ -49,8 +52,9 @@ use scarab_deployment::{
 };
 use scarab_engine::{
     release_gate, Attempt, AttemptId, AttemptOutcome, Clock, Db, DeployContext,
-    DeploymentConcurrencyHold, DeploymentGateDecision, DeploymentGates, RunDeploymentRequest,
-    RunId, RunStatus, Scheduler, StepId, StepRun, StepSpec, StepStatus, Timestamp,
+    DeploymentConcurrencyHold, DeploymentGateDecision, DeploymentGateWait, DeploymentGates,
+    RunDeploymentRequest, RunId, RunStatus, Scheduler, StepId, StepRun, StepSpec, StepStatus,
+    Timestamp,
 };
 use scarab_project::{
     EnvironmentGovernanceStore, EnvironmentProjectEligibility, EnvironmentProjectOverlay,
@@ -246,11 +250,11 @@ impl DeploymentGates for ApproveMidPass<'_> {
         run: &RunId,
         gate: &StepId,
         request: &RunDeploymentRequest,
-        window_floor: Timestamp,
+        wait: DeploymentGateWait,
         now: Timestamp,
     ) -> Result<Option<DeploymentGateDecision>, String> {
         self.inner
-            .deployment_gate_verdict(run, gate, request, window_floor, now)
+            .deployment_gate_verdict(run, gate, request, wait, now)
             .await
     }
 
@@ -526,10 +530,26 @@ fn report_input(status: SourceAssertedStatus, at: Millis) -> DeploymentInput {
 
 /// What the server's oracle (a fresh per-tick view) answers for `ra`'s
 /// DeploymentGate `live` on `bump`'s request, its Attempt started at
-/// `floor`, asked at `now`.
+/// `floor`, asked at `now`. The wait waits afresh (a Retry on the same
+/// request), so `floor` IS its window start — these scenarios place inputs
+/// relative to it.
 async fn decide(
     oracle: &ServerDeploymentGates,
     floor: Millis,
+    now: Millis,
+) -> Option<DeploymentGateDecision> {
+    decide_wait(oracle, floor, true, now).await
+}
+
+/// [`decide`], saying whether the wait waits afresh. `afresh: false` is the
+/// gate's FIRST wait — the production default — with no succeeding-Attempt
+/// floor (a deploy Step that was not retried): its window is the request's
+/// own mark (effective at 0), and `started_at` only bounds when it may be
+/// asked.
+async fn decide_wait(
+    oracle: &ServerDeploymentGates,
+    started_at: Millis,
+    afresh: bool,
     now: Millis,
 ) -> Option<DeploymentGateDecision> {
     oracle
@@ -538,7 +558,11 @@ async fn decide(
             &rid("ra"),
             &id("live"),
             &request_row("bump", "web", &["live"]),
-            Timestamp(floor),
+            DeploymentGateWait {
+                started_at: Timestamp(started_at),
+                afresh,
+                deploy_attempt_started_at: None,
+            },
             Timestamp(now),
         )
         .await
@@ -679,6 +703,73 @@ async fn pg_a_decider_waits_out_an_append_holding_the_counter() {
         decision.passed,
         "the `live` received inside the deadline was committed by an append the \
          decider must wait out: {decision:?}"
+    );
+    tdb.cleanup().await;
+}
+
+/// The same interleaving for the gate's FIRST wait (`afresh: false`, the
+/// production default): unfloored, its window is the request's own mark
+/// (effective at 0), so its stall instant is 0 + DEADLINE. The held append
+/// carries a `live` received inside that deadline; the decider asks past
+/// it. Its read must wait out the append too: `passed`, not a `stalled`
+/// taken past an uncommitted input stamped before `now`.
+#[tokio::test]
+async fn pg_a_first_wait_decider_waits_out_an_append_holding_the_counter() {
+    let Some(tdb) = common::fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
+    pg.migrate().await.unwrap();
+    let store: Arc<dyn DeploymentStore> = pg.clone();
+    store.append(ORG, &request_input(), 5).await.unwrap();
+    // The gate Attempt opened at 20; the window (unfloored) at the request.
+    let gate_started: Millis = 20;
+    let now = DEADLINE + 10;
+    let live_at = DEADLINE - 10;
+
+    let mut tx = tdb.pool.begin().await.unwrap();
+    scarab_db_postgres::append_deployment_input(
+        &mut tx,
+        ORG,
+        &report_input(SourceAssertedStatus::Live, live_at),
+        live_at,
+    )
+    .await
+    .unwrap();
+
+    let as_db: Arc<dyn Db> = pg.clone();
+    let oracle = ServerDeploymentGates::new(as_db, store.clone(), None);
+    let decider = tokio::spawn(async move { decide_wait(&oracle, gate_started, false, now).await });
+
+    let give_up = Instant::now() + Duration::from_secs(10);
+    loop {
+        if decider.is_finished() {
+            break;
+        }
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_stat_activity
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(&tdb.pool)
+        .await
+        .unwrap();
+        if waiting > 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < give_up,
+            "the decider neither waited on the counter nor returned"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tx.commit().await.unwrap();
+
+    let decision = decider.await.unwrap().expect("decided");
+    assert!(
+        decision.passed,
+        "the first wait's `live` received inside the deadline was committed by an append \
+         the decider must wait out: {decision:?}"
     );
     tdb.cleanup().await;
 }

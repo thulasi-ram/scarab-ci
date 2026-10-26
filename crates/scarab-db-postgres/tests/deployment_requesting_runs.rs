@@ -5,8 +5,10 @@
 //! In flight = the Run is not terminal and a Step of it requesting the target
 //! is `Ready`/`Running`, or `Succeeded` with a DeploymentGate on that request
 //! not yet terminal — reached (every need of it Succeeded), or not reached
-//! and its request's effective time after the caller's cutoff. Distinct Runs,
-//! scoped to (org, environment, source, id).
+//! and its requesting Step's latest Attempt start after the caller's cutoff. Distinct Runs,
+//! scoped to (org, environment, source, id). Also in flight, whatever the
+//! Run's status: a requester whose unit's teardown (a cancel or a rerun's
+//! supersession) is not yet retired (git-bug f22056d).
 //! One scenario, run against real Postgres (skipped when
 //! `SCARAB_TEST_DATABASE_URL` is unset) and the in-memory twin, so the two
 //! stay equivalent.
@@ -301,6 +303,130 @@ async fn inmemory_in_flight_runs_are_counted_once_each() {
     in_flight_runs_are_counted_once_each(&InMemoryDb::new()).await;
 }
 
+/// A launched requester `bump` (prod/web) in Run `run`: `Running` on `a1`,
+/// whose Pod handle is recorded.
+async fn seed_launched(db: &dyn Db, run: &str) {
+    seed(
+        db,
+        run,
+        RunStatus::Running,
+        &[("bump", "prod", "web", StepStatus::Running, &[])],
+        &[],
+    )
+    .await;
+    let (run, bump, a1) = (
+        RunId(run.into()),
+        StepId("bump".into()),
+        AttemptId("a1".into()),
+    );
+    db.record_attempt(
+        &run,
+        &bump,
+        &Attempt {
+            id: a1.clone(),
+            started_at: Timestamp(2),
+            failure: None,
+            failure_detail: None,
+            outcome: AttemptOutcome::Running,
+        },
+    )
+    .await
+    .unwrap();
+    db.set_attempt_handle(&run, &bump, &a1, &format!("pod-{}", run.0))
+        .await
+        .unwrap();
+}
+
+/// The one pending teardown message of `kind` for `run`.
+async fn teardown_of(db: &dyn Db, run: &str, kind: &str) -> scarab_engine::OutboxId {
+    let mine: Vec<_> = db
+        .claim_outbox("test", Some(kind), 100, 0)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|m| m.run.0 == run)
+        .collect();
+    assert_eq!(mine.len(), 1, "one {kind} intent for {run}: {mine:?}");
+    mine[0].id
+}
+
+/// A cancelled or superseded requester's deploy Step stops being in flight
+/// at once, but its unit runs on through its termination grace, still acting
+/// on the target (git-bug f22056d). So it counts — whatever its Run's status
+/// — until its teardown intent is retired: dispatched (the unit is gone) or
+/// dead-lettered (abandoned, with a diagnostic). A cancel that caught the
+/// Step before anything launched holds nothing.
+async fn a_requester_counts_until_its_teardown_is_retired(db: &dyn Db) {
+    use scarab_engine::{cancel_run_request, rerun_step, CANCEL_ATTEMPT, SUPERSEDE_TEARDOWN};
+    let clock = scarab_testkit::FakeClock::new(10);
+    let web = || count(db, "prod", "web", "nobody");
+
+    seed_launched(db, "t-cancel").await;
+    seed_launched(db, "t-abandoned").await;
+    seed_launched(db, "t-rerun").await;
+    seed(
+        db,
+        "t-unlaunched",
+        RunStatus::Running,
+        &[("bump", "prod", "web", StepStatus::Ready, &[])],
+        &[],
+    )
+    .await;
+    assert_eq!(web().await, 4, "all four in flight before any teardown");
+
+    for run in ["t-cancel", "t-abandoned", "t-unlaunched"] {
+        assert!(cancel_run_request(db, &clock, &RunId(run.into()), None)
+            .await
+            .unwrap());
+    }
+    rerun_step(
+        db,
+        &clock,
+        &RunId("t-rerun".into()),
+        &StepId("bump".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.run_status(&RunId("t-cancel".into())).await.unwrap(),
+        Some(RunStatus::Cancelled)
+    );
+    assert_eq!(
+        web().await,
+        3,
+        "the cancelled and the superseded requesters hold until their teardown is retired; \
+         the unlaunched one never had a unit"
+    );
+
+    let cancel = teardown_of(db, "t-cancel", CANCEL_ATTEMPT).await;
+    db.mark_dispatched(cancel).await.unwrap();
+    assert_eq!(web().await, 2, "t-cancel's unit is gone");
+    let abandoned = teardown_of(db, "t-abandoned", CANCEL_ATTEMPT).await;
+    db.dead_letter_outbox(abandoned).await.unwrap();
+    assert_eq!(web().await, 1, "an abandoned teardown holds no longer");
+    let rerun = teardown_of(db, "t-rerun", SUPERSEDE_TEARDOWN).await;
+    db.mark_dispatched(rerun).await.unwrap();
+    assert_eq!(web().await, 0, "t-rerun's superseded unit is gone");
+}
+
+#[tokio::test]
+async fn pg_a_requester_counts_until_its_teardown_is_retired() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+    a_requester_counts_until_its_teardown_is_retired(&db).await;
+    tdb.cleanup().await;
+}
+
+#[tokio::test]
+async fn inmemory_a_requester_counts_until_its_teardown_is_retired() {
+    a_requester_counts_until_its_teardown_is_retired(&InMemoryDb::new()).await;
+}
+
 /// Run `run` (created at `created_at`, Running): `bump` Succeeded with
 /// Attempts started at `attempts`, requesting `prod`/`web` with DeploymentGate
 /// `live` (Pending) on it, which needs `live_needs`; `verify` stays Pending.
@@ -428,4 +554,178 @@ async fn pg_an_unreached_gate_stops_counting_at_the_cutoff() {
 #[tokio::test]
 async fn inmemory_an_unreached_gate_stops_counting_at_the_cutoff() {
     an_unreached_gate_stops_counting_at_the_cutoff(&InMemoryDb::new()).await;
+}
+
+/// A cancel that dies part-way still holds the target, and still tears the
+/// unit down (review correctness MED1). The cancel used to enqueue its
+/// teardown intent LAST — after the deploy Step went
+/// `Cancelled` and the Run transitioned. In between, the Step no longer
+/// counted as in flight and no intent counted for it either, so a held Run
+/// was promoted while the holder's Pod still ran; and a crash there lost the
+/// intent for good (a re-sent cancel finds the Run terminal and does
+/// nothing): no teardown, and no hold. The crash is constructed by refusing
+/// the Run's `RunTransitioned` journal write — the last write of the cancel.
+async fn a_cancel_that_dies_part_way_still_holds(db: &dyn Db, arm: impl FnOnce()) {
+    use scarab_engine::{cancel_run_request, CANCEL_ATTEMPT};
+    let clock = scarab_testkit::FakeClock::new(10);
+    let web = || count(db, "prod", "web", "nobody");
+    let run = RunId("t-crash".into());
+    seed_launched(db, "t-crash").await;
+    assert_eq!(web().await, 1);
+
+    arm();
+    assert!(
+        cancel_run_request(db, &clock, &run, None).await.is_err(),
+        "the crash was injected"
+    );
+    assert_eq!(
+        web().await,
+        1,
+        "the holder's unit may still be running: it holds until its teardown is retired"
+    );
+    let cancel = teardown_of(db, "t-crash", CANCEL_ATTEMPT).await;
+    db.mark_dispatched(cancel).await.unwrap();
+    assert_eq!(web().await, 0, "its unit is gone");
+}
+
+#[tokio::test]
+async fn pg_a_cancel_that_dies_part_way_still_holds() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+    sqlx::query(
+        "CREATE FUNCTION test_refuse_run_transitioned() RETURNS trigger AS $$
+         BEGIN
+           IF NEW.payload ? 'RunTransitioned' THEN
+             RAISE EXCEPTION 'injected: crash before the run journal';
+           END IF;
+           RETURN NEW;
+         END $$ LANGUAGE plpgsql",
+    )
+    .execute(&tdb.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER test_refuse_run_transitioned BEFORE INSERT ON events
+         FOR EACH ROW EXECUTE FUNCTION test_refuse_run_transitioned()",
+    )
+    .execute(&tdb.pool)
+    .await
+    .unwrap();
+    a_cancel_that_dies_part_way_still_holds(&db, || {}).await;
+    tdb.cleanup().await;
+}
+
+#[tokio::test]
+async fn inmemory_a_cancel_that_dies_part_way_still_holds() {
+    let db = InMemoryDb::new();
+    a_cancel_that_dies_part_way_still_holds(&db, || {
+        db.fail_next_event_append(|p| {
+            matches!(p, scarab_engine::EventPayload::RunTransitioned { .. })
+        })
+    })
+    .await;
+}
+
+/// A rerun that dies part-way still holds the target (review correctness
+/// MED2). The rerun moved the in-flight deploy Step `Running → Pending` (no
+/// longer counted as in flight) and only after its whole re-arm loop wrote
+/// the `supersede_teardown` intent that keeps it holding until its Pod is
+/// gone: a held Run could be promoted in between, and a crash in between left
+/// no teardown and no hold — the superseded Pod ran on beside the next one.
+/// The crash is constructed by refusing the `AttemptSuperseded` journal
+/// write: [`rerun_crash_seed`], arm, [`rerun_crash_dies`], disarm,
+/// [`rerun_crash_converges`].
+async fn rerun_crash_seed(db: &dyn Db) {
+    seed_launched(db, "t-rerun-crash").await;
+    assert_eq!(count(db, "prod", "web", "nobody").await, 1);
+}
+
+async fn rerun_crash_dies(db: &dyn Db) {
+    let clock = scarab_testkit::FakeClock::new(10);
+    let (run, bump) = (RunId("t-rerun-crash".into()), StepId("bump".into()));
+    assert!(
+        scarab_engine::rerun_step(db, &clock, &run, &bump, None)
+            .await
+            .is_err(),
+        "the crash was injected"
+    );
+    let bump_now = &db.steps_of_run(&run).await.unwrap()[0];
+    assert_eq!(
+        (bump_now.status, bump_now.attempts[0].outcome),
+        (StepStatus::Running, AttemptOutcome::Running),
+        "the re-arm, its stamp and its journal are one commit (git-bug 586187a): all rolled back"
+    );
+    assert_eq!(
+        count(db, "prod", "web", "nobody").await,
+        1,
+        "the superseded unit may still be running: it holds until its teardown is retired"
+    );
+}
+
+async fn rerun_crash_converges(db: &dyn Db) {
+    let clock = scarab_testkit::FakeClock::new(20);
+    let (run, bump) = (RunId("t-rerun-crash".into()), StepId("bump".into()));
+    let web = || count(db, "prod", "web", "nobody");
+    // The re-sent rerun converges onto the same teardown intent.
+    scarab_engine::rerun_step(db, &clock, &run, &bump, None)
+        .await
+        .unwrap();
+    let steps = db.steps_of_run(&run).await.unwrap();
+    assert_eq!(steps[0].status, StepStatus::Pending, "re-armed");
+    assert_eq!(web().await, 1, "still holding until the unit is gone");
+    let teardown = teardown_of(db, "t-rerun-crash", scarab_engine::SUPERSEDE_TEARDOWN).await;
+    db.mark_dispatched(teardown).await.unwrap();
+    assert_eq!(web().await, 0, "its unit is gone");
+}
+
+#[tokio::test]
+async fn pg_a_rerun_that_dies_part_way_still_holds() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+    rerun_crash_seed(&db).await;
+    sqlx::query(
+        "CREATE FUNCTION test_refuse_attempt_superseded() RETURNS trigger AS $$
+         BEGIN
+           IF NEW.payload ? 'AttemptSuperseded' THEN
+             RAISE EXCEPTION 'injected: crash before the supersession journal';
+           END IF;
+           RETURN NEW;
+         END $$ LANGUAGE plpgsql",
+    )
+    .execute(&tdb.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER test_refuse_attempt_superseded BEFORE INSERT ON events
+         FOR EACH ROW EXECUTE FUNCTION test_refuse_attempt_superseded()",
+    )
+    .execute(&tdb.pool)
+    .await
+    .unwrap();
+    rerun_crash_dies(&db).await;
+    sqlx::query("DROP TRIGGER test_refuse_attempt_superseded ON events")
+        .execute(&tdb.pool)
+        .await
+        .unwrap();
+    rerun_crash_converges(&db).await;
+    tdb.cleanup().await;
+}
+
+#[tokio::test]
+async fn inmemory_a_rerun_that_dies_part_way_still_holds() {
+    let db = InMemoryDb::new();
+    rerun_crash_seed(&db).await;
+    db.fail_next_event_append(|p| {
+        matches!(p, scarab_engine::EventPayload::AttemptSuperseded { .. })
+    });
+    rerun_crash_dies(&db).await;
+    rerun_crash_converges(&db).await;
 }

@@ -10,8 +10,11 @@
 //! - **`deployment_gate`** — for a DeploymentGate that is waiting right now,
 //!   the DeploymentTarget it waits on and where the Deployment its requester
 //!   asked for stands: the Environment's log folded as the Deployments page
-//!   folds it (the Environment's own deadline). Display only; the verdict is
-//!   the engine's, from its own fold.
+//!   folds it (the Environment's own deadline), and `fails_at` — when the
+//!   gate itself fails `stalled`, on the engine's clock: its wait's window
+//!   (built by the scheduler's own [`deployment_gate_wait`]) plus its
+//!   Project's effective deadline ([`ServerDeploymentGates::run_gate_deadline`]).
+//!   Display only; the verdict is the engine's, from its own fold.
 //! - **`held`** — why a deploy Step is held by per-DeploymentTarget
 //!   concurrency, asked of the same oracle the scheduler asks
 //!   ([`ServerDeploymentGates::step_concurrency_hold`]). Derived, because
@@ -28,10 +31,11 @@ use std::sync::Arc;
 
 use scarab_deployment::{fold_ledger, DeploymentRequester, DeploymentTarget, FoldedLedger};
 use scarab_engine::{
-    AttemptOutcome, EventPayload, RunDeploymentRequest, RunId, RunStatus, StepRun, StepStatus,
+    deployment_gate_wait, AttemptOutcome, DeploymentGateWait, EventPayload, RunDeploymentRequest,
+    RunId, RunStatus, StepRun, StepStatus,
 };
 
-use crate::deployment_gates::ServerDeploymentGates;
+use crate::deployment_gates::{DeploymentGateWindow, ServerDeploymentGates};
 use crate::{org_environments, ApiError, AppState, DeploymentGateDto, GateResolutionDto};
 
 /// The gate/hold facts of one step. Every field is `None` for a step with
@@ -52,6 +56,19 @@ fn is_waiting_gate(s: &StepRun, status_of: &HashMap<&str, StepStatus>) -> bool {
         && s.attempts.last().map(|a| a.outcome) == Some(AttemptOutcome::Running)
 }
 
+/// The waiting gates of a run's `steps` ([`is_waiting_gate`]), in step order
+/// — what the run list says a Run waits on (git-bug `c489346`).
+pub(crate) fn waiting_gates(steps: &[StepRun]) -> Vec<&StepRun> {
+    let status_of: HashMap<&str, StepStatus> = steps
+        .iter()
+        .map(|s| (s.step.0.as_str(), s.status))
+        .collect();
+    steps
+        .iter()
+        .filter(|s| is_waiting_gate(s, &status_of))
+        .collect()
+}
+
 fn needs_met(s: &StepRun, status_of: &HashMap<&str, StepStatus>) -> bool {
     s.needs
         .iter()
@@ -66,27 +83,30 @@ pub(crate) async fn step_gate_views(
     steps: &[StepRun],
 ) -> Result<HashMap<String, StepGateView>, ApiError> {
     let mut views: HashMap<String, StepGateView> = HashMap::new();
-    if steps.iter().any(StepRun::is_gate) {
-        for e in st.db.events(run).await? {
-            if let EventPayload::GateResolved {
-                step,
-                attempt,
-                passed,
-                reason,
-                deployment,
-                by,
-            } = e.kind
-            {
-                // The journal is in append order: the last one is the latest.
-                views.entry(step.0).or_default().gate_resolution = Some(GateResolutionDto {
-                    passed,
-                    reason,
-                    at: e.at.0,
-                    attempt: attempt.0,
-                    by,
-                    deployment_id: deployment,
-                });
-            }
+    let events = if steps.iter().any(StepRun::is_gate) {
+        st.db.events(run).await?
+    } else {
+        Vec::new()
+    };
+    for e in &events {
+        if let EventPayload::GateResolved {
+            step,
+            attempt,
+            passed,
+            reason,
+            deployment,
+            by,
+        } = &e.kind
+        {
+            // The journal is in append order: the last one is the latest.
+            views.entry(step.0.clone()).or_default().gate_resolution = Some(GateResolutionDto {
+                passed: *passed,
+                reason: reason.clone(),
+                at: e.at.0,
+                attempt: attempt.0.clone(),
+                by: by.clone(),
+                deployment_id: *deployment,
+            });
         }
     }
 
@@ -113,12 +133,24 @@ pub(crate) async fn step_gate_views(
         }
         let mut folds: HashMap<(String, String), Option<Arc<FoldedLedger>>> = HashMap::new();
         let now = st.clock.now().await.0;
+        let oracle = st.deployments.clone().map(|store| {
+            ServerDeploymentGates::new(st.db.clone(), store, st.environment_governance.clone())
+        });
         for gate in waiting {
             // No row: the engine fails such a gate at once; nothing to show.
             let Some(request) = requests.iter().find(|r| r.gate_steps.contains(&gate.step)) else {
                 continue;
             };
-            let dto = deployment_gate_dto(st, run, request, &mut folds, now).await;
+            // `is_waiting_gate`: its latest Attempt is the open one.
+            let wait = gate
+                .attempts
+                .last()
+                .map(|a| deployment_gate_wait(gate, a, &request.step, steps, &events));
+            let gate_clock = GateClock {
+                oracle: oracle.as_ref(),
+                wait,
+            };
+            let dto = deployment_gate_dto(st, run, request, &mut folds, now, gate_clock).await;
             views
                 .entry(gate.step.0.clone())
                 .or_default()
@@ -165,15 +197,26 @@ pub(crate) async fn step_gate_views(
     Ok(views)
 }
 
+/// What a waiting gate's `fails_at` is computed from: the oracle the engine
+/// asks (for the Project's effective deadline) and the gate's open wait, built
+/// as the scheduler builds it.
+struct GateClock<'a> {
+    oracle: Option<&'a ServerDeploymentGates>,
+    wait: Option<DeploymentGateWait>,
+}
+
 /// Where a waiting DeploymentGate's request stands, as the Deployments page
-/// would show it. Without a Deployment store only the target is known; on a
-/// read error (logged) only the target, and `record_unreadable` says why.
+/// would show it, and when the gate fails if nothing decisive arrives (the
+/// engine's clock, not the Deployment's). Without a Deployment store only the
+/// target is known; on a read error (logged) only the target, and
+/// `record_unreadable` says why.
 async fn deployment_gate_dto(
     st: &AppState,
     run: &RunId,
     request: &RunDeploymentRequest,
     folds: &mut HashMap<(String, String), Option<Arc<FoldedLedger>>>,
     now: scarab_deployment::Millis,
+    clock: GateClock<'_>,
 ) -> DeploymentGateDto {
     let mut dto = DeploymentGateDto {
         environment: request.environment.clone(),
@@ -181,6 +224,7 @@ async fn deployment_gate_dto(
         target_id: request.target_id.clone(),
         deployment_id: None,
         deployment_status: None,
+        fails_at: None,
         version: None,
         latest_label: None,
         record_unreadable: false,
@@ -234,6 +278,19 @@ async fn deployment_gate_dto(
     };
     dto.deployment_id = Some(folded.public_id(deployment));
     dto.deployment_status = Some(deployment.status(now, deadline).into());
+    // The gate's own clock (git-bug `ec84c5d`): its window — floored at a
+    // Retry's start, or a retried deploy Step's succeeding Attempt — plus
+    // its Project's effective deadline, as the engine decides it.
+    if let (Some(oracle), Some(wait)) = (clock.oracle, clock.wait) {
+        match oracle.run_gate_deadline(run, request).await {
+            Ok(gate_deadline) => {
+                dto.fails_at = DeploymentGateWindow::of(deployment, &requester, &wait)
+                    .map(|w| w.fails_at(gate_deadline));
+            }
+            Err(e) => tracing::warn!(run = %run.0, error = %e,
+                "run view: could not read the gate's deadline"),
+        }
+    }
     dto.version = Some(deployment.version.0.clone());
     dto.latest_label = deployment
         .reports

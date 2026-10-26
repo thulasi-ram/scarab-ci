@@ -1,0 +1,14 @@
+-- git-bug b6b8510: the ordered upstream steps behind an attempt's workspace
+-- input roots, stamped at LAUNCH (the index space of the fetcher's
+-- SCARAB_SNAPSHOT_ROOTS). Settle resolves a WorkspaceInputCollisions sample's
+-- root indices against this list, not a re-derivation from settle-time
+-- step outputs (an upstream that gained or lost an output in between would
+-- shift the indices and misattribute the sample).
+--
+-- JSON array of step ids, in root order. NULL = not recorded (an attempt
+-- launched with no workspace inputs, or by a binary older than this column;
+-- settle falls back to the re-derivation for those).
+--
+-- Forward-only, additive (expand-contract, ADR-0003): an old binary never
+-- names the column.
+ALTER TABLE attempts ADD COLUMN workspace_input_steps JSONB;

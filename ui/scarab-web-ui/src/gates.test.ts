@@ -12,7 +12,11 @@ import {
   actionableGates,
   rejectReasonError,
   gateWaitHint,
+  inboxRuns,
+  inboxVerb,
+  inboxDetail,
 } from "./gates";
+import { mockRuns } from "./mock";
 
 const gate = (id: string, status: string, kind = "manual", needs: string[] = []) => ({
   id,
@@ -148,6 +152,40 @@ describe("gateStatus", () => {
       deployment_gate: { target_source: "argocd", target_id: "web", deployment_status: "requested" },
     });
     expect(gateStatusText(s)).toBe("waiting on argocd/web (requested)");
+  });
+
+  // git-bug ec84c5d: the Deployment's status runs on its Environment's baseline
+  // over its lifetime; a retried gate waits afresh on its own deadline. With
+  // `fails_at`, the line says whose status "stalled" is and when the GATE fails.
+  it("names the Deployment's status apart from when the gate itself fails", () => {
+    const s = waitingDeploy({
+      deployment_gate: {
+        target_source: "argocd",
+        target_id: "web",
+        deployment_status: "stalled",
+        fails_at: 7_320_000,
+      },
+    });
+    const at = (ms: number) => `T+${ms / 1000}s`;
+    expect(gateStatus(s, at)).toEqual({
+      tone: "waiting",
+      text: "waiting on argocd/web (Deployment: stalled · gate fails at T+7320s)",
+    });
+  });
+
+  it("keeps the source's label beside the Deployment's status", () => {
+    const s = waitingDeploy({
+      deployment_gate: {
+        target_source: "argocd",
+        target_id: "web",
+        deployment_status: "in_progress",
+        latest_label: "sync wave 3",
+        fails_at: 60_000,
+      },
+    });
+    expect(gateStatusText(s, (ms) => `@${ms}`)).toBe(
+      'waiting on argocd/web (Deployment: in progress, "sync wave 3" · gate fails at @60000)',
+    );
   });
 
   it("says so when the requester's Deployment is not in the record yet", () => {
@@ -292,5 +330,59 @@ describe("gateWaitHint", () => {
 
   it("names unmet needs first", () => {
     expect(gateWaitHint(waitingDeploy({ needs: ["test"] }), statusOf)).toBe("waiting on test");
+  });
+});
+
+// --- git-bug c489346: the dashboard inbox follows reached gates -------------
+
+describe("inboxRuns", () => {
+  it("includes a RUNNING run whose gate is reached while a sibling still runs", () => {
+    const running = { id: "r1", status: "running", waiting_gates: [{ step: "approve", kind: "manual", since: 1 }] };
+    expect(inboxRuns([running])).toEqual([running]);
+  });
+
+  it("leaves out a running run with no waiting gate, and terminal runs", () => {
+    expect(
+      inboxRuns([
+        { status: "running" },
+        { status: "running", waiting_gates: [] },
+        { status: "succeeded" },
+      ]),
+    ).toEqual([]);
+  });
+
+  it("still lists a suspended run an older server sends without waiting_gates", () => {
+    expect(inboxRuns([{ status: "suspended" }])).toHaveLength(1);
+  });
+
+  it("over the mock: both suspended runs and the running one with a reached gate", () => {
+    const ids = inboxRuns(mockRuns).map((r) => r.id);
+    expect(ids).toEqual([
+      "01984f10a1b24c7e8f0012ab34cd56ef",
+      "01984f22bb334d8e9a1122cd44ef6600",
+      "01984f35cc445e9fab2233de55f07711",
+    ]);
+  });
+});
+
+describe("inbox row text", () => {
+  const g = (step: string, kind: string) => ({ step, kind, since: 0 });
+
+  it("approves a manual gate and says the run is still running beside it", () => {
+    const r = { status: "running", waiting_gates: [g("approve", "manual")] };
+    expect(inboxVerb(r)).toBe("approve");
+    expect(inboxDetail(r)).toBe("gate approve (manual) waiting · other steps still running");
+  });
+
+  it("reviews a wait no human approves, and names every waiting gate", () => {
+    const r = { status: "suspended", waiting_gates: [g("live", "deployment"), g("soak", "timer")] };
+    expect(inboxVerb(r)).toBe("review");
+    expect(inboxDetail(r)).toBe("gates live (deployment), soak (timer) waiting");
+  });
+
+  it("keeps the old wording for a suspended run without waiting_gates", () => {
+    const r = { status: "suspended" };
+    expect(inboxVerb(r)).toBe("approve");
+    expect(inboxDetail(r)).toBe("suspended on a gate · waiting for a decision");
   });
 });
