@@ -425,8 +425,7 @@ pub async fn run(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
                 s3.bucket.clone(),
                 &s3.endpoint,
                 &s3.region,
-                &s3.access_key,
-                &s3.secret_key,
+                s3.static_keys.as_ref().map(|(a, s)| (a.as_str(), s.as_str())),
             )?,
             StoreConfig::LocalDir(dir) => S3Storage::local(dir)?,
         }

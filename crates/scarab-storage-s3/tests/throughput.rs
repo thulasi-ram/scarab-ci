@@ -121,9 +121,11 @@ async fn cas_leg_throughput_by_concurrency() {
                 std::env::var("SCARAB_BENCH_S3_BUCKET").unwrap_or_else(|_| "scarab-logs".into()),
                 &endpoint,
                 "us-east-1",
-                &std::env::var("SCARAB_BENCH_S3_KEY").unwrap_or_else(|_| "scarab".into()),
-                &std::env::var("SCARAB_BENCH_S3_SECRET")
-                    .unwrap_or_else(|_| "scarabsecret".into()),
+                Some((
+                    &std::env::var("SCARAB_BENCH_S3_KEY").unwrap_or_else(|_| "scarab".into()),
+                    &std::env::var("SCARAB_BENCH_S3_SECRET")
+                        .unwrap_or_else(|_| "scarabsecret".into()),
+                )),
             )
             .expect("s3 cas")
         }
