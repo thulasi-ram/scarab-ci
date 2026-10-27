@@ -1,0 +1,780 @@
+<!DOCTYPE html><html lang="en" dir="ltr" data-theme="dark" data-has-toc data-has-sidebar class="astro-vdxcvpsm"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>0070. Deployments as a vendor-neutral record: what is live, not who approved | Scarab</title><link rel="canonical" href="https://thulasi-ram.github.io/scarab-ci/tech/adr/0070-deployments-as-a-vendor-neutral-record/"/><link rel="sitemap" href="/scarab-ci/sitemap-index.xml"/><link rel="icon" href="/scarab-ci/favicon.ico" sizes="any"/><link rel="apple-touch-icon" href="/scarab-ci/apple-touch-icon.png"/><link rel="shortcut icon" href="/scarab-ci/favicon.svg" type="image/svg+xml"/><meta name="generator" content="Astro v7.0.9"/><meta name="generator" content="Starlight v0.41.3"/><meta property="og:title" content="0070. Deployments as a vendor-neutral record: what is live, not who approved"/><meta property="og:type" content="article"/><meta property="og:url" content="https://thulasi-ram.github.io/scarab-ci/tech/adr/0070-deployments-as-a-vendor-neutral-record/"/><meta property="og:locale" content="en"/><meta property="og:site_name" content="Scarab"/><meta name="twitter:card" content="summary_large_image"/><script>
+	window.StarlightThemeProvider = (() => {
+		const storedTheme =
+			typeof localStorage !== 'undefined' && localStorage.getItem('starlight-theme');
+		const theme =
+			storedTheme ||
+			(window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+		document.documentElement.dataset.theme = theme === 'light' ? 'light' : 'dark';
+		return {
+			updatePickers(theme = storedTheme || 'auto') {
+				document.querySelectorAll('starlight-theme-select').forEach((picker) => {
+					const select = picker.querySelector('select');
+					if (select) select.value = theme;
+					/** @type {HTMLTemplateElement | null} */
+					const tmpl = document.querySelector(`#theme-icons`);
+					const newIcon = tmpl && tmpl.content.querySelector('.' + theme);
+					if (newIcon) {
+						const oldIcon = picker.querySelector('svg.label-icon');
+						if (oldIcon) {
+							oldIcon.replaceChildren(...newIcon.cloneNode(true).childNodes);
+						}
+					}
+				});
+			},
+		};
+	})();
+</script><template id="theme-icons"><svg aria-hidden="true" class="light astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M5 12a1 1 0 0 0-1-1H3a1 1 0 0 0 0 2h1a1 1 0 0 0 1-1Zm.64 5-.71.71a1 1 0 0 0 0 1.41 1 1 0 0 0 1.41 0l.71-.71A1 1 0 0 0 5.64 17ZM12 5a1 1 0 0 0 1-1V3a1 1 0 0 0-2 0v1a1 1 0 0 0 1 1Zm5.66 2.34a1 1 0 0 0 .7-.29l.71-.71a1 1 0 1 0-1.41-1.41l-.66.71a1 1 0 0 0 0 1.41 1 1 0 0 0 .66.29Zm-12-.29a1 1 0 0 0 1.41 0 1 1 0 0 0 0-1.41l-.71-.71a1.004 1.004 0 1 0-1.43 1.41l.73.71ZM21 11h-1a1 1 0 0 0 0 2h1a1 1 0 0 0 0-2Zm-2.64 6A1 1 0 0 0 17 18.36l.71.71a1 1 0 0 0 1.41 0 1 1 0 0 0 0-1.41l-.76-.66ZM12 6.5a5.5 5.5 0 1 0 5.5 5.5A5.51 5.51 0 0 0 12 6.5Zm0 9a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Zm0 3.5a1 1 0 0 0-1 1v1a1 1 0 0 0 2 0v-1a1 1 0 0 0-1-1Z"/></svg><svg aria-hidden="true" class="dark astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M21.64 13a1 1 0 0 0-1.05-.14 8.049 8.049 0 0 1-3.37.73 8.15 8.15 0 0 1-8.14-8.1 8.59 8.59 0 0 1 .25-2A1 1 0 0 0 8 2.36a10.14 10.14 0 1 0 14 11.69 1 1 0 0 0-.36-1.05Zm-9.5 6.69A8.14 8.14 0 0 1 7.08 5.22v.27a10.15 10.15 0 0 0 10.14 10.14 9.784 9.784 0 0 0 2.1-.22 8.11 8.11 0 0 1-7.18 4.32v-.04Z"/></svg><svg aria-hidden="true" class="auto astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M21 14h-1V7a3 3 0 0 0-3-3H7a3 3 0 0 0-3 3v7H3a1 1 0 0 0-1 1v2a3 3 0 0 0 3 3h14a3 3 0 0 0 3-3v-2a1 1 0 0 0-1-1ZM6 7a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v7H6V7Zm14 10a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-1h16v1Z"/></svg></template><link rel="stylesheet" href="/scarab-ci/_astro/print.ehPL0gv-.css" media="print"><link rel="stylesheet" href="/scarab-ci/_astro/middleware.iSOPaR4s.css"><link rel="stylesheet" href="/scarab-ci/_astro/index.BdeWKgqi.css"><script type="module" src="/scarab-ci/_astro/page.B2uBVZjk.js"></script></head><body class="astro-vdxcvpsm"><a class="sl-skip-link astro-vxeigawq" href="#_top">Skip to content</a><div data-slot="layout" class="astro-6hobpl37"><header class="astro-6hobpl37"><div class="container-wrapper px-6 astro-6hobpl37"><div class="container astro-6hobpl37"><button class="show-modal astro-w34sq3kk" popovertargetaction="toggle" popovertarget="drawer"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="astro-w34sq3kk"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 9h16.5m-16.5 6.75h16.5" class="astro-w34sq3kk"></path></svg><span class="sr-only astro-w34sq3kk">Toggle Menu</span></button><div class="site-title-wrapper astro-sycd25p5"><a href="/scarab-ci/" class="site-title astro-lygsa2fc"><img class="light:sl-hidden logo astro-lygsa2fc" alt="Scarab" src="/scarab-ci/_astro/scarab-emblem-dark.bsLsTo-T.svg" width="1098" height="976"><img class="dark:sl-hidden logo astro-lygsa2fc" alt="Scarab" src="/scarab-ci/_astro/scarab-emblem.CC8IbydN.svg" width="1098" height="976"><span class="title-text astro-lygsa2fc">Scarab</span></a><nav class="nav-bar astro-tahnhu4v"><a class="astro-tahnhu4v" href="/scarab-ci/get-started/overview/" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">Get Started</a><a class="astro-tahnhu4v" href="/scarab-ci/usage/pipeline-syntax/" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">Usage</a><a class="astro-tahnhu4v" href="/scarab-ci/reference/api/" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">References</a><a class="astro-tahnhu4v" href="https://demo-scarab.ahiravan.dev/" target="_blank" rel="noopener" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">Demo</a></nav></div><div class="header-right astro-sycd25p5"><site-search class="astro-sycd25p5 astro-goos2lhy" data-translations="{&quot;placeholder&quot;:&quot;Search&quot;}"><button data-open-modal disabled aria-label="Search" aria-keyshortcuts="Control+K" class="astro-goos2lhy"><span aria-hidden="true" class="astro-goos2lhy">Search</span><kbd class="sl-hidden md:sl-flex astro-goos2lhy" style="display: none;"><kbd class="astro-goos2lhy">Ctrl</kbd><kbd class="astro-goos2lhy">K</kbd></kbd></button><dialog style="padding:0" aria-label="Search" class="astro-goos2lhy"><div class="dialog-frame sl-flex astro-goos2lhy"><button data-close-modal class="sl-flex md:sl-hidden astro-goos2lhy">Cancel</button><div class="search-container astro-goos2lhy"><div id="starlight__search" class="astro-goos2lhy"></div></div></div></dialog></site-search><script>
+    (() => {
+        const openBtn = document.querySelector('button[data-open-modal]');
+        const shortcut = openBtn?.querySelector('kbd');
+        if (!openBtn || !(shortcut instanceof HTMLElement)) {
+            return;
+        }
+        const updateShortcutDisplay = () => {
+            shortcut.style.setProperty(
+                'display',
+                matchMedia('(min-width: 40rem)').matches ? 'flex' : 'none',
+                'important'
+            );
+        };
+        const platformKey = shortcut.querySelector('kbd');
+        // eslint-disable-next-line regexp/no-unused-capturing-group
+        if (platformKey && /(Mac|iPhone|iPod|iPad)/i.test(navigator.platform)) {
+            platformKey.textContent = '⌘';
+            openBtn.setAttribute('aria-keyshortcuts', 'Meta+K');
+        }
+        updateShortcutDisplay();
+        matchMedia('(min-width: 40rem)').addEventListener('change', updateShortcutDisplay);
+    })();
+</script><script type="module" src="/scarab-ci/_astro/Search.astro_astro_type_script_index_0_lang.BNSpSyix.js"></script><nav class="header-nav astro-sycd25p5"><div class="astro-sycd25p5"><a href="https://github.com/thulasi-ram/scarab-ci" rel="me" class="sl-flex button astro-bs4vfkht" data-variant="ghost"><span class="sr-only astro-bs4vfkht">GitHub</span><svg aria-hidden="true" class="astro-bs4vfkht astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M12 .3a12 12 0 0 0-3.8 23.38c.6.12.83-.26.83-.57L9 21.07c-3.34.72-4.04-1.61-4.04-1.61-.55-1.39-1.34-1.76-1.34-1.76-1.08-.74.09-.73.09-.73 1.2.09 1.83 1.24 1.83 1.24 1.08 1.83 2.81 1.3 3.5 1 .1-.78.42-1.31.76-1.61-2.67-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.14-.3-.54-1.52.1-3.18 0 0 1-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.28-1.55 3.29-1.23 3.29-1.23.64 1.66.24 2.88.12 3.18a4.65 4.65 0 0 1 1.23 3.22c0 4.61-2.8 5.63-5.48 5.92.42.36.81 1.1.81 2.22l-.01 3.29c0 .31.2.69.82.57A12 12 0 0 0 12 .3Z"/></svg></a></div><div class="astro-sycd25p5"><starlight-theme-lucode-select class="astro-7vkpjdjh"><button aria-label="Select theme" aria-live="polite" class="sl-flex button astro-7vkpjdjh" title="Select theme" data-variant="ghost"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="sun astro-7vkpjdjh"><circle cx="12" cy="12" r="4" class="astro-7vkpjdjh"></circle><path d="M12 2v2" class="astro-7vkpjdjh"></path><path d="M12 20v2" class="astro-7vkpjdjh"></path><path d="m4.93 4.93 1.41 1.41" class="astro-7vkpjdjh"></path><path d="m17.66 17.66 1.41 1.41" class="astro-7vkpjdjh"></path><path d="M2 12h2" class="astro-7vkpjdjh"></path><path d="M20 12h2" class="astro-7vkpjdjh"></path><path d="m6.34 17.66-1.41 1.41" class="astro-7vkpjdjh"></path><path d="m19.07 4.93-1.41 1.41" class="astro-7vkpjdjh"></path></svg><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="moon astro-7vkpjdjh"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z" class="astro-7vkpjdjh"> </path></svg><span class="sr-only astro-7vkpjdjh">Toggle theme</span></button></starlight-theme-lucode-select><script>
+    // eslint-disable-next-line no-undef
+    StarlightThemeProvider.updatePickers();
+</script><script type="module">var e=`starlight-theme`;function t(e){return e===`auto`||e===`dark`||e===`light`?e:`auto`}function n(){return t(typeof localStorage<`u`&&localStorage.getItem(e))}function r(t){typeof localStorage<`u`&&localStorage.setItem(e,t===`light`||t===`dark`?t:``)}function i(){return matchMedia(`(prefers-color-scheme: light)`).matches?`light`:`dark`}function a(e){StarlightThemeProvider.updatePickers(e),document.documentElement.dataset.theme=e===`auto`?i():e,r(e)}matchMedia(`(prefers-color-scheme: light)`).addEventListener(`change`,()=>{n()===`auto`&&a(`auto`)}),customElements.define(`starlight-theme-lucode-select`,class extends HTMLElement{constructor(){super(),a(n());let e=this.querySelector(`button`);e?.addEventListener(`click`,()=>{let n=t(document.documentElement.dataset.theme),r=n===`dark`?`light`:n===`light`?`dark`:`auto`;a(r),e?.setAttribute(`aria-label`,`${r} theme`)})}});</script></div><div class="astro-sycd25p5"><script type="module">var e=class extends HTMLElement{constructor(){super();let e=this.querySelector(`select`);e&&(e.addEventListener(`change`,e=>{e.currentTarget instanceof HTMLSelectElement&&(window.location.pathname=e.currentTarget.value)}),window.addEventListener(`pageshow`,t=>{if(!t.persisted)return;let n=e.querySelector(`option[selected]`)?.index;n!==e.selectedIndex&&(e.selectedIndex=n??0)}))}};customElements.define(`starlight-lang-select`,e);</script></div></nav></div><scarab-version-select data-root="/scarab-ci/" data-base="/scarab-ci/" data-version="v0.2" hidden="true" class="astro-jcjov46q"><select aria-label="Documentation version" class="astro-jcjov46q"></select></scarab-version-select><script type="module" src="/scarab-ci/_astro/VersionSelect.astro_astro_type_script_index_0_lang.BvwAqe9Q.js"></script></div></div></header><main class="astro-6hobpl37"><div class="container-wrapper astro-6hobpl37"><div class="container container-wrapper-main astro-6hobpl37"><aside class="aside astro-6hobpl37"><div class="sidebar astro-5xeag62i"><div class="sidebar-border-gradient astro-5xeag62i"></div><div class="sidebar-spacer astro-5xeag62i"></div><div class="sidebar-fade-top astro-5xeag62i"></div><div class="container-sidebar astro-5xeag62i"><div class="sidebar-entries astro-5xeag62i"><div class="container-sidebar-entry astro-k3wmqijo"><h4 class="entry-title astro-k3wmqijo">Get Started</h4><div class="container-group-link astro-k3wmqijo"><a href="/scarab-ci/get-started/overview/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Overview</span></a><a href="/scarab-ci/get-started/deploy-helm/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Installation</span></a><a href="/scarab-ci/get-started/run-locally/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Run locally</span></a><a href="/scarab-ci/get-started/local-development/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Local Development</span></a></div></div><div class="container-sidebar-entry astro-k3wmqijo"><h4 class="entry-title astro-k3wmqijo">Usage</h4><div class="container-group-link astro-k3wmqijo"><a href="/scarab-ci/usage/pipeline-syntax/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Pipeline Syntax</span></a><a href="/scarab-ci/usage/secrets/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Secrets</span></a><a href="/scarab-ci/usage/environments/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Environments</span></a><a href="/scarab-ci/usage/environment-variables/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Environment Variables</span></a></div></div><div class="container-sidebar-entry astro-k3wmqijo"><h4 class="entry-title astro-k3wmqijo">References</h4><div class="container-group-link astro-k3wmqijo"><a href="/scarab-ci/reference/api/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">API</span></a><div class="container-sidebar-entry astro-k3wmqijo"><h4 class="entry-title astro-k3wmqijo">ADR</h4><div class="container-group-link astro-k3wmqijo"><a href="/scarab-ci/tech/adr/0001-ci-as-durable-execution/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0001. CI as durable execution (the wedge)</span></a><a href="/scarab-ci/tech/adr/0002-durability-model/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0002. Durability model: durable DAG orchestrator + at-least-once steps</span></a><a href="/scarab-ci/tech/adr/0003-durability-substrate-postgres/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0003. Durability substrate: own it — DBOS pattern on Postgres (Rust)</span></a><a href="/scarab-ci/tech/adr/0004-execution-topology/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0004. Execution topology: pod-per-step + content-addressed workspace</span></a><a href="/scarab-ci/tech/adr/0005-tenancy-and-k8s-only/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0005. Tenancy &amp; deployment; Kubernetes as the only backend</span></a><a href="/scarab-ci/tech/adr/0006-pipeline-ontology/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0006. Pipeline ontology: flat recursive DAG</span></a><a href="/scarab-ci/tech/adr/0007-data-passing-model/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0007. Data-passing model: Workspace / Result / Artifact / Cache</span></a><a href="/scarab-ci/tech/adr/0008-step-contract/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0008. Step contract: OCI image + convention + built-in kinds</span></a><a href="/scarab-ci/tech/adr/0009-dsl-ir-yaml-cel/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0009. DSL: typed Pipeline IR + YAML frontend + CEL</span></a><a href="/scarab-ci/tech/adr/0010-forge-integration/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0010. Forge integration: agnostic core, OIDC identity, in-repo config</span></a><a href="/scarab-ci/tech/adr/0011-durable-scheduler/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0011. Scheduling: durable admission control</span></a><a href="/scarab-ci/tech/adr/0012-api-surface/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0012. API surface: REST/OpenAPI + SSE + internal gRPC</span></a><a href="/scarab-ci/tech/adr/0013-history-and-observability/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0013. History &amp; observability: state tables + append-only event log</span></a><a href="/scarab-ci/tech/adr/0014-secrets/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0014. Secrets: envelope-encrypted PG + pluggable providers</span></a><a href="/scarab-ci/tech/adr/0015-supply-chain-oidc/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0015. Supply-chain: Scarab as OIDC issuer + provenance-by-construction</span></a><a href="/scarab-ci/tech/adr/0016-code-architecture/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0016. Code architecture: hexagonal + adapter crates + converged binary</span></a><a href="/scarab-ci/tech/adr/0017-testing-strategy/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0017. Correctness &amp; testing strategy</span></a><a href="/scarab-ci/tech/adr/0018-image-building/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0018. Container image building: rootless BuildKit</span></a><a href="/scarab-ci/tech/adr/0019-local-execution/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0019. Local execution: executor-local behind the Executor port</span></a><a href="/scarab-ci/tech/adr/0020-retry-and-failure/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0020. Retry &amp; failure taxonomy</span></a><a href="/scarab-ci/tech/adr/0021-double-effect-fencing/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0021. Double-effect hazard: fencing tokens + idempotency contract</span></a><a href="/scarab-ci/tech/adr/0022-upgrades-and-versioning/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0022. Upgrades &amp; schema evolution: version-tolerant from day one</span></a><a href="/scarab-ci/tech/adr/0023-dag-shape/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0023. DAG shape: static matrix v1, dynamic reserved</span></a><a href="/scarab-ci/tech/adr/0024-environments/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0024. Environments: first-class with protection rules</span></a><a href="/scarab-ci/tech/adr/0025-cross-pipeline-orchestration/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0025. Cross-pipeline orchestration: nest vs trigger</span></a><a href="/scarab-ci/tech/adr/0026-resource-and-placement/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0026. Resource &amp; placement model</span></a><a href="/scarab-ci/tech/adr/0027-restart-semantics/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0027. Restart semantics: content-addressed smart invalidation</span></a><a href="/scarab-ci/tech/adr/0028-ui-stack/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0028. UI stack: SolidJS + TS + generated client</span></a><a href="/scarab-ci/tech/adr/0029-workspace-cas/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0029. Workspace content-addressing: per-file merkle CAS</span></a><a href="/scarab-ci/tech/adr/0030-operational-defaults/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0030. Operational defaults</span></a><a href="/scarab-ci/tech/adr/0031-pure-computation-deps/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0031. Purity means no I/O, not no dependencies: pure-computation crates allowed</span></a><a href="/scarab-ci/tech/adr/0032-slices-3-5-implementation-decisions/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0032. Slice 3–5 implementation decisions (forge, identity, scheduler, gates, secrets, OIDC, BuildKit)</span></a><a href="/scarab-ci/tech/adr/0033-transitive-skip/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0033. Transitive skip: a guarded-off step skips its descendants</span></a><a href="/scarab-ci/tech/adr/0034-external-gate-token/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0034. External-gate release: HMAC token</span></a><a href="/scarab-ci/tech/adr/0035-explicit-outputs/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0035. Explicit workspace `outputs:`</span></a><a href="/scarab-ci/tech/adr/0036-local-execution-dev-backend/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0036. Local execution: a non-production dev/CLI backend (amends 0005)</span></a><a href="/scarab-ci/tech/adr/0037-environment-governance/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0037. Environment governance: scoped secrets, approval-as-gate, admission at point-of-use</span></a><a href="/scarab-ci/tech/adr/0038-invoke-and-local-reuse/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0038. `invoke` is compile-time inlining; local reuse via `.scarab/lib`, third-party reuse via OCI images</span></a><a href="/scarab-ci/tech/adr/0039-privileged-images/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0039. Privileged step images: hardened baseline + governed capability grants per Environment</span></a><a href="/scarab-ci/tech/adr/0040-documentation-site/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0040. Documentation site: Astro Starlight, in-repo, DESIGN.md-branded</span></a><a href="/scarab-ci/tech/adr/0041-named-results-and-interpolation/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0041. Named step results + launch-time interpolation (`${{ outputs.&lt;id&gt;.&lt;name&gt; }}`)</span></a><a href="/scarab-ci/tech/adr/0042-trusted-egress-sidecar/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0042. Trusted per-Pod egress sidecar → fence-scoped results API → Postgres</span></a><a href="/scarab-ci/tech/adr/0043-launch-parameters-and-manual-dispatch/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0043. Launch parameters + manual dispatch as a repo-aware trigger</span></a><a href="/scarab-ci/tech/adr/0044-protection-ref-vs-read-ref/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0044. Branch protection matches a symbolic ref, not the commit SHA</span></a><a href="/scarab-ci/tech/adr/0045-source-provisioning/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0045. Source provisioning: the `clone` step kind</span></a><a href="/scarab-ci/tech/adr/0046-forge-auth-and-multi-adapter/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0046. Forge auth is adapter-internal; GitHub + Forgejo adapters in v1</span></a><a href="/scarab-ci/tech/adr/0047-retry-classification-and-attempt-model/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0047. Retry classification, attempt/fence model, and dead-letter (implements 0020)</span></a><a href="/scarab-ci/tech/adr/0048-fail-closed-startup/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0048. Fail-closed startup: validated config, boot refusal, mandatory Postgres</span></a><a href="/scarab-ci/tech/adr/0049-identity-and-access/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0049. Identity &amp; access: forge-agnostic authn, Scarab-native RBAC</span></a><a href="/scarab-ci/tech/adr/0050-retention-and-gc/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0050. Retention &amp; GC: mark-sweep CAS, lifecycle-keyed eligibility</span></a><a href="/scarab-ci/tech/adr/0051-multi-replica-operation/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0051. Multi-replica operation: tail lease, replica-agnostic SSE, shared OIDC key</span></a><a href="/scarab-ci/tech/adr/0052-artifacts/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0052. Artifacts: a dedicated per-run store, convention-emitted</span></a><a href="/scarab-ci/tech/adr/0053-observability-and-lifecycle/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0053. Observability &amp; lifecycle: metrics, structured logs, readiness, graceful shutdown</span></a><a href="/scarab-ci/tech/adr/0054-product-surface-serving/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0054. Product surface: embedded UI, run cancellation, API/CLI truthfulness</span></a><a href="/scarab-ci/tech/adr/0055-placement-profiles/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0055. Placement profiles: named profiles + baseline + governed `k8s_overlay`</span></a><a href="/scarab-ci/tech/adr/0056-run-takes-and-attempt-grain-evidence/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0056. Run Takes and attempt-grain evidence</span></a><a href="/scarab-ci/tech/adr/0057-run-provenance-trigger-context/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0057. Run provenance: trigger context and origin details</span></a><a href="/scarab-ci/tech/adr/0058-runtime-service-containers/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0058. Runtime service containers: co-located Sidecar (default) + Run-scoped Shared (opt-in)</span></a><a href="/scarab-ci/tech/adr/0059-tick-fault-isolation/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0059. Per-run tick fault isolation + bounded per-run failures</span></a><a href="/scarab-ci/tech/adr/0060-org-settings-connections-and-secret-management/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0060. Org settings surface: connection lifecycle, org/env secret editing, IaC-or-UI connections</span></a><a href="/scarab-ci/tech/adr/0061-workspace-data-path/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0061. Workspace data path: workspace service + node driver, lazy materialisation</span></a><a href="/scarab-ci/tech/adr/0062-workspace-export-lazy-without-node-driver/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0062. Workspace export: lazy materialisation without a node driver</span></a><a href="/scarab-ci/tech/adr/0063-step-logs-on-the-data-depot/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0063. Step logs live on the Data Depot, and the workspace service is renamed</span></a><a href="/scarab-ci/tech/adr/0064-durability-tiering-and-the-write-path/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0064. Durability tiering and the write path: warm-first, flush before `Succeeded`, and the promise is the backing</span></a><a href="/scarab-ci/tech/adr/0065-retention-cache-and-rederivation/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0065. Retention, Cache, and re-derivation: keep less, recompute on request, and let the operator tune it</span></a><a href="/scarab-ci/tech/adr/0066-the-depot-is-a-cache/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0066. The Depot is a cache: HA, warm-only, and what each costs</span></a><a href="/scarab-ci/tech/adr/0067-the-pack-is-the-record/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0067. The pack is the record: mandatory dependencies, a direct write path, and a self-describing bucket</span></a><a href="/scarab-ci/tech/adr/0068-the-infra-observer/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0068. The infra observer: narrating why a step has no logs</span></a><a href="/scarab-ci/tech/adr/0069-identity-links/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0069. Identity links: one Principal, many provider identities, pinned by immutable id</span></a><a href="/scarab-ci/tech/adr/0070-deployments-as-a-vendor-neutral-record/" aria-current="page" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0070. Deployments as a vendor-neutral record: what is live, not who approved</span></a><a href="/scarab-ci/tech/adr/0071-org-level-environments/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0071. Org-level Environments: a place that decides who may deploy into it</span></a><a href="/scarab-ci/tech/adr/0072-plugins-a-governed-extension-point/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0072. Plugins: a second, governed extension point beside Steps</span></a><a href="/scarab-ci/tech/adr/0073-step-up-confirmation/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0073. Step-up confirmation: a human, a passkey, the exact action</span></a><a href="/scarab-ci/tech/adr/readme/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Architecture Decision Records</span></a></div></div><a href="/scarab-ci/tech/context/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Thesis &amp; language (CONTEXT)</span></a></div></div></div><div class="sidebar-fade-bottom astro-5xeag62i"></div></div></div></aside><script type="module">var e=document.getElementById(`starlight__sidebar`),t=e?.querySelector(`sl-sidebar-state-persist`),n=`sl-sidebar-state`,r=()=>{let r=[],i=t?.dataset.hash||``;try{let e=sessionStorage.getItem(n),t=JSON.parse(e||`{}`);Array.isArray(t.open)&&t.hash===i&&(r=t.open)}catch{}return{hash:i,open:r,scroll:e?.scrollTop||0}},i=e=>{try{sessionStorage.setItem(n,JSON.stringify(e))}catch{}},a=()=>i(r()),o=(e,t)=>{let n=r();n.open[t]=e,i(n)};t?.addEventListener(`click`,e=>{if(!(e.target instanceof Element))return;let t=e.target.closest(`summary`)?.closest(`details`);if(!t)return;let n=t.querySelector(`sl-sidebar-restore`),r=parseInt(n?.dataset.index||``);isNaN(r)||o(!t.open,r)}),addEventListener(`visibilitychange`,()=>{document.visibilityState===`hidden`&&a()}),addEventListener(`pageHide`,a);</script><main class="container-main astro-c4hhlov6" data-slot="docs"><div class="main astro-c4hhlov6"><main data-pagefind-body class="astro-vdxcvpsm" lang="en" dir="ltr"><scarab-version-notice data-root="/scarab-ci/" data-base="/scarab-ci/" data-version="v0.2" data-pagefind-ignore="true" hidden="true" class="astro-lnhkisss">You are reading the docs for <strong class="astro-lnhkisss">v0.2</strong>. <a href="/scarab-ci/" class="astro-lnhkisss">The latest release is <span data-latest class="astro-lnhkisss"></span> →</a></scarab-version-notice><script type="module" src="/scarab-ci/_astro/VersionBanner.astro_astro_type_script_index_0_lang.DW4M5yKX.js"></script><div data-slot="doc-title" class="astro-5dl4r4d3"><div data-slot="doc-title-header" class="astro-5dl4r4d3"><h1 id="_top" class="astro-5dl4r4d3">0070. Deployments as a vendor-neutral record: what is live, not who approved</h1><div data-slot="doc-title-actions" class="astro-5dl4r4d3"><a data-slot="button" data-size="icon-md" href="/scarab-ci/tech/adr/0069-identity-links/" class="astro-i6idhh3o link-button secondary astro-5dl4r4d3"><svg aria-hidden="true" class="astro-5dl4r4d3 astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M17 11H9.41l3.3-3.29a1.004 1.004 0 1 0-1.42-1.42l-5 5a1 1 0 0 0-.21.33 1 1 0 0 0 0 .76 1 1 0 0 0 .21.33l5 5a1.002 1.002 0 0 0 1.639-.325 1 1 0 0 0-.219-1.095L9.41 13H17a1 1 0 0 0 0-2Z"/></svg></a><a data-slot="button" data-size="icon-md" href="/scarab-ci/tech/adr/0071-org-level-environments/" class="astro-i6idhh3o link-button secondary astro-5dl4r4d3"><svg aria-hidden="true" class="astro-5dl4r4d3 astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M17.92 11.62a1.001 1.001 0 0 0-.21-.33l-5-5a1.003 1.003 0 1 0-1.42 1.42l3.3 3.29H7a1 1 0 0 0 0 2h7.59l-3.3 3.29a1.002 1.002 0 0 0 .325 1.639 1 1 0 0 0 1.095-.219l5-5a1 1 0 0 0 .21-.33 1 1 0 0 0 0-.76Z"/></svg></a></div></div><!--  --></div><div class="markdown-wrapper astro-q6e3s5kt"><div class="sl-markdown-content astro-q6e3s5kt"><ul>
+<li><strong>Status:</strong> Proposed</li>
+<li><strong>Date:</strong> 2026-10-22</li>
+<li><strong>Deciders:</strong> thulasi.ram (architect)</li>
+<li><strong>Builds on:</strong> <a href="0024-environments.md">0024</a> (Environment as the deploy-governance
+home), <a href="0037-environment-governance.md">0037</a> (approval is a gate; admission at the
+point of use)</li>
+<li><strong>Relates:</strong> <a href="0008-step-contract.md">0008</a> (<code dir="auto">gate</code>), <a href="0021-double-effect-fencing.md">0021</a>
+(fencing), <a href="0041-named-results-and-interpolation.md">0041</a> (step results),
+<a href="0047-retry-classification-and-attempt-model.md">0047</a> (failure classes, gate expiry),
+<a href="0056-run-takes-and-attempt-grain-evidence.md">0056</a> (the sense of <em>superseded</em>),
+<a href="0071-org-level-environments.md">0071</a> (where Deployments live),
+<a href="0072-plugins-a-governed-extension-point.md">0072</a> (who reports them)</li>
+<li><strong>Executable spec:</strong> <code dir="auto">crates/scarab-deployment</code> (pure fold; invariants as property
+tests in <code dir="auto">tests/invariants.rs</code>)</li>
+</ul>
+<div class="sl-heading-wrapper level-h2"><h2 id="context">Context</h2><a class="sl-anchor-link" href="#context"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Context”</span></a></div>
+<p>Scarab has a <code dir="auto">deployments</code> table, but nothing in it is a deployment. A row is written in
+exactly one place: when a manual gate is approved and released
+(<code dir="auto">crates/scarab-server/src/lib.rs:6603-6619</code>). It holds org, project, environment,
+<code dir="auto">git_ref</code>, run, <code dir="auto">approved_by</code> and a timestamp. It is an <strong>approval log</strong>: it has no
+target, no version, no digest and no outcome. A <strong>Deploy Run</strong> (a Run whose Pipeline
+names an <code dir="auto">environment:</code>) <em>governs</em> a deploy; it does not <em>record</em> one, and its success
+means only that its Steps succeeded.</p>
+<p>The motivating user is Treebo. Argo CD runs with auto-sync and <code dir="auto">selfHeal</code>, a sync retry
+limit of 5 (about 31 minutes of backoff), database migrations as Sync hooks at wave 5,
+and image bumps made by PR to a shared <code dir="auto">devops-gitops</code> repository. A watcher
+(argo-watcher v0.10.7) waits 15 minutes and ignores <code dir="auto">operationState</code>, so a sync that is
+still retrying, or has already given up, reads as success or as an unrelated timeout.
+QA’s question is “what counts as a deployment?”: failures surface late, there is no
+single row per deploy, and two syncs of one change cannot be attributed.</p>
+<p>Three properties of today’s gates also block any “wait until it is live” step:</p>
+<ul>
+<li><strong>Gates cannot fail</strong> except by the opt-in <code dir="auto">gate_expires_after</code> (ADR-0047). There is no
+“passed or failed with a reason”.</li>
+<li><strong>A waiting gate suspends the whole Run.</strong> The gate pre-pass transitions the Run to
+<code dir="auto">Suspended</code> as soon as any Pending gate has its dependencies satisfied
+(<code dir="auto">crates/scarab-engine/src/scheduler.rs:1662-1677</code>), so independent branches stop.</li>
+<li><strong>Gate clocks are Run-level.</strong> Timer release and expiry measure from the Run’s
+<code dir="auto">suspended_at</code> and pick the <em>first</em> matching gate with <code dir="auto">find()</code>
+(<code dir="auto">scheduler.rs:2858-2908</code>). Two gates cannot have two clocks.</li>
+</ul>
+<p>The governing principle for this work, from the owner: <em>“We should not overfit scarab to
+argo, we should ensure the plugin system is powerful enough to fit argo.”</em> Argo is the
+proving workload, not the model. No CD tool’s nouns (Application, sync, Freight,
+Promotion) enter core.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="decision">Decision</h2><a class="sl-anchor-link" href="#decision"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Decision”</span></a></div>
+<div class="sl-heading-wrapper level-h3"><h3 id="1-core-owns-a-vendor-neutral-deployment-record-plugins-observe-and-act">1. Core owns a vendor-neutral Deployment record; plugins observe and act</h3><a class="sl-anchor-link" href="#1-core-owns-a-vendor-neutral-deployment-record-plugins-observe-and-act"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “1. Core owns a vendor-neutral Deployment record; plugins observe and act”</span></a></div>
+<p>Core owns the <strong>Deployment</strong> record and a <strong>fixed</strong> status vocabulary. Plugins
+(ADR-0072) own vendor knowledge: how to observe a CD tool and how to act on it. This is
+the shape of GitHub Deployments/Statuses, GitLab deployments, CDEvents and DORA’s
+deployment events: a neutral record that many tools write into.</p>
+<p>The rules live in one pure crate, <code dir="auto">crates/scarab-deployment</code>: a fold over requests and
+source reports with no I/O, no clock (time is an input) and no vendor knowledge. It is
+the only place that turns inputs into Deployments and statuses. Modularity is a crate
+boundary; trust stays in core. There is no “deployment plugin”, and plugins never depend
+on plugins.</p>
+<p><strong>Approval stops being “the deployment”.</strong> Approval answers <em>may this change go out?</em>. A
+Deployment answers <em>what is live where, and how did it get there?</em>. They differ in
+cardinality: one approved Run may deploy to several DeploymentTargets, and a change can
+go live with no Run at all (a hotfix applied by hand, a <code dir="auto">selfHeal</code> revert). Approval
+becomes <strong>evidence attached to</strong> a Deployment, through the requesting Run’s gate
+history. The existing <code dir="auto">deployments</code> rows stay readable as legacy approval history
+(ADR-0071 §9).</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="2-a-deployment-is-an-occurrence-the-key-only-correlates">2. A Deployment is an occurrence; the key only correlates</h3><a class="sl-anchor-link" href="#2-a-deployment-is-an-occurrence-the-key-only-correlates"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “2. A Deployment is an occurrence; the key only correlates”</span></a></div>
+<p>A <strong>Deployment</strong> is a specific <strong>DeploymentVersion</strong> made, or asked to be made, live on
+a specific <strong>DeploymentTarget</strong>, together with what was reported about it afterwards. It
+has its own id. <em>(Environment, DeploymentTarget, DeploymentVersion)</em> is only its
+<strong>correlation key</strong>. (The Environment is part of the target, because a target belongs to
+exactly one Environment.)</p>
+<ul>
+<li><strong>Join unless final.</strong> A request or report attaches to the newest Deployment with its
+key unless that one is <code dir="auto">superseded</code>. Otherwise it creates a new Deployment. A retried
+deploy Step, or two concurrent requesters, therefore make one Deployment.</li>
+<li><strong>Rollback is a new Deployment</strong> of an older DeploymentVersion. An old Deployment is
+never edited back to life.</li>
+<li>A Deployment <strong>outlives</strong> the Deploy Run that requested it, and may have <strong>no</strong> Deploy
+Run at all. A report that creates one makes an <strong>Unexplained</strong> Deployment.</li>
+<li><strong>Explanation is decided by timing.</strong> A request that joins a report-created Deployment
+explains it only if its Step <strong>started at or before core first received</strong> that
+Deployment (effective time ≤ creation time): the Step was already running when the
+source showed the change, so it can be what made it. That is the same test that makes a
+late request history rather than a rollback (§7, INV-DEP-11), and it covers the normal
+Argo flow, where the source reports after the Step starts but before it succeeds. A
+request whose Step started <strong>after</strong> is recorded as a <strong>claim</strong>: it stays among the
+requesters, so a DeploymentGate on it still resolves, but it never explains the
+Deployment, which <strong>stays Unexplained</strong>. Otherwise any request that happened to name the
+same version would launder a hand-applied hotfix (ADR-0071 §4). The decision is made as
+inputs arrive and is <strong>sticky</strong> (INV-DEP-12): a rerun Step’s later request never
+un-explains a Deployment, and a requester that explained it is never demoted to a claim.
+With two requesters, any one that qualifies explains it. “Made live by” lists only the
+requesters that are not claims.</li>
+<li><strong>Known limits of the timing rule.</strong> A retried Step used to read as a claim when its
+succeeding Attempt started after the source’s report, although its first Attempt made
+the change. That limit is <strong>closed</strong> (owner decision 2026-10-24, git-bug <code dir="auto">2b5d9d9</code>):
+the effective time is the start of the Step’s <strong>first Attempt in its current Take</strong>
+(§7), so automatic retries and an operator Retry share it. That time is attribution
+only: a DeploymentGate’s first wait opens at the <em>succeeding</em> Attempt’s start, so an
+earlier Attempt’s failure never fails the gate of the Attempt that recovered (§8). A
+Rerun of the Step starts a new Take with its own, later effective time, so a change
+made by hand between two Takes is never laundered. What remains is inherent: a
+long-running Step, its retries included, that spans a hand-applied change of the same
+version explains it; the record cannot tell the two apart.</li>
+</ul>
+<div class="sl-heading-wrapper level-h3"><h3 id="3-deploymenttarget-the-smallest-unit-that-independently-succeeds-or-fails">3. DeploymentTarget: the smallest unit that independently succeeds or fails</h3><a class="sl-anchor-link" href="#3-deploymenttarget-the-smallest-unit-that-independently-succeeds-or-fails"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “3. DeploymentTarget: the smallest unit that independently succeeds or fails”</span></a></div>
+<p>One Argo Application, one Helm release, one ECS service. Its identity is opaque and
+source-supplied, <em>(source, id)</em>. Core compares it and never parses it. It comes into
+existence the first time it is named, by a request or a report. There is no prior
+registration. A rename at the source is a new DeploymentTarget. So is a <strong>re-home</strong>: when
+the source reports a known target under a grouping that maps to another Environment (an
+Argo Application moved to another Argo project, or an admin moving the grouping between
+Environments), it is recorded as a new DeploymentTarget in the new Environment and the old
+one ends. Its history stays where it was; nothing is moved, and the move is not a standing
+conflict.</p>
+<p>“Ends” is a <strong>display, not a status</strong>: the old Environment’s board shows the target as
+<strong>Moved</strong> — naming where its reports go now (“now: prod”), or that no Environment lists
+the grouping (“unmapped”) — instead of claiming what was last live there; no input is
+appended and no seventh status exists. Moved is derived on read from the current
+EnvironmentDeploymentSources, so an admin’s edit shows at once. A request for the target on
+the old Environment waits and, honestly, stalls: its reports now land elsewhere. The new
+Environment never shows the old one’s last status as its own; the target appears there
+when its reporter re-sends its current state (§11). Fan-out (one Environment
+across regions or clusters) is several DeploymentTargets, not a grouping concept.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="4-deploymentversion-an-opaque-label-in-a-scheme-the-source-declares-provisional">4. DeploymentVersion: an opaque label in a scheme the source declares (PROVISIONAL)</h3><a class="sl-anchor-link" href="#4-deploymentversion-an-opaque-label-in-a-scheme-the-source-declares-provisional"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “4. DeploymentVersion: an opaque label in a scheme the source declares (PROVISIONAL)”</span></a></div>
+<p>A DeploymentVersion is an opaque label, compared only for equality. Its <strong>scheme is
+declared by the source, per DeploymentTarget</strong>, and requesters must use that scheme. The
+source publishes a <strong>scheme id</strong> with each target. A request whose version does not fit
+the target’s scheme is <strong>rejected when it is recorded</strong>, instead of waiting silently on a
+version the source will never report.</p>
+<p>The first-party Argo plugin’s default scheme is <strong>the set of image references in the pod
+templates of the Application’s target manifests</strong>: what Argo rendered from git (its
+<code dir="auto">manifests</code>, or the <code dir="auto">targetState</code> of its managed resources), not what is running. It is
+deliberately <strong>not</strong> <code dir="auto">status.summary.images</code>, which is collected from live Pods: during a
+rolling update it is the union of old and new, it includes sidecars a mutating webhook
+injected, Sync-hook Job Pods flicker in and out of it, and a scale-to-zero app has an
+empty set. Each of those would create a spurious Deployment that supersedes the requested
+one and fails its DeploymentGate. The target-manifest set avoids all four, and shows the
+new version as soon as Argo refreshes, before the sync. Like any per-target scheme, it
+also avoids the gitops-commit problem: on a shared gitops repository an unrelated team’s
+merge would change every Application’s version (audit finding 1, a blocker).</p>
+<p>Its blind spots, stated plainly:</p>
+<ul>
+<li><strong>Tags, not digests.</strong> The references are the strings written in the manifest, usually
+tags. A tag re-pushed to new bytes is the same DeploymentVersion.</li>
+<li><strong>Config-only changes are invisible.</strong> A values, ConfigMap or replica change leaves the
+image set as it was. A request for it joins the Deployment already live, and a
+DeploymentGate on it passes at once, before Argo applies anything. <strong>A DeploymentGate
+proves “V is live”, not “my change took effect”.</strong></li>
+<li><strong>The requester must predict the whole rendered set</strong>, including every image the chart
+renders that the change did not touch.</li>
+<li><strong>The path-commit option has its own gaps.</strong> <em>The last commit touching the target’s
+path</em> sees config changes, but misses kustomize bases outside the path, multi-source
+Applications and remote charts, and needs git read access because Argo does not expose
+it. It is no rollout signal either: whether a version is serving is the reporter’s job
+(§11).</li>
+</ul>
+<p>Artifact digests attach to a Deployment as <strong>evidence</strong>, zero or more, never as identity.</p>
+<p><strong>The known weakness is equality-only correlation</strong>, which forces the requester to predict
+how the source will render its change. The leading alternative, to be evaluated with real
+data, is <strong>source acknowledgement</strong>: the source maps a request, or the commit that carried
+it, to the version it actually rendered, in the style of GitHub Deployments. The
+observed-only board (Implementation horizon, step 2) exists partly to gather that
+evidence before DeploymentGates bake a scheme into Steps.</p>
+<p><strong>This decision is provisional.</strong> The owner’s words: <em>“not grasping the gravity… once
+it’s used practically I will know.”</em> Revisit after the first real use against Treebo’s
+Argo. The fold does not depend on the scheme. Only the reporter and the requester do.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="5-six-statuses-and-who-may-set-each">5. Six statuses, and who may set each</h3><a class="sl-anchor-link" href="#5-six-statuses-and-who-may-set-each"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “5. Six statuses, and who may set each”</span></a></div>
+<table>
+<thead>
+<tr>
+<th>Status</th>
+<th>Set by</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">requested</code></td>
+<td>core</td>
+<td>Asked for; no source report yet.</td>
+</tr>
+<tr>
+<td><code dir="auto">in_progress</code></td>
+<td>source</td>
+<td>The source is working on it.</td>
+</tr>
+<tr>
+<td><code dir="auto">live</code></td>
+<td>source</td>
+<td>The requested version is serving.</td>
+</tr>
+<tr>
+<td><code dir="auto">failed</code></td>
+<td>source</td>
+<td>The source has given up, with a reason.</td>
+</tr>
+<tr>
+<td><code dir="auto">stalled</code></td>
+<td>core</td>
+<td>Not converged within the EnvironmentDeploymentDeadline. Can still recover.</td>
+</tr>
+<tr>
+<td><code dir="auto">superseded</code></td>
+<td>core</td>
+<td>A newer Deployment took its place on the same DeploymentTarget. Final.</td>
+</tr>
+</tbody>
+</table>
+<p>A source can assert only <code dir="auto">in_progress</code>, <code dir="auto">live</code> or <code dir="auto">failed</code>. The type system enforces this
+(<code dir="auto">SourceAssertedStatus</code>), so a plugin cannot fake a timeout or hide a change by calling
+it superseded. At most one Deployment per DeploymentTarget is <code dir="auto">live</code>. <code dir="auto">failed → live</code> is
+allowed while the Deployment is still the newest on its target. Only <code dir="auto">superseded</code> is
+final. <em>Superseded</em> means what it means for an Attempt (ADR-0056): a newer one took its
+place.</p>
+<p><strong>A status earns its place only if something branches on it</strong>: a gate, a governance rule
+or a view. “Was it ever live?” is a fact read from the reports, not a status. <em>Unexplained</em>
+(no requester) and <em>Unconfirmed</em> (requested on a target its source has not yet
+reported) are display terms, not statuses.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="6-deploymentstatusreport-a-status-plus-a-label">6. DeploymentStatusReport: a status plus a label</h3><a class="sl-anchor-link" href="#6-deploymentstatusreport-a-status-plus-a-label"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “6. DeploymentStatusReport: a status plus a label”</span></a></div>
+<p>A report is a DeploymentStatus, a free-form label (“canary 2/4 at 25%”, “hook migrate:
+secret missing”), an optional link, and the source’s own time. The source’s time is
+<strong>display only</strong>; core orders every input by the time it received it (§8). The ordered
+reports are the Deployment’s
+<strong>stages</strong> as shown to QA. Core displays the label and never interprets it. <strong>New vendor
+states become labels, never statuses.</strong></p>
+<div class="sl-heading-wrapper level-h3"><h3 id="7-deploymentrequest-a-step-field-recorded-on-success">7. DeploymentRequest: a Step field, recorded on success</h3><a class="sl-anchor-link" href="#7-deploymentrequest-a-step-field-recorded-on-success"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “7. DeploymentRequest: a Step field, recorded on success”</span></a></div>
+<p>A <strong>DeploymentRequest</strong> is a Step’s declaration, in a Deploy Run, that its success asks
+for a DeploymentVersion on a DeploymentTarget. It is a field on any Step, not a step
+kind. As built (MMP slice (b)):</p>
+<div class="expressive-code"><link rel="stylesheet" href="/scarab-ci/_astro/ec.v4551.css"><script type="module" src="/scarab-ci/_astro/ec.0vx5m.js"></script><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="yaml"><code><div class="ec-line"><div class="code"><span style="--0:#7FDBCA;--1:#111111">environment</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">prod</span></div></div><div class="ec-line"><div class="code"><span style="--0:#7FDBCA;--1:#111111">interface</span><span style="--0:#D6DEEB;--1:#403F53">: { </span><span style="--0:#7FDBCA;--1:#111111">inputs</span><span style="--0:#D6DEEB;--1:#403F53">: [ { </span><span style="--0:#7FDBCA;--1:#111111">name</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">app</span><span style="--0:#D6DEEB;--1:#403F53">, </span><span style="--0:#7FDBCA;--1:#111111">type</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">string</span><span style="--0:#D6DEEB;--1:#403F53">, </span><span style="--0:#7FDBCA;--1:#111111">required</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#FF6A83;--1:#A24848">false</span><span style="--0:#D6DEEB;--1:#403F53">, </span><span style="--0:#7FDBCA;--1:#111111">default</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">payments-api</span><span style="--0:#D6DEEB;--1:#403F53"> } ] }</span></div></div><div class="ec-line"><div class="code"><span style="--0:#7FDBCA;--1:#111111">steps</span><span style="--0:#D6DEEB;--1:#403F53">:</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#D6DEEB;--1:#403F53">  </span></span><span style="--0:#D6DEEB;--1:#403F53">- </span><span style="--0:#7FDBCA;--1:#111111">id</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">bump-gitops</span></div></div><div class="ec-line"><div class="code"><span class="indent">    </span><span style="--0:#7FDBCA;--1:#111111">image</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">ghcr.io/acme/gitops-bump@sha256:…</span></div></div><div class="ec-line"><div class="code"><span class="indent">    </span><span style="--0:#7FDBCA;--1:#111111">results</span><span style="--0:#D6DEEB;--1:#403F53">: [</span><span style="--0:#ECC48D;--1:#3B61B0">images</span><span style="--0:#D6DEEB;--1:#403F53">, </span><span style="--0:#ECC48D;--1:#3B61B0">digests</span><span style="--0:#D6DEEB;--1:#403F53">]   </span><span style="--0:#919F9F;--1:#5F636F"># the result names this Step emits</span></div></div><div class="ec-line"><div class="code"><span class="indent">    </span><span style="--0:#7FDBCA;--1:#111111">deployment_requests</span><span style="--0:#D6DEEB;--1:#403F53">:</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#D6DEEB;--1:#403F53">      </span></span><span style="--0:#D6DEEB;--1:#403F53">- </span><span style="--0:#7FDBCA;--1:#111111">target</span><span style="--0:#D6DEEB;--1:#403F53">: { </span><span style="--0:#7FDBCA;--1:#111111">source</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">argo-prod</span><span style="--0:#D6DEEB;--1:#403F53">, </span><span style="--0:#7FDBCA;--1:#111111">id</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#ECC48D;--1:#984E4D">${{ inputs.app }}</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53"> }  </span><span style="--0:#919F9F;--1:#5F636F"># literal or ${{ inputs.* }}</span></div></div><div class="ec-line"><div class="code"><span class="indent">        </span><span style="--0:#7FDBCA;--1:#111111">version</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">images</span><span style="--0:#D6DEEB;--1:#403F53">          </span><span style="--0:#919F9F;--1:#5F636F"># a declared result, in the source's scheme</span></div></div><div class="ec-line"><div class="code"><span class="indent">        </span><span style="--0:#7FDBCA;--1:#111111">evidence</span><span style="--0:#D6DEEB;--1:#403F53">: [</span><span style="--0:#ECC48D;--1:#3B61B0">digests</span><span style="--0:#D6DEEB;--1:#403F53">]      </span><span style="--0:#919F9F;--1:#5F636F"># optional: declared results holding artifact digests</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#D6DEEB;--1:#403F53">  </span></span><span style="--0:#D6DEEB;--1:#403F53">- </span><span style="--0:#7FDBCA;--1:#111111">id</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">payments-live</span></div></div><div class="ec-line"><div class="code"><span class="indent">    </span><span style="--0:#7FDBCA;--1:#111111">gate</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">deployment</span></div></div><div class="ec-line"><div class="code"><span class="indent">    </span><span style="--0:#7FDBCA;--1:#111111">deployment</span><span style="--0:#D6DEEB;--1:#403F53">: { </span><span style="--0:#7FDBCA;--1:#111111">step</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">bump-gitops</span><span style="--0:#D6DEEB;--1:#403F53"> }  </span><span style="--0:#919F9F;--1:#5F636F"># + target: {…} when the Step requests &gt;1 target</span></div></div><div class="ec-line"><div class="code"><span class="indent">    </span><span style="--0:#7FDBCA;--1:#111111">needs</span><span style="--0:#D6DEEB;--1:#403F53">: [</span><span style="--0:#ECC48D;--1:#3B61B0">bump-gitops</span><span style="--0:#D6DEEB;--1:#403F53">]</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="environment: prodinterface: { inputs: [ { name: app, type: string, required: false, default: payments-api } ] }steps:  - id: bump-gitops    image: ghcr.io/acme/gitops-bump@sha256:…    results: [images, digests]   # the result names this Step emits    deployment_requests:      - target: { source: argo-prod, id: &quot;${{ inputs.app }}&quot; }  # literal or ${{ inputs.* }}        version: images          # a declared result, in the source&#x27;s scheme        evidence: [digests]      # optional: declared results holding artifact digests  - id: payments-live    gate: deployment    deployment: { step: bump-gitops }  # + target: {…} when the Step requests >1 target    needs: [bump-gitops]"><div></div></button></div></figure></div>
+<ul>
+<li><strong>The Pipeline check</strong> rejects, before any Run exists: a request on a Pipeline with no
+<code dir="auto">environment:</code>; one on a matrixed Step (every leg would request the same target); a
+<code dir="auto">version</code> or <code dir="auto">evidence</code> that names a result the Step does not declare in <code dir="auto">results:</code>
+(result names are file stems: <code dir="auto">/scarab/results/&lt;name&gt;.json</code>); a target part that is
+neither a literal nor exactly <code dir="auto">${{ inputs.&lt;declared input&gt; }}</code>; and two requests of one
+Step naming the same target. A gate Step declares neither <code dir="auto">results</code> nor requests.</li>
+<li><strong>Recorded only when the Step succeeds</strong>, with values taken from the Step’s own
+results (ADR-0041): the version must be a non-empty JSON string, each evidence result a
+string or an array of strings. The success transition, the Attempt’s outcome and one
+Deployment input per request commit in <strong>one transaction</strong>. An exit 0 observed for an
+Attempt that is no longer the Step’s latest (superseded, cancelled, or a successor
+runs) records nothing. A Step that changed the world and then failed records nothing;
+the change surfaces as Unexplained.</li>
+<li><strong>On Kubernetes, results arrive through the results-egress sidecar</strong>, not from the
+executor. The executor withholds the Step’s success until the sidecar has terminated,
+and the sidecar exits only after the results were committed or its POST failed. A
+failed drain therefore reads as “exit 0, result missing” and still fails the Step as
+DeploymentRequest incomplete, never auto-retried. Its <strong>reason</strong> says what happened
+(git-bug <code dir="auto">0cb5895</code>, owner-approved): when the sidecar terminated non-zero (its POST
+gave up, or it was killed at the grace period), the reason names the sidecar and its
+exit code, says the Step’s own output may be fine and asks for a retry of the Step,
+instead of telling the author to write <code dir="auto">/scarab/results/&lt;name&gt;.json</code>. When the executor
+cannot say (an API error, or the Pod is already gone) the reason says delivery could
+not be checked, blaming neither. Every wording still names the missing results. The
+engine asks the executor for this only when a request is incomplete.</li>
+<li><strong>The DeploymentTarget is static</strong>: a literal or a launch input, resolved once at Run
+creation against the launch parameters (a webhook Run uses the inputs’ defaults). An
+unresolved or empty part refuses the Run, and so do two requests of one Step that
+resolve to the same target. <code dir="auto">POST /v1/runs</code> (inline IR) refuses any request or
+DeploymentGate: they need a Deploy Run. The Environment check happens at Run creation,
+before any Pod. The ownership check (ADR-0071) belongs there too, and is <strong>not built</strong>
+(git-bug <code dir="auto">9c1173a</code>).</li>
+<li><strong>Effective time.</strong> A request carries the time its Step <em>started</em> (when the change was
+made) as well as the time it was recorded (when the Step succeeded). As built, the
+effective time is the <code dir="auto">started_at</code> of the Step’s <strong>first Attempt in its current Take</strong>
+(git-bug <code dir="auto">2b5d9d9</code>), and the receipt time is read right before the commit. Takes are a
+derived lens (ADR-0056), so “current Take” is judged on the Run’s journal by position:
+the first <code dir="auto">AttemptStarted</code> of the Step after the latest Rerun that re-armed it. An
+automatic retry and an operator Retry do not start a new Take; a Rerun of an unrelated
+Step is no boundary for this one. A journal that names no such Attempt falls back to
+the succeeding Attempt’s start, the later and so the more conservative time. The
+effective time is <strong>attribution only</strong> (what explains a Deployment, §2, INV-DEP-11):
+a DeploymentGate’s window opens at the <em>succeeding</em> Attempt’s start instead (§8). Both
+times are control-plane times, and the effective time is clamped to be no later than
+the request’s receipt time; a source’s clock never enters the comparison. If the key’s
+newest Deployment is already final, the request still <strong>joins it as history</strong> when core
+first received that Deployment at or after the effective time: the source simply got
+there before the request was recorded. Only an <em>older</em> final Deployment makes the
+request a genuine rollback (INV-DEP-11).</li>
+<li><strong>Scheme check.</strong> A version that does not fit the target’s published scheme id (§4), or
+the source’s default scheme for a target it has not named yet, is to be rejected when
+the request is recorded, failing the Step as <strong>DeploymentRequest incomplete</strong> below.
+<strong>Not built</strong> (git-bug <code dir="auto">5fc1860</code>): today any non-empty string is recorded.</li>
+<li><strong>Incomplete request.</strong> If the Step exits 0 but its DeploymentRequest cannot be
+completed (a referenced result is missing or of the wrong type), the Step fails with the
+failure class <strong>DeploymentRequest incomplete</strong> (<code dir="auto">deployment-request-incomplete</code>), naming
+every problem at once. It is Failed, not dead-lettered, and <strong>never auto-retried</strong>,
+<code dir="auto">retry:</code> included: the change has probably already landed. The per-Step <code dir="auto">results:</code>
+declaration is what lets the Pipeline check catch an undeclared result first.</li>
+<li><strong>Environment mismatch.</strong> A DeploymentTarget already known in <strong>another</strong> Environment
+is refused at Run creation: a webhook delivery names the refused Pipeline, a dispatch
+answers 403. “Known” means the source’s current routing of the target, else the
+Environment of its newest recorded input. A request that an admitted Run has not yet
+recorded does not count, so two Runs in different Environments that both name a
+never-seen target are both admitted, and the target’s home then follows its newest
+input (git-bug <code dir="auto">9e66f2c</code>). A target the source later reports under another
+Environment is re-homed (§3), never moved.</li>
+</ul>
+<div class="sl-heading-wrapper level-h3"><h3 id="8-deploymentgate-core-resolves-it-looking-only-forward">8. DeploymentGate: core resolves it, looking only forward</h3><a class="sl-anchor-link" href="#8-deploymentgate-core-resolves-it-looking-only-forward"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “8. DeploymentGate: core resolves it, looking only forward”</span></a></div>
+<p>A <strong>DeploymentGate</strong> is a gate kind that waits on a DeploymentRequest made by an upstream
+Step of the same Run. <strong>Core resolves it</strong> from status reports. A plugin reports facts
+and never resolves a DeploymentGate (ADR-0072).</p>
+<p>It is spelled <code dir="auto">gate: deployment</code> with <code dir="auto">deployment: { step, target? }</code> (§7’s example).
+The Pipeline check requires <code dir="auto">step</code> to be one the gate needs, directly or transitively,
+that declares <code dir="auto">deployment_requests</code>. <code dir="auto">target</code> must be omitted when that Step makes
+exactly one request, and must otherwise spell one of them exactly as the request does. A
+matrixed DeploymentGate is refused. Approving or releasing it is refused: core
+resolves it. Any principal who can write to the Run may <strong>reject</strong> it with a reason, as for
+every gate (§9), because rejecting only tightens. <code dir="auto">gate_expires_after</code> still bounds its
+wait.</p>
+<p><strong>Attribution and the gate window are split</strong> (owner, 2026-10-24). Three starts, one
+role each:</p>
+<ul>
+<li><strong>Attribution</strong> is the request’s effective time: the deploy Step’s <strong>first Attempt in
+the current Take</strong> (§7). It decides what the request explains (§2, INV-DEP-11), and
+nothing else.</li>
+<li>A gate’s <strong>first wait</strong> on a request opens at the start of the deploy Step’s Attempt
+that <strong>succeeded</strong> and recorded the request. For a deploy Step that was not retried
+this is the same instant as the effective time, and the window is the request’s own
+mark. For a retried one it is a floor later than the effective time: reports received
+while an earlier, failed Attempt ran do not decide the gate, and the stall clock starts
+at the succeeding Attempt, not at the first. So a Retry of the deploy Step after its
+first Attempt caused a <code dir="auto">failed</code> (a missing secret, then fixed) is not failed by that
+stale label, and an operator Retry long after the first Attempt died does not stall a
+live Deployment on the gate’s first ask. The engine reads that start from the deploy
+Step’s durable Attempt rows (its latest <code dir="auto">Succeeded</code> Attempt), so a restart reads the
+same one; no migration.</li>
+<li>A wait that <strong>waits afresh</strong> opens at <strong>max(request effective time, gate Attempt
+start)</strong>: its own Attempt’s start. A wait waits afresh when an earlier wait of the same
+gate already reached a verdict while this same request stood: a Retry, or a Rerun of
+the gate alone.</li>
+</ul>
+<p>Every floor only narrows the window (INV-DEP-13). From the window start:</p>
+<ul>
+<li><strong>passed</strong> if the Deployment was live at that point, or is reported <code dir="auto">live</code> after it;</li>
+<li><strong>failed</strong> on a <code dir="auto">failed</code> report after it, on supersession, or once the
+deadline has elapsed since it. The source’s label is the reason.</li>
+</ul>
+<p>Whatever happens first decides. A failure that predates the window never fails the gate:
+a re-deploy after fixing a missing secret is not failed by the earlier failure.</p>
+<p>So a report received <em>while the succeeding deploy Attempt was still running</em>, after it
+started and before the gate’s Attempt existed, counts. A <code dir="auto">failed</code> then fails the gate
+with the source’s label, and a <code dir="auto">live</code> then passes it, instead of the gate waiting out its
+deadline. The owner decided this on 2026-10-24 (git-bug <code dir="auto">fce05da</code>): the gap between the
+deploy Step’s start and the gate’s start is exactly what the gate must not miss. A report
+received before that Attempt started is history to the gate.</p>
+<p>The stall deadline runs from the window start too, so for a first wait it runs from the
+succeeding deploy Attempt’s start, and the <code dir="auto">stalled</code> reason names it (“…within 3600s of step
+<code dir="auto">bump</code> starting”, “…of step <code dir="auto">bump</code>’s succeeding attempt starting”, “…of this gate attempt
+starting”). A deploy Attempt that itself ran past the deadline, with nothing decisive
+reported, fails its gate <code dir="auto">stalled</code> the first time the gate is asked. A deadline shorter
+than one deploy Attempt is a misconfiguration; an operator’s delay before a Retry is not
+counted. No verdict is reached for an instant
+before the gate’s own Attempt exists: the oracle answers only for a <code dir="auto">now</code> at or after
+that Attempt’s start, even when the verdict’s own instant (a report, the deadline) is
+earlier.</p>
+<p>Whether a wait waits afresh is judged on the Run’s journal, by position and never by
+time. The request now standing was recorded by its requester Step’s latest <strong>executed</strong>
+success (<code dir="auto">Running → Succeeded</code>), in the same commit as that success. So a <code dir="auto">GateResolved</code>
+of the gate after that success was reached on this same request. A Rerun of the deploy
+Step makes a <strong>new request</strong>, with a new effective time. The gate’s next wait is then a
+first wait on that request and opens at its succeeding deploy Attempt’s start, not at the
+gate Attempt’s start. A re-arm of the deploy Step, or a skip-if-unchanged of it, records no request, so
+the old one still stands. A journal with no executed success of the requester counts any
+earlier verdict of the gate, because a floor only narrows the window (INV-DEP-13).</p>
+<p>The Attempt-start bound is the instant <em>(Attempt start, after every sequence number)</em>.
+An input received in the millisecond the Attempt started therefore counts as <strong>before</strong>
+the window: a <code dir="auto">live</code> then passes the gate at once, and a <code dir="auto">failed</code> then is history. A
+window bounded this way opens only once that millisecond has ended. Until then, more
+inputs stamped in it can still arrive, and deciding early let one of them flip a verdict
+already reached (INV-DEP-10). A supersession that predates the bound does fail a retried
+gate, at its start: <code dir="auto">superseded</code> is final.</p>
+<p><strong>As built.</strong> The deadline is the Project’s effective one, the tighter of the
+Environment’s baseline and the Project’s EnvironmentProjectOverlay (§10). It is the
+1-hour default when the Org no longer has the Environment, and it is re-read on every
+tick. The verdict’s reason is <code dir="auto">"&lt;version&gt; live on &lt;source&gt;/&lt;id&gt;: &lt;label&gt;"</code> (or <code dir="auto">"…was already live…"</code>), the source’s <code dir="auto">failed</code> label verbatim, <code dir="auto">"superseded by &lt;version&gt;"</code>, or
+<code dir="auto">"stalled: not live within &lt;deadline&gt; of &lt;window start&gt;"</code>. Missing or unreadable records
+are handled as
+follows:</p>
+<ul>
+<li><strong>The request is missing.</strong> A Run whose request row for the gate is missing fails the
+gate at once. Run creation writes those rows before any Step exists, and they never
+change. A request that is not yet in the Deployment record fails the gate only after an
+<strong>uncached</strong> re-read of the record. Each tick shares one fold per Environment, and that
+fold may predate the request’s commit on another replica. The re-read is causal: the
+request commits with the deploy Step’s success, and the gate’s wait opened after that.</li>
+<li><strong>The record cannot be read.</strong> The gate takes <strong>no decision</strong> that tick, so one bad row
+cannot fail every Deploy Run in the Environment, but only until the deadline has
+elapsed since the gate Attempt’s start. That is the one window start known without the
+record, and never earlier than the real one, so an unreadable record never fails a gate
+sooner than a readable one would. After that it fails <code dir="auto">stalled</code>, and the read error is
+in the reason. An error reading the deadline itself still means no decision (git-bug
+<code dir="auto">eace9a8</code>).</li>
+</ul>
+<p><strong>“Before” and “after” mean received before and after.</strong> Core stamps every input, request
+or report, with its <strong>receipt time</strong>: the caller reads it from the control-plane clock
+right before the append, and the store keeps it monotone per Org (the later of it and the
+Org’s last stamp) in the transaction that appends the input, so receipt order and arrival
+order agree. A receipt time more than a minute ahead of the database’s own clock is
+refused, so one replica’s runaway clock cannot push every later stamp into the future.
+The request’s effective time, the gate Attempt’s start and the gate’s <code dir="auto">now</code> come from
+that same control-plane clock. A DeploymentGate decides only below the store’s
+<strong>horizon</strong>. Before folding, the oracle fences the Org’s stamp clock to after its <code dir="auto">now</code>,
+in one statement that waits out any append holding the counter. So every input it did
+not read is stamped after the instant it decides for, whatever the appender’s clock or
+commit latency. A source’s own timestamp is display
+only. The fold requires non-decreasing time and clamps an input that arrives backdated up
+to the last one rather than trusting it. Two inputs can still share a millisecond, so ties
+are broken by arrival sequence, and a deadline sorts before every input stamped the same
+time.</p>
+<p>The cost of ordering by receipt: a stale <code dir="auto">failed</code> that reaches core late counts as
+<em>after</em> the window and can fail a fresh gate. The DeploymentReporterContract’s “source
+order, never replay older history” (§11) is what prevents that, and so it is
+load-bearing.</p>
+<p>The verdict is <strong>journaled per Attempt</strong> when it is first reached, as a <code dir="auto">GateResolved</code>
+carrying the Deployment’s id, and never re-derived from the log afterwards: a gate tick
+can race an append, and a verdict the engine has already acted on must not flip. The
+Deployment’s status may move on: a Run that went red on <code dir="auto">stalled</code> stays red even if the
+Deployment later goes <code dir="auto">live</code>. <strong>Retry is a new Attempt that waits afresh</strong> on the same
+Deployment, and its later Attempt start opens a new window, so the failure that failed
+the last Attempt is history to it. The recovery path is: fix
+the secret, Resync (a PluginAction, ADR-0072), Retry the gate. The deploy Step does not
+run again. Gate Retry is built; Resync is not (ADR-0072’s MLP), so today the source must
+report again by itself.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="9-every-gate-can-fail-holds-only-its-dependents-and-has-its-own-clock">9. Every gate can fail, holds only its dependents, and has its own clock</h3><a class="sl-anchor-link" href="#9-every-gate-can-fail-holds-only-its-dependents-and-has-its-own-clock"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “9. Every gate can fail, holds only its dependents, and has its own clock”</span></a></div>
+<p>These changes apply to <strong>all</strong> gate kinds, not only DeploymentGate:</p>
+<ul>
+<li><strong>A gate resolves <code dir="auto">passed</code> or <code dir="auto">failed</code> with a reason.</strong> A failed gate skips its
+dependents and fails the Run (as ADR-0047’s expiry already does for one case).</li>
+<li><strong>A waiting gate holds only the Steps that depend on it.</strong> The Run suspends only when
+nothing else can run. Waiting bills no Run budget, because the budget sums Running
+intervals only.</li>
+<li><strong>Each gate has its own wait clock</strong>, started when its dependencies are satisfied and
+evaluated whether the Run is running or suspended. This replaces the Run-level
+<code dir="auto">suspended_at</code> and the <code dir="auto">find()</code> of the first matching gate (<code dir="auto">scheduler.rs:2858-2908</code>)
+and the whole-Run suspension in the pre-pass (<code dir="auto">scheduler.rs:1662-1677</code>).</li>
+<li>A verdict is final <strong>per Attempt</strong>, journaled when first reached. A Retry of a failed
+gate is a new Attempt that waits afresh: a rejected approval asks again.</li>
+</ul>
+<p>As built (MMP slice (b)):</p>
+<ul>
+<li>
+<p><strong>A wait is an Attempt.</strong> When a gate is reached (every need <code dir="auto">Succeeded</code>), core opens a
+<code dir="auto">running</code> Attempt for that wait. The gate Step itself stays <code dir="auto">Pending</code> until its verdict.
+The Attempt’s <code dir="auto">started_at</code> is the gate’s clock start. It is computed once from the event
+log, frozen, and identical across a crash and every re-tick. The start is the latest of:</p>
+<ul>
+<li>each need’s latest finish since that need’s own latest re-arm;</li>
+<li>the gate’s own latest re-arm (a Retry, or a Rerun that invalidates it);</li>
+<li>for a gate with no needs only, the Run’s first <code dir="auto">→ Running</code>.</li>
+</ul>
+<p>A need that is <code dir="auto">Succeeded</code> in the rows but has no finish in the log counts as the
+moment the Attempt opened, so a crash can only start a clock late, never early. A timer
+passes at <code dir="auto">started_at + gate_after</code>, and expiry fires at
+<code dir="auto">started_at + gate_expires_after</code>, for every gate kind.</p>
+</li>
+<li>
+<p><strong>Ways to fail.</strong> A gate fails by expiry, by the DeploymentGate oracle (§8), by
+<code dir="auto">POST /v1/runs/{id}/gates/{step}/reject</code> (a reason of 1 to 1024 bytes is required; the
+caller needs Write on the Run), or by an external gate’s token
+<code dir="auto">POST /v1/runs/{id}/gates/{step}/release</code> with <code dir="auto">{"passed": false, "reason": …}</code>. A
+reject consults no Environment governance, since it only tightens. Who may reject in a
+governed Environment is open (git-bug <code dir="auto">5c86952</code>). The wait’s Attempt fails with the
+failure class <code dir="auto">gate</code>, never auto-retried. Its dependents are Skipped and the Run ends
+Failed.</p>
+</li>
+<li>
+<p><strong>One write.</strong> A verdict closes the open Attempt, moves the gate out of <code dir="auto">Pending</code> and
+journals <code dir="auto">GateResolved { passed, reason, by, deployment }</code> in <strong>one transaction</strong>, fenced
+on that Attempt. A verdict on a wait that was superseded or cancelled meanwhile writes
+nothing.</p>
+</li>
+<li>
+<p><strong>Gates act only when reached.</strong> Approving, releasing or rejecting a gate whose needs
+have not all succeeded is refused (409). Approvals count <strong>per wait</strong>: only those given
+after the gate’s latest re-arm count toward the quorum, so a Retry or Rerun asks again.</p>
+</li>
+<li>
+<p><strong>The suspend rule.</strong> The Run suspends only when nothing is <code dir="auto">Ready</code> or <code dir="auto">Running</code> and
+every other non-terminal Step is behind a waiting gate or a per-DeploymentTarget
+concurrency hold (ADR-0071 §9). The Run reopens as soon as anything can run.</p>
+</li>
+<li>
+<p><strong>Known gaps:</strong> the dashboard’s “Waiting on you” inbox still reads Run status, so a gate
+waiting inside a Running Run does not appear there (git-bug <code dir="auto">c489346</code>). A waiting gate
+whose dependents are all terminal still keeps its Run suspended (git-bug <code dir="auto">2c37802</code>).</p>
+</li>
+</ul>
+<div class="sl-heading-wrapper level-h3"><h3 id="10-environmentdeploymentdeadline-the-stall-clock">10. EnvironmentDeploymentDeadline: the stall clock</h3><a class="sl-anchor-link" href="#10-environmentdeploymentdeadline-the-stall-clock"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “10. EnvironmentDeploymentDeadline: the stall clock”</span></a></div>
+<p>How long a Deployment in an Environment may stay <code dir="auto">requested</code> or <code dir="auto">in_progress</code> before core
+marks it <code dir="auto">stalled</code>. It is measured from creation and <strong>restarted by every request that
+joins</strong>. A later <code dir="auto">live</code> or <code dir="auto">failed</code> report still recovers a stalled Deployment.</p>
+<p>It is set on the Environment, and that <strong>baseline deadline alone drives a Deployment’s
+status</strong>, so one Deployment has one status whoever looks at it. A Project’s
+EnvironmentProjectOverlay (ADR-0071) may set a tighter deadline, which applies <strong>only to
+that Project’s DeploymentGates</strong>.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="11-deploymentreportercontract-what-every-reporter-promises">11. DeploymentReporterContract: what every reporter promises</h3><a class="sl-anchor-link" href="#11-deploymentreportercontract-what-every-reporter-promises"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “11. DeploymentReporterContract: what every reporter promises”</span></a></div>
+<p>Core publishes the contract every <code dir="auto">report_deployments</code> plugin must follow, so that
+behaviour is the same across CD tools:</p>
+<ul>
+<li>Report <code dir="auto">failed</code> <strong>only when the source has given up</strong>: it will not progress without
+intervention. For Argo, that means retries are exhausted or the sync was terminated by
+timeout. Until then, report <code dir="auto">in_progress</code> with the reason as the label.</li>
+<li>Report <code dir="auto">live</code> <strong>only when the requested DeploymentVersion is actually serving</strong>:
+applied and healthy at that version, where the source can tell. For Argo, that is
+synced to a target whose version is the requested one, and healthy.</li>
+<li><code dir="auto">live → failed</code> is allowed.</li>
+<li>A re-apply of the same DeploymentVersion is a report, not a new Deployment.</li>
+<li>Report <strong>transitions only</strong>, never every reconcile. Argo reconciles about every three
+minutes; a report per reconcile adds no fact and grows every Environment’s log.</li>
+<li>Report <strong>in source order</strong> and <strong>never replay older history</strong>. Core judges before and
+after by receipt time (§8), so a stale report delivered late reads as new.</li>
+<li>Each report carries an <strong>idempotency key</strong> and a <strong>source sequence</strong> per
+<em>(installation, DeploymentTarget)</em>. Core drops a repeat, and a report whose sequence is
+not newer than the last one it accepted, so an at-least-once retry cannot flip <code dir="auto">live</code>
+back to <code dir="auto">failed</code>.</li>
+<li>Reports reach core by push under an identity core verifies, and core sets the report’s
+source from that identity, never from the report (ADR-0072 §11).</li>
+<li>Sequences are integers from 1 to <strong>2^53 − 1</strong>, the largest a JSON number holds exactly
+in every reader. (A reporter that sends a huge one freezes its own target: every later
+report is stale until an admin resets the cursor.)</li>
+<li><strong>Re-send when asked.</strong> Core never fabricates a report from what it last heard. When a
+target routes to an Environment its last status never reached — a grouping an admin just
+mapped, or moved — <code dir="auto">GET /targets</code> flags it <code dir="auto">resend</code>. Poll <code dir="auto">GET /targets?resend=true</code> at
+least once a minute and re-send each flagged target’s <strong>current</strong> state as a new report
+(next sequence, new idempotency key): the one exception to “transitions only”. Skip a
+target you have no status for. Only a status report that lands clears the flag; an
+ownership report does not.</li>
+<li><strong>Page <code dir="auto">/targets</code></strong> (<code dir="auto">after</code> = the previous page’s <code dir="auto">next_after</code>, <code dir="auto">limit</code> ≤ 1000), at
+start-up to seed cursors and on every resend poll.</li>
+<li><strong>Read results per item.</strong> A batch is answered item by item: <code dir="auto">accepted</code>, <code dir="auto">duplicate</code>,
+<code dir="auto">stale</code>, <code dir="auto">unmapped</code>, or <code dir="auto">rejected</code> with a reason — unreadable, breaking a rule, or past a
+per-installation cap (<code dir="auto">cap:</code>). A rejected item stored nothing, not even its key: fix it
+or drop it, never retry it unchanged.</li>
+<li><strong>A 409 names the key</strong> reused for different content, and means the <strong>whole batch was
+rolled back</strong>. That item is a reporter bug: log it, drop it, and resend the rest
+unchanged.</li>
+<li><strong>Back off on 429 and 503</strong> by <code dir="auto">Retry-After</code>. 429: a batch from this installation is
+already in flight — send one at a time. 503: core is saturated; nothing was recorded, so
+the same batch is safe to resend.</li>
+<li><strong>A report during the deploy Step counts.</strong> A DeploymentGate’s first wait opens at the
+start of the deploy Step’s Attempt that succeeded (§8). A <code dir="auto">failed</code> that this Attempt’s
+change caused, reported while it was still running, fails the gate with its label, and
+a <code dir="auto">live</code> passes it. The reporter need not report again once the gate opens. A report
+from an earlier, failed Attempt of a retried deploy Step does not decide the gate, so
+after a deploy Step Retry the reporter must report the new attempt’s outcome. Only a
+Retry of the gate waits afresh, so after a gate Retry the reporter must report again
+(Resync, ADR-0072). This closes the gap of git-bug <code dir="auto">fce05da</code>.</li>
+</ul>
+<p>The first-party Argo plugin is the contract’s reference implementation.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="12-the-invariants-are-the-executable-spec">12. The invariants are the executable spec</h3><a class="sl-anchor-link" href="#12-the-invariants-are-the-executable-spec"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “12. The invariants are the executable spec”</span></a></div>
+<p>The fold’s invariants are numbered so that tests, ADRs and code comments can cite them.
+Each is a property test in <code dir="auto">crates/scarab-deployment/tests/invariants.rs</code>, except
+INV-DEP-6, which the type system enforces. The crate is the spec. If this list and the
+crate disagree, the crate wins and this ADR is stale.</p>
+<ul>
+<li><strong>INV-DEP-1</strong> At most one Deployment per DeploymentTarget is <code dir="auto">live</code>.</li>
+<li><strong>INV-DEP-2</strong> <code dir="auto">superseded</code> is absorbing. A late request may still add itself as a
+requester (history, not change).</li>
+<li><strong>INV-DEP-3</strong> The newest Deployment on a DeploymentTarget is never <code dir="auto">superseded</code>.</li>
+<li><strong>INV-DEP-4</strong> At most one non-superseded Deployment per (target, version).</li>
+<li><strong>INV-DEP-5</strong> Every non-superseded Deployment other than the newest is <code dir="auto">live</code>, so at
+most two are open per target.</li>
+<li><strong>INV-DEP-6</strong> A source can assert only <code dir="auto">in_progress</code>, <code dir="auto">live</code> or <code dir="auto">failed</code> (types).</li>
+<li><strong>INV-DEP-7</strong> <code dir="auto">stalled</code> only when the deadline has elapsed on the stall clock and the
+latest report is neither <code dir="auto">live</code> nor <code dir="auto">failed</code>.</li>
+<li><strong>INV-DEP-8</strong> No input is lost: every request and every report lands on exactly one
+Deployment with its key.</li>
+<li><strong>INV-DEP-9</strong> A DeploymentGate looks forward from its window start: for a first wait,
+the start of the deploy Step’s succeeding Attempt (its request’s effective time when it
+was not retried); for a wait that waits afresh, the later of the effective time and its
+gate Attempt’s start (§8). A failure <strong>received before</strong> the window opens never fails
+it; one <strong>received after</strong> may.</li>
+<li><strong>INV-DEP-10</strong> A DeploymentGate verdict, once reached, never changes. The fold keeps
+this for a reader whose <code dir="auto">now</code> is below the store’s horizon (§8). The oracle reads only
+so, and the engine also journals the verdict per Attempt.</li>
+<li><strong>INV-DEP-11</strong> A late request joins the Deployment the source already saw. It is not a
+rollback.</li>
+<li><strong>INV-DEP-12</strong> A claim never explains a Deployment, and nothing un-explains one (§2).</li>
+<li><strong>INV-DEP-13</strong> An Attempt-start bound — the gate Attempt’s of a wait that waits afresh,
+or the succeeding deploy Attempt’s of a retried deploy Step’s first wait — only ever
+narrows its window. An input received at or before that Attempt started never fails the
+gate, and the bound never makes a verdict arrive sooner or land earlier than it would
+without it (§8). So the Retry of a failed DeploymentGate waits afresh on the same
+Deployment, and a deploy Step Retry is not failed by its earlier Attempt’s report.</li>
+</ul>
+<p>The property suite found three real holes before any persistence existed: an older
+version reported live again rejoining its old Deployment (INV-DEP-3), a gate verdict
+flipping between two inputs in the same millisecond (INV-DEP-10, hence the total order),
+and a late request being treated as a rollback (INV-DEP-11). A second audit found a
+fourth: inputs folded in arrival order but judged on the source’s clock, so a backdated
+report could flip a verdict. Receipt-time stamping and the fold’s clamp close it; a
+scenario test covers one case, and a property test over backdated and non-monotone inputs
+holds INV-DEP-1..11 after the clamp. The same backdated-input property test later found a
+fifth, in the Attempt-start bound itself. A window bounded at <em>(Attempt start, after
+every sequence number)</em> could decide while <code dir="auto">now</code> was still that millisecond, and a
+<code dir="auto">failed</code> received later in the same millisecond then withdrew the verdict (INV-DEP-10).
+A window bounded this way now opens only once its own millisecond has ended (§8). R3
+found a sixth, the same hole as the fifth with a wider trigger. A commit slower than one
+millisecond, or a lagging replica clock, stamped an input before a verdict already
+reached. It is closed by the store horizon, not by the fold.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="13-one-environment-per-run-now-one-per-invoke-segment-in-the-target-state">13. One Environment per Run now; one per <code dir="auto">invoke</code> segment in the target state</h3><a class="sl-anchor-link" href="#13-one-environment-per-run-now-one-per-invoke-segment-in-the-target-state"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “13. One Environment per Run now; one per invoke segment in the target state”</span></a></div>
+<p>The <strong>target state</strong> is an Environment per <code dir="auto">invoke</code> segment. Each segment is governed by
+its own Environment: approval, secrets and eligibility are checked at Run creation for
+every Environment named, and concurrency is per segment, never per Run. The <strong>first
+cut</strong> keeps ADR-0037’s one Environment per Run. Promotion is chained Deploy Runs over the
+<code dir="auto">upstream</code> trigger.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="consequences">Consequences</h2><a class="sl-anchor-link" href="#consequences"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Consequences”</span></a></div>
+<ul>
+<li>“What is live in prod” has one org-wide answer, with stages QA can read and an outcome
+that does not depend on a watcher’s timeout.</li>
+<li>A Deploy Run can wait for its change to go live, as a gate that can fail with the
+source’s reason, without stopping unrelated branches of the Run.</li>
+<li>Changes made outside Scarab become visible as Unexplained rather than invisible.</li>
+<li>The gate rework touches every gate kind. Per-gate clocks and dependent-only holding
+change scheduler behaviour that existing Pipelines rely on. A Run with a waiting gate
+and runnable siblings now keeps running instead of suspending.</li>
+<li>New failure classes (<code dir="auto">deployment-request-incomplete</code>, and <code dir="auto">gate</code> for every failed gate
+wait) and a new per-Step result declaration (<code dir="auto">results:</code>) for the Pipeline check.</li>
+<li>A provisional decision (the version scheme) is load-bearing for correlation. It is
+isolated in the reporter and the requester so that revising it does not touch the fold.
+Under the default scheme a DeploymentGate cannot see a config-only change (§4).</li>
+<li>Every board read refolds the Environment’s whole input log, and so does every tick
+that has a DeploymentGate waiting in it: the gates of one Environment share one fold per
+tick. “Transitions only” (§11) bounds the log’s growth; an incremental fold or a
+snapshot is a known follow-up (git-bug <code dir="auto">1f2163f</code>).</li>
+<li>Ordering by receipt time makes the reporter contract’s “source order, never replay”
+load-bearing (§8).</li>
+<li>Known gaps this ADR does not close: approvers are opt-in, so an Environment with
+approvers does not force a gate into a Pipeline that omits one (git-bug <code dir="auto">cd43bf3</code>); and
+external gate release skips <code dir="auto">admits()</code> (git-bug <code dir="auto">220917f</code>). Both matter more once gates
+gate real deploys.</li>
+</ul>
+<div class="sl-heading-wrapper level-h2"><h2 id="alternatives-considered">Alternatives considered</h2><a class="sl-anchor-link" href="#alternatives-considered"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Alternatives considered”</span></a></div>
+<ul>
+<li><strong>Deployment as a plugin, with core unaware.</strong> Rejected. Gates, governance and
+red/green must read a status core understands, and a plugin would then have to depend
+on another plugin to share it. Plugins depend only on core; modularity is achieved as a
+crate boundary (<code dir="auto">scarab-deployment</code>) instead.</li>
+<li><strong>Keep approval as the deployment</strong> (today’s row). Rejected. It has the wrong
+cardinality, records no target, version or outcome, and cannot represent a change
+made outside Scarab.</li>
+<li><strong>Let plugins define statuses.</strong> Rejected. Core could not branch on them; new vendor
+states become labels instead.</li>
+<li><strong>Plugins resolve DeploymentGates.</strong> Rejected. A plugin reports facts; core decides,
+so that the forward-looking and freeze rules hold across every CD tool.</li>
+<li><strong>(target, version) as the Deployment’s identity.</strong> Rejected. It cannot tell a
+rollback from a retried request, and it forces an old record to be edited when an older
+version returns.</li>
+<li><strong>Gitops commit as the default version scheme.</strong> Rejected as the Argo default. On a
+shared gitops repository, every unrelated merge changes the version of every target
+(audit finding 1). It is kept as a per-target option (<em>last commit touching the path</em>),
+with the gaps listed in §4.</li>
+<li><strong><code dir="auto">status.summary.images</code> as the Argo default.</strong> Rejected. It is read from live Pods:
+the old∪new union during a rollout, injected sidecars, Sync-hook Pods and empty sets for
+scale-to-zero apps each create a spurious Deployment that supersedes the requested one.</li>
+<li><strong>Source acknowledgement</strong> (the source maps a request or commit to the version it
+rendered). Not rejected: the leading alternative to equality-only correlation, deferred
+until real use gives data to judge it (§4).</li>
+<li><strong>Ordering inputs by the source’s timestamp.</strong> Rejected. Source and control-plane clocks
+skew, and a skewed report turned a late request into a phantom rollback. Core’s receipt
+time orders; the source’s time is display only.</li>
+<li><strong>Re-deriving a gate verdict from the log on every tick.</strong> Rejected. A tick can race an
+append, and a backlogged input could flip a verdict already acted on. The verdict is
+journaled per Attempt.</li>
+<li><strong>Admin-registered DeploymentTargets.</strong> Rejected. A target is born when first named.
+Registration duplicates the source’s own inventory and drifts from it.</li>
+<li><strong>A gate that looks backwards</strong> (fail on any <code dir="auto">failed</code> on the Deployment). Rejected. A
+re-deploy after a fix would be failed by the failure it fixes (audit finding 2).</li>
+<li><strong>A DeploymentRequest step kind.</strong> Rejected in favour of a field on any Step, because
+the Step that makes the change is the one that knows its version.</li>
+</ul>
+<div class="sl-heading-wrapper level-h2"><h2 id="implementation-horizon">Implementation horizon</h2><a class="sl-anchor-link" href="#implementation-horizon"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Implementation horizon”</span></a></div>
+<ul>
+<li><strong>MMP, in this order.</strong> Each step leaves something usable, and real data arrives before
+the riskiest step depends on it.
+<ol>
+<li><strong>A minimal org-level Environment</strong> (ADR-0071): its name and its
+EnvironmentDeploymentSources. Deployment inputs are keyed by Org and Environment
+name, so this comes first; reads use org Read.</li>
+<li><strong>The first-party Argo reporter (ADR-0072) together with the read side</strong>: the
+Deployment record persisted from the fold, a read API, a Deployments view and an
+Environment board. The DeploymentReporterContract ships here. This is an
+<strong>observed-only board</strong> (every Deployment is Unexplained) that needs no Pipeline
+change, and it gives real evidence on the provisional version scheme.</li>
+<li><strong>The full Environment migration</strong> (ADR-0071): eligibility, overlays, privilege
+grants.</li>
+<li><strong>The Run side</strong> (slice (b), built): <code dir="auto">results:</code> and <code dir="auto">deployment_requests</code>,
+DeploymentGate, per-DeploymentTarget concurrency holds (ADR-0071 §9), and the general
+gate changes: gates can fail and be rejected, per-gate clocks, holding only
+dependents, verdicts journaled per Attempt, a first wait opening at the deploy Step’s
+succeeding Attempt, and gate Retry with the Attempt-start window (§8, §9). The Run page shows
+each gate’s verdict and reason, what a waiting DeploymentGate waits on, and why a
+deploy Step is held; the Deployments view links each requester to its Run.</li>
+</ol>
+</li>
+<li><strong>MLP:</strong> the Resync PluginAction that makes the gate-Retry recovery path usable.</li>
+<li><strong>Known follow-ups</strong>, deferred from slice (b) with tickets:
+<ul>
+<li>the scheme check (§7, <code dir="auto">5fc1860</code>) and the ownership rejection (<code dir="auto">9c1173a</code>);</li>
+<li>a target first claimed by two Environments at once (<code dir="auto">9e66f2c</code>);</li>
+<li>a failed results drain on Kubernetes reads as DeploymentRequest incomplete (<code dir="auto">0cb5895</code>):
+<strong>decided</strong> 2026-10-24 and built — same class, an honest reason (§7);</li>
+<li>a retried deploy Step’s request reads as a claim (<code dir="auto">2b5d9d9</code>): <strong>decided</strong> 2026-10-24
+and built — effective at the first Attempt of the current Take (§2, §7);</li>
+<li>when the first gate Attempt’s window should open (<code dir="auto">fce05da</code>): <strong>decided</strong> 2026-10-24
+and built, at the start of the deploy Step’s succeeding Attempt — the request’s
+effective time unless the deploy Step was retried; attribution and the gate window
+split the same day (§8);</li>
+<li>a wait with no bound when its deadline cannot be read (<code dir="auto">eace9a8</code>);</li>
+<li>an incremental or snapshot fold (<code dir="auto">1f2163f</code>);</li>
+<li>a Rerun skips a deploy Step whose inputs are unchanged, so a rollback Rerun fails its
+DeploymentGate (<code dir="auto">d880466</code>);</li>
+<li>an <code dir="auto">invoke</code> library’s target input leaks to the caller’s launch inputs (<code dir="auto">bbbf618</code>);</li>
+<li>a version with surrounding whitespace is stored verbatim (<code dir="auto">5f03853</code>);</li>
+<li>one Pipeline’s refusal aborts the later Pipelines of a webhook event (<code dir="auto">66171a0</code>);</li>
+<li>who may reject a gate in a governed Environment (<code dir="auto">5c86952</code>);</li>
+<li>the “Waiting on you” inbox (<code dir="auto">c489346</code>), and a doomed Run kept suspended by its gate
+(<code dir="auto">2c37802</code>);</li>
+<li>every terminal Step transition and its event in one write (<code dir="auto">586187a</code>).</li>
+</ul>
+</li>
+<li><strong>Target state:</strong> an Environment per <code dir="auto">invoke</code> segment; the path-commit version option.</li>
+<li><strong>Revisit:</strong> the DeploymentVersion scheme, after the first real use, with source
+acknowledgement as the leading alternative.</li>
+</ul>
+</div></div><!-- footer --><footer class="astro-l3glpecf"><div class="pagination-links print:hidden astro-urgzmesl"><a class="prev astro-urgzmesl" href="/scarab-ci/tech/adr/0069-identity-links/" rel="prev"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="astro-urgzmesl"><path d="m15 18-6-6 6-6" class="astro-urgzmesl"></path></svg>0069. Identity links: one Principal, many provider identities, pinned by immutable id</a><a class="next astro-urgzmesl" href="/scarab-ci/tech/adr/0071-org-level-environments/" rel="next">0071. Org-level Environments: a place that decides who may deploy into it<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="astro-urgzmesl"><path d="m9 18 6-6-6-6" class="astro-urgzmesl"></path></svg></a></div></footer></main></div><div class="toc astro-c4hhlov6"><div class="astro-zfomn2we"><starlight-toc data-min-h="2" data-max-h="3" class="astro-3zcp52y7"><nav aria-labelledby="starlight__on-this-page" class="astro-3zcp52y7"><p id="starlight__on-this-page" class="astro-3zcp52y7">On this page</p><ul style="--depth: 0;" class="astro-2faeg4pj"><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#_top" style="--depth: 0;" class="astro-2faeg4pj">Overview</a></li><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#context" style="--depth: 0;" class="astro-2faeg4pj">Context</a></li><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#decision" style="--depth: 0;" class="astro-2faeg4pj">Decision</a><ul style="--depth: 1;" class="astro-2faeg4pj"><li style="--depth: 1;" class="astro-2faeg4pj"><a href="#1-core-owns-a-vendor-neutral-deployment-record-plugins-observe-and-act" style="--depth: 1;" class="astro-2faeg4pj">1. Core owns a vendor-neutral Deployment record; plugins observe and act</a></li><li style="--depth: 1;" class="astro-2faeg4pj"><a href="#2-a-deployment-is-an-occurrence-the-key-only-correlates" style="--depth: 1;" class="astro-2faeg4pj">2. A Deployment is an occurrence; the key only correlates</a></li><li style="--depth: 1;" class="astro-2faeg4pj"><a href="#3-deploymenttarget-the-smallest-unit-that-independently-succeeds-or-fails" style="--depth: 1;" class="astro-2faeg4pj">3. DeploymentTarget: the smallest unit that independently succeeds or fails</a></li><li style="--depth: 1;" class="astro-2faeg4pj"><a href="#4-deploymentversion-an-opaque-label-in-a-scheme-the-source-declares-provisional" style="--depth: 1;" class="astro-2faeg4pj">4. DeploymentVersion: an opaque label in a scheme the source declares (PROVISIONAL)</a></li><li style="--depth: 1;" class="astro-2faeg4pj"><a href="#5-six-statuses-and-who-may-set-each" style="--depth: 1;" class="astro-2faeg4pj">5. Six statuses, and who may set each</a></li><li style="--depth: 1;" class="astro-2faeg4pj"><a href="#6-deploymentstatusreport-a-status-plus-a-label" style="--depth: 1;" class="astro-2faeg4pj">6. DeploymentStatusReport: a status plus a label</a></li><li style="--depth: 1;" class="astro-2faeg4pj"><a href="#7-deploymentrequest-a-step-field-recorded-on-success" style="--depth: 1;" class="astro-2faeg4pj">7. DeploymentRequest: a Step field, recorded on success</a></li><li style="--depth: 1;" class="astro-2faeg4pj"><a href="#8-deploymentgate-core-resolves-it-looking-only-forward" style="--depth: 1;" class="astro-2faeg4pj">8. DeploymentGate: core resolves it, looking only forward</a></li><li style="--depth: 1;" class="astro-2faeg4pj"><a href="#9-every-gate-can-fail-holds-only-its-dependents-and-has-its-own-clock" style="--depth: 1;" class="astro-2faeg4pj">9. Every gate can fail, holds only its dependents, and has its own clock</a></li><li style="--depth: 1;" class="astro-2faeg4pj"><a href="#10-environmentdeploymentdeadline-the-stall-clock" style="--depth: 1;" class="astro-2faeg4pj">10. EnvironmentDeploymentDeadline: the stall clock</a></li><li style="--depth: 1;" class="astro-2faeg4pj"><a href="#11-deploymentreportercontract-what-every-reporter-promises" style="--depth: 1;" class="astro-2faeg4pj">11. DeploymentReporterContract: what every reporter promises</a></li><li style="--depth: 1;" class="astro-2faeg4pj"><a href="#12-the-invariants-are-the-executable-spec" style="--depth: 1;" class="astro-2faeg4pj">12. The invariants are the executable spec</a></li><li style="--depth: 1;" class="astro-2faeg4pj"><a href="#13-one-environment-per-run-now-one-per-invoke-segment-in-the-target-state" style="--depth: 1;" class="astro-2faeg4pj">13. One Environment per Run now; one per invoke segment in the target state</a></li></ul></li><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#consequences" style="--depth: 0;" class="astro-2faeg4pj">Consequences</a></li><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#alternatives-considered" style="--depth: 0;" class="astro-2faeg4pj">Alternatives considered</a></li><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#implementation-horizon" style="--depth: 0;" class="astro-2faeg4pj">Implementation horizon</a></li></ul></nav></starlight-toc><script type="module">var e=class extends HTMLElement{_current=this.querySelector(`a[aria-current="true"]`);minH=Number.parseInt(this.dataset.minH||`2`,10);maxH=Number.parseInt(this.dataset.maxH||`3`,10);set current(e){e!==this._current&&(this._current&&this._current.removeAttribute(`aria-current`),e.setAttribute(`aria-current`,`true`),this._current=e)}onIdle=e=>(window.requestIdleCallback||(e=>setTimeout(e,1)))(e);constructor(){super(),this.onIdle(()=>this.init())}init=()=>{let e=[...this.querySelectorAll(`a`)],t=e=>{if(e instanceof HTMLHeadingElement){if(e.id===`_top`)return!0;let t=e.tagName[1];if(t){let e=Number.parseInt(t,10);if(e>=this.minH&&e<=this.maxH)return!0}}return!1},n=e=>{if(!e)return null;let r=e;for(;e;){if(t(e))return e;for(e=e.previousElementSibling;e?.lastElementChild;)e=e.lastElementChild;let r=n(e);if(r)return r}return n(r.parentElement)},r=t=>{for(let{isIntersecting:r,target:i}of t){if(!r)continue;let t=n(i);if(!t)continue;let a=e.find(e=>e.hash===`#${encodeURIComponent(t.id)}`);if(a){this.current=a;break}}},i=document.querySelectorAll(`main [id], main [id] ~ *, main .content > *`),a,o=()=>{a||(a=new IntersectionObserver(r,{rootMargin:this.getRootMargin()}),i.forEach(e=>a.observe(e)))};o();let s;window.addEventListener(`resize`,()=>{a&&=(a.disconnect(),void 0),clearTimeout(s),s=setTimeout(()=>this.onIdle(o),200)})};getRootMargin(){let e=(document.querySelector(`header`)?.getBoundingClientRect().height||0)+(this.querySelector(`summary`)?.getBoundingClientRect().height||0)+32;return`-${e}px 0% ${e+53-document.documentElement.clientHeight}px`}};customElements.define(`starlight-toc`,e);</script></div></div></main></div></div></main><footer class="astro-6hobpl37"><div data-slot="footer-text" class="astro-6hobpl37">Scarab — a modern CI engine for Kubernetes: forge-native, on a durable core. Themed with <a href="https://github.com/lucas-labs/lucode-starlight-theme">Lucode Starlight</a>.</div></footer></div><div popover="auto" id="drawer" class="astro-cn5bvrke"><button class="sheet-overlay astro-cn5bvrke" popovertarget="drawer" popovertargetaction="hide"></button><div class="content astro-cn5bvrke"><div class="header astro-cn5bvrke"><button class="drag-icon astro-cn5bvrke" popovertarget="drawer" popovertargetaction="hide"><span class="astro-cn5bvrke"></span></button></div><div class="body astro-cn5bvrke"><div class="links-nav astro-cn5bvrke"><a href="/scarab-ci/get-started/overview/" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">Get Started</a><a href="/scarab-ci/usage/pipeline-syntax/" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">Usage</a><a href="/scarab-ci/reference/api/" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">References</a><a href="https://demo-scarab.ahiravan.dev/" target="_blank" rel="noopener" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">Demo</a></div><div class="links-docs astro-cn5bvrke"><div class="container-sidebar-entry astro-cn5bvrke"><h4 class="entry-title astro-cn5bvrke">Get Started</h4><a href="/scarab-ci/get-started/overview/" class="astro-cn5bvrke" data-active="false">Overview</a><a href="/scarab-ci/get-started/deploy-helm/" class="astro-cn5bvrke" data-active="false">Installation</a><a href="/scarab-ci/get-started/run-locally/" class="astro-cn5bvrke" data-active="false">Run locally</a><a href="/scarab-ci/get-started/local-development/" class="astro-cn5bvrke" data-active="false">Local Development</a></div><div class="container-sidebar-entry astro-cn5bvrke"><h4 class="entry-title astro-cn5bvrke">Usage</h4><a href="/scarab-ci/usage/pipeline-syntax/" class="astro-cn5bvrke" data-active="false">Pipeline Syntax</a><a href="/scarab-ci/usage/secrets/" class="astro-cn5bvrke" data-active="false">Secrets</a><a href="/scarab-ci/usage/environments/" class="astro-cn5bvrke" data-active="false">Environments</a><a href="/scarab-ci/usage/environment-variables/" class="astro-cn5bvrke" data-active="false">Environment Variables</a></div><div class="container-sidebar-entry astro-cn5bvrke"><h4 class="entry-title astro-cn5bvrke">References</h4><a href="/scarab-ci/reference/api/" class="astro-cn5bvrke" data-active="false">API</a><a href="/scarab-ci/tech/context/" class="astro-cn5bvrke" data-active="false">Thesis &amp; language (CONTEXT)</a></div></div></div></div></div><script type="module">var e=document.getElementById(`drawer`);e&&e.addEventListener(`toggle`,e=>{let t=e.newState===`open`;document.documentElement.style.overflow=t?`hidden`:``,document.body.style.overflow=t?`hidden`:``});</script></body></html>

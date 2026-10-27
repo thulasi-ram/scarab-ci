@@ -1,0 +1,398 @@
+<!DOCTYPE html><html lang="en" dir="ltr" data-theme="dark" data-has-hero class="astro-vdxcvpsm"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Scarab | Scarab</title><link rel="canonical" href="https://thulasi-ram.github.io/scarab-ci/"/><link rel="sitemap" href="/scarab-ci/sitemap-index.xml"/><link rel="icon" href="/scarab-ci/favicon.ico" sizes="any"/><link rel="apple-touch-icon" href="/scarab-ci/apple-touch-icon.png"/><link rel="shortcut icon" href="/scarab-ci/favicon.svg" type="image/svg+xml"/><meta name="generator" content="Astro v7.0.9"/><meta name="generator" content="Starlight v0.41.3"/><meta property="og:title" content="Scarab"/><meta property="og:type" content="article"/><meta property="og:url" content="https://thulasi-ram.github.io/scarab-ci/"/><meta property="og:locale" content="en"/><meta property="og:description" content="A modern CI engine for Kubernetes. It gives you the cohesion of a CI that lives in your forge, built on a control plane that treats a run as state rather than a process. Written in Rust."/><meta property="og:site_name" content="Scarab"/><meta name="twitter:card" content="summary_large_image"/><meta name="description" content="A modern CI engine for Kubernetes. It gives you the cohesion of a CI that lives in your forge, built on a control plane that treats a run as state rather than a process. Written in Rust."/><script>
+	window.StarlightThemeProvider = (() => {
+		const storedTheme =
+			typeof localStorage !== 'undefined' && localStorage.getItem('starlight-theme');
+		const theme =
+			storedTheme ||
+			(window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+		document.documentElement.dataset.theme = theme === 'light' ? 'light' : 'dark';
+		return {
+			updatePickers(theme = storedTheme || 'auto') {
+				document.querySelectorAll('starlight-theme-select').forEach((picker) => {
+					const select = picker.querySelector('select');
+					if (select) select.value = theme;
+					/** @type {HTMLTemplateElement | null} */
+					const tmpl = document.querySelector(`#theme-icons`);
+					const newIcon = tmpl && tmpl.content.querySelector('.' + theme);
+					if (newIcon) {
+						const oldIcon = picker.querySelector('svg.label-icon');
+						if (oldIcon) {
+							oldIcon.replaceChildren(...newIcon.cloneNode(true).childNodes);
+						}
+					}
+				});
+			},
+		};
+	})();
+</script><template id="theme-icons"><svg aria-hidden="true" class="light astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M5 12a1 1 0 0 0-1-1H3a1 1 0 0 0 0 2h1a1 1 0 0 0 1-1Zm.64 5-.71.71a1 1 0 0 0 0 1.41 1 1 0 0 0 1.41 0l.71-.71A1 1 0 0 0 5.64 17ZM12 5a1 1 0 0 0 1-1V3a1 1 0 0 0-2 0v1a1 1 0 0 0 1 1Zm5.66 2.34a1 1 0 0 0 .7-.29l.71-.71a1 1 0 1 0-1.41-1.41l-.66.71a1 1 0 0 0 0 1.41 1 1 0 0 0 .66.29Zm-12-.29a1 1 0 0 0 1.41 0 1 1 0 0 0 0-1.41l-.71-.71a1.004 1.004 0 1 0-1.43 1.41l.73.71ZM21 11h-1a1 1 0 0 0 0 2h1a1 1 0 0 0 0-2Zm-2.64 6A1 1 0 0 0 17 18.36l.71.71a1 1 0 0 0 1.41 0 1 1 0 0 0 0-1.41l-.76-.66ZM12 6.5a5.5 5.5 0 1 0 5.5 5.5A5.51 5.51 0 0 0 12 6.5Zm0 9a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Zm0 3.5a1 1 0 0 0-1 1v1a1 1 0 0 0 2 0v-1a1 1 0 0 0-1-1Z"/></svg><svg aria-hidden="true" class="dark astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M21.64 13a1 1 0 0 0-1.05-.14 8.049 8.049 0 0 1-3.37.73 8.15 8.15 0 0 1-8.14-8.1 8.59 8.59 0 0 1 .25-2A1 1 0 0 0 8 2.36a10.14 10.14 0 1 0 14 11.69 1 1 0 0 0-.36-1.05Zm-9.5 6.69A8.14 8.14 0 0 1 7.08 5.22v.27a10.15 10.15 0 0 0 10.14 10.14 9.784 9.784 0 0 0 2.1-.22 8.11 8.11 0 0 1-7.18 4.32v-.04Z"/></svg><svg aria-hidden="true" class="auto astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M21 14h-1V7a3 3 0 0 0-3-3H7a3 3 0 0 0-3 3v7H3a1 1 0 0 0-1 1v2a3 3 0 0 0 3 3h14a3 3 0 0 0 3-3v-2a1 1 0 0 0-1-1ZM6 7a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v7H6V7Zm14 10a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-1h16v1Z"/></svg></template><link rel="stylesheet" href="/scarab-ci/_astro/print.ehPL0gv-.css" media="print"><link rel="stylesheet" href="/scarab-ci/_astro/middleware.iSOPaR4s.css"><link rel="stylesheet" href="/scarab-ci/_astro/index.BdeWKgqi.css"><script type="module" src="/scarab-ci/_astro/page.B2uBVZjk.js"></script><style>.ascii-scene:where(.astro-27vmcqgk){max-width:100%;line-height:0;position:relative;overflow:hidden}.ascii-scene:where(.astro-27vmcqgk) pre:where(.astro-27vmcqgk){font-family:JetBrains Mono,ui-monospace,monospace;font-size:var(--ascii-fs,8px);line-height:calc(var(--ascii-fs,8px) * .9);letter-spacing:calc(var(--ascii-fs,8px) * .3);text-align:left;user-select:none;background:0 0;border:none;margin:0;padding:0;position:absolute;inset:0;overflow:hidden}.ascii-scene:where(.astro-27vmcqgk) .ascii-em:where(.astro-27vmcqgk){color:var(--ascii-emerald)}.ascii-scene:where(.astro-27vmcqgk) .ascii-au:where(.astro-27vmcqgk){color:var(--ascii-gold)}.ascii-scene:where(.astro-27vmcqgk) .ascii-fe:where(.astro-27vmcqgk){color:var(--ascii-gray);font-size:calc(var(--ascii-fs,8px) * var(--ascii-leg,.85));letter-spacing:calc(var(--ascii-fs,8px) * (.9 - .6 * var(--ascii-leg,.85)));transform:translateX(calc(var(--ascii-fs,8px) * .3 * (1 - var(--ascii-leg,.85))))}.ascii-scene:where(.astro-27vmcqgk) .ascii-bubble:where(.astro-27vmcqgk){color:var(--sl-color-white,var(--ascii-gray));line-height:var(--ascii-fs,8px);inset:auto}
+</style></head><body class="astro-vdxcvpsm"><a class="sl-skip-link astro-vxeigawq" href="#_top">Skip to content</a><div data-slot="layout" class="astro-6hobpl37"><header class="astro-6hobpl37"><div class="container-wrapper px-6 astro-6hobpl37"><div class="container astro-6hobpl37"><button class="show-modal astro-w34sq3kk" popovertargetaction="toggle" popovertarget="drawer"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="astro-w34sq3kk"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 9h16.5m-16.5 6.75h16.5" class="astro-w34sq3kk"></path></svg><span class="sr-only astro-w34sq3kk">Toggle Menu</span></button><div class="site-title-wrapper astro-sycd25p5"><a href="/scarab-ci/" class="site-title astro-lygsa2fc"><img class="light:sl-hidden logo astro-lygsa2fc" alt="Scarab" src="/scarab-ci/_astro/scarab-emblem-dark.bsLsTo-T.svg" width="1098" height="976"><img class="dark:sl-hidden logo astro-lygsa2fc" alt="Scarab" src="/scarab-ci/_astro/scarab-emblem.CC8IbydN.svg" width="1098" height="976"><span class="title-text astro-lygsa2fc">Scarab</span></a><nav class="nav-bar astro-tahnhu4v"><a class="astro-tahnhu4v" href="/scarab-ci/get-started/overview/" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">Get Started</a><a class="astro-tahnhu4v" href="/scarab-ci/usage/pipeline-syntax/" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">Usage</a><a class="astro-tahnhu4v" href="/scarab-ci/reference/api/" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">References</a><a class="astro-tahnhu4v" href="https://demo-scarab.ahiravan.dev/" target="_blank" rel="noopener" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">Demo</a></nav></div><div class="header-right astro-sycd25p5"><site-search class="astro-sycd25p5 astro-goos2lhy" data-translations="{&quot;placeholder&quot;:&quot;Search&quot;}"><button data-open-modal disabled aria-label="Search" aria-keyshortcuts="Control+K" class="astro-goos2lhy"><span aria-hidden="true" class="astro-goos2lhy">Search</span><kbd class="sl-hidden md:sl-flex astro-goos2lhy" style="display: none;"><kbd class="astro-goos2lhy">Ctrl</kbd><kbd class="astro-goos2lhy">K</kbd></kbd></button><dialog style="padding:0" aria-label="Search" class="astro-goos2lhy"><div class="dialog-frame sl-flex astro-goos2lhy"><button data-close-modal class="sl-flex md:sl-hidden astro-goos2lhy">Cancel</button><div class="search-container astro-goos2lhy"><div id="starlight__search" class="astro-goos2lhy"></div></div></div></dialog></site-search><script>
+    (() => {
+        const openBtn = document.querySelector('button[data-open-modal]');
+        const shortcut = openBtn?.querySelector('kbd');
+        if (!openBtn || !(shortcut instanceof HTMLElement)) {
+            return;
+        }
+        const updateShortcutDisplay = () => {
+            shortcut.style.setProperty(
+                'display',
+                matchMedia('(min-width: 40rem)').matches ? 'flex' : 'none',
+                'important'
+            );
+        };
+        const platformKey = shortcut.querySelector('kbd');
+        // eslint-disable-next-line regexp/no-unused-capturing-group
+        if (platformKey && /(Mac|iPhone|iPod|iPad)/i.test(navigator.platform)) {
+            platformKey.textContent = '⌘';
+            openBtn.setAttribute('aria-keyshortcuts', 'Meta+K');
+        }
+        updateShortcutDisplay();
+        matchMedia('(min-width: 40rem)').addEventListener('change', updateShortcutDisplay);
+    })();
+</script><script type="module" src="/scarab-ci/_astro/Search.astro_astro_type_script_index_0_lang.BNSpSyix.js"></script><nav class="header-nav astro-sycd25p5"><div class="astro-sycd25p5"><a href="https://github.com/thulasi-ram/scarab-ci" rel="me" class="sl-flex button astro-bs4vfkht" data-variant="ghost"><span class="sr-only astro-bs4vfkht">GitHub</span><svg aria-hidden="true" class="astro-bs4vfkht astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M12 .3a12 12 0 0 0-3.8 23.38c.6.12.83-.26.83-.57L9 21.07c-3.34.72-4.04-1.61-4.04-1.61-.55-1.39-1.34-1.76-1.34-1.76-1.08-.74.09-.73.09-.73 1.2.09 1.83 1.24 1.83 1.24 1.08 1.83 2.81 1.3 3.5 1 .1-.78.42-1.31.76-1.61-2.67-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.14-.3-.54-1.52.1-3.18 0 0 1-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.28-1.55 3.29-1.23 3.29-1.23.64 1.66.24 2.88.12 3.18a4.65 4.65 0 0 1 1.23 3.22c0 4.61-2.8 5.63-5.48 5.92.42.36.81 1.1.81 2.22l-.01 3.29c0 .31.2.69.82.57A12 12 0 0 0 12 .3Z"/></svg></a></div><div class="astro-sycd25p5"><starlight-theme-lucode-select class="astro-7vkpjdjh"><button aria-label="Select theme" aria-live="polite" class="sl-flex button astro-7vkpjdjh" title="Select theme" data-variant="ghost"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="sun astro-7vkpjdjh"><circle cx="12" cy="12" r="4" class="astro-7vkpjdjh"></circle><path d="M12 2v2" class="astro-7vkpjdjh"></path><path d="M12 20v2" class="astro-7vkpjdjh"></path><path d="m4.93 4.93 1.41 1.41" class="astro-7vkpjdjh"></path><path d="m17.66 17.66 1.41 1.41" class="astro-7vkpjdjh"></path><path d="M2 12h2" class="astro-7vkpjdjh"></path><path d="M20 12h2" class="astro-7vkpjdjh"></path><path d="m6.34 17.66-1.41 1.41" class="astro-7vkpjdjh"></path><path d="m19.07 4.93-1.41 1.41" class="astro-7vkpjdjh"></path></svg><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="moon astro-7vkpjdjh"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z" class="astro-7vkpjdjh"> </path></svg><span class="sr-only astro-7vkpjdjh">Toggle theme</span></button></starlight-theme-lucode-select><script>
+    // eslint-disable-next-line no-undef
+    StarlightThemeProvider.updatePickers();
+</script><script type="module">var e=`starlight-theme`;function t(e){return e===`auto`||e===`dark`||e===`light`?e:`auto`}function n(){return t(typeof localStorage<`u`&&localStorage.getItem(e))}function r(t){typeof localStorage<`u`&&localStorage.setItem(e,t===`light`||t===`dark`?t:``)}function i(){return matchMedia(`(prefers-color-scheme: light)`).matches?`light`:`dark`}function a(e){StarlightThemeProvider.updatePickers(e),document.documentElement.dataset.theme=e===`auto`?i():e,r(e)}matchMedia(`(prefers-color-scheme: light)`).addEventListener(`change`,()=>{n()===`auto`&&a(`auto`)}),customElements.define(`starlight-theme-lucode-select`,class extends HTMLElement{constructor(){super(),a(n());let e=this.querySelector(`button`);e?.addEventListener(`click`,()=>{let n=t(document.documentElement.dataset.theme),r=n===`dark`?`light`:n===`light`?`dark`:`auto`;a(r),e?.setAttribute(`aria-label`,`${r} theme`)})}});</script></div><div class="astro-sycd25p5"><script type="module">var e=class extends HTMLElement{constructor(){super();let e=this.querySelector(`select`);e&&(e.addEventListener(`change`,e=>{e.currentTarget instanceof HTMLSelectElement&&(window.location.pathname=e.currentTarget.value)}),window.addEventListener(`pageshow`,t=>{if(!t.persisted)return;let n=e.querySelector(`option[selected]`)?.index;n!==e.selectedIndex&&(e.selectedIndex=n??0)}))}};customElements.define(`starlight-lang-select`,e);</script></div></nav></div><scarab-version-select data-root="/scarab-ci/" data-base="/scarab-ci/" data-version="v0.2" hidden="true" class="astro-jcjov46q"><select aria-label="Documentation version" class="astro-jcjov46q"></select></scarab-version-select><script type="module" src="/scarab-ci/_astro/VersionSelect.astro_astro_type_script_index_0_lang.BvwAqe9Q.js"></script></div></div></header><main class="astro-6hobpl37"><script type="module">var e=document.getElementById(`starlight__sidebar`),t=e?.querySelector(`sl-sidebar-state-persist`),n=`sl-sidebar-state`,r=()=>{let r=[],i=t?.dataset.hash||``;try{let e=sessionStorage.getItem(n),t=JSON.parse(e||`{}`);Array.isArray(t.open)&&t.hash===i&&(r=t.open)}catch{}return{hash:i,open:r,scroll:e?.scrollTop||0}},i=e=>{try{sessionStorage.setItem(n,JSON.stringify(e))}catch{}},a=()=>i(r()),o=(e,t)=>{let n=r();n.open[t]=e,i(n)};t?.addEventListener(`click`,e=>{if(!(e.target instanceof Element))return;let t=e.target.closest(`summary`)?.closest(`details`);if(!t)return;let n=t.querySelector(`sl-sidebar-restore`),r=parseInt(n?.dataset.index||``);isNaN(r)||o(!t.open,r)}),addEventListener(`visibilitychange`,()=>{document.visibilityState===`hidden`&&a()}),addEventListener(`pageHide`,a);</script><main data-pagefind-body class="astro-vdxcvpsm" lang="en" dir="ltr"><scarab-version-notice data-root="/scarab-ci/" data-base="/scarab-ci/" data-version="v0.2" data-pagefind-ignore="true" hidden="true" class="astro-lnhkisss">You are reading the docs for <strong class="astro-lnhkisss">v0.2</strong>. <a href="/scarab-ci/" class="astro-lnhkisss">The latest release is <span data-latest class="astro-lnhkisss"></span> →</a></scarab-version-notice><script type="module" src="/scarab-ci/_astro/VersionBanner.astro_astro_type_script_index_0_lang.DW4M5yKX.js"></script><div class="container-section astro-ns5ameaa" data-width="lg"><div class="container-wrapper astro-ns5ameaa"><div class="container astro-ns5ameaa"><div class="hero astro-74dhfumx" data-layout="split-left" data-has-image><div class="hero-image astro-74dhfumx"><img src="/scarab-ci/_astro/scarab-emblem-dark-square.CRi77mgJ_LQeXu.svg" loading="eager" decoding="async" alt="The Scarab emblem: a scarab with spread wings inside a ring" width="512" height="512" class="astro-74dhfumx light:sl-hidden"><img src="/scarab-ci/_astro/scarab-emblem-square.exDhk4mv_LQeXu.svg" loading="eager" decoding="async" alt="The Scarab emblem: a scarab with spread wings inside a ring" width="512" height="512" class="dark:sl-hidden astro-74dhfumx"></div><div class="hero-info astro-74dhfumx"><div class="hero-title-container astro-74dhfumx"><h1 id="_top" data-page-title class="astro-74dhfumx">Scarab</h1></div><div class="hero-content-container astro-74dhfumx"><div class="tagline astro-74dhfumx">A modern CI engine for Kubernetes that lives in your forge. It treats your run as state, not a process you hope stays alive.</div><div class="actions astro-74dhfumx"><a data-slot="button" data-size="md" href="/scarab-ci/get-started/run-locally/" class="astro-i6idhh3o link-button primary astro-74dhfumx">Run it locally</a><a data-slot="button" data-size="md" href="https://demo-scarab.ahiravan.dev/" class="astro-i6idhh3o link-button secondary astro-74dhfumx">See the live demo</a><a data-slot="button" data-size="md" href="/scarab-ci/tech/adr/0001-ci-as-durable-execution/" class="astro-i6idhh3o link-button minimal astro-74dhfumx">Why an engine, not a runner</a></div></div></div></div></div></div></div><div class="markdown-wrapper astro-q6e3s5kt"><div class="sl-markdown-content astro-q6e3s5kt">
+<p>CI tools tend to fall into two camps. <strong>Workflow engines</strong> (Argo, Tekton, Temporal) have a
+durable core that survives a crash, but they aren’t really CI: forge integration, in-repo config,
+PR checks, identity, secrets, the DSL, and the UI are all yours to build. <strong>CIs that live in your
+forge</strong> (GitHub Actions, GitLab, Woodpecker, Drone) hand you all of that, but underneath, the
+orchestrator is just a job runner. If the control plane restarts partway through a run, the run is
+orphaned or starts over. Scarab is built to be <strong>both at once</strong>: the batteries-included feel of a
+forge CI, sitting on a control plane that treats a run as durable <strong>state</strong> rather than a process
+it forgets the moment it restarts.</p>
+<p><img src="/scarab-ci/_astro/dashboard.CHpvfnnQ_2mumo1.webp" alt="The Scarab dashboard: an action inbox of runs paused on a gate, recently visited repos shown as pass/fail status cards, and the repo list sorted by what you touched last" loading="lazy" decoding="async" width="1485" height="812"></p>
+<div class="sl-heading-wrapper level-h2"><h2 id="what-makes-it-different">What makes it different</h2><a class="sl-anchor-link" href="#what-makes-it-different"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “What makes it different”</span></a></div>
+<figure class="sc-home-camps" role="img" aria-label="Workflow engines have a durable core but are not CI; forge CIs are batteries-included but not durable. Scarab is both at once."><svg viewBox="0 0 640 224" xmlns="http://www.w3.org/2000/svg" class="sc-home-camps-svg"><defs><marker id="sc-home-chev" viewBox="0 0 8 8" refX="4" refY="6.4" markerWidth="7" markerHeight="7" orient="auto"><path d="M1.4 3 L4 6 L6.6 3" class="sc-home-chev-head" fill="none" stroke-linecap="round" stroke-linejoin="round"></path></marker></defs><g class="sc-home-camp"><rect x="34" y="20" width="214" height="62" rx="12" class="sc-home-camp-box"></rect><text x="141" y="47" class="sc-home-camp-title" text-anchor="middle">workflow engines</text><text x="141" y="66" class="sc-home-camp-sub" text-anchor="middle">durable core · not CI</text></g><g class="sc-home-camp"><rect x="392" y="20" width="214" height="62" rx="12" class="sc-home-camp-box"></rect><text x="499" y="47" class="sc-home-camp-title" text-anchor="middle">forge CIs</text><text x="499" y="66" class="sc-home-camp-sub" text-anchor="middle">batteries · not durable</text></g><path d="M141 82 C141 122 282 110 282 148" class="sc-home-flow" fill="none" marker-end="url(#sc-home-chev)"></path><path d="M499 82 C499 122 358 110 358 148" class="sc-home-flow" fill="none" marker-end="url(#sc-home-chev)"></path><rect x="230" y="150" width="180" height="56" rx="13" class="sc-home-both-box"></rect><text x="320" y="176" class="sc-home-both-title" text-anchor="middle">Scarab</text><text x="320" y="193" class="sc-home-both-sub" text-anchor="middle">both at once</text></svg></figure><dl class="sc-home-specsheet"><div class="sc-home-spec-row"><dt class="sc-home-spec-key">cohesion</dt><dd class="sc-home-spec-body"><p class="sc-home-spec-claim">One product, not a kit.</p><p class="sc-home-spec-support">A CI that lives in your forge (DSL, secrets, approvals, identity, UI) on a durable engine. Not a workflow engine you have to build a CI on top of, and not a job-runner CI with nothing durable underneath.</p></dd></div><div class="sc-home-spec-row"><dt class="sc-home-spec-key">durability</dt><dd class="sc-home-spec-body"><p class="sc-home-spec-claim">Runs are state, not processes.</p><p class="sc-home-spec-support">A durable state machine on Postgres, in the spirit of DBOS. When the control plane restarts, a run resumes from its last completed step, and each step runs exactly once. That’s the architecture doing its job, not a boast.</p></dd></div><div class="sc-home-spec-row"><dt class="sc-home-spec-key">identity</dt><dd class="sc-home-spec-body"><p class="sc-home-spec-claim">Keyless by design.</p><p class="sc-home-spec-support">OIDC that doesn’t care which forge you use, with Scarab acting as its own OIDC issuer so runs can federate into your cloud without long-lived keys. Adapters for GitHub and Forgejo are implemented today. See Status.</p></dd></div><div class="sc-home-spec-row"><dt class="sc-home-spec-key">the DSL</dt><dd class="sc-home-spec-body"><p class="sc-home-spec-claim">A real language, not templated YAML.</p><p class="sc-home-spec-support">A typed intermediate representation with a YAML frontend and CEL expressions. Under it all is one flat recursive DAG, where <code>invoke</code> is reuse and matrix is just a modifier.</p></dd></div></dl>
+<div class="sl-heading-wrapper level-h2"><h2 id="why-now">Why now</h2><a class="sl-anchor-link" href="#why-now"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Why now”</span></a></div>
+<div class="ascii-scene ascii-accent astro-27vmcqgk" id="ascii-dungroller-urm4d" data-ascii="dungroller" data-fps="12" style="--ascii-fs:3.33px;--ascii-leg:0.85;width:263.73600000000005px;height:161.838px" aria-hidden="true"><pre class="ascii-em astro-27vmcqgk" data-layer="0">
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                             ●●●●●● ●
+                          ●●●●●●●●●●●●
+                         ●●●●●●●●●●●●●
+                        ●●●●●●●●●●●●●
+                        ●●●●●●●●●●●●
+                        ●●●●●●●●●●●
+                         ●●●●●●●●●●
+                           ●●●●●●●
+                            ●●●●●
+                              ●●
+                               ●
+
+
+
+
+
+
+
+
+
+
+ .                         .                   .   .
+             .                 .                           .
+
+
+
+
+
+
+
+
+</pre><pre class="ascii-au astro-27vmcqgk" data-layer="1">
+
+
+
+
+
+                                                    •••●●●••●●●••
+                                                 ●●●•           •●●
+                                                ••                ●●•
+                                              ●●•                   ••
+                                             ●●                      ●●
+                                            •●                        ●●
+                                           ••                          ●●
+                                           ●                            ••
+                                          ●●                             ●
+                                         ●●                              ●●
+                                         •                                ●
+                                         •                                ••
+                                        ●•                •••              •
+                                        ●              ••••••              ●●
+                             ●●●●●●     ●              •• ••••              ●
+                           ●●●●●●●●●    •           •       ••        ••    ●
+                           ●●      ●   ••                    •••      ••    ●
+                                       ●          ••         •••            •
+                                       ●          ••         •••            ●
+                                       ●●                                   ●
+                                        ●                                   ●
+                                        •         •                         ●
+                      ●●●               •                            •••    •
+                    ●●●●●●●             ●                            •••   ••
+                   ●●●●●●●●●            ●●         ••                •••   ●
+                  ●●●●●●●●●●●●           ●         •••••                  ●●
+                 ●●●  ●●●●●●●●●          ••          •••                  ●
+                 ●      ●●●●●●●           •          •••     ••• •       ••
+                        ●●●●●●●           ●●                 •••         •
+                    ●●   ●●●●●             ●●                •••        ●●
+                    ●●  ●●●●●               ••                         ●●
+                     ●●●●●●●                 ••                       •●
+                  ●●●●●●●●●                   ●●                     ••
+                  ●●● ●●●                      ●●                  ●●●
+                                                ●••               ●●
+                                                  •●●●         ●●••
+                                                     ●••●●●••●●●
+
+
+
+
+
+
+
+
+
+
+</pre><pre class="ascii-fe astro-27vmcqgk" data-layer="2">
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                       ●
+                                       ●
+                                      ●
+                                     ●
+                                      ●
+                                      ●
+                                      ●
+                                     ●●
+                                   ●●
+
+
+
+
+
+
+
+
+
+                            ●
+                            ●
+                         ●  ●
+                     ●    ●●
+                   ●●     ●●
+                         ●●●
+·   ·.  ·.  ·.  ·.  ·.  ·.  ·  .·  .·  .·  .·   ·   ·  .·  .·  .·  .·  .·  .·  .·  .·  .
+·.  ·.  ·.  ·   ·.  ·.  ·   ·   ·  .·  .·  .·  .·  .·  .·   ·  .·  .·  .·  .·  .·  .·  .
+
+
+
+
+
+
+
+
+</pre></div><script type="module" src="/scarab-ci/_astro/AsciiScene.astro_astro_type_script_index_0_lang.BS4kamMk.js"></script>
+<p>As pipelines get longer and more autonomous (agents, review gates that sit open for hours,
+workflows that span days), “the job died, click re-run” stops being good enough. Scarab can hold
+a paused run almost for free and pick up exactly where it left off, and it keeps an event log that
+only ever grows, so you can see everything that happened. That’s where a durable core earns its
+keep. It’s also the kind of foundation that agent-driven development actually wants, rather than
+just a nicer YAML dialect. And Scarab is <em>built</em> that way too: ambitious systems software from a
+small team, at a pace that used to take a room full of people.</p>
+<p><img src="/scarab-ci/_astro/run-detail.B048dF-5_Z1Bj1TF.webp" alt="A Scarab run: the step DAG, live logs, and an event timeline showing a retried step and the run paused on a manual deploy gate" loading="lazy" decoding="async" width="1485" height="812"></p>
+<div class="sl-heading-wrapper level-h2"><h2 id="lineage">Lineage</h2><a class="sl-anchor-link" href="#lineage"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Lineage”</span></a></div>
+<p>Scarab owes its shape to <a href="https://woodpecker-ci.org/">Woodpecker</a>: lean CI that lives in your
+forge, with none of the enterprise ceremony. It’s shaped just as much by Woodpecker’s <em>limits</em>:
+the many backends it has to support, and the pace a volunteer project can sustain. Sticking to
+Kubernetes alone is us shedding that backend baggage on purpose, and the pace is what a small team
+leaning on AI can now hold.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="where-to-go-next">Where to go next</h2><a class="sl-anchor-link" href="#where-to-go-next"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Where to go next”</span></a></div>
+<div class="sc-home-next"><a class="sc-home-next-el" href="/scarab-ci/get-started/run-locally/"><span class="sc-home-next-main"><span class="sc-home-next-label">Run it locally</span><span class="sc-home-next-desc">bring up Postgres + MinIO + a kind cluster and watch a pipeline complete</span></span><span class="sc-home-next-arrow" aria-hidden="true">→</span></a><a class="sc-home-next-el" href="/scarab-ci/tech/context/"><span class="sc-home-next-main"><span class="sc-home-next-label">Read the design</span><span class="sc-home-next-desc">the thesis, the durability contract, and the ubiquitous language: 40+ ADRs on the why</span></span><span class="sc-home-next-arrow" aria-hidden="true">→</span></a></div><aside aria-label="Status: honest" class="starlight-aside starlight-aside--note"><p class="starlight-aside__title" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" class="starlight-aside__icon"><path d="M12 11a1 1 0 0 0-1 1v4a1 1 0 0 0 2 0v-4a1 1 0 0 0-1-1Zm.38-3.92a1 1 0 0 0-.76 0 1 1 0 0 0-.33.21 1.15 1.15 0 0 0-.21.33 1 1 0 0 0 .21 1.09c.097.088.209.16.33.21A1 1 0 0 0 13 8a1.05 1.05 0 0 0-.29-.71 1 1 0 0 0-.33-.21ZM12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20Zm0 18a8 8 0 1 1 0-16.001A8 8 0 0 1 12 20Z"/></svg>Status: honest</p><div class="starlight-aside__content"><p>A proven core, with real forge and Kubernetes I/O wired in around it. <strong>Proven against real
+Postgres:</strong> the durable engine, crash and resume, exactly-once execution, restarting a single
+step, gates, the content-addressed workspace, <code dir="auto">invoke</code>, secrets, and the OIDC issuer (the
+workspace suite passes locally). <strong>Implemented:</strong> the GitHub adapter (it ingests webhooks and
+posts commit statuses) and a Forgejo adapter, so more than one forge is supported; Pod execution
+on a live Kubernetes cluster (<code dir="auto">scarab-executor-k8s</code>, with cluster tests); the results-egress
+sidecar image (<code dir="auto">docker/sidecar/</code>); and CI that runs the Rust suite on every push
+(<code dir="auto">.github/workflows/ci.yml</code>). None of it is yet hardened at scale. Read this as a proven state
+machine with its edges freshly wired up: implemented, but not yet battle-tested in production.</p></div></aside>
+<div class="sl-heading-wrapper level-h2"><h2 id="references">References</h2><a class="sl-anchor-link" href="#references"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “References”</span></a></div>
+<ul>
+<li><a href="/scarab-ci/tech/adr/0005-tenancy-and-k8s-only/">ADR-0005: Tenancy &amp; deployment: Kubernetes as the only backend</a></li>
+</ul>
+<style>
+/* ===== Home-page scoped styles (sc-home-*) — do not leak to other pages ===== */
+
+/* ---- Positioning diagram ---- */
+.sc-home-camps { margin: 0 0 2.5rem; padding: 0; }
+.sc-home-camps-svg {
+width: 100%;
+height: auto;
+display: block;
+max-width: 560px;
+margin-inline: auto;
+}
+.sc-home-camp-box, .sc-home-both-box {
+fill: color-mix(in oklab, var(--scarab-emerald) 4%, transparent);
+stroke-width: 1.25;
+stroke-dasharray: 1.5 4;
+stroke-linecap: round;
+}
+.sc-home-camp-box { stroke: color-mix(in oklab, var(--muted-foreground, gray) 55%, transparent); }
+.sc-home-both-box {
+stroke: var(--scarab-copper);
+stroke-dasharray: 2 4;
+fill: color-mix(in oklab, var(--scarab-copper) 9%, transparent);
+}
+.sc-home-camp-title, .sc-home-both-title {
+font-family: var(--sl-font-mono);
+font-size: 14px;
+font-weight: 500;
+fill: var(--foreground, var(--sl-color-white));
+}
+.sc-home-both-title { fill: var(--scarab-copper); font-size: 15px; }
+.sc-home-camp-sub, .sc-home-both-sub {
+font-family: var(--sl-font-mono);
+font-size: 10.5px;
+fill: var(--muted-foreground, var(--sl-color-gray-3));
+}
+.sc-home-both-sub { fill: color-mix(in oklab, var(--scarab-copper) 80%, var(--muted-foreground)); }
+.sc-home-flow {
+stroke: var(--scarab-emerald);
+stroke-width: 1.5;
+stroke-dasharray: 1.5 5;
+stroke-linecap: round;
+opacity: 0.9;
+}
+.sc-home-chev-head {
+stroke: var(--scarab-emerald);
+stroke-width: 1.4;
+}
+
+/* ---- Spec-sheet definition list ---- */
+.sc-home-specsheet { margin: 0 0 0.5rem; padding: 0; }
+.sc-home-spec-row {
+display: grid;
+grid-template-columns: 10.5rem 1fr;
+gap: 1.5rem;
+padding: 1.15rem 0;
+border-top: 1px dotted color-mix(in oklab, var(--scarab-emerald) 26%, var(--border));
+align-items: baseline;
+}
+.sc-home-spec-row:last-child {
+border-bottom: 1px dotted color-mix(in oklab, var(--scarab-emerald) 26%, var(--border));
+}
+.sc-home-spec-key {
+font-family: var(--sl-font-mono);
+font-size: 0.9rem;
+font-weight: 500;
+color: var(--scarab-emerald);
+letter-spacing: 0.01em;
+position: relative;
+padding-left: 0.9rem;
+}
+.sc-home-spec-key::before {
+content: "\2022";
+position: absolute;
+left: 0;
+color: color-mix(in oklab, var(--scarab-emerald) 60%, transparent);
+}
+.sc-home-spec-body { margin: 0; }
+.sc-home-spec-claim {
+margin: 0 0 0.35rem;
+font-weight: 700;
+font-size: 1.05rem;
+line-height: 1.35;
+color: var(--foreground, var(--sl-color-white));
+}
+.sc-home-spec-support {
+margin: 0;
+font-size: 0.92rem;
+line-height: 1.6;
+color: var(--muted-foreground, var(--sl-color-gray-3));
+max-width: 46rem;
+}
+
+/* ---- Editorial "next" links ---- */
+.sc-home-next { margin: 0; }
+.sc-home-next-el {
+display: flex;
+align-items: center;
+gap: 1.5rem;
+padding: 1.3rem 0.25rem 1.3rem 0;
+text-decoration: none !important;
+border-top: 1px dotted color-mix(in oklab, var(--scarab-emerald) 26%, var(--border));
+color: inherit;
+transition: padding-left 0.18s ease, background 0.18s ease;
+}
+.sc-home-next-el:last-child {
+border-bottom: 1px dotted color-mix(in oklab, var(--scarab-emerald) 26%, var(--border));
+}
+.sc-home-next-el:hover { padding-left: 0.75rem; }
+.sc-home-next-main { display: flex; flex-direction: column; gap: 0.3rem; flex: 1; }
+.sc-home-next-label {
+font-family: var(--sl-font-mono);
+font-size: 1.25rem;
+font-weight: 500;
+color: var(--foreground, var(--sl-color-white));
+letter-spacing: -0.01em;
+}
+.sc-home-next-el:hover .sc-home-next-label { color: var(--scarab-emerald); }
+.sc-home-next-desc {
+font-size: 0.9rem;
+color: var(--muted-foreground, var(--sl-color-gray-3));
+line-height: 1.5;
+}
+.sc-home-next-arrow {
+font-family: var(--sl-font-mono);
+font-size: 1.6rem;
+color: var(--scarab-emerald);
+transition: transform 0.18s ease;
+flex-shrink: 0;
+}
+.sc-home-next-el:hover .sc-home-next-arrow { transform: translateX(4px); }
+
+/* ---- Responsive ---- */
+@media (max-width: 640px) {
+.sc-home-spec-row { grid-template-columns: 1fr; gap: 0.5rem; }
+.sc-home-next-el { gap: 0.75rem; }
+.sc-home-next-label { font-size: 1.05rem; }
+}
+
+/* ---- Reduced motion: no essential motion; disable hover transitions ---- */
+@media (prefers-reduced-motion: reduce) {
+.sc-home-next-el, .sc-home-next-arrow { transition: none; }
+}
+</style></div></div><!-- footer --></main></main><footer class="astro-6hobpl37"><div data-slot="footer-text" class="astro-6hobpl37">Scarab — a modern CI engine for Kubernetes: forge-native, on a durable core. Themed with <a href="https://github.com/lucas-labs/lucode-starlight-theme">Lucode Starlight</a>.</div></footer></div><div popover="auto" id="drawer" class="astro-cn5bvrke"><button class="sheet-overlay astro-cn5bvrke" popovertarget="drawer" popovertargetaction="hide"></button><div class="content astro-cn5bvrke"><div class="header astro-cn5bvrke"><button class="drag-icon astro-cn5bvrke" popovertarget="drawer" popovertargetaction="hide"><span class="astro-cn5bvrke"></span></button></div><div class="body astro-cn5bvrke"><div class="links-nav astro-cn5bvrke"><a href="/scarab-ci/get-started/overview/" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">Get Started</a><a href="/scarab-ci/usage/pipeline-syntax/" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">Usage</a><a href="/scarab-ci/reference/api/" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">References</a><a href="https://demo-scarab.ahiravan.dev/" target="_blank" rel="noopener" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">Demo</a></div><div class="links-docs astro-cn5bvrke"><div class="container-sidebar-entry astro-cn5bvrke"><h4 class="entry-title astro-cn5bvrke">Get Started</h4><a href="/scarab-ci/get-started/overview/" class="astro-cn5bvrke" data-active="false">Overview</a><a href="/scarab-ci/get-started/deploy-helm/" class="astro-cn5bvrke" data-active="false">Installation</a><a href="/scarab-ci/get-started/run-locally/" class="astro-cn5bvrke" data-active="false">Run locally</a><a href="/scarab-ci/get-started/local-development/" class="astro-cn5bvrke" data-active="false">Local Development</a></div><div class="container-sidebar-entry astro-cn5bvrke"><h4 class="entry-title astro-cn5bvrke">Usage</h4><a href="/scarab-ci/usage/pipeline-syntax/" class="astro-cn5bvrke" data-active="false">Pipeline Syntax</a><a href="/scarab-ci/usage/secrets/" class="astro-cn5bvrke" data-active="false">Secrets</a><a href="/scarab-ci/usage/environments/" class="astro-cn5bvrke" data-active="false">Environments</a><a href="/scarab-ci/usage/environment-variables/" class="astro-cn5bvrke" data-active="false">Environment Variables</a></div><div class="container-sidebar-entry astro-cn5bvrke"><h4 class="entry-title astro-cn5bvrke">References</h4><a href="/scarab-ci/reference/api/" class="astro-cn5bvrke" data-active="false">API</a><a href="/scarab-ci/tech/context/" class="astro-cn5bvrke" data-active="false">Thesis &amp; language (CONTEXT)</a></div></div></div></div></div><script type="module">var e=document.getElementById(`drawer`);e&&e.addEventListener(`toggle`,e=>{let t=e.newState===`open`;document.documentElement.style.overflow=t?`hidden`:``,document.body.style.overflow=t?`hidden`:``});</script></body></html>

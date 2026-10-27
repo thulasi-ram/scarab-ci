@@ -1,0 +1,1269 @@
+<!DOCTYPE html><html lang="en" dir="ltr" data-theme="dark" data-has-toc data-has-sidebar class="astro-vdxcvpsm"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>0062. Workspace export: lazy materialisation without a node driver | Scarab</title><link rel="canonical" href="https://thulasi-ram.github.io/scarab-ci/tech/adr/0062-workspace-export-lazy-without-node-driver/"/><link rel="sitemap" href="/scarab-ci/sitemap-index.xml"/><link rel="icon" href="/scarab-ci/favicon.ico" sizes="any"/><link rel="apple-touch-icon" href="/scarab-ci/apple-touch-icon.png"/><link rel="shortcut icon" href="/scarab-ci/favicon.svg" type="image/svg+xml"/><meta name="generator" content="Astro v7.0.9"/><meta name="generator" content="Starlight v0.41.3"/><meta property="og:title" content="0062. Workspace export: lazy materialisation without a node driver"/><meta property="og:type" content="article"/><meta property="og:url" content="https://thulasi-ram.github.io/scarab-ci/tech/adr/0062-workspace-export-lazy-without-node-driver/"/><meta property="og:locale" content="en"/><meta property="og:site_name" content="Scarab"/><meta name="twitter:card" content="summary_large_image"/><script>
+	window.StarlightThemeProvider = (() => {
+		const storedTheme =
+			typeof localStorage !== 'undefined' && localStorage.getItem('starlight-theme');
+		const theme =
+			storedTheme ||
+			(window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+		document.documentElement.dataset.theme = theme === 'light' ? 'light' : 'dark';
+		return {
+			updatePickers(theme = storedTheme || 'auto') {
+				document.querySelectorAll('starlight-theme-select').forEach((picker) => {
+					const select = picker.querySelector('select');
+					if (select) select.value = theme;
+					/** @type {HTMLTemplateElement | null} */
+					const tmpl = document.querySelector(`#theme-icons`);
+					const newIcon = tmpl && tmpl.content.querySelector('.' + theme);
+					if (newIcon) {
+						const oldIcon = picker.querySelector('svg.label-icon');
+						if (oldIcon) {
+							oldIcon.replaceChildren(...newIcon.cloneNode(true).childNodes);
+						}
+					}
+				});
+			},
+		};
+	})();
+</script><template id="theme-icons"><svg aria-hidden="true" class="light astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M5 12a1 1 0 0 0-1-1H3a1 1 0 0 0 0 2h1a1 1 0 0 0 1-1Zm.64 5-.71.71a1 1 0 0 0 0 1.41 1 1 0 0 0 1.41 0l.71-.71A1 1 0 0 0 5.64 17ZM12 5a1 1 0 0 0 1-1V3a1 1 0 0 0-2 0v1a1 1 0 0 0 1 1Zm5.66 2.34a1 1 0 0 0 .7-.29l.71-.71a1 1 0 1 0-1.41-1.41l-.66.71a1 1 0 0 0 0 1.41 1 1 0 0 0 .66.29Zm-12-.29a1 1 0 0 0 1.41 0 1 1 0 0 0 0-1.41l-.71-.71a1.004 1.004 0 1 0-1.43 1.41l.73.71ZM21 11h-1a1 1 0 0 0 0 2h1a1 1 0 0 0 0-2Zm-2.64 6A1 1 0 0 0 17 18.36l.71.71a1 1 0 0 0 1.41 0 1 1 0 0 0 0-1.41l-.76-.66ZM12 6.5a5.5 5.5 0 1 0 5.5 5.5A5.51 5.51 0 0 0 12 6.5Zm0 9a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Zm0 3.5a1 1 0 0 0-1 1v1a1 1 0 0 0 2 0v-1a1 1 0 0 0-1-1Z"/></svg><svg aria-hidden="true" class="dark astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M21.64 13a1 1 0 0 0-1.05-.14 8.049 8.049 0 0 1-3.37.73 8.15 8.15 0 0 1-8.14-8.1 8.59 8.59 0 0 1 .25-2A1 1 0 0 0 8 2.36a10.14 10.14 0 1 0 14 11.69 1 1 0 0 0-.36-1.05Zm-9.5 6.69A8.14 8.14 0 0 1 7.08 5.22v.27a10.15 10.15 0 0 0 10.14 10.14 9.784 9.784 0 0 0 2.1-.22 8.11 8.11 0 0 1-7.18 4.32v-.04Z"/></svg><svg aria-hidden="true" class="auto astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M21 14h-1V7a3 3 0 0 0-3-3H7a3 3 0 0 0-3 3v7H3a1 1 0 0 0-1 1v2a3 3 0 0 0 3 3h14a3 3 0 0 0 3-3v-2a1 1 0 0 0-1-1ZM6 7a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v7H6V7Zm14 10a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-1h16v1Z"/></svg></template><link rel="stylesheet" href="/scarab-ci/_astro/print.ehPL0gv-.css" media="print"><link rel="stylesheet" href="/scarab-ci/_astro/middleware.iSOPaR4s.css"><link rel="stylesheet" href="/scarab-ci/_astro/index.BdeWKgqi.css"><script type="module" src="/scarab-ci/_astro/page.B2uBVZjk.js"></script></head><body class="astro-vdxcvpsm"><a class="sl-skip-link astro-vxeigawq" href="#_top">Skip to content</a><div data-slot="layout" class="astro-6hobpl37"><header class="astro-6hobpl37"><div class="container-wrapper px-6 astro-6hobpl37"><div class="container astro-6hobpl37"><button class="show-modal astro-w34sq3kk" popovertargetaction="toggle" popovertarget="drawer"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="astro-w34sq3kk"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 9h16.5m-16.5 6.75h16.5" class="astro-w34sq3kk"></path></svg><span class="sr-only astro-w34sq3kk">Toggle Menu</span></button><div class="site-title-wrapper astro-sycd25p5"><a href="/scarab-ci/" class="site-title astro-lygsa2fc"><img class="light:sl-hidden logo astro-lygsa2fc" alt="Scarab" src="/scarab-ci/_astro/scarab-emblem-dark.bsLsTo-T.svg" width="1098" height="976"><img class="dark:sl-hidden logo astro-lygsa2fc" alt="Scarab" src="/scarab-ci/_astro/scarab-emblem.CC8IbydN.svg" width="1098" height="976"><span class="title-text astro-lygsa2fc">Scarab</span></a><nav class="nav-bar astro-tahnhu4v"><a class="astro-tahnhu4v" href="/scarab-ci/get-started/overview/" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">Get Started</a><a class="astro-tahnhu4v" href="/scarab-ci/usage/pipeline-syntax/" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">Usage</a><a class="astro-tahnhu4v" href="/scarab-ci/reference/api/" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">References</a><a class="astro-tahnhu4v" href="https://demo-scarab.ahiravan.dev/" target="_blank" rel="noopener" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">Demo</a></nav></div><div class="header-right astro-sycd25p5"><site-search class="astro-sycd25p5 astro-goos2lhy" data-translations="{&quot;placeholder&quot;:&quot;Search&quot;}"><button data-open-modal disabled aria-label="Search" aria-keyshortcuts="Control+K" class="astro-goos2lhy"><span aria-hidden="true" class="astro-goos2lhy">Search</span><kbd class="sl-hidden md:sl-flex astro-goos2lhy" style="display: none;"><kbd class="astro-goos2lhy">Ctrl</kbd><kbd class="astro-goos2lhy">K</kbd></kbd></button><dialog style="padding:0" aria-label="Search" class="astro-goos2lhy"><div class="dialog-frame sl-flex astro-goos2lhy"><button data-close-modal class="sl-flex md:sl-hidden astro-goos2lhy">Cancel</button><div class="search-container astro-goos2lhy"><div id="starlight__search" class="astro-goos2lhy"></div></div></div></dialog></site-search><script>
+    (() => {
+        const openBtn = document.querySelector('button[data-open-modal]');
+        const shortcut = openBtn?.querySelector('kbd');
+        if (!openBtn || !(shortcut instanceof HTMLElement)) {
+            return;
+        }
+        const updateShortcutDisplay = () => {
+            shortcut.style.setProperty(
+                'display',
+                matchMedia('(min-width: 40rem)').matches ? 'flex' : 'none',
+                'important'
+            );
+        };
+        const platformKey = shortcut.querySelector('kbd');
+        // eslint-disable-next-line regexp/no-unused-capturing-group
+        if (platformKey && /(Mac|iPhone|iPod|iPad)/i.test(navigator.platform)) {
+            platformKey.textContent = '⌘';
+            openBtn.setAttribute('aria-keyshortcuts', 'Meta+K');
+        }
+        updateShortcutDisplay();
+        matchMedia('(min-width: 40rem)').addEventListener('change', updateShortcutDisplay);
+    })();
+</script><script type="module" src="/scarab-ci/_astro/Search.astro_astro_type_script_index_0_lang.BNSpSyix.js"></script><nav class="header-nav astro-sycd25p5"><div class="astro-sycd25p5"><a href="https://github.com/thulasi-ram/scarab-ci" rel="me" class="sl-flex button astro-bs4vfkht" data-variant="ghost"><span class="sr-only astro-bs4vfkht">GitHub</span><svg aria-hidden="true" class="astro-bs4vfkht astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M12 .3a12 12 0 0 0-3.8 23.38c.6.12.83-.26.83-.57L9 21.07c-3.34.72-4.04-1.61-4.04-1.61-.55-1.39-1.34-1.76-1.34-1.76-1.08-.74.09-.73.09-.73 1.2.09 1.83 1.24 1.83 1.24 1.08 1.83 2.81 1.3 3.5 1 .1-.78.42-1.31.76-1.61-2.67-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.14-.3-.54-1.52.1-3.18 0 0 1-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.28-1.55 3.29-1.23 3.29-1.23.64 1.66.24 2.88.12 3.18a4.65 4.65 0 0 1 1.23 3.22c0 4.61-2.8 5.63-5.48 5.92.42.36.81 1.1.81 2.22l-.01 3.29c0 .31.2.69.82.57A12 12 0 0 0 12 .3Z"/></svg></a></div><div class="astro-sycd25p5"><starlight-theme-lucode-select class="astro-7vkpjdjh"><button aria-label="Select theme" aria-live="polite" class="sl-flex button astro-7vkpjdjh" title="Select theme" data-variant="ghost"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="sun astro-7vkpjdjh"><circle cx="12" cy="12" r="4" class="astro-7vkpjdjh"></circle><path d="M12 2v2" class="astro-7vkpjdjh"></path><path d="M12 20v2" class="astro-7vkpjdjh"></path><path d="m4.93 4.93 1.41 1.41" class="astro-7vkpjdjh"></path><path d="m17.66 17.66 1.41 1.41" class="astro-7vkpjdjh"></path><path d="M2 12h2" class="astro-7vkpjdjh"></path><path d="M20 12h2" class="astro-7vkpjdjh"></path><path d="m6.34 17.66-1.41 1.41" class="astro-7vkpjdjh"></path><path d="m19.07 4.93-1.41 1.41" class="astro-7vkpjdjh"></path></svg><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="moon astro-7vkpjdjh"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z" class="astro-7vkpjdjh"> </path></svg><span class="sr-only astro-7vkpjdjh">Toggle theme</span></button></starlight-theme-lucode-select><script>
+    // eslint-disable-next-line no-undef
+    StarlightThemeProvider.updatePickers();
+</script><script type="module">var e=`starlight-theme`;function t(e){return e===`auto`||e===`dark`||e===`light`?e:`auto`}function n(){return t(typeof localStorage<`u`&&localStorage.getItem(e))}function r(t){typeof localStorage<`u`&&localStorage.setItem(e,t===`light`||t===`dark`?t:``)}function i(){return matchMedia(`(prefers-color-scheme: light)`).matches?`light`:`dark`}function a(e){StarlightThemeProvider.updatePickers(e),document.documentElement.dataset.theme=e===`auto`?i():e,r(e)}matchMedia(`(prefers-color-scheme: light)`).addEventListener(`change`,()=>{n()===`auto`&&a(`auto`)}),customElements.define(`starlight-theme-lucode-select`,class extends HTMLElement{constructor(){super(),a(n());let e=this.querySelector(`button`);e?.addEventListener(`click`,()=>{let n=t(document.documentElement.dataset.theme),r=n===`dark`?`light`:n===`light`?`dark`:`auto`;a(r),e?.setAttribute(`aria-label`,`${r} theme`)})}});</script></div><div class="astro-sycd25p5"><script type="module">var e=class extends HTMLElement{constructor(){super();let e=this.querySelector(`select`);e&&(e.addEventListener(`change`,e=>{e.currentTarget instanceof HTMLSelectElement&&(window.location.pathname=e.currentTarget.value)}),window.addEventListener(`pageshow`,t=>{if(!t.persisted)return;let n=e.querySelector(`option[selected]`)?.index;n!==e.selectedIndex&&(e.selectedIndex=n??0)}))}};customElements.define(`starlight-lang-select`,e);</script></div></nav></div><scarab-version-select data-root="/scarab-ci/" data-base="/scarab-ci/" data-version="v0.2" hidden="true" class="astro-jcjov46q"><select aria-label="Documentation version" class="astro-jcjov46q"></select></scarab-version-select><script type="module" src="/scarab-ci/_astro/VersionSelect.astro_astro_type_script_index_0_lang.BvwAqe9Q.js"></script></div></div></header><main class="astro-6hobpl37"><div class="container-wrapper astro-6hobpl37"><div class="container container-wrapper-main astro-6hobpl37"><aside class="aside astro-6hobpl37"><div class="sidebar astro-5xeag62i"><div class="sidebar-border-gradient astro-5xeag62i"></div><div class="sidebar-spacer astro-5xeag62i"></div><div class="sidebar-fade-top astro-5xeag62i"></div><div class="container-sidebar astro-5xeag62i"><div class="sidebar-entries astro-5xeag62i"><div class="container-sidebar-entry astro-k3wmqijo"><h4 class="entry-title astro-k3wmqijo">Get Started</h4><div class="container-group-link astro-k3wmqijo"><a href="/scarab-ci/get-started/overview/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Overview</span></a><a href="/scarab-ci/get-started/deploy-helm/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Installation</span></a><a href="/scarab-ci/get-started/run-locally/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Run locally</span></a><a href="/scarab-ci/get-started/local-development/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Local Development</span></a></div></div><div class="container-sidebar-entry astro-k3wmqijo"><h4 class="entry-title astro-k3wmqijo">Usage</h4><div class="container-group-link astro-k3wmqijo"><a href="/scarab-ci/usage/pipeline-syntax/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Pipeline Syntax</span></a><a href="/scarab-ci/usage/secrets/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Secrets</span></a><a href="/scarab-ci/usage/environments/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Environments</span></a><a href="/scarab-ci/usage/environment-variables/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Environment Variables</span></a></div></div><div class="container-sidebar-entry astro-k3wmqijo"><h4 class="entry-title astro-k3wmqijo">References</h4><div class="container-group-link astro-k3wmqijo"><a href="/scarab-ci/reference/api/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">API</span></a><div class="container-sidebar-entry astro-k3wmqijo"><h4 class="entry-title astro-k3wmqijo">ADR</h4><div class="container-group-link astro-k3wmqijo"><a href="/scarab-ci/tech/adr/0001-ci-as-durable-execution/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0001. CI as durable execution (the wedge)</span></a><a href="/scarab-ci/tech/adr/0002-durability-model/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0002. Durability model: durable DAG orchestrator + at-least-once steps</span></a><a href="/scarab-ci/tech/adr/0003-durability-substrate-postgres/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0003. Durability substrate: own it — DBOS pattern on Postgres (Rust)</span></a><a href="/scarab-ci/tech/adr/0004-execution-topology/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0004. Execution topology: pod-per-step + content-addressed workspace</span></a><a href="/scarab-ci/tech/adr/0005-tenancy-and-k8s-only/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0005. Tenancy &amp; deployment; Kubernetes as the only backend</span></a><a href="/scarab-ci/tech/adr/0006-pipeline-ontology/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0006. Pipeline ontology: flat recursive DAG</span></a><a href="/scarab-ci/tech/adr/0007-data-passing-model/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0007. Data-passing model: Workspace / Result / Artifact / Cache</span></a><a href="/scarab-ci/tech/adr/0008-step-contract/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0008. Step contract: OCI image + convention + built-in kinds</span></a><a href="/scarab-ci/tech/adr/0009-dsl-ir-yaml-cel/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0009. DSL: typed Pipeline IR + YAML frontend + CEL</span></a><a href="/scarab-ci/tech/adr/0010-forge-integration/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0010. Forge integration: agnostic core, OIDC identity, in-repo config</span></a><a href="/scarab-ci/tech/adr/0011-durable-scheduler/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0011. Scheduling: durable admission control</span></a><a href="/scarab-ci/tech/adr/0012-api-surface/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0012. API surface: REST/OpenAPI + SSE + internal gRPC</span></a><a href="/scarab-ci/tech/adr/0013-history-and-observability/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0013. History &amp; observability: state tables + append-only event log</span></a><a href="/scarab-ci/tech/adr/0014-secrets/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0014. Secrets: envelope-encrypted PG + pluggable providers</span></a><a href="/scarab-ci/tech/adr/0015-supply-chain-oidc/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0015. Supply-chain: Scarab as OIDC issuer + provenance-by-construction</span></a><a href="/scarab-ci/tech/adr/0016-code-architecture/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0016. Code architecture: hexagonal + adapter crates + converged binary</span></a><a href="/scarab-ci/tech/adr/0017-testing-strategy/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0017. Correctness &amp; testing strategy</span></a><a href="/scarab-ci/tech/adr/0018-image-building/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0018. Container image building: rootless BuildKit</span></a><a href="/scarab-ci/tech/adr/0019-local-execution/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0019. Local execution: executor-local behind the Executor port</span></a><a href="/scarab-ci/tech/adr/0020-retry-and-failure/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0020. Retry &amp; failure taxonomy</span></a><a href="/scarab-ci/tech/adr/0021-double-effect-fencing/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0021. Double-effect hazard: fencing tokens + idempotency contract</span></a><a href="/scarab-ci/tech/adr/0022-upgrades-and-versioning/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0022. Upgrades &amp; schema evolution: version-tolerant from day one</span></a><a href="/scarab-ci/tech/adr/0023-dag-shape/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0023. DAG shape: static matrix v1, dynamic reserved</span></a><a href="/scarab-ci/tech/adr/0024-environments/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0024. Environments: first-class with protection rules</span></a><a href="/scarab-ci/tech/adr/0025-cross-pipeline-orchestration/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0025. Cross-pipeline orchestration: nest vs trigger</span></a><a href="/scarab-ci/tech/adr/0026-resource-and-placement/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0026. Resource &amp; placement model</span></a><a href="/scarab-ci/tech/adr/0027-restart-semantics/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0027. Restart semantics: content-addressed smart invalidation</span></a><a href="/scarab-ci/tech/adr/0028-ui-stack/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0028. UI stack: SolidJS + TS + generated client</span></a><a href="/scarab-ci/tech/adr/0029-workspace-cas/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0029. Workspace content-addressing: per-file merkle CAS</span></a><a href="/scarab-ci/tech/adr/0030-operational-defaults/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0030. Operational defaults</span></a><a href="/scarab-ci/tech/adr/0031-pure-computation-deps/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0031. Purity means no I/O, not no dependencies: pure-computation crates allowed</span></a><a href="/scarab-ci/tech/adr/0032-slices-3-5-implementation-decisions/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0032. Slice 3–5 implementation decisions (forge, identity, scheduler, gates, secrets, OIDC, BuildKit)</span></a><a href="/scarab-ci/tech/adr/0033-transitive-skip/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0033. Transitive skip: a guarded-off step skips its descendants</span></a><a href="/scarab-ci/tech/adr/0034-external-gate-token/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0034. External-gate release: HMAC token</span></a><a href="/scarab-ci/tech/adr/0035-explicit-outputs/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0035. Explicit workspace `outputs:`</span></a><a href="/scarab-ci/tech/adr/0036-local-execution-dev-backend/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0036. Local execution: a non-production dev/CLI backend (amends 0005)</span></a><a href="/scarab-ci/tech/adr/0037-environment-governance/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0037. Environment governance: scoped secrets, approval-as-gate, admission at point-of-use</span></a><a href="/scarab-ci/tech/adr/0038-invoke-and-local-reuse/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0038. `invoke` is compile-time inlining; local reuse via `.scarab/lib`, third-party reuse via OCI images</span></a><a href="/scarab-ci/tech/adr/0039-privileged-images/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0039. Privileged step images: hardened baseline + governed capability grants per Environment</span></a><a href="/scarab-ci/tech/adr/0040-documentation-site/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0040. Documentation site: Astro Starlight, in-repo, DESIGN.md-branded</span></a><a href="/scarab-ci/tech/adr/0041-named-results-and-interpolation/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0041. Named step results + launch-time interpolation (`${{ outputs.&lt;id&gt;.&lt;name&gt; }}`)</span></a><a href="/scarab-ci/tech/adr/0042-trusted-egress-sidecar/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0042. Trusted per-Pod egress sidecar → fence-scoped results API → Postgres</span></a><a href="/scarab-ci/tech/adr/0043-launch-parameters-and-manual-dispatch/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0043. Launch parameters + manual dispatch as a repo-aware trigger</span></a><a href="/scarab-ci/tech/adr/0044-protection-ref-vs-read-ref/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0044. Branch protection matches a symbolic ref, not the commit SHA</span></a><a href="/scarab-ci/tech/adr/0045-source-provisioning/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0045. Source provisioning: the `clone` step kind</span></a><a href="/scarab-ci/tech/adr/0046-forge-auth-and-multi-adapter/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0046. Forge auth is adapter-internal; GitHub + Forgejo adapters in v1</span></a><a href="/scarab-ci/tech/adr/0047-retry-classification-and-attempt-model/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0047. Retry classification, attempt/fence model, and dead-letter (implements 0020)</span></a><a href="/scarab-ci/tech/adr/0048-fail-closed-startup/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0048. Fail-closed startup: validated config, boot refusal, mandatory Postgres</span></a><a href="/scarab-ci/tech/adr/0049-identity-and-access/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0049. Identity &amp; access: forge-agnostic authn, Scarab-native RBAC</span></a><a href="/scarab-ci/tech/adr/0050-retention-and-gc/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0050. Retention &amp; GC: mark-sweep CAS, lifecycle-keyed eligibility</span></a><a href="/scarab-ci/tech/adr/0051-multi-replica-operation/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0051. Multi-replica operation: tail lease, replica-agnostic SSE, shared OIDC key</span></a><a href="/scarab-ci/tech/adr/0052-artifacts/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0052. Artifacts: a dedicated per-run store, convention-emitted</span></a><a href="/scarab-ci/tech/adr/0053-observability-and-lifecycle/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0053. Observability &amp; lifecycle: metrics, structured logs, readiness, graceful shutdown</span></a><a href="/scarab-ci/tech/adr/0054-product-surface-serving/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0054. Product surface: embedded UI, run cancellation, API/CLI truthfulness</span></a><a href="/scarab-ci/tech/adr/0055-placement-profiles/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0055. Placement profiles: named profiles + baseline + governed `k8s_overlay`</span></a><a href="/scarab-ci/tech/adr/0056-run-takes-and-attempt-grain-evidence/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0056. Run Takes and attempt-grain evidence</span></a><a href="/scarab-ci/tech/adr/0057-run-provenance-trigger-context/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0057. Run provenance: trigger context and origin details</span></a><a href="/scarab-ci/tech/adr/0058-runtime-service-containers/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0058. Runtime service containers: co-located Sidecar (default) + Run-scoped Shared (opt-in)</span></a><a href="/scarab-ci/tech/adr/0059-tick-fault-isolation/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0059. Per-run tick fault isolation + bounded per-run failures</span></a><a href="/scarab-ci/tech/adr/0060-org-settings-connections-and-secret-management/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0060. Org settings surface: connection lifecycle, org/env secret editing, IaC-or-UI connections</span></a><a href="/scarab-ci/tech/adr/0061-workspace-data-path/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0061. Workspace data path: workspace service + node driver, lazy materialisation</span></a><a href="/scarab-ci/tech/adr/0062-workspace-export-lazy-without-node-driver/" aria-current="page" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0062. Workspace export: lazy materialisation without a node driver</span></a><a href="/scarab-ci/tech/adr/0063-step-logs-on-the-data-depot/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0063. Step logs live on the Data Depot, and the workspace service is renamed</span></a><a href="/scarab-ci/tech/adr/0064-durability-tiering-and-the-write-path/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0064. Durability tiering and the write path: warm-first, flush before `Succeeded`, and the promise is the backing</span></a><a href="/scarab-ci/tech/adr/0065-retention-cache-and-rederivation/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0065. Retention, Cache, and re-derivation: keep less, recompute on request, and let the operator tune it</span></a><a href="/scarab-ci/tech/adr/0066-the-depot-is-a-cache/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0066. The Depot is a cache: HA, warm-only, and what each costs</span></a><a href="/scarab-ci/tech/adr/0067-the-pack-is-the-record/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0067. The pack is the record: mandatory dependencies, a direct write path, and a self-describing bucket</span></a><a href="/scarab-ci/tech/adr/0068-the-infra-observer/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0068. The infra observer: narrating why a step has no logs</span></a><a href="/scarab-ci/tech/adr/0069-identity-links/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0069. Identity links: one Principal, many provider identities, pinned by immutable id</span></a><a href="/scarab-ci/tech/adr/0070-deployments-as-a-vendor-neutral-record/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0070. Deployments as a vendor-neutral record: what is live, not who approved</span></a><a href="/scarab-ci/tech/adr/0071-org-level-environments/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0071. Org-level Environments: a place that decides who may deploy into it</span></a><a href="/scarab-ci/tech/adr/0072-plugins-a-governed-extension-point/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0072. Plugins: a second, governed extension point beside Steps</span></a><a href="/scarab-ci/tech/adr/0073-step-up-confirmation/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">0073. Step-up confirmation: a human, a passkey, the exact action</span></a><a href="/scarab-ci/tech/adr/readme/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Architecture Decision Records</span></a></div></div><a href="/scarab-ci/tech/context/" aria-current="false" class="entry-link astro-k3wmqijo"><span class="entry-link-inner astro-k3wmqijo">Thesis &amp; language (CONTEXT)</span></a></div></div></div><div class="sidebar-fade-bottom astro-5xeag62i"></div></div></div></aside><script type="module">var e=document.getElementById(`starlight__sidebar`),t=e?.querySelector(`sl-sidebar-state-persist`),n=`sl-sidebar-state`,r=()=>{let r=[],i=t?.dataset.hash||``;try{let e=sessionStorage.getItem(n),t=JSON.parse(e||`{}`);Array.isArray(t.open)&&t.hash===i&&(r=t.open)}catch{}return{hash:i,open:r,scroll:e?.scrollTop||0}},i=e=>{try{sessionStorage.setItem(n,JSON.stringify(e))}catch{}},a=()=>i(r()),o=(e,t)=>{let n=r();n.open[t]=e,i(n)};t?.addEventListener(`click`,e=>{if(!(e.target instanceof Element))return;let t=e.target.closest(`summary`)?.closest(`details`);if(!t)return;let n=t.querySelector(`sl-sidebar-restore`),r=parseInt(n?.dataset.index||``);isNaN(r)||o(!t.open,r)}),addEventListener(`visibilitychange`,()=>{document.visibilityState===`hidden`&&a()}),addEventListener(`pageHide`,a);</script><main class="container-main astro-c4hhlov6" data-slot="docs"><div class="main astro-c4hhlov6"><main data-pagefind-body class="astro-vdxcvpsm" lang="en" dir="ltr"><scarab-version-notice data-root="/scarab-ci/" data-base="/scarab-ci/" data-version="v0.2" data-pagefind-ignore="true" hidden="true" class="astro-lnhkisss">You are reading the docs for <strong class="astro-lnhkisss">v0.2</strong>. <a href="/scarab-ci/" class="astro-lnhkisss">The latest release is <span data-latest class="astro-lnhkisss"></span> →</a></scarab-version-notice><script type="module" src="/scarab-ci/_astro/VersionBanner.astro_astro_type_script_index_0_lang.DW4M5yKX.js"></script><div data-slot="doc-title" class="astro-5dl4r4d3"><div data-slot="doc-title-header" class="astro-5dl4r4d3"><h1 id="_top" class="astro-5dl4r4d3">0062. Workspace export: lazy materialisation without a node driver</h1><div data-slot="doc-title-actions" class="astro-5dl4r4d3"><a data-slot="button" data-size="icon-md" href="/scarab-ci/tech/adr/0061-workspace-data-path/" class="astro-i6idhh3o link-button secondary astro-5dl4r4d3"><svg aria-hidden="true" class="astro-5dl4r4d3 astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M17 11H9.41l3.3-3.29a1.004 1.004 0 1 0-1.42-1.42l-5 5a1 1 0 0 0-.21.33 1 1 0 0 0 0 .76 1 1 0 0 0 .21.33l5 5a1.002 1.002 0 0 0 1.639-.325 1 1 0 0 0-.219-1.095L9.41 13H17a1 1 0 0 0 0-2Z"/></svg></a><a data-slot="button" data-size="icon-md" href="/scarab-ci/tech/adr/0063-step-logs-on-the-data-depot/" class="astro-i6idhh3o link-button secondary astro-5dl4r4d3"><svg aria-hidden="true" class="astro-5dl4r4d3 astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M17.92 11.62a1.001 1.001 0 0 0-.21-.33l-5-5a1.003 1.003 0 1 0-1.42 1.42l3.3 3.29H7a1 1 0 0 0 0 2h7.59l-3.3 3.29a1.002 1.002 0 0 0 .325 1.639 1 1 0 0 0 1.095-.219l5-5a1 1 0 0 0 .21-.33 1 1 0 0 0 0-.76Z"/></svg></a></div></div><!--  --></div><div class="markdown-wrapper astro-q6e3s5kt"><div class="sl-markdown-content astro-q6e3s5kt"><ul>
+<li><strong>Status:</strong> Accepted</li>
+<li><strong>Date:</strong> 2026-07-28</li>
+<li><strong>Deciders:</strong> thulasi.ram (architect)</li>
+</ul>
+<blockquote>
+<p><strong>Amended 2026-08-03 by <a href="0066-the-depot-is-a-cache.md">0066</a> — the lazy feed is CANCELLED on
+measurement, and the machinery built for it is being deleted. Read this before reading anything
+below.</strong> This ADR’s entire purpose is to deliver <strong>laziness</strong> — a Step transferring what it reads
+rather than what it inherits — without a node driver. git-bug <code dir="auto">4ce7f2c</code> measured the leg laziness
+was buying, on the real <code dir="auto">workspaced::router</code> over the real <code dir="auto">WorkspaceClient</code>, and the premise
+inverted:</p>
+<table>
+<thead>
+<tr>
+<th>leg</th>
+<th>per file</th>
+<th>at 50k files</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>feed (<code dir="auto">Cas::materialize</code> — the exact call <code dir="auto">scarab-wsfetch</code> makes)</td>
+<td><strong>0.54 ms</strong></td>
+<td><strong>~27 s</strong></td>
+</tr>
+<tr>
+<td>cold drain</td>
+<td><strong>2.68 ms</strong></td>
+<td><strong>~134 s</strong></td>
+</tr>
+</tbody>
+</table>
+<p>The feed is ~<strong>10× cheaper</strong> than <a href="0061-workspace-data-path.md">0061</a> s0 measured, and <strong>the drain
+is now 5× the feed</strong> — so the leg this ADR optimises is the <em>smaller</em> one. Worse for the case:
+of the feed’s 1076 ms (2000 files), only <strong>434 ms is blob GETs</strong>; <strong>55% is local filesystem
+writes</strong>, which a lazy mount pays anyway on first read. Laziness could at best defer a minority
+share of an already-cheap leg, in exchange for a privileged mount, a per-node prerequisite and an
+NFS server. <strong>The eager <code dir="auto">scarab-wsfetch</code> init container stays.</strong></p>
+<p><strong>Being deleted</strong> (0066 point 10): <code dir="auto">crates/scarab-server/src/export.rs</code>, <code dir="auto">farm.rs</code>, and the Export
+half of <code dir="auto">settle.rs</code> — ~10k lines with no control-plane or executor caller. Dormant is not free: the
+live <code dir="auto">/v1/exports*</code> routes are attack surface (any fence token could <code dir="auto">DELETE</code> another fence’s
+Export until they were Browse-gated), every refactor pays to keep it compiling, and it invites
+someone to wire it up without reading why it was shelved.</p>
+<p><strong>Three carve-outs.</strong> (a) The <strong>fence-residue sweep</strong> is extracted from <code dir="auto">sweep_exports_once</code>
+<strong>first</strong> — the ledger and drain-record TTLs live inside it and are load-bearing. (b)
+<strong><code dir="auto">changeset.rs</code> and its test tier stay</strong>: it is the only code anywhere that reads an <code dir="auto">overlayfs</code>
+upper layer, it was finally executed 2026-08-02, and it is exactly what a revived laziness effort
+would want. (c) The <strong>reflink primitive</strong> (<code dir="auto">reflink-copy</code>) stays — a future local cache wants it.</p>
+<p><strong>What survives of this ADR: the substrate facts</strong> — the measured kernel/PSA/overlayfs/NFS
+findings, including <code dir="auto">20e8786</code>’s ganesha semantics — <strong>and the change-set tier.</strong> They are why the
+revival path is a known quantity rather than a fresh investigation.</p>
+<p><strong>The named revival candidate is JuiceFS plus its CSI driver — not a rebuild of the ganesha path.</strong>
+Triggers, so this is not re-litigated on taste: a read-fraction measurement showing Steps touch a
+small share of their workspace, or workspaces growing until 27 s matters. It needs the privileged
+CSI DaemonSet this ADR already priced out, so the cost is known.</p>
+</blockquote>
+<div class="sl-heading-wrapper level-h2"><h2 id="context">Context</h2><a class="sl-anchor-link" href="#context"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Context”</span></a></div>
+<p><a href="0061-workspace-data-path.md">0061</a> decided a four-part workspace data path. Part 2 was <strong>a
+Scarab node driver, shipped and installed as standard</strong>, which would mount a Workspace Snapshot
+as a read-only lower layer with a pod-local writable upper layer, materialising <strong>lazily</strong> so a
+Step transfers what it reads rather than what it inherits. Part 2 is the part 0061’s own
+measurement section identifies as load-bearing:</p>
+<blockquote>
+<p><strong>Consequence for sequencing.</strong> Part 2 (<strong>lazy materialisation</strong>) is the load-bearing part,
+not part 3.</p>
+</blockquote>
+<p>A deployment constraint arrived after 0061 was accepted and it forbids the mechanism:</p>
+<blockquote>
+<p><strong>No DaemonSet from Scarab at all — privileged or not.</strong> The only nodes Scarab may touch are
+the node its server runs on and the nodes its Step Pods run on.</p>
+</blockquote>
+<p>The constraint protects against a <strong>cluster-wide footprint that Scarab installs and versions</strong>:
+something present on every node, outliving every Run, that a platform team must accept, upgrade
+and trust. It is not a blanket prohibition on privilege, and it is not a prohibition on touching
+a node a Step Pod is already running on.</p>
+<blockquote>
+<p><strong>Amended 2026-08-02 — the rule is the rationale, and stating it as “no DaemonSet” hid an
+option.</strong> The sentence above is the constraint; <em>“Scarab installs and versions”</em> is what makes
+it one. A DaemonSet an <strong>operator</strong> chooses, installs and upgrades on its own schedule is
+outside it for the same reason a lazy snapshotter is (the third row of the table below) — it is
+someone else’s node change. The concrete consequence: <strong><code dir="auto">csi-driver-nfs</code> is a live alternative
+to <code dir="auto">nfs-utils</code> as the per-node prerequisite of part 2</strong>, not something this rule excludes. Its
+node plugin ships its own NFS client and mounts in the host mount namespace, so it makes the
+delivery path work on nodes whose image has no <code dir="auto">mount.nfs</code> at all (Bottlerocket, hardened AMIs
+— exactly the population red-team #1 names as the risk). The choice an operator faces is
+therefore <strong>“a node package Scarab cannot install” vs “an upstream chart Scarab does not
+version”</strong>, and this ADR deliberately does not make it for them.</p>
+<p><strong>The trap, recorded so whoever picks it up does not discover it in a benchmark.</strong>
+<code dir="auto">csi-driver-nfs</code> declares a real <code dir="auto">fsGroupPolicy</code>, which invites kubelet to <strong>recursively chown
+the whole mount</strong> on Pod start — walking every inherited path and thereby destroying exactly the
+laziness the Export exists to buy (and defeating the caching argument below). Using it requires
+<code dir="auto">fsGroupChangePolicy: OnRootMismatch</code>, or no <code dir="auto">fsGroup</code> at all. This is the same fact as red-team
+#4 seen from the other side: the in-tree NFS plugin’s <code dir="auto">Managed: false</code> is <em>why</em> fsGroup does not
+apply there, and a CSI driver that manages it is not a free upgrade.</p>
+</blockquote>
+<p>0061 did not test part 2 against this, because it asserted the problem away:</p>
+<blockquote>
+<p>…it is the only mechanism that does — intercepting reads requires a privileged mount, which an
+unprivileged Pod cannot arrange for itself.</p>
+</blockquote>
+<p>Both halves of that sentence are true and the conclusion drawn from them is not, because <strong>the
+Pod was never going to be the thing arranging the mount.</strong> In Kubernetes the privileged mounter
+is <strong>kubelet</strong>: a Pod <em>declares</em> a volume and kubelet performs the mount on its behalf. So an
+entirely unprivileged Pod can have an exotic filesystem at <code dir="auto">/workspace</code> without holding any
+capability at all. 0061’s ten “Alternatives considered” are all about transport and topology and
+none of them asks where the mount could come from instead.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="the-complete-space-which-is-what-makes-this-decidable">The complete space, which is what makes this decidable</h3><a class="sl-anchor-link" href="#the-complete-space-which-is-what-makes-this-decidable"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “The complete space, which is what makes this decidable”</span></a></div>
+<p><strong>On a cold Pod, moving less than the whole workspace requires either interception or
+foreknowledge. There is no third source of laziness.</strong> Foreknowledge means inferring a Step’s
+read set, which fails silently when wrong (a missing file makes a test skip, not fail). That
+leaves interception, and interception has exactly three possible owners:</p>
+<table>
+<thead>
+<tr>
+<th>owner</th>
+<th>verdict</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>a privileged mount inside the Step Pod</strong> (FUSE, <code dir="auto">fuse-overlayfs</code>)</td>
+<td><strong>Dead.</strong> Measured: rejected by PodSecurity at <strong>both</strong> <code dir="auto">baseline</code> and <code dir="auto">restricted</code>.</td>
+</tr>
+<tr>
+<td><strong>kubelet</strong>, mounting a network filesystem</td>
+<td><strong>This ADR.</strong> kubelet holds the privilege; the Pod holds none.</td>
+</tr>
+<tr>
+<td><strong>the container runtime</strong> (lazy snapshotters — stargz, nydus)</td>
+<td>Not ours to install or version; a platform team adopts it on its own schedule.</td>
+</tr>
+</tbody>
+</table>
+<p>That table is the decision. Everything below is the consequence of picking row two.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="measured-facts">Measured facts</h3><a class="sl-anchor-link" href="#measured-facts"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Measured facts”</span></a></div>
+<p>All on <code dir="auto">colima</code>, k3s <code dir="auto">v1.35.0+k3s1</code>, runtime <code dir="auto">docker://29.5.2</code>, node filesystem <strong>ext4</strong>.
+Recorded because several of them contradict what this design was expected to need.</p>
+<p><strong>Mount propagation.</strong> A mount made in one container can reach a sibling:</p>
+<div class="expressive-code"><link rel="stylesheet" href="/scarab-ci/_astro/ec.v4551.css"><script type="module" src="/scarab-ci/_astro/ec.0vx5m.js"></script><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="plaintext"><code><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">unprivileged sidecar + mountPropagation: Bidirectional</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#d6deeb;--1:#403f53">      </span></span><span style="--0:#d6deeb;--1:#403f53">→ Forbidden: Bidirectional mount propagation is available only to privileged containers</span></div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">privileged sidecar + Bidirectional, alongside an unprivileged `restricted`-baseline step container</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#d6deeb;--1:#403f53">      </span></span><span style="--0:#d6deeb;--1:#403f53">→ valid Pod (server dry-run)</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="unprivileged sidecar + mountPropagation: Bidirectional      → Forbidden: Bidirectional mount propagation is available only to privileged containersprivileged sidecar + Bidirectional, alongside an unprivileged &#x60;restricted&#x60;-baseline step container      → valid Pod (server dry-run)"><div></div></button></div></figure></div>
+<p>and the mount <strong>stacks directly on the shared volume’s own root</strong>, which is what keeps
+<code dir="auto">/workspace</code> at <code dir="auto">/workspace</code>. From the step container’s <code dir="auto">/proc/self/mountinfo</code>:</p>
+<div class="expressive-code"><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="plaintext"><code><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">1187 1179 0:153 / /wsa rw,relatime master:498 - tmpfs tmpfs rw,inode64     # stacked ON the volume root</span></div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">1188 1179 253:1 …/empty-dir/wsb /wsb … ext4                                 # plain emptyDir, for contrast</span></div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">1189 1188 0:154 / /wsb/nested … tmpfs                                       # nested one level under</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="1187 1179 0:153 / /wsa rw,relatime master:498 - tmpfs tmpfs rw,inode64     # stacked ON the volume root1188 1179 253:1 …/empty-dir/wsb /wsb … ext4                                 # plain emptyDir, for contrast1189 1188 0:154 / /wsb/nested … tmpfs                                       # nested one level under"><div></div></button></div></figure></div>
+<p>Nesting would have forced the workspace to move to a deeper path and every pipeline with a
+hardcoded <code dir="auto">/workspace</code> would have paid for it. It does not.</p>
+<p><strong>Unmount does not propagate back.</strong> When the sidecar unmounted, the step kept the mount and
+merely lost its <code dir="auto">master:</code> link — contents still readable. So a daemon that dies mid-Step leaves a
+live mountpoint that fails every operation. This is designed for below, not discovered later.</p>
+<p><strong>PodSecurity is what kills the in-Pod mount, and it kills it at <code dir="auto">baseline</code>:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Pod shape</th>
+<th><code dir="auto">enforce=baseline</code></th>
+<th><code dir="auto">enforce=restricted</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>plain <code dir="auto">emptyDir</code></td>
+<td>allowed</td>
+<td>allowed</td>
+</tr>
+<tr>
+<td><strong>privileged sidecar + <code dir="auto">Bidirectional</code></strong></td>
+<td><strong>denied</strong></td>
+<td><strong>denied</strong></td>
+</tr>
+<tr>
+<td>inline <code dir="auto">nfs:</code> volume</td>
+<td>allowed</td>
+<td><strong>denied</strong> — restricted volume types</td>
+</tr>
+<tr>
+<td><strong><code dir="auto">persistentVolumeClaim</code></strong></td>
+<td><strong>allowed</strong></td>
+<td><strong>allowed</strong></td>
+</tr>
+<tr>
+<td><code dir="auto">image:</code> volume</td>
+<td>allowed</td>
+<td>allowed</td>
+</tr>
+<tr>
+<td><code dir="auto">hostPath</code></td>
+<td><strong>denied</strong></td>
+<td><strong>denied</strong></td>
+</tr>
+<tr>
+<td>inline <code dir="auto">csi:</code> volume</td>
+<td>allowed</td>
+<td><strong>allowed</strong></td>
+</tr>
+<tr>
+<td>generic <code dir="auto">ephemeral</code> (inline PVC template)</td>
+<td>allowed</td>
+<td><strong>allowed</strong></td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>Amended 2026-08-02 — three rows the first version of this table did not have, and one of them
+changes what part 2’s delivery may be.</strong> <code dir="auto">restricted</code>’s volume-type allow-list is exactly
+<code dir="auto">configMap, csi, downwardAPI, emptyDir, ephemeral, persistentVolumeClaim, projected, secret</code>.
+So <strong><code dir="auto">csi:</code> and generic <code dir="auto">ephemeral</code> are PSA-legal at <code dir="auto">restricted</code> too</strong> — the table as written
+implied a PVC was the only legal envelope for an exotic volume, and it is not; it is one of
+three. That matters because it is what makes <code dir="auto">csi-driver-nfs</code> (amendment above) and an inline
+per-Step ephemeral volume claim reachable without weakening the posture. And <strong><code dir="auto">hostPath</code> is
+denied at <code dir="auto">baseline</code></strong>, not merely at <code dir="auto">restricted</code> — it is one of <code dir="auto">baseline</code>’s own prohibitions,
+which is why the <code dir="auto">LocalPath</code> delivery below reaches a production cluster as a <code dir="auto">local</code> PV and
+only ever as <code dir="auto">hostPath</code> in dev.</p>
+</blockquote>
+<p>Two things follow. <code dir="auto">baseline</code> — not <code dir="auto">restricted</code> — is the level orgs actually set as a cluster
+default, because <code dir="auto">restricted</code> breaks too much; so the population that cannot run a privileged
+sidecar is every enforcing cluster, not a minority of them. And <strong>a PVC is the PSA-legal envelope
+for a volume type that is otherwise forbidden</strong>, because <code dir="auto">persistentVolumeClaim</code> is on
+<code dir="auto">restricted</code>’s allow-list and the PV behind it is an admin-mediated object. Inline <code dir="auto">nfs:</code> is
+denied at <code dir="auto">restricted</code>; the same NFS wearing a PVC is allowed.</p>
+<p>There is a mechanical escape from PSA — it is per-namespace, a namespace label overrides the
+cluster default, and Scarab owns its step namespace — and it is rejected. It would make the
+default data path depend on being permitted to weaken the posture of our own namespace, which any
+org that takes PSA seriously blocks with Kyverno or Gatekeeper. A default path resting on that is
+not a path.</p>
+<p><strong><code dir="auto">overlayfs</code> on ext4 protects its lower layer — but read the next block before concluding
+anything about hardlinks from this one.</strong> One privileged pod,
+directories on a real ext4 volume (<code dir="auto">overlayfs</code> cannot be stacked on the container rootfs, which is
+itself <code dir="auto">overlayfs</code>):</p>
+<div class="expressive-code"><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="plaintext"><code><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">fs type            : ext2/ext3                    # ext4 family — no reflink</span></div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">hardlink farm      : blob link count = 2          # free, zero bytes copied</span></div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">plain overlay (lowerdir = the farm)   : MOUNTED</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#d6deeb;--1:#403f53">  </span></span><span style="--0:#d6deeb;--1:#403f53">step writes through it →</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#d6deeb;--1:#403f53">    </span></span><span style="--0:#d6deeb;--1:#403f53">merged sees      : step wrote this</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#d6deeb;--1:#403f53">    </span></span><span style="--0:#d6deeb;--1:#403f53">CAS blob now     : original content           # UNCHANGED — the store cannot be corrupted</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#d6deeb;--1:#403f53">    </span></span><span style="--0:#d6deeb;--1:#403f53">upper holds      : main.rs                    # the EXACT change set</span></div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">overlay + index=on,nfs_export=on      : MOUNTED   # exportable over NFS</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="fs type            : ext2/ext3                    # ext4 family — no reflinkhardlink farm      : blob link count = 2          # free, zero bytes copiedplain overlay (lowerdir = the farm)   : MOUNTED  step writes through it →    merged sees      : step wrote this    CAS blob now     : original content           # UNCHANGED — the store cannot be corrupted    upper holds      : main.rs                    # the EXACT change setoverlay + index=on,nfs_export=on      : MOUNTED   # exportable over NFS"><div></div></button></div></figure></div>
+<p><strong>A hardlink cannot carry per-snapshot metadata, and that is the real constraint on the Farm.</strong>
+This was measured <em>after</em> the paragraph above was first written, and it corrects it:</p>
+<div class="expressive-code"><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="plaintext"><code><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">set the snapshot's recorded mtime on the FARM entry → CAS blob mtime moved too</span></div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">chmod 755 the farm entry                            → CAS blob mode changed too</span></div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">reflink (APFS clonefile) instead of hardlink        → CAS blob metadata independent</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="set the snapshot&#x27;s recorded mtime on the FARM entry → CAS blob mtime moved toochmod 755 the farm entry                            → CAS blob mode changed tooreflink (APFS clonefile) instead of hardlink        → CAS blob metadata independent"><div></div></button></div></figure></div>
+<p>A hardlink is a second <em>name</em> for one inode, and mode and mtime live on the inode. <a href="0061-workspace-data-path.md">0061</a>
+s7 made mode/mtime fidelity a pinned contract (<code dir="auto">crates/scarab-storage-s3/tests/fidelity.rs</code>) after
+measuring that dropping it silently degraded cross-Step incremental compilation, and s8 rejected
+letting a first-writer’s timestamp win for a shared blob. So restoring a snapshot’s metadata onto a
+hardlinked farm entry would <strong>mutate the CAS blob</strong> — the precise corruption this design claims to
+prevent — and two snapshots sharing content but not timestamps would fight over it.</p>
+<p><strong>Therefore the Farm materialises by <code dir="auto">reflink</code> where the filesystem offers it and by plain copy
+where it does not; hardlinks are not the mechanism.</strong> The earlier claim that “reflink is a bonus,
+not a dependency” is withdrawn. What survives is the part that matters: even the copy rung is a
+<strong>local</strong> copy at disk speed, against 4–6 ms per file of network round-trip in the measured status
+quo — for 50 000 files that is seconds versus minutes. The ordering argument is untouched; only the
+size of the win moves, and only on filesystems without reflink.</p>
+<p>The verified <code dir="auto">overlayfs</code> result above still stands on its own terms — <strong>copy-up does not modify the
+lower layer</strong>, so a Farm built by any rung is safe against a Step writing through it. That was what
+the probe tested; it did not test metadata, and saying so is the point.</p>
+<p>This inverts one warning and it is worth keeping the corrected form: the local dogfood disk is
+<strong>ext4</strong>, which has no reflink, so the dogfood exercises the <strong>copy</strong> rung and the reflink rung is
+the one it cannot reach. Any benchmark must therefore state which rung it took.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="the-governing-principle-unchanged">The governing principle, unchanged</h2><a class="sl-anchor-link" href="#the-governing-principle-unchanged"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “The governing principle, unchanged”</span></a></div>
+<p>0061’s principle still decides the arguable calls:</p>
+<blockquote>
+<p><strong>Minimise the substrate idiosyncrasies an author must know.</strong></p>
+</blockquote>
+<p><code dir="auto">/workspace</code> stays at <code dir="auto">/workspace</code>, holds the same bytes, and a Step cannot tell which of the
+configurations below produced it. Where the substrate is expensive, the system pays.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="decision">Decision</h2><a class="sl-anchor-link" href="#decision"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Decision”</span></a></div>
+<p><strong>Five parts.</strong></p>
+<p><strong>1. A Snapshot Farm — the CAS given tree shape, without leaving the disk.</strong>
+The workspace service materialises a Workspace Snapshot into a directory tree on <strong>its own disk</strong>
+whose entries are <strong><code dir="auto">reflink</code> clones of CAS blobs where the filesystem supports it, and local copies
+where it does not</strong>. Either way <strong>no round-trip is made and nothing crosses a network.</strong> A Farm is
+<strong>immutable and read-only</strong>, keyed by snapshot root, built once and <strong>shared by every Step that
+inherits that snapshot</strong> — so fan-out costs nothing. The Farm is a warm-tier cache object: bounded
+by space, LRU-evicted, and a miss is slower and never wrong.</p>
+<p>Not hardlinks: see the measurement above — a hardlink shares its inode, so restoring a snapshot’s
+mode and mtime onto a farm entry mutates the CAS blob, and 0061 s7 makes that fidelity a pinned
+contract.</p>
+<p>This is where the per-file cost goes to die, and the reason is the <strong>CAS</strong>, not the transport: the
+store already holds exactly one copy of each content <strong>on the same filesystem as the Farm</strong>, so
+building a tree never has to ask the network for a byte. 0061 measured the CAS legs at 4–6 ms per
+file against <em>loopback</em> object storage. A reflink is a local metadata operation in the tens of
+microseconds; a local copy is disk bandwidth. For a 50 000-file <code dir="auto">node_modules</code> or <code dir="auto">target/</code> that is
+<strong>about a second on reflink, a few seconds on a plain copy, and minutes today.</strong></p>
+<p><strong>2. A Workspace Export — the Step’s Workspace, mounted by kubelet.</strong>
+Per Step, the service mounts <code dir="auto">overlayfs</code> with the Farm as <strong>lowerdir</strong> and a per-Step directory as
+<strong>upperdir</strong>, and exports the merged view. The Step Pod receives it as a <strong>PersistentVolumeClaim</strong>
+bound to a per-Step PersistentVolume with an NFS source, mounted at <code dir="auto">/workspace</code>.</p>
+<p>The Step Pod holds <strong>no privilege, no capability, and no PSA exception</strong>. It does not fetch, and
+there is nothing to copy back. Reads fault over the network only for what the Step actually opens
+— which is the laziness part 2 of 0061 wanted, obtained from kubelet instead of from a driver.
+Delivery <strong>as a PVC rather than an inline <code dir="auto">nfs:</code> volume is load-bearing</strong>, not stylistic: the table
+above shows inline <code dir="auto">nfs:</code> is denied at <code dir="auto">restricted</code> and the PVC is not.</p>
+<p><strong>The PV must pin <code dir="auto">mountOptions: [nfsvers=4.2]</code>, and that is a correctness requirement rather than
+a tuning choice</strong> (probed 2026-08-02 on this machine). A kind node — <code dir="auto">kindest/node</code>, which
+<code dir="auto">just up</code> runs Steps on — ships <code dir="auto">/sbin/mount.nfs</code>, <code dir="auto">mount.nfs4</code> and <code dir="auto">rpc.statd</code>, but has no
+<code dir="auto">systemd</code> to <em>run</em> <code dir="auto">rpc.statd</code>, so a mount that defaults to <strong>v3</strong> fails with <em>“rpc.statd is not
+running”</em>. <code dir="auto">-o vers=4</code> and an unqualified mount that negotiates 4.2 both succeed. An unpinned PV
+therefore works or does not depending on what the client’s default happens to be on that node —
+the substrate idiosyncrasy the governing principle exists to keep off an author’s desk. (<code dir="auto">nolock</code>
+is the alternative for a deployment that must stay on v3; the pin is the default.)</p>
+<blockquote>
+<p><strong>Amended 2026-08-02 — delivery is a seam with three arms, and NFS is only one of them.</strong>
+Part 2 above reads as if “the Export” and “NFS” were the same decision. They are not, and
+separating them is what makes the <em>correctness</em> half testable before the <em>transport</em> half
+exists. Export prepare returns a <strong><code dir="auto">Delivery</code></strong>, and the executor’s single flagged
+volume-kind line (<code dir="auto">crates/scarab-executor-k8s/src/lib.rs</code>, the “THE one line that chooses the
+volume kind” comment) is its one consumer:</p>
+<ul>
+<li><strong><code dir="auto">Eager</code></strong> — today’s <code dir="auto">emptyDir</code> plus the <code dir="auto">scarab-wsfetch</code> copy. Unchanged, and the fallback
+the ladder already names.</li>
+<li><strong><code dir="auto">LocalPath</code></strong> — the Depot’s overlay <code dir="auto">merged/</code> made visible in the <strong>host</strong> mount namespace
+(the Depot’s data mount carries <code dir="auto">CAP_SYS_ADMIN</code> and <code dir="auto">Bidirectional</code> propagation) and handed to
+a <strong>co-located</strong> Step as a <code dir="auto">local</code> PV — PSA-legal at <code dir="auto">restricted</code>, unlike <code dir="auto">hostPath</code>, which the
+amended table above shows is denied at <code dir="auto">baseline</code>. No network, no NFS, no server. The Step is
+pinned to the Depot’s node by affinity, which is precisely why <strong>this is a dev/single-node
+posture and not the production default</strong>: it caps a Run’s throughput at one node and it writes
+a placement constraint onto every Step, which is the fight with <a href="0055-placement-profiles.md">0055</a>
+part 4 already refuses to pick.</li>
+<li><strong><code dir="auto">Nfs</code></strong> — part 2 as written, once there is a server.</li>
+</ul>
+<p>A deployment that asks for a delivery its topology cannot serve <strong>refuses at launch</strong>, in the
+same fail-closed shape the cutover knob already required — never a silent fall back to <code dir="auto">Eager</code>.</p>
+<p><code dir="auto">LocalPath</code> cannot exist in <strong>proc mode</strong>: the Depot there is a darwin host process and darwin
+has no <code dir="auto">overlayfs</code>. It is a <code dir="auto">just local-helm</code> capability only, and any recipe or test that
+claims otherwise is claiming something the substrate cannot do.</p>
+</blockquote>
+<p><strong>The Export mount carries <code dir="auto">redirect_dir=on</code>, and that is a correctness requirement rather than a
+tuning choice.</strong> Without it, <code dir="auto">rename(2)</code> of a directory that exists only in the lower layer returns
+<strong><code dir="auto">EXDEV</code></strong> — measured: <code dir="auto">rename failed: Cross-device link</code>, with the module default <code dir="auto">redirect_dir=N</code>.
+Directory renames are not exotic; git, cargo, npm, pip and maven all do them, and today they work
+because <code dir="auto">/workspace</code> is a plain <code dir="auto">emptyDir</code>. An Export that broke them would hand authors “Invalid
+cross-device link” as substrate knowledge, which the governing principle forbids. Worse, <code dir="auto">mv</code>
+<em>masks</em> it by recursively copying the subtree, so the failure mode is not an error but a <strong>silent
+full copy of an inherited tree</strong> — which then lands in the upper layer and makes “the change set is
+the upper layer, exactly” re-ingest a tree nothing changed. Verified that <code dir="auto">redirect_dir=on</code> coexists
+with <code dir="auto">nfs_export=on</code> — which <code dir="auto">metacopy</code> does not, that being the actual reason <code dir="auto">metacopy</code> is
+unavailable to an Export — so the fix is available.</p>
+<blockquote>
+<p><strong>Amended 2026-08-02 (stage-2a substrate spike) — the mount is no longer a probe’s mount carried
+into production by inference; it is the one the code writes, and the option string is
+load-bearing.</strong> <code dir="auto">crates/scarab-server/src/export.rs:501-508</code>’s <strong>exact</strong> option string mounted
+<strong>first try</strong> from a privileged Pod on the colima node — Ubuntu 24.04.4, kernel
+<strong>6.8.0-117-generic</strong>, k3s <strong>v1.35.0</strong>, docker runtime, <code dir="auto">hostPath</code> on <strong>ext4</strong> — with the kernel
+echoing back <code dir="auto">+uuid=on,nouserxattr</code>. On that node the overlay module parameters <code dir="auto">redirect_dir</code>,
+<code dir="auto">index</code> and <code dir="auto">nfs_export</code> are <strong>all default <code dir="auto">N</code></strong>, so every behaviour parts 2 and 3 depend on comes
+from that string and from nothing else: a delivery path that drops, reorders or re-derives it
+returns <code dir="auto">EXDEV</code> on the first <code dir="auto">mv</code> of an inherited directory, silently masked into a full subtree
+copy by <code dir="auto">mv</code>. <code dir="auto">index=on,nfs_export=on</code> also mounted cleanly (an actual NFS export was not
+exercised — 2a does not need one).</p>
+</blockquote>
+<p><strong>This forces part 3’s reader to support <code dir="auto">trusted.overlay.redirect</code>, not refuse it.</strong> A directory
+rename under <code dir="auto">redirect_dir=on</code> records the old path in that xattr, so a change-set reader that
+treats <code dir="auto">redirect</code> as unsupported would refuse every renamed directory. The two halves have to agree,
+and the ADR previously implied they could each be decided alone — it even said in part 3 that “only
+directory renames need refusing” while part 2 required supporting them, which is the shape of
+mistake that ships as a defect rather than a disagreement.</p>
+<p><strong>3. The change set is the upper layer, exactly.</strong>
+An <code dir="auto">overlayfs</code> upper directory contains precisely the paths the Step touched, put there by the
+kernel. The drain reads the upper, hashes only those files, folds them into the CAS and returns a
+new snapshot root — <strong>all on the service’s own local disk, with no network in the path.</strong></p>
+<p><strong>“Hashes only those files” is true of the snapshot <em>root</em> and false of the <em>content identity</em>, and
+that was measured by building the fold rather than reasoned about here.</strong> The two coordinates are
+not symmetric: a <strong>root</strong> is an address, so an untouched subtree can be carried forward by naming
+its hash and nothing needs reading. A <strong>content identity</strong> is not an address — nothing is stored
+under one and nothing can be fetched by one (see <a href="../../CONTEXT.md">CONTEXT.md</a> §4.2) — so a subtree
+carried by hash has a <em>known root</em> and an <strong>unknown identity</strong>, and every rebuilt directory level
+must walk its untouched siblings to compute theirs: one <code dir="auto">tree_entries</code> per directory, recursively.</p>
+<p>The consequence is shaped opposite to intuition and is worth stating plainly, because it inverts
+which edit is cheap: <strong>a change deep in the tree costs little and a change near the root costs an
+identity walk of most of the parent.</strong> Editing <code dir="auto">README.md</code> at the workspace root is the expensive
+case, not editing one file under <code dir="auto">target/</code>.</p>
+<p>This is local work against the warm tier, so “no network in the path” stands unharmed — but it is
+work, and an ADR whose entire argument is about per-file cost should not have left it unbooked. The
+fold memoises within one settle, which bounds it to one walk per directory rather than one per
+reference; that is a constant factor, not a structural fix. The structural fix is a persisted
+<code dir="auto">snapshot root → content identity</code> index in the warm tier, which is filed rather than decided here.</p>
+<p><strong>Reading a change set must fail closed on missing privilege, and the reason is nastier than it
+looks.</strong> An upper layer records deletions as whiteouts (a character device with <code dir="auto">rdev == 0</code>) and
+wholesale directory replacements as the <code dir="auto">trusted.overlay.opaque</code> xattr. <code dir="auto">trusted.*</code> xattrs are
+readable only with <code dir="auto">CAP_SYS_ADMIN</code> — and the kernel answers an unprivileged read with <strong><code dir="auto">ENODATA</code>,
+which is indistinguishable from “the attribute is not set”</strong> (measured while implementing s2:
+kernel 6.8.0, an unprivileged reader saw <em>nothing</em> on an upper that demonstrably carried the
+markers). So a drain that merely <em>tried</em> to read them would report “no opaque directories, no
+renames”, be believed, and publish a snapshot missing every deletion. The reader therefore checks
+its own effective capabilities up front and <strong>refuses</strong> rather than answering. A silent “nothing
+changed” is the worst available failure and it is one syscall away from being the default.</p>
+<p>Two further measured refinements, because they decide what has to be supported rather than merely
+tolerated. A <strong>file</strong> rename is exact — it appears as a whiteout plus a full copy, with no
+<code dir="auto">redirect</code> — so <code dir="auto">redirect</code> is a <strong>directory</strong> phenomenon only, and a <code dir="auto">redirect</code> on anything else is
+a shape we do not understand and must refuse. And <code dir="auto">redirect_dir=on</code> <em>is</em> honoured when passed at
+mount time even though the module default is off, so a directory rename really does reach the drain
+in production. Copy-up also stamps <code dir="auto">origin</code> on files and <code dir="auto">impure</code> on their parent directories, which
+must be <strong>tolerated as bookkeeping</strong> — treat them as unsupported markers and every real drain fails
+on its first edited file.</p>
+<p><strong>So a change set is not quite “the upper layer”.</strong> It is the upper layer <strong>plus a graft
+instruction</strong>, and the graft is the one thing in it that means nothing on its own: a renamed
+directory’s <code dir="auto">redirect</code> names a path in the <strong>parent snapshot</strong>, not in the upper. Three
+consequences the drain must honour, each of which fails <em>silently</em> if it does not:</p>
+<ul>
+<li><strong>Resolve grafts before deletions.</strong> A rename also whiteouts the old path, so a drain that
+applied deletions first would delete the graft’s own source.</li>
+<li><strong>Every other path is a merged-view path</strong>, including the renamed directory’s own — its upper
+name <em>is</em> its new name. Only <code dir="auto">redirect</code> is in parent-snapshot coordinates, and mixing the two
+silently grafts the wrong subtree.</li>
+<li><strong>Redirects compose.</strong> A relative <code dir="auto">redirect</code> under an already-renamed ancestor resolves against
+that ancestor’s <strong>lower</strong> coordinate, not its merged one; resolving against the merged parent
+grafts nothing and loses a subtree without erroring. A leading <code dir="auto">/</code> is the kernel’s encoding for
+<em>overlay-root</em>-relative, which is how a cross-parent rename is recorded — so an absolute redirect
+must be <strong>resolved, not rejected</strong>, or the design refuses precisely the renames part 2 requires
+it to support.</li>
+</ul>
+<p><strong>Durability is not local, and the cold upload stays on the critical path.</strong> The paragraph above
+says the fold happens “with no network in the path”, which is true of the <em>fold</em> and was allowed to
+imply something false about the <em>Attempt</em>. The service’s own disk <strong>is the warm tier</strong>, and
+<a href="0061-workspace-data-path.md">0061</a> part 4 requires a Workspace Snapshot to be durable before an
+Attempt is <code dir="auto">Succeeded</code>, while 0061’s retention table says warm is bounded by space, evicts, and
+promises nothing. 0061 also rejected exactly the shortcut this wording invited: <em>“writing warm-first
+and letting the service tier onward would make the warm tier load-bearing for durability, which part
+4 forbids.”</em></p>
+<p><strong>Decided: 0061 part 4 stands verbatim.</strong> A change set is folded into the CAS locally <em>and then
+uploaded to cold before the Attempt may reach <code dir="auto">Succeeded</code></em>. A Step that exits 0 whose service dies
+immediately afterwards must not leave a green Attempt whose evidence is gone, and warm cannot promise
+otherwise — so a green Attempt always has its snapshot in the tier that makes a promise.</p>
+<p>The reason this is affordable, and it is the whole argument: <strong>what gets uploaded is now only the
+change set.</strong> Today’s drain ships the <em>entire</em> workspace over the <code dir="auto">exec</code> tar tunnel whether it
+changed or not. So an Export that folds locally and then uploads what the Step actually wrote moves
+<strong>strictly less</strong> than the status quo, while keeping a durability guarantee the status quo also has.
+The cold leg is a real cost and it is booked here rather than discovered in a benchmark: it is one
+upload per Step, sized by the change set, on the critical path to <code dir="auto">Succeeded</code>.</p>
+<p>Two consequences worth naming. The upload cannot be skipped for content cold already holds without an
+existence primitive on the <code dir="auto">ObjectStore</code> port, which is a filed gap — so the first implementation
+pays for content cold may already have. And the <em>laziness</em> this ADR buys is on the <strong>read</strong> side; the
+write side is bounded by the change set, not by interception, which is why part 5 exists.</p>
+<p>This is not an optimisation of the drain, it is a different kind of answer. 0061’s deferred
+overlay-diff drain (git-bug <code dir="auto">66fc0e3</code>) wanted this and believed it needed a privileged mount on
+the node. A <strong>stat cache</strong> — comparing each file’s <code dir="auto">(size, mtime)</code> against the input manifest,
+git’s index-cache trick — was the approved unprivileged approximation, and its failure mode is
+<em>silently publishing a stale hash</em> on an mtime race. The upper layer makes the change set exact,
+so that failure mode does not exist rather than being defended against. The stat cache survives
+as the drain for configurations without an Export (part 5’s ladder, and the local executor), where
+it is the correct fallback and not the mechanism.</p>
+<blockquote>
+<p><strong>Stage 1 landed 2026-08-01, and its trusted egress helper SHARES the wsfetch image.</strong> 0061’s
+s3-drain put the drain in-Pod ahead of any Export: every workspace Step Pod’s egress barrier is
+now the <code dir="auto">scarab-wsfetch</code> image (<code dir="auto">hold</code> + the exec’d <code dir="auto">drain</code>), one knob with the fetcher — chart
+<code dir="auto">workspace.fetcherImage</code> / <code dir="auto">SCARAB_WSFETCH_IMAGE</code> — not a second image to version. When stage 2
+puts the change set on the service side, the helper’s <code dir="auto">drain</code> is the thing that stops walking
+<code dir="auto">/workspace</code> and starts reading the upper; the container, its token, its record rendezvous and
+its exit-code contract are already in place and do not move.</p>
+</blockquote>
+<p><strong>4. Zone preference is soft, and a miss is a cost line rather than an outage.</strong>
+A Workspace Export lives on <strong>one</strong> service replica’s disk, and the volume must be named in the
+Pod spec before the scheduler places anything. Scarab picks the replica at launch, prepares the
+Export there, and expresses a <strong>preferred</strong> (never required) zone affinity on the Pod. If the
+scheduler honours it the mount is in-zone; if capacity says otherwise the Pod mounts cross-AZ —
+slower, metered, <strong>never wrong</strong>.</p>
+<p>Hard-pinning is rejected: it hands the scheduler a zone constraint on every Step, which fights the
+spot capacity 0061 names as the operating environment, and it silently amends the placement
+overlays <a href="0055-placement-profiles.md">0055</a> makes the operator’s to own. When a snapshot is warm
+nowhere, every zone is equally good and the preference has nothing to say.</p>
+<p><strong>5. An optional node-side accelerator, for write-heavy Steps on fast local disk.</strong>
+Writes in part 2 cross the network. Where a cluster permits privilege and its nodes have fast
+local storage, a Step may instead run with the <strong>same primitive in a different place</strong>: a
+privileged Scarab-owned native sidecar mounts <code dir="auto">overlayfs</code> with the <strong>Export as lowerdir
+(read-only)</strong> and a <strong>node-local <code dir="auto">emptyDir</code> as upperdir</strong>, and propagates the merged view to
+<code dir="auto">/workspace</code> via <code dir="auto">Bidirectional</code> propagation. Reads still fault over the network; <strong>writes never
+touch it during the Step</strong>; at exit the sidecar ships the upper layer — again the exact change set
+— to the service.</p>
+<p>This is opt-in and it is an accelerator, not a second architecture. Both configurations use the
+same Farm, the same CAS, the same snapshot roots, the same <code dir="auto">/workspace</code>, and in both the upper
+layer is the change set. The only difference is <strong>where writes land in the interim</strong>.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="the-privilege-ladder">The privilege ladder</h3><a class="sl-anchor-link" href="#the-privilege-ladder"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “The privilege ladder”</span></a></div>
+<p>The service needs <code dir="auto">CAP_SYS_ADMIN</code> to mount <code dir="auto">overlayfs</code>. That is one <strong>operator-installed
+StatefulSet</strong> — the exception storage operators are routinely granted, on the node the constraint
+explicitly permits — and it is <em>preferred</em>, not required. The interface is “give me a tree-shaped
+writable view of a snapshot on the service’s disk”, with three backends:</p>
+<p>The two axes are independent — how the Farm is built, and whether an <code dir="auto">overlayfs</code> sits on top of it —
+so they are two ladders, not one:</p>
+<table>
+<thead>
+<tr>
+<th>Farm build</th>
+<th>needs</th>
+<th>cost, 50k files</th>
+<th>metadata fidelity</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">reflink</code> clone per blob</td>
+<td>XFS (reflink=1), btrfs, APFS</td>
+<td><strong>~1 s</strong>, no bytes</td>
+<td>exact</td>
+</tr>
+<tr>
+<td>plain local copy per blob</td>
+<td>nothing</td>
+<td>seconds, at disk bandwidth</td>
+<td>exact</td>
+</tr>
+<tr>
+<td><del>hardlink per blob</del></td>
+<td>—</td>
+<td>free</td>
+<td><strong>unsafe — mutates the CAS blob</strong></td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Export build</th>
+<th>needs</th>
+<th>change set</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">overlayfs</code>, Farm as lower</td>
+<td>service pod <code dir="auto">CAP_SYS_ADMIN</code></td>
+<td><strong>exact</strong> (the upper layer)</td>
+</tr>
+<tr>
+<td>writable copy of the Farm</td>
+<td>nothing</td>
+<td>stat cache — <code dir="auto">(size, mtime, ctime)</code> approximation</td>
+</tr>
+</tbody>
+</table>
+<p>Every live rung produces an identical tree, and the slowest is a <strong>local</strong> copy at disk speed
+instead of 50 000 network round-trips. <strong>A build must report which rung it took</strong>; a benchmark that
+silently drops a rung reports a number the real deployment would never produce.</p>
+<p>Two corrections to that paragraph, both found while building the rungs.</p>
+<p><strong>“Identical tree” has one exception, and it is a refusal rather than a wrong tree.</strong> The copy rung
+<em>reads</em> the Farm and the overlay rung never does — it only names it as a lowerdir and lets the kernel
+read it. So a Farm entry whose recorded mode denies read to the service’s uid (a <code dir="auto">0o000</code> file, which
+the fidelity contract obliges the Farm to reproduce faithfully) builds on the overlay rung and
+<strong>fails</strong> on the copy rung. Loud, and therefore acceptable; recorded because “identical” invited the
+opposite assumption.</p>
+<p><strong>The rung table above is missing a row, and the omission looks accidental.</strong> The <em>Farm</em> ladder’s top
+rung is <code dir="auto">reflink</code>, and a Farm and its Exports live on <strong>one filesystem</strong> by construction — part 1
+puts farms on the warm volume precisely so a clone cannot cross a filesystem boundary. So “a writable
+copy of the Farm” could be a <strong>CoW clone</strong> of it: nearly free, metadata-exact per entry, and correct
+for exactly the reason the overlay rung is correct, since copy-on-write independence is what a reflink
+provides. That would make the unprivileged Export rung nearly as cheap as the privileged one wherever
+the filesystem clones, which materially weakens the case for <code dir="auto">CAP_SYS_ADMIN</code> being <em>preferred</em>. What
+it would not change is the change set: that stays the stat-cache approximation, which remains the real
+reason to prefer the overlay. Filed, not built.</p>
+<p><strong>And the two columns of this table must not be independently reachable.</strong> The change-set column is
+not a note about what the drain <em>tends</em> to do, it is a constraint on what it <em>can</em> do: an upper layer
+read from the copy rung reports every inherited file as written and <strong>no deletion at all</strong>, because
+nothing on that disk distinguishes the two. Reading it as an overlay upper therefore publishes a
+snapshot in which everything the Step deleted has silently returned. This shipped as a real defect —
+the seam carried an overlay-marker value across both rungs — and the fix was to make the wrong
+pairing unrepresentable in the type rather than to document against it. The lesson generalises to
+every row of every ladder in this ADR: <strong>if two rungs need different drains, the rung must choose the
+drain.</strong></p>
+<p><strong>What refusing the capability actually costs.</strong> The first version of this sentence said “never
+correctness, and never a second code path”, which was wrong on both halves and was corrected once to
+say the rungs differ in <em>correctness</em>. That was true of the stat cache <strong>as first built</strong> and is no
+longer true of it, so here is the settled position.</p>
+<p><code dir="auto">(size, mtime)</code> alone has a hole that is not a race but a <strong>determinism</strong>: any writer that preserves
+both length and timestamp — <code dir="auto">cp -p</code>, <code dir="auto">touch -r</code>, <code dir="auto">rsync -a</code>, <code dir="auto">tar -xp</code> — defeats it every time,
+reproducibly, and those are ordinary CI operations rather than pathological ones. A racily-clean
+check does not help, because nothing about it is racy.</p>
+<p><strong><code dir="auto">ctime</code> closes it, and this is why git’s index records more than size and mtime.</strong> No syscall sets
+ctime; <code dir="auto">utimensat</code> <em>bumps</em> it as a side effect. So comparing the observed ctime against the moment
+materialisation completed catches every one of those writers. Verified on APFS, ext4, tmpfs and an
+overlayfs upper: <code dir="auto">rewrite+utimensat</code>, <code dir="auto">cp -p</code>, <code dir="auto">touch -r</code> and <code dir="auto">tar -xpf</code> all moved ctime past the
+capture; a pure read did not.</p>
+<p>Two things that only measurement would have produced, both now contractual. The mtime cutoff needs a
+one-second slack for coarse filesystems and <strong>the ctime cutoff must not have one</strong> — materialisation
+finishes in the milliseconds <em>before</em> the capture, so a slack there puts every file inside the
+untrusted window and the cache degrades to hashing everything (measured: every file re-read, nothing
+ever reused). The asymmetry is principled: the mtime cutoff compares a <em>recorded producer timestamp</em>
+against a different clock, while the ctime cutoff compares two readings of <em>the same</em> clock
+milliseconds apart. And the capture must be stamped <strong>at least a millisecond after</strong> the last file is
+written, or millisecond truncation leaves materialisation’s final files inside the capture’s own tick.</p>
+<p>So the rungs do not differ in correctness. They differ in <strong>what their correctness rests on</strong>: the
+upper layer is the kernel’s own record of what was touched, while the stat cache is sound only given
+an unforgeable ctime, a capture stamped after materialisation, a filesystem whose ctime is not coarse,
+and a Step that cannot move the clock backwards (ADR-0039 drops <strong>ALL</strong> capabilities, so no
+<code dir="auto">CAP_SYS_TIME</code>). Those assumptions hold in every configuration Scarab ships, and they are assumptions
+where the exact path has none. It remains <strong>two drains</strong>, which 0061 part 1 would still count against
+this design; the defence is that only one of them is ever used in a cluster, and the other exists
+where there is no Export to read — the local executor.</p>
+<p>The threat model is worth stating plainly, because it bounds all of this: the stat cache guards
+against <strong>accident, not malice</strong>. A Step that deliberately forges timestamps to poison its own change
+set corrupts only its own fenced evidence.</p>
+<p><strong>The Farm rung is per-file, not per-build.</strong> A clone can fail on an individual file while
+succeeding on its neighbours, so <code dir="auto">Mixed</code> is a real outcome and the <em>counters</em> — how many were
+cloned, how many copied — are the reportable truth rather than a single label. Discovered while
+implementing s1; the two-rung table above reads as if a build picks one rung and keeps it, and that
+is a simplification.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="vocabulary">Vocabulary</h3><a class="sl-anchor-link" href="#vocabulary"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Vocabulary”</span></a></div>
+<p><strong>Snapshot Farm</strong> — the immutable, shared, tree-shaped view of one Workspace Snapshot on the
+workspace service’s disk, built by <code dir="auto">reflink</code> where the filesystem offers it and by local copy where
+it does not. (Not hardlinks — see the measurement above; the first draft of this ADR said hardlinks
+and was wrong.) Defined here and <strong>deliberately kept out of
+<a href="../../CONTEXT.md">CONTEXT.md</a></strong>: it is a cache implementation, not domain language, and the
+glossary is a glossary.</p>
+<p>Two terms do reach the glossary, because they are distinctions a reader must not conflate:</p>
+<ul>
+<li><strong>Workspace Export</strong> — the <em>delivered</em> form of a Workspace: the per-Attempt, writable,
+network-mounted view a Step Pod receives. Losing an Export fails that Attempt, which retries;
+losing a <strong>Snapshot</strong> widens a rerun’s scope. Different words, different consequences.</li>
+<li><strong>Change set</strong> — the exact set of paths an Attempt wrote, <em>known</em> from the upper layer rather
+than inferred. Where there is no Export it is <em>approximated</em> from <code dir="auto">(size, mtime)</code>, and that is
+the one place in the data path where a wrong answer is possible rather than merely slow.</li>
+</ul>
+<p><code dir="auto">Workspace</code> also loses its “Pod-local, dies with the Pod” claim, which was an implementation leak
+in a glossary: a Step cannot tell whether its bytes sit on its node, on the service, or across
+both, and the lifetime unit is the <strong>Attempt</strong>.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="the-fence">The fence</h3><a class="sl-anchor-link" href="#the-fence"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “The fence”</span></a></div>
+<p>An Export’s identity is a <strong>capability, not an assertion</strong>. NFS authenticates with <code dir="auto">AUTH_SYS</code> —
+the client asserts a uid and the server believes it — so per-Step isolation cannot come from the
+protocol. It comes from the export path being an unguessable 256-bit secret, TTL’d to the Step’s
+deadline, <strong>pinned to the first client that mounts it</strong>, and revoked when the Attempt settles.
+That is structurally the same capability the existing per-Pod HMAC workspace token is, delivered
+through a different channel; Scarab already creates a Pod and a Secret per Step, so a PV and a PVC
+per Step is the same order of object churn.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="consequences">Consequences</h2><a class="sl-anchor-link" href="#consequences"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Consequences”</span></a></div>
+<ul>
+<li><strong>The service becomes a network filesystem server.</strong> <code dir="auto">nfs-ganesha</code> in userspace is the trodden
+path. It is a real new dependency implementing a protocol with decades of edge cases, and it is
+the largest single risk in this ADR. <strong>It is also the part 2a does not need</strong> (see the delivery
+seam), and as of 2026-08-02 it is verifiable on this dev machine rather than on a box we do not
+have.</li>
+<li><strong>A privileged workspace-service Pod is the preferred configuration.</strong> Per the ladder this is
+degradable, so it is not an install prerequisite — which is the material difference from 0061’s
+node driver, and the reason this design satisfies the constraint at all.</li>
+<li><strong><code dir="auto">/workspace</code> does not move</strong>, measured, so no authored pipeline changes.</li>
+<li><strong>Writes cross the network in the default configuration.</strong> This is the last structural cost and
+it is smaller than it sounds: today’s drain ships the <strong>entire</strong> workspace over the <code dir="auto">exec</code> tar
+tunnel whether it changed or not, where an Export ships only the bytes the Step actually wrote,
+once, at write time. <strong>The risk is operation count, not byte volume</strong> — NFS charges a round-trip
+per file operation, and a build that creates, writes and <code dir="auto">fsync</code>s many small files pays latency
+per file that no bandwidth fixes. That is what part 5 exists for and what the spike must measure.</li>
+<li><strong>Aggressive client attribute caching is safe here and is not in general.</strong> An Export has exactly
+<strong>one client and one writer</strong>, and its lower layer is immutable by construction, so a high
+<code dir="auto">actimeo</code> cannot serve a stale answer. This is the specific lever against the many-small-files
+metadata cost that makes EFS bad at <code dir="auto">node_modules</code>.</li>
+<li><strong>A dead FUSE-or-NFS mount fails the Attempt, and must say so.</strong> Measured: unmount does not
+propagate back to the Step, so a failed daemon leaves a live mountpoint returning errors on every
+operation. Hard mounts plus the existing Step deadline plus durable retry is the right handler —
+a stall becomes a deadline-exceeded Attempt that retries — but the Attempt must name the cause
+rather than surface a mystery I/O error (<a href="0027-restart-semantics.md">0027</a>: smart never means
+mysterious).</li>
+<li><strong>Rolling the service is now a drain-then-roll operation.</strong> With per-AZ replicas, a Step mounts
+one replica, so an upgrade must stop accepting new Exports and wait for in-flight Steps (minutes)
+before rolling. Blast radius of a replica loss is the Steps mounted on it, not all of them.</li>
+<li><strong>Warm-tier eviction stops being optional.</strong> Farms and Exports are directories on a bounded disk,
+and today the warm tier has no eviction at all (git-bug <code dir="auto">24476bc</code>). That ticket becomes blocking.</li>
+<li><strong>Per-Step PV/PVC objects and per-Step exports are a reaping obligation.</strong> A leaked Export is a
+leaked directory and a leaked capability.</li>
+<li><strong><code dir="auto">0061</code>’s cross-AZ claim is amended.</strong> “Cross-AZ traffic is confined to the archive drain” is
+false once a Step can mount a replica in another zone; part 4 makes that a priced, preferred-
+affinity miss instead of an invariant.</li>
+<li><strong>The eager fetcher becomes the no-Export fallback, not the standard route.</strong> <code dir="auto">scarab-wsfetch</code>
+and the HTTP CAS path shipped on PR #93 remain the path for the local executor and for any mode
+without an Export. They stop being the way a Step gets its inputs in a cluster.</li>
+</ul>
+<div class="sl-heading-wrapper level-h2"><h2 id="alternatives-considered">Alternatives considered</h2><a class="sl-anchor-link" href="#alternatives-considered"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Alternatives considered”</span></a></div>
+<ul>
+<li>
+<p><strong>FUSE (or <code dir="auto">fuse-overlayfs</code>) inside the Step Pod, via a privileged Scarab sidecar.</strong> The closest
+drop-in, and the union would not even need <code dir="auto">overlayfs</code> — a daemon we write <em>is</em> the union (lower
+= fetch-on-open, upper = pod-local, copy-up on write). Rejected on the measured PSA table: denied
+at <code dir="auto">baseline</code>, which is the common cluster default. Survives only as part 5, opt-in, where the
+privilege buys local writes rather than laziness.</p>
+</li>
+<li>
+<p><strong>FUSE inside the Step’s <em>own</em> container</strong> via <a href="0039-privileged-images.md">0039</a>’s governed
+<code dir="auto">add_capabilities</code>. Rejected: it hands <code dir="auto">SYS_ADMIN</code> to the <em>user’s</em> container and guts 0039’s
+restricted baseline. Named because it is the obvious move and it is worse than a DaemonSet, not
+better. Mount propagation makes it unnecessary in any case — a sibling container can own the
+mount.</p>
+</li>
+<li>
+<p><strong>Inline <code dir="auto">nfs:</code> volume instead of a PVC.</strong> Simpler and denied at <code dir="auto">restricted</code> (measured). The PVC
+is not ceremony.</p>
+</li>
+<li>
+<p><strong>A warm, content-indexed pool of block PVCs handed to Step Pods</strong> — better than laziness on its
+best axis, since a pre-populated volume moves <strong>0%</strong> of a tree where laziness moves 5%, and it is
+PSA-clean. Rejected because it re-binds volumes to short-lived Pods, which is precisely what
+0061 part 1 designed away: <em>“Every problem PVCs have here… comes from binding volumes to
+short-lived pods. Bind them to the long-lived thing instead and all of it goes away.”</em> Attach is
+5–20 s on EBS-class storage and detach wedges when a spot node goes; volumes are AZ-pinned, so
+they constrain scheduling and fight 0055; per-node attachment quotas cap concurrent Steps in the
+mid-20s; RWO means a fan-out needs a clone per consumer; and the write-back needs a
+detach-and-reattach before the volume can return to the pool. A pool genuinely fixes provisioning
+and population — the part 0061’s “PVC per Step” rejection did not consider — and fixes none of
+the rest.</p>
+</li>
+<li>
+<p><strong>EFS (or any managed RWX filesystem) mounted directly.</strong> 0061 rejected “RWX PVC per Run” partly
+as “a much heavier prerequisite than the driver”. <strong>That reasoning is now backwards and is
+corrected here</strong>: the EFS CSI driver is a DaemonSet and therefore forbidden, while EFS reached
+through an NFS-sourced PV needs no driver at all. It still loses, for two reasons that are not
+the availability argument. It makes a managed filesystem product a <strong>prerequisite</strong>, which 0061
+declines to do even for object storage (“an operator’s cost decision, not an engine decision”).
+And it puts the per-file cost back on the wire: EFS charges roughly a millisecond per metadata
+operation, where a Snapshot Farm charges tens of microseconds locally. Running our own server is
+what buys the Farm; a managed one cannot be given hardlinks into our CAS.</p>
+</li>
+<li>
+<p><strong>A hardlink Farm, so the Farm is free on every filesystem.</strong> This is what the ADR originally
+decided and it is <strong>withdrawn on measurement</strong>: mode and mtime live on the inode, a hardlink is a
+second name for one inode, so writing a snapshot’s recorded metadata onto a farm entry mutates the
+CAS blob. 0061 s7 pinned that fidelity after measuring real damage from losing it, and s8 rejected
+first-writer-wins timestamps for shared content. Kept in the record because the mistake is
+reusable: the <code dir="auto">overlayfs</code> probe verified that copy-up does not modify the lower layer and was read
+as verifying the Farm was safe, which it never tested. <strong>A probe proves what it exercised.</strong></p>
+</li>
+<li>
+<p><strong>A metadata-variant hardlink pool</strong> — one materialised copy per distinct <code dir="auto">(content, mode, mtime)</code>
+and hardlinks from there, so repeats are free. Rejected for the first cut: mtimes vary per file in
+a real build, so the sharing rate collapses toward one copy per file and the pool buys complexity
+rather than speed. Worth revisiting only if measurement shows real trees cluster into few distinct
+metadata variants.</p>
+</li>
+<li>
+<p><strong>A custom NFS server implementing copy-on-write in userspace</strong>, so a hardlink farm could be
+exported directly with no <code dir="auto">overlayfs</code> and no <code dir="auto">CAP_SYS_ADMIN</code>. Technically sound — we would break
+the link on first write ourselves — and rejected because it means writing the CoW semantics the
+kernel already has, in the write path of every Step, in exchange for a capability an
+operator-installed StatefulSet can reasonably hold.</p>
+<blockquote>
+<p><strong>Amended 2026-08-02 — read the scope of this rejection before citing it against 2b.</strong> What is
+rejected here is <strong>implementing copy-on-write in userspace</strong>, which is a property of the
+<em>hardlink-farm-without-<code dir="auto">overlayfs</code></em> shape. It says nothing about a userspace NFS server sitting
+<strong>above an already-mounted overlay</strong>: there the kernel is still doing the CoW and the server is
+a protocol adapter over an ordinary directory. So “we rejected a custom NFS server” is not an
+argument against 2b’s linked-in-server option, only against making one do the union.</p>
+</blockquote>
+</li>
+<li>
+<p><strong>OCI <code dir="auto">image</code> volumes as the transport.</strong> PSA-clean at <code dir="auto">restricted</code> (measured), node-cached,
+parallel and runtime-managed, and it becomes lazy for free the day a platform team adopts a lazy
+snapshotter — a node change Scarab neither installs nor versions, which is the cleanest possible
+fit to the constraint. Not chosen because the laziness is contingent on someone else’s adoption
+and the read-only union problem returns (a copy into <code dir="auto">emptyDir</code> reads every file; working
+directly in a read-only tree changes the authoring model). Also currently untestable locally:
+the runtime here is <code dir="auto">docker://29.5.2</code>, and cri-dockerd does not implement image volumes. Retained
+as a possible internal representation, which is where 0061 already had it.</p>
+</li>
+<li>
+<p><strong>Fusing the boundary instead of making it lazy</strong> — automatically co-locating a linear chain of
+Steps into one Pod when placement profiles match and no gate or approval intervenes, so no bytes
+move at all. Distinct from 0061’s rejected “coarsening the unit”, which is an <em>authoring</em> change;
+this is invisible. Not rejected on merit — it attacks boundary <strong>count</strong> where this ADR attacks
+boundary <strong>cost</strong> — but deferred: it trades away per-Step restart granularity inside a fused
+group, which collides with <a href="0027-restart-semantics.md">0027</a> and
+<a href="0056-run-takes-and-attempt-grain-evidence.md">0056</a> and would have to be governed and visible.
+Filed separately.</p>
+</li>
+<li>
+<p><strong>Inferring a Step’s read set (profile-guided prefetch).</strong> Foreknowledge instead of interception.
+Rejected as unsafe in this direction: a wrong guess does not fail, it succeeds with a file
+missing. Write-side inference is a different and safe proposition and is what the stat cache is.</p>
+</li>
+</ul>
+<div class="sl-heading-wrapper level-h2"><h2 id="red-team-findings-this-adr-does-not-yet-answer">Red-team findings this ADR does not yet answer</h2><a class="sl-anchor-link" href="#red-team-findings-this-adr-does-not-yet-answer"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Red-team findings this ADR does not yet answer”</span></a></div>
+<p>A red team was run against this ADR before code rested on it, with a live cluster. It confirmed the
+design’s load-bearing claims — an overlay <strong>does</strong> survive being exported and re-read through a
+second fresh client with modes and mtimes intact, <code dir="auto">/workspace</code> <strong>does</strong> stay put, per-Step PV/PVC
+churn <strong>is</strong> cheap (80 objects in 2.3 s, 40 PVs <code dir="auto">Bound</code> in under 5 s, no quota trouble), and PSA
+<code dir="auto">restricted</code> <strong>does</strong> admit an unprivileged Pod with an NFS-backed PVC <em>including the bind</em>. The
+PVC-as-envelope argument is sound.</p>
+<p>It also found the following, which are recorded here rather than quietly fixed because several change
+what the design must do. Each is filed.</p>
+<ol>
+<li>
+<p><strong>kubelet needs an NFS client on every Step node — CONFIRMED, and it dents the headline claim.</strong>
+The delivery path had never actually been mounted. When it was: PV bound, PSA admitted the Pod,
+the scheduler placed it, then kubelet failed with <em>“you might need a /sbin/mount.nfs helper
+program”</em> and the Pod hung in <code dir="auto">ContainerCreating</code> <strong>forever</strong>. The colima node has no <code dir="auto">nfs-utils</code>.
+So “the Pod needs nothing and kubelet does the mount” is true of <em>privilege</em> and false of
+<em>packages</em>: an NFS-sourced PV requires an NFS client on each node that runs a Step. That is not a
+DaemonSet and not something Scarab installs, but it <strong>is</strong> a per-node prerequisite, and it must be
+stated as one — it is present on most distributions and its absence on minimal images
+(Bottlerocket, hardened AMIs) is a real risk. It also means the s9 spike cannot run on <code dir="auto">just up</code>
+or <code dir="auto">local-helm</code> until the colima VM gets <code dir="auto">nfs-common</code>.</p>
+<blockquote>
+<p><strong>Amended 2026-08-02 — the prerequisite is confirmed, but the last sentence was wrong and the
+gate it gates is now MET.</strong> “The dev substrate cannot mount an Export, so verification needs a
+separate privileged Linux box” was recorded here and in the stage-2 table yesterday, and it
+survived one day. Probed on this machine:</p>
+<ul>
+<li>The colima VM is <strong>Ubuntu 24.04.4, kernel 6.8.0-117-generic, k3s v1.35.0+k3s1</strong>,
+aarch64/<code dir="auto">vz</code>/virtiofs. <code dir="auto">mount.nfs</code> was indeed <strong>absent</strong> — but <code dir="auto">nfs</code>, <code dir="auto">nfsv4</code> and <code dir="auto">nfsd</code> are
+all <strong>on disk</strong> and <code dir="auto">modprobe</code> cleanly, and <code dir="auto">apt-get install -y nfs-common</code> pulls
+<code dir="auto">mount.nfs 2.6.4</code> from <code dir="auto">ports.ubuntu.com</code>. One command, no custom image, no separate host.
+It is installed now; it survives <code dir="auto">colima stop</code>/<code dir="auto">start</code> and is lost on <code dir="auto">colima delete</code>.</li>
+<li><strong>The delivery path then mounted, on colima k3s.</strong> A PV with an <code dir="auto">nfs:</code> source (server = the
+node’s own INTERNAL-IP, <code dir="auto">192.168.5.1</code>) + PVC + consumer Pod went <code dir="auto">Running</code> → <code dir="auto">Succeeded</code> in
+<strong>~6 s</strong>, mounted <code dir="auto">vers=3</code>, and the Pod <strong>read and wrote through it</strong>. kubelet did the mount,
+exactly as part 2 claims.</li>
+<li><strong>kind needs nothing at all.</strong> The default <code dir="auto">kindest/node</code> (v1.36.1, what
+<code dir="auto">deploy/local-proc/kind.yaml</code> creates) already ships <code dir="auto">/sbin/mount.nfs</code>, <code dir="auto">mount.nfs4</code> and
+<code dir="auto">rpc.statd</code> — no install, no custom node image, no <code dir="auto">kind.yaml</code> change. The one catch is the
+<code dir="auto">nfsvers=4.2</code> pin recorded in part 2: v3 fails there for want of a running <code dir="auto">rpc.statd</code>.</li>
+</ul>
+<p><strong>So this finding’s own gate — “a Step Pod on <code dir="auto">just up</code> / <code dir="auto">just local-helm</code> mounts an
+NFS-backed PVC and reads a file through it” — is met for <code dir="auto">local-helm</code> and one cluster-create
+away for proc/kind.</strong> What remains true, and is the whole of what this finding should ever
+have claimed: an NFS-sourced PV needs an NFS client on every Step node, <code dir="auto">nfs-common</code> is not
+in the colima image by default, and <strong>there is no colima provisioning hook in this repo</strong> — so
+it must be either a documented prerequisite with a fail-fast check or a recipe that installs
+it. (Nothing about the <em>2a</em> <code dir="auto">LocalPath</code> delivery needs any of this; see part 2.)</p>
+</blockquote>
+</li>
+<li>
+<p><strong>Evicting a Farm under a live Export is silent corruption — CONFIRMED, and worse than “must not
+happen”.</strong> With lower entries deleted while the overlay was mounted, <code dir="auto">ls</code> of the merged directory
+returned <strong>empty</strong> while <code dir="auto">cat</code> of already-cached paths still returned content, and a write into the
+vanished directory returned <strong>rc=0</strong>. A Step would see an empty tree, build nothing, and exit 0 —
+the fail-silently class this ADR rejects read-set inference for. Nothing refcounts Farms against
+live Exports today, and the <code dir="auto">actimeo</code> argument (“the lower layer is immutable by construction”)
+inherits the same assumption. Reaping is therefore a correctness mechanism, not housekeeping.</p>
+<p><strong>Addressed in s4, and the same failure turned out to have a second route this finding did not
+name.</strong> Farms now carry on-disk leases and an eviction fails closed while one is held. But an
+<em>empty tree served to a Step</em> does not require an eviction at all: a <strong>service restart</strong> destroys
+the overlay mount with the old mount namespace, and an Export whose record is then adopted from
+disk points at a <code dir="auto">merged/</code> directory that is no longer a mountpoint — empty, writable, rc=0, exit
+0. Identical symptom, no Farm touched. So the invariant to hold is not “do not evict a leased
+Farm” but <strong>“never hand out a Workspace that is not backed by what its record says”</strong>, which
+costs a mountpoint check at claim time and a re-mount on adoption. Recorded because the narrower
+framing is what let it hide: the guard was built, tested, and the hole was beside it.</p>
+<blockquote>
+<p><strong>Amended 2026-08-02 (stage-2a substrate spike) — restart is SAFER than this reasoned, and it
+LEAKS, which is the failure the remount-invariant above does not cover.</strong> Measured, not
+argued. Killing the mounter left <strong>every overlay alive in the host mount namespace</strong>: the Step
+Pod kept reading <em>and writing</em> through it throughout, and a fresh mounter that adopted the
+record could read a change the Step had written while the mounter was dead. So a Depot restart
+is <strong>not</strong> destructive to an in-flight Step on the <code dir="auto">LocalPath</code> delivery — the mount outlives
+the process that made it, and the “empty, writable, rc=0” symptom above comes from an
+adoption that <em>re-mounts blindly</em> or fails to check, not from the restart itself.</p>
+<p>The cost is on the other side: <strong>kubelet never unmounts these</strong>, so nothing reaps them. A node
+accumulates one leaked overlay per restarted-through Export until mount-table exhaustion.
+<strong>Requirement: the Depot must reconcile at boot</strong> — adopt the mounts backing live Exports
+(verifying each is still a mountpoint of the expected shape) and unmount every orphan whose
+Export record is gone. This is not housekeeping either; it is the other half of the
+“never hand out a Workspace that is not backed by what its record says” invariant, and it is
+the s4 restart-adoption seam’s remaining obligation.</p>
+</blockquote>
+</li>
+<li>
+<p><strong>Part 3’s “no network in the path” collides with 0061 part 4 — CONFIRMED (documents).</strong> Folding a
+change set into the CAS on the service’s own disk lands it in the <strong>warm</strong> tier, and 0061 part 4
+requires durability before <code dir="auto">Succeeded</code> while 0061 explicitly forbids making warm load-bearing for
+durability. So either part 4 weakens or a cold upload stays on the critical path — and this ADR
+books neither. Unbooked cost, exactly what 0061’s own “price of seeding the warm tier” section
+exists to avoid repeating.</p>
+<p><strong>Answered: part 4 stands verbatim and the cold upload is on the critical path</strong>, booked in part 3
+above. The claim that moved is “no network in the path”, which was true of the fold and false of
+the Attempt.</p>
+</li>
+<li>
+<p><strong><code dir="auto">fsGroup</code> does not survive an NFS volume — PLAUSIBLE, strong, and possibly a blocker for part 2.</strong>
+The executor sets <code dir="auto">fs_group: WORKSPACE_GID</code> and comments that the restored <code dir="auto">/workspace</code> is “owned
+by <code dir="auto">WORKSPACE_GID</code> and only group-writable”. The in-tree NFS plugin reports <code dir="auto">Managed: false</code>, so
+kubelet applies <strong>no</strong> fsGroup ownership. Write access then rests on AUTH_SYS uid/gid against the
+modes 0061 s7 preserves exactly — and <code dir="auto">0644</code> is not group-writable. <strong>The Step may be unable to
+write to its own Workspace.</strong> This ADR discusses AUTH_SYS only in the context of the fence and
+never as an access-control problem for the Step itself.</p>
+<blockquote>
+<p><strong>Amended 2026-08-02 (stage-2a substrate spike) — the other side of this finding is now
+MEASURED, and it is worse than a permission problem: on a delivery where kubelet <em>does</em> manage
+fsGroup, <code dir="auto">fsGroup</code> ALONE DESTROYS LAZINESS.</strong> The DaemonSet amendment at the top of this ADR
+called <code dir="auto">csi-driver-nfs</code>’s <code dir="auto">fsGroupPolicy</code> a trap “recorded so whoever picks it up does not
+discover it in a benchmark”. It was discovered anyway, on the <code dir="auto">local</code> PV: with <code dir="auto">fsGroup: 1000</code>
+and no policy set, kubelet’s recursive <code dir="auto">chown</code> walked the volume and <strong>copied up all 200/200
+lower files before the container started</strong>. Laziness gone, before a single line of the Step
+ran. This is red-team #4 inverted — NFS’s <code dir="auto">Managed: false</code> is what <em>spares</em> it, and any
+delivery that manages fsGroup pays it.</p>
+<p><strong>Proven mitigation, and the recipe is exact — both halves are required:</strong></p>
+<ol>
+<li><code dir="auto">fsGroupChangePolicy: OnRootMismatch</code> on the Pod, <strong>and</strong></li>
+<li>the Depot pre-sets <code dir="auto">upper/</code> to <code dir="auto">uid:gid = &lt;step uid&gt;:&lt;fsGroup&gt;</code> with mode <strong><code dir="auto">2777</code></strong>.</li>
+</ol>
+<p><strong>The setgid bit is the load-bearing part.</strong> <code dir="auto">OnRootMismatch</code> with mode <code dir="auto">0775</code> still copied all
+200 files: kubelet’s root-mismatch test compares the <strong>setgid bit</strong> as well as owner and gid,
+so a root that is otherwise correct but not setgid reads as a mismatch and triggers the full
+walk. Anything that reconstructs this recipe from memory and drops the <code dir="auto">2</code> re-introduces a
+total copy-up that no test asserting <em>correctness</em> will catch.</p>
+<p><strong>Requirement, separately measured: <code dir="auto">upper/</code>’s ownership and mode must be set BEFORE
+<code dir="auto">mount(2)</code>, not after.</strong> Chmod-ing the upper once the overlay is mounted leaves <code dir="auto">stat</code> on the
+merged root reporting the <strong>new</strong> mode while the kernel’s permission check still uses the
+<strong>old</strong> one — an unprivileged <code dir="auto">rename(2)</code> of a lower directory fails <code dir="auto">EACCES</code> against a merged
+root that displays <code dir="auto">0777</code>. Chmod through the <em>merged</em> path fixes it immediately, which is the
+tell; ordering the change before the mount avoids the state entirely.</p>
+</blockquote>
+</li>
+<li>
+<p><strong>The fence is weaker than the word “capability” implies — PLAUSIBLE.</strong> A userspace NFSv4 client
+needs no privilege, no PV and no kubelet, and can assert any uid; a probe mounted with
+<code dir="auto">noresvport</code>, so the privileged-port defence never engaged. First-mount pinning pins the <strong>node</strong>,
+because kubelet does the mounting — so co-tenant Steps on one node share an identity. And path
+secrecy is the only remaining barrier while the path sits in a <strong>cluster-scoped PV object</strong> and in
+the node’s <code dir="auto">/proc/mounts</code>. “Structurally the same capability as the HMAC token” overstates it: the
+token is per-Pod and unreadable by other Pods; this is not. Needs a real answer — <code dir="auto">resvport</code>, a
+NetworkPolicy, per-Step uid squashing — or an honest downgrade of the claim.</p>
+</li>
+<li>
+<p><strong>Revocation and restart are unhandled — CONFIRMED.</strong> Revoking an export under a live client gives
+<code dir="auto">ESTALE</code> then <code dir="auto">EACCES</code>, and <code dir="auto">nfsd</code> start logs a <strong>90-second grace period</strong> plus <em>“Unable to
+initialize client recovery tracking … Is nfsdcld running?”</em>. This ADR handles a dead daemon but not
+revocation racing a Pod already in SIGTERM grace, nor the post-restart grace window, nor <code dir="auto">nfsdcld</code>
+as a dependency.</p>
+</li>
+<li>
+<p><strong>Part 4’s zone preference has no merge story with 0055 — PLAUSIBLE.</strong> <code dir="auto">affinity</code> appears nowhere
+in the Rust sources, and a placement overlay is applied as a block, so whichever writer goes last
+replaces the other’s affinity wholesale. A preference Scarab adds and an overlay the operator owns
+cannot both survive without a defined merge.</p>
+</li>
+<li>
+<p><strong>The s9 spike as specified cannot falsify the design — PLAUSIBLE.</strong> Operations-per-second under
+latency exercises none of: <code dir="auto">EXDEV</code>/redirect correctness, whiteout and opaque handling in the drain,
+eviction under a live mount, restart with live Exports, or cross-AZ behaviour. Its rung guard
+covers reflink and <code dir="auto">overlayfs</code> but not <code dir="auto">redirect_dir</code>, not which drain ran, and not whether the
+mount was actually NFS. A spike shaped only to produce a number will produce one.</p>
+<blockquote>
+<p><strong>Amended 2026-08-02 — a spike shaped to falsify was run instead, and it falsified two things.</strong>
+The stage-2a substrate spike produced <strong>no ops/sec number at all</strong> and was worth more than one:
+it exercised the mount, propagation escape, PSA admission, <code dir="auto">redirect_dir</code> through a live mount,
+and all four change-set forms in a real upper (chain and verdicts in the 2a table below). Two
+beliefs died — <code dir="auto">fsGroup</code> silently defeating laziness (#4 above) and mounts leaking across a
+Depot restart (#2 above) — and both were invisible to the metric this row warned about. The
+ops/sec row stays open and stays 2b’s; it is now the <em>only</em> remaining reason to run a
+number-shaped spike.</p>
+</blockquote>
+</li>
+</ol>
+<div class="sl-heading-wrapper level-h2"><h2 id="open--deliberately-not-decided-here">Open — deliberately not decided here</h2><a class="sl-anchor-link" href="#open--deliberately-not-decided-here"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Open — deliberately not decided here”</span></a></div>
+<div class="sl-heading-wrapper level-h3"><h3 id="stage-2--what-still-stands-between-here-and-an-export-delivered-workspace">Stage 2 — what still stands between here and an Export-delivered <code dir="auto">/workspace</code></h3><a class="sl-anchor-link" href="#stage-2--what-still-stands-between-here-and-an-export-delivered-workspace"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Stage 2 — what still stands between here and an Export-delivered /workspace”</span></a></div>
+<p>Stage 1 (the in-Pod drain, 0061 s3-drain) is live. Stage 2 — a Step Pod mounting a Workspace
+Export instead of an eager copy — is <strong>not</strong>, and the remaining work is enumerable rather than
+vague. Each row names what it is blocked on, the gate that proves it, and its size.</p>
+<blockquote>
+<p><strong>Rewritten 2026-08-02, because the sequencing was wrong.</strong> The first version of this table
+ordered the work behind an NFS server and then behind a machine to run it on, on the strength of
+the “cannot be verified here” claim the red-team-#1 amendment above retracts. Both premises are
+gone, and with them the reason to do the two halves together. <strong>Split stage 2 at the delivery
+seam</strong>: the <em>correctness</em> of the Export — the overlay rung executing, a real kernel-produced
+upper reaching <code dir="auto">read_change_set</code>, <code dir="auto">redirect_dir</code>/<code dir="auto">EXDEV</code> through a live mount — has nothing to do
+with NFS, and waiting on a transport to test it is what kept the exact path unexecuted (the most
+important caveat on this ADR, below). 2a buys that today on <code dir="auto">local-helm</code>. 2b is then a transport
+change against a path already known to be correct.</p>
+</blockquote>
+<p><strong>2a — the delivery seam and a co-located, NFS-free path.</strong> No server, no NFS client, no new
+protocol. This is what unblocks the correctness half.</p>
+<table>
+<thead>
+<tr>
+<th>work</th>
+<th>blocked on</th>
+<th>gate (what proves it)</th>
+<th>size</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>The <code dir="auto">Delivery</code> seam</strong> — <code dir="auto">Delivery::{Eager, LocalPath, Nfs}</code> returned by Export prepare, with the one flagged volume-kind line in <code dir="auto">crates/scarab-executor-k8s/src/lib.rs</code> as its only consumer</td>
+<td>nothing</td>
+<td>a deployment asking for a delivery its topology cannot serve <strong>refuses at launch</strong> (proc mode asking for <code dir="auto">LocalPath</code> is the test case), never silently feeding <code dir="auto">Eager</code></td>
+<td>small</td>
+</tr>
+<tr>
+<td><strong><code dir="auto">LocalPath</code> delivery</strong> — the Depot’s overlay <code dir="auto">merged/</code> published into the host mount namespace (<code dir="auto">CAP_SYS_ADMIN</code> + <code dir="auto">Bidirectional</code> on its data mount) and handed to a node-pinned Step as a <code dir="auto">local</code> PV (<code dir="auto">hostPath</code> dev-only — denied at <code dir="auto">baseline</code>, per the amended PSA table)</td>
+<td>the seam row</td>
+<td>on <code dir="auto">just local-helm</code>: a Step Pod writes <code dir="auto">/workspace</code> through a REAL overlay and the Depot reads the change set out of the upper</td>
+<td>medium — <strong><code dir="auto">local-helm</code> only</strong>, the darwin Depot in proc mode has no <code dir="auto">overlayfs</code></td>
+</tr>
+<tr>
+<td><strong><code dir="auto">0ad393c</code> — the exact-path overlay test</strong> — <code dir="auto">read_change_set</code> has never met a kernel-produced upper; every green test covers the copy rung’s approximation</td>
+<td>the <code dir="auto">LocalPath</code> row, which <em>is</em> the place to run it — not a separate privileged host</td>
+<td>whiteouts, opaque dirs, file renames, and absolute+relative <code dir="auto">redirect</code> resolution asserted against a REAL upper produced by a REAL Step</td>
+<td>the tier, and 2a supplies it</td>
+</tr>
+<tr>
+<td><strong>Export/Farm lifecycle and reaping</strong> — the per-Step volume objects and the Farm underneath them (eviction under a live Export is silent corruption, red-team #2)</td>
+<td>git-bug <code dir="auto">24476bc</code> (on the critical path, not beside it)</td>
+<td>no orphaned volume object, Export or Farm survives Run teardown; a reaped Farm under a live Export is refused, not corrupted</td>
+<td>medium</td>
+</tr>
+<tr>
+<td><strong>eager|lazy cutover config</strong> — the volume-kind line becomes a per-deployment posture</td>
+<td>the rows above</td>
+<td>an explicit knob, fail-closed; <code dir="auto">eager_fetch_total</code> goes to zero and stays there on a lazy deployment</td>
+<td>small, once the substrate is proven</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>Amended 2026-08-02 — the 2a chain was EXECUTED on this machine, end to end, and it holds. This
+is measurement, not a plan.</strong> Substrate: colima node, Ubuntu 24.04.4, kernel
+<strong>6.8.0-117-generic</strong>, k3s <strong>v1.35.0</strong>, docker runtime, ext4. Overlay module parameters
+<code dir="auto">redirect_dir</code>, <code dir="auto">index</code>, <code dir="auto">nfs_export</code> <strong>all default <code dir="auto">N</code></strong>. The chain, in the order it was proven:</p>
+<ol>
+<li><strong>The mount.</strong> <code dir="auto">export.rs:501-508</code>’s exact option string mounted <strong>first try</strong> from a
+privileged Pod with <code dir="auto">hostPath</code> + <code dir="auto">mountPropagation: Bidirectional</code> (that Pod’s <code dir="auto">/warm</code> was
+already <code dir="auto">shared</code>); the kernel echoed <code dir="auto">+uuid=on,nouserxattr</code>.</li>
+<li><strong>Propagation escapes the Pod — the load-bearing unknown.</strong> The overlay appears in the
+<strong>node’s</strong> <code dir="auto">/proc/1/mounts</code> with <code dir="auto">findmnt PROPAGATION=shared</code>. The whole <code dir="auto">LocalPath</code> delivery
+rested on this and it had never been observed.</li>
+<li><strong>PSA <code dir="auto">restricted</code> admits the delivery.</strong> A <code dir="auto">local</code> PV (nodeAffinity → colima) + PVC was
+admitted and delivered the <strong>real overlay</strong> as <code dir="auto">/workspace</code> — fstype <code dir="auto">overlay</code> in the
+container’s own <code dir="auto">/proc/self/mounts</code>, not a copy of it.</li>
+<li><strong>A restricted Step produces all four change-set forms.</strong> With <code dir="auto">runAsNonRoot</code>, <code dir="auto">runAsUser 1000</code>, <code dir="auto">drop: [ALL]</code>, <code dir="auto">seccompProfile: RuntimeDefault</code>, the upper held: a <strong>new file</strong> (uid
+1000); a <strong>modified file</strong> (<code dir="auto">trusted.overlay.origin</code>, lower nlink <code dir="auto">U-1</code>); a <strong>deletion</strong>
+(whiteout chardev <code dir="auto">0:0</code>); and a <strong>renamed directory</strong> (<code dir="auto">trusted.overlay.redirect='docs'</code> on an
+<strong>empty</strong> upper dir, <code dir="auto">trusted.overlay.impure='y'</code> on its parent). The lower layer stayed
+<strong>byte-for-byte pristine</strong>, and a file the Step never read was <strong>never copied up</strong> — laziness
+holds under a real Step, which is the claim this ADR is built on.</li>
+</ol>
+<p><strong>De-risked by this spike</strong> — the <code dir="auto">LocalPath</code> delivery row’s substrate (rows 1–4 of the chain are
+exactly its gate’s preconditions), and the <code dir="auto">0ad393c</code> exact-path row’s <em>inputs</em>: a kernel-produced
+upper carrying every marker shape the reader must handle now demonstrably exists and has been
+characterised on the substrate <code dir="auto">local-helm</code> runs on.</p>
+<p><strong>Still open, and not weakened</strong> — the <strong><code dir="auto">Delivery</code> seam</strong> row (refuse-at-launch is untouched by
+this spike), the second half of the <code dir="auto">LocalPath</code> gate (<strong>the Depot reading the change set with its
+own code</strong>, as opposed to the shapes being present for it to read), the whole of <code dir="auto">0ad393c</code>
+(<code dir="auto">read_change_set</code> has still never met this upper), the cutover-config row, and
+<strong>Export/Farm lifecycle and reaping — which this spike ENLARGED</strong>, see the mount-leak amendment
+at red-team #2.</p>
+<p><strong>Requirements this puts on production code.</strong> Each is a constraint, not a note:</p>
+<ul>
+<li><strong><code dir="auto">read_change_set</code> requires <code dir="auto">CAP_SYS_ADMIN</code> or it is silent data loss.</strong> Without it <code dir="auto">listxattr</code>
+<strong>omits</strong> the <code dir="auto">trusted.*</code> names entirely — no error, no hint — so a renamed directory reads as
+<em>“delete <code dir="auto">docs</code>, create empty <code dir="auto">documentation</code>”</em> and the contents are lost, because upper’s
+<code dir="auto">documentation</code> genuinely <strong>is</strong> empty and the files live in lower behind the redirect. This is
+the omission-shaped sibling of part 3’s <code dir="auto">ENODATA</code> discussion, and <strong>the existing guard does
+cover it</strong>: <code dir="auto">changeset.rs</code>’s <code dir="auto">require_marker_privilege()</code> reads <code dir="auto">CapEff</code> from
+<code dir="auto">/proc/self/status</code> and returns <code dir="auto">NoSysAdmin</code> before walking whenever <code dir="auto">Markers::Overlay</code> is
+requested — a capability check, not a <code dir="auto">getxattr</code> probe, so silent omission cannot slip past it.
+The obligation that remains is on the <em>deployment</em>: the Depot must actually hold the capability
+wherever an overlay-rung drain runs, or every such drain refuses.</li>
+<li><strong><code dir="auto">hostPath</code> is refused under PSA <code dir="auto">restricted</code></strong> — exact message: <code dir="auto">restricted volume type "hostPath"</code>. The <code dir="auto">local</code> PV + PVC is the <strong>only</strong> admissible delivery; <code dir="auto">hostPath</code> is a dev-only
+shortcut and will not survive a restricted namespace. (Consistent with the amended PSA table,
+which already records <code dir="auto">hostPath</code> as denied at <code dir="auto">baseline</code> too.)</li>
+<li><strong>Never reconstruct <code dir="auto">upperdir</code> by parsing host mounts.</strong> The host’s <code dir="auto">/proc/1/mounts</code> records the
+<strong>Pod’s</strong> paths for <code dir="auto">lowerdir</code> and <code dir="auto">upperdir</code>, not host paths, because that is the namespace the
+mount was made from. Code that re-derives an upper from the host mount table reads a path that
+does not exist there.</li>
+<li><strong>The fsGroup recipe</strong> (<code dir="auto">OnRootMismatch</code> + <code dir="auto">upper/</code> at <code dir="auto">uid:gid</code> with mode <strong><code dir="auto">2777</code></strong>) and the
+<strong>set-ownership-before-<code dir="auto">mount(2)</code></strong> ordering: both at red-team #4 above.</li>
+<li><strong>Boot-time mount reconciliation</strong>: red-team #2 above.</li>
+</ul>
+<p><strong>Refuted, so nobody re-litigates it.</strong> A <code dir="auto">redirect_dir</code> <strong>directory rename by an unprivileged,
+zero-capability uid WORKS</strong> — proven directly, through a bind mount, and through a PSA-restricted
+Pod’s PVC. It does <strong>not</strong> need <code dir="auto">CAP_SYS_ADMIN</code>; only <em>reading</em> the resulting xattr does. The two
+are different privileges on different sides of the boundary and this ADR should never again imply
+otherwise.</p>
+<p><strong>Still untested, plainly.</strong> Multi-node — the cluster is single-node, so the <code dir="auto">local</code> PV’s
+<code dir="auto">nodeAffinity</code> was never really exercised and node-pinning remains asserted rather than shown;
+<strong>concurrent Steps on one Export</strong>; and <strong>kubelet restart mid-Step</strong>.</p>
+</blockquote>
+<p><strong>Node pinning is what makes 2a a dev/single-node posture rather than the production default</strong>, and
+it must not be allowed to look like a shipping answer: it caps a Run at one node’s throughput and
+writes a placement constraint onto every Step, which fights <a href="0055-placement-profiles.md">0055</a> in
+precisely the way part 4 refuses to. 2a is a <strong>test and dogfood</strong> delivery that happens to be real.</p>
+<p><strong>2b — the transport.</strong> Everything only a network filesystem can answer, now <strong>locally verifiable</strong>
+(red-team #1 amendment: colima mounts NFS, kind’s node image already can).</p>
+<table>
+<thead>
+<tr>
+<th>work</th>
+<th>blocked on</th>
+<th>gate (what proves it)</th>
+<th>size</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>A userspace NFSv4 server</strong> — <code dir="auto">nfs-ganesha</code>, or a linked-in server, exporting the overlay merged view; the rung that needs no kernel <code dir="auto">nfsd</code> on the Depot</td>
+<td>2a (export something already known correct)</td>
+<td>a Step Pod mounts the export and round-trips a file, with the harness failing LOUDLY on any silent rung fallback</td>
+<td>spike, days</td>
+</tr>
+<tr>
+<td><strong><code dir="auto">Delivery::Nfs</code></strong> — the PV, its <code dir="auto">mountOptions: [nfsvers=4.2]</code> pin, and per-Step bind/reap churn</td>
+<td>the server row</td>
+<td>churn stays cheap at Run scale; the mount is asserted to be NFS at the version pinned, not merely “a mount”</td>
+<td>medium</td>
+</tr>
+<tr>
+<td><strong><code dir="auto">nfs-common</code> on Step nodes</strong> — confirmed per-node prerequisite; not in the colima image, and this repo has <strong>no colima provisioning hook</strong></td>
+<td>a choice: document it with a fail-fast preflight, install it from a recipe, or take <code dir="auto">csi-driver-nfs</code> (see the DaemonSet amendment, and its <code dir="auto">fsGroupPolicy</code> trap)</td>
+<td><code dir="auto">just local-helm</code> either mounts an Export or fails naming the missing package — never <code dir="auto">ContainerCreating</code> forever</td>
+<td>small</td>
+</tr>
+<tr>
+<td><strong>fsGroup over NFS</strong> — kubelet applies no fsGroup to NFS volumes (<code dir="auto">Managed: false</code>, red-team #4), so a non-root Step may be unable to write its own Workspace</td>
+<td>a decision: per-Step uid squash on the export vs group-writable modes stamped at Farm build (each changes what s7 fidelity means for modes)</td>
+<td>a non-root Step under the ADR-0039 restricted baseline writes an Export-backed <code dir="auto">/workspace</code></td>
+<td>medium, and a potential part-2 blocker</td>
+</tr>
+<tr>
+<td><strong>The fence over AUTH_SYS</strong> — <code dir="auto">resvport</code>, NetworkPolicy, uid squashing (red-team #5: a userspace client needs no kubelet and can assert any uid; first-mount pinning pins the <em>node</em>)</td>
+<td>the server row</td>
+<td>a co-tenant Pod on the same node cannot read another Step’s Export, demonstrated rather than argued — or the “capability” claim is honestly downgraded</td>
+<td>medium</td>
+</tr>
+<tr>
+<td><strong>Revocation, <code dir="auto">ESTALE</code> and the restart grace window</strong> (red-team #6: 90-second grace, <code dir="auto">nfsdcld</code>)</td>
+<td>the server row</td>
+<td>revoking under a live client, and restarting the server with live Exports, both produce a <strong>named</strong> Attempt failure rather than a mystery I/O error</td>
+<td>medium</td>
+</tr>
+<tr>
+<td><strong>Ops/sec under latency</strong> for a <code dir="auto">cargo</code>-shaped write load against a real in-cluster Export</td>
+<td>everything above</td>
+<td>the one unpriced number in the design; it decides whether part 5 is an accelerator or a requirement</td>
+<td>spike</td>
+</tr>
+</tbody>
+</table>
+<p>None of the 2b rows can be answered by 2a, and that is the reason 2b exists rather than being
+folded away: they are all properties of a network protocol, and <code dir="auto">LocalPath</code> has no network.</p>
+<ul>
+<li>
+<p><strong>The exact path has never executed, and every green test exercises the approximate one.</strong> This is
+the most important caveat on this ADR’s status and it is easy to miss, because the code is written,
+reviewed and tested. Part 3’s argument — that the rungs “do not differ in correctness” because the
+upper layer is the kernel’s own record — rests entirely on the <strong>overlay</strong> rung. Reaching it needs
+a privileged Linux host with a Rust toolchain, which nothing in this repo’s loop has: the dogfood
+node has no Rust, GitHub Actions is quota-blocked, and darwin cannot mount <code dir="auto">overlayfs</code> at all. So
+the mount, the resulting upper layer, and <code dir="auto">read_change_set</code> against a real one are all unexecuted,
+while the <strong>copy</strong> rung — whose change set is the <code dir="auto">(size, mtime, ctime)</code> approximation — is what
+every passing test covers. A reader should treat “the change set is exact” as <em>designed and
+unverified</em>, not as <em>working</em>. Tracked as the tier problem rather than as a bug in any one slice
+(git-bug <code dir="auto">0ad393c</code>), because the missing thing is a place to run it.</p>
+<blockquote>
+<p><strong>Amended 2026-08-02: the status is unchanged, the diagnosis is not.</strong> The exact path still has
+never executed. But “nothing in this repo’s loop has a privileged Linux host with a Rust
+toolchain” is the wrong reason — the Rust toolchain is not needed <em>on</em> the host, and
+<code dir="auto">just local-helm</code> already runs the Depot as an in-cluster StatefulSet on a Linux node with a
+real ext4 disk. 2a’s <code dir="auto">LocalPath</code> delivery makes a Step write through that overlay with no NFS
+anywhere, which is where <code dir="auto">read_change_set</code> finally meets a kernel-produced upper and where
+<code dir="auto">redirect_dir</code>/<code dir="auto">EXDEV</code> runs through a live mount. The blocker was never the tier; it was having
+filed this behind a transport. That is what the resequenced stage-2 table above fixes.</p>
+</blockquote>
+<blockquote>
+<p><strong>Amended 2026-08-02 (stage-2a substrate spike) — the substrate half of this caveat is now
+DISCHARGED; the code half is not, and the distinction is the whole of the remaining status.</strong>
+The overlay was mounted from the exact option string the code writes, its propagation was
+observed escaping into the node’s mount namespace, a PSA-<code dir="auto">restricted</code> Step Pod received the real
+overlay through a <code dir="auto">local</code> PV, and that Step produced a kernel-made upper containing every marker
+shape part 3 enumerates — new file, copy-up <code dir="auto">origin</code>, whiteout, and a directory <code dir="auto">redirect</code> with
+its parent’s <code dir="auto">impure</code> (chain and substrate in the 2a amendment above). So “the mount, the
+resulting upper layer” are no longer unexecuted, and <strong>the reasons given for why they could not
+be are all gone</strong>.
+<strong>What is still unexecuted is <code dir="auto">read_change_set</code> against one of these uppers.</strong> Scarab’s own
+reader has met no kernel-produced upper; every green test still covers the copy rung’s
+approximation. A reader should now treat “the change set is exact” as <em>designed, with its
+substrate verified and its reader unverified</em> — a narrower claim than yesterday’s and still not
+<em>working</em>. <code dir="auto">0ad393c</code> stays open and is no longer blocked on anything but doing it.</p>
+</blockquote>
+</li>
+<li>
+<p><strong>Operations-per-second under latency, measured, for a <code dir="auto">cargo</code>-shaped write workload against a
+real in-cluster Export.</strong> This is the one unpriced number in the design and it is the number that
+decides whether part 5 is an accelerator or a requirement. Byte throughput is <em>not</em> the thing to
+measure. The harness must fail loudly if it silently falls back a rung on the ladder — a spike
+that reports a flattering number because reflink or <code dir="auto">overlayfs</code> was unavailable is the failure
+mode this repo has already paid for.</p>
+</li>
+<li>
+<p><strong>Farm-and-Export reaping and the warm-tier space bound.</strong> Blocked on git-bug <code dir="auto">24476bc</code>, which is
+now on the critical path rather than beside it.</p>
+</li>
+<li>
+<p><strong><code dir="auto">overlayfs</code> with an NFS mount as <code dir="auto">lowerdir</code></strong>, which part 5 requires. Documented as working
+with caveats; unverified here, and load-bearing for the accelerator only.</p>
+</li>
+<li>
+<p><del><strong>Whether <code dir="auto">overlayfs</code> <code dir="auto">metacopy=on</code> can restore a hardlink Farm.</strong></del> <strong>Answered: not for a
+Workspace Export — but the first answer recorded here was wrong, and the correction matters.</strong></p>
+<p><strong>What was wrong.</strong> This ADR briefly claimed <code dir="auto">metacopy=on</code> “mounts and then does a full data
+copy-up anyway”, citing <code dir="auto">upper entry size 17, blocks 8</code> on a 17-byte file. That is not evidence of
+a data copy: <code dir="auto">metacopy</code> <strong>preserves <code dir="auto">size</code> by design</strong>, and 8 blocks is ext4’s 4 KiB minimum
+allocation. Re-run on an 8 MiB lower file the answer inverts — <code dir="auto">size=8388608</code> with <strong>8 blocks
+allocated</strong> and <code dir="auto">trusted.overlay.metacopy=""</code> on the upper entry. <strong><code dir="auto">metacopy</code> works, from the
+mount option alone, with the module parameter still <code dir="auto">N</code>.</strong> A hardlink Farm under <code dir="auto">metacopy</code> was
+also verified safe: link count 2, CAS blob still <code dir="auto">644</code>, merged view reading <code dir="auto">755</code>.</p>
+<p>The claim that the module parameter made it “accepted and ineffective” was also a <strong>category
+error</strong>: the service-side overlay is mounted on the <em>workspace service</em>, so a module parameter
+would be one node — the one the constraint already permits — not every Step node.</p>
+<p><strong>The real reason it cannot be used, which is a different fact entirely:</strong></p>
+<div class="expressive-code"><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="plaintext"><code><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">mount -o index=on,nfs_export=on,metacopy=on  →  refused: conflicting options</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="mount -o index=on,nfs_export=on,metacopy=on  →  refused: conflicting options"><div></div></button></div></figure></div>
+<p>An Export must be <strong>exportable</strong>, and <code dir="auto">nfs_export</code> and <code dir="auto">metacopy</code> are mutually exclusive. So on the
+service side the Farm cannot use hardlinks, and part 1’s reflink-or-copy stands — for this reason,
+not the one first written down.</p>
+<p><strong>And it opens something.</strong> Part 5’s node-side accelerator mounts an overlay with <strong>no
+<code dir="auto">nfs_export</code></strong>, so <code dir="auto">metacopy</code> <em>is</em> available there. That is worth following up rather than burying:
+it would let the accelerator’s upper carry metadata with no data copy.</p>
+<p>Kept in full because the mistake is the reusable part. The first probe measured a real thing and the
+conclusion drawn from it was unsound, for the third time in this ADR’s short life — and each time
+the tell was the same, a probe whose result was read as answering a question it had not asked.</p>
+</li>
+<li>
+<p><strong>Automatic Cache detection for lockfile-derived trees</strong> — recognising <code dir="auto">node_modules</code>, <code dir="auto">.venv</code>,
+vendored <code dir="auto">~/.m2</code> and the pip/uv caches from their lockfiles and routing them through
+<a href="0007-data-passing-model.md">0007</a>’s <strong>Cache</strong> instead of the Workspace, so that less is subject
+to the write cost at all. Deliberately <strong>not</strong> decided in this ADR: it is a heuristic whose
+failure mode is wrong output (<code dir="auto">target/</code> is Cache-shaped when the next Step rebuilds and an
+<em>output</em> when the next Step consumes a binary), and it deserves its own trade-off record rather
+than riding along on a transport decision.</p>
+</li>
+</ul>
+<div class="sl-heading-wrapper level-h2"><h2 id="references">References</h2><a class="sl-anchor-link" href="#references"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “References”</span></a></div>
+<ul>
+<li><a href="0004-execution-topology.md">0004</a> — pod-per-step; this ADR changes how the workspace reaches a Pod</li>
+<li><a href="0007-data-passing-model.md">0007</a> — Workspace / Result / Artifact / Cache</li>
+<li><a href="0027-restart-semantics.md">0027</a> — content-addressed invalidation; “smart never means mysterious”</li>
+<li><a href="0029-workspace-cas.md">0029</a> — per-file merkle CAS; the Farm is its tree-shaped view</li>
+<li><a href="0039-privileged-images.md">0039</a> — the restricted step baseline this ADR does not weaken</li>
+<li><a href="0050-retention-and-gc.md">0050</a> — retention and GC</li>
+<li><a href="0055-placement-profiles.md">0055</a> — placement profiles; part 4 must not silently amend them</li>
+<li><a href="0061-workspace-data-path.md">0061</a> — <strong>supersedes its part 2</strong>; amends its line on privileged
+mounts, its node-driver install prerequisite, and its cross-AZ confinement claim</li>
+</ul>
+</div></div><!-- footer --><footer class="astro-l3glpecf"><div class="pagination-links print:hidden astro-urgzmesl"><a class="prev astro-urgzmesl" href="/scarab-ci/tech/adr/0061-workspace-data-path/" rel="prev"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="astro-urgzmesl"><path d="m15 18-6-6 6-6" class="astro-urgzmesl"></path></svg>0061. Workspace data path: workspace service + node driver, lazy materialisation</a><a class="next astro-urgzmesl" href="/scarab-ci/tech/adr/0063-step-logs-on-the-data-depot/" rel="next">0063. Step logs live on the Data Depot, and the workspace service is renamed<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="astro-urgzmesl"><path d="m9 18 6-6-6-6" class="astro-urgzmesl"></path></svg></a></div></footer></main></div><div class="toc astro-c4hhlov6"><div class="astro-zfomn2we"><starlight-toc data-min-h="2" data-max-h="3" class="astro-3zcp52y7"><nav aria-labelledby="starlight__on-this-page" class="astro-3zcp52y7"><p id="starlight__on-this-page" class="astro-3zcp52y7">On this page</p><ul style="--depth: 0;" class="astro-2faeg4pj"><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#_top" style="--depth: 0;" class="astro-2faeg4pj">Overview</a></li><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#context" style="--depth: 0;" class="astro-2faeg4pj">Context</a><ul style="--depth: 1;" class="astro-2faeg4pj"><li style="--depth: 1;" class="astro-2faeg4pj"><a href="#the-complete-space-which-is-what-makes-this-decidable" style="--depth: 1;" class="astro-2faeg4pj">The complete space, which is what makes this decidable</a></li><li style="--depth: 1;" class="astro-2faeg4pj"><a href="#measured-facts" style="--depth: 1;" class="astro-2faeg4pj">Measured facts</a></li></ul></li><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#the-governing-principle-unchanged" style="--depth: 0;" class="astro-2faeg4pj">The governing principle, unchanged</a></li><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#decision" style="--depth: 0;" class="astro-2faeg4pj">Decision</a><ul style="--depth: 1;" class="astro-2faeg4pj"><li style="--depth: 1;" class="astro-2faeg4pj"><a href="#the-privilege-ladder" style="--depth: 1;" class="astro-2faeg4pj">The privilege ladder</a></li><li style="--depth: 1;" class="astro-2faeg4pj"><a href="#vocabulary" style="--depth: 1;" class="astro-2faeg4pj">Vocabulary</a></li><li style="--depth: 1;" class="astro-2faeg4pj"><a href="#the-fence" style="--depth: 1;" class="astro-2faeg4pj">The fence</a></li></ul></li><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#consequences" style="--depth: 0;" class="astro-2faeg4pj">Consequences</a></li><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#alternatives-considered" style="--depth: 0;" class="astro-2faeg4pj">Alternatives considered</a></li><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#red-team-findings-this-adr-does-not-yet-answer" style="--depth: 0;" class="astro-2faeg4pj">Red-team findings this ADR does not yet answer</a></li><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#open--deliberately-not-decided-here" style="--depth: 0;" class="astro-2faeg4pj">Open — deliberately not decided here</a><ul style="--depth: 1;" class="astro-2faeg4pj"><li style="--depth: 1;" class="astro-2faeg4pj"><a href="#stage-2--what-still-stands-between-here-and-an-export-delivered-workspace" style="--depth: 1;" class="astro-2faeg4pj">Stage 2 — what still stands between here and an Export-delivered /workspace</a></li></ul></li><li style="--depth: 0;" class="astro-2faeg4pj"><a href="#references" style="--depth: 0;" class="astro-2faeg4pj">References</a></li></ul></nav></starlight-toc><script type="module">var e=class extends HTMLElement{_current=this.querySelector(`a[aria-current="true"]`);minH=Number.parseInt(this.dataset.minH||`2`,10);maxH=Number.parseInt(this.dataset.maxH||`3`,10);set current(e){e!==this._current&&(this._current&&this._current.removeAttribute(`aria-current`),e.setAttribute(`aria-current`,`true`),this._current=e)}onIdle=e=>(window.requestIdleCallback||(e=>setTimeout(e,1)))(e);constructor(){super(),this.onIdle(()=>this.init())}init=()=>{let e=[...this.querySelectorAll(`a`)],t=e=>{if(e instanceof HTMLHeadingElement){if(e.id===`_top`)return!0;let t=e.tagName[1];if(t){let e=Number.parseInt(t,10);if(e>=this.minH&&e<=this.maxH)return!0}}return!1},n=e=>{if(!e)return null;let r=e;for(;e;){if(t(e))return e;for(e=e.previousElementSibling;e?.lastElementChild;)e=e.lastElementChild;let r=n(e);if(r)return r}return n(r.parentElement)},r=t=>{for(let{isIntersecting:r,target:i}of t){if(!r)continue;let t=n(i);if(!t)continue;let a=e.find(e=>e.hash===`#${encodeURIComponent(t.id)}`);if(a){this.current=a;break}}},i=document.querySelectorAll(`main [id], main [id] ~ *, main .content > *`),a,o=()=>{a||(a=new IntersectionObserver(r,{rootMargin:this.getRootMargin()}),i.forEach(e=>a.observe(e)))};o();let s;window.addEventListener(`resize`,()=>{a&&=(a.disconnect(),void 0),clearTimeout(s),s=setTimeout(()=>this.onIdle(o),200)})};getRootMargin(){let e=(document.querySelector(`header`)?.getBoundingClientRect().height||0)+(this.querySelector(`summary`)?.getBoundingClientRect().height||0)+32;return`-${e}px 0% ${e+53-document.documentElement.clientHeight}px`}};customElements.define(`starlight-toc`,e);</script></div></div></main></div></div></main><footer class="astro-6hobpl37"><div data-slot="footer-text" class="astro-6hobpl37">Scarab — a modern CI engine for Kubernetes: forge-native, on a durable core. Themed with <a href="https://github.com/lucas-labs/lucode-starlight-theme">Lucode Starlight</a>.</div></footer></div><div popover="auto" id="drawer" class="astro-cn5bvrke"><button class="sheet-overlay astro-cn5bvrke" popovertarget="drawer" popovertargetaction="hide"></button><div class="content astro-cn5bvrke"><div class="header astro-cn5bvrke"><button class="drag-icon astro-cn5bvrke" popovertarget="drawer" popovertargetaction="hide"><span class="astro-cn5bvrke"></span></button></div><div class="body astro-cn5bvrke"><div class="links-nav astro-cn5bvrke"><a href="/scarab-ci/get-started/overview/" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">Get Started</a><a href="/scarab-ci/usage/pipeline-syntax/" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">Usage</a><a href="/scarab-ci/reference/api/" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">References</a><a href="https://demo-scarab.ahiravan.dev/" target="_blank" rel="noopener" class="astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke astro-cn5bvrke">Demo</a></div><div class="links-docs astro-cn5bvrke"><div class="container-sidebar-entry astro-cn5bvrke"><h4 class="entry-title astro-cn5bvrke">Get Started</h4><a href="/scarab-ci/get-started/overview/" class="astro-cn5bvrke" data-active="false">Overview</a><a href="/scarab-ci/get-started/deploy-helm/" class="astro-cn5bvrke" data-active="false">Installation</a><a href="/scarab-ci/get-started/run-locally/" class="astro-cn5bvrke" data-active="false">Run locally</a><a href="/scarab-ci/get-started/local-development/" class="astro-cn5bvrke" data-active="false">Local Development</a></div><div class="container-sidebar-entry astro-cn5bvrke"><h4 class="entry-title astro-cn5bvrke">Usage</h4><a href="/scarab-ci/usage/pipeline-syntax/" class="astro-cn5bvrke" data-active="false">Pipeline Syntax</a><a href="/scarab-ci/usage/secrets/" class="astro-cn5bvrke" data-active="false">Secrets</a><a href="/scarab-ci/usage/environments/" class="astro-cn5bvrke" data-active="false">Environments</a><a href="/scarab-ci/usage/environment-variables/" class="astro-cn5bvrke" data-active="false">Environment Variables</a></div><div class="container-sidebar-entry astro-cn5bvrke"><h4 class="entry-title astro-cn5bvrke">References</h4><a href="/scarab-ci/reference/api/" class="astro-cn5bvrke" data-active="false">API</a><a href="/scarab-ci/tech/context/" class="astro-cn5bvrke" data-active="false">Thesis &amp; language (CONTEXT)</a></div></div></div></div></div><script type="module">var e=document.getElementById(`drawer`);e&&e.addEventListener(`toggle`,e=>{let t=e.newState===`open`;document.documentElement.style.overflow=t?`hidden`:``,document.body.style.overflow=t?`hidden`:``});</script></body></html>
