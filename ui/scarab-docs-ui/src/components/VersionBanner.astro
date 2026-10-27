@@ -1,0 +1,62 @@
+---
+// Banner override: Starlight's own banner, plus a notice on pages from a line
+// that is no longer the latest. Decided at page load from versions.json, for
+// the same reason as the dropdown: this build cannot know what ships after it.
+import DefaultBanner from '@astrojs/starlight/components/Banner.astro';
+import { DOCS_BASE, DOCS_ROOT, DOCS_VERSION } from '../lib/docs-env.mjs';
+---
+
+<DefaultBanner />
+{
+  DOCS_VERSION && (
+    <scarab-version-notice
+      data-root={DOCS_ROOT}
+      data-base={DOCS_BASE}
+      data-version={DOCS_VERSION}
+      data-pagefind-ignore
+      hidden
+    >
+      You are reading the docs for <strong>{DOCS_VERSION}</strong>.{' '}
+      <a href={DOCS_ROOT}>
+        The latest release is <span data-latest /> →
+      </a>
+    </scarab-version-notice>
+  )
+}
+
+<script>
+  import { loadManifest, switchTo } from '../lib/versions-client';
+
+  customElements.define(
+    'scarab-version-notice',
+    class extends HTMLElement {
+      async connectedCallback() {
+        const { root = '', base = '', version = '' } = this.dataset;
+        const manifest = await loadManifest(root);
+        if (!manifest || manifest.latest === version) return;
+        const latest = this.querySelector('[data-latest]');
+        if (latest) latest.textContent = manifest.latest;
+        this.querySelector('a')?.addEventListener('click', (e) => {
+          e.preventDefault();
+          switchTo(root, base, manifest, manifest.latest);
+        });
+        this.hidden = false;
+      }
+    },
+  );
+</script>
+
+<style>
+  scarab-version-notice:not([hidden]) {
+    display: block;
+    padding: var(--sl-nav-pad-y) var(--sl-nav-pad-x);
+    background-color: var(--muted);
+    color: var(--foreground);
+    font-size: var(--sl-text-sm);
+    text-align: center;
+  }
+  a {
+    color: var(--sl-color-text-accent);
+    font-weight: 500;
+  }
+</style>

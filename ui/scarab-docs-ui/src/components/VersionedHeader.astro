@@ -1,0 +1,14 @@
+---
+// Header override: lucode's header, then the docs version dropdown.
+//
+// Not a ThemeSelect override, though that is where a picker usually goes:
+// lucode's Header imports its OWN ThemeSelect directly rather than through
+// Starlight's override slot, so a ThemeSelect override never reaches the page.
+// Overriding Header makes lucode log that it skipped its own Header override;
+// that is expected — we render it right here.
+import LucodeHeader from 'lucode-starlight/components/overrides/Header.astro';
+import VersionSelect from './VersionSelect.astro';
+---
+
+<LucodeHeader />
+<VersionSelect />
