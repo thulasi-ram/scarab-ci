@@ -200,11 +200,17 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+  # Kubernetes forbids ANY change to volumeClaimTemplates after creation, so
+  # these labels must be version-free: workspaceLabels carries helm.sh/chart
+  # and app.kubernetes.io/version, which turned every chart bump into a
+  # rejected StatefulSet update. image.yml's chart job renders two versions
+  # and diffs every immutable spec field to keep it that way.
   volumeClaimTemplates:
     - metadata:
         name: cas
         labels:
-          {{- include "scarab.workspaceLabels" . | nindent 10 }}
+          {{- include "scarab.workspaceSelectorLabels" . | nindent 10 }}
+          app.kubernetes.io/component: workspace
       spec:
         accessModes: ["ReadWriteOnce"]
         {{- if .Values.workspace.persistence.storageClass }}

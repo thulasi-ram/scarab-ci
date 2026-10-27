@@ -582,6 +582,12 @@ openapi-drift:
 pr-gate n:
     python3 scripts/pr_gate.py {{n}}
 
+# Chart guard (mirrors the CI `chart` job step): render the chart at two
+# versions and fail if any immutable StatefulSet spec field differs — such a
+# field makes every chart upgrade a rejected update. Needs helm + yq v4.
+chart-immutable:
+    scripts/chart_statefulset_immutable.sh deploy/helm/scarab
+
 # Compile-check everything.
 check:
     cargo check --workspace
