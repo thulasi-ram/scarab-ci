@@ -200,11 +200,8 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-  # Kubernetes forbids ANY change to volumeClaimTemplates after creation, so
-  # these labels must be version-free: workspaceLabels carries helm.sh/chart
-  # and app.kubernetes.io/version, which turned every chart bump into a
-  # rejected StatefulSet update. image.yml's chart job renders two versions
-  # and diffs every immutable spec field to keep it that way.
+  # Immutable after creation, so version-free labels only (not workspaceLabels);
+  # guarded by scripts/chart_statefulset_immutable.sh.
   volumeClaimTemplates:
     - metadata:
         name: cas

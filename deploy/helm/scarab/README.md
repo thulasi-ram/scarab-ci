@@ -333,6 +333,26 @@ which is exactly the cost the warm tier exists to remove.
 > zone placement, and reachability from a step Pod. `workspace.replicaCount > 1`
 > has not been exercised.
 
+### Upgrading from 0.2.1 or earlier
+
+Up to 0.2.1 the StatefulSet's `volumeClaimTemplates` carried the chart and app
+version as labels, and Kubernetes never lets an update change that field, so
+every upgrade failed with `spec: Forbidden: updates to statefulset spec for
+fields other than 'replicas', 'ordinals', 'template', ...`. From 0.2.2 the
+template is version-free, but an existing StatefulSet still holds the old
+labels. Delete it once, keeping its Pod and volume, then upgrade:
+
+```sh
+kubectl -n scarab delete sts --cascade=orphan \
+  -l app.kubernetes.io/name=scarab-workspace,app.kubernetes.io/instance=<release>
+helm upgrade scarab oci://ghcr.io/thulasi-ram/charts/scarab --version 0.2.2 ...
+```
+
+The recreated StatefulSet re-adopts the existing PVC by name (`cas-<sts>-0`);
+the old PVC simply keeps its old labels. Expect
+one restart of the workspace Pod. Later upgrades apply in place — the chart's CI
+renders two versions and fails if any immutable StatefulSet field differs.
+
 ## Plugins (`plugins`, ADR-0072)
 
 Off by default. `plugins.enabled=true` runs the plugin runtime: Scarab manages

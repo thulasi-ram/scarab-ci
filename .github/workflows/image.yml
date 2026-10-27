@@ -405,9 +405,6 @@ jobs:
           grep -q 'SCARAB_SIDECAR_IMAGE: "ghcr.io/x/sidecar:pinned"' <<<"$out"
           grep -q 'SCARAB_RESULTS_API_URL: "http://t-scarab.ci.svc"' <<<"$out"
 
-      # A value that moves with the chart version inside an immutable
-      # StatefulSet field makes every upgrade a rejected update (the workspace
-      # PVC template's version labels did, from v0.1.0 to v0.2.1).
       - name: StatefulSet upgrades apply in place
         run: scripts/chart_statefulset_immutable.sh "$CHART_DIR"
 

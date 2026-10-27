@@ -434,6 +434,9 @@ workspace:
     # PVC is sizing the CACHE, not a leak's runway. Pressure is visible as
     # scarab_workspace_warm_used_bytes vs scarab_workspace_warm_budget_bytes,
     # and what the bound costs as warm_evicted_bytes_total{class="cache_only"}.
+    # Choose it up front: it lands in the StatefulSet's volumeClaimTemplates,
+    # which Kubernetes never lets an upgrade change (to resize, expand the PVC
+    # itself, then recreate the StatefulSet with --cascade=orphan).
     size: 20Gi
     # This volume is the warm CAS — the Depot's local cache tier in front of
     # the cold object store (ADR-0066: the Depot is a cache). Its whole point
