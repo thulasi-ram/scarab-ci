@@ -3,6 +3,8 @@ import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 import starlightOpenAPI from 'starlight-openapi';
 import lucode from 'lucode-starlight';
+import { baseLinks } from './scripts/base-links.mjs';
+import { DOCS_BASE, DOCS_ROOT } from './src/lib/docs-env.mjs';
 
 // Scarab documentation site — ADR-0040.
 // - Operator-primary IA, published honestly (stubs are explicit).
@@ -10,10 +12,12 @@ import lucode from 'lucode-starlight';
 //   place (starlight-openapi, build time). ADRs + CONTEXT.md are synced from
 //   ../../docs by scripts/sync-content.mjs (a gitignored prebuild step — the
 //   canonical source stays in docs/; nothing is committed twice).
-// - GitHub Pages project subpath: base '/scarab-ci/'.
+// - GitHub Pages project subpath: base '/scarab-ci/' — or, for a release line's
+//   own copy, '/scarab-ci/vX.Y/' (SCARAB_DOCS_BASE; see scripts/docs-version.mjs
+//   for how the versioned site is laid out).
 export default defineConfig({
   site: 'https://thulasi-ram.github.io',
-  base: '/scarab-ci/',
+  base: DOCS_BASE,
   vite: {
     // AsciiScene imports baked frames from ui/brand/ascii/generated (the
     // canonical committed output — not copied per-app). Dev server needs the
@@ -33,12 +37,19 @@ export default defineConfig({
       },
       // Brand favicon (ui/brand): theme-aware SVG (ink outline on light, gold on
       // dark), with .ico + apple-touch fallbacks. Starlight prepends `base` to
-      // `favicon`; the `head` hrefs are written with the /scarab-ci/ base inline.
+      // `favicon`; the `head` hrefs are written with the build's base inline.
       favicon: '/favicon.svg',
       head: [
-        { tag: 'link', attrs: { rel: 'icon', href: '/scarab-ci/favicon.ico', sizes: 'any' } },
-        { tag: 'link', attrs: { rel: 'apple-touch-icon', href: '/scarab-ci/apple-touch-icon.png' } },
+        { tag: 'link', attrs: { rel: 'icon', href: `${DOCS_BASE}favicon.ico`, sizes: 'any' } },
+        { tag: 'link', attrs: { rel: 'apple-touch-icon', href: `${DOCS_BASE}apple-touch-icon.png` } },
       ],
+      // Docs versioning: the version dropdown rides in the header, the
+      // "not the latest" notice in the banner (see the components for why
+      // Header rather than ThemeSelect).
+      components: {
+        Header: './src/components/VersionedHeader.astro',
+        Banner: './src/components/VersionBanner.astro',
+      },
       customCss: [
         // Geist is the face shadcn/ui (and thus the Lucode base) is drawn with —
         // JetBrains Mono stays for machine tokens (ids, logs, durations) and is
@@ -117,5 +128,8 @@ export default defineConfig({
         },
       ],
     }),
+    // Last, so it sees the finished pages: point hand-written /scarab-ci/
+    // links at this build's base.
+    baseLinks(DOCS_ROOT, DOCS_BASE),
   ],
 });

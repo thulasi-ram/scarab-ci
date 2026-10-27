@@ -1,0 +1,64 @@
+---
+// The docs version dropdown. Its options come from /scarab-ci/versions.json at
+// page load, not from the build: old lines are never rebuilt, yet must still
+// list every newer one. Hidden until the manifest loads and names this build's
+// line, so a local build (no version, no manifest) shows nothing.
+import { DOCS_BASE, DOCS_ROOT, DOCS_VERSION } from '../lib/docs-env.mjs';
+---
+
+{
+  DOCS_VERSION && (
+    <scarab-version-select
+      data-root={DOCS_ROOT}
+      data-base={DOCS_BASE}
+      data-version={DOCS_VERSION}
+      hidden
+    >
+      <select aria-label="Documentation version" />
+    </scarab-version-select>
+  )
+}
+
+<script>
+  import { loadManifest, switchTo } from '../lib/versions-client';
+
+  customElements.define(
+    'scarab-version-select',
+    class extends HTMLElement {
+      async connectedCallback() {
+        const { root = '', base = '', version = '' } = this.dataset;
+        const select = this.querySelector('select');
+        const manifest = await loadManifest(root);
+        if (!select || !manifest?.versions.some((v) => v.version === version)) return;
+        for (const { version: v } of manifest.versions) {
+          const label = v === manifest.latest ? `${v} (latest)` : v;
+          select.add(new Option(label, v, false, v === version));
+        }
+        this.hidden = false;
+        select.addEventListener('change', () => switchTo(root, base, manifest, select.value));
+      }
+    },
+  );
+</script>
+
+<style>
+  scarab-version-select:not([hidden]) {
+    display: flex;
+    align-items: center;
+    margin-inline-start: 0.5rem;
+  }
+  select {
+    height: 2rem;
+    padding-inline: 0.5rem;
+    border: 1px solid var(--border);
+    border-radius: calc(var(--radius) - 2px);
+    background-color: transparent;
+    color: var(--foreground);
+    font-family: var(--sl-font-mono);
+    font-size: 0.8125rem;
+    cursor: pointer;
+  }
+  select:hover {
+    background-color: color-mix(in oklab, var(--accent) 80%, transparent);
+  }
+</style>

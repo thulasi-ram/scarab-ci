@@ -1,43 +1,144 @@
 # Build and deploy the Scarab docs site to GitHub Pages — ADR-0040.
 #
-# Release-gated: publishes on a v* tag (the production path) plus a manual
-# workflow_dispatch (the escape hatch while pre-tag). NOT on every push to main.
-# The build runs from ui/scarab-docs-ui but checks out the whole repo, so it can
-# source ../../docs (ADRs, CONTEXT) and ../../openapi.json in place.
+# Release-gated and VERSIONED: a stable v* tag publishes its release line
+# (vX.Y) into /scarab-ci/vX.Y/ and, when it is the highest stable tag, also
+# rebuilds the root /scarab-ci/ as "latest". Never on a push to main, so
+# unreleased docs cannot replace released ones. The rules for which tag
+# publishes what live in ui/scarab-docs-ui/scripts/docs-version.mjs (tested).
+#
+# Old lines are never rebuilt, so the accumulated site is kept on the
+# `gh-pages` branch: each run adds its build there, pushes, then deploys the
+# WHOLE branch through the same Pages artifact + `github-pages` environment as
+# before. (deploy-pages replaces the entire site on every deploy — without the
+# branch, publishing v0.3 would delete v0.2.) The `github-pages` environment
+# must allow `v*` tags, not just main; it was main-only until 2026-10-28, which
+# rejected every tag deploy.
+#
+# The build checks out the whole repo at the TAG, so it sources ../../docs
+# (ADRs, CONTEXT) and ../../openapi.json as they were at that release.
 name: docs
 
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to (re)publish, e.g. v0.2.0. Only stable tags publish.
+        required: true
 
-# Least privilege for Pages deploys via OIDC.
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
-# One in-flight deploy at a time; don't cancel a publish midway.
+# One in-flight publish at a time — runs push to the same gh-pages branch —
+# and never cancel one midway.
 concurrency:
   group: pages
   cancel-in-progress: false
 
 jobs:
-  build:
+  publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+    permissions:
+      contents: write # push the accumulated site to gh-pages
+    outputs:
+      publish: ${{ steps.plan.outputs.publish }}
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      SITE: ${{ github.workspace }}/site
     steps:
       - uses: actions/checkout@v4
-      - uses: withastro/action@v3
         with:
-          path: ui/scarab-docs-ui
-          package-manager: npm
+          ref: ${{ inputs.tag || github.ref_name }}
+          fetch-depth: 0 # every tag: "latest" is decided against all of them
+
+      - name: Plan
+        id: plan
+        working-directory: ui/scarab-docs-ui
+        run: |
+          if [ ! -f scripts/docs-version.mjs ]; then
+            echo "::error::$TAG predates versioned docs and cannot be published at a versioned base"
+            exit 1
+          fi
+          node --test scripts/*.test.mjs
+          git tag -l 'v*' | node scripts/docs-version.mjs plan "$TAG" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Skipped
+        if: steps.plan.outputs.publish != 'true'
+        env:
+          REASON: ${{ steps.plan.outputs.reason }}
+        run: echo "::notice::not publishing docs — $REASON"
+
+      - if: steps.plan.outputs.publish == 'true'
+        uses: actions/setup-node@v4
+        with:
           node-version: 24
+          cache: npm
+          cache-dependency-path: ui/scarab-docs-ui/package-lock.json
+
+      - if: steps.plan.outputs.publish == 'true'
+        working-directory: ui/scarab-docs-ui
+        run: npm ci
+
+      - name: Check out the published site
+        if: steps.plan.outputs.publish == 'true'
+        run: |
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null; then
+            git fetch --depth 1 origin gh-pages
+            git worktree add --detach "$SITE" FETCH_HEAD
+          else
+            # First publish: an empty, history-free branch. (Not `worktree add
+            # --orphan`, which needs git >= 2.42.)
+            git worktree add --detach "$SITE"
+            git -C "$SITE" checkout -q --orphan gh-pages
+            git -C "$SITE" rm -rfq .
+          fi
+
+      - name: Build the release line (and latest)
+        if: steps.plan.outputs.publish == 'true'
+        working-directory: ui/scarab-docs-ui
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+          LATEST: ${{ steps.plan.outputs.latest }}
+        run: |
+          SCARAB_DOCS_BASE="/scarab-ci/$VERSION/" SCARAB_DOCS_VERSION="$VERSION" npm run build
+          rm -rf "${SITE:?}/$VERSION"
+          cp -R dist "$SITE/$VERSION"
+          if [ "$LATEST" = true ]; then
+            SCARAB_DOCS_BASE=/scarab-ci/ SCARAB_DOCS_VERSION="$VERSION" npm run build
+            # Replace the root build, keeping every line's folder + the manifest.
+            find "$SITE" -mindepth 1 -maxdepth 1 -regextype posix-extended \
+              ! -name .git ! -name versions.json ! -regex '.*/v[0-9]+\.[0-9]+' \
+              -exec rm -rf {} +
+            cp -R dist/. "$SITE/"
+          fi
+          node scripts/docs-version.mjs manifest "$SITE/versions.json" "$TAG" "$LATEST"
+
+      - name: Push the site to gh-pages
+        if: steps.plan.outputs.publish == 'true'
+        working-directory: site
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git diff --cached --quiet || git commit -q -m "docs: publish $TAG"
+          git push origin HEAD:refs/heads/gh-pages
+
+      - if: steps.plan.outputs.publish == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
 
   deploy:
-    needs: build
+    needs: publish
+    if: needs.publish.outputs.publish == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Least privilege for Pages deploys via OIDC.
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
