@@ -7627,6 +7627,8 @@ export interface operations {
             query?: {
                 /** @description max runs (default 50, capped 200) */
                 limit?: number;
+                /** @description only deploy runs into this Environment (ADR-0074); applied before `limit`; must not be empty */
+                environment?: string;
             };
             header?: never;
             path: {
@@ -7646,6 +7648,13 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["RunListResponse"];
                 };
+            };
+            /** @description `environment` present but empty */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };

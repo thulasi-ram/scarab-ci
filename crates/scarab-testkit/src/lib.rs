@@ -1582,6 +1582,7 @@ impl Db for InMemoryDb {
         &self,
         org: &str,
         project: &str,
+        environment: Option<&str>,
         limit: u32,
     ) -> Result<Vec<RunSummary>, DbError> {
         let want = (org.to_string(), project.to_string());
@@ -1591,6 +1592,7 @@ impl Db for InMemoryDb {
             .iter()
             .filter(|(run, _)| st.run_tenant.get(*run) == Some(&want))
             .map(|(run, status)| fake_run_summary(&st, run, *status))
+            .filter(|s| environment.is_none_or(|e| s.environment.as_deref() == Some(e)))
             .collect();
         out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.run.0.cmp(&a.run.0)));
         out.truncate(limit as usize);

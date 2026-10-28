@@ -813,11 +813,15 @@ pub trait Db: Send + Sync {
 
     /// The most recent runs for one tenant `(org, project)`, newest first, capped
     /// at `limit` — the source for a repo's `GET /v1/repos/{org}/{repo}/runs`
-    /// history and the dashboard's per-repo pass/fail chart.
+    /// history and the dashboard's per-repo pass/fail chart. With
+    /// `environment`, only the deploy runs into that Environment (ADR-0074 §2:
+    /// a Project's deploys are its Runs filtered by Environment) — filtered
+    /// before the `limit`, so a page holds the newest *matching* runs.
     async fn list_runs_for_tenant(
         &self,
         org: &str,
         project: &str,
+        environment: Option<&str>,
         limit: u32,
     ) -> Result<Vec<RunSummary>, DbError>;
 

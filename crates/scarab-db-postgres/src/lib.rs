@@ -1377,19 +1377,24 @@ impl Db for PostgresDb {
         &self,
         org: &str,
         project: &str,
+        environment: Option<&str>,
         limit: u32,
     ) -> Result<Vec<RunSummary>, DbError> {
+        // `$3 IS NULL` disengages the Environment filter; it is applied in the
+        // WHERE, before the LIMIT, so a filtered page is the newest matches.
         let rows = sqlx::query(
             "SELECT id, status, created_at, updated_at, tenant_org, tenant_project, run_number,
                     origin_trigger_kind, origin_actor, origin_ref, origin_sha, origin_pr_number,
                     origin_pr_base, pipeline, trigger_title, deploy_environment
              FROM runs
              WHERE tenant_org = $1 AND tenant_project = $2
+               AND ($3::text IS NULL OR deploy_environment = $3)
              ORDER BY created_at DESC, id DESC
-             LIMIT $3",
+             LIMIT $4",
         )
         .bind(org)
         .bind(project)
+        .bind(environment)
         .bind(limit as i64)
         .fetch_all(self.pool())
         .await

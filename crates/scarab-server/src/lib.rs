@@ -2151,6 +2151,16 @@ pub struct ListRunsQuery {
     pub limit: Option<u32>,
 }
 
+/// Query for [`list_repo_runs`]: a page size plus an optional Environment.
+#[derive(Debug, Deserialize)]
+pub struct ListRepoRunsQuery {
+    /// Max runs to return (default [`DEFAULT_RUNS_LIMIT`], capped at [`MAX_RUNS_LIMIT`]).
+    pub limit: Option<u32>,
+    /// Only the deploy runs into this Environment (ADR-0074 §2). Absent = every
+    /// run; present but empty is a 400, never a silent "match nothing".
+    pub environment: Option<String>,
+}
+
 /// Default page size for `GET /v1/runs`.
 const DEFAULT_RUNS_LIMIT: u32 = 50;
 /// Upper bound so a client can't request an unbounded scan.
@@ -3333,7 +3343,7 @@ async fn list_projects(
             // Recency signal (ADR-0046): the tenant's most recent run, if any.
             let last_run_at = st
                 .db
-                .list_runs_for_tenant(&resolved.org, &resolved.project, 1)
+                .list_runs_for_tenant(&resolved.org, &resolved.project, None, 1)
                 .await?
                 .first()
                 .map(|r| r.created_at.0);
@@ -3371,23 +3381,35 @@ async fn list_projects(
     params(
         ("org" = String, Path, description = "org slug"),
         ("repo" = String, Path, description = "project (repo) name"),
-        ("limit" = Option<u32>, Query, description = "max runs (default 50, capped 200)")
+        ("limit" = Option<u32>, Query, description = "max runs (default 50, capped 200)"),
+        ("environment" = Option<String>, Query, description = "only deploy runs into this Environment (ADR-0074); applied before `limit`; must not be empty")
     ),
-    responses((status = 200, body = RunListResponse))
+    responses(
+        (status = 200, body = RunListResponse),
+        (status = 400, description = "`environment` present but empty")
+    )
 )]
 async fn list_repo_runs(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((org, repo)): Path<(String, String)>,
-    Query(q): Query<ListRunsQuery>,
+    Query(q): Query<ListRepoRunsQuery>,
 ) -> Result<Json<RunListResponse>, ApiError> {
     let scope = scarab_identity::Scope::Project {
         org: org.clone(),
         name: repo.clone(),
     };
     authorize_scoped(&st, &headers, Action::Read, Some(&scope)).await?;
+    if q.environment.as_deref() == Some("") {
+        return Err(ApiError::BadRequest(
+            "`environment` must name an Environment; omit it to list every run".into(),
+        ));
+    }
     let limit = q.limit.unwrap_or(DEFAULT_RUNS_LIMIT).min(MAX_RUNS_LIMIT);
-    let runs = st.db.list_runs_for_tenant(&org, &repo, limit).await?;
+    let runs = st
+        .db
+        .list_runs_for_tenant(&org, &repo, q.environment.as_deref(), limit)
+        .await?;
     Ok(Json(RunListResponse {
         runs: run_summaries(&st, runs).await?,
     }))
