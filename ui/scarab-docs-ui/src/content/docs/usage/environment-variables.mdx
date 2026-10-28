@@ -20,12 +20,12 @@ machine, see [Local Development](/scarab-ci/get-started/local-development/).
 |---|---|
 | `SCARAB_DATABASE_URL` | Postgres connection, which holds run state and the event log; mandatory for every serving role. |
 | `SCARAB_ADDR` | Bind address (default `0.0.0.0:8080`). |
-| `SCARAB_ROLE` | Which slice(s) this process runs: `api` / `scheduler` / `executor` / `webhook` / `converged`. |
+| `SCARAB_ROLE` | Which slice(s) this process runs: `api` / `scheduler` / `executor` / `webhook` / `converged`, or `workspace` for the Data Depot. |
 | `SCARAB_EXECUTOR` | `k8s` (prod) or `local` (dev/CLI). |
 | `SCARAB_NAMESPACE` | k8s namespace step Pods launch into. |
 | `SCARAB_PUBLIC_URL` | Scarab's public base URL, the run deep-link every forge status carries (default `http://localhost:8080`). |
 
-**Object store**: set `SCARAB_S3_BUCKET` to select S3/MinIO; otherwise `SCARAB_OBJECT_DIR` is the fallback to a local directory (dev).
+**Object store**: set `SCARAB_S3_BUCKET` to select S3/MinIO. For tests and dev loops you can set `SCARAB_OBJECT_DIR` to a local directory instead. With neither, the server refuses to start.
 
 | Variable | Purpose |
 |---|---|

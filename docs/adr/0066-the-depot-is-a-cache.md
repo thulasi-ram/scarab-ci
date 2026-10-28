@@ -13,6 +13,12 @@
   is new here), [0013](0013-history-and-observability.md) (**amends "bodies never"**),
   [0047](0047-retry-classification-and-attempt-model.md) (the failure classes the clocks split into)
 
+> **Status note (2026-10-28):** The drain write path is no longer replica-local. git-bug
+> `afb13c2` (commit `0c1973d`) stages each sealed pack in the shared Postgres index, so more than
+> one Depot replica is correct for drains. It is tested with two routers over one database and one
+> bucket, not yet on a live cluster; the chart still defaults `replicaCount` to 1
+> (`deploy/helm/scarab/values.yaml`).
+
 > **Amended 2026-08-24 by [0067](0067-the-pack-is-the-record.md) — the "soft, recommended" stance
 > is reversed: Postgres *and* object storage are hard requirements (owner decision, 2026-08-23).**
 > 0067 is the packing ADR point 7 called for, and it implements point 1's cache invariant by
@@ -584,8 +590,10 @@ speculative:
   something on the Depot's volume that cannot be recreated is a defect by this ADR, regardless of how
   convenient it is.
 - **HA requires object storage, and that is now a documented product statement**, not an inference an
-  operator has to make. Warm-only remains supported, with a bounded recent window and a per-Attempt
-  stamp (`42d997c`, [0064](0064-durability-tiering-and-the-write-path.md) part 5).
+  operator has to make. ~~Warm-only remains supported, with a bounded recent window and a per-Attempt
+  stamp (`42d997c`, [0064](0064-durability-tiering-and-the-write-path.md) part 5).~~ (Reversed by
+  [0067](0067-the-pack-is-the-record.md): object storage is required, and the server refuses to
+  start without one: `MissingObjectStore` in `crates/scarab-server/src/config.rs`.)
 - **`WS_DRAIN_ESCALATION_MS` becomes operator-facing documentation** with a sizing rule, and a stale
   helper image now fails slowly. Both are new things to explain in the operations docs.
 - **The workspace Service becomes headless**, and

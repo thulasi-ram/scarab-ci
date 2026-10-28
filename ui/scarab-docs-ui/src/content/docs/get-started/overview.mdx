@@ -43,10 +43,12 @@ in seconds.
 Whichever path you choose, `scarab-server` needs:
 
 - **Postgres**: the durable store that all run state and coordination go
-  through; without it the server serves the API only.
+  through. The server refuses to start without `SCARAB_DATABASE_URL`.
 - **An S3-compatible object store** (AWS S3 or in-cluster MinIO) for logs,
   artifacts, and the content-addressed workspace snapshots that reruns restore
-  from. For lightweight local runs it can fall back to a local directory.
+  from. The server refuses to start without one. For tests and dev loops you
+  can point it at a local directory with an explicit `--object-dir`, whose
+  contents are not durable.
 - **A Kubernetes namespace with RBAC** so it can launch one Pod per pipeline step.
 
 [Installation](/scarab-ci/get-started/deploy-helm/) sets all three up through

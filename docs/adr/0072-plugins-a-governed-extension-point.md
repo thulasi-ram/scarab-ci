@@ -1,6 +1,9 @@
 # 0072. Plugins: a second, governed extension point beside Steps
 
-- **Status:** Proposed
+- **Status:** Accepted. The MMP is built on main (`crates/scarab-plugin`,
+  `crates/scarab-plugin-argocd`, migrations `0055_plugins.sql` and
+  `0056_plugin_connections.sql`, the `/v1/orgs/{org}/plugins/*` routes). See
+  [Implementation horizon](#implementation-horizon) for what is still open.
 - **Date:** 2026-10-22
 - **Deciders:** thulasi.ram (architect)
 - **Builds on:** [0008](0008-step-contract.md) (a Step is any OCI image; the step

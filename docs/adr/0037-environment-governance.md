@@ -4,6 +4,10 @@
 - **Date:** 2026-07-13
 - **Deciders:** thulasi.ram (architect)
 
+> **Status note (2026-10-28):** Environments are org-level now.
+> [0071](0071-org-level-environments.md) revises this ADR's per-repo scoping (§A, §C and
+> the §E paths); the other decisions here stand.
+
 Refines [0024](0024-environments.md) (which modeled the concept) and wires it to
 [0008](0008-step-contract.md) gates, [0014](0014-secrets.md) secret scopes, and
 [0034](0034-external-gate-token.md) gate release. Closes the stored-but-not-enforced
@@ -84,13 +88,19 @@ environment *governs* it, regardless of what the YAML says (the GHA model).
 ### E. Management API surface (`Administer` for writes)
 
 ```
-PUT    /v1/environments/{project}/{name}            upsert env + protection rules
-GET    /v1/environments/{project}                   list environments
-GET    /v1/environments/{project}/{name}            get one (rules + effective secret status)
-DELETE /v1/environments/{project}/{name}            remove
-GET    /v1/environments/{project}/{name}/deployments deployment history (was the deploy handler)
-GET    /v1/projects/{project}/secrets/matrix        keys × envs effective-status read model (UI)
+PUT    /v1/orgs/{org}/environments/{env}                       upsert env
+PUT    /v1/orgs/{org}/environments/{env}/protection            protection rules
+GET    /v1/repos/{org}/{repo}/environments                     list environments
+GET    /v1/repos/{org}/{repo}/environments/{name}              get one (rules + effective secret status)
+DELETE /v1/orgs/{org}/environments/{env}                       remove
+GET    /v1/repos/{org}/{repo}/environments/{name}/deployments  deployment history (was the deploy handler)
+GET    /v1/repos/{org}/{repo}/secrets/matrix                   keys × envs effective-status read model (UI)
 ```
+
+(As decided, these were `/v1/environments/{project}/...` and
+`/v1/projects/{project}/secrets/matrix`. They moved under `/v1/repos/{org}/{repo}/`, and
+[0071](0071-org-level-environments.md) then moved environment writes to the org.
+`openapi.json` has the current list.)
 
 Secret CRUD stays the existing scoped endpoints ([0014]). Gate approval stays
 `POST /v1/runs/{id}/gates/{step}/approve` (RBAC `Write` **and** membership in the

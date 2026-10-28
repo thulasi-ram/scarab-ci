@@ -316,10 +316,17 @@ Why it is built this way:
   the chart renders nothing rather than an open service.
 
 Operating it: `/readyz` is *warm writable + cold reachable*, deliberately not the
-control plane's database check. The warm tier is bounded by **space** and **LRU
-eviction is not implemented yet**, so `scarab_workspace_warm_used_bytes` on
-`/metrics` is the whole budget. Alert on it against
-`workspace.persistence.size`. `scarab_workspace_warm_write_failed_total`
+control plane's database check. The warm tier is bounded by **space**: an LRU
+sweep runs every 60 seconds and, once `scarab_workspace_warm_used_bytes` passes
+`scarab_workspace_warm_budget_bytes` (`workspace.warmBudgetBytes`, default 90%
+of the volume), evicts down to 80% of the budget. It evicts content that is
+already durable in the packs first, then cache-only content. Both gauges are on
+`/metrics`. `scarab_workspace_warm_evicted_bytes_total{class="cache_only"}`
+climbing means the volume is too small for the working set and future reads
+will miss. The sweep never evicts a file whose mtime is under an hour old (a
+write sets it, and a read refreshes it at most once an hour), so a volume that
+fills within an hour still runs out of space:
+`scarab_workspace_warm_full_total` counts those failed writes. `scarab_workspace_warm_write_failed_total`
 climbing means snapshots are still durable (cold succeeded) but the cache is
 not being filled.
 

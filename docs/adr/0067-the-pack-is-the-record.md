@@ -65,7 +65,7 @@ forced the warm tier to hold things it may not lose.
 
 ## Decision
 
-Eleven parts. Part 1 makes the rest possible.
+Twelve parts. Part 1 makes the rest possible.
 
 ### 1. Postgres and an object store are both hard requirements
 
@@ -270,6 +270,9 @@ independent of every part above: `scarab-wsfetch` uses a bare `reqwest::Client::
 timeout and **no backoff**, so a 20–30 s outage burns an Attempt's whole budget in seconds and the
 Run dead-letters. That is [0066](0066-the-depot-is-a-cache.md) point 2's other half and it is still
 the single cheapest availability fix in the tree. **`replicaCount > 1` is worth nothing without it.**
+(Done: `scarab-wsfetch` now retries transient failures with a 1 s→10 s backoff inside a
+window sized from the step timeout; see `retry_window` in
+`crates/scarab-workspace-client/src/bin/scarab-wsfetch.rs`.)
 
 **What gets harder.**
 
@@ -286,7 +289,10 @@ the single cheapest availability fix in the tree. **`replicaCount > 1` is worth 
 config defaults, `values.yaml`'s empty `bucket`, ~28 test sites that boot a local directory,
 `crash_resume.rs` (which explicitly clears every `SCARAB_S3_*` variable), and CI (`ci.yml` has no
 MinIO and `kind.yml` runs the live tier on a local directory). Note also that **no workflow runs
-`helm lint` or `helm template`**, so chart changes have no CI coverage at all today.
+`helm lint` or `helm template`**, so chart changes have no CI coverage at all today. (Done:
+`ci.yml` and `kind.yml` both start MinIO, and the `chart` job in `.github/workflows/image.yml`
+runs `helm lint`, `helm template` and `scripts/chart_statefulset_immutable.sh` on every PR that
+touches the chart.)
 
 ## Alternatives considered
 

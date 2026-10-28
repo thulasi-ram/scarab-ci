@@ -256,5 +256,5 @@ per-Run escape hatch for investigations.
 - [0050](0050-retention-and-gc.md) — retention classes and the sweeper
 - [0055](0055-placement-profiles.md) — the operator-owned named-profile pattern `RetentionProfile` copies
 - [0061](0061-workspace-data-path.md) — the governing principle, the retention table, the widened rerun
-- [0062](0062-workspace-export-lazy-without-node-driver.md) — the Farm/Export machinery a Cache reuses
+- [0062](0062-workspace-export-lazy-without-node-driver.md) — the Farm/Export machinery a Cache was first meant to reuse (deleted by [0066](0066-the-depot-is-a-cache.md); a Cache now rides the CAS and the eager feed)
 - [0064](0064-durability-tiering-and-the-write-path.md) — what must be durable before `Succeeded`

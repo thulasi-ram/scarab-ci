@@ -378,9 +378,12 @@ New event **`AttemptSuperseded { step, attempt, by }`**. New per-Attempt outcome
 **additively** as `outcome` on `AttemptDto` (`shadowed` stays a *flag* on a succeeded
 Attempt, not an outcome — see the 2026-07-20 amendment).
 
-### UI direction (working spec — not yet built)
+### UI direction (working spec)
 
-Recorded so the design is not lost; nothing here is implemented. One screen
+Recorded so the design is not lost. (Done: built in the web-UI "redesign stages
+1–4", commits `f761f72`…`fc60556`. Two controls changed shape later: the version
+rail became `VersionDropdown.tsx` and the filmstrip became `AttemptsDropdown.tsx`,
+both under `ui/scarab-web-ui/src/components/`.) One screen
 that is really a **3-axis selector (version × step × try)** feeding five evidence
 views (Logs / Results / Outputs / Workspace, plus run-level Artifacts). Each
 control is chosen by the **cardinality** of its axis:

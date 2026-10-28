@@ -25,8 +25,9 @@ durable execution passes none of them:
 - **Not fully proven yet.** The part our code proves (Postgres crash/resume and
   exactly-once, in [`crash_resume.rs`](../crates/scarab-db-postgres/tests/crash_resume.rs),
   which runs against real Postgres) is the part the durable workflow engines already have. The
-  part that would set us apart (live-Pod re-attach, execution replay as a
-  feature) is `#[ignore]`d or partial.
+  part that would set us apart is not proven: the control-plane crash test with a real Pod in
+  flight (`crates/scarab-e2e/tests/crash_resume.rs`, weekly in `e2e.yml`) doesn't pass yet, and
+  execution replay is not a feature.
 
 So we keep durability but stop leading with it. It guides the engineering and is
 a real supporting claim, but it is not the headline.
@@ -48,17 +49,19 @@ defend, because it is an architecture claim that can be checked rather than a
 benchmark claim.
 
 The caveat that keeps this defensible: the durable engine is proven, and the
-forge-native domain model is proven **against a fake forge**. Live GitHub I/O
-and live-k8s execution are the remaining work (see Claims we don't make).
+forge-native domain model is proven **against a fake forge**. The GitHub and
+Forgejo adapters and Pod execution on Kubernetes are implemented and tested (a
+kind cluster in CI, real forges by hand), but not yet hardened, and crash/resume
+with a live Pod doesn't pass yet (see Claims we don't make).
 
 ## One-liners (ranked)
 
 1. **"CI that treats your run as state, not a process."** Recommended lead. It
    describes the durable core without saying "durable", it is concrete, and it
    is the one idea the job-runner CIs don't share.
-2. **"A modern CI engine for Kubernetes — forge-native, on a durable core."**
-   Recommended descriptor and H1. It uses the "modern CI engine" framing and
-   ties it to the two real properties (forge-native and durable). Both are
+2. **"A CI engine for Kubernetes — forge-native, on a durable core."**
+   Recommended descriptor and H1. It says what Scarab is (a CI engine for
+   Kubernetes) with no adjective, and ties it to the two real properties (forge-native and durable). Both are
    architecture claims, not benchmarks, so it does not overclaim.
 3. **"Forge-native CI, on an engine that doesn't forget."** Witty, and links the
    two halves. Good for a post headline.
@@ -82,13 +85,15 @@ and live-k8s execution are the remaining work (see Claims we don't make).
 
 **Don't:**
 - ❌ "Durable execution" as a bare H1 or a one-word pitch.
-- ❌ "Durable execution **on Kubernetes**" or live-Pod re-attach. No live-k8s
-  proof exists; the crash test's executor is a fake.
+- ❌ "Durable execution **on Kubernetes**" or live-Pod re-attach. The Postgres
+  crash test's executor is a fake, and the stack-level crash test with a real Pod
+  (`scarab-e2e` `crash_resume`) doesn't pass yet.
 - ❌ "**Unlike** Argo/Tekton/Temporal, we're durable." They are durable too, so
   it makes us look uninformed. Never compare ourselves with that group on
   durability.
 - ❌ "Time-travel" or "replay" as a shipped feature. It follows from the event
-  log, and there is no query endpoint yet. At most: "an append-only event log
+  log, but the only endpoint streams the log as it is (`GET /v1/runs/{id}/events`);
+  nothing reconstructs past state or replays a run. At most: "an append-only event log
   that makes execution history inspectable."
 - ❌ "Indefinite approval gates" as a differentiator. GitLab, Buildkite, CircleCI
   and GitHub already suspend cheaply.
@@ -131,26 +136,35 @@ Show respect and say plainly where we differ; never take a swipe.
 
 ## Claims we don't make (the code or the market won't back them)
 
-1. ❌ "Works with GitHub today." All 8 outbound `ForgePort` methods are
-   `unimplemented!()` (`scarab-forge-github/src/lib.rs:177-226`). Say "designed
-   forge-native; live GitHub integration in progress."
-2. ❌ Any end-to-end durability-on-Kubernetes or live-Pod re-attach claim
-   (live-k8s tests are `#[ignore]`d; the slice-1 umbrella issue is still open
-   for this).
+1. ❌ "Works with GitHub" with no qualifier, or "production-ready on GitHub". The
+   adapter is implemented: every `ForgePort` method makes real GitHub API calls
+   (`crates/scarab-forge-github/src/lib.rs`), and the live demo takes its webhooks
+   from a GitHub App. But its live contract test (`tests/contract_live.rs`) runs only
+   by hand, and no CI job talks to real GitHub. Say "GitHub and Forgejo adapters
+   implemented; not yet hardened against live forges."
+2. ❌ Any end-to-end durability-on-Kubernetes or live-Pod re-attach claim. The
+   executor's live-cluster tests, re-attach after relaunch included, pass on kind
+   (`kind.yml`), but the stack-level crash/resume test with a real Pod in flight
+   doesn't pass yet.
 3. ❌ Durable execution as a selling point against Argo/Tekton/Temporal/Kestra.
 4. ❌ Time-travel / replay as a feature.
 5. ❌ Indefinite gates as a differentiator.
-6. ❌ Live fork-PR trust / OAuth enforcement against a real forge (`get_permissions`
-   is `unimplemented!()`; the domain lockout logic is real and tested, so claim that).
-7. ❌ "Named-result capture works on Kubernetes." The ingest API and wiring
-   exist; the egress sidecar image does not.
-8. ❌ "Continuously tested." No CI runs the Rust suite yet, and the core
-   durability tests skip silently and pass without `SCARAB_TEST_DATABASE_URL`.
+6. ❌ Live fork-PR trust / OAuth enforcement against a real forge. `get_permissions`
+   is implemented for GitHub, but no test exercises it against real GitHub; the
+   domain lockout logic is real and tested, so claim that.
+7. ❌ "Named-result capture is hardened on Kubernetes." The egress sidecar image
+   (`docker/sidecar/`) exists and a kind test captures a named result end to end
+   (`results_sidecar_captures_a_named_result_end_to_end`), so claim it scoped to
+   that: tested on a kind cluster.
+8. ❌ "Every change runs the full test suite." `ci.yml` runs the Rust suite against
+   real Postgres on every push to main and on PRs that touch Rust (in CI a skipped
+   Postgres test fails the job), but `kind.yml` runs the live-cluster tests only for
+   changes to the execution path, and the full-stack e2e tier runs weekly.
 
 **Keep a visible Status line, and don't apologise for it.** Durable engine:
-proven. Forge-native domain model: proven against a fake forge. Live GitHub I/O
-+ live-k8s execution: in progress. Being upfront in that one line is what makes
-every other claim believable.
+proven. Forge-native domain model: proven against a fake forge. Forge adapters
+and Kubernetes execution: implemented and tested, not yet hardened. Being upfront
+in that one line is what makes every other claim believable.
 
 ## Voice
 
@@ -162,9 +176,9 @@ review, cut it.
 
 | Prefer | Avoid |
 |---|---|
-| modern CI engine; forge-native, durable core | durable CI (bare adjective) |
+| CI engine for Kubernetes; forge-native, durable core | durable CI (bare adjective) |
 | treats your run as state, not a process | resilient / robust / bulletproof |
 | resumes from the last completed step | "never fails" |
-| designed forge-native; live GitHub in progress | works with GitHub (today) |
+| GitHub and Forgejo adapters implemented, not yet hardened | works with GitHub (no qualifier) |
 | built AI-first (development pace) | AI-native / AI-powered CI |
 | inspired by Woodpecker's limits | "unlike Woodpecker" (swipe) |

@@ -60,8 +60,9 @@ published build). See [Installation](/scarab-ci/get-started/deploy-helm/).
 
 :::tip[See the UI]
 `just ui` starts the SolidJS web UI (Vite on <code>http://localhost:5173</code>), which proxies
-`/v1` to the running server. It's an early scaffold today. The rich UI, with a live DAG and logs
-streamed over SSE, is a follow-up.
+`/v1` to the running server. Open a run to see its step DAG and event timeline, which refresh
+while the run is going, and each step's logs, which stream live over SSE. To look around
+without a server, `just ui-mock` renders the same UI from built-in fixtures.
 :::
 
 ## What just happened

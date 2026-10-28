@@ -60,7 +60,8 @@ Scarab is a *tool*, and a tool needs a published site. The forces:
    `starlight-openapi`, both at build time. No duplicated markdown; ADRs stay authored in `docs/`.
 
 4. **IA is operator-primary, published accurately.** Sidebar: **Home** (landing: the durability
-   pitch, screenshots) · **Get Started** (Run locally — real today; Deploy with Helm — **stub**) ·
+   pitch, screenshots) · **Get Started** (Run locally — real today; Deploy with Helm — **stub**;
+   done: real since the chart shipped in `deploy/helm/scarab/`) ·
    **Guides** (pipeline authoring; grows as slices land) · **Configure** (ENV/config reference) ·
    **Reference** (API, auto-generated) · **Tech** (`CONTEXT.md` + ADRs, sourced in place). Pages
    exist in the nav only when backed by shipped reality; aspirational pages are clearly-marked
@@ -108,8 +109,11 @@ Scarab is a *tool*, and a tool needs a published site. The forces:
   `workflow_dispatch`). Between tags the published Tech section lags `main` — acceptable, and
   arguably desirable (published = a coherent snapshot).
 - **Follow-ups (out of scope here):** authoring + distributing the Helm chart (the "Deploy with
-  Helm" page is a stub until it exists); real screenshots (once `scarab-web-ui` + server render
-  something worth showing); doc versioning (the deferred "widget").
+  Helm" page is a stub until it exists) (done: `deploy/helm/scarab/`, published to
+  `oci://ghcr.io/thulasi-ram/charts/scarab` on `v*` tags); real screenshots (once
+  `scarab-web-ui` + server render something worth showing) (done:
+  `ui/scarab-docs-ui/src/assets/*.jpg`); doc versioning (the deferred "widget") (done: PR #36,
+  a per-release version dropdown).
 
 ## Alternatives considered
 

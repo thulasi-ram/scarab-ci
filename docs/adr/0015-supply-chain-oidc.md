@@ -4,6 +4,9 @@
 - **Date:** 2026-07-12
 - **Deciders:** thulasi.ram (architect)
 
+> **Status note (2026-10-28):** the OIDC issuer half is built (`crates/scarab-server/src/oidc.rs`).
+> The provenance half (attestation capture, SLSA, cosign, SBOM export) is not built yet.
+
 ## Context
 
 Because the DAG is durable, content-addressed, and records exactly what produced what, two

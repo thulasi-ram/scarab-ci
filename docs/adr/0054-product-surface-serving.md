@@ -36,8 +36,10 @@ Cancel control (currently disabled) is enabled.
 
 - **OpenAPI drift gate:** a CI test diffs the committed `openapi.json` against the
   freshly-generated document and **fails on drift**; the typed UI client is
-  regenerated in the same step. (The spec must cover *all* routes, not the 14 of
-  ~23 it lists today.)
+  regenerated in the same step. (The spec must cover *all* routes. When this was
+  decided it listed only 14 of ~23. Done: the `openapi-drift` job in
+  `.github/workflows/ci.yml`, and `route_table_equals_the_openapi_spec` in
+  `crates/scarab-server/tests/step_up_routes.rs` checks full coverage.)
 - **CLI:** implement the stubbed subcommands — `validate` (offline IR compile),
   `lint` (incl. the ADR-0045 missing-`clone` rule), `logs`, `restart`. **Until a
   subcommand is real, its stub exits non-zero**, never 0 — no silent pass.

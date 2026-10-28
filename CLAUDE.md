@@ -40,6 +40,12 @@ rather than running the raw commands ad hoc — that keeps the next run
 reproducible. `just local-helm` needs `deploy/local-helm/.env` and kube context
 `colima`; see `deploy/local-helm/README.md`.
 
+## Writing docs
+
+Any prose (docs site, READMEs, ADRs, CONTEXT.md, UI copy) follows
+`docs/WRITING.md`: plain and concrete, no intensifiers, few adjectives, none of
+the banned jargon. What we may *claim* is governed by `docs/positioning.md`.
+
 ## Testing philosophy
 
 Classical (not mockist): mock only true externals; keep the suite minimal in v1

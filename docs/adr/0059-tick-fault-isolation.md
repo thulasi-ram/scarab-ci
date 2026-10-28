@@ -37,7 +37,7 @@ But it is a **point fix, not the general property**, and two gaps remain:
 The tick is the forward-progress engine for the whole fleet; its fault-isolation model should be
 a deliberate, documented invariant rather than an accident of which call sites happen to use `?`.
 
-## Decision (proposed)
+## Decision
 
 **1. Per-Run fault isolation is a tick invariant.** The per-Run portion of a tick —
 reconcile-services, admit, advance for a given Run — MUST be fault-isolated: an error attributable to
@@ -69,7 +69,7 @@ alternative.
 - More error plumbing inside `tick_all`; the outer-`Result`-vs-inner-`Vec` split must stay clear so
   "fatal tick failure" and "isolated per-Run failure" never blur.
 
-## Open questions (to grill)
+## Open questions (resolved — see the 2026-07-25 amendment)
 
 - **Bound: wall-clock deadline vs consecutive-tick count?** Wall-clock is frequency-independent and
   matches Fix A; a count is simpler but couples the bound to the tick interval.

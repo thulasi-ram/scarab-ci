@@ -5,6 +5,11 @@
 - **Deciders:** thulasi.ram (architect)
 - **Amends:** [0010](0010-forge-integration.md) (forge integration)
 
+> **Status note (2026-10-28):** Both adapters are built (`crates/scarab-forge-github/`,
+> `crates/scarab-forge-forgejo/`), along with the `ForgeConnection` store, the per-forge
+> webhook endpoints, delivery-id dedup (`webhook_deliveries`) and the `target_url` run
+> link. The gaps and `lib.rs` line numbers cited below describe the code at decision time.
+
 ## Context
 
 The forge adapter is unbuilt: 8 outbound `GithubForge` methods are

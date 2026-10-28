@@ -1,6 +1,7 @@
 # 0069. Identity links: one Principal, many provider identities, pinned by immutable id
 
-- **Status:** Proposed
+- **Status:** Accepted. Built on main (PR #10; migration `0052_identity_links.sql`, the
+  `/v1/me/identities/*` routes).
 - **Date:** 2026-10-16
 - **Deciders:** thulasi.ram (architect)
 - **Builds on:** [0049](0049-identity-and-access.md) (authn → `Principal`, native

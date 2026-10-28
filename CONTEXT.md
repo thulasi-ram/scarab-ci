@@ -137,7 +137,7 @@ Durable execution here means a **durable orchestrator**, *not* replayable step i
 | **Adapter** | A concrete implementation of a Port, in a **separate vendor crate** (`scarab-forge-github`, `scarab-db-postgres`, …), holding all infra deps. |
 | **IR** | The typed, versioned **Pipeline Intermediate Representation** — the *real* DSL. YAML is one frontend; the API schema *is* the IR. |
 | **Forge** | The domain *concept* of a source-of-repos/sink-of-status (GitHub, GitLab, Forgejo). Vendors are **adapters**, never their own domain. |
-| **Data Depot** | The long-lived Scarab-operated service that holds the data plane **near where Steps run**: the warm CAS, **Snapshot Farms**, live **Workspace Exports**, the **Step log** namespace, and **Cache** (ADR-0061, 0062, 0063, 0065). Same binary as the control plane, different role (`--role depot`) and **no durable core**. It **connects to the control plane's Postgres** but **owns no schema and never migrates** (2026-08-23): the rule being protected is that it is *not a system of record*, not that it *never uses a database*: a Depot rolled ahead of the control plane must not be able to half-migrate anything, and everything it reads there is **derived and rebuildable from the object store**. Was "the workspace service" until 2026-07-28; renamed because that named it after *one of its tenants* and broke as soon as a second kind of data arrived. `warm store` was rejected for naming it after one of its *properties*, which encodes a tiering decision and dates the same way. **Not** a **Workspace**, a **Workspace Snapshot** or a **Workspace Export** — those are data it holds, and they keep their names. **By definition a cache** (ADR-0066): it holds nothing that cannot be recreated. That is why running more replicas is enough for HA, eviction is safe by construction, and losing a replica only costs latency. Anything that makes it a system of record is a defect. |
+| **Data Depot** | The long-lived Scarab-operated service that holds the data plane **near where Steps run**: the warm CAS, **Snapshot Farms**, live **Workspace Exports**, the **Step log** namespace, and **Cache** (ADR-0061, 0062, 0063, 0065). Same binary as the control plane, different role (`--role workspace`) and **no durable core**. It **connects to the control plane's Postgres** but **owns no schema and never migrates** (2026-08-23): the rule being protected is that it is *not a system of record*, not that it *never uses a database*: a Depot rolled ahead of the control plane must not be able to half-migrate anything, and everything it reads there is **derived and rebuildable from the object store**. Was "the workspace service" until 2026-07-28; renamed because that named it after *one of its tenants* and broke as soon as a second kind of data arrived. `warm store` was rejected for naming it after one of its *properties*, which encodes a tiering decision and dates the same way. **Not** a **Workspace**, a **Workspace Snapshot** or a **Workspace Export** — those are data it holds, and they keep their names. **By definition a cache** (ADR-0066): it holds nothing that cannot be recreated. That is why running more replicas is enough for HA, eviction is safe by construction, and losing a replica only costs latency. Anything that makes it a system of record is a defect. |
 | **Warm-only** | **Retired as a deployment mode (2026-08-23).** **Postgres and an object store are both hard requirements**; Scarab is not expected to function without either. Warm-only survives only as a *runtime degradation* (the cold tier is configured but briefly unreachable), never as a supported way to deploy. What follows is the superseded definition, kept because the disclosure vocabulary it introduced still fits that degradation. ~~The named deployment mode in which **no independent cold tier is configured** (ADR-0064's `st_dev` test) — object storage is a **soft, recommended** requirement, not a hard one (ADR-0066).~~ Supported, with a **smaller but accurate** guarantee rather than a silent downgrade: the **Data Depot** offers a bounded *recent window*, every Attempt is stamped `warm-only` in `attempts.output_durability`, and warm eviction is real data loss, not just added latency. It does **not** mean the Depot becomes the system of record — it means there **is** no system of record for **Workspace Snapshots** in that deployment, which is disclosable because they are reproducible from the forge. Depot **HA requires object storage** — a documented consequence, not a gap. |
 
 ### 4.5 Tenancy & forge binding
@@ -227,42 +227,44 @@ use exactly the contract third parties do** — if one needs more, core changes.
                                                  [ Step Pod ]  one per Step
                                                       │  ▲
                                  BULK snapshot bytes  │  │  ✅ feed  (Scarab-owned fetcher)
-                                                      ▼  │  ⛔ drain (s3-drain, NOT built)
-                                          [workspace role]  the workspace service (ADR-0061)
+                                                      ▼  │  ✅ drain (`scarab-wsfetch drain`, in the Pod)
+                                          [workspace role]  the Data Depot (ADR-0061, 0067)
                                           warm merkle CAS on a PersistentVolume, one per
-                                          failure domain · bounded by SPACE · no Postgres
+                                          failure domain · bounded by SPACE (LRU sweep) ·
+                                          derived rows in Postgres, never migrates
                                                       │
    Object store (S3/MinIO) ◀── logs · artifacts · cache ┘
-                           ◀── Workspace Snapshots: the COLD archive, bounded by TIME
-                           ◀── ⚠ BULK, TODAY: the DRAIN tars every byte out of the Step Pod
-                               over `kubectl exec` into the control plane, which hashes it
-                               and writes it here. Artifact harvest is a third `exec` tar.
-                               So ADR-0061 part 3 is HALF done: the read path left the
-                               control plane, the write path has not.
+                           ◀── Workspace Snapshots as packs: the COLD archive, bounded by TIME
+                           ◀── ⚠ BULK, TODAY: artifact harvest still tars `/scarab/artifacts`
+                               out of the Step Pod over `kubectl exec` into the control
+                               plane, which writes it here. It is the last `exec` tar.
 ```
 
 Which edge carries bulk data is the central question of ADR-0061, so the four labels matter.
 **control plane ↔ Step Pod** carries root hashes only — that property belongs to *this* edge
-and no other. **Step Pod ↔ workspace service** is the bulk edge by design; its feed half is
-real, its drain half is s3-drain and is not built. **control plane → object store** is bulk
-*today*, for the drain, and a diagram without that edge wrongly implies part 3 is finished.
+and no other. **Step Pod ↔ workspace service** is the bulk edge by design, and both halves now
+use it: the fetcher feeds a Step's inputs, and `scarab-wsfetch drain` in the Pod's egress
+container sends its outputs to the Depot, which writes them to the object store as packs.
+**control plane → object store** is still bulk *today* for artifacts only, because artifact
+harvest is an `exec` tar through the control plane.
 **control plane ↔ workspace service** is small and off the critical path: Browse reads
 snapshots through the service (falling through to the object store when it cannot answer),
-and the drain seeds it as a warm tier.
+and the control plane reads the drain's record from the Depot to decide the Attempt.
 
 - **One binary, many roles**
   (`scarab-server --role converged|api|scheduler|executor|webhook|workspace`).
   Postgres (outbox) is the coordination bus; no service-to-service RPC required internally.
-  `workspace` is the one **data-plane** role: it never connects to Postgres and never runs
-  a migration (ADR-0061), so it keeps serving a Step its inputs through a database outage.
+  `workspace` is the one **data-plane** role: it connects to Postgres only for derived,
+  rebuildable rows (drain records, write ledgers) and never runs a migration (ADR-0067). Its
+  pool connects lazily and content reads never touch Postgres, so it keeps serving a Step its
+  inputs through a database outage.
 - **Control-plane / data-plane split:** the durable *brain* records intent ("Step S should
   run"); the *executor* observes it, creates the Pod, watches it, writes back terminal state.
   The intent is that bulk **data** does not cross the brain — the control plane exchanges root
-  hashes and Step Pods talk to the workspace service. **Half true today**: ADR-0061 supersedes
-  the `kubectl exec` tar tunnel on the **feed** side, where a Scarab-owned fetcher has replaced
-  it. The **drain** still tars every byte out through the Kubernetes API server, and artifact
-  harvest is a third `exec` tar; both go with s3-drain. Do not read this bullet as a
-  description of the running system's write path.
+  hashes and Step Pods talk to the workspace service. **True today for workspaces**: a
+  Scarab-owned fetcher feeds inputs and `scarab-wsfetch drain` sends outputs to the Depot, so
+  neither crosses the Kubernetes API server. The exception is **artifact harvest**, which is
+  still an `exec` tar into the control plane until artifacts move onto the Depot.
 - **Three stateful components, and the third is deliberate.** Postgres (state + event log),
   an object store (blobs), and the **workspace service**'s persistent volume.
   [ADR-0004](docs/adr/0004-execution-topology.md) called object storage "the second (and

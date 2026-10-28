@@ -7,7 +7,7 @@
 
 # Scarab
 
-**A modern CI engine for Kubernetes — forge-native, on a durable core.**
+**A CI engine for Kubernetes — forge-native, on a durable core.**
 
 A CI system for Kubernetes with the forge pieces built in: webhooks, pipelines
 in your repo, PR checks, secrets, approvals and a UI. Each run is stored as
@@ -68,27 +68,40 @@ can now move faster than a volunteer project can.
 
 ## Status
 
-The core engine is proven. The live I/O at the edges (real forges, real clusters) is still
-being wired up. Scarab is not a shipped product yet.
+Scarab is not a shipped product yet. The durable engine is tested against real Postgres in CI.
+The forge and Kubernetes integrations are implemented and tested, some in CI and some by hand,
+but none of them has carried production load.
 
-- **Proven (against real Postgres).** The durable engine: crash-mid-run → resume, exactly-once
-  step execution, restart-a-step, durable gates, content-addressed workspace, `invoke`
-  inlining, scheduler (concurrency/fairness/supersede), secrets + fork-PR lockout, and a
-  self-hosted OIDC issuer. The workspace test suite passes locally.
-- **Proven against a *fake* forge.** The forge-native flow end-to-end: signed webhook →
-  in-repo `.scarab` config → run → checks posted back → OAuth-gated reads.
-- **Implemented, not yet battle-tested against a live forge.** Two real forge adapters —
-  GitHub (`/webhooks/github`) and Forgejo (`/webhooks/forgejo`) — each with HMAC webhook
-  ingest and commit-status posting over real HTTP (multi-adapter). The end-to-end
-  loop against a live forge is wired but not yet hardened.
-- **In progress.** Live-Kubernetes Pod execution and re-attach (tested only via `#[ignore]`d
-  live-cluster paths), the results-egress sidecar image, and a CI job that runs the Rust
-  suite on push.
+- **Tested against real Postgres, in CI.** The durable engine: crash-mid-run → resume,
+  exactly-once step execution, restart-a-step, durable gates, content-addressed workspace,
+  `invoke` inlining, scheduler (concurrency/fairness/supersede), secrets + fork-PR lockout, and
+  a self-hosted OIDC issuer. `.github/workflows/ci.yml` runs the workspace suite against real
+  Postgres and MinIO on every push to main and on every PR that touches Rust code. In CI a
+  Postgres-backed test that would skip fails instead.
+- **Tested against a *fake* forge.** The forge-native flow end-to-end: signed webhook →
+  in-repo `.scarab` config → run → commit statuses posted back → OAuth-gated reads.
+- **Implemented, and run against real forges by hand.** Two forge adapters, GitHub
+  (`/webhooks/github`) and Forgejo (`/webhooks/forgejo`), each with HMAC webhook ingest and
+  commit-status posting over real HTTP. `just forgejo-verify` drives a real Forgejo container
+  through add-connection → bind → hook → signed push → Run. It doesn't check status posting,
+  and CI doesn't run it. The [live demo](#live-demo) and this repo's own dogfood setup
+  (`deploy/local-helm/`) take their webhooks from a GitHub App. Each adapter also has a live
+  contract test (`tests/contract_live.rs`) that you run by hand.
+- **Implemented, and tested on a kind cluster.** Pod-per-step execution on Kubernetes
+  (`scarab-executor-k8s`): re-attach after an executor relaunch, step deadlines, cancel, clone
+  and build steps, the workspace feed and drain, artifact harvest, and the results-egress
+  sidecar image (`docker/sidecar/`). `.github/workflows/kind.yml` runs these live-cluster
+  tests on a throwaway kind cluster for PRs and pushes to main that change the execution path
+  (the executor, engine, server, storage and workspace-client crates, or `docker/`), not on
+  every PR.
+- **Not proven yet.** Control-plane crash and resume with a real Pod in flight. The
+  `crash_resume` test in `crates/scarab-e2e` does this on a kind cluster; it runs weekly
+  (`.github/workflows/e2e.yml`) and doesn't pass yet. Nothing has run at production scale.
+- **Missing.** `on: cron` and `on: upstream` triggers parse, but nothing produces those
+  events yet, so they never fire.
 
-The durable state machine is real and tested. Anything that depends on *a live forge* or
-*a live cluster* is not yet demonstrated. We build in thin end-to-end (tracer-bullet)
-slices. See [docs/positioning.md](docs/positioning.md) for what we do and don't claim, and
-why.
+We build in thin end-to-end (tracer-bullet) slices. See
+[docs/positioning.md](docs/positioning.md) for what we do and don't claim, and why.
 
 ## Live demo
 
@@ -107,11 +120,11 @@ free-tier capacity that can be reclaimed, so there is no SLA.
 The full docs site, **[docs.scarab](https://thulasi-ram.github.io/scarab-ci/)**, is built
 with Astro Starlight and published to GitHub Pages on tag. It has the
 getting-started guides, the pipeline authoring/config reference, the generated OpenAPI, and
-all ~40 ADRs. In-repo, the same sources live under:
+all 70+ ADRs. In-repo, the same sources live under:
 
 - **[CONTEXT.md](CONTEXT.md)** — the core idea, the durability contract, non-goals, and the
   **ubiquitous language** every crate/API/UI must use.
-- **[docs/adr/](docs/adr/)** — ~40 Architecture Decision Records (why each major
+- **[docs/adr/](docs/adr/)** — 70+ Architecture Decision Records (why each major
   decision was made).
 - **[docs/positioning.md](docs/positioning.md)** — what we do and don't claim, and why.
 - **Issues** — tracked in [git-bug](https://github.com/git-bug/git-bug) (embedded in this
@@ -151,7 +164,7 @@ claim yet.
 | Execution | **Pod-per-step**, content-addressed workspace (per-file merkle CAS); k8s-only |
 | Pipeline model | **Flat recursive DAG** (`Pipeline → Step`); `invoke` = reuse; matrix = modifier |
 | DSL | Typed **IR** (the real DSL) + YAML frontend + **CEL** expressions |
-| API | **REST/OpenAPI + SSE** (dogfooded by UI & CLI) + internal gRPC |
+| API | **REST/OpenAPI + SSE** (dogfooded by UI & CLI); roles coordinate through the Postgres outbox, and the Data Depot speaks HTTP |
 | Code | **Hexagonal**, compiler-pure domain crates + per-vendor adapter crates; one converged binary |
 | Security | Forge-agnostic OIDC identity; **Scarab as OIDC issuer** for keyless federation |
 | UI | SolidJS + generated OpenAPI client |
@@ -173,7 +186,7 @@ crates/
   scarab-executor-{k8s,local} · scarab-forge-{github,forgejo}        exec/forge adapters
   scarab-testkit      fakes: FakeClock / InMemoryDb / FakeExecutor
   scarab-server       composition root: axum + OpenAPI + SSE; role runner
-  scarab-cli          CLI (generated from OpenAPI)
+  scarab-cli          CLI over the same REST API as the UI
 ```
 
 ## Building

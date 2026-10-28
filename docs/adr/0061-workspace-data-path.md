@@ -102,7 +102,9 @@ drain` in the egress helper, the helper ingests `/workspace` to the Depot warm-f
 (`/have`-dedup), prunes to the authored `outputs:` and folds the content identity in-process,
 and posts a **drain record** to the Depot as the hand-off. The control plane reads the record
 back, awaits the archival `flush`, and patches root/identity/durability onto the Pod — hashes
-and a record, never bytes.
+and a record, never bytes. (Superseded 2026-08-24 by [0067](0067-the-pack-is-the-record.md): the
+drain now writes one atomic pack to object storage, and there is no warm-first write and no
+`flush` call. See the note at the top.)
 
 **2. A Scarab node driver, shipped and installed as standard.**
 It mounts a Workspace Snapshot into a Step Pod as a **read-only lower layer** with a
@@ -328,7 +330,8 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
   wrong. The sentence should be read as the intent, not the guarantee.
 - **Object storage stays generic.** Scarab names no product and makes no single-zone /
   multi-zone / storage-class call. That is the operator's cost model, not ours.
-- **Version skew** between server, service and driver becomes a supported concern.
+- **Version skew** between server, service ~~and driver~~ becomes a supported concern. (The
+  driver went away with part 2; see [0062](0062-workspace-export-lazy-without-node-driver.md).)
 - **Browse** ([0056](0056-run-takes-and-attempt-grain-evidence.md)) reads snapshots from the
   service **and falls through to object storage when the service cannot answer**, which keeps
   working after the Run's nodes are gone — on spot, that is within minutes, and a live-volume

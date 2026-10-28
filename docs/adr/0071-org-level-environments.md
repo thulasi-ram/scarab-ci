@@ -1,6 +1,8 @@
 # 0071. Org-level Environments: a place that decides who may deploy into it
 
-- **Status:** Proposed
+- **Status:** Accepted. The MMP is built on main (migrations `0054_org_environments.sql`
+  and `0057_org_environment_governance.sql`, the `/v1/orgs/{org}/environments/*` routes).
+  See [Implementation horizon](#implementation-horizon) for what is still open.
 - **Date:** 2026-10-22
 - **Deciders:** thulasi.ram (architect)
 - **Builds on:** [0024](0024-environments.md) (Environment as a built-in entity),

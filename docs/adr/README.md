@@ -1,7 +1,8 @@
 # Architecture Decision Records
 
-These ADRs record the main decisions behind Scarab, captured in a design review session
-on 2026-07-12. Each is written in a light [MADR](https://adr.github.io/madr/) style:
+These ADRs record the main decisions behind Scarab. The first batch (0001 to 0032) came out of
+a design review session on 2026-07-12; the rest were added one at a time as later work needed a
+decision. Each is written in a light [MADR](https://adr.github.io/madr/) style:
 **Context → Decision → Consequences → Alternatives considered**.
 
 They explain *why*. The *what* (the domain vocabulary and a system overview) is in
@@ -10,8 +11,10 @@ They explain *why*. The *what* (the domain vocabulary and a system overview) is 
 ## Status lifecycle
 
 `Proposed` → `Accepted` → (`Superseded by NNNN` | `Deprecated`). All ADRs below are
-`Accepted` unless noted. A decision changes when a **new** ADR supersedes the old
-one. We don't edit history (the same idea as our version-tolerance principle).
+`Accepted` unless noted. A decision changes when a **new** ADR supersedes or amends the old
+one. We don't rewrite the old ADR's text. When a later ADR changes part of an earlier one, the
+earlier ADR gets a dated note at the changed section (for example "Amended 2026-08-24 by 0067"),
+so a reader sees the change where it applies and the original reasoning stays readable.
 
 ## Index
 
@@ -81,10 +84,10 @@ one. We don't edit history (the same idea as our version-tolerance principle).
 | [0064](0064-durability-tiering-and-the-write-path.md) | Durability tiering + write path: **warm-first with one batched flush** that gates `Succeeded`, a cold tier proven by `st_dev` (a second PVC counts, a `LocalDir` beside the CAS does not), graceful warm-only deployments, durability stamped per Attempt (**amends 0061 part 4**) | Accepted |
 | [0065](0065-retention-cache-and-rederivation.md) | Retention, **Cache** (explicit keyed directory cache — implements 0007's concept), `RetentionProfile` (operator-defined, author-selectable), re-derivation is human-triggered via the widened rerun with full-cascade disclosure; no automatic Cache detection; checkout is not a special case | Accepted |
 | [0068](0068-the-infra-observer.md) | The **infra observer**: a control-plane-side reader of the backend's account of an in-flight unit (`Executor::infra_condition`), appending to the run's **activity log** on *change* — the missing channel for "why is there no log", since a Pod that never started has no stdout to tail; the terminal cause also stamps `attempts.failure_detail` | Accepted |
-| [0069](0069-identity-links.md) | **Identity links**: a `Principal` is a Scarab record holding one identity per provider, pinned by the provider's **immutable** id (never `login`); ids are readable (`github:alice`), minted once, never re-minted; several providers (legacy env vars = the one `unqualified_ids` provider); forge import resolves collaborators by external id and pre-creates **unclaimed** Principals; admin-typed handles must name an existing Principal; linking is explicit (never by email), merge only on proven control | Proposed |
-| [0070](0070-deployments-as-a-vendor-neutral-record.md) | **Deployments as a vendor-neutral record**: a Deployment is an occurrence keyed by (DeploymentTarget, DeploymentVersion); six statuses (source asserts `in_progress`/`live`/`failed`, core derives `requested`/`stalled`/`superseded`); `deployment_requests` with an effective time; a core-resolved, forward-looking **DeploymentGate**; every gate can fail, holds only its dependents and has its own clock; INV-DEP-1..11 in `scarab-deployment` (approval becomes evidence, not the deployment) | Proposed |
-| [0071](0071-org-level-environments.md) | **Org-level Environments**: an Environment is an org-wide place; EnvironmentProjectEligibility (fail-closed), tighten-only EnvironmentProjectOverlay, DeploymentTargetProjectOwnership mirrored from the source, EnvironmentDeploymentSources, two Environment secret scopes, Environment RBAC scope, per-Project privilege grants, concurrency per DeploymentTarget; behaviour-preserving migration (**revises 0037's per-repo scoping**) | Proposed |
-| [0072](0072-plugins-a-governed-extension-point.md) | **Plugins**: a second extension point beside Steps (0008 and 0038's rejections stand) — digest-pinned out-of-process image + closed capability manifest, PluginPrincipal (two-key gate approval), PluginActions as `plugin_action` Steps, CredentialBroker with per-action write rules, `framed`/`trusted_dom` UI tiers, StepUpConfirmation, isolated `scarab-plugins` namespace with a fail-closed probe, signed publishers + operator ceiling + kill switch | Proposed |
+| [0069](0069-identity-links.md) | **Identity links**: a `Principal` is a Scarab record holding one identity per provider, pinned by the provider's **immutable** id (never `login`); ids are readable (`github:alice`), minted once, never re-minted; several providers (legacy env vars = the one `unqualified_ids` provider); forge import resolves collaborators by external id and pre-creates **unclaimed** Principals; admin-typed handles must name an existing Principal; linking is explicit (never by email), merge only on proven control | Accepted |
+| [0070](0070-deployments-as-a-vendor-neutral-record.md) | **Deployments as a vendor-neutral record**: a Deployment is an occurrence keyed by (DeploymentTarget, DeploymentVersion); six statuses (source asserts `in_progress`/`live`/`failed`, core derives `requested`/`stalled`/`superseded`); `deployment_requests` with an effective time; a core-resolved, forward-looking **DeploymentGate**; every gate can fail, holds only its dependents and has its own clock; INV-DEP-1..11 in `scarab-deployment` (approval becomes evidence, not the deployment) | Accepted |
+| [0071](0071-org-level-environments.md) | **Org-level Environments**: an Environment is an org-wide place; EnvironmentProjectEligibility (fail-closed), tighten-only EnvironmentProjectOverlay, DeploymentTargetProjectOwnership mirrored from the source, EnvironmentDeploymentSources, two Environment secret scopes, Environment RBAC scope, per-Project privilege grants, concurrency per DeploymentTarget; behaviour-preserving migration (**revises 0037's per-repo scoping**) | Accepted |
+| [0072](0072-plugins-a-governed-extension-point.md) | **Plugins**: a second extension point beside Steps (0008 and 0038's rejections stand) — digest-pinned out-of-process image + closed capability manifest, PluginPrincipal (two-key gate approval), PluginActions as `plugin_action` Steps, CredentialBroker with per-action write rules, `framed`/`trusted_dom` UI tiers, StepUpConfirmation, isolated `scarab-plugins` namespace with a fail-closed probe, signed publishers + operator ceiling + kill switch | Accepted |
 | [0073](0073-step-up-confirmation.md) | **Step-up confirmation**: a passkey (WebAuthn) is the step-up (GitHub/Forgejo re-login never counts; enroll at first crown-jewel op, first passkey only after a fresh login); the crown-jewel list incl. irreversible destruction; fixed 5-min window + always-ask credential/channel minting; 403 `step_up_required`; StepUpConfirmationRequest (agents/CLI → one-time exact-action link confirmed by their own human); OrgSecurityEventLog incl. refusals; enforced from day one with `scarab security setup/status` + server break-glass; hand-rolled WebAuthn RP on `ring`, one classified route table | Accepted |
 
 > For *features* deliberately deferred until demand appears (as opposed to ADRs

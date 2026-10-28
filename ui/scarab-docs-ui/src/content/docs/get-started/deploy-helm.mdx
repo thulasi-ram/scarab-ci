@@ -152,8 +152,9 @@ The kube context must be `colima` (the deploy script refuses otherwise). Configu
 `deploy/local-helm/.env`; see `deploy/local-helm/README.md` for the steps to configure the App and
 the caveats about the object store.
 
-For a workflow that stays on your laptop with no cluster at all, [Run locally](/scarab-ci/get-started/run-locally/)
-is the lightest way to exercise the system.
+To skip the chart, [Run locally](/scarab-ci/get-started/run-locally/) runs `scarab-server` as a
+host process on your laptop, with Postgres and MinIO in docker compose and step Pods on a local
+kind cluster.
 
 ## References
 

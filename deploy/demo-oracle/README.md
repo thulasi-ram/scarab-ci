@@ -218,9 +218,10 @@ idle k3s box is well under the CPU and network thresholds. With 12 GB, memory is
 the only metric that might keep it above the line on its own, and "probably
 fine" is not good enough for the box the demo runs on.
 
-`.github/workflows/demo-keepalive.yml` runs every 4 hours and pushes an empty
-commit to a `demo-keepalive` branch, which the GitHub App delivers as a real
-`push` → a real Run. Six real runs a day move all three metrics.
+`.github/workflows/demo-keepalive.yml` runs once a day (06:23 UTC) and pushes an
+empty commit to a `demo-keepalive` branch, which the GitHub App delivers as a real
+`push` → a real Run. It ran every 4 hours until 2026-10-19, when the cadence was
+cut to save Actions minutes; if Oracle reclaims the box, raise it first.
 
 It has to be triggered from outside, because **nothing in the engine schedules `cron:`
 triggers**. The DSL parses `on: { cron: … }` and `scarab_forge::Event::Cron`
@@ -228,27 +229,28 @@ exists as a type, but outside `scarab-forge`'s own unit tests `Event::Cron`
 appears only in `match` arms — nothing constructs one. A pipeline declaring a
 cron trigger never runs.
 
-### There is no machine credential for `POST …/dispatch`
+### The keepalive pushes, though it could now dispatch
 
-The keepalive would rather dispatch than push, but today it cannot:
+When this mode was first deployed the server had no machine credential, so a
+scheduled job had nothing to present to `POST …/dispatch`. It has one now:
 
-* requests authenticate with `Authorization: Bearer <session-id>` (or the
-  `scarab_session` cookie), and a **session id** is the only bearer credential the
-  server knows (`session_id()` in `crates/scarab-server/src/lib.rs`);
-* sessions are created in exactly one place, `POST /v1/auth/login`, which takes an
-  OAuth **authorization code** and exchanges it at the provider
-  (`OAuthAuthenticator::exchange`). Authorization codes are single-use and only
-  a browser redirect produces one;
-* a session lives **24 hours** (`SESSION_TTL_MS`);
-* there is no PAT, no service account, no token-issuing endpoint, and no
-  client-credentials grant. `openapi.json` declares no `securitySchemes` at all.
+* an org or project admin mints an **issued API token** with
+  `POST /v1/orgs/{org}/tokens` or the **API tokens** section of Settings. The token
+  is scoped to one Org or Project, carries a role ceiling (`viewer` | `member` |
+  `admin` | `owner`), expires after 1 to 365 days, and is sent as
+  `Authorization: Bearer scarab_pat_…`. The server keeps only its SHA-256;
+* `POST /v1/repos/{org}/{repo}/dispatch` needs Write, which a project-scoped
+  `member` token has. The pipeline must also opt in with `on: manual` (or
+  `on: api`);
+* tokens are wired whenever OAuth login is (`with_api_tokens` in
+  `crates/scarab-server/src/main.rs`), which it is on this box;
+* a token cannot mint tokens, so a human re-mints it before it expires.
 
-So a scheduled runner has nothing to present, and a hand-pasted session would
-expire five times between two runs of a 4-hourly cron. Fixing this needs a **server
-feature** (issued API tokens with a verb and an expiry, created by an Owner), not
-a deploy trick. The workflow says so in a marked TODO rather than inventing one.
-Pushing instead is not a workaround: a real push through the real webhook makes
-a *better* demo, and nothing is faked.
+So the keepalive could dispatch with a token kept as an Actions secret. It
+doesn't: `.github/workflows/demo-keepalive.yml` still pushes an empty commit,
+and the TODO block in its header still describes the old gap. Pushing works
+for this job anyway: a real push through the real webhook takes the same path
+a contributor's push does, and nothing is faked.
 
 ### Backups, and what survives losing the instance
 

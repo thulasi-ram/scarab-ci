@@ -1,6 +1,8 @@
 # 0070. Deployments as a vendor-neutral record: what is live, not who approved
 
-- **Status:** Proposed
+- **Status:** Accepted. The MMP is built on main (`crates/scarab-deployment`, migrations
+  `0053`–`0058`, the `/v1/orgs/{org}/environments/{env}/deployments` routes). See
+  [Implementation horizon](#implementation-horizon) for what is still open.
 - **Date:** 2026-10-22
 - **Deciders:** thulasi.ram (architect)
 - **Builds on:** [0024](0024-environments.md) (Environment as the deploy-governance
@@ -456,8 +458,8 @@ These changes apply to **all** gate kinds, not only DeploymentGate:
   intervals only.
 - **Each gate has its own wait clock**, started when its dependencies are satisfied and
   evaluated whether the Run is running or suspended. This replaces the Run-level
-  `suspended_at` and the `find()` of the first matching gate (`scheduler.rs:2858-2908`)
-  and the whole-Run suspension in the pre-pass (`scheduler.rs:1662-1677`).
+  `suspended_at` and the `find()` of the first matching gate, and the whole-Run
+  suspension in the gate pre-pass (both cited by line in Context, as the code stood then).
 - A verdict is final **per Attempt**, journaled when first reached. A Retry of a failed
   gate is a new Attempt that waits afresh: a rejected approval asks again.
 

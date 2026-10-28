@@ -7,6 +7,12 @@
   [0013](0013-history-and-observability.md) (log pipeline),
   [0048](0048-fail-closed-startup.md) / [0015](0015-supply-chain-oidc.md) (OIDC key)
 
+> **Status note (2026-10-28):** Two Depot facts in the 2026-08-03 amendment below have changed.
+> git-bug `e140121` is fixed: `scarab-wsfetch` now retries a Depot outage inside a window sized from
+> the step timeout (`crates/scarab-workspace-client/tests/fetch_retry.rs`). And
+> [0067](0067-the-pack-is-the-record.md) dropped fence affinity as a correctness requirement:
+> Depot state lives in Postgres and the bucket, so any replica can serve a drain (git-bug `afb13c2`).
+
 ## Context
 
 The chart pins `replicaCount: 1`. Most of the control plane is already

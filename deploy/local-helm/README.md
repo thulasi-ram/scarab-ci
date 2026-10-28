@@ -8,10 +8,10 @@ are **not** deployed here; they ship to GitHub Pages.
 **Object store (why MinIO):** the server's CAS holds logs, artifacts, and the
 per-step **workspace snapshots** that reruns restore. `deploy.sh` points it at the
 in-cluster MinIO (`minio.yaml`, `pgsty/minio`, the maintained fork of the archived upstream; no Bitnami, same as
-Postgres) on a PVC. This matters: the local-dir fallback lives on the server
-Pod's `scratch` emptyDir, and every deploy now rolls the Pod, so it would wipe
-all workspaces and any rerun of a prior run would hang restoring its
-input. Override `SCARAB_S3_*` in `.env` to use real S3 (then MinIO is skipped).
+Postgres) on a PVC. The server refuses to boot without a bucket (ADR-0067 part 1:
+there is no local-directory fallback), and the PVC keeps the bucket's contents
+across the Pod roll every deploy does, so reruns of earlier runs can still restore
+their inputs. Override `SCARAB_S3_*` in `.env` to use real S3 (then MinIO is skipped).
 
 **Incomplete multipart uploads (git-bug ad79c90):** the Depot streams drain
 bytes as multipart pack uploads; a crashed replica cannot abort its own. The
@@ -48,8 +48,7 @@ repeatedly hit a control plane that deployed while its data plane never came up.
 
 ### `just local-helm` only works on an image that knows the workspace role
 
-Three deliberate choices interact badly, and until ADR-0061 merges they rule out
-every mode except `local`:
+Three choices interact badly on an image built before ADR-0061:
 
 1. the workspace service runs the **same image** as the server, with
    `SCARAB_ROLE=workspace` (this is what prevents version skew);
@@ -69,15 +68,17 @@ refuses with an error giving the cause, the effect and the fix. It preflights
 the **fetcher** image the same way, because that one fails in a worse way: a missing
 `scarab-wsfetch` does not break the deploy at all, it leaves every Step that
 inherits a workspace sitting in `Init:ImagePullBackOff` *after* the script has
-printed "Deployed." `ghcr.io/thulasi-ram/scarab-wsfetch:edge` does not exist until
-`image.yml` publishes it post-merge.
+printed "Deployed."
 
-So, today:
+ADR-0061 is on `main`, and `image.yml` publishes `scarab-server` and
+`scarab-wsfetch` (with the clone and sidecar images) as `edge` and `sha-<sha>` on
+every push to main. The preflight now refuses only a `sha-*` pinned to a commit
+from before ADR-0061:
 
 ```sh
-just local-helm local        # ✅ builds server + clone + sidecar + wsfetch from the tree
-just local-helm              # ❌ refused: `edge` predates ADR-0061 (and no wsfetch:edge yet)
-just local-helm sha-<sha>    # ✅ only once image.yml has published ADR-0061
+just local-helm local        # builds server + clone + sidecar + wsfetch from the tree
+just local-helm              # ghcr `edge`
+just local-helm sha-<sha>    # a published SHA; refused if it predates ADR-0061
 ```
 
 There is deliberately **no flag that disables the workspace service** to work

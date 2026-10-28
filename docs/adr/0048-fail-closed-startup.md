@@ -43,7 +43,10 @@ Refuse to boot when a feature is *enabled* but unsafely configured:
 
 - Secrets store active but `SCARAB_MASTER_KEY` missing/invalid (no more
   silent random KEK).
-- S3 selected (bucket set) but creds empty.
+- S3 selected (bucket set) but only one of `SCARAB_S3_ACCESS_KEY` /
+  `SCARAB_S3_SECRET_KEY` set. (As decided, empty creds were refused. Since PR #34,
+  setting neither key uses the AWS ambient credential chain, so only a half-set
+  pair refuses to boot; see `crates/scarab-server/src/config.rs`.)
 - OIDC issuer enabled but no **persistent** key source (today it regenerates the
   signing key every boot → federation silently breaks on restart/replica).
 

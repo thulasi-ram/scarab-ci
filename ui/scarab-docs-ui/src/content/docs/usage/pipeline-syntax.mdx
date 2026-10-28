@@ -78,7 +78,8 @@ reuse, deploys, and the operational settings.
 
 `on:` maps a trigger kind to a filter. The kinds Scarab understands are `push`, `pull_request`,
 `tag`, `release`, `comment`, `cron`, `manual`, `api`, and `upstream`. An empty `on:` means the
-pipeline has no automatic triggers: it runs only when launched explicitly.
+pipeline has no automatic triggers: it runs only when launched explicitly. `cron` and `upstream`
+parse, but nothing produces those events yet, so those two triggers never fire.
 
 ```yaml
 on:

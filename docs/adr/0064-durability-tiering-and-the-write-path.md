@@ -89,7 +89,9 @@ The test is `st_dev` of the cold directory against the warm directory, which is 
 **different device**, so the probe answers `separate-volume` while the backing dies with the Pod.
 `st_dev` measures *independence*, not *persistence* — persistence of the backing is the **chart's**
 check (refuse or loudly label a cold path that resolves to an `emptyDir`), not a `stat`'s.
-Follow-up: the chart-side check is not yet built.
+Follow-up: the chart-side check is not yet built. (No longer needed: since
+[0067](0067-the-pack-is-the-record.md) part 1 the chart has no local-directory cold tier, and an
+empty `scarab.s3.bucket` fails the boot; see `deploy/helm/scarab/templates/statefulset-workspace.yaml`.)
 
 "Is it object storage?" was the obvious test and it is the wrong one: it would reject a second PVC,
 which is a perfectly good cold tier, and accept nothing else. The guarantee comes from the backing,

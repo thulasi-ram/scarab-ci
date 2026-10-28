@@ -5,6 +5,11 @@
 - **Deciders:** thulasi.ram (architect)
 - **Amends:** [0020](0020-retry-and-failure.md) (retry & failure taxonomy)
 
+> **Status note (2026-10-28):** This model is built: `retry:` in the IR, kubelet step
+> deadlines (`activeDeadlineSeconds` in `crates/scarab-executor-k8s`), outbox poison
+> handling (`migrations/0021_outbox_poison.sql`), and the scheduler now produces
+> `DeadLettered`. The Context below describes the code before this ADR was built.
+
 ## Context
 
 ADR-0020 set the *policy* (infra auto-retry, step retry opt-in, timeouts,
@@ -71,9 +76,9 @@ infra failure silently assumes every step is retry-safe. Split it:
 
 ### `retry:` IR syntax
 
-`retry: { on: failure, max: N }` (ADR-0020's syntax), currently not expressible
-(`scarab-pipeline` has no `retry`). `on` selects post-start-infra/step/timeout;
-never-started infra retries independently of it.
+`retry: { on: failure, max: N }` (ADR-0020's syntax), not expressible when this
+was decided (done: `Retry` in `crates/scarab-pipeline/src/lib.rs`). `on` selects
+post-start-infra/step/timeout; never-started infra retries independently of it.
 
 ### Timeouts
 

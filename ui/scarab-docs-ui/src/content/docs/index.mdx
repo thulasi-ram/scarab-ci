@@ -1,10 +1,10 @@
 ---
 title: Scarab
-description: A modern CI engine for Kubernetes that plugs into your forge. The control plane keeps each run as saved state rather than a running process, so a control-plane restart doesn't lose it. Written in Rust.
+description: A CI engine for Kubernetes that plugs into your forge. The control plane keeps each run as saved state rather than a running process, so a control-plane restart doesn't lose it. Written in Rust.
 template: splash
 hero:
   layout: split-left
-  tagline: A modern CI engine for Kubernetes that plugs into your forge. Each run is saved as state, so it survives a control-plane restart.
+  tagline: A CI engine for Kubernetes that plugs into your forge. Each run is saved as state, so it survives a control-plane restart.
   image:
     # The brand emblem, square-cropped (1:1) — ink outline on light, gold on dark.
     light: ../../assets/brand/scarab-emblem-square.svg
@@ -138,15 +138,19 @@ faster pace.
 </div>
 
 :::note[Status]
-A proven core, with real forge and Kubernetes I/O wired in around it. **Proven against real
-Postgres:** the durable engine, crash and resume, exactly-once execution, restarting a single
-step, gates, the content-addressed workspace, `invoke`, secrets, and the OIDC issuer (the
-workspace suite passes locally). **Implemented:** the GitHub adapter (it ingests webhooks and
-posts commit statuses) and a Forgejo adapter, so more than one forge is supported; Pod execution
-on a live Kubernetes cluster (`scarab-executor-k8s`, with cluster tests); the results-egress
-sidecar image (`docker/sidecar/`); and CI that runs the Rust suite on every push
-(`.github/workflows/ci.yml`). None of it is hardened at scale yet: the core is proven, and
-the integrations around it are implemented but not yet proven under production load.
+Scarab is not a shipped product yet. **Tested against real Postgres, in CI:** the durable
+engine, crash and resume, exactly-once execution, restarting a single step, gates, the
+content-addressed workspace, `invoke`, secrets, and the OIDC issuer. `ci.yml` runs the
+workspace suite on every push to main and on every PR that touches Rust code. **Tested against
+a fake forge:** webhook → in-repo config → run → commit statuses posted back. **Implemented, and
+run against real forges by hand:** the GitHub and Forgejo adapters (webhook ingest and commit
+statuses); `just forgejo-verify` drives a real Forgejo from hook to Run, and the live demo takes
+its webhooks from a GitHub App. **Implemented, and tested on a kind cluster:** Pod execution and
+re-attach (`scarab-executor-k8s`) and the results-egress sidecar (`docker/sidecar/`).
+`kind.yml` runs those tests for changes to the execution path, not on every PR. **Not proven
+yet:** control-plane crash and resume with a real Pod in flight (the weekly e2e test for it
+doesn't pass yet) and production-scale load. **Missing:** `on: cron` and `on: upstream`
+triggers parse, but nothing produces those events yet.
 :::
 
 ## References

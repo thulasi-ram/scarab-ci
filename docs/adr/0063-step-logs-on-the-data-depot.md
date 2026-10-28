@@ -165,6 +165,10 @@ Renamed: `--role workspace` → `--role depot`, `Role::Workspace` → `Role::Dep
 `SCARAB_WORKSPACE_DATA_DIR` → `SCARAB_DEPOT_DATA_DIR`, `workspaced.rs` → `depotd.rs`, the chart's
 `*-workspace.yaml` objects and `workspace.*` values → `*-depot.yaml` and `depot.*`, and
 `just workspace-logs`/`workspace-status` → `just depot-logs`/`depot-status`.
+(Not done yet: the code still has `Role::Workspace`, `--role workspace` and `workspaced.rs`
+under `crates/scarab-server/src/`, the chart still ships `statefulset-workspace.yaml`, and the
+`Justfile` still has `workspace-logs` and `workspace-status`. The repo `CLAUDE.md` uses the
+names the code has.)
 
 **Deliberately not renamed**, because they are correctly named: **Workspace**, **Workspace
 Snapshot** and **Workspace Export** are domain terms about workspaces;
