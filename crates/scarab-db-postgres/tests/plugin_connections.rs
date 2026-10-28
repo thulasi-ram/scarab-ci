@@ -55,6 +55,7 @@ fn installation(org: &str, name: &str, id: &str) -> PluginInstallation {
                 }],
             }],
             config_keys: vec![],
+            actions: vec![],
         },
         manifest_sha256: "0".repeat(64),
         config: BTreeMap::new(),

@@ -612,6 +612,7 @@ async fn drive_to_gate(pg: &Arc<PostgresDb>, run: &RunId) {
         cache: None,
         clone: None,
         build: None,
+        plugin_action: None,
         artifacts: vec![],
         placement_profiles: vec![],
         resources: Default::default(),

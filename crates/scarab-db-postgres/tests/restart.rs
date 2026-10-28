@@ -29,6 +29,7 @@ fn spec() -> StepSpec {
         cache: None,
         clone: None,
         build: None,
+        plugin_action: None,
         artifacts: vec![],
         placement_profiles: vec![],
         resources: Default::default(),

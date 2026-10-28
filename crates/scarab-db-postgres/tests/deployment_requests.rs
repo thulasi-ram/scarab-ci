@@ -390,6 +390,7 @@ fn manifest() -> PluginManifest {
         capabilities: vec![PluginCapability::ReportDeployments],
         connections: vec![],
         config_keys: vec![],
+        actions: vec![],
     }
 }
 

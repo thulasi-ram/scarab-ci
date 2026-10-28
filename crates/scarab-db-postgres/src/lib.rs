@@ -499,6 +499,151 @@ impl Db for PostgresDb {
         Ok(())
     }
 
+    async fn record_plugin_invocation(
+        &self,
+        inv: &scarab_engine::PluginInvocation,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO plugin_invocations
+                 (id, run_id, step_id, attempt_id, org, installation, action, inputs,
+                  poll_interval_ms, created_at, next_offer_at, lease_until, label,
+                  last_answer_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(&inv.id)
+        .bind(&inv.run.0)
+        .bind(&inv.step.0)
+        .bind(&inv.attempt.0)
+        .bind(&inv.org)
+        .bind(&inv.installation)
+        .bind(&inv.action)
+        .bind(serde_json::to_value(&inv.inputs).map_err(|e| DbError::Other(e.to_string()))?)
+        .bind(inv.poll_interval_ms)
+        .bind(inv.created_at.0)
+        .bind(inv.next_offer_at.0)
+        .bind(inv.lease_until.map(|t| t.0))
+        .bind(inv.label.as_deref())
+        .bind(inv.last_answer_at.map(|t| t.0))
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn plugin_invocation(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<Option<scarab_engine::PluginInvocation>, DbError> {
+        let row = sqlx::query(&format!(
+            "SELECT {PLUGIN_INVOCATION_COLUMNS} FROM plugin_invocations i
+             WHERE i.run_id = $1 AND i.step_id = $2 AND i.attempt_id = $3"
+        ))
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(&attempt.0)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(db_err)?;
+        row.map(|r| plugin_invocation_row(&r)).transpose()
+    }
+
+    async fn plugin_invocation_by_id(
+        &self,
+        id: &str,
+    ) -> Result<Option<scarab_engine::PluginInvocation>, DbError> {
+        let row = sqlx::query(&format!(
+            "SELECT {PLUGIN_INVOCATION_COLUMNS} FROM plugin_invocations i WHERE i.id = $1"
+        ))
+        .bind(id)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(db_err)?;
+        row.map(|r| plugin_invocation_row(&r)).transpose()
+    }
+
+    async fn lease_plugin_invocations(
+        &self,
+        org: &str,
+        installation: &str,
+        now: Timestamp,
+        lease_until: Timestamp,
+        limit: u32,
+    ) -> Result<Vec<scarab_engine::PluginInvocation>, DbError> {
+        // One statement: pick under `FOR UPDATE SKIP LOCKED` and lease. A
+        // concurrent caller either skips a row this one holds or, starting
+        // after this commit, sees its lease — never leases it twice.
+        let rows = sqlx::query(&format!(
+            "WITH picked AS (
+                 SELECT i.id FROM plugin_invocations i
+                 WHERE i.org = $1 AND i.installation = $2
+                   AND i.next_offer_at <= $3
+                   AND (i.lease_until IS NULL OR i.lease_until <= $3)
+                   AND {PLUGIN_FENCE_CURRENT}
+                 ORDER BY i.next_offer_at, i.id
+                 LIMIT $5
+                 FOR UPDATE OF i SKIP LOCKED
+             )
+             UPDATE plugin_invocations i SET lease_until = $4
+             FROM picked WHERE i.id = picked.id
+             RETURNING {PLUGIN_INVOCATION_COLUMNS}"
+        ))
+        .bind(org)
+        .bind(installation)
+        .bind(now.0)
+        .bind(lease_until.0)
+        .bind(i64::from(limit))
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?;
+        let mut out = rows
+            .iter()
+            .map(plugin_invocation_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        out.sort_by(|a, b| (a.next_offer_at.0, &a.id).cmp(&(b.next_offer_at.0, &b.id)));
+        Ok(out)
+    }
+
+    async fn record_plugin_pending(
+        &self,
+        id: &str,
+        label: &str,
+        at: Timestamp,
+        next_offer_at: Timestamp,
+    ) -> Result<bool, DbError> {
+        let done = sqlx::query(&format!(
+            "UPDATE plugin_invocations i
+             SET label = $2, last_answer_at = $3, next_offer_at = $4, lease_until = NULL
+             WHERE i.id = $1 AND {PLUGIN_FENCE_CURRENT}"
+        ))
+        .bind(id)
+        .bind(label)
+        .bind(at.0)
+        .bind(next_offer_at.0)
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    async fn open_plugin_invocations(
+        &self,
+        org: Option<&str>,
+    ) -> Result<Vec<scarab_engine::PluginInvocation>, DbError> {
+        let rows = sqlx::query(&format!(
+            "SELECT {PLUGIN_INVOCATION_COLUMNS} FROM plugin_invocations i
+             WHERE ($1::TEXT IS NULL OR i.org = $1) AND {PLUGIN_FENCE_CURRENT}
+             ORDER BY i.created_at, i.id"
+        ))
+        .bind(org)
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?;
+        rows.iter().map(plugin_invocation_row).collect()
+    }
+
     async fn ingest_attempt_results(
         &self,
         run: &RunId,
@@ -1638,6 +1783,39 @@ impl Db for PostgresDb {
             Some((attempt, scarab_engine::AttemptStamp::Failure { kind, detail })) => {
                 update_attempt_failure(&mut *tx, run, step, attempt, *kind, detail.as_deref())
                     .await?;
+            }
+            Some((attempt, scarab_engine::AttemptStamp::SucceededWithResults(results))) => {
+                update_attempt_outcome(&mut *tx, run, step, attempt, AttemptOutcome::Succeeded)
+                    .await?;
+                // As `set_step_results`: the attempt's copy and the step's
+                // latest-evidence row, in this same commit.
+                let json =
+                    serde_json::to_value(results).map_err(|e| DbError::Other(e.to_string()))?;
+                sqlx::query(
+                    "UPDATE step_runs
+                     SET results = $3,
+                         evidence_attempt = $4,
+                         updated_at = (extract(epoch from now()) * 1000)::bigint
+                     WHERE run_id = $1 AND step_id = $2",
+                )
+                .bind(&run.0)
+                .bind(&step.0)
+                .bind(&json)
+                .bind(&attempt.0)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+                sqlx::query(
+                    "UPDATE attempts SET results = $4
+                     WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
+                )
+                .bind(&run.0)
+                .bind(&step.0)
+                .bind(&attempt.0)
+                .bind(&json)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
             }
             None => {}
         }
@@ -3597,6 +3775,54 @@ fn needs_from_value(v: Value) -> Result<Vec<StepId>, DbError> {
     Ok(ids.into_iter().map(StepId).collect())
 }
 
+/// The columns a [`scarab_engine::PluginInvocation`] is read from, on alias `i`.
+const PLUGIN_INVOCATION_COLUMNS: &str = "i.id, i.run_id, i.step_id, i.attempt_id, i.org, \
+     i.installation, i.action, i.inputs, i.poll_interval_ms, i.created_at, i.next_offer_at, \
+     i.lease_until, i.label, i.last_answer_at";
+
+/// An invocation's fence is current (ADR-0074 §5): its Step is `running` on
+/// exactly its Attempt — the latest by mint order — and that Attempt is
+/// still `running`. A cancel, a Retry or a superseded Take each break one of
+/// these, so the invocation stops being offered with no write here.
+const PLUGIN_FENCE_CURRENT: &str = "EXISTS (
+         SELECT 1 FROM step_runs s
+         JOIN attempts a ON a.run_id = s.run_id AND a.step_id = s.step_id
+         WHERE s.run_id = i.run_id AND s.step_id = i.step_id AND s.status = 'running'
+           AND a.attempt_id = i.attempt_id AND a.outcome = 'running'
+           AND NOT EXISTS (
+               SELECT 1 FROM attempts b
+               WHERE b.run_id = i.run_id AND b.step_id = i.step_id
+                 AND CAST(substring(b.attempt_id FROM 2) AS INTEGER)
+                     > CAST(substring(i.attempt_id FROM 2) AS INTEGER)))";
+
+fn plugin_invocation_row(
+    r: &sqlx::postgres::PgRow,
+) -> Result<scarab_engine::PluginInvocation, DbError> {
+    let inputs: Value = r.try_get("inputs").map_err(db_err)?;
+    Ok(scarab_engine::PluginInvocation {
+        id: r.try_get("id").map_err(db_err)?,
+        run: RunId(r.try_get("run_id").map_err(db_err)?),
+        step: StepId(r.try_get("step_id").map_err(db_err)?),
+        attempt: AttemptId(r.try_get("attempt_id").map_err(db_err)?),
+        org: r.try_get("org").map_err(db_err)?,
+        installation: r.try_get("installation").map_err(db_err)?,
+        action: r.try_get("action").map_err(db_err)?,
+        inputs: serde_json::from_value(inputs).map_err(|e| DbError::Other(e.to_string()))?,
+        poll_interval_ms: r.try_get("poll_interval_ms").map_err(db_err)?,
+        created_at: Timestamp(r.try_get("created_at").map_err(db_err)?),
+        next_offer_at: Timestamp(r.try_get("next_offer_at").map_err(db_err)?),
+        lease_until: r
+            .try_get::<Option<i64>, _>("lease_until")
+            .map_err(db_err)?
+            .map(Timestamp),
+        label: r.try_get("label").map_err(db_err)?,
+        last_answer_at: r
+            .try_get::<Option<i64>, _>("last_answer_at")
+            .map_err(db_err)?
+            .map(Timestamp),
+    })
+}
+
 fn step_status_str(s: StepStatus) -> &'static str {
     match s {
         StepStatus::Pending => "pending",
@@ -3645,6 +3871,8 @@ fn failure_str(f: FailureKind) -> &'static str {
         FailureKind::Gate => "gate",
         // Forward-only, like "missing-inputs" (slice b, criterion 1).
         FailureKind::DeploymentRequestIncomplete => "deployment-request-incomplete",
+        // Forward-only, like "missing-inputs" (ADR-0074 §5).
+        FailureKind::PluginUnavailable => "plugin-unavailable",
     }
 }
 
@@ -3663,6 +3891,7 @@ fn failure_from_str(s: &str) -> Result<FailureKind, DbError> {
         "missing-inputs" => Ok(FailureKind::MissingInputs),
         "gate" => Ok(FailureKind::Gate),
         "deployment-request-incomplete" => Ok(FailureKind::DeploymentRequestIncomplete),
+        "plugin-unavailable" => Ok(FailureKind::PluginUnavailable),
         other => Err(DbError::Other(format!("unknown failure kind {other:?}"))),
     }
 }

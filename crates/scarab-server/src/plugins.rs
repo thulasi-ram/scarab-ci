@@ -254,6 +254,17 @@ pub struct PluginManifestDto {
     pub capabilities: Vec<PluginCapabilityDto>,
     pub connections: Vec<ConnectionSlotDto>,
     pub config_keys: Vec<String>,
+    /// The PluginActions it offers under `offer_actions` (ADR-0072 §4): what
+    /// a `plugin_action` step may name.
+    pub actions: Vec<PluginActionDeclDto>,
+}
+
+/// A PluginAction a plugin offers (ADR-0074 §5).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PluginActionDeclDto {
+    pub name: String,
+    /// Seconds between offers while the action answers `pending`.
+    pub poll_interval_secs: u32,
 }
 
 impl From<&PluginManifest> for PluginManifestDto {
@@ -271,6 +282,14 @@ impl From<&PluginManifest> for PluginManifestDto {
                 })
                 .collect(),
             config_keys: m.config_keys.clone(),
+            actions: m
+                .actions
+                .iter()
+                .map(|a| PluginActionDeclDto {
+                    name: a.name.clone(),
+                    poll_interval_secs: a.poll_interval_secs(),
+                })
+                .collect(),
         }
     }
 }
@@ -964,6 +983,15 @@ pub(crate) async fn uninstall_plugin(
     for credential_ref in &removed.connection_credential_refs {
         delete_connection_credential(&st, credential_ref).await;
     }
+    // Its pending plugin_action steps can get no answer now (ADR-0074 §5).
+    crate::plugin_actions::fail_for_installation(
+        &*st.db,
+        &*st.clock,
+        &org,
+        &name,
+        "was uninstalled",
+    )
+    .await;
     Ok(Json(UninstalledPluginDto {
         name,
         removed_deployment_sources: removed.deployment_sources.iter().map(Into::into).collect(),
@@ -991,6 +1019,9 @@ async fn set_state(
             by,
             "plugin installation killed (ADR-0072 §10)"
         );
+        // Its pending plugin_action steps can get no answer now (ADR-0074 §5).
+        crate::plugin_actions::fail_for_installation(&*st.db, &*st.clock, org, name, "was killed")
+            .await;
     }
     Ok(Json(with_sources(st, &installation).await?))
 }

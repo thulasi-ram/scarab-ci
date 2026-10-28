@@ -1193,6 +1193,215 @@ async fn reopen_if_runnable(db: &dyn Db, clock: &dyn Clock, run: &RunId) -> Resu
     Ok(())
 }
 
+/// The timeout reason of a `plugin_action` Step (ADR-0074 §5): the action,
+/// the deadline, the last label the plugin reported and when it last
+/// answered, relative to the deadline.
+fn plugin_timeout_reason(timeout_ms: i64, deadline: i64, inv: &crate::PluginInvocation) -> String {
+    let secs = timeout_ms / 1000;
+    let action = format!("`{}/{}`", inv.installation, inv.action);
+    let last = match &inv.label {
+        Some(label) => format!("last state: \"{label}\""),
+        None => "no state reported".to_string(),
+    };
+    let answered = match inv.last_answer_at {
+        Some(at) => format!(
+            "the plugin last answered {}s before the deadline",
+            (deadline - at.0).max(0) / 1000
+        ),
+        None => "the plugin never answered this invocation".to_string(),
+    };
+    format!("plugin action {action} did not finish within {secs}s; {last}; {answered}")
+}
+
+/// The executor of a [`Scheduler`] built off the scheduling loop to settle a
+/// `plugin_action` Attempt ([`answer_plugin_invocation`],
+/// [`fail_plugin_invocations`]): such an Attempt launched nothing, and the
+/// settle paths those use never reach the executor. Every call is refused,
+/// so a path that did reach it fails loudly instead of acting.
+struct NoUnit;
+
+#[async_trait::async_trait]
+impl Executor for NoUnit {
+    async fn launch(&self, _: &StepRun, _: &StepSpec) -> Result<ExecHandle, ExecError> {
+        Err(ExecError::Refused(
+            "a plugin_action step launches nothing".into(),
+        ))
+    }
+    async fn poll(&self, _: &ExecHandle) -> Result<ExecState, ExecError> {
+        Err(ExecError::Refused(
+            "a plugin_action step launches nothing".into(),
+        ))
+    }
+    async fn cancel(&self, _: &ExecHandle) -> Result<(), ExecError> {
+        Ok(())
+    }
+    fn unit_handle(&self, _: &StepRun) -> Option<ExecHandle> {
+        None
+    }
+    async fn torn_down(&self, _: &ExecHandle) -> Result<bool, ExecError> {
+        Ok(true)
+    }
+    async fn results_delivery_failure(&self, _: &ExecHandle) -> Result<Option<String>, ExecError> {
+        Ok(None)
+    }
+    async fn workspace_provisioning(
+        &self,
+        _: &ExecHandle,
+    ) -> Result<Option<crate::ProvisioningReport>, ExecError> {
+        Ok(None)
+    }
+    async fn infra_condition(
+        &self,
+        _: &ExecHandle,
+    ) -> Result<Option<crate::InfraCondition>, ExecError> {
+        Ok(None)
+    }
+}
+
+/// Is `invocation`'s fence current: its Step `Running` on exactly that
+/// Attempt, which is still `running`?
+async fn plugin_fence_current(
+    db: &dyn Db,
+    invocation: &crate::PluginInvocation,
+) -> Result<bool, DbError> {
+    let steps = db.steps_of_run(&invocation.run).await?;
+    let Some(step) = steps.iter().find(|s| s.step == invocation.step) else {
+        return Ok(false);
+    };
+    let attempts = db
+        .attempts_of_step(&invocation.run, &invocation.step)
+        .await?;
+    Ok(step.status == StepStatus::Running
+        && attempts
+            .last()
+            .is_some_and(|a| a.id == invocation.attempt && a.outcome == AttemptOutcome::Running))
+}
+
+/// Apply a plugin's answer to `invocation` (ADR-0074 §5). Needs only the
+/// [`Db`] and [`Clock`] ports, so the broker calls it directly.
+///
+/// - `pending`: the label is stored on the invocation (overwritten, not
+///   journaled) and the invocation is offered again after the action's poll
+///   interval.
+/// - `succeeded`: the Step goes `Succeeded` with `results` as its results,
+///   the Attempt stamped and the events journaled, in one commit.
+/// - `failed`: the Attempt fails as a Step verdict ([`FailureKind::Step`])
+///   with `reason`, through the same retry policy as a container's non-zero
+///   exit (an author `retry:` re-runs it on a new Attempt).
+///
+/// An answer whose fence is no longer current is dropped
+/// ([`AnswerOutcome::Stale`](crate::AnswerOutcome::Stale)) and writes
+/// nothing. `succeeded` results over the size limit are refused before
+/// anything is written.
+pub async fn answer_plugin_invocation(
+    db: &dyn Db,
+    clock: &dyn Clock,
+    invocation: &crate::PluginInvocation,
+    answer: crate::PluginAnswer,
+) -> Result<Result<crate::AnswerOutcome, crate::AnswerRefused>, SchedulerError> {
+    use crate::plugin_action::{truncate_chars, MAX_PLUGIN_LABEL_CHARS, MAX_PLUGIN_REASON_CHARS};
+    use crate::{AnswerOutcome, PluginAnswer};
+    if let PluginAnswer::Succeeded { results } = &answer {
+        if let Err(refused) = crate::plugin_action::check_results(results) {
+            return Ok(Err(refused));
+        }
+    }
+    let now = clock.now().await;
+    if let PluginAnswer::Pending { label } = &answer {
+        let next = Timestamp(now.0.saturating_add(invocation.poll_interval_ms.max(0)));
+        let label = truncate_chars(label, MAX_PLUGIN_LABEL_CHARS);
+        let recorded = db
+            .record_plugin_pending(&invocation.id, &label, now, next)
+            .await?;
+        return Ok(Ok(if recorded {
+            AnswerOutcome::Accepted
+        } else {
+            AnswerOutcome::Stale
+        }));
+    }
+    if !plugin_fence_current(db, invocation).await? {
+        return Ok(Ok(AnswerOutcome::Stale));
+    }
+    let sched = Scheduler::new(db, clock, &NoUnit, "plugin-answer");
+    let (run, step, attempt) = (&invocation.run, &invocation.step, &invocation.attempt);
+    let closed = match answer {
+        PluginAnswer::Succeeded { results } => {
+            sched
+                .commit_verdict(
+                    run,
+                    step,
+                    attempt,
+                    StepStatus::Succeeded,
+                    None,
+                    None,
+                    Some(results),
+                )
+                .await?
+        }
+        PluginAnswer::Failed { reason } => {
+            let reason = truncate_chars(&reason, MAX_PLUGIN_REASON_CHARS);
+            sched
+                .settle_failed_attempt(run, step, attempt, FailureKind::Step, Some(reason))
+                .await?;
+            // The settle writes nothing when a peer moved the step first;
+            // read back whether this answer is what closed the Attempt.
+            db.attempts_of_step(run, step)
+                .await?
+                .iter()
+                .any(|a| &a.id == attempt && a.outcome == AttemptOutcome::Failed)
+        }
+        PluginAnswer::Pending { .. } => unreachable!("handled above"),
+    };
+    if !closed {
+        return Ok(Ok(AnswerOutcome::Stale));
+    }
+    reopen_if_runnable(db, clock, run)
+        .await
+        .map_err(|e| SchedulerError::Db(DbError::Other(e.to_string())))?;
+    Ok(Ok(AnswerOutcome::Accepted))
+}
+
+/// Fail each of `invocations` whose fence is still current with
+/// [`FailureKind::PluginUnavailable`] and `reason` (ADR-0074 §5): its
+/// installation was killed or uninstalled, so no answer can come. Never
+/// retried. Returns how many Attempts this closed.
+pub async fn fail_plugin_invocations(
+    db: &dyn Db,
+    clock: &dyn Clock,
+    invocations: &[crate::PluginInvocation],
+    reason: &str,
+) -> Result<usize, SchedulerError> {
+    let sched = Scheduler::new(db, clock, &NoUnit, "plugin-unavailable");
+    let mut closed = 0;
+    for inv in invocations {
+        if !plugin_fence_current(db, inv).await? {
+            continue;
+        }
+        let cause = format!(
+            "plugin installation `{}` {reason}; action `{}` cannot be answered",
+            inv.installation, inv.action
+        );
+        if sched
+            .commit_verdict(
+                &inv.run,
+                &inv.step,
+                &inv.attempt,
+                StepStatus::Failed,
+                Some(FailureKind::PluginUnavailable),
+                Some(cause),
+                None,
+            )
+            .await?
+        {
+            closed += 1;
+            reopen_if_runnable(db, clock, &inv.run)
+                .await
+                .map_err(|e| SchedulerError::Db(DbError::Other(e.to_string())))?;
+        }
+    }
+    Ok(closed)
+}
+
 /// Is gate `gate` **reached** — has every one of its needs Succeeded?
 fn gate_reached(gate: &StepRun, steps: &[StepRun]) -> bool {
     gate.needs.iter().all(|n| {
@@ -1584,8 +1793,9 @@ fn only_gate_waits_outstanding(steps: &[StepRun]) -> bool {
 
 /// Suspend predicate (slice b, criteria 3 and 4): the run may suspend iff at
 /// least one step is **waiting** — a gate that is Pending with every need
-/// Succeeded, or a deploy Step in `concurrency_held` (Pending, needs met, held
-/// by per-DeploymentTarget concurrency this pass) — no step is
+/// Succeeded, a deploy Step in `concurrency_held` (Pending, needs met, held
+/// by per-DeploymentTarget concurrency this pass), or a Running `plugin_action`
+/// Step in it (ADR-0074 §5: its Attempt waits on a plugin, holding no Pod) — no step is
 /// `Ready`/`Running`, and every other non-terminal step is transitively behind
 /// a waiting one. A step held for any other reason — a `uses:` readiness hold,
 /// a Pending step a dead upstream will Skip next pass — keeps the run
@@ -1600,9 +1810,12 @@ fn only_waits_outstanding(
     let waiting: std::collections::HashSet<&StepId> = steps
         .iter()
         .filter(|s| {
-            s.status == StepStatus::Pending
+            (s.status == StepStatus::Pending
                 && s.needs.iter().all(succeeded)
-                && (s.is_gate() || concurrency_held.contains(&s.step))
+                && (s.is_gate() || concurrency_held.contains(&s.step)))
+                // A pending plugin action (ADR-0074 §5) is Running on an
+                // Attempt that holds no Pod; the caller names it here.
+                || (s.status == StepStatus::Running && concurrency_held.contains(&s.step))
         })
         .map(|s| &s.step)
         .collect();
@@ -2268,6 +2481,7 @@ impl<'a> Scheduler<'a> {
         // Shared services (ADR-0058) are born + readiness-polled before admission
         // so the readiness gate reads fresh statuses this same tick.
         self.reconcile_services(run).await?;
+        self.enforce_plugin_action_deadlines().await?;
         self.admit(run).await?;
         self.reconcile().await?;
         self.advance(run).await?;
@@ -2296,6 +2510,9 @@ impl<'a> Scheduler<'a> {
     /// (see [`TickHealth`]), restoring "forward progress **or** explicit
     /// dead-letter" (CONTEXT §7.1) at the per-run grain.
     pub async fn tick_all(&self) -> Result<Vec<(RunId, SchedulerError)>, SchedulerError> {
+        // Pending plugin actions past their deadline (ADR-0074 §5) fail
+        // before admission looks at their Runs.
+        self.enforce_plugin_action_deadlines().await?;
         let runs = self.db.active_runs().await?;
         // Runs that finished (or dead-lettered) must not keep a failure streak
         // alive in the process-lifetime map.
@@ -2454,7 +2671,8 @@ impl<'a> Scheduler<'a> {
         // again, from its own snapshot, before any `Pending → Ready`.
         if status == RunStatus::Suspended {
             let steps = self.db.steps_of_run(run).await?;
-            let held = self.deployment_concurrency_holds(run, &steps).await?;
+            let mut held = self.deployment_concurrency_holds(run, &steps).await?;
+            held.extend(self.plugin_action_waits(run, &steps).await?);
             if only_waits_outstanding(&steps, &held) {
                 return Ok(());
             }
@@ -2723,11 +2941,22 @@ impl<'a> Scheduler<'a> {
         let any_pending_gate = steps
             .iter()
             .any(|s| s.is_gate() && s.status == StepStatus::Pending);
-        if (any_pending_gate || !concurrency_held.is_empty())
-            && only_waits_outstanding(&self.db.steps_of_run(run).await?, &concurrency_held)
-        {
-            self.transition_run(run, RunStatus::Running, RunStatus::Suspended)
-                .await?;
+        // A Running Step in the snapshot may be a pending plugin action
+        // (ADR-0074 §5), which waits like a gate; a Step claimed in this
+        // very pass shows as Pending here and is asked about next pass.
+        let any_running = steps.iter().any(|s| s.status == StepStatus::Running);
+        if any_pending_gate || !concurrency_held.is_empty() || any_running {
+            let now_steps = self.db.steps_of_run(run).await?;
+            if let Some(plugin_waits) = self.plugin_waits_if_all(run, &now_steps).await? {
+                let mut waits = concurrency_held;
+                waits.extend(plugin_waits);
+                if (any_pending_gate || !waits.is_empty())
+                    && only_waits_outstanding(&now_steps, &waits)
+                {
+                    self.transition_run(run, RunStatus::Running, RunStatus::Suspended)
+                        .await?;
+                }
+            }
         }
         Ok(())
     }
@@ -3247,6 +3476,20 @@ impl<'a> Scheduler<'a> {
                     ExecHandle(h)
                 }
                 None => {
+                    // A plugin_action Step launches nothing (ADR-0074 §5): its
+                    // Attempt offers an invocation instead, recorded once.
+                    // Checked first, so no Pod-shaped teardown is ever
+                    // enqueued for it.
+                    if let Some(spec) = self.db.step_spec(&run, &step).await? {
+                        if spec.plugin_action.is_some() {
+                            if self.launch_still_wanted(&run, &step, &attempt).await? {
+                                self.offer_plugin_action(&run, &step, &attempt, spec)
+                                    .await?;
+                            }
+                            self.db.mark_dispatched(msg.id).await?;
+                            return Ok(());
+                        }
+                    }
                     // Launch only a unit that is still wanted (red team A2):
                     // the step still `Running` on THIS attempt, in a Run not
                     // terminal. A launch intent can outlive its claim — an
@@ -3611,6 +3854,143 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
+    /// Start a `plugin_action` Attempt (ADR-0074 §5): resolve its `with`
+    /// against the upstream results, then record the invocation the plugin
+    /// will pull. A bad `${{ … }}` reference fails the Step `Config` before
+    /// anything is offered, as it does before a Pod is created.
+    async fn offer_plugin_action(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        spec: StepSpec,
+    ) -> Result<(), SchedulerError> {
+        let spec = match self.interpolate_spec(run, step, spec).await? {
+            Ok(spec) => spec,
+            Err(reason) => {
+                return self
+                    .finalize_step(
+                        run,
+                        step,
+                        attempt,
+                        StepStatus::Failed,
+                        Some(FailureKind::Config),
+                        Some(reason),
+                    )
+                    .await;
+            }
+        };
+        let Some(action) = spec.plugin_action else {
+            return Ok(());
+        };
+        let now = self.clock.now().await;
+        self.db
+            .record_plugin_invocation(&crate::PluginInvocation {
+                id: crate::plugin_invocation_id(run, step, attempt),
+                run: run.clone(),
+                step: step.clone(),
+                attempt: attempt.clone(),
+                org: action.org,
+                installation: action.installation,
+                action: action.action,
+                inputs: action.with,
+                poll_interval_ms: i64::from(action.poll_interval_secs).saturating_mul(1000),
+                created_at: now,
+                next_offer_at: now,
+                lease_until: None,
+                label: None,
+                last_answer_at: None,
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// The Running `plugin_action` Steps of `steps` — the waits that hold no
+    /// Pod (ADR-0074 §5).
+    async fn plugin_action_waits(
+        &self,
+        run: &RunId,
+        steps: &[StepRun],
+    ) -> Result<std::collections::HashSet<StepId>, SchedulerError> {
+        let mut out = std::collections::HashSet::new();
+        for s in steps.iter().filter(|s| s.status == StepStatus::Running) {
+            if self
+                .db
+                .step_spec(run, &s.step)
+                .await?
+                .is_some_and(|spec| spec.plugin_action.is_some())
+            {
+                out.insert(s.step.clone());
+            }
+        }
+        Ok(out)
+    }
+
+    /// [`plugin_action_waits`](Self::plugin_action_waits) when EVERY
+    /// Running Step of `steps` is a pending plugin action; `None` as soon as
+    /// one is not (a Pod is running, so the Run cannot suspend), which keeps
+    /// the common case to one spec read.
+    async fn plugin_waits_if_all(
+        &self,
+        run: &RunId,
+        steps: &[StepRun],
+    ) -> Result<Option<std::collections::HashSet<StepId>>, SchedulerError> {
+        let mut out = std::collections::HashSet::new();
+        for s in steps.iter().filter(|s| s.status == StepStatus::Running) {
+            let is_action = self
+                .db
+                .step_spec(run, &s.step)
+                .await?
+                .is_some_and(|spec| spec.plugin_action.is_some());
+            if !is_action {
+                return Ok(None);
+            }
+            out.insert(s.step.clone());
+        }
+        Ok(Some(out))
+    }
+
+    /// Enforce each pending `plugin_action` Step's `timeout` at its deadline
+    /// (ADR-0074 §5), across every Run: no kubelet does it for this kind,
+    /// and no grace is added since nothing runs that could still finish on
+    /// its own. Read from the invocation rows, so a Run with no plugin
+    /// action costs nothing here. The reason names the plugin's last label
+    /// and when it last answered. A Suspended Run whose action timed out
+    /// reopens at once.
+    pub async fn enforce_plugin_action_deadlines(&self) -> Result<(), SchedulerError> {
+        let now = self.clock.now().await;
+        for inv in self.db.open_plugin_invocations(None).await? {
+            let Some(started_at) = self
+                .db
+                .attempts_of_step(&inv.run, &inv.step)
+                .await?
+                .iter()
+                .find(|a| a.id == inv.attempt)
+                .map(|a| a.started_at)
+            else {
+                continue;
+            };
+            let timeout_ms = self.step_timeout_ms(&inv.run, &inv.step).await?;
+            let deadline = started_at.0.saturating_add(timeout_ms);
+            if now.0 < deadline {
+                continue;
+            }
+            let reason = plugin_timeout_reason(timeout_ms, deadline, &inv);
+            self.settle_failed_attempt(
+                &inv.run,
+                &inv.step,
+                &inv.attempt,
+                FailureKind::Timeout,
+                Some(reason),
+            )
+            .await?;
+            reopen_if_runnable(self.db, self.clock, &inv.run)
+                .await
+                .map_err(|e| SchedulerError::Db(DbError::Other(e.to_string())))?;
+        }
+        Ok(())
+    }
+
     /// Settle-time cache recording (ADR-0065 s1): upsert each reported save
     /// into the `cache_entries` mapping. **Best-effort both ways** — nothing
     /// here may fail the step: a save is an optimisation hint, and the drain
@@ -3843,7 +4223,16 @@ impl<'a> Scheduler<'a> {
         // env has already been injected above.
         let has_interp = spec.image.contains("${{")
             || spec.command.iter().any(|c| c.contains("${{"))
-            || spec.env.iter().any(|(_, v)| v.contains("${{"));
+            || spec.env.iter().any(|(_, v)| v.contains("${{"))
+            || spec.plugin_action.as_ref().is_some_and(|a| {
+                scarab_pipeline::PluginActionSpec {
+                    with: a.with.clone(),
+                    ..Default::default()
+                }
+                .strings()
+                .iter()
+                .any(|s| s.contains("${{"))
+            });
         if !has_interp {
             return Ok(Ok(spec));
         }
@@ -3895,6 +4284,10 @@ impl<'a> Scheduler<'a> {
             }
             for (_, v) in &mut out.env {
                 *v = interp(v)?;
+            }
+            if let Some(action) = &mut out.plugin_action {
+                action.with = scarab_pipeline::interpolate_with(&action.with, &ctx)
+                    .map_err(|e| e.to_string())?;
             }
             Ok::<(), String>(())
         })() {
@@ -4668,7 +5061,8 @@ impl<'a> Scheduler<'a> {
             FailureKind::Config
             | FailureKind::MissingInputs
             | FailureKind::Gate
-            | FailureKind::DeploymentRequestIncomplete => 1,
+            | FailureKind::DeploymentRequestIncomplete
+            | FailureKind::PluginUnavailable => 1,
             _ => configured.unwrap_or(1),
         };
 
@@ -5017,6 +5411,26 @@ impl<'a> Scheduler<'a> {
         failure: Option<FailureKind>,
         cause: Option<String>,
     ) -> Result<(), SchedulerError> {
+        self.commit_verdict(run, step, attempt, to, failure, cause, None)
+            .await
+            .map(|_| ())
+    }
+
+    /// [`finalize_step`](Self::finalize_step), optionally landing the
+    /// Attempt's `results` in the same commit (a plugin's `succeeded`
+    /// answer, ADR-0074 §5). `true` when this call's commit is the one that
+    /// finalized the step; `false` when a peer did first (`Conflict`).
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_verdict(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        to: StepStatus,
+        failure: Option<FailureKind>,
+        cause: Option<String>,
+        results: Option<BTreeMap<String, serde_json::Value>>,
+    ) -> Result<bool, SchedulerError> {
         // Optimistic guard: if a peer already finalized this step, our UPDATE
         // matches zero rows (Conflict) — we write no duplicate events but still
         // let the caller retire the outbox message. Exactly-once step terminus.
@@ -5033,7 +5447,10 @@ impl<'a> Scheduler<'a> {
         // interpolation failure) that never routed through
         // `settle_failed_attempt`. Idempotent when they did.
         let stamp = match (to, failure) {
-            (StepStatus::Succeeded, _) => Some(AttemptStamp::Outcome(AttemptOutcome::Succeeded)),
+            (StepStatus::Succeeded, _) => Some(match results {
+                Some(results) => AttemptStamp::SucceededWithResults(results),
+                None => AttemptStamp::Outcome(AttemptOutcome::Succeeded),
+            }),
             (StepStatus::Failed, Some(kind)) => Some(AttemptStamp::Failure {
                 kind,
                 detail: cause.clone(),
@@ -5064,8 +5481,8 @@ impl<'a> Scheduler<'a> {
             )
             .await
         {
-            Ok(()) => Ok(()),
-            Err(DbError::Conflict) => Ok(()),
+            Ok(()) => Ok(true),
+            Err(DbError::Conflict) => Ok(false),
             Err(e) => Err(e.into()),
         }
     }

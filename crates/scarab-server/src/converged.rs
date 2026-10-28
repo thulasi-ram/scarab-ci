@@ -115,6 +115,12 @@ async fn ensure_log_tails(db: &Arc<dyn Db>, tailer: &LogTailer) -> Result<(), Sc
     for run in db.active_runs().await? {
         for step in db.steps_of_run(&run).await? {
             if step.status == StepStatus::Running {
+                let spec = db.step_spec(&run, &step.step).await?;
+                // A plugin_action step runs no Pod, so it has no log to tail
+                // (ADR-0074 §5).
+                if spec.as_ref().is_some_and(|s| s.plugin_action.is_some()) {
+                    continue;
+                }
                 tailer.ensure(&step);
                 // Also tail each authored sidecar service (ADR-0058), co-located in
                 // the step's Pod as container `service-{i}`. Enumerating the step
@@ -125,7 +131,7 @@ async fn ensure_log_tails(db: &Arc<dyn Db>, tailer: &LogTailer) -> Result<(), Sc
                 // sidecar streams. Best-effort + idempotent per fence (the tailer
                 // dedups), like `ensure` itself; a step with no stored spec (a gate)
                 // has no services.
-                if let Some(spec) = db.step_spec(&run, &step.step).await? {
+                if let Some(spec) = spec {
                     for i in 0..spec.services.len() {
                         tailer.ensure_sidecar(&step, i);
                     }

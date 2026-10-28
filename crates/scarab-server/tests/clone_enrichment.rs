@@ -52,6 +52,7 @@ fn clone_spec(read_only: bool) -> StepSpec {
             ..Default::default()
         }),
         build: None,
+        plugin_action: None,
         artifacts: vec![],
         placement_profiles: vec![],
         resources: Default::default(),
@@ -183,6 +184,7 @@ fn build_spec(image: &str) -> StepSpec {
         workspace_outputs: vec![],
         cache: None,
         clone: None,
+        plugin_action: None,
         build: Some(BuildConfig {
             context: ".".into(),
             dockerfile: "Dockerfile".into(),

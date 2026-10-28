@@ -442,6 +442,64 @@ pub trait Db: Send + Sync {
         attempt: &AttemptId,
     ) -> Result<Option<String>, DbError>;
 
+    /// Record the [`PluginInvocation`](crate::PluginInvocation) a
+    /// `plugin_action` Attempt offers (ADR-0074 §5). Idempotent on its id
+    /// (a function of the fence): a redelivered launch writes nothing new.
+    async fn record_plugin_invocation(
+        &self,
+        invocation: &crate::PluginInvocation,
+    ) -> Result<(), DbError>;
+
+    /// The invocation of one Attempt, if it was recorded.
+    async fn plugin_invocation(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<Option<crate::PluginInvocation>, DbError>;
+
+    /// The invocation with `id`, whatever its state.
+    async fn plugin_invocation_by_id(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::PluginInvocation>, DbError>;
+
+    /// Lease up to `limit` **offerable** invocations of installation
+    /// `installation` in `org` until `lease_until`, and return them.
+    /// Offerable: its Attempt is the Step's latest, still `running`, its Step
+    /// is `Running`, `next_offer_at <= now`, and no lease is held past `now`.
+    /// Concurrent callers never lease one invocation twice (Postgres: `FOR
+    /// UPDATE SKIP LOCKED`), so several plugin replicas share one queue.
+    async fn lease_plugin_invocations(
+        &self,
+        org: &str,
+        installation: &str,
+        now: Timestamp,
+        lease_until: Timestamp,
+        limit: u32,
+    ) -> Result<Vec<crate::PluginInvocation>, DbError>;
+
+    /// Record a `pending` answer to invocation `id`: store `label` (it
+    /// overwrites the last one), stamp `at` as the last answer, release the
+    /// lease, and offer it again at `next_offer_at` — only while its fence
+    /// is current (the same test as the lease). `false`: stale, nothing
+    /// written.
+    async fn record_plugin_pending(
+        &self,
+        id: &str,
+        label: &str,
+        at: Timestamp,
+        next_offer_at: Timestamp,
+    ) -> Result<bool, DbError>;
+
+    /// Every invocation whose fence is current (its Attempt is still the
+    /// Step's running one) — for `org` only when given. What the kill
+    /// switch and the absent-plugin sweep fail (ADR-0074 §5).
+    async fn open_plugin_invocations(
+        &self,
+        org: Option<&str>,
+    ) -> Result<Vec<crate::PluginInvocation>, DbError>;
+
     /// Record a step's **named results** (ADR-0041) — the typed `name → value`
     /// map it emitted via the results channel (ADR-0008), captured under the
     /// fence. Attempt-grain evidence (ADR-0056): writes the attempt's own

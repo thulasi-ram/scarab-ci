@@ -790,6 +790,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config.public_url.clone(),
             ));
             tracing::info!("converged driver started");
+            // Absent plugins (ADR-0074 §5): fail the pending plugin_action
+            // steps of a killed or uninstalled installation, should the kill
+            // or uninstall request not have.
+            scarab_server::plugin_actions::spawn_sweeper(
+                db.clone(),
+                clock.clone(),
+                pg.clone() as Arc<dyn scarab_plugin::PluginStore>,
+            );
         }
     }
 

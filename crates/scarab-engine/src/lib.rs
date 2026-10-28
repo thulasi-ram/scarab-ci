@@ -17,8 +17,14 @@
 //!
 //! Everything below is a compiling skeleton — method bodies are stubs.
 
+pub mod plugin_action;
 pub mod ports;
 pub mod scheduler;
+
+pub use plugin_action::{
+    plugin_invocation_id, AnswerOutcome, AnswerRefused, PluginAnswer, PluginInvocation,
+    MAX_STEP_RESULTS_BYTES, PLUGIN_INVOCATION_LEASE_MS,
+};
 
 pub use ports::{
     Clock, Db, DeploymentConcurrencyHold, DeploymentGateDecision, DeploymentGateWait,
@@ -30,8 +36,7 @@ pub use scheduler::{
     gate_approvers, pin_run_snapshots, plan_rerun, record_gate_approval,
     reject_gate, release_gate, wait_began_at,
     rerun_step, rerun_step_widened, retry_step, retry_step_widened, run_status_post_key,
-    unpin_run_snapshots,
-    ExpiredInput, PlanReason, PlannedStep, RerunError, RerunPlan, Scheduler, SchedulerError,
+    unpin_run_snapshots, answer_plugin_invocation, fail_plugin_invocations, ExpiredInput, PlanReason, PlannedStep, RerunError, RerunPlan, Scheduler, SchedulerError,
     AttemptTeardown, Supervision, TeardownAttempt, TickHealth, CANCEL_ATTEMPT, CANCEL_RUN,
     LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS,
     RUN_STATUS_CHANGED, SUPERSEDE_TEARDOWN,
@@ -259,6 +264,14 @@ pub enum FailureKind {
     ///
     /// **Forward-only**, like `MissingInputs`.
     DeploymentRequestIncomplete,
+    /// **Plugin unavailable** (ADR-0074 §5): a `plugin_action` Step's
+    /// installation was killed (ADR-0072 §10) or uninstalled while the
+    /// Step waited on it, so no answer can come. Never auto-retried, even
+    /// with `retry:`: re-offering to an installation that is gone cannot
+    /// succeed. The Step goes `Failed`, the run settles `Failed`.
+    ///
+    /// **Forward-only**, like `MissingInputs`.
+    PluginUnavailable,
 }
 
 // ---------------------------------------------------------------------------
@@ -387,6 +400,11 @@ pub enum AttemptStamp {
         kind: FailureKind,
         detail: Option<String>,
     },
+    /// The `Succeeded` outcome together with the Attempt's results, written
+    /// as [`Db::set_step_results`] writes them (the attempt's copy and the
+    /// step's latest-evidence row): how a plugin's `succeeded` answer closes
+    /// a `plugin_action` Attempt in one commit (ADR-0074 §5).
+    SucceededWithResults(std::collections::BTreeMap<String, serde_json::Value>),
 }
 
 /// What a step transition's CAS requires of the step's **latest** Attempt,
@@ -644,6 +662,12 @@ pub struct StepSpec {
     /// BuildKit with this context instead of an authored image/command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<BuildConfig>,
+    /// Set when this is a **plugin_action** step (ADR-0072 §4, ADR-0074 §5):
+    /// the scheduler launches nothing through the [`Executor`]; it records a
+    /// [`PluginInvocation`] the plugin pulls from the broker, and the
+    /// plugin's answer is the Attempt's verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_action: Option<PluginActionConfig>,
     /// Artifact publication globs (ADR-0052): filters what the backend
     /// collects from `/scarab/artifacts/` post-step. Empty = everything.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -692,6 +716,20 @@ pub struct StepSpec {
     /// (absent in older stored specs → empty).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub matrix_values: std::collections::BTreeMap<String, String>,
+}
+
+/// A `plugin_action` step as Run creation admitted it (ADR-0074 §5): the
+/// installation (by its never-reused name in `org`), the action, its
+/// authored inputs (interpolated when the Attempt starts) and the poll
+/// interval the action's manifest declared at admission.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginActionConfig {
+    pub org: String,
+    pub installation: String,
+    pub action: String,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub with: std::collections::BTreeMap<String, serde_json::Value>,
+    pub poll_interval_secs: u32,
 }
 
 /// The launch context of a step's keyed directory Cache (ADR-0065 s1).
@@ -1922,7 +1960,8 @@ impl StepRun {
                 | FailureKind::Config
                 | FailureKind::MissingInputs
                 | FailureKind::Gate
-                | FailureKind::DeploymentRequestIncomplete,
+                | FailureKind::DeploymentRequestIncomplete
+                | FailureKind::PluginUnavailable,
             ) => StepStatus::Failed,
             Some(FailureKind::Infra {
                 never_started: true,

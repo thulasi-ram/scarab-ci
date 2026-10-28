@@ -71,6 +71,8 @@ pub mod oidc;
 /// ADR-0071: the minimal org-level Environment — its admin/read API and the
 /// EnvironmentDeploymentDeadline the Deployment read fold uses.
 pub mod org_environments;
+/// ADR-0074 §5: failing the pending plugin_action steps of an absent plugin.
+pub mod plugin_actions;
 /// ADR-0072: PluginInstallations — the first-party catalog, install,
 /// uninstall, the kill switch — and the read views report ingest feeds.
 pub mod plugins;
@@ -190,6 +192,8 @@ pub struct AppState {
     /// connection, so a flood cannot queue behind the installation's row
     /// lock — the lock a kill needs.
     pub plugin_ingest_permits: Arc<broker::IngestPermits>,
+    /// Open long polls per plugin installation (ADR-0074 §5).
+    pub plugin_poll_permits: Arc<broker::PollPermits>,
     /// How many entries the CredentialBroker's journal queue holds between
     /// the read proxy and its writer (ADR-0072 §5). Full, the proxy refuses
     /// to forward (503) rather than forward what it cannot journal.
@@ -311,6 +315,7 @@ impl AppState {
             plugins: None,
             broker_plugins: None,
             plugin_ingest_permits: Arc::new(broker::IngestPermits::default()),
+            plugin_poll_permits: Arc::new(broker::PollPermits::default()),
             broker_journal_queue: broker_proxy::JOURNAL_QUEUE,
             plugin_tokens: None,
             plugin_policy: Arc::new(plugins::PluginPolicy::off()),
@@ -828,6 +833,13 @@ pub struct StepDto {
     #[serde(default, skip_serializing)]
     #[schema(ignore)]
     pub gate: Option<serde_json::Value>,
+    /// NOT part of the inline IR subset: read only so [`create_run`] can
+    /// refuse a `plugin_action` step (ADR-0074 §5), whose plugin is admitted
+    /// against the Run's Org — an inline run has none. Never serialized; not
+    /// in the schema.
+    #[serde(default, skip_serializing)]
+    #[schema(ignore)]
+    pub plugin_action: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1348,6 +1360,27 @@ pub struct StepStatusDto {
     /// (ADR-0058) — the DAG's service edges. Empty for a step that uses none.
     #[serde(default)]
     pub uses: Vec<String>,
+    /// For a `plugin_action` step (ADR-0074 §5): the plugin, the action and,
+    /// for its latest Attempt, the plugin's latest `pending` label. Absent
+    /// for every other step kind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin_action: Option<PluginActionStepDto>,
+}
+
+/// A `plugin_action` step as the Run page shows it (ADR-0074 §5).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PluginActionStepDto {
+    /// The plugin installation's name.
+    pub plugin: String,
+    pub action: String,
+    /// The latest `pending` label the plugin gave for the latest Attempt
+    /// ("sync retry 2/5"). Overwritten by each answer, not journaled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Unix-ms the plugin last answered the latest Attempt's invocation.
+    /// Absent: it has not answered yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_answer_at: Option<i64>,
 }
 
 /// How a gate's wait resolved: its `GateResolved` journal entry.
@@ -1446,7 +1479,9 @@ pub struct AttemptDto {
     /// reason is in `failure_detail`) | `deployment-request-incomplete` (the
     /// step exited 0 but its results could not complete a DeploymentRequest
     /// it declares; never auto-retried; what is missing is in
-    /// `failure_detail`).
+    /// `failure_detail`) | `plugin-unavailable` (a `plugin_action` step's
+    /// plugin installation was killed or uninstalled while it waited; never
+    /// auto-retried).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure: Option<String>,
     /// The executor's human-readable cause for a failed attempt (ticket
@@ -1477,6 +1512,7 @@ fn attempt_dto(a: &scarab_engine::Attempt) -> AttemptDto {
             scarab_engine::FailureKind::DeploymentRequestIncomplete => {
                 "deployment-request-incomplete"
             }
+            scarab_engine::FailureKind::PluginUnavailable => "plugin-unavailable",
         }
         .to_string()
     });
@@ -1701,6 +1737,13 @@ async fn create_run(
                 step.id
             )));
         }
+        if step.plugin_action.is_some() {
+            return Err(ApiError::BadRequest(format!(
+                "step `{}`: a plugin_action step needs a repo pipeline: its plugin is \
+                 installed in the Run's org, and an inline run has none",
+                step.id
+            )));
+        }
     }
 
     // Same retry bound the YAML compiler enforces (ADR-0047): a liveness bound,
@@ -1762,6 +1805,7 @@ async fn create_run(
             cache: None,
             clone: None,
             build: None,
+            plugin_action: None,
             artifacts: vec![],
             placement_profiles: step.placement_profiles.clone(),
             resources: step.resources.clone(),
@@ -1874,11 +1918,12 @@ async fn dispatch(
         .as_ref()
         .ok_or_else(|| ApiError::BadRequest("no forge configured".into()))?;
 
-    let run = dispatch_run(
+    let run = dispatch_run_with_plugins(
         forge.as_ref(),
         st.db.as_ref(),
         st.clock.as_ref(),
         st.environment_governance.as_deref(),
+        st.plugins.as_deref(),
         principal.subject,
         scarab_forge::RepoRef {
             owner: org,
@@ -2253,7 +2298,8 @@ async fn get_run(
     let mut step_dtos = Vec::with_capacity(steps.len());
     for s in steps {
         let view = gate_views.remove(&s.step.0).unwrap_or_default();
-        let (services, uses) = match st.db.step_spec(&run, &s.step).await? {
+        let spec = st.db.step_spec(&run, &s.step).await?;
+        let (services, uses) = match &spec {
             Some(spec) => (
                 spec.services
                     .iter()
@@ -2268,6 +2314,21 @@ async fn get_run(
             ),
             None => (Vec::new(), Vec::new()),
         };
+        let plugin_action = match spec.and_then(|spec| spec.plugin_action) {
+            Some(action) => {
+                let invocation = match s.attempts.last() {
+                    Some(a) => st.db.plugin_invocation(&run, &s.step, &a.id).await?,
+                    None => None,
+                };
+                Some(PluginActionStepDto {
+                    plugin: action.installation,
+                    action: action.action,
+                    label: invocation.as_ref().and_then(|i| i.label.clone()),
+                    last_answer_at: invocation.and_then(|i| i.last_answer_at.map(|t| t.0)),
+                })
+            }
+            None => None,
+        };
         step_dtos.push(StepStatusDto {
             id: s.step.0,
             status: step_status_name(s.status).to_string(),
@@ -2280,6 +2341,7 @@ async fn get_run(
             held: view.held,
             services,
             uses,
+            plugin_action,
         });
     }
     Ok(Json(RunStatusResponse {
@@ -4241,6 +4303,20 @@ pub async fn trigger_runs_from_event(
     governance: Option<&dyn scarab_project::EnvironmentGovernanceStore>,
     event: &scarab_forge::Event,
 ) -> Result<TriggerOutcome, TriggerError> {
+    trigger_runs_from_event_with_plugins(forge, db, clock, governance, None, event).await
+}
+
+/// [`trigger_runs_from_event`], with the plugin registry `plugin_action`
+/// Steps are admitted against (ADR-0074 §5). Without one, a pipeline with
+/// a `plugin_action` Step is refused.
+pub async fn trigger_runs_from_event_with_plugins(
+    forge: &dyn scarab_forge::ForgePort,
+    db: &dyn Db,
+    clock: &dyn Clock,
+    governance: Option<&dyn scarab_project::EnvironmentGovernanceStore>,
+    plugins: Option<&dyn scarab_plugin::PluginStore>,
+    event: &scarab_forge::Event,
+) -> Result<TriggerOutcome, TriggerError> {
     // Repo-less events (cron/manual/api) don't carry in-repo config here.
     let Some(repo) = event.repo() else {
         return Ok(TriggerOutcome::default());
@@ -4299,7 +4375,10 @@ pub async fn trigger_runs_from_event(
         // skips this pipeline only (the dispatch path turns the same refusal
         // into a fail-closed error). Webhook-triggered runs supply no launch
         // parameters.
-        match admit_and_create_run(db, clock, governance, event, &ir, path, &excluded, None).await?
+        match admit_and_create_run(
+            db, clock, governance, plugins, event, &ir, path, &excluded, None,
+        )
+        .await?
         {
             Admission::Created(run) => outcome.runs.push(run),
             // A branch-scoped Environment ignoring every other branch is the
@@ -4319,6 +4398,9 @@ pub async fn trigger_runs_from_event(
                     ref environment, ..
                 }
                 | AdmissionRefusal::DeploymentRequestUnresolved {
+                    ref environment, ..
+                }
+                | AdmissionRefusal::PluginActionUnavailable {
                     ref environment, ..
                 }),
             ) => {
@@ -4417,6 +4499,11 @@ enum AdmissionRefusal {
     /// requests resolve to one target (git-bug 66171a0). Decided before
     /// anything is persisted; `reason` names the step and the input.
     DeploymentRequestUnresolved { environment: String, reason: String },
+    /// A `plugin_action` Step names a plugin installation the Org does not
+    /// have (or has killed), or an action its manifest does not declare
+    /// (ADR-0074 §5). `environment` is the pipeline's, or empty for a CI
+    /// pipeline; `reason` names the step, the plugin and the action.
+    PluginActionUnavailable { environment: String, reason: String },
 }
 
 /// The outcome of admitting one compiled pipeline (ADR-0037, ADR-0071 §2):
@@ -4604,6 +4691,7 @@ async fn admit_and_create_run(
     db: &dyn Db,
     clock: &dyn Clock,
     governance: Option<&dyn scarab_project::EnvironmentGovernanceStore>,
+    plugins: Option<&dyn scarab_plugin::PluginStore>,
     event: &scarab_forge::Event,
     ir: &scarab_pipeline::PipelineIr,
     path: &str,
@@ -4669,10 +4757,24 @@ async fn admit_and_create_run(
         }
     }
 
+    // ADR-0074 §5: every `plugin_action` Step names an installed plugin
+    // that declares the action — refused before anything is persisted.
+    let actions = match resolve_plugin_actions(plugins, &repo.owner, ir).await? {
+        Ok(actions) => actions,
+        Err(reason) => {
+            return Ok(Admission::Refused(
+                AdmissionRefusal::PluginActionUnavailable {
+                    environment: ir.environment.clone().unwrap_or_default(),
+                    reason,
+                },
+            ))
+        }
+    };
+
     let now = clock.now().await;
     let run = new_run_id();
     persist_run_from_ir(
-        db, &run, ir, event, path, &gov, excluded, params, &requests, now,
+        db, &run, ir, event, path, &gov, excluded, params, &requests, &actions, now,
     )
     .await?;
     // Freeze the resolved launch parameters on the run so every step's
@@ -4682,6 +4784,83 @@ async fn admit_and_create_run(
         db.set_run_params(&run, params).await?;
     }
     Ok(Admission::Created(run))
+}
+
+/// Each `plugin_action` Step's admitted config, by step id (ADR-0074 §5):
+/// the installation named `plugin` in `org` must exist, be enabled and
+/// declare `action` under `offer_actions`. The action's poll interval is
+/// pinned here, from the manifest the installation was approved with.
+/// `Ok(Err(reason))` refuses the Run.
+async fn resolve_plugin_actions(
+    plugins: Option<&dyn scarab_plugin::PluginStore>,
+    org: &str,
+    ir: &scarab_pipeline::PipelineIr,
+) -> Result<
+    Result<std::collections::BTreeMap<String, scarab_engine::PluginActionConfig>, String>,
+    TriggerError,
+> {
+    let mut out = std::collections::BTreeMap::new();
+    for step in &ir.steps {
+        let Some(action) = &step.plugin_action else {
+            continue;
+        };
+        let Some(store) = plugins else {
+            return Ok(Err(format!(
+                "step `{}`: `plugin_action` needs plugins, which this server does not run \
+                 (SCARAB_PLUGINS)",
+                step.id
+            )));
+        };
+        let installation = store
+            .installation(org, &action.plugin)
+            .await
+            .map_err(|e| TriggerError::Pipeline(format!("plugin registry: {e}")))?;
+        let Some(installation) = installation else {
+            return Ok(Err(format!(
+                "step `{}`: no plugin named `{}` is installed in org `{org}`",
+                step.id, action.plugin
+            )));
+        };
+        if installation.state == scarab_plugin::InstallationState::Killed {
+            return Ok(Err(format!(
+                "step `{}`: plugin `{}` is killed in org `{org}` (ADR-0072 §10)",
+                step.id, action.plugin
+            )));
+        }
+        let Some(decl) = installation.manifest.action(&action.action) else {
+            let offered: Vec<&str> = if installation
+                .manifest
+                .has(scarab_plugin::PluginCapability::OfferActions)
+            {
+                installation
+                    .manifest
+                    .actions
+                    .iter()
+                    .map(|a| a.name.as_str())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            return Ok(Err(format!(
+                "step `{}`: plugin `{}` does not offer action `{}` (it offers: [{}])",
+                step.id,
+                action.plugin,
+                action.action,
+                offered.join(", ")
+            )));
+        };
+        out.insert(
+            step.id.clone(),
+            scarab_engine::PluginActionConfig {
+                org: org.to_string(),
+                installation: installation.name.clone(),
+                action: decl.name.clone(),
+                with: action.with.clone(),
+                poll_interval_secs: decl.poll_interval_secs(),
+            },
+        );
+    }
+    Ok(Ok(out))
 }
 
 /// Every Step's DeploymentRequests (slice b, criterion 1; ADR-0070 §7),
@@ -4973,6 +5152,7 @@ fn admission_refusal_message(refusal: &AdmissionRefusal, org: &str, project: &st
             home,
         } => deployment_target_elsewhere_message(environment, step, target_source, target_id, home),
         AdmissionRefusal::DeploymentRequestUnresolved { reason, .. } => reason.clone(),
+        AdmissionRefusal::PluginActionUnavailable { reason, .. } => reason.clone(),
     }
 }
 
@@ -5111,6 +5291,29 @@ pub async fn dispatch_run(
     kind: DispatchKind,
     reason: Option<String>,
 ) -> Result<RunId, DispatchError> {
+    dispatch_run_with_plugins(
+        forge, db, clock, governance, None, actor, repo, r#ref, pipeline, params, kind, reason,
+    )
+    .await
+}
+
+/// [`dispatch_run`], with the plugin registry `plugin_action` Steps are
+/// admitted against (ADR-0074 §5).
+#[allow(clippy::too_many_arguments)] // the dispatch coordinates are irreducible
+pub async fn dispatch_run_with_plugins(
+    forge: &dyn scarab_forge::ForgePort,
+    db: &dyn Db,
+    clock: &dyn Clock,
+    governance: Option<&dyn scarab_project::EnvironmentGovernanceStore>,
+    plugins: Option<&dyn scarab_plugin::PluginStore>,
+    actor: String,
+    repo: scarab_forge::RepoRef,
+    r#ref: String,
+    pipeline: String,
+    params: std::collections::BTreeMap<String, serde_json::Value>,
+    kind: DispatchKind,
+    reason: Option<String>,
+) -> Result<RunId, DispatchError> {
     // Resolve the dispatch ref to a concrete commit — the form and the run see
     // byte-identical config (no branch-moved skew), and the Run is reproducible
     // (ADR-0043 §4).
@@ -5172,6 +5375,7 @@ pub async fn dispatch_run(
         db,
         clock,
         governance,
+        plugins,
         &event,
         &ir,
         &path,
@@ -5220,6 +5424,7 @@ pub async fn dispatch_run(
         AdmissionRefusal::DeploymentRequestUnresolved { reason, .. } => {
             DispatchError::Pipeline(reason)
         }
+        AdmissionRefusal::PluginActionUnavailable { reason, .. } => DispatchError::Pipeline(reason),
     })
 }
 
@@ -5338,6 +5543,7 @@ async fn persist_run_from_ir(
     excluded: &[String],
     params: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
     deployment_requests: &[scarab_engine::RunDeploymentRequest],
+    plugin_actions: &std::collections::BTreeMap<String, scarab_engine::PluginActionConfig>,
     now: Timestamp,
 ) -> Result<(), TriggerError> {
     let locked_out = gov.locked_out();
@@ -5495,6 +5701,42 @@ async fn persist_run_from_ir(
             db.create_step_run(run, &step_id, None, &needs, now).await?;
             let timer = step.gate_after.map(|s| s as i64);
             db.set_step_gate(run, &step_id, kind, timer).await?;
+        } else if step.plugin_action.is_some() {
+            // A plugin_action step (ADR-0074 §5) runs no container: its spec
+            // carries only the admitted action, which the scheduler turns
+            // into an invocation when the Attempt starts.
+            let Some(action) = plugin_actions.get(&step.id) else {
+                return Err(TriggerError::Pipeline(format!(
+                    "step `{}`: plugin_action was not admitted",
+                    step.id
+                )));
+            };
+            let spec = StepSpec {
+                image: String::new(),
+                command: Vec::new(),
+                env: Vec::new(),
+                secrets: Vec::new(),
+                run_as_root: false,
+                add_capabilities: Vec::new(),
+                privileged: false,
+                timeout_seconds: step.timeout,
+                workspace_inputs: vec![],
+                workspace_outputs: Vec::new(),
+                cache: None,
+                clone: None,
+                build: None,
+                plugin_action: Some(action.clone()),
+                artifacts: vec![],
+                placement_profiles: Vec::new(),
+                resources: Default::default(),
+                k8s_overlay: None,
+                oidc_token: None,
+                services: Vec::new(),
+                uses: Vec::new(),
+                matrix_values: step.matrix_values.clone(),
+            };
+            db.create_step_run(run, &step_id, Some(&spec), &needs, now)
+                .await?;
         } else if let Some(clone) = &step.clone {
             // A clone step (ADR-0045): the engine runs the canonical
             // scarab-clone image with context pinned from the trigger. The
@@ -5539,6 +5781,7 @@ async fn persist_run_from_ir(
                     credential: None,
                 }),
                 build: None,
+                plugin_action: None,
                 artifacts: vec![],
                 placement_profiles: step.placement_profiles.clone(),
                 resources: step.resources.clone(),
@@ -5620,6 +5863,7 @@ async fn persist_run_from_ir(
                 cache: cache_config(step),
                 clone: None,
                 build,
+                plugin_action: None,
                 artifacts: step.artifacts.clone(),
                 placement_profiles: step.placement_profiles.clone(),
                 resources: step.resources.clone(),
@@ -5882,11 +6126,12 @@ async fn ingest_event(
             Json(serde_json::json!({ "ignored": "no forge configured" })),
         ));
     };
-    match trigger_runs_from_event(
+    match trigger_runs_from_event_with_plugins(
         forge.as_ref(),
         st.db.as_ref(),
         st.clock.as_ref(),
         st.environment_governance.as_deref(),
+        st.plugins.as_deref(),
         &event,
     )
     .await
@@ -11060,6 +11305,7 @@ impl utoipa::Modify for StepUpResponses {
         GateResolutionDto,
         DeploymentGateDto,
         StepServiceDto,
+        PluginActionStepDto,
         AttemptDto,
         ServiceStatusDto,
         StepResultDto,
@@ -11123,6 +11369,7 @@ impl utoipa::Modify for StepUpResponses {
         plugins::RequestRuleDto,
         plugins::ConnectionSlotDto,
         plugins::PluginManifestDto,
+        plugins::PluginActionDeclDto,
         plugins::PluginCatalogEntryDto,
         plugins::InstallationStateDto,
         plugins::RuntimeStatusDto,

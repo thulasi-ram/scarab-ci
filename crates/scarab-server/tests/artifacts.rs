@@ -613,6 +613,7 @@ async fn published_artifacts_are_durably_indexed_in_postgres() {
         cache: None,
         clone: None,
         build: None,
+        plugin_action: None,
         // The feature: this step publishes artifacts of record (ADR-0052).
         artifacts: vec!["dist/*".into()],
         placement_profiles: vec![],

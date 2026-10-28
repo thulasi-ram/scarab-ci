@@ -68,6 +68,7 @@ fn spec(cache: Option<CacheConfig>) -> StepSpec {
         cache,
         clone: None,
         build: None,
+        plugin_action: None,
         artifacts: vec![],
         placement_profiles: vec![],
         resources: Default::default(),

@@ -5,7 +5,9 @@
 //! not in the public OpenAPI document.
 //!
 //! Slice d1 serves identity and report ingest; slice d3 adds the read proxy
-//! over PluginConnections ([`crate::broker_proxy`]).
+//! over PluginConnections ([`crate::broker_proxy`]). ADR-0074 §5 adds the
+//! invocation protocol of polling PluginActions: a long poll that leases the
+//! caller's offered invocations, and the answer route.
 //!
 //! Every route but `healthz` goes through [`authenticate_plugin`]: the
 //! token is verified ([`PluginTokenVerifier`]), its ServiceAccount mapped to
@@ -34,7 +36,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use axum::body::{Body, Bytes};
-use axum::extract::{DefaultBodyLimit, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -106,11 +108,60 @@ impl IngestPermits {
     }
 }
 
+/// Long polls one installation may have open in this process: a few, so
+/// several replicas of a plugin can each hold one, but a plugin cannot hold
+/// many database-polling loops open.
+const POLLS_PER_INSTALLATION: usize = 4;
+/// How often a long poll looks for an offerable invocation while it waits.
+const POLL_RECHECK: std::time::Duration = std::time::Duration::from_secs(1);
+/// The wait of a long poll that names none, in seconds.
+const DEFAULT_POLL_WAIT_SECS: u64 = 25;
+
+/// One semaphore per installation id for open long polls
+/// ([`POLLS_PER_INSTALLATION`]); like [`IngestPermits`], keyed only by ids a
+/// verified token mapped to.
+#[derive(Default)]
+pub struct PollPermits {
+    by_installation: Mutex<HashMap<String, Arc<Semaphore>>>,
+}
+
+impl PollPermits {
+    fn try_acquire(&self, installation_id: &str) -> Option<OwnedSemaphorePermit> {
+        let semaphore = {
+            let mut map = self
+                .by_installation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            map.entry(installation_id.to_string())
+                .or_insert_with(|| Arc::new(Semaphore::new(POLLS_PER_INSTALLATION)))
+                .clone()
+        };
+        semaphore.try_acquire_owned().ok()
+    }
+}
+
 /// The router the broker listener serves.
 pub fn router(state: AppState) -> Router {
     let reads = Router::new()
         .route(&format!("{BROKER_PREFIX}/whoami"), get(whoami))
         .route(&format!("{BROKER_PREFIX}/targets"), get(targets))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            authenticate_plugin,
+        ));
+    // The invocation protocol (ADR-0074 §5). The long poll takes one of the
+    // installation's poll permits; answering takes none.
+    let polls = Router::new()
+        .route(&format!("{BROKER_PREFIX}/invocations"), get(invocations))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            authenticate_plugin_for_poll,
+        ));
+    let answers = Router::new()
+        .route(
+            &format!("{BROKER_PREFIX}/invocations/{{id}}/answer"),
+            post(answer),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             authenticate_plugin,
@@ -148,6 +199,8 @@ pub fn router(state: AppState) -> Router {
         // the isolation probe, slice d2) must not need a token.
         .route(&format!("{BROKER_PREFIX}/healthz"), get(healthz))
         .merge(reads)
+        .merge(polls)
+        .merge(answers)
         .merge(ingest)
         .merge(proxy)
         .layer(DefaultBodyLimit::max(BROKER_BODY_LIMIT_BYTES))
@@ -259,12 +312,23 @@ async fn authenticate_plugin_for_proxy(
     authenticate(st, req, next, Gate::Proxy).await
 }
 
+/// [`authenticate_plugin`], plus one of the installation's long-poll
+/// permits ([`PollPermits`]), held until the poll answers.
+async fn authenticate_plugin_for_poll(
+    State(st): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    authenticate(st, req, next, Gate::Poll).await
+}
+
 /// Which per-installation permit a route takes before the first read.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Gate {
     None,
     Ingest,
     Proxy,
+    Poll,
 }
 
 async fn authenticate(st: AppState, mut req: Request, next: Next, gate: Gate) -> Response {
@@ -272,13 +336,25 @@ async fn authenticate(st: AppState, mut req: Request, next: Next, gate: Gate) ->
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
-    let _permit = if gate == Gate::Ingest {
-        match st.plugin_ingest_permits.try_acquire(&id) {
+    let _permit = match gate {
+        Gate::Ingest => match st.plugin_ingest_permits.try_acquire(&id) {
             Some(permit) => Some(permit),
             None => return BrokerError::TooManyRequests.into_response(),
-        }
-    } else {
-        None
+        },
+        Gate::Poll => match st.plugin_poll_permits.try_acquire(&id) {
+            Some(permit) => Some(permit),
+            None => {
+                return retry_after(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    RETRY_AFTER_TOO_MANY_SECS,
+                    format!(
+                        "this installation already has {POLLS_PER_INSTALLATION} long polls \
+                         open in this server; wait for one to return"
+                    ),
+                )
+            }
+        },
+        Gate::None | Gate::Proxy => None,
     };
     if gate == Gate::Proxy {
         let Some(proxy) = req
@@ -511,6 +587,129 @@ async fn targets(
             })
             .collect(),
         next_after,
+    }))
+}
+
+/// `GET …/invocations` (ADR-0074 §5).
+#[derive(Debug, Deserialize)]
+struct InvocationsQuery {
+    /// Seconds to wait for an invocation when none is offerable now:
+    /// default 25, at most [`scarab_plugin::MAX_POLL_WAIT_SECS`]; 0 answers
+    /// at once.
+    wait: Option<u64>,
+    /// At most this many invocations: default and maximum
+    /// [`scarab_plugin::MAX_INVOCATIONS_PER_POLL`].
+    limit: Option<u32>,
+}
+
+/// The long poll: lease up to `limit` offerable invocations of the caller's
+/// installation, waiting up to `wait` seconds for one. Each returned
+/// invocation is leased for [`scarab_engine::PLUGIN_INVOCATION_LEASE_MS`];
+/// unanswered, it is offered again. The queue is read from the database on
+/// every check, so any replica serves any plugin replica, and the kill
+/// switch is re-read on each check: a kill ends an open poll with a 403.
+async fn invocations(
+    State(st): State<AppState>,
+    Extension(PluginCaller(i)): Extension<PluginCaller>,
+    Query(q): Query<InvocationsQuery>,
+) -> Result<Json<scarab_plugin::InvocationsPage>, BrokerError> {
+    if !i.manifest.has(PluginCapability::OfferActions) {
+        return Err(ApiError::Denied(format!(
+            "plugin installation `{}` offers no actions (its manifest does not ask for \
+             `offer_actions`)",
+            i.name
+        ))
+        .into());
+    }
+    let wait = std::time::Duration::from_secs(
+        q.wait
+            .unwrap_or(DEFAULT_POLL_WAIT_SECS)
+            .min(scarab_plugin::MAX_POLL_WAIT_SECS),
+    );
+    let limit = q
+        .limit
+        .unwrap_or(scarab_plugin::MAX_INVOCATIONS_PER_POLL)
+        .clamp(1, scarab_plugin::MAX_INVOCATIONS_PER_POLL);
+    let give_up = tokio::time::Instant::now() + wait;
+    loop {
+        let now = st.clock.now().await;
+        let lease_until =
+            scarab_engine::Timestamp(now.0 + scarab_engine::PLUGIN_INVOCATION_LEASE_MS);
+        let leased = st
+            .db
+            .lease_plugin_invocations(&i.org, &i.name, now, lease_until, limit)
+            .await
+            .map_err(ApiError::Db)?;
+        if !leased.is_empty() {
+            return Ok(Json(scarab_plugin::InvocationsPage {
+                invocations: leased.into_iter().map(offered).collect(),
+            }));
+        }
+        let left = give_up.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return Ok(Json(scarab_plugin::InvocationsPage {
+                invocations: Vec::new(),
+            }));
+        }
+        tokio::time::sleep(left.min(POLL_RECHECK)).await;
+        // The kill switch, again: a poll may outlive the request's check.
+        caller(&st, &i.id).await?;
+    }
+}
+
+fn offered(inv: scarab_engine::PluginInvocation) -> scarab_plugin::OfferedInvocation {
+    scarab_plugin::OfferedInvocation {
+        fence: scarab_plugin::InvocationFence {
+            run: inv.run.0,
+            step: inv.step.0,
+            attempt: inv.attempt.0,
+        },
+        id: inv.id,
+        action: inv.action,
+        inputs: inv.inputs,
+        lease_expires_at: inv.lease_until.map(|t| t.0).unwrap_or_default(),
+        last_label: inv.label,
+    }
+}
+
+/// `POST …/invocations/{id}/answer` (ADR-0074 §5). An invocation of another
+/// installation is a 404, exactly like one that does not exist: a plugin
+/// answers only for its own. A `stale` outcome means the fence moved on
+/// (cancel, Retry, superseded Take) and nothing was recorded.
+async fn answer(
+    State(st): State<AppState>,
+    Extension(PluginCaller(i)): Extension<PluginCaller>,
+    Path(id): Path<String>,
+    Json(body): Json<scarab_plugin::InvocationAnswer>,
+) -> Result<Json<scarab_plugin::AnswerResponse>, BrokerError> {
+    let invocation = st
+        .db
+        .plugin_invocation_by_id(&id)
+        .await
+        .map_err(ApiError::Db)?
+        .filter(|inv| inv.org == i.org && inv.installation == i.name)
+        .ok_or(ApiError::NotFound)?;
+    let answer = match body {
+        scarab_plugin::InvocationAnswer::Pending { label } => {
+            scarab_engine::PluginAnswer::Pending { label }
+        }
+        scarab_plugin::InvocationAnswer::Succeeded { results } => {
+            scarab_engine::PluginAnswer::Succeeded { results }
+        }
+        scarab_plugin::InvocationAnswer::Failed { reason } => {
+            scarab_engine::PluginAnswer::Failed { reason }
+        }
+    };
+    let outcome = scarab_engine::answer_plugin_invocation(&*st.db, &*st.clock, &invocation, answer)
+        .await
+        .map_err(|e| match e {
+            scarab_engine::SchedulerError::Db(e) => ApiError::Db(e),
+            e => ApiError::Db(scarab_engine::DbError::Other(e.to_string())),
+        })?
+        .map_err(|refused| ApiError::BadRequest(refused.to_string()))?;
+    Ok(Json(match outcome {
+        scarab_engine::AnswerOutcome::Accepted => scarab_plugin::AnswerResponse::Accepted,
+        scarab_engine::AnswerOutcome::Stale => scarab_plugin::AnswerResponse::Stale,
     }))
 }
 

@@ -171,6 +171,8 @@ struct InMemoryState {
     run_deploy: HashMap<RunId, scarab_engine::DeployContext>,
     /// Per-(run, step) rows: status, spec, attempts.
     steps: HashMap<(RunId, StepId), StepRec>,
+    /// `plugin_action` invocations (ADR-0074 §5), by id.
+    plugin_invocations: std::collections::BTreeMap<String, scarab_engine::PluginInvocation>,
     /// The transactional outbox.
     outbox: Vec<OutboxEntry>,
     /// Per-(run, step, attempt) log-chunk index (offsets only, no bodies).
@@ -646,7 +648,31 @@ fn stamp_attempt_locked(
             a.failure_detail = detail.clone();
             a.outcome = AttemptOutcome::Failed;
         }
+        scarab_engine::AttemptStamp::SucceededWithResults(results) => {
+            a.outcome = AttemptOutcome::Succeeded;
+            rec.results = results.clone();
+            rec.evidence_attempt = Some(attempt.clone());
+            st.attempt_evidence
+                .entry((run.clone(), step.clone(), attempt.clone()))
+                .or_default()
+                .results = results.clone();
+        }
     }
+}
+
+/// A `plugin_action` invocation's fence is current (mirrors the Postgres
+/// `PLUGIN_FENCE_CURRENT`): its Step `Running` on exactly its Attempt, the
+/// latest by mint order, still `Running`.
+fn plugin_fence_current_locked(st: &InMemoryState, inv: &scarab_engine::PluginInvocation) -> bool {
+    let Some(rec) = st.steps.get(&(inv.run.clone(), inv.step.clone())) else {
+        return false;
+    };
+    rec.status == Some(StepStatus::Running)
+        && rec
+            .attempts
+            .iter()
+            .max_by_key(|a| attempt_order_key(a))
+            .is_some_and(|a| a.id == inv.attempt && a.outcome == AttemptOutcome::Running)
 }
 
 /// [`Db::record_step_transition`]'s guard under the caller's lock, with the
@@ -933,6 +959,112 @@ impl Db for InMemoryDb {
             .or_default()
             .results = results.clone();
         Ok(())
+    }
+
+    async fn record_plugin_invocation(
+        &self,
+        inv: &scarab_engine::PluginInvocation,
+    ) -> Result<(), DbError> {
+        let mut st = self.state.lock().unwrap();
+        st.plugin_invocations
+            .entry(inv.id.clone())
+            .or_insert_with(|| inv.clone());
+        Ok(())
+    }
+
+    async fn plugin_invocation(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<Option<scarab_engine::PluginInvocation>, DbError> {
+        let st = self.state.lock().unwrap();
+        Ok(st
+            .plugin_invocations
+            .values()
+            .find(|i| &i.run == run && &i.step == step && &i.attempt == attempt)
+            .cloned())
+    }
+
+    async fn plugin_invocation_by_id(
+        &self,
+        id: &str,
+    ) -> Result<Option<scarab_engine::PluginInvocation>, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .plugin_invocations
+            .get(id)
+            .cloned())
+    }
+
+    async fn lease_plugin_invocations(
+        &self,
+        org: &str,
+        installation: &str,
+        now: Timestamp,
+        lease_until: Timestamp,
+        limit: u32,
+    ) -> Result<Vec<scarab_engine::PluginInvocation>, DbError> {
+        let mut st = self.state.lock().unwrap();
+        let mut ids: Vec<(i64, String)> = st
+            .plugin_invocations
+            .values()
+            .filter(|i| {
+                i.org == org
+                    && i.installation == installation
+                    && i.next_offer_at.0 <= now.0
+                    && i.lease_until.is_none_or(|l| l.0 <= now.0)
+                    && plugin_fence_current_locked(&st, i)
+            })
+            .map(|i| (i.next_offer_at.0, i.id.clone()))
+            .collect();
+        ids.sort();
+        let mut out = Vec::new();
+        for (_, id) in ids.into_iter().take(limit as usize) {
+            let inv = st.plugin_invocations.get_mut(&id).expect("listed above");
+            inv.lease_until = Some(lease_until);
+            out.push(inv.clone());
+        }
+        Ok(out)
+    }
+
+    async fn record_plugin_pending(
+        &self,
+        id: &str,
+        label: &str,
+        at: Timestamp,
+        next_offer_at: Timestamp,
+    ) -> Result<bool, DbError> {
+        let mut st = self.state.lock().unwrap();
+        let Some(inv) = st.plugin_invocations.get(id).cloned() else {
+            return Ok(false);
+        };
+        if !plugin_fence_current_locked(&st, &inv) {
+            return Ok(false);
+        }
+        let inv = st.plugin_invocations.get_mut(id).expect("read above");
+        inv.label = Some(label.to_string());
+        inv.last_answer_at = Some(at);
+        inv.next_offer_at = next_offer_at;
+        inv.lease_until = None;
+        Ok(true)
+    }
+
+    async fn open_plugin_invocations(
+        &self,
+        org: Option<&str>,
+    ) -> Result<Vec<scarab_engine::PluginInvocation>, DbError> {
+        let st = self.state.lock().unwrap();
+        let mut out: Vec<_> = st
+            .plugin_invocations
+            .values()
+            .filter(|i| org.is_none_or(|o| i.org == o) && plugin_fence_current_locked(&st, i))
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| (a.created_at.0, &a.id).cmp(&(b.created_at.0, &b.id)));
+        Ok(out)
     }
 
     async fn ingest_attempt_results(
