@@ -1024,6 +1024,45 @@ mod tests {
         }
     }
 
+    /// One record per Project holding an overlay, a grant or both, in name
+    /// order, each Project's eligibility decided by the Environment's own
+    /// matcher — a Project made ineligible still shows what it holds.
+    #[test]
+    fn project_records_merge_overlays_and_grants_per_project() {
+        let env = OrgEnvironment {
+            org: "acme".into(),
+            name: "prod".into(),
+            description: String::new(),
+            protection: EnvironmentProtectionRules::default(),
+            eligibility: EnvironmentProjectEligibility::Projects(strings(&["pay*"])),
+            created_at: 0,
+            updated_at: 0,
+            updated_by: "amy".into(),
+        };
+        let mut web = overlay(rules(&["alice"], &[]));
+        web.project = "web".into();
+        let records = EnvironmentProjectRecord::collect(
+            &env,
+            [overlay(rules(&["bob"], &[])), web],
+            [grant(vec![], true)],
+        );
+        let summary: Vec<_> = records
+            .iter()
+            .map(|r| {
+                (
+                    r.project.as_str(),
+                    r.eligible,
+                    r.overlay.is_some(),
+                    r.privilege_grant.is_some(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![("payments", true, true, true), ("web", false, true, false)]
+        );
+    }
+
     #[test]
     fn no_grant_admits_run_as_root_and_refuses_every_governed_grant() {
         let root = GrantRequest {
