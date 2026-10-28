@@ -1023,7 +1023,10 @@ export interface paths {
          *     (the org's and the input's Project's effective Policies, as admission
          *     consults them). Input: `input`, `decision_id` (its recorded input and
          *     schema version), or `pipeline` (compiled here with `libs`; no forge
-         *     read).
+         *     read). A supplied or recorded input with a string over its cap is a 400.
+         *     A Pipeline whose Run is over an input cap is answered as admission
+         *     decides it: each matched Policy is an error, which denies when the Policy
+         *     is enforced.
          */
         post: operations["policy_test"];
         delete?: never;
@@ -3357,7 +3360,10 @@ export interface components {
             /** @description A `run.create` input, as a PolicyDecision records it. */
             input?: Record<string, never> | null;
             pipeline?: null | components["schemas"]["PolicyTestPipeline"];
-            /** @description A draft Policy, compiled at the org level. */
+            /**
+             * @description A draft Policy, compiled at the org level. Needs Administer on the
+             *     org; stored Policies need Read.
+             */
             policy?: Record<string, never> | null;
             /** @description A stored Policy of this org (either level). */
             policy_id?: string | null;
@@ -7261,14 +7267,14 @@ export interface operations {
                     "application/json": components["schemas"]["PolicyTestResponse"];
                 };
             };
-            /** @description not one input form, a draft that does not compile, a Pipeline that does not compile, a Run admission refuses before its Policies, or an input that cannot be matched */
+            /** @description not one input form, a draft that does not compile, a Pipeline that does not compile, a Run admission refuses before its Policies, an input that cannot be matched, or a supplied input with a string over its cap */
             400: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content?: never;
             };
-            /** @description no Read on the org */
+            /** @description no Read on the org, or a draft `policy` without Administer on the org */
             403: {
                 headers: {
                     [name: string]: unknown;
