@@ -1,0 +1,19 @@
+[package]
+name = "scarab-policy"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+# ADR-0075 spike: the CEL subset type checker for Policy rules. A pure crate:
+# no I/O, no clock, no RNG.
+[dependencies]
+cel = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Admitted per ADR-0031 (I/O-free library). Both are already in the tree as
+# dependencies of `cel` itself, at these versions, so naming them adds no crate:
+# `regex` compiles a `matches()` pattern when the rule is checked, with the same
+# engine `cel` evaluates it with; `chrono` builds the `cel::Value::Timestamp`
+# a checkpoint's `time` is bound as. Neither reads the clock here.
+regex = "1"
+chrono = { version = "0.4", default-features = false, features = ["alloc", "serde"] }

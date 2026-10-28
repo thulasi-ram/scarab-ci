@@ -2923,6 +2923,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "scarab-policy"
+version = "0.2.2"
+dependencies = [
+ "cel",
+ "chrono",
+ "regex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "scarab-project"
 version = "0.2.2"
 dependencies = [
