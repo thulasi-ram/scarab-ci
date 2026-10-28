@@ -11,9 +11,9 @@
 //! The subset: field access, `has()`, literals (scalars, lists, maps),
 //! `==` `!=` `<` `<=` `>` `>=`, `&&` `||` `!` `?:`, `in` on lists and maps,
 //! `startsWith` `endsWith` `contains` `matches` (literal pattern, compiled
-//! here), `size`, `timestamp('<literal>')` and `duration('<literal>')`,
-//! string `+` (for `message_expr`), and `exists` `all` `exists_one` over lists.
-//! Anything else is "not supported in policies".
+//! here), `size`, `timestamp('<literal>')` and `duration('<literal>')`, and
+//! `exists` `all` `exists_one` over lists. Anything else, `+` on strings
+//! included, is "not supported in policies".
 //!
 //! **Cost bound.** Each node costs 1. A macro costs its range plus
 //! `cap × (predicate + 1)`, where `cap` is the list's declared size cap (a
@@ -32,13 +32,20 @@ use cel::common::ast::{
 
 use crate::schema::{Schema, Type};
 
-/// The largest cost bound a rule may have.
-pub const MAX_COST: u64 = 10_000;
+/// The largest cost bound a rule may have: about the number of AST nodes the
+/// evaluator visits in the worst case. 100,000 admits one macro over the
+/// Steps of a Run nested with one over each Step's `origin` (ADR-0075 §4's
+/// example costs 75,265 under `run.create`'s caps), and rejects two macros
+/// nested over the Steps, which is quadratic in the size of the Run.
+pub const MAX_COST: u64 = 100_000;
 
-/// The longest rule source, in bytes. See [`parse`].
+/// The longest rule source, in bytes: the 4 KiB ADR-0075 §6 sets for rules,
+/// and `scarab-pipeline` for `when:` and `${{ }}`. See [`parse`].
 pub const MAX_SOURCE_LEN: usize = 4096;
 
-/// The deepest the checker recurses into a rule.
+/// The deepest the checker recurses into a rule's AST: ADR-0075 §6's 64
+/// levels. The parser has already accepted the rule by then; this bounds the
+/// checker's own recursion and rejects a rule nested deeper.
 pub const MAX_DEPTH: u32 = 64;
 
 /// Identifiers CEL resolves to types. Type values are outside the subset.
@@ -87,7 +94,7 @@ pub struct Checked {
 }
 
 /// Parses `source` and checks it against `schema`, expecting `expected` (bool
-/// for a `when`, string for a `message_expr`).
+/// for a `when`; [`Type::Dyn`] accepts any result type).
 pub fn check(schema: &Schema, source: &str, expected: &Type) -> Result<Checked, Vec<Diagnostic>> {
     let program = parse(source)?;
     let mut checker = Checker {
@@ -309,7 +316,28 @@ impl Checker<'_> {
         }
     }
 
+    /// A read of a variable: warns when it is an optional top-level variable
+    /// that nothing guarded with `!= null`. A side of `==` / `!=` reads it
+    /// through [`Checker::ident_type`] instead (see [`Checker::equality_side`]).
     fn ident(&mut self, e: &IdedExpr, name: &str) -> Checked1 {
+        let shadowed = self.scopes.iter().any(|(n, _)| n == name);
+        if !shadowed
+            && self.schema.variable(name).is_some_and(|v| v.optional)
+            && !self.guarded(name)
+        {
+            let w = self.diag(
+                e,
+                format!(
+                    "`{name}` may be null; guard the read with `{name} != null && ...`, \
+                     or a missing value fails the rule closed"
+                ),
+            );
+            self.warnings.push(w);
+        }
+        self.ident_type(e, name)
+    }
+
+    fn ident_type(&self, e: &IdedExpr, name: &str) -> Checked1 {
         if let Some((_, t)) = self.scopes.iter().rev().find(|(n, _)| n == name) {
             return Ok((t.clone(), 1));
         }
@@ -338,30 +366,8 @@ impl Checker<'_> {
         }
     }
 
-    /// A read of the operand of a select: warns when it is an optional
-    /// top-level variable that nothing guarded with `!= null`.
-    fn operand(&mut self, operand: &IdedExpr) -> Checked1 {
-        if let Expr::Ident(name) = &operand.expr {
-            let shadowed = self.scopes.iter().any(|(n, _)| n == name);
-            if !shadowed
-                && self.schema.variable(name).is_some_and(|v| v.optional)
-                && !self.guarded(name)
-            {
-                let w = self.diag(
-                    operand,
-                    format!(
-                        "`{name}` may be null; guard the read with `{name} != null && ...`, \
-                         or a missing value fails the rule closed"
-                    ),
-                );
-                self.warnings.push(w);
-            }
-        }
-        self.expr(operand)
-    }
-
     fn select(&mut self, e: &IdedExpr, sel: &SelectExpr) -> Checked1 {
-        let (t, cost) = self.operand(&sel.operand)?;
+        let (t, cost) = self.expr(&sel.operand)?;
         match &t {
             Type::Struct(name) => {
                 let decl = self.schema.struct_decl(name);
@@ -403,7 +409,7 @@ impl Checker<'_> {
     }
 
     fn has(&mut self, e: &IdedExpr, sel: &SelectExpr) -> Checked1 {
-        let (t, cost) = self.operand(&sel.operand)?;
+        let (t, cost) = self.expr(&sel.operand)?;
         match &t {
             Type::Struct(name) => {
                 let decl = self.schema.struct_decl(name);
@@ -425,6 +431,17 @@ impl Checker<'_> {
                 Ok((Type::Bool, cost + 1))
             }
             other => Err(self.diag(e, format!("has() needs a struct or map field, not {other}"))),
+        }
+    }
+
+    /// One side of `==` / `!=`. Comparing a null variable with anything is
+    /// false or true, never an error, so a variable read here draws no
+    /// warning: `principal != null` is the guard itself, and
+    /// `principal == "user:x"` is false when there is no Principal.
+    fn equality_side(&mut self, side: &IdedExpr) -> Checked1 {
+        match &side.expr {
+            Expr::Ident(name) => self.ident_type(side, name),
+            _ => self.expr(side),
         }
     }
 
@@ -476,8 +493,8 @@ impl Checker<'_> {
                 Ok((t, cc + ct.max(ce) + 1))
             }
             (operators::EQUALS, None, [a, b]) | (operators::NOT_EQUALS, None, [a, b]) => {
-                let (ta, ca) = self.expr(a)?;
-                let (tb, cb) = self.expr(b)?;
+                let (ta, ca) = self.equality_side(a)?;
+                let (tb, cb) = self.equality_side(b)?;
                 self.equatable(e, a, &ta, b, &tb)?;
                 Ok((Type::Bool, ca + cb + 1))
             }
@@ -532,15 +549,6 @@ impl Checker<'_> {
                     }
                 }
                 Ok((Type::Bool, cn + ch + cap + 1))
-            }
-            (operators::ADD, None, [a, b]) => {
-                let (ta, ca) = self.expr(a)?;
-                let (tb, cb) = self.expr(b)?;
-                if is_stringy(&ta) && is_stringy(&tb) {
-                    Ok((Type::String, ca + cb + 1))
-                } else {
-                    Err(self.unsupported(e, &format!("`+` on {ta} and {tb} (only strings join)")))
-                }
             }
             ("size", None, [x]) | ("size", Some(x), []) => {
                 let (t, c) = self.expr(x)?;

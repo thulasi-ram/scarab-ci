@@ -1,70 +1,149 @@
-//! Realistic `invoke.resolve` policies: the ones that must check and decide as
+//! Realistic `run.create` policies: the ones that must check and decide as
 //! expected, and the ones the checker must refuse with a useful message.
 
 use scarab_policy::check::{check, MAX_COST};
 use scarab_policy::eval::{compile_rule, evaluate_rule, RuleOutcome};
-use scarab_policy::invoke_resolve::{
-    schema, Environment, Invoke, InvokeResolveInput, InvokeTarget, Project, TargetKind,
+use scarab_policy::run_create::{
+    schema, ForgeToken, Gate, GateKind, Org, Origin, OriginKind, Pipeline, Project, RunCreateInput,
+    Step, Trigger, TriggerKind, UpstreamGate,
 };
 use scarab_policy::schema::{Capped, Schema, Timestamp, Type};
 
-struct Sample {
-    kind: TargetKind,
-    name: &'static str,
-    version: Option<&'static str>,
-    tags: &'static [&'static str],
-    project: &'static str,
-    environment: Option<&'static str>,
-    time: &'static str,
+fn cap<T, const N: usize>(items: Vec<T>) -> Capped<T, N> {
+    Capped::new(items).expect("within the cap")
 }
 
-const BASE: Sample = Sample {
-    kind: TargetKind::Library,
-    name: "scarab/rust",
-    version: Some("1.4.0"),
-    tags: &["owner:platform", "stable"],
-    project: "payments-api",
-    environment: Some("production"),
-    time: "2026-11-02T10:00:00Z",
-};
+fn strings<const N: usize>(items: &[&str]) -> Capped<String, N> {
+    cap(items.iter().map(|s| s.to_string()).collect())
+}
 
-impl Sample {
-    fn input(&self) -> InvokeResolveInput {
-        InvokeResolveInput {
-            invoke: Invoke {
-                target: InvokeTarget {
-                    kind: self.kind,
-                    name: self.name.to_string(),
-                    content_hash: "ab".repeat(32),
-                    version: self.version.map(str::to_string),
-                    tags: Capped::new(self.tags.iter().map(|t| t.to_string()).collect())
-                        .expect("within the cap"),
-                },
-            },
-            project: Project {
-                name: self.project.to_string(),
-            },
-            environment: self.environment.map(|name| Environment {
-                name: name.to_string(),
-            }),
-            time: Timestamp(
-                chrono::DateTime::parse_from_rfc3339(self.time)
-                    .expect("valid time")
-                    .to_utc(),
-            ),
-        }
+fn at(time: &str) -> Timestamp {
+    Timestamp(
+        chrono::DateTime::parse_from_rfc3339(time)
+            .expect("valid time")
+            .to_utc(),
+    )
+}
+
+fn library(name: &str, source: &str) -> Origin {
+    Origin {
+        kind: OriginKind::Library,
+        name: name.to_string(),
+        source: Some(source.to_string()),
+        content_hash: "ab".repeat(32),
     }
 }
 
-fn applies(schema: &Schema, when: &str, sample: &Sample) -> bool {
-    let rule = compile_rule(schema, when, "denied", None)
+fn origin(kind: OriginKind, name: &str) -> Origin {
+    Origin {
+        kind,
+        name: name.to_string(),
+        source: None,
+        content_hash: "cd".repeat(32),
+    }
+}
+
+fn step(id: &str) -> Step {
+    Step {
+        id: id.to_string(),
+        image: "registry.acme.dev/rust:1.84".to_string(),
+        digest: Some(format!("sha256:{}", "e".repeat(64))),
+        grants: strings(&[]),
+        k8s_overlay: false,
+        secrets: strings(&[]),
+        placement_profiles: strings(&[]),
+        deploy: false,
+        forge_token: Some(ForgeToken::Read),
+        uses_environment_authority: false,
+        origin: cap(vec![]),
+        upstream_gates: cap(vec![]),
+    }
+}
+
+/// A push to main of `payments-api`'s production Pipeline: a test Step, a
+/// manual gate, and a deploy Step from an approved library behind it.
+fn base() -> RunCreateInput {
+    let deploy = Step {
+        deploy: true,
+        uses_environment_authority: true,
+        secrets: strings(&["KUBECONFIG"]),
+        origin: cap(vec![library(
+            "deploy-helm",
+            "github.com/acme/scarab-libs//deploy-helm.yaml",
+        )]),
+        upstream_gates: cap(vec![UpstreamGate {
+            id: "approve".to_string(),
+            kind: GateKind::Manual,
+        }]),
+        ..step("deploy/helm")
+    };
+    RunCreateInput {
+        org: Org {
+            name: "acme".to_string(),
+        },
+        project: Project {
+            name: "payments-api".to_string(),
+        },
+        trigger: Trigger {
+            kind: TriggerKind::Push,
+            r#ref: Some("refs/heads/main".to_string()),
+            sha: Some("f".repeat(40)),
+            fork: false,
+            actor: Some("octocat".to_string()),
+            principal: Some("user:octocat".to_string()),
+            reason: None,
+        },
+        pipeline: Pipeline {
+            name: "release".to_string(),
+            environment: Some("production".to_string()),
+            deploy: false,
+        },
+        steps: cap(vec![step("test"), deploy]),
+        gates: cap(vec![Gate {
+            id: "approve".to_string(),
+            kind: GateKind::Manual,
+            origin: cap(vec![]),
+            dependents: strings(&["deploy/helm"]),
+        }]),
+        principal: None,
+        time: at("2026-11-02T10:00:00Z"),
+    }
+}
+
+/// `base()` with the deploy Step's invoke chain replaced.
+fn deploying_from(chain: Vec<Origin>) -> RunCreateInput {
+    let mut input = base();
+    let mut steps: Vec<Step> = vec![step("test")];
+    steps.push(Step {
+        origin: cap(chain),
+        ..step("deploy/helm")
+    });
+    input.steps = cap(steps);
+    input
+}
+
+fn with_steps(steps: Vec<Step>) -> RunCreateInput {
+    RunCreateInput {
+        steps: cap(steps),
+        ..base()
+    }
+}
+
+fn outcome(schema: &Schema, when: &str, input: &RunCreateInput) -> RuleOutcome {
+    let rule = compile_rule(schema, when, "denied")
+        .unwrap_or_else(|e| panic!("`{when}` should check: {e:?}"));
+    evaluate_rule(schema, &rule, input)
+}
+
+fn applies(schema: &Schema, when: &str, input: &RunCreateInput) -> bool {
+    let rule = compile_rule(schema, when, "denied")
         .unwrap_or_else(|e| panic!("`{when}` should check: {e:?}"));
     let warnings: Vec<_> = rule.warnings().collect();
     assert!(
         warnings.is_empty(),
         "`{when}`: unexpected warnings {warnings:?}"
     );
-    match evaluate_rule(schema, &rule, &sample.input()) {
+    match evaluate_rule(schema, &rule, input) {
         RuleOutcome::Applies { .. } => true,
         RuleOutcome::DoesNotApply => false,
         RuleOutcome::DeniedOnError { error, .. } => panic!("`{when}` failed: {error}"),
@@ -72,299 +151,325 @@ fn applies(schema: &Schema, when: &str, sample: &Sample) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Policies that check and decide.
+// ADR-0075 §4's example rule.
 // ---------------------------------------------------------------------------
 
+const ADR_EXAMPLE: &str = r#"steps.exists(s, s.origin.exists(o,
+        o.kind == "library" &&
+        !(o.source.startsWith("github.com/thulasi-ram/scarab-ci/") ||
+          o.source in ["github.com/acme/scarab-libs//deploy-helm.yaml"])))"#;
+
 #[test]
-fn library_allowlist_by_prefix_and_list() {
+fn adr_example_checks_within_the_cost_bound_and_warns_on_source() {
     let s = schema();
-    let when = r#"invoke.target.kind == "library" &&
-        !(invoke.target.name.startsWith("scarab/") ||
-          invoke.target.name in ["acme/deploy-helm"])"#;
-    assert!(!applies(&s, when, &BASE));
-    assert!(!applies(
-        &s,
-        when,
-        &Sample {
-            name: "acme/deploy-helm",
-            ..BASE
-        }
+    let checked = check(&s, ADR_EXAMPLE, &Type::Bool).expect("the ADR's example checks");
+    // 1 + MAX_STEPS × (3 + 18 × MAX_ORIGIN), see run_create's module docs.
+    assert_eq!(checked.cost, 75_265);
+    assert!(checked.cost <= MAX_COST);
+    // `source` is optional: `o.kind == "library"` does not tell the checker
+    // it is present, so both reads draw the editor's warning.
+    let warnings: Vec<String> = checked.warnings.iter().map(|w| w.to_string()).collect();
+    assert_eq!(warnings.len(), 2, "{warnings:?}");
+    for w in &warnings {
+        assert!(
+            w.contains("`source` is optional; guard the read with `has(o.source) && ...`"),
+            "{w}"
+        );
+    }
+}
+
+#[test]
+fn adr_example_decides() {
+    let s = schema();
+    let allowed = |chain: Vec<Origin>| outcome(&s, ADR_EXAMPLE, &deploying_from(chain));
+    assert_eq!(outcome(&s, ADR_EXAMPLE, &base()), RuleOutcome::DoesNotApply);
+    assert_eq!(
+        allowed(vec![library(
+            "rust",
+            "github.com/thulasi-ram/scarab-ci/libs/rust.yaml"
+        )]),
+        RuleOutcome::DoesNotApply
+    );
+    assert!(matches!(
+        allowed(vec![library("miner", "github.com/evil/libs//miner.yaml")]),
+        RuleOutcome::Applies { .. }
     ));
-    assert!(applies(
-        &s,
-        when,
-        &Sample {
-            name: "evil/miner",
-            ..BASE
-        }
+    // Deeper in the chain counts too.
+    assert!(matches!(
+        allowed(vec![
+            origin(OriginKind::File, ".scarab/lib/deploy.yaml"),
+            library("miner", "github.com/evil/libs//miner.yaml"),
+        ]),
+        RuleOutcome::Applies { .. }
     ));
-    assert!(!applies(
-        &s,
-        when,
-        &Sample {
-            name: "evil/miner",
-            kind: TargetKind::Local,
-            ..BASE
-        }
+    // Files and plugins are not libraries.
+    assert_eq!(
+        allowed(vec![origin(OriginKind::Plugin, "argocd")]),
+        RuleOutcome::DoesNotApply
+    );
+    // A library link without a source fails closed: the warning's point.
+    assert!(matches!(
+        allowed(vec![origin(OriginKind::Library, "nameless")]),
+        RuleOutcome::DeniedOnError { .. }
     ));
 }
 
 #[test]
-fn every_plugin_requires_approval() {
+fn adr_example_with_has_guard_has_no_warnings() {
     let s = schema();
-    let when = r#"invoke.target.kind == "plugin""#;
+    let when = r#"steps.exists(s, s.origin.exists(o,
+        o.kind == "library" && has(o.source) &&
+        !(o.source.startsWith("github.com/thulasi-ram/scarab-ci/") ||
+          o.source in ["github.com/acme/scarab-libs//deploy-helm.yaml"])))"#;
+    assert!(!applies(&s, when, &base()));
     assert!(applies(
         &s,
         when,
-        &Sample {
-            kind: TargetKind::Plugin,
-            ..BASE
-        }
+        &deploying_from(vec![library("miner", "github.com/evil/libs//miner.yaml")])
     ));
-    assert!(!applies(&s, when, &BASE));
+}
+
+// ---------------------------------------------------------------------------
+// Policies that check and decide.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_plugin_gate_is_refused() {
+    let s = schema();
+    let when = r#"gates.exists(g, g.kind == "plugin")"#;
+    assert!(!applies(&s, when, &base()));
+    let mut input = base();
+    input.gates = cap(vec![Gate {
+        id: "argocd".to_string(),
+        kind: GateKind::Plugin,
+        origin: cap(vec![origin(OriginKind::Plugin, "argocd")]),
+        dependents: strings(&[]),
+    }]);
+    assert!(applies(&s, when, &input));
 }
 
 #[test]
 fn holiday_freeze_window_in_production() {
     let s = schema();
-    let when = r#"environment != null && environment.name == "production" &&
+    let when = r#"has(pipeline.environment) && pipeline.environment == "production" &&
         time >= timestamp("2026-12-20T00:00:00Z") && time < timestamp("2027-01-04T00:00:00Z")"#;
-    assert!(applies(
-        &s,
-        when,
-        &Sample {
-            time: "2026-12-24T12:00:00Z",
-            ..BASE
-        }
-    ));
-    assert!(!applies(&s, when, &BASE));
-    assert!(!applies(
-        &s,
-        when,
-        &Sample {
-            time: "2026-12-24T12:00:00Z",
-            environment: Some("staging"),
-            ..BASE
-        }
-    ));
+    let christmas = RunCreateInput {
+        time: at("2026-12-24T12:00:00Z"),
+        ..base()
+    };
+    assert!(applies(&s, when, &christmas));
+    assert!(!applies(&s, when, &base()));
+    let mut staging = RunCreateInput {
+        time: at("2026-12-24T12:00:00Z"),
+        ..base()
+    };
+    staging.pipeline.environment = Some("staging".to_string());
+    assert!(!applies(&s, when, &staging));
     // No Environment: the guard short-circuits instead of failing closed.
-    assert!(!applies(
+    let mut none = RunCreateInput {
+        time: at("2026-12-24T12:00:00Z"),
+        ..base()
+    };
+    none.pipeline.environment = None;
+    assert!(!applies(&s, when, &none));
+}
+
+#[test]
+fn privileged_grant_blocks_with_exists() {
+    let s = schema();
+    let when = r#"steps.exists(s, s.grants.exists(g, g == "privileged"))"#;
+    assert!(!applies(&s, when, &base()));
+    let privileged = Step {
+        grants: strings(&["add-capabilities", "privileged"]),
+        ..step("build")
+    };
+    assert!(applies(&s, when, &with_steps(vec![privileged])));
+    assert!(!applies(&s, when, &with_steps(vec![])));
+}
+
+#[test]
+fn every_image_from_the_registry_with_all_and_matches() {
+    let s = schema();
+    let when = r#"!steps.all(s, s.image.matches("^registry\\.acme\\.dev/"))"#;
+    assert!(!applies(&s, when, &base()));
+    let docker_hub = Step {
+        image: "docker.io/library/alpine:3".to_string(),
+        ..step("lint")
+    };
+    assert!(applies(
         &s,
         when,
-        &Sample {
-            time: "2026-12-24T12:00:00Z",
-            environment: None,
-            ..BASE
-        }
+        &with_steps(vec![step("test"), docker_hub])
     ));
 }
 
 #[test]
-fn deprecated_tag_blocks_with_exists() {
+fn exactly_one_deploy_step_with_exists_one() {
     let s = schema();
-    let when = r#"invoke.target.tags.exists(t, t == "deprecated")"#;
-    assert!(applies(
-        &s,
-        when,
-        &Sample {
-            tags: &["stable", "deprecated"],
-            ..BASE
-        }
-    ));
-    assert!(!applies(&s, when, &BASE));
-    assert!(!applies(&s, when, &Sample { tags: &[], ..BASE }));
+    let when = "!steps.exists_one(s, s.deploy)";
+    assert!(!applies(&s, when, &base()));
+    assert!(applies(&s, when, &with_steps(vec![step("test")])));
+    let two = vec![
+        Step {
+            deploy: true,
+            ..step("a")
+        },
+        Step {
+            deploy: true,
+            ..step("b")
+        },
+    ];
+    assert!(applies(&s, when, &with_steps(two)));
 }
 
 #[test]
-fn every_tag_must_be_well_formed_with_all_and_matches() {
+fn unpinned_or_latest_image_with_has() {
     let s = schema();
-    let when = r#"!invoke.target.tags.all(t, t.matches("^[a-z0-9:-]+$"))"#;
-    assert!(!applies(&s, when, &BASE));
-    assert!(applies(
-        &s,
-        when,
-        &Sample {
-            tags: &["stable", "Owner:X"],
-            ..BASE
-        }
-    ));
-}
-
-#[test]
-fn exactly_one_owner_with_exists_one() {
-    let s = schema();
-    let when = r#"!invoke.target.tags.exists_one(t, t.startsWith("owner:"))"#;
-    assert!(!applies(&s, when, &BASE));
-    assert!(applies(
-        &s,
-        when,
-        &Sample {
-            tags: &["stable"],
-            ..BASE
-        }
-    ));
-    assert!(applies(
-        &s,
-        when,
-        &Sample {
-            tags: &["owner:a", "owner:b"],
-            ..BASE
-        }
-    ));
-}
-
-#[test]
-fn unpinned_or_prerelease_library_with_has() {
-    let s = schema();
-    let when = r#"invoke.target.kind == "library" &&
-        (!has(invoke.target.version) || invoke.target.version.endsWith("-rc"))"#;
-    assert!(!applies(&s, when, &BASE));
-    assert!(applies(
-        &s,
-        when,
-        &Sample {
-            version: None,
-            ..BASE
-        }
-    ));
-    assert!(applies(
-        &s,
-        when,
-        &Sample {
-            version: Some("2.0.0-rc"),
-            ..BASE
-        }
-    ));
+    let when = r#"steps.exists(s, !has(s.digest) || s.image.endsWith(":latest"))"#;
+    assert!(!applies(&s, when, &base()));
+    let unpinned = Step {
+        digest: None,
+        ..step("build")
+    };
+    assert!(applies(&s, when, &with_steps(vec![unpinned])));
+    let latest = Step {
+        image: "registry.acme.dev/rust:latest".to_string(),
+        ..step("build")
+    };
+    assert!(applies(&s, when, &with_steps(vec![latest])));
 }
 
 #[test]
 fn content_hash_must_be_a_sha256() {
     let s = schema();
-    let when = r#"size(invoke.target.content_hash) != 64 ||
-        !invoke.target.content_hash.matches("^[0-9a-f]+$")"#;
-    assert!(!applies(&s, when, &BASE));
+    let when = r#"steps.exists(s, s.origin.exists(o,
+        size(o.content_hash) != 64 || !o.content_hash.matches("^[0-9a-f]+$")))"#;
+    assert!(!applies(&s, when, &base()));
+    let mut short = origin(OriginKind::File, ".scarab/lib/x.yaml");
+    short.content_hash = "abc".to_string();
+    assert!(applies(&s, when, &deploying_from(vec![short])));
 }
 
 #[test]
 fn payments_projects_get_one_plugin() {
     let s = schema();
-    let when = r#"project.name.startsWith("payments-") && invoke.target.kind == "plugin" &&
-        !(invoke.target.name in ["scarab/argocd"])"#;
-    let plugin = Sample {
-        kind: TargetKind::Plugin,
-        ..BASE
+    let when = r#"project.name.startsWith("payments-") && gates.exists(g,
+        g.origin.exists(o, o.kind == "plugin" && !(o.name in ["scarab/argocd"])))"#;
+    let with_plugin = |project: &str, plugin: &str| {
+        let mut input = base();
+        input.project.name = project.to_string();
+        input.gates = cap(vec![Gate {
+            id: "sync".to_string(),
+            kind: GateKind::Plugin,
+            origin: cap(vec![origin(OriginKind::Plugin, plugin)]),
+            dependents: strings(&[]),
+        }]);
+        input
     };
-    assert!(applies(
-        &s,
-        when,
-        &Sample {
-            name: "acme/helm",
-            ..plugin
-        }
-    ));
+    assert!(applies(&s, when, &with_plugin("payments-api", "acme/helm")));
     assert!(!applies(
         &s,
         when,
-        &Sample {
-            name: "scarab/argocd",
-            ..plugin
-        }
+        &with_plugin("payments-api", "scarab/argocd")
     ));
-    assert!(!applies(
-        &s,
-        when,
-        &Sample {
-            name: "acme/helm",
-            project: "web",
-            ..plugin
-        }
-    ));
+    assert!(!applies(&s, when, &with_plugin("web", "acme/helm")));
 }
 
 #[test]
-fn no_local_invokes_in_production_with_a_conditional() {
+fn no_local_files_in_production_with_a_conditional() {
     let s = schema();
-    let when = r#"environment != null
-        ? environment.name == "production" && invoke.target.kind == "local"
+    let when = r#"has(pipeline.environment)
+        ? pipeline.environment == "production" &&
+          steps.exists(s, s.origin.exists(o, o.kind == "file"))
         : false"#;
-    assert!(applies(
-        &s,
-        when,
-        &Sample {
-            kind: TargetKind::Local,
-            ..BASE
-        }
-    ));
-    assert!(!applies(
-        &s,
-        when,
-        &Sample {
-            kind: TargetKind::Local,
-            environment: None,
-            ..BASE
-        }
-    ));
-    assert!(!applies(&s, when, &BASE));
+    let local = deploying_from(vec![origin(OriginKind::File, ".scarab/lib/deploy.yaml")]);
+    assert!(applies(&s, when, &local));
+    let mut no_env = local;
+    no_env.pipeline.environment = None;
+    assert!(!applies(&s, when, &no_env));
+    assert!(!applies(&s, when, &base()));
 }
 
 #[test]
 fn blocklist_as_a_map_literal() {
     let s = schema();
-    let when = r#"invoke.target.name in {"evil/miner": true, "bad/lib": true}"#;
-    assert!(applies(
-        &s,
-        when,
-        &Sample {
-            name: "bad/lib",
-            ..BASE
-        }
-    ));
-    assert!(!applies(&s, when, &BASE));
+    let when = r#"steps.exists(s, s.image in {"evil/miner:1": true, "bad/image:2": true})"#;
+    let bad = Step {
+        image: "bad/image:2".to_string(),
+        ..step("x")
+    };
+    assert!(applies(&s, when, &with_steps(vec![bad])));
+    assert!(!applies(&s, when, &base()));
 }
 
 #[test]
-fn path_traversal_in_a_name() {
+fn path_traversal_in_an_origin_name() {
     let s = schema();
-    let when = r#"invoke.target.name.contains("..") || invoke.target.name.endsWith("/")"#;
+    let when = r#"steps.exists(s, s.origin.exists(o,
+        o.name.contains("..") || o.name.endsWith("/")))"#;
     assert!(applies(
         &s,
         when,
-        &Sample {
-            name: "scarab/../x",
-            ..BASE
-        }
+        &deploying_from(vec![origin(OriginKind::File, ".scarab/../x.yaml")])
     ));
-    assert!(!applies(&s, when, &BASE));
+    assert!(!applies(&s, when, &base()));
+}
+
+#[test]
+fn environment_authority_needs_a_manual_gate_upstream() {
+    // ADR-0075 §5's deny: a Step using the Environment's authority with no
+    // manual gate before it. It must fit the cost bound.
+    let s = schema();
+    let when = r#"steps.exists(s, s.uses_environment_authority &&
+        !s.upstream_gates.exists(g, g.kind == "manual"))"#;
+    assert_eq!(check(&s, when, &Type::Bool).expect("checks").cost, 85_505);
+    assert!(!applies(&s, when, &base()));
+    let ungated = Step {
+        uses_environment_authority: true,
+        secrets: strings(&["TOKEN"]),
+        ..step("deploy")
+    };
+    assert!(applies(&s, when, &with_steps(vec![ungated])));
+}
+
+#[test]
+fn manual_dispatch_needs_a_reason() {
+    // ADR-0075 §5: a missing reason is a deny over `reason`.
+    let s = schema();
+    let when = r#"trigger.kind in ["manual", "api"] && !has(trigger.reason)"#;
+    assert!(!applies(&s, when, &base()));
+    let mut manual = base();
+    manual.trigger.kind = TriggerKind::Manual;
+    assert!(applies(&s, when, &manual));
+    manual.trigger.reason = Some("hotfix".to_string());
+    assert!(!applies(&s, when, &manual));
 }
 
 #[test]
 fn duration_literals_compare() {
     let s = schema();
-    assert!(applies(&s, r#"duration("1h30m") > duration("1h")"#, &BASE));
+    assert!(applies(
+        &s,
+        r#"duration("1h30m") > duration("1h")"#,
+        &base()
+    ));
 }
 
 #[test]
-fn message_expr_is_a_checked_string() {
+fn rule_message_is_static() {
     let s = schema();
     let rule = compile_rule(
         &s,
-        r#"!invoke.target.name.startsWith("scarab/")"#,
-        "This library is not approved.",
-        Some(r#""not approved: " + invoke.target.name"#),
+        r#"trigger.fork"#,
+        "Runs from forks are not allowed here.",
     )
     .expect("checks");
+    let mut fork = base();
+    fork.trigger.fork = true;
     assert_eq!(
-        evaluate_rule(
-            &s,
-            &rule,
-            &Sample {
-                name: "evil/miner",
-                ..BASE
-            }
-            .input()
-        ),
+        evaluate_rule(&s, &rule, &fork),
         RuleOutcome::Applies {
-            message: "not approved: evil/miner".to_string()
+            message: "Runs from forks are not allowed here.".to_string()
         }
     );
 }
@@ -378,57 +483,64 @@ fn unguarded_optional_field_warns_and_fails_closed() {
     let s = schema();
     let rule = compile_rule(
         &s,
-        r#"invoke.target.version.startsWith("0.")"#,
+        r#"trigger.ref.startsWith("refs/heads/release/")"#,
         "denied",
-        None,
     )
     .expect("a warning, not an error");
     let warnings: Vec<String> = rule.warnings().map(|w| w.to_string()).collect();
     assert_eq!(warnings.len(), 1, "{warnings:?}");
     assert!(
-        warnings[0].contains("guard the read with `has(invoke.target.version) && ...`"),
+        warnings[0].contains("guard the read with `has(trigger.ref) && ...`"),
         "{warnings:?}"
     );
-    assert_eq!(
-        evaluate_rule(&s, &rule, &BASE.input()),
-        RuleOutcome::DoesNotApply
-    );
-    let RuleOutcome::DeniedOnError { error, .. } = evaluate_rule(
-        &s,
-        &rule,
-        &Sample {
-            version: None,
-            ..BASE
-        }
-        .input(),
-    ) else {
+    assert_eq!(evaluate_rule(&s, &rule, &base()), RuleOutcome::DoesNotApply);
+    let mut cron = base();
+    cron.trigger.kind = TriggerKind::Cron;
+    cron.trigger.r#ref = None;
+    let RuleOutcome::DeniedOnError { error, .. } = evaluate_rule(&s, &rule, &cron) else {
         panic!("a missing optional field must deny");
     };
-    assert!(error.contains("version"), "{error}");
+    assert!(error.contains("ref"), "{error}");
 }
 
 #[test]
 fn unguarded_optional_variable_warns_and_fails_closed() {
     let s = schema();
-    let rule = compile_rule(&s, r#"environment.name == "production""#, "denied", None)
+    let rule = compile_rule(&s, r#"principal.startsWith("user:")"#, "denied")
         .expect("a warning, not an error");
     let warnings: Vec<String> = rule.warnings().map(|w| w.to_string()).collect();
     assert_eq!(warnings.len(), 1, "{warnings:?}");
     assert!(
-        warnings[0].contains("`environment` may be null"),
+        warnings[0].contains("`principal` may be null"),
         "{warnings:?}"
     );
     assert!(matches!(
-        evaluate_rule(
-            &s,
-            &rule,
-            &Sample {
-                environment: None,
-                ..BASE
-            }
-            .input()
-        ),
+        evaluate_rule(&s, &rule, &base()),
         RuleOutcome::DeniedOnError { .. }
+    ));
+    // Equality with a null variable is false, not an error: no warning.
+    assert!(!applies(&s, r#"principal == "user:octocat""#, &base()));
+    assert!(applies(
+        &s,
+        r#"principal == "user:octocat""#,
+        &RunCreateInput {
+            principal: Some("user:octocat".to_string()),
+            ..base()
+        }
+    ));
+    // Guarded, it neither warns nor fails.
+    assert!(!applies(
+        &s,
+        r#"principal != null && principal.startsWith("bot:")"#,
+        &RunCreateInput {
+            principal: Some("user:octocat".to_string()),
+            ..base()
+        }
+    ));
+    assert!(!applies(
+        &s,
+        r#"principal != null && principal.startsWith("bot:")"#,
+        &base()
     ));
 }
 
@@ -455,38 +567,38 @@ fn assert_rejected(when: &str, expected: &str) {
 #[test]
 fn misspelt_field() {
     assert_eq!(
-        rejected(r#"invoke.target.nmae == "x""#),
-        "1:14: `invoke.target.nmae`: no field `nmae` on InvokeTarget (did you mean `name`?); \
-         fields are kind, name, content_hash, version, tags"
+        rejected(r#"trigger.rfe == "x""#),
+        "1:8: `trigger.rfe`: no field `rfe` on Trigger (did you mean `ref`?); \
+         fields are kind, ref, sha, fork, actor, principal, reason"
     );
 }
 
 #[test]
 fn misspelt_variable() {
     assert_rejected(
-        r#"invokee.target.name == "x""#,
-        "`invokee`: no variable `invokee` at invoke.resolve (did you mean `invoke`?); \
-         variables are invoke, project, environment, time",
+        r#"triger.kind == "push""#,
+        "`triger`: no variable `triger` at run.create (did you mean `trigger`?); \
+         variables are org, project, trigger, pipeline, steps, gates, principal, time",
     );
 }
 
 #[test]
 fn misspelt_enum_value() {
     assert_rejected(
-        r#"invoke.target.kind == "libary""#,
-        r#"`"libary"`: "libary" is not a TargetKind (did you mean `library`?); values are local, library, plugin"#,
+        r#"trigger.kind == "pul_request""#,
+        r#"`"pul_request"`: "pul_request" is not a TriggerKind (did you mean `pull_request`?); values are push, pull_request, tag, release, comment, cron, manual, api, upstream"#,
     );
     assert_rejected(
-        r#"invoke.target.kind in ["local", "plugn"]"#,
-        r#""plugn" is not a TargetKind"#,
+        r#"steps.exists(s, s.origin.exists(o, o.kind in ["file", "libary"]))"#,
+        r#""libary" is not a OriginKind"#,
     );
 }
 
 #[test]
 fn string_compared_with_int() {
     assert_rejected(
-        r#"invoke.target.name == 1"#,
-        "`invoke.target.name == 1`: cannot compare string with int",
+        r#"pipeline.name == 1"#,
+        "`pipeline.name == 1`: cannot compare string with int",
     );
 }
 
@@ -501,35 +613,36 @@ fn timestamp_ordered_against_a_string() {
 #[test]
 fn when_that_is_not_a_bool() {
     assert_rejected(
-        "invoke.target.name",
+        "pipeline.name",
         "the rule must return bool, but this returns string",
     );
 }
 
 #[test]
-fn message_expr_that_is_not_a_string() {
-    let err = compile_rule(&schema(), "true", "m", Some("size(invoke.target.tags)"))
-        .expect_err("an int message");
-    assert!(
-        err[0]
-            .message
-            .contains("must return string, but this returns int"),
-        "{err:?}"
+fn string_concatenation_is_not_supported() {
+    // String `+` existed for `message_expr`, which ADR-0075 removed.
+    assert_rejected(
+        r#"pipeline.name + "-prod" == "release-prod""#,
+        "the `+` operator is not supported in policies",
+    );
+    assert_rejected(
+        r#"steps.exists(s, s.id == pipeline.name + "/deploy")"#,
+        "`pipeline.name + \"/deploy\"`: the `+` operator is not supported in policies",
     );
 }
 
 #[test]
 fn unsupported_function_and_operator() {
     assert_rejected(
-        r#"invoke.target.name.lowerAscii() == "x""#,
+        r#"pipeline.name.lowerAscii() == "x""#,
         "the function `lowerAscii` is not supported in policies",
     );
     assert_rejected(
-        "size(invoke.target.tags) * 2 > 4",
+        "size(steps) * 2 > 4",
         "the `*` operator is not supported in policies",
     );
     assert_rejected(
-        "invoke.target.tags[0] == \"x\"",
+        r#"steps[0].id == "x""#,
         "the `[]` operator is not supported in policies",
     );
 }
@@ -537,20 +650,20 @@ fn unsupported_function_and_operator() {
 #[test]
 fn non_literal_and_invalid_regex() {
     assert_rejected(
-        "invoke.target.name.matches(project.name)",
+        "pipeline.name.matches(project.name)",
         "`project.name`: matches() takes a string literal pattern in policies",
     );
-    assert_rejected(r#"invoke.target.name.matches("[")"#, "invalid pattern");
+    assert_rejected(r#"pipeline.name.matches("[")"#, "invalid pattern");
 }
 
 #[test]
 fn macro_over_a_non_list() {
     assert_rejected(
-        r#"invoke.target.name.exists(c, c == "a")"#,
-        "`invoke.target.name`: `exists` needs a list, not string",
+        r#"pipeline.name.exists(c, c == "a")"#,
+        "`pipeline.name`: `exists` needs a list, not string",
     );
     assert_rejected(
-        "invoke.target.tags.map(t, t).size() > 0",
+        "steps.map(s, s.id).size() > 0",
         "the `map/filter` macro is not supported in policies",
     );
 }
@@ -558,47 +671,46 @@ fn macro_over_a_non_list() {
 #[test]
 fn iteration_variable_has_the_element_type() {
     assert_rejected(
-        "invoke.target.tags.exists(t, t > 3)",
-        "`t > 3`: cannot order string against int",
+        "steps.exists(s, s.id > 3)",
+        "`s.id > 3`: cannot order string against int",
     );
     assert_rejected(
-        "invoke.target.tags.all(t, t.name == \"x\")",
-        "`t.name`: cannot select a field from string",
+        r#"steps.exists(s, s.secrets.all(x, x.name == "x"))"#,
+        "`x.name`: cannot select a field from string",
     );
 }
 
 #[test]
 fn cost_above_the_limit() {
-    let error = rejected(
-        "invoke.target.tags.exists(a, invoke.target.tags.exists(b, \
-         invoke.target.tags.exists(c, a == b && b == c)))",
-    );
+    // Two macros nested over the Steps: quadratic in the Run.
+    let error = rejected("steps.exists(a, steps.exists(b, a.id == b.id && a.image != b.image))");
     assert!(
         error.contains(&format!("above the limit of {MAX_COST}")),
         "{error}"
     );
-    // Two levels fit.
+    // One over the Steps and one over each Step's origin fits (the ADR's
+    // example, above); so does one over the Steps and one over its secrets.
     check(
         &schema(),
-        "invoke.target.tags.exists(a, invoke.target.tags.exists(b, a == b))",
+        r#"steps.exists(s, s.secrets.exists(x, x == "PROD_DB"))"#,
         &Type::Bool,
     )
-    .expect("two nested macros fit");
+    .expect("steps × secrets fits");
 }
 
 #[test]
 fn absent_field_is_not_null() {
     assert_rejected(
-        "invoke.target.version == null",
-        "invoke.target.version is string and is never null; test presence with has(invoke.target.version)",
+        "trigger.ref == null",
+        "trigger.ref is string and is never null; test presence with has(trigger.ref)",
     );
 }
 
 #[test]
 fn has_on_a_misspelt_field_and_bad_literals() {
     assert_rejected(
-        "has(invoke.target.verison)",
-        "no field `verison` on InvokeTarget (did you mean `version`?)",
+        "has(trigger.rfe)",
+        "no field `rfe` on Trigger (did you mean `ref`?)",
     );
     assert_rejected(
         r#"time > timestamp("yesterday")"#,
@@ -609,10 +721,10 @@ fn has_on_a_misspelt_field_and_bad_literals() {
 
 #[test]
 fn oversized_and_overnested_rules() {
-    let long = format!("invoke.target.name == \"{}\"", "x".repeat(5000));
+    let long = format!("pipeline.name == \"{}\"", "x".repeat(5000));
     assert_rejected(&long, "a rule is at most 4096 bytes");
     // A left-recursive chain, not `((((…`: in a debug build cel 0.15's parser
     // overflows a test thread's 2 MiB stack at about 12 nested parentheses.
-    let deep = format!("{} == \"x\"", vec!["\"a\""; 70].join(" + "));
+    let deep = format!("pipeline{} == \"x\"", ".name".repeat(70));
     assert_rejected(&deep, "nested more than 64 deep");
 }

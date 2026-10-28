@@ -15,38 +15,26 @@ use cel::{Context, Value};
 use crate::check::{check, Checked, Diagnostic};
 use crate::schema::{Schema, Type};
 
-/// One rule of a Policy, checked.
+/// One rule of a Policy, checked. Its message is static (ADR-0075 §4): the
+/// decision stores the input, which shows what the rule matched.
 #[derive(Debug)]
 pub struct Rule {
     pub when: Checked,
     pub message: String,
-    pub message_expr: Option<Checked>,
 }
 
 impl Rule {
     pub fn warnings(&self) -> impl Iterator<Item = &Diagnostic> {
-        self.when
-            .warnings
-            .iter()
-            .chain(self.message_expr.iter().flat_map(|m| &m.warnings))
+        self.when.warnings.iter()
     }
 }
 
-/// Checks a rule's `when` (must be bool) and `message_expr` (must be string).
-pub fn compile_rule(
-    schema: &Schema,
-    when: &str,
-    message: &str,
-    message_expr: Option<&str>,
-) -> Result<Rule, Vec<Diagnostic>> {
+/// Checks a rule's `when`, which must return a bool.
+pub fn compile_rule(schema: &Schema, when: &str, message: &str) -> Result<Rule, Vec<Diagnostic>> {
     let when = check(schema, when, &Type::Bool)?;
-    let message_expr = message_expr
-        .map(|m| check(schema, m, &Type::String))
-        .transpose()?;
     Ok(Rule {
         when,
         message: message.to_string(),
-        message_expr,
     })
 }
 
@@ -73,18 +61,9 @@ pub fn evaluate_rule<I: serde::Serialize>(schema: &Schema, rule: &Rule, input: &
     };
     match rule.when.program.execute(&context) {
         Ok(Value::Bool(false)) => RuleOutcome::DoesNotApply,
-        Ok(Value::Bool(true)) => {
-            let message = match &rule.message_expr {
-                Some(m) => match m.program.execute(&context) {
-                    Ok(Value::String(s)) => s.to_string(),
-                    // The `when` held, so the effect applies either way; a
-                    // broken message only loses its detail.
-                    _ => rule.message.clone(),
-                },
-                None => rule.message.clone(),
-            };
-            RuleOutcome::Applies { message }
-        }
+        Ok(Value::Bool(true)) => RuleOutcome::Applies {
+            message: rule.message.clone(),
+        },
         Ok(other) => denied(format!("`when` returned {other:?}, not a bool")),
         Err(e) => denied(e.to_string()),
     }

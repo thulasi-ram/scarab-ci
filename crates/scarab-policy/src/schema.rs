@@ -204,7 +204,8 @@ macro_rules! policy_struct {
             fn policy_type(reg: &mut $crate::schema::Registry) -> $crate::schema::Type {
                 reg.struct_type(stringify!($name), |reg| vec![
                     $( $crate::schema::Field {
-                        name: stringify!($field).to_string(),
+                        // `r#ref` is the field `ref`, as serde names it.
+                        name: stringify!($field).trim_start_matches("r#").to_string(),
                         ty: <$ty as $crate::schema::PolicyType>::policy_type(reg),
                         optional: <$ty as $crate::schema::PolicyType>::OPTIONAL,
                     } ),*
