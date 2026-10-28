@@ -55,6 +55,15 @@ Whichever path you choose, `scarab-server` needs:
 the chart; the [Run locally](/scarab-ci/get-started/run-locally/) recipes start
 them for you on your machine.
 
+## Where Scarab stops
+
+Scarab is CI. It runs and governs the run that deploys (approvals, allowed refs, scoped
+secrets), and it can wait inside that run until your CD tool reports the change live. It keeps
+no record of what is live where after the run ends, and it doesn't detect changes made outside
+it. Argo CD, Flux or your CD tool of choice answers those. See
+[Deploying with Argo CD](/scarab-ci/usage/deploying-with-argo-cd/).
+
 ## References
 
 - [ADR-0005: Tenancy & deployment, Kubernetes as the only backend](/scarab-ci/tech/adr/0005-tenancy-and-k8s-only/)
+- [ADR-0074: Deployments leave core](/scarab-ci/tech/adr/0074-deployments-leave-core/)
