@@ -148,7 +148,7 @@ pub struct CreatePolicyRequest {
     /// typed `setting` (§7).
     #[schema(value_type = Object)]
     pub policy: Value,
-    /// Why, recorded on the PolicyVersion.
+    /// Why, recorded on the PolicyVersion. At most 2,000 bytes.
     #[serde(default)]
     pub reason: Option<String>,
 }
@@ -334,6 +334,24 @@ pub struct RuleReadsDto {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// The longest `reason` a Policy change records, in bytes.
+pub const MAX_REASON_BYTES: usize = 2_000;
+/// The most live Policies one scope (an org, or one Project) may hold. Each
+/// is compiled again at every Run admission it applies to.
+pub const MAX_POLICIES_PER_SCOPE: usize = 256;
+
+/// A change's `reason`, refused over [`MAX_REASON_BYTES`].
+fn reason_of(reason: Option<String>) -> Result<String, ApiError> {
+    let reason = reason.unwrap_or_default();
+    if reason.len() > MAX_REASON_BYTES {
+        return Err(ApiError::BadRequest(format!(
+            "`reason` is at most {MAX_REASON_BYTES} bytes; this one is {}",
+            reason.len()
+        )));
+    }
+    Ok(reason)
+}
+
 fn store(st: &AppState) -> Result<&dyn PolicyStore, ApiError> {
     st.policies.as_deref().ok_or(ApiError::NotFound)
 }
@@ -507,7 +525,16 @@ async fn create_at(
     )
     .await?;
     let store = store(st)?;
+    let reason = reason_of(body.reason)?;
     let policy = compiled_body(body.policy, scope.level()).await?;
+    // A soft cap: two creates racing at the limit can both pass.
+    let live = store.list(&scope).await.map_err(store_api_error)?.len();
+    if live >= MAX_POLICIES_PER_SCOPE {
+        return Err(ApiError::Conflict(format!(
+            "this scope already has {live} Policies, the most it may hold \
+             ({MAX_POLICIES_PER_SCOPE}); delete one first"
+        )));
+    }
     let now = st.clock.now().await.0;
     let stored = store
         .create(&NewPolicy {
@@ -515,7 +542,7 @@ async fn create_at(
             scope,
             body: policy,
             author: principal.subject,
-            reason: body.reason.unwrap_or_default(),
+            reason,
             at: now,
         })
         .await
@@ -562,6 +589,7 @@ async fn update_at(
     )
     .await?;
     let store = store(st)?;
+    let reason = reason_of(body.reason)?;
     let stored = live_at_version(store, &scope, id, body.expected_version).await?;
     let policy = compiled_body(body.policy, scope.level()).await?;
     judge(st, guard, update_loosenings(&stored, &policy)).await?;
@@ -573,7 +601,7 @@ async fn update_at(
             &policy,
             &PolicyChange {
                 author: principal.subject,
-                reason: body.reason.unwrap_or_default(),
+                reason,
                 step_up_ref: guard.confirmation_id(),
                 at: now,
             },
@@ -599,6 +627,7 @@ async fn delete_at(
     )
     .await?;
     let store = store(st)?;
+    let reason = reason_of(q.reason)?;
     let stored = live_at_version(store, &scope, id, q.expected_version).await?;
     // ADR-0075 §10: deleting an enforced Policy loosens; an audit-mode one
     // enforces nothing.
@@ -618,7 +647,7 @@ async fn delete_at(
             stored.version,
             &PolicyChange {
                 author: principal.subject,
-                reason: q.reason.unwrap_or_default(),
+                reason,
                 step_up_ref: guard.confirmation_id(),
                 at: now,
             },
@@ -662,10 +691,10 @@ pub(crate) async fn list_org_policies(
     summary = "Add an org Policy (ADR-0075 §4, §10)",
     responses(
         (status = 201, body = PolicyDto),
-        (status = 400, description = "not a Policy, or it does not compile (its checkpoint is not yet consulted, a CEL error, an effect the checkpoint does not allow)"),
+        (status = 400, description = "not a Policy, or it does not compile (its checkpoint is not yet consulted, a CEL error, an effect the checkpoint does not allow), or `reason` is over 2,000 bytes"),
         (status = 403, description = "not an org admin"),
         (status = 404, description = "policies not configured"),
-        (status = 409, description = "a live Policy here has that name")
+        (status = 409, description = "a live Policy here has that name, or the scope holds its 256 Policies")
     )
 )]
 pub(crate) async fn create_org_policy(
@@ -714,7 +743,7 @@ pub(crate) async fn get_org_policy(
     summary = "Replace an org Policy (ADR-0075 §10, §11)",
     responses(
         (status = 200, body = PolicyDto),
-        (status = 400, description = "not a Policy, or it does not compile"),
+        (status = 400, description = "not a Policy, or it does not compile, or `reason` is over 2,000 bytes"),
         (status = 403, description = "not an org admin"),
         (status = 404, description = "no such live Policy in this org, or not configured"),
         (status = 409, description = "`expected_version` is not the stored version, or the name is taken")
@@ -743,6 +772,7 @@ pub(crate) async fn update_org_policy(
     summary = "Delete an org Policy (ADR-0075 §10)",
     responses(
         (status = 200, body = PolicyDto),
+        (status = 400, description = "`reason` is over 2,000 bytes"),
         (status = 403, description = "not an org admin"),
         (status = 404, description = "no such live Policy in this org, or not configured"),
         (status = 409, description = "`expected_version` is not the stored version")
@@ -821,10 +851,10 @@ pub(crate) async fn list_project_policies(
     summary = "Add a Project typed setting (ADR-0075 §7, §10)",
     responses(
         (status = 201, body = PolicyDto),
-        (status = 400, description = "not a typed setting (ADR-0075 §7), or it does not compile"),
+        (status = 400, description = "not a typed setting (ADR-0075 §7), or it does not compile, or `reason` is over 2,000 bytes"),
         (status = 403, description = "not a Project admin"),
         (status = 404, description = "policies not configured"),
-        (status = 409, description = "a live Policy here has that name")
+        (status = 409, description = "a live Policy here has that name, or the scope holds its 256 Policies")
     )
 )]
 pub(crate) async fn create_project_policy(
@@ -873,7 +903,7 @@ pub(crate) async fn get_project_policy(
     summary = "Replace a Project typed setting (ADR-0075 §10, §11)",
     responses(
         (status = 200, body = PolicyDto),
-        (status = 400, description = "not a typed setting (ADR-0075 §7), or it does not compile"),
+        (status = 400, description = "not a typed setting (ADR-0075 §7), or it does not compile, or `reason` is over 2,000 bytes"),
         (status = 403, description = "not a Project admin"),
         (status = 404, description = "no such live Policy in this Project, or not configured"),
         (status = 409, description = "`expected_version` is not the stored version, or the name is taken")
@@ -910,6 +940,7 @@ pub(crate) async fn update_project_policy(
     summary = "Delete a Project typed setting (ADR-0075 §10)",
     responses(
         (status = 200, body = PolicyDto),
+        (status = 400, description = "`reason` is over 2,000 bytes"),
         (status = 403, description = "not a Project admin"),
         (status = 404, description = "no such live Policy in this Project, or not configured"),
         (status = 409, description = "`expected_version` is not the stored version")

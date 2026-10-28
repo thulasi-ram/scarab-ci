@@ -433,6 +433,95 @@ async fn roles_a_member_cannot_write_and_a_project_admin_writes_only_its_project
     assert!(policies.list(&org).await.unwrap().is_empty());
 }
 
+/// A change's `reason` is at most 2,000 bytes, and a scope holds at most
+/// 256 live Policies.
+#[tokio::test]
+async fn reasons_and_policies_per_scope_are_capped() {
+    let (h, policies) = with_policies();
+    let (s, _) = admin(&h).await;
+    let long = "r".repeat(2_001);
+    let (st, b) = h
+        .cookie(
+            "POST",
+            "/v1/orgs/acme/policies",
+            Some(json!({ "policy": deny_local_library("audit"), "reason": long })),
+            &s,
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+    assert!(b.to_string().contains("at most 2000 bytes"), "{b}");
+    let created = create(
+        &h,
+        &s,
+        "/v1/orgs/acme/policies",
+        deny_local_library("audit"),
+    )
+    .await;
+    let (st, b) = h
+        .cookie(
+            "PUT",
+            &format!("/v1/orgs/acme/policies/{}", created["id"].as_str().unwrap()),
+            Some(json!({
+                "policy": deny_local_library("audit"),
+                "expected_version": created["version"],
+                "reason": "r".repeat(2_001)
+            })),
+            &s,
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+    let (st, b) = h
+        .cookie(
+            "DELETE",
+            &format!(
+                "/v1/orgs/acme/policies/{}?expected_version=1&reason={}",
+                created["id"].as_str().unwrap(),
+                "r".repeat(2_001)
+            ),
+            None,
+            &s,
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+
+    // Fill the org to the cap (one live Policy is there already).
+    for i in 1..256 {
+        let mut body = deny_local_library("audit");
+        body["name"] = json!(format!("p{i}"));
+        policies
+            .create(&scarab_policy::store::NewPolicy {
+                id: format!("seed-{i}"),
+                scope: scarab_policy::store::PolicyScope::Org { org: "acme".into() },
+                body: scarab_policy::policy::Policy::from_json(body).unwrap(),
+                author: "amy".into(),
+                reason: String::new(),
+                at: 1,
+            })
+            .await
+            .unwrap();
+    }
+    let mut one_more = deny_local_library("audit");
+    one_more["name"] = json!("one-more");
+    let (st, b) = h
+        .cookie(
+            "POST",
+            "/v1/orgs/acme/policies",
+            Some(json!({ "policy": one_more, "reason": "r" })),
+            &s,
+        )
+        .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{b}");
+    assert!(b.to_string().contains("256"), "{b}");
+    // The cap is per scope: a Project's typed settings are counted apart.
+    create(
+        &h,
+        &s,
+        "/v1/orgs/acme/projects/web/policies",
+        blocked_setting(),
+    )
+    .await;
+}
+
 fn pipeline_form() -> Value {
     json!({
         "yaml": CI_YAML,
