@@ -1,6 +1,6 @@
 # 0072. Plugins: a second, governed extension point beside Steps
 
-- **Status:** Accepted. The MMP is built on main (`crates/scarab-plugin`,
+- **Status:** Accepted; `report_deployments`, §11, and the parts of §4 and §5 bound to a DeploymentTarget superseded by [0074](0074-deployments-leave-core.md) (2026-10-28). The MMP is built on main (`crates/scarab-plugin`,
   `crates/scarab-plugin-argocd`, migrations `0055_plugins.sql` and
   `0056_plugin_connections.sql`, the `/v1/orgs/{org}/plugins/*` routes). See
   [Implementation horizon](#implementation-horizon) for what is still open.

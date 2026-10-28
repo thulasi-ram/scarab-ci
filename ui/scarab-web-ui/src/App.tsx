@@ -11,7 +11,6 @@ import RunDetail from "./routes/RunDetail";
 import RunPipeline from "./routes/RunPipeline";
 import Settings from "./routes/Settings";
 import Account from "./routes/Account";
-import Deployments from "./routes/Deployments";
 import ConfirmRequest from "./routes/ConfirmRequest";
 
 export default function App() {
@@ -43,7 +42,6 @@ export default function App() {
       <Route path="/security/confirm/:id" component={ConfirmRequest} />
       {/* What is live where (ADR-0070), org-scoped; `?env=` picks the
           Environment. One segment, like /settings. */}
-      <Route path="/deployments" component={Deployments} />
       <Route path="/:org/:repo/run" component={RunPipeline} />
       <Route path="/:org/:repo/runs/:id" component={RunDetail} />
       <Route path="/:org/:repo" component={RepoView} />

@@ -20,8 +20,6 @@ type RunStatusDto = components["schemas"]["RunStatusResponse"];
 type RunSummaryDto = components["schemas"]["RunSummaryDto"];
 type ArtifactDto = components["schemas"]["ArtifactDto"];
 type ServiceStatusDto = components["schemas"]["ServiceStatusDto"];
-type DeploymentDto = components["schemas"]["DeploymentDto"];
-type BoardRowDto = components["schemas"]["EnvironmentBoardRowDto"];
 type OrgEnvironmentDto = components["schemas"]["OrgEnvironmentDto"];
 type RulesDto = components["schemas"]["EnvironmentProtectionRulesDto"];
 type OverlayDto = components["schemas"]["EnvironmentProjectOverlayDto"];
@@ -31,8 +29,6 @@ type EnvironmentProjectDto = components["schemas"]["EnvironmentProjectDto"];
 type MigrationReportDto = components["schemas"]["EnvironmentMigrationReportDto"];
 type PluginCatalogEntryDto = components["schemas"]["PluginCatalogEntryDto"];
 type PluginInstallationDto = components["schemas"]["PluginInstallationDto"];
-type UnmappedGroupingDto = components["schemas"]["UnmappedGroupingDto"];
-type DeploymentSourceTargetDto = components["schemas"]["DeploymentSourceTargetDto"];
 type PluginConnectionDto = components["schemas"]["PluginConnectionDto"];
 
 const now = Date.now();
@@ -44,12 +40,10 @@ const RUN_ID = "0190f8a2000071fb8c0011223344aabb";
 // RunRerunRequested boundary with superseded/shadowed attempts), a shared
 // service + a docked sidecar (ADR-0058), a pending manual gate, an artifact.
 const RICH_RUN_ID = "0190f8a2000071fb8c0099887766ccdd";
-// The DEPLOY run (slice b, criterion 5): one Deploy Run showing every
-// DeploymentGate state — waiting (on Deployment #16, linked from the
-// Deployments page), passed, failed — and a deploy step HELD by
-// per-DeploymentTarget concurrency. Reached from /deployments (edge-gateway's
-// in-flight row) at /acme/edge-gateway/runs/<id>.
-const DEPLOY_RUN_ID = "0190f8a2000071fb8c00d3e9107a1616";
+// The GATES run (ADR-0070 §9): one Deploy Run showing every external gate
+// state — waiting, passed, failed with a reason. At
+// /acme/edge-gateway/runs/<id>.
+const GATES_RUN_ID = "0190f8a2000071fb8c00d3e9107a1616";
 
 // ── /v1/me ────────────────────────────────────────────────────────────────
 // An Owner of the one implicit org (ADR-0060), so the Settings gear renders.
@@ -129,6 +123,7 @@ const summary = (
 ): RunSummaryDto => ({
   duration_ms: 0,
   created_at: ago(60000),
+  deploy: false,
   ...o,
 });
 const runs = [
@@ -179,9 +174,11 @@ const strip = (pattern: string) =>
       status: c === "x" ? "failed" : c === "c" ? "cancelled" : "succeeded",
       duration_ms: 40000 + ((i * 37) % 11) * 22000,
       created_at: ago((i + 1) * 900000),
-      // Every third run is a deploy — a pipeline with `environment:` — so the
-      // runs list's pipeline/environment filters have something to offer.
+      // Every third run is a deploy — marked `deploy: true`, with an
+      // `environment:` — so the runs list's pipeline/environment/deploys
+      // filters have something to offer.
       pipeline: i % 3 === 2 ? "deploy" : "ci",
+      deploy: i % 3 === 2,
       ...(i % 3 === 2 ? { environment: i % 2 ? "production" : "staging" } : {}),
     })),
   });
@@ -458,18 +455,17 @@ const deployments: Record<string, unknown[]> = {
   preview: [],
 };
 
-// ── the DEPLOY run (slice b, criterion 5) ───────────────────────────────────
-//   bump        ✓ → live        DeploymentGate WAITING on #16 (in progress)
-//   bump-canary ✓ → live-canary DeploymentGate PASSED (Healthy · Synced)
-//   bump-eu     ✓ → live-eu     DeploymentGate FAILED (the source's label)
-//   bump-docs   HELD — `argocd`/`docs` is at its concurrency limit
+// ── the GATES run (ADR-0070 §9) ──────────────────────────────────────────────
+//   bump        ✓ → live        external gate WAITING
+//   bump-canary ✓ → live-canary external gate PASSED (with a reason)
+//   bump-eu     ✓ → live-eu     external gate FAILED (released with passed:false)
 //   smoke       needs live (not reached)
-const deployGate = (id: string, needs: string, status: string, a1: number, outcome: string) => ({
+const externalGate = (id: string, needs: string, status: string, a1: number, outcome: string) => ({
   id,
   status,
   attempts: 1,
   needs: [needs],
-  gate: "deployment",
+  gate: "external",
   attempt_list: [
     {
       id: "a1",
@@ -482,15 +478,17 @@ const deployGate = (id: string, needs: string, status: string, a1: number, outco
     },
   ],
 });
-const deployBump = (id: string, at: number) => ({
+const gatesBump = (id: string, at: number) => ({
   id,
+  // The step that changes what is live — its pipeline marks it `deploy: true`.
+  deploy: true,
   status: "succeeded",
   attempts: 1,
   needs: [],
   attempt_list: [{ id: "a1", started_at: ago(at), failed: false, outcome: "succeeded" }],
 });
-const deployRunStatus: RunStatusDto = {
-  id: DEPLOY_RUN_ID,
+const gatesRunStatus: RunStatusDto = {
+  id: GATES_RUN_ID,
   status: "suspended",
   run_number: 58,
   pipeline: "deploy",
@@ -499,57 +497,34 @@ const deployRunStatus: RunStatusDto = {
   params: {},
   snapshot_retention: { retention_days: 14, expired: false, pinned: false },
   steps: [
-    deployBump("bump", 5 * min),
+    gatesBump("bump", 5 * min),
+    externalGate("live", "bump", "pending", 4 * min, "running"),
+    gatesBump("bump-canary", 5 * min),
     {
-      ...deployGate("live", "bump", "pending", 4 * min, "running"),
-      deployment_gate: {
-        environment: "production",
-        target_source: "argocd",
-        target_id: "edge-gateway",
-        deployment_id: 16,
-        deployment_status: "in_progress",
-        // The gate's own clock: `bump`'s start + the Project's 15 min gate deadline.
-        fails_at: ago(5 * min) + 15 * min,
-        version: "sha-a1b2c3d",
-        latest_label: "sync wave 3: rollout",
-      },
-    },
-    deployBump("bump-canary", 5 * min),
-    {
-      ...deployGate("live-canary", "bump-canary", "succeeded", 4 * min, "succeeded"),
+      ...externalGate("live-canary", "bump-canary", "succeeded", 4 * min, "succeeded"),
       gate_resolution: {
         passed: true,
-        reason: "sha-a1b2c3d live on `argocd`/`edge-canary`: Healthy · Synced",
+        reason: "sha-a1b2c3d live on edge-canary: Healthy · Synced",
         at: ago(3 * min),
         attempt: "a1",
-        deployment_id: 17,
       },
     },
-    deployBump("bump-eu", 5 * min),
+    gatesBump("bump-eu", 5 * min),
     {
-      ...deployGate("live-eu", "bump-eu", "failed", 4 * min, "failed"),
+      ...externalGate("live-eu", "bump-eu", "failed", 4 * min, "failed"),
       gate_resolution: {
         passed: false,
         reason: "ImagePullBackOff: sha-a1b2c3d not found in registry",
         at: ago(2 * min),
         attempt: "a1",
-        deployment_id: 18,
       },
-    },
-    {
-      id: "bump-docs",
-      status: "pending",
-      attempts: 0,
-      needs: [],
-      attempt_list: [],
-      held: "held: waiting for deployment concurrency on `argocd`/`docs` (1/1 in flight)",
     },
     { id: "smoke", status: "pending", attempts: 0, needs: ["live"], attempt_list: [] },
   ],
 };
-const dev = sse(DEPLOY_RUN_ID);
-const deployEventsBody = [
-  dev(ago(5 * min + 5000), {
+const gev = sse(GATES_RUN_ID);
+const gatesEventsBody = [
+  gev(ago(5 * min + 5000), {
     Raw: {
       trigger: {
         event: {
@@ -564,254 +539,46 @@ const deployEventsBody = [
     },
   }),
   ...["bump", "bump-canary", "bump-eu"].flatMap((s) => [
-    dev(ago(5 * min), { AttemptStarted: { step: s, attempt: "a1" } }),
-    dev(ago(4 * min + 10000), { AttemptFinished: { step: s, attempt: "a1" } }),
-    dev(ago(4 * min + 9000), { StepTransitioned: { step: s, from: "running", to: "succeeded" } }),
+    gev(ago(5 * min), { AttemptStarted: { step: s, attempt: "a1" } }),
+    gev(ago(4 * min + 10000), { AttemptFinished: { step: s, attempt: "a1" } }),
+    gev(ago(4 * min + 9000), { StepTransitioned: { step: s, from: "running", to: "succeeded" } }),
   ]),
   ...["live", "live-canary", "live-eu"].map((s) =>
-    dev(ago(4 * min), { AttemptStarted: { step: s, attempt: "a1" } }),
+    gev(ago(4 * min), { AttemptStarted: { step: s, attempt: "a1" } }),
   ),
-  dev(ago(3 * min), { AttemptFinished: { step: "live-canary", attempt: "a1" } }),
-  dev(ago(3 * min), {
+  gev(ago(3 * min), { AttemptFinished: { step: "live-canary", attempt: "a1" } }),
+  gev(ago(3 * min), {
     GateResolved: {
       step: "live-canary",
       attempt: "a1",
       passed: true,
-      reason: "sha-a1b2c3d live on `argocd`/`edge-canary`: Healthy · Synced",
-      deployment: 17,
+      reason: "sha-a1b2c3d live on edge-canary: Healthy · Synced",
     },
   }),
-  dev(ago(2 * min), { AttemptFinished: { step: "live-eu", attempt: "a1", failure: "gate" } }),
-  dev(ago(2 * min), {
+  gev(ago(2 * min), { AttemptFinished: { step: "live-eu", attempt: "a1", failure: "gate" } }),
+  gev(ago(2 * min), {
     GateResolved: {
       step: "live-eu",
       attempt: "a1",
       passed: false,
       reason: "ImagePullBackOff: sha-a1b2c3d not found in registry",
-      deployment: 18,
     },
   }),
 ].join("");
 
-// ── Deployment record (ADR-0070) — /deployments and the Environment board ──
-// Org-scoped ids (the org's input sequence) — so a higher id was created later,
-// exactly as the server's receipt-time stamps make it. production covers every
-// row shape the page distinguishes: a requested rollout reported in stages up
-// to live; an Unexplained live (Argo selfHeal reverted it, no Deploy Run asked)
-// that a later run named — a claim, not an explanation; a stalled rollout
-// behind an older live; an Unconfirmed request on a brand-new target; and
-// superseded rows that were, and never were, live. staging has one live. The
-// board sends `newest: null` when the newest is the live one, as the server
-// does.
-const argo = (environment: string, id: string) => ({ environment, source: "argocd", id });
-const req = (run: string, project: string | null, at: number, claim = false) => ({
-  run,
-  step: "deploy",
-  effective_at: at,
-  project,
-  claim,
-  evidence: [] as string[],
-});
-const report = (
-  status: "in_progress" | "live" | "failed",
-  label: string,
-  at: number,
-  link: string | null = null,
-) => ({ status, label, at, source_at: at - 1500, link });
-const ARGO_UI = "https://argocd.acme.example/applications";
-
-const depOrders13: DeploymentDto = {
-  id: 13,
-  target: argo("production", "orders-api"),
-  version: "sha-4f2a1c9",
-  status: "live",
-  requesters: [req(RUN_ID, "orders-api", ago(42 * min))],
-  reports: [
-    report("in_progress", "sync wave 1: config", ago(41 * min), `${ARGO_UI}/orders-api`),
-    report("in_progress", "sync wave 5: migrate", ago(39 * min), `${ARGO_UI}/orders-api`),
-    report("live", "Healthy · Synced", ago(36 * min), `${ARGO_UI}/orders-api`),
-  ],
-  created_at: ago(42 * min),
-  was_ever_live: true,
-  unexplained: false,
-  unconfirmed: false,
-};
-const depOrders9: DeploymentDto = {
-  id: 9,
-  target: argo("production", "orders-api"),
-  version: "sha-1b7e300",
-  status: "superseded",
-  requesters: [req("01984d00bb11", "orders-api", ago(26 * 60 * min))],
-  reports: [report("live", "Healthy · Synced", ago(26 * 60 * min - 4 * min))],
-  created_at: ago(26 * 60 * min),
-  // Live until #13 was reported live, not when #13 was requested.
-  superseded_at: ago(36 * min),
-  was_ever_live: true,
-  unexplained: false,
-  unconfirmed: false,
-};
-const depOrders10: DeploymentDto = {
-  id: 10,
-  target: argo("production", "orders-api"),
-  version: "sha-2c0d4e1",
-  status: "superseded",
-  requesters: [req("01984e00aa22", "orders-api", ago(20 * 60 * min))],
-  reports: [
-    report("in_progress", "sync wave 5: migrate", ago(20 * 60 * min - 2 * min)),
-    report("failed", "migration 0042 timed out", ago(20 * 60 * min - 9 * min)),
-  ],
-  created_at: ago(20 * 60 * min),
-  superseded_at: ago(42 * min),
-  was_ever_live: false,
-  unexplained: false,
-  unconfirmed: false,
-};
-const depGateway14: DeploymentDto = {
-  id: 14,
-  target: argo("production", "edge-gateway"),
-  version: "sha-9c0ffee",
-  status: "live",
-  // A run that only started after Argo showed the revert named the same
-  // version: listed as a claim, and the Deployment stays Unexplained.
-  requesters: [req("01984f20ab99", "edge-gateway", ago(10 * min), true)],
-  reports: [report("live", "selfHeal: reverted to git", ago(18 * min), `${ARGO_UI}/edge-gateway`)],
-  created_at: ago(18 * min),
-  was_ever_live: true,
-  unexplained: true,
-  unconfirmed: false,
-};
-const depGateway8: DeploymentDto = {
-  id: 8,
-  target: argo("production", "edge-gateway"),
-  version: "sha-ab12cd3",
-  status: "superseded",
-  requesters: [req("01984c00cc33", "edge-gateway", ago(3 * 24 * 60 * min))],
-  reports: [report("live", "Healthy · Synced", ago(3 * 24 * 60 * min - 3 * min))],
-  created_at: ago(3 * 24 * 60 * min),
-  superseded_at: ago(18 * min),
-  was_ever_live: true,
-  unexplained: false,
-  unconfirmed: false,
-};
-const depInventory12: DeploymentDto = {
-  id: 12,
-  target: argo("production", "inventory-svc"),
-  version: "sha-77ab001",
-  status: "stalled",
-  // A requester whose run is not stamped with a project: shown, not linked.
-  requesters: [req("01984f00dd44", null, ago(95 * min))],
-  reports: [report("in_progress", "sync wave 2: waiting for healthy", ago(93 * min))],
-  created_at: ago(95 * min),
-  was_ever_live: false,
-  unexplained: false,
-  unconfirmed: false,
-};
-const depInventory7: DeploymentDto = {
-  id: 7,
-  target: argo("production", "inventory-svc"),
-  version: "sha-5d5d5d5",
-  status: "live",
-  requesters: [req("01984b00ee55", "inventory-svc", ago(4 * 24 * 60 * min))],
-  reports: [report("live", "Healthy · Synced", ago(4 * 24 * 60 * min - 5 * min))],
-  created_at: ago(4 * 24 * 60 * min),
-  was_ever_live: true,
-  unexplained: false,
-  unconfirmed: false,
-};
-const depMessaging15: DeploymentDto = {
-  id: 15,
-  target: argo("production", "messaging"),
-  version: "sha-e1e1e10",
-  status: "requested",
-  requesters: [req("01984f30ff66", "messaging", ago(6 * min))],
-  reports: [],
-  created_at: ago(6 * min),
-  was_ever_live: false,
-  unexplained: false,
-  unconfirmed: true,
-};
-// A rollout in flight, requested by the DEPLOY run's `bump` — its `live`
-// DeploymentGate waits on it.
-const depGateway16: DeploymentDto = {
-  id: 16,
-  target: argo("production", "edge-gateway"),
-  version: "sha-a1b2c3d",
-  status: "in_progress",
-  requesters: [{ ...req(DEPLOY_RUN_ID, "edge-gateway", ago(4 * min)), step: "bump" }],
-  reports: [
-    report("in_progress", "sync wave 1: config", ago(3 * min), `${ARGO_UI}/edge-gateway`),
-    report("in_progress", "sync wave 3: rollout", ago(2 * min), `${ARGO_UI}/edge-gateway`),
-  ],
-  created_at: ago(4 * min),
-  was_ever_live: false,
-  unexplained: false,
-  unconfirmed: false,
-};
-const depStagingOrders11: DeploymentDto = {
-  id: 11,
-  target: argo("staging", "orders-api"),
-  version: "sha-4f2a1c9",
-  status: "live",
-  requesters: [req("01984f05aa77", "orders-api", ago(3 * 60 * min))],
-  reports: [report("live", "Healthy · Synced", ago(3 * 60 * min - 2 * min))],
-  created_at: ago(3 * 60 * min),
-  was_ever_live: true,
-  unexplained: false,
-  unconfirmed: false,
-};
-
-/** Each Environment's Deployments, newest first (the list endpoint's order). */
-const envDeployments: Record<string, DeploymentDto[]> = {
-  production: [
-    depGateway16,
-    depMessaging15,
-    depGateway14,
-    depOrders13,
-    depInventory12,
-    depOrders10,
-    depOrders9,
-    depGateway8,
-    depInventory7,
-  ],
-  staging: [depStagingOrders11],
-};
-// staging's orders-api is Moved (ADR-0070 §3): no Environment lists argocd's
-// `staging` grouping any more (it is among argocd's unmapped groupings
-// below), so its reports are dropped — the row keeps its history and says so.
-const board: BoardRowDto[] = [
-  { target: depOrders13.target, live: depOrders13, newest: null, moved_away: null },
-  { target: depGateway14.target, live: depGateway14, newest: depGateway16, moved_away: null },
-  { target: depInventory12.target, live: depInventory7, newest: depInventory12, moved_away: null },
-  { target: depMessaging15.target, live: null, newest: depMessaging15, moved_away: null },
-  {
-    target: depStagingOrders11.target,
-    live: depStagingOrders11,
-    newest: null,
-    moved_away: { now: null },
-  },
-];
-
-// ── Org-level Environments (ADR-0071) — Settings › Environments, and the
-// Deployments page's pills. production is registered with two sources; qa is
-// registered with nothing deployed yet (a pill with an empty list); staging
-// has Deployments but no org Environment, so its pill reads "unregistered ·
-// default deadline". Writes echo back and persist nothing.
+// ── Org-level Environments (ADR-0071) — Settings › Environments. production
+// has a baseline; qa still has the permissive one. Writes echo back and
+// persist nothing.
 const orgEnvironments: OrgEnvironmentDto[] = [
   {
     org: "acme",
     name: "production",
     description: "customer-facing, eu-west-1 + us-east-1",
-    deployment_deadline_ms: 30 * min,
-    deployment_sources: [
-      { installation: "argocd", vendor_grouping: "production" },
-      { installation: "argocd-us", vendor_grouping: "production" },
-    ],
     protection: {
       approvers: ["ops-lead"],
       allowed_refs: ["refs/heads/main"],
       wait_timer_s: 0,
       require_reason: false,
-      deployment_concurrency: null,
     },
     eligibility: { all_projects: true, projects: [] },
     created_at: ago(40 * 24 * 60 * min),
@@ -822,15 +589,12 @@ const orgEnvironments: OrgEnvironmentDto[] = [
     org: "acme",
     name: "qa",
     description: "",
-    deployment_deadline_ms: 60 * min,
-    deployment_sources: [{ installation: "argocd", vendor_grouping: "qa" }],
     // Still the permissive baseline the migration gave it — the report flags it.
     protection: {
       approvers: [],
       allowed_refs: [],
       wait_timer_s: 0,
       require_reason: false,
-      deployment_concurrency: null,
     },
     eligibility: { all_projects: false, projects: ["scarab", "web-*"] },
     created_at: ago(2 * 60 * min),
@@ -849,8 +613,6 @@ const overlays: Record<string, Record<string, OverlayDto>> = {
       allowed_refs: [],
       wait_timer_s: 300,
       require_reason: true,
-      deployment_concurrency: null,
-      deployment_gate_deadline_ms: 15 * min,
     },
   },
 };
@@ -871,22 +633,14 @@ const grants: Record<string, Record<string, GrantDto>> = {
 
 /** The server's merge (ADR-0071 §3), so the fixtures' `effective` blocks are
  *  what the server would answer: approvers union, ref layers ANDed, the
- *  stricter wait/limit/deadline, reason if either sets it. */
+ *  stricter wait, reason if either sets it. */
 function effectiveOf(env: OrgEnvironmentDto, overlay: OverlayDto | undefined) {
   const b: RulesDto = env.protection;
-  const limits = [b.deployment_concurrency, overlay?.deployment_concurrency].filter(
-    (n): n is number => n != null,
-  );
   return {
     approvers: [...new Set([...b.approvers, ...(overlay?.approvers ?? [])])],
     allowed_ref_layers: overlay ? [b.allowed_refs, overlay.allowed_refs] : [b.allowed_refs],
     wait_timer_s: Math.max(b.wait_timer_s, overlay?.wait_timer_s ?? 0),
     require_reason: b.require_reason || (overlay?.require_reason ?? false),
-    deployment_concurrency: limits.length ? Math.min(...limits) : null,
-    deployment_gate_deadline_ms: Math.min(
-      env.deployment_deadline_ms,
-      overlay?.deployment_gate_deadline_ms ?? Infinity,
-    ),
   };
 }
 
@@ -906,17 +660,7 @@ function projectEnvironments(project: string): ProjectEnvironmentDto[] {
         name: env.name,
         eligible: eligible(env, project),
         baseline: env.protection,
-        deployment_deadline_ms: env.deployment_deadline_ms,
-        overlay: overlay
-          ? {
-              approvers: overlay.approvers,
-              allowed_refs: overlay.allowed_refs,
-              wait_timer_s: overlay.wait_timer_s,
-              require_reason: overlay.require_reason,
-              deployment_concurrency: overlay.deployment_concurrency,
-            }
-          : null,
-        overlay_deployment_gate_deadline_ms: overlay?.deployment_gate_deadline_ms ?? null,
+        overlay: overlay ?? null,
         effective: effectiveOf(env, overlay),
         privilege_grant: grants[env.name]?.[project] ?? null,
       };
@@ -999,16 +743,12 @@ const migrationReport: MigrationReportDto[] = [
   },
 ];
 
-// ── Plugins (ADR-0072) — Settings › Plugins, the Environment dialog's
-// installation picker, and the board's owners line. Consistent with the
-// org Environments above: `argocd` is running and feeds production + qa;
-// `argocd-us` (production's second source) is killed. `argocd` also reports
-// on two groupings no Environment lists. Writes echo a record and persist
-// nothing.
+// ── Plugins (ADR-0072) — Settings › Plugins. `argocd` is running;
+// `argocd-us` is killed. Writes echo a record and persist nothing.
 const ARGOCD_REPO = "ghcr.io/thulasi-ram/scarab-plugin-argocd";
 const argocdManifest: PluginCatalogEntryDto["manifest"] = {
   plugin: "argocd",
-  capabilities: ["report_deployments", "use_connection"],
+  capabilities: ["use_connection"],
   connections: [
     {
       name: "argocd",
@@ -1032,7 +772,7 @@ const pluginCatalog: PluginCatalogEntryDto[] = [
   {
     plugin: "argocd",
     description:
-      "Reports Argo CD Application syncs into the Deployment record (first-party; ADR-0070 §11's reference reporter).",
+      "Reads Argo CD Application state through its connection (first-party).",
     image_repository: ARGOCD_REPO,
     manifest: argocdManifest,
     first_party: true,
@@ -1060,18 +800,18 @@ const pluginInstallation = (
   killed_at: null,
   killed_by: null,
   manifest: argocdManifest,
-  deployment_sources: [],
-  usage: { targets: 0, max_targets: 10000, unmapped_groupings: 0, max_unmapped_groupings: 1000 },
+  storage: null,
   ...o,
 });
 const plugins: PluginInstallationDto[] = [
   pluginInstallation("argocd", "4f2a1c9e7b3d", {
     runtime_message: "watching 6 applications",
-    usage: { targets: 4, max_targets: 10000, unmapped_groupings: 2, max_unmapped_groupings: 1000 },
-    deployment_sources: [
-      { environment: "production", vendor_grouping: "production" },
-      { environment: "qa", vendor_grouping: "qa" },
-    ],
+    storage: {
+      claim: "argocd-state",
+      mount_path: "/data",
+      owner_annotation: "scarab.io/plugin-installation",
+      owner_annotation_value: "acme/argocd",
+    },
   }),
   pluginInstallation("argocd-us", "d81e6b02c4aa", {
     state: "killed",
@@ -1080,7 +820,6 @@ const plugins: PluginInstallationDto[] = [
     killed_by: "j.lee",
     killed_at: ago(90 * min),
     approved_at: ago(5 * 24 * 60 * min),
-    deployment_sources: [{ environment: "production", vendor_grouping: "production" }],
   }),
 ];
 // Connections (ADR-0072 §5): `argocd` is bound over https; `argocd-us` was
@@ -1113,54 +852,6 @@ const pluginConnections: Record<string, PluginConnectionDto[]> = {
     }),
   ],
 };
-const unmappedGroupings: Record<string, UnmappedGroupingDto[]> = {
-  argocd: [
-    {
-      vendor_grouping: "staging",
-      reports: 14,
-      first_at: ago(3 * 24 * 60 * min),
-      last_at: ago(25 * min),
-      last_target_id: "orders-api",
-    },
-    {
-      vendor_grouping: "preview",
-      reports: 2,
-      first_at: ago(5 * 60 * min),
-      last_at: ago(4 * 60 * min),
-      last_target_id: "pr-218-web",
-    },
-  ],
-};
-const sourceTarget = (
-  environment: string,
-  target_id: string,
-  owner_projects: string[],
-  last_version: string,
-): DeploymentSourceTargetDto & { environment: string } => ({
-  environment,
-  source: "argocd",
-  principal: "plugin:argocd",
-  target_id,
-  vendor_grouping: environment,
-  version_scheme: "argocd.target-images.v1",
-  owner_projects,
-  owners_reported_at: owner_projects.length ? ago(6 * 60 * min) : null,
-  last_version,
-  last_status: "live",
-  last_label: "Healthy · Synced",
-  resend: false,
-  last_sequence: 42,
-  updated_at: ago(36 * min),
-});
-const deploymentTargets = [
-  sourceTarget("production", "orders-api", ["acme/orders-api"], "sha-4f2a1c9"),
-  sourceTarget("production", "edge-gateway", ["acme/edge-gateway", "acme/platform"], "sha-9c0ffee"),
-  sourceTarget("production", "inventory-svc", ["acme/inventory"], "sha-5d5d5d5"),
-  // messaging is absent: it is Unconfirmed on the board — its source has
-  // never reported on it — so there is no target row and no owners line.
-  // staging has none: argocd's `staging` grouping is unmapped (Moved row).
-];
-
 const secretNames = { names: ["GHCR_TOKEN", "DATABASE_URL", "SLACK_WEBHOOK_URL"] };
 // Org scope (no `repo=`) holds the org-wide base of the inheritance chain — the
 // Settings page's Org Secrets section (ADR-0060).
@@ -1503,7 +1194,22 @@ function route(pathname: string, search: string, method: string): Response | nul
 
   // /v1/repos/{org}/{repo}/runs
   if ((m = p.match(/^\/v1\/repos\/[^/]+\/([^/]+)\/runs$/))) {
-    return json(repoRuns[m[1]] ?? strip("ooooooooooooo"));
+    const { runs } = repoRuns[m[1]] ?? strip("ooooooooooooo");
+    // `?environment=` and `?deploy=` filter before `limit`, as the server
+    // does; an empty environment is a 400.
+    const q = new URLSearchParams(search);
+    const env = q.get("environment");
+    if (env === "") {
+      return new Response("`environment` must name an Environment", { status: 400 });
+    }
+    const deploy = q.get("deploy");
+    const matching = runs.filter(
+      (r) =>
+        (env == null || r.environment === env) &&
+        (deploy == null || r.deploy === (deploy === "true")),
+    );
+    const limit = Number(q.get("limit") ?? 50);
+    return json({ runs: matching.slice(0, limit) });
   }
   // /v1/repos/{org}/{repo}/environments
   if ((m = p.match(/^\/v1\/repos\/[^/]+\/([^/]+)\/environments$/))) {
@@ -1561,15 +1267,12 @@ function route(pathname: string, search: string, method: string): Response | nul
           org: decodeURIComponent(m[1]!),
           name,
           description: "",
-          deployment_deadline_ms: 60 * min,
-          deployment_sources: [],
           // A new Environment: permissive baseline, no eligible project.
           protection: {
             approvers: [],
             allowed_refs: [],
             wait_timer_s: 0,
             require_reason: false,
-            deployment_concurrency: null,
           },
           eligibility: { all_projects: false, projects: [] },
           created_at: now,
@@ -1606,8 +1309,6 @@ function route(pathname: string, search: string, method: string): Response | nul
                 allowed_refs: [],
                 wait_timer_s: 0,
                 require_reason: false,
-                deployment_concurrency: null,
-                deployment_gate_deadline_ms: null,
               }
             : { privileged_images: [], permit_k8s_overlay: false }),
       );
@@ -1621,8 +1322,7 @@ function route(pathname: string, search: string, method: string): Response | nul
     return json({ ...line, acknowledged_at: line.acknowledged_at ?? now, acknowledged_by: line.acknowledged_by ?? "a.kim" });
   }
 
-  // Plugins (ADR-0072): catalog, installations, kill/enable, uninstall,
-  // unmapped groupings, and an Environment's reported targets + owners.
+  // Plugins (ADR-0072): catalog, installations, kill/enable, uninstall.
   if (/^\/v1\/orgs\/[^/]+\/plugin-catalog$/.test(p)) return json(pluginCatalog);
   if (/^\/v1\/orgs\/[^/]+\/plugins$/.test(p)) {
     if (method === "POST") {
@@ -1635,12 +1335,26 @@ function route(pathname: string, search: string, method: string): Response | nul
           runtime_message: "",
           probe_passed_at: null,
           approved_at: now,
-          deployment_sources: [],
         }),
         { status: 201 },
       );
     }
     return json(plugins);
+  }
+  if ((m = p.match(/^\/v1\/orgs\/[^/]+\/plugins\/([^/]+)\/storage$/))) {
+    const found = plugins.find((x) => x.name === decodeURIComponent(m![1]!));
+    if (!found) return new Response("no such installation", { status: 404 });
+    if (method === "DELETE") return json({ ...found, storage: null });
+    // The body is not visible here; echo the default claim as mounted.
+    return json({
+      ...found,
+      storage: {
+        claim: `${found.name}-state`,
+        mount_path: "/data",
+        owner_annotation: "scarab.io/plugin-installation",
+        owner_annotation_value: `${found.org}/${found.name}`,
+      },
+    });
   }
   if ((m = p.match(/^\/v1\/orgs\/[^/]+\/plugins\/([^/]+)\/connections(?:\/([^/]+))?$/))) {
     const found = plugins.find((x) => x.name === decodeURIComponent(m![1]!));
@@ -1652,10 +1366,9 @@ function route(pathname: string, search: string, method: string): Response | nul
     // The body is not visible here; echo the slot as bound.
     return json(list.find((c) => c.slot === slot) ?? pluginConnection(slot, {}));
   }
-  if ((m = p.match(/^\/v1\/orgs\/[^/]+\/plugins\/([^/]+)(?:\/(kill|enable|unmapped-groupings))?$/))) {
+  if ((m = p.match(/^\/v1\/orgs\/[^/]+\/plugins\/([^/]+)(?:\/(kill|enable))?$/))) {
     const found = plugins.find((x) => x.name === decodeURIComponent(m![1]!));
     if (!found) return new Response("no such installation", { status: 404 });
-    if (m[2] === "unmapped-groupings") return json(unmappedGroupings[found.name] ?? []);
     // Kill and enable flip `state` only, as the server does: the runtime
     // (slice d2) reports what it observes, later.
     if (m[2] === "kill") {
@@ -1665,37 +1378,10 @@ function route(pathname: string, search: string, method: string): Response | nul
       return json({ ...found, state: "enabled", killed_by: null, killed_at: null });
     }
     if (method === "DELETE") {
-      return json({ name: found.name, removed_deployment_sources: found.deployment_sources });
+      return json({ name: found.name });
     }
     return json(found);
   }
-  if ((m = p.match(/^\/v1\/orgs\/[^/]+\/environments\/([^/]+)\/deployment-targets$/))) {
-    const env = decodeURIComponent(m[1]!);
-    return json(
-      deploymentTargets.filter((t) => t.environment === env).map(({ environment: _, ...t }) => t),
-    );
-  }
-
-  // Deployment record (ADR-0070): the board, an env's list, one Deployment.
-  if (/^\/v1\/orgs\/[^/]+\/board$/.test(p)) {
-    const env = new URLSearchParams(search).get("environment");
-    return json(env ? board.filter((r) => r.target.environment === env) : board);
-  }
-  if ((m = p.match(/^\/v1\/orgs\/[^/]+\/environments\/([^/]+)\/deployments$/))) {
-    const q = new URLSearchParams(search);
-    const src = q.get("target_source");
-    const tid = q.get("target_id");
-    return json(
-      (envDeployments[decodeURIComponent(m[1]!)] ?? []).filter(
-        (d) => (!src || d.target.source === src) && (!tid || d.target.id === tid),
-      ),
-    );
-  }
-  if ((m = p.match(/^\/v1\/orgs\/[^/]+\/environments\/([^/]+)\/deployments\/(\d+)$/))) {
-    const d = (envDeployments[decodeURIComponent(m[1]!)] ?? []).find((x) => x.id === Number(m![2]));
-    return d ? json(d) : new Response(null, { status: 404 });
-  }
-
   if (p === "/v1/connections") return json(connections);
   if (/^\/v1\/connections\/[^/]+\/available-repos$/.test(p)) return json(availableRepos);
   if (/^\/v1\/connections\/[^/]+\/preflight$/.test(p)) return json(connectionPreflight);
@@ -1715,15 +1401,15 @@ function route(pathname: string, search: string, method: string): Response | nul
   if (p === `/v1/runs/${RUN_ID}/artifacts`) return json([]);
   if (p === `/v1/runs/${RUN_ID}/services`) return json([]);
 
-  // the DEPLOY run (DeploymentGates + a concurrency hold)
-  if (p === `/v1/runs/${DEPLOY_RUN_ID}`) return json(deployRunStatus);
-  if (p === `/v1/runs/${DEPLOY_RUN_ID}/events`)
-    return new Response(deployEventsBody, {
+  // the GATES run (external gates: waiting, passed, failed)
+  if (p === `/v1/runs/${GATES_RUN_ID}`) return json(gatesRunStatus);
+  if (p === `/v1/runs/${GATES_RUN_ID}/events`)
+    return new Response(gatesEventsBody, {
       status: 200,
       headers: { "content-type": "text/event-stream" },
     });
-  if (p === `/v1/runs/${DEPLOY_RUN_ID}/artifacts`) return json([]);
-  if (p === `/v1/runs/${DEPLOY_RUN_ID}/services`) return json([]);
+  if (p === `/v1/runs/${GATES_RUN_ID}/artifacts`) return json([]);
+  if (p === `/v1/runs/${GATES_RUN_ID}/services`) return json([]);
   // Reject a gate (ADR-0070 §9): the fixture is static, so it only answers.
   if (method === "POST" && /^\/v1\/runs\/[^/]+\/gates\/[^/]+\/reject$/.test(p)) {
     return json({ rejected: true }, { status: 202 });

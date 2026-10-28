@@ -374,10 +374,6 @@ pub(crate) fn governed_routes() -> Routes {
             &ops::MIGRATION_ACK,
             oe::acknowledge_environment_migration_report,
         )
-        .get(
-            "/v1/orgs/{org}/environments/{env}/deployment-targets",
-            plugins::environment_deployment_targets,
-        )
         .get("/v1/orgs/{org}/plugin-catalog", plugins::plugin_catalog)
         .get("/v1/orgs/{org}/plugins", plugins::list_plugins)
         .post(
@@ -401,9 +397,15 @@ pub(crate) fn governed_routes() -> Routes {
             &ops::PLUGIN_ENABLE,
             plugins::enable_plugin,
         )
-        .get(
-            "/v1/orgs/{org}/plugins/{name}/unmapped-groupings",
-            plugins::unmapped_groupings,
+        .put(
+            "/v1/orgs/{org}/plugins/{name}/storage",
+            &ops::PLUGIN_STORAGE_PUT,
+            plugins::put_plugin_storage,
+        )
+        .delete(
+            "/v1/orgs/{org}/plugins/{name}/storage",
+            &ops::PLUGIN_STORAGE_DELETE,
+            plugins::delete_plugin_storage,
         )
         .get(
             "/v1/orgs/{org}/plugins/{name}/connections",
@@ -418,15 +420,6 @@ pub(crate) fn governed_routes() -> Routes {
             "/v1/orgs/{org}/plugins/{name}/connections/{slot}",
             &ops::PLUGIN_CONNECTION_DELETE,
             plugins::delete_plugin_connection,
-        )
-        .get("/v1/orgs/{org}/board", get_environment_board)
-        .get(
-            "/v1/orgs/{org}/environments/{env}/deployments",
-            list_environment_deployments,
-        )
-        .get(
-            "/v1/orgs/{org}/environments/{env}/deployments/{id}",
-            get_deployment,
         )
         .get("/v1/connections", list_connections)
         .post(

@@ -6,14 +6,13 @@
 
 use scarab_db_postgres::PostgresDb;
 use scarab_project::{
-    migrate_legacy_environment, Environment, EnvironmentDeploymentDeadline,
-    EnvironmentGovernanceStore, EnvironmentProjectEligibility, OrgEnvironment, OrgEnvironmentStore,
-    ProtectionRules,
+    migrate_legacy_environment, Environment, EnvironmentGovernanceStore,
+    EnvironmentProjectEligibility, OrgEnvironment, OrgEnvironmentStore, ProtectionRules,
 };
 
 /// Make `project`'s legacy environment `name` (with `protection`) what ADR-0071
 /// §10 makes of it: the org Environment `name` (created with the permissive
-/// baseline and the default deadline if missing — step 1), `project` added to
+/// baseline if missing — step 1), `project` added to
 /// its eligibility by exact name (step 6), and `project`'s overlay and grant
 /// from [`migrate_legacy_environment`] (steps 2, 3, 5) — replacing any it had.
 pub async fn seed_migrated_environment(
@@ -31,11 +30,6 @@ pub async fn seed_migrated_environment(
                 org: org.into(),
                 name: name.into(),
                 description: String::new(),
-                deployment_deadline: EnvironmentDeploymentDeadline::new(
-                    scarab_deployment::DEFAULT_DEPLOYMENT_DEADLINE_MS,
-                )
-                .unwrap(),
-                deployment_sources: Vec::new(),
                 protection: Default::default(),
                 eligibility: Default::default(),
                 created_at: 0,

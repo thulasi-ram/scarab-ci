@@ -151,7 +151,9 @@ re-attach (`scarab-executor-k8s`) and the results-egress sidecar (`docker/sideca
 2026-10-28 the job fails at image load, before the tests run; last green on main 2026-10-20). **Not proven
 yet:** control-plane crash and resume with a real Pod in flight (the weekly e2e test for it
 doesn't pass yet) and production-scale load. **Missing:** `on: cron` and `on: upstream`
-triggers parse, but nothing produces those events yet.
+triggers parse, but nothing produces those events yet. **Out of scope:** continuous delivery.
+Scarab runs and governs the run that deploys and keeps no record of what is live after it ends;
+your CD tool does that ([Deploying with Argo CD](/scarab-ci/usage/deploying-with-argo-cd/)).
 :::
 
 ## References

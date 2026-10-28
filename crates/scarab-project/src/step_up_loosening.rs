@@ -8,11 +8,9 @@
 //! change counts as a loosening, because a false positive costs one passkey
 //! tap and a false negative is the hole step-up exists to close.
 
-use std::collections::BTreeSet;
-
 use crate::{
-    glob_match, EnvironmentDeploymentSource, EnvironmentProjectEligibility,
-    EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant, EnvironmentProtectionRules,
+    glob_match, EnvironmentProjectEligibility, EnvironmentProjectOverlay,
+    EnvironmentProjectPrivilegeGrant, EnvironmentProtectionRules,
 };
 
 /// One way a governance write loosens an Environment, in words a human
@@ -53,8 +51,7 @@ fn covered(old: &[String], pattern: &str) -> bool {
 /// - allowed refs widened: a restricted list made empty (any ref), or a new
 ///   glob no old one covers. An unrestricted (empty) list can only tighten;
 /// - a shorter wait timer;
-/// - `require_reason` switched off;
-/// - a concurrency limit removed or raised.
+/// - `require_reason` switched off.
 pub fn protection_loosenings(
     old: &EnvironmentProtectionRules,
     new: &EnvironmentProtectionRules,
@@ -85,44 +82,18 @@ pub fn protection_loosenings(
     if old.require_reason && !new.require_reason {
         out.push(Loosening::new("no longer requires a reason"));
     }
-    match (old.deployment_concurrency, new.deployment_concurrency) {
-        (Some(a), None) => out.push(Loosening::new(format!(
-            "removes the deployment concurrency limit of {a}"
-        ))),
-        (Some(a), Some(b)) if b > a => out.push(Loosening::new(format!(
-            "raises the deployment concurrency limit from {a} to {b}"
-        ))),
-        _ => {}
-    }
     out
 }
 
 /// E1 for one Project's overlay: the protection rules as above (no overlay
-/// yet reads as the permissive default, so creating one never loosens), plus
-/// its DeploymentGate deadline removed or lengthened.
+/// yet reads as the permissive default, so creating one never loosens).
 pub fn overlay_loosenings(
     old: Option<&EnvironmentProjectOverlay>,
     new: &EnvironmentProjectOverlay,
 ) -> Vec<Loosening> {
     let default_rules = EnvironmentProtectionRules::default();
     let old_rules = old.map_or(&default_rules, |o| &o.rules);
-    let mut out = protection_loosenings(old_rules, &new.rules);
-    match (
-        old.and_then(|o| o.deployment_gate_deadline),
-        new.deployment_gate_deadline,
-    ) {
-        (Some(a), None) => out.push(Loosening::new(format!(
-            "removes the deployment gate deadline of {} ms",
-            a.millis()
-        ))),
-        (Some(a), Some(b)) if b > a => out.push(Loosening::new(format!(
-            "lengthens the deployment gate deadline from {} ms to {} ms",
-            a.millis(),
-            b.millis()
-        ))),
-        _ => {}
-    }
-    out
+    protection_loosenings(old_rules, &new.rules)
 }
 
 /// E2 — how replacing eligibility `old` with `new` loosens it: opening it to
@@ -142,30 +113,6 @@ pub fn eligibility_loosenings(
             .map(|g| Loosening::new(format!("admits projects matching `{g}`")))
             .collect(),
     }
-}
-
-/// E3 — the EnvironmentDeploymentSources `new` adds over `old` (a new
-/// Environment's `old` is empty): each is a new outside party whose reports
-/// the Environment will accept. Removals, descriptions and deadlines are not
-/// governed.
-pub fn deployment_source_additions(
-    old: &[EnvironmentDeploymentSource],
-    new: &[EnvironmentDeploymentSource],
-) -> Vec<Loosening> {
-    let old: BTreeSet<&EnvironmentDeploymentSource> = old.iter().collect();
-    let mut added: Vec<&EnvironmentDeploymentSource> =
-        new.iter().filter(|s| !old.contains(s)).collect();
-    added.sort();
-    added.dedup();
-    added
-        .into_iter()
-        .map(|s| {
-            Loosening::new(format!(
-                "adds deployment source `{}` / `{}`",
-                s.installation, s.vendor_grouping
-            ))
-        })
-        .collect()
 }
 
 /// E4 — how replacing one Project's privilege grant `old` (none = an empty

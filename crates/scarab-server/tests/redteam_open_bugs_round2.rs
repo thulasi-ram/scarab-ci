@@ -17,7 +17,6 @@ mod common;
 mod step_up_harness;
 
 use std::collections::BTreeMap;
-use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -25,21 +24,18 @@ use axum::http::StatusCode;
 use serde_json::{json, Value};
 
 use scarab_db_postgres::PostgresDb;
-use scarab_deployment::DeploymentStore;
 use scarab_engine::ports::{ExecHandle, ExecState, Executor, FailureClass};
 use scarab_engine::ExecError;
 use scarab_engine::{
-    cancel_run_request, rerun_step, AttemptOutcome, Clock, Db, DeployContext, EventKind,
-    EventPayload, RunDeploymentRequest, RunId, RunStatus, Scheduler, StepId, StepRun, StepSpec,
-    StepStatus, EVENT_VERSION, RUN_STATUS_CHANGED,
+    cancel_run_request, release_gate, rerun_step, AttemptOutcome, Clock, Db, DeployContext,
+    EventKind, EventPayload, RunId, RunStatus, Scheduler, StepId, StepRun, StepSpec, StepStatus,
+    EVENT_VERSION, RUN_STATUS_CHANGED,
 };
 use scarab_forge::StatusState;
 use scarab_identity::{api_token_hash, ApiToken, ApiTokenStore, PasskeyStore, Role, Scope};
 use scarab_project::{
-    EnvironmentDeploymentDeadline, EnvironmentGovernanceStore, EnvironmentProjectEligibility,
-    EnvironmentProjectOverlay, EnvironmentProtectionRules, OrgEnvironment, OrgEnvironmentStore,
+    EnvironmentGovernanceStore, EnvironmentProjectEligibility, OrgEnvironment, OrgEnvironmentStore,
 };
-use scarab_server::deployment_gates::ServerDeploymentGates;
 use scarab_server::drain_forge_statuses;
 use scarab_testkit::{
     FakeClock, FakeExecutor, FakeForge, InMemoryDb, InMemoryEnvironmentGovernance, LaunchHook,
@@ -52,7 +48,6 @@ const ORG: &str = "acme";
 const ENV: &str = "prod";
 const PROJECT: &str = "web";
 const T0: i64 = 1_000;
-const WEB: &str = "web";
 
 fn id(s: &str) -> StepId {
     StepId(s.into())
@@ -148,16 +143,14 @@ impl Executor for HookExec {
 #[allow(dead_code)]
 struct World {
     db: Arc<dyn Db>,
-    store: Arc<dyn DeploymentStore>,
     governance: Arc<dyn EnvironmentGovernanceStore>,
-    oracle: ServerDeploymentGates,
     clock: FakeClock,
     exec: Arc<FakeExecutor>,
     pg: Option<common::TestDb>,
 }
 
 impl World {
-    async fn pg(limit: Option<u32>) -> Option<World> {
+    async fn pg() -> Option<World> {
         let tdb = common::fresh_db().await?;
         let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
         pg.migrate().await.unwrap();
@@ -165,8 +158,6 @@ impl World {
             org: ORG.into(),
             name: ENV.into(),
             description: String::new(),
-            deployment_deadline: EnvironmentDeploymentDeadline::new(5 * 60_000).unwrap(),
-            deployment_sources: Vec::new(),
             protection: Default::default(),
             eligibility: EnvironmentProjectEligibility::AllProjects,
             created_at: 1,
@@ -185,10 +176,10 @@ impl World {
         .await
         .unwrap();
         let governance: Arc<dyn EnvironmentGovernanceStore> = pg.clone();
-        Some(World::new(pg.clone(), pg, governance, limit, Some(tdb)).await)
+        Some(World::new(pg, governance, Some(tdb)).await)
     }
 
-    async fn inmemory(limit: Option<u32>) -> World {
+    async fn inmemory() -> World {
         let db = Arc::new(InMemoryDb::new());
         let governance: Arc<dyn EnvironmentGovernanceStore> =
             Arc::new(InMemoryEnvironmentGovernance::new().with_environment(
@@ -196,42 +187,19 @@ impl World {
                 ENV,
                 EnvironmentProjectEligibility::AllProjects,
             ));
-        World::new(db.clone(), db, governance, limit, None).await
+        World::new(db, governance, None).await
     }
 
     async fn new(
         db: Arc<dyn Db>,
-        store: Arc<dyn DeploymentStore>,
         governance: Arc<dyn EnvironmentGovernanceStore>,
-        limit: Option<u32>,
         pg: Option<common::TestDb>,
     ) -> World {
-        governance
-            .put_environment_project_overlay(
-                &EnvironmentProjectOverlay {
-                    org: ORG.into(),
-                    environment: ENV.into(),
-                    project: PROJECT.into(),
-                    rules: EnvironmentProtectionRules {
-                        deployment_concurrency: limit.map(|n| NonZeroU32::new(n).unwrap()),
-                        ..Default::default()
-                    },
-                    deployment_gate_deadline: None,
-                },
-                "amy",
-                1,
-            )
-            .await
-            .unwrap();
-        let oracle =
-            ServerDeploymentGates::new(db.clone(), store.clone(), Some(governance.clone()));
         let exec = Arc::new(FakeExecutor::new());
         exec.set_results("bump", BTreeMap::from([("version".into(), json!("v1"))]));
         World {
             db,
-            store,
             governance,
-            oracle,
             clock: FakeClock::new(T0),
             exec,
             pg,
@@ -261,30 +229,10 @@ impl World {
         db.create_step_run(&run, &id(deploy_step), Some(&spec()), &[], now)
             .await
             .unwrap();
-        ir_steps.push(json!({
-            "id": deploy_step, "image": "busybox", "results": ["version"],
-            "deployment_requests": [
-                { "target": { "source": "argocd", "id": WEB }, "version": "version" }
-            ] }));
+        ir_steps.push(json!({ "id": deploy_step, "image": "busybox", "results": ["version"] }));
         db.store_run_ir(
             &run,
             &json!({ "ir_version": 2, "environment": ENV, "steps": ir_steps }),
-        )
-        .await
-        .unwrap();
-        db.set_run_deployment_requests(
-            &run,
-            &[RunDeploymentRequest {
-                step: id(deploy_step),
-                ordinal: 0,
-                org: ORG.into(),
-                environment: ENV.into(),
-                target_source: "argocd".into(),
-                target_id: WEB.into(),
-                version_result: "version".into(),
-                evidence_results: Vec::new(),
-                gate_steps: Vec::new(),
-            }],
         )
         .await
         .unwrap();
@@ -335,13 +283,7 @@ impl World {
     }
 
     async fn tick(&self) {
-        let gates = self.oracle.for_tick();
-        let isolated = self
-            .scheduler()
-            .with_deployments(Some(&gates))
-            .tick_all()
-            .await
-            .unwrap();
+        let isolated = self.scheduler().tick_all().await.unwrap();
         assert!(isolated.is_empty(), "{isolated:?}");
     }
 
@@ -400,27 +342,27 @@ impl World {
 }
 
 macro_rules! both {
-    ($scenario:ident, $limit:expr) => {
+    ($scenario:ident) => {
         mod $scenario {
             #[tokio::test]
             async fn pg() {
-                match super::World::pg($limit).await {
+                match super::World::pg().await {
                     Some(w) => super::$scenario(w).await,
                     None => eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset"),
                 }
             }
             #[tokio::test]
             async fn inmemory() {
-                super::$scenario(super::World::inmemory($limit).await).await
+                super::$scenario(super::World::inmemory().await).await
             }
         }
     };
-    ($scenario:ident, $limit:expr, ignore = $why:literal) => {
+    ($scenario:ident, ignore = $why:literal) => {
         mod $scenario {
             #[tokio::test]
             #[ignore = $why]
             async fn pg() {
-                match super::World::pg($limit).await {
+                match super::World::pg().await {
                     Some(w) => super::$scenario(w).await,
                     None => eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset"),
                 }
@@ -428,7 +370,7 @@ macro_rules! both {
             #[tokio::test]
             #[ignore = $why]
             async fn inmemory() {
-                super::$scenario(super::World::inmemory($limit).await).await
+                super::$scenario(super::World::inmemory().await).await
             }
         }
     };
@@ -479,20 +421,21 @@ async fn a_stale_cancel_intent_spares_the_reruns_attempt(w: World) {
 }
 // Fixed round 3: cancel intents are attempt-scoped (`cancel_attempt` names
 // a1), so the drain never reads the rerun's a2.
-both!(a_stale_cancel_intent_spares_the_reruns_attempt, None);
+both!(a_stale_cancel_intent_spares_the_reruns_attempt);
 
 // ---------------------------------------------------------------------------
 // R2-E2 — the intent rides the FIRST transition of a multi-step cancel and
 // can be drained (and retired) before the LAST one. A deploy step claimed and
 // launched in between is then cancelled by the same intent key — which is
-// already dispatched, so the insert is a no-op: its Pod is never torn down
-// and nothing holds its DeploymentTarget.
+// already dispatched, so the insert is a no-op: its Pod is never torn down.
 //
-// Constructed: the auto-cancel (`Scheduler::cancel_run`) awaits an inline
-// `executor.cancel` per running step; the hook runs inside the second one,
-// after `a_build`'s commit wrote `cancel:ra:g0`. In it, "replica B" frees the
-// target (cancels rival rz), drains every CANCEL_RUN, admits ra (claims
-// `c_bump`) and launches it.
+// Constructed: `c_bump` waits behind a manual gate (it once waited on a
+// per-DeploymentTarget hold, removed by ADR-0074) while ra's plain steps
+// start; the gate is released and admission claims `c_bump` without
+// draining its launch. The auto-cancel (`Scheduler::cancel_run`) awaits an
+// inline `executor.cancel` per running step; the hook runs inside the second
+// one, after `a_build`'s commit wrote `cancel:ra:g0`. In it, "replica B"
+// drains every CANCEL_RUN and then the launch intents, launching `c_bump`.
 // ---------------------------------------------------------------------------
 async fn a_cancel_drained_mid_cancel_still_tears_down_a_step_launched_in_between(w: World) {
     mid_cancel_drain(w, false).await
@@ -506,23 +449,30 @@ async fn a_mid_cancel_drain_survives_a_transient_inline_cancel_error(w: World) {
 }
 
 async fn mid_cancel_drain(w: World, blip: bool) {
-    // Rival rz holds target `web` (limit 1) while ra's plain steps start.
-    w.seed_deploy("rz").await;
-    w.running_on("rz", "bump", "a1").await;
-    w.seed_deploy_with("ra", "c_bump", &["a_build", "b_mid"])
-        .await;
+    // A manual gate holds c_bump while ra's plain steps start.
+    w.seed_plain_steps(
+        "ra",
+        &[
+            ("a_build", &[]),
+            ("b_mid", &[]),
+            ("hold", &[]),
+            ("c_bump", &["hold"]),
+        ],
+    )
+    .await;
+    w.db.set_step_gate(&rid("ra"), &id("hold"), "manual", None)
+        .await
+        .unwrap();
     w.running_on("ra", "a_build", "a1").await;
     w.running_on("ra", "b_mid", "a1").await;
     assert_eq!(w.step("ra", "c_bump").await.status, StepStatus::Pending);
-    // rz goes away; admission claims c_bump (Running, a1, LAUNCH_STEP
-    // pending, no handle yet) — its launch not yet drained.
-    assert!(cancel_run_request(&*w.db, &w.clock, &rid("rz"), None)
+    // The gate is released; admission claims c_bump (Running, a1,
+    // LAUNCH_STEP pending, no handle yet) — its launch not yet drained.
+    release_gate(&*w.db, &w.clock, &rid("ra"), &id("hold"))
         .await
-        .unwrap());
+        .unwrap();
     {
-        let gates = w.oracle.for_tick();
-        let s = w.scheduler().with_deployments(Some(&gates));
-        s.reconcile_cancellations().await.unwrap();
+        let s = w.scheduler();
         for _ in 0..3 {
             s.admit(&rid("ra")).await.unwrap();
         }
@@ -592,16 +542,10 @@ async fn mid_cancel_drain(w: World, blip: bool) {
     );
     w.finish().await;
 }
-both!(
-    a_cancel_drained_mid_cancel_still_tears_down_a_step_launched_in_between,
-    Some(1)
-);
+both!(a_cancel_drained_mid_cancel_still_tears_down_a_step_launched_in_between);
 // Fixed round 3: each step's cancel commit carries its own attempt-keyed
 // intent, so c_bump's is never a no-op behind a key retired mid-cancel.
-both!(
-    a_mid_cancel_drain_survives_a_transient_inline_cancel_error,
-    Some(1)
-);
+both!(a_mid_cancel_drain_survives_a_transient_inline_cancel_error);
 
 // ---------------------------------------------------------------------------
 // R2-E3 — the generation is read BEFORE the transitions it keys (ABA). A
@@ -664,10 +608,7 @@ async fn a_stale_generation_read_cannot_orphan_the_reruns_attempt(w: World) {
 }
 // Fixed round 3: the cancel's CAS names the attempt it read
 // (`AttemptFrontier`), so the ABA conflicts, re-reads, and cancels a2.
-both!(
-    a_stale_generation_read_cannot_orphan_the_reruns_attempt,
-    None
-);
+both!(a_stale_generation_read_cannot_orphan_the_reruns_attempt);
 
 // ---------------------------------------------------------------------------
 // R2-E4 — cancel → rerun → cancel, three times. Each cancel must write its
@@ -721,7 +662,7 @@ async fn three_cancel_rerun_cycles_each_tear_down(w: World) {
     );
     w.finish().await;
 }
-both!(three_cancel_rerun_cycles_each_tear_down, None);
+both!(three_cancel_rerun_cycles_each_tear_down);
 
 // ---------------------------------------------------------------------------
 // R2-E5 — "the forge's last word" (A7 fix) under at-least-once delivery. The
@@ -787,10 +728,7 @@ async fn a_redelivered_stale_post_does_not_end_the_forge_on_the_old_verdict(w: W
 }
 // Fixed round 3: posts carry their generation; the drainer retires a stale
 // one unposted.
-both!(
-    a_redelivered_stale_post_does_not_end_the_forge_on_the_old_verdict,
-    None
-);
+both!(a_redelivered_stale_post_does_not_end_the_forge_on_the_old_verdict);
 
 // ---------------------------------------------------------------------------
 // R2-E6 — the late-launch teardown in a LIVE run: a rerun supersedes `c_y`
@@ -867,76 +805,7 @@ async fn a_late_launch_teardown_in_a_live_run_spares_the_sibling(w: World) {
     let _ = sib;
     w.finish().await;
 }
-both!(
-    a_late_launch_teardown_in_a_live_run_spares_the_sibling,
-    None
-);
-
-// ---------------------------------------------------------------------------
-// R2-E7 — hold leg 2 now counts a pending CANCEL_RUN whenever the deploy
-// step's latest attempt has a handle, whatever its status. A deploy step
-// that SUCCEEDED (Pod gone) in a Run later cancelled while another step's
-// Pod lingers forever: the rival is over-held — but only until the
-// teardown's poison ceiling, never forever.
-// ---------------------------------------------------------------------------
-async fn an_over_hold_from_a_finished_deploy_step_is_bounded(w: World) {
-    w.seed_deploy("ra").await;
-    // `slow` needs `bump`, so bump alone consumes the scripted success.
-    w.db.create_step_run(
-        &rid("ra"),
-        &id("slow"),
-        Some(&spec()),
-        &[id("bump")],
-        scarab_engine::Timestamp(T0),
-    )
-    .await
-    .unwrap();
-    w.db.store_run_ir(
-        &rid("ra"),
-        &json!({ "ir_version": 2, "environment": ENV, "steps": [
-            { "id": "bump", "image": "busybox", "results": ["version"],
-              "deployment_requests": [
-                { "target": { "source": "argocd", "id": WEB }, "version": "version" } ] },
-            { "id": "slow", "image": "busybox", "needs": ["bump"] } ] }),
-    )
-    .await
-    .unwrap();
-    w.running_on("ra", "bump", "a1").await;
-    w.exec.script_outcome(ExecState::Succeeded);
-    for _ in 0..4 {
-        if w.step("ra", "bump").await.status == StepStatus::Succeeded {
-            break;
-        }
-        w.tick().await;
-    }
-    w.running_on("ra", "slow", "a1").await;
-    if w.step("ra", "bump").await.status != StepStatus::Succeeded {
-        eprintln!("precondition not reached (scripted outcome went to `slow`); skipping");
-        w.finish().await;
-        return;
-    }
-    w.exec.linger_after_cancel(u32::MAX);
-    assert!(cancel_run_request(&*w.db, &w.clock, &rid("ra"), None)
-        .await
-        .unwrap());
-    w.seed_deploy("rb").await;
-    let mut held = 0;
-    for _ in 0..30 {
-        w.tick().await;
-        if w.step("rb", "bump").await.status == StepStatus::Pending {
-            held += 1;
-        } else {
-            break;
-        }
-    }
-    eprintln!("rb over-held for {held} ticks behind a finished deploy step");
-    assert!(
-        held < 30,
-        "rb held forever behind a Run whose deploy step had already succeeded"
-    );
-    w.finish().await;
-}
-both!(an_over_hold_from_a_finished_deploy_step_is_bounded, Some(1));
+both!(a_late_launch_teardown_in_a_live_run_spares_the_sibling);
 
 // ---------------------------------------------------------------------------
 // R2-E8 — rolling upgrade (migration 0065 is expand-only). An OLD binary's
@@ -983,7 +852,7 @@ async fn a_rerun_by_an_old_binary_still_gets_its_cancel(w: World) {
 mod a_rerun_by_an_old_binary_still_gets_its_cancel {
     #[tokio::test]
     async fn pg() {
-        match super::World::pg(None).await {
+        match super::World::pg().await {
             Some(w) => super::a_rerun_by_an_old_binary_still_gets_its_cancel(w).await,
             None => eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset"),
         }
@@ -1017,7 +886,7 @@ async fn legitimate_launches_are_never_refused(w: World) {
     assert_eq!(a1.outcome, AttemptOutcome::Running);
     w.finish().await;
 }
-both!(legitimate_launches_are_never_refused, None);
+both!(legitimate_launches_are_never_refused);
 
 // ===========================================================================
 // Auth / step-up

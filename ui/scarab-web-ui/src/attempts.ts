@@ -121,15 +121,6 @@ export const causeSuffix = (c?: AttemptCause): string =>
 /** The dropdown row's title: `try N` + its cause suffix. */
 export const tryTitle = (t: FilmstripTry): string => `try ${t.index + 1}${causeSuffix(t.cause)}`;
 
-/** The human label of a failure class (`AttemptDto.failure`). Most classes
- * read fine as their wire token (`step`, `timeout`, `gate`); the ones that do
- * not are spelled out. Unknown tokens pass through, so a newer server's class
- * still shows. */
-const FAILURE_LABELS: Record<string, string> = {
-  "deployment-request-incomplete": "DeploymentRequest incomplete",
-};
-export const failureLabel = (failure: string): string => FAILURE_LABELS[failure] ?? failure;
-
 /** Prefer the backend's authoritative `outcome` (AttemptDto.outcome) so a
  * still-running / superseded / cancelled try is never mislabelled green. Fall
  * back to the pre-fix superseded→failed→green derivation only when `outcome` is
@@ -142,14 +133,14 @@ export const tryOutcome = (t: FilmstripTry): string => {
     case "succeeded":
       return "✓ succeeded";
     case "failed":
-      return `✗ failed${t.failure ? ` · ${failureLabel(t.failure)}` : ""}`;
+      return `✗ failed${t.failure ? ` · ${t.failure}` : ""}`;
     case "superseded":
       return "⊘ superseded";
     case "cancelled":
       return "⊘ cancelled";
   }
   if (t.superseded) return "⊘ superseded";
-  if (t.failed) return `✗ failed${t.failure ? ` · ${failureLabel(t.failure)}` : ""}`;
+  if (t.failed) return `✗ failed${t.failure ? ` · ${t.failure}` : ""}`;
   return "✓ succeeded";
 };
 

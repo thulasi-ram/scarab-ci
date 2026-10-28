@@ -1,6 +1,6 @@
 # 0071. Org-level Environments: a place that decides who may deploy into it
 
-- **Status:** Accepted. The MMP is built on main (migrations `0054_org_environments.sql`
+- **Status:** Accepted; §4, §5, §9, the EnvironmentDeploymentDeadline, and the deployment parts of §1 and §3 superseded by [0074](0074-deployments-leave-core.md) (2026-10-28). The MMP is built on main (migrations `0054_org_environments.sql`
   and `0057_org_environment_governance.sql`, the `/v1/orgs/{org}/environments/*` routes).
   See [Implementation horizon](#implementation-horizon) for what is still open.
 - **Date:** 2026-10-22

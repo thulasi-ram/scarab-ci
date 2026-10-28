@@ -1,6 +1,6 @@
 {
   "plugin": "argocd",
-  "capabilities": ["report_deployments", "use_connection"],
+  "capabilities": ["use_connection"],
   "connections": [
     {
       "name": "argocd",
@@ -30,5 +30,5 @@
       ]
     }
   ],
-  "config_keys": ["ARGOCD_UI_URL", "OWNER_ANNOTATION"]
+  "config_keys": []
 }

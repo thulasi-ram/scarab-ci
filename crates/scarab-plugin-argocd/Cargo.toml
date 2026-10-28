@@ -4,19 +4,17 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
-# The first-party Argo CD reporter (ADR-0070 §4/§11, ADR-0072 §5/§11): a Plugin
-# that watches Argo CD through the CredentialBroker's read proxy and pushes
-# DeploymentStatusReports to the broker.
+# The first-party Argo CD Plugin (ADR-0072 §5/§11): reads Argo CD through the
+# CredentialBroker's read proxy. ADR-0074 removed the Deployment record it used
+# to report into; its Argo CD types and status rules stay as library code.
 #
 # It deliberately depends on NO `scarab-*` crate outside `[dev-dependencies]`.
 # Everything it knows about Scarab is the broker's HTTP contract, spelled out
-# again here in its own types — so it is the proof that a third-party reporter
-# can be written from the published contract alone, and a broker change that
-# breaks the contract breaks this crate's contract test, not a hidden shared
-# type.
+# again here in its own types — so a broker change that breaks the contract
+# breaks this crate's contract test, not a hidden shared type.
 #
 # `manifest.json` is compiled into the server's first-party catalog
-# (`include_str!`); it is the authority on what this reporter may read.
+# (`include_str!`); it is the authority on what this plugin may read.
 
 [lib]
 name = "scarab_plugin_argocd"
@@ -27,7 +25,7 @@ name = "scarab-plugin-argocd"
 path = "src/main.rs"
 
 # A fake Argo CD API server for local verification (`just plugin-verify`) and
-# the `fake` image target. Never part of the reporter image.
+# the `fake` image target. Never part of the plugin image.
 [[bin]]
 name = "fake-argocd"
 path = "src/bin/fake-argocd/main.rs"
@@ -51,9 +49,9 @@ axum = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 
 [dev-dependencies]
-# The contract test (tests/contract.rs) runs this reporter against the REAL
+# The contract test (tests/contract.rs) runs this plugin against the REAL
 # broker router over Postgres, with the fake Argo CD in process. Test-only:
-# none of these is linked into the reporter binary.
+# none of these is linked into the plugin binary.
 scarab-server = { path = "../scarab-server" }
 scarab-db-postgres = { workspace = true }
 scarab-plugin = { workspace = true }

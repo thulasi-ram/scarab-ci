@@ -9,12 +9,7 @@ scarab-engine = { workspace = true }
 scarab-project = { workspace = true }
 scarab-forge = { workspace = true }
 scarab-identity = { workspace = true }
-# ADR-0070: the Deployment record's input log (`DeploymentStore`). The fold
-# stays in the pure crate; this adapter only stores and returns inputs.
-scarab-deployment = { workspace = true }
-# ADR-0072: the PluginInstallation registry and report ingest (`PluginStore`),
-# which appends to the Deployment record in the same transaction as its
-# idempotency and sequence bookkeeping.
+# ADR-0072: the PluginInstallation registry (`PluginStore`).
 scarab-plugin = { workspace = true }
 async-trait = { workspace = true }
 sqlx = { workspace = true }

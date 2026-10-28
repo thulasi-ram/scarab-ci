@@ -1,22 +1,15 @@
-//! Table tests of the reporter's pure core against Argo CD-shaped JSON
+//! Table tests of the plugin's pure library code against Argo CD-shaped JSON
 //! (`tests/fixtures/argocd/`, synthetic: realistic `Application` and
 //! managed-resources shapes, `targetState` as Argo's JSON-in-a-string).
 //!
 //! - **version** (ADR-0070 §4): target pod-template images, hooks excluded,
 //!   initContainers included, live state and `summary.images` ignored;
 //! - **assess** (ADR-0070 §5, §11; plan-d's table): `failed` only once Argo
-//!   gave up, `live` only synced and healthy;
-//! - **transition**: report only when *(version, status, label)* changes.
-
-use std::collections::BTreeSet;
+//!   gave up, `live` only synced and healthy.
 
 use scarab_plugin_argocd::argo::{Application, ManagedResources};
 use scarab_plugin_argocd::assess::{assess, Status};
-use scarab_plugin_argocd::report::{
-    due, observe, owners_from_annotation, status_item, Cursor, Due, KeyMinter, ReportItem,
-    Reported, Unreportable,
-};
-use scarab_plugin_argocd::version::{target_images, version_of, VERSION_SCHEME};
+use scarab_plugin_argocd::version::{target_images, version_of};
 
 fn fixture(name: &str) -> String {
     let path = format!(
@@ -80,16 +73,11 @@ fn a_config_only_change_leaves_the_version_as_it_was() {
 }
 
 #[test]
-fn no_pod_templates_means_no_version_and_no_report() {
+fn no_pod_templates_means_no_version() {
     for name in ["managed-config-only-app.json", "managed-empty.json"] {
         let images = target_images(&managed(name));
         assert!(images.is_empty(), "{name}: {images:?}");
         assert_eq!(version_of(&images), None, "{name}");
-        assert_eq!(
-            observe(&app("app-synced-healthy.json"), &images, "acme", "x", None),
-            Err(Unreportable::NoImages),
-            "{name}: owner default 7 — an empty set is not reported"
-        );
     }
 }
 
@@ -201,111 +189,4 @@ fn a_finished_operation_on_the_current_revision_decides_even_when_synced() {
     // The same failure on an older revision says nothing about this one.
     a.status.sync.revision = Some("ffffffffffffffffffffffffffffffffffffffff".into());
     assert_eq!(assess(&a).status, Status::Live);
-}
-
-#[test]
-fn owners_come_from_the_annotation_in_the_installations_org_only() {
-    let (kept, ignored) = owners_from_annotation(
-        Some(" acme/web, acme/web-worker ,, other/web, acme/web, not-a-pair, acme/bad repo"),
-        "acme",
-    );
-    assert_eq!(kept, ["acme/web", "acme/web-worker"]);
-    assert_eq!(ignored, ["other/web", "not-a-pair", "acme/bad repo"]);
-    assert_eq!(owners_from_annotation(None, "acme"), (vec![], vec![]));
-}
-
-fn observation(app_name: &str) -> scarab_plugin_argocd::report::Observation {
-    observe(
-        &app(app_name),
-        &target_images(&managed("managed-web.json")),
-        "acme",
-        "scarab.io/owner-projects",
-        Some("https://argo.acme.example/"),
-    )
-    .unwrap()
-}
-
-#[test]
-fn an_observation_carries_target_grouping_owners_and_link() {
-    let obs = observation("app-synced-healthy.json");
-    assert_eq!(obs.target_id, "argocd/web");
-    assert_eq!(obs.vendor_grouping, "prod");
-    assert_eq!(obs.version, WEB_VERSION);
-    assert_eq!(obs.owners, ["acme/web", "acme/web-worker"]);
-    assert_eq!(
-        obs.link.as_deref(),
-        Some("https://argo.acme.example/applications/argocd/web")
-    );
-    // The wire item: exactly the contract's fields, no `source`.
-    let item = status_item(&obs, &KeyMinter::with_nonce("n"), 7, 1_700_000_000_000);
-    let wire = serde_json::to_value(&item).unwrap();
-    assert_eq!(wire["type"], "status");
-    assert_eq!(wire["version_scheme"], VERSION_SCHEME);
-    assert_eq!(wire["status"], "live");
-    assert_eq!(wire["sequence"], 7);
-    assert!(wire.get("source").is_none());
-    let fields: BTreeSet<&str> = wire
-        .as_object()
-        .unwrap()
-        .keys()
-        .map(String::as_str)
-        .collect();
-    assert_eq!(
-        fields,
-        BTreeSet::from([
-            "type",
-            "idempotency_key",
-            "sequence",
-            "vendor_grouping",
-            "target_id",
-            "version",
-            "version_scheme",
-            "status",
-            "label",
-            "link",
-            "source_at",
-            "owners",
-        ])
-    );
-    assert!(matches!(item, ReportItem::Status(_)));
-}
-
-#[test]
-fn transitions_only_report_what_changed() {
-    let live = observation("app-synced-healthy.json");
-    let reported = |o: &scarab_plugin_argocd::report::Observation| Cursor {
-        last_sequence: 3,
-        vendor_grouping: Some(o.vendor_grouping.clone()),
-        reported: Some(Reported {
-            version: o.version.clone(),
-            status: o.assessment.status,
-            label: o.assessment.label.clone(),
-        }),
-        owners: Some(o.owners.clone()),
-    };
-    // Never seen: report.
-    assert_eq!(due(None, &live, false), Due::Status);
-    // A reconcile that changed nothing (a new reconciledAt, an unrelated
-    // gitops commit with the same images): nothing.
-    assert_eq!(due(Some(&reported(&live)), &live, false), Due::Nothing);
-    // Core flagged it for a re-send: the current state again.
-    assert_eq!(due(Some(&reported(&live)), &live, true), Due::Status);
-    // A new status or label at the same version: report.
-    let progressing = observation("app-rollout-progressing.json");
-    assert_eq!(
-        due(Some(&reported(&live)), &progressing, false),
-        Due::Status
-    );
-    // A new version: report.
-    let mut newer = live.clone();
-    newer.version = "ghcr.io/acme/web:1.43.0".into();
-    assert_eq!(due(Some(&reported(&live)), &newer, false), Due::Status);
-    // Moved to another project (grouping): report, so core re-routes it.
-    let mut moved = live.clone();
-    moved.vendor_grouping = "staging".into();
-    assert_eq!(due(Some(&reported(&live)), &moved, false), Due::Status);
-    // Only the owners changed: an ownership report, not a status.
-    let mut reowned = live.clone();
-    reowned.owners = vec!["acme/web".into()];
-    assert_eq!(due(Some(&reported(&live)), &reowned, false), Due::Ownership);
 }

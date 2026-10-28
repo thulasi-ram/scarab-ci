@@ -1,14 +1,12 @@
 //! ADR-0073 §3: which Environment governance edits loosen it. Unit cases for
-//! each rule (E1-E4), and properties: tightening is never flagged, and
+//! each rule (E1, E2, E4; E3 went with deployment sources in ADR-0074), and
+//! properties: tightening is never flagged, and
 //! dropping an approver or adding an uncovered glob always is.
-
-use std::num::NonZeroU32;
 
 use proptest::prelude::*;
 use scarab_project::{
-    deployment_source_additions, eligibility_loosenings, glob_subsumes, overlay_loosenings,
-    privilege_grant_loosenings, protection_loosenings, EnvironmentDeploymentDeadline,
-    EnvironmentDeploymentSource, EnvironmentProjectEligibility, EnvironmentProjectOverlay,
+    eligibility_loosenings, glob_subsumes, overlay_loosenings, privilege_grant_loosenings,
+    protection_loosenings, EnvironmentProjectEligibility, EnvironmentProjectOverlay,
     EnvironmentProjectPrivilegeGrant, EnvironmentProtectionRules, ImageGrant, Loosening,
 };
 
@@ -26,13 +24,6 @@ fn whats(l: Vec<Loosening>) -> Vec<String> {
 
 fn projects(p: &[&str]) -> EnvironmentProjectEligibility {
     EnvironmentProjectEligibility::Projects(p.iter().map(|s| s.to_string()).collect())
-}
-
-fn source(installation: &str, grouping: &str) -> EnvironmentDeploymentSource {
-    EnvironmentDeploymentSource {
-        installation: installation.into(),
-        vendor_grouping: grouping.into(),
-    }
 }
 
 fn image(digest: &str, privileged: bool, caps: &[&str]) -> ImageGrant {
@@ -53,17 +44,12 @@ fn grant(images: Vec<ImageGrant>, permit_k8s_overlay: bool) -> EnvironmentProjec
     }
 }
 
-fn overlay(
-    rules: EnvironmentProtectionRules,
-    deadline_ms: Option<i64>,
-) -> EnvironmentProjectOverlay {
+fn overlay(rules: EnvironmentProtectionRules) -> EnvironmentProjectOverlay {
     EnvironmentProjectOverlay {
         org: "acme".into(),
         environment: "prod".into(),
         project: "web".into(),
         rules,
-        deployment_gate_deadline: deadline_ms
-            .map(|ms| EnvironmentDeploymentDeadline::new(ms).unwrap()),
     }
 }
 
@@ -116,64 +102,35 @@ fn allowed_refs_loosen_by_widening_or_clearing() {
 }
 
 #[test]
-fn timer_reason_and_concurrency_loosen_one_way() {
+fn timer_and_reason_loosen_one_way() {
     let base = EnvironmentProtectionRules {
         wait_timer_s: 60,
         require_reason: true,
-        deployment_concurrency: NonZeroU32::new(2),
         ..Default::default()
     };
     let looser = EnvironmentProtectionRules {
         wait_timer_s: 30,
         require_reason: false,
-        deployment_concurrency: NonZeroU32::new(3),
         ..Default::default()
     };
-    assert_eq!(protection_loosenings(&base, &looser).len(), 3);
+    assert_eq!(protection_loosenings(&base, &looser).len(), 2);
     assert!(
         protection_loosenings(&looser, &base).is_empty(),
         "the reverse tightens"
     );
-    let unlimited = EnvironmentProtectionRules {
-        deployment_concurrency: None,
-        ..base.clone()
-    };
-    assert_eq!(
-        whats(protection_loosenings(&base, &unlimited)),
-        vec!["removes the deployment concurrency limit of 2"]
-    );
-    assert!(protection_loosenings(&unlimited, &base).is_empty());
     assert!(protection_loosenings(&base, &base).is_empty());
 }
 
 #[test]
 fn an_overlay_loosens_against_the_old_overlay_or_the_default() {
     // Creating an overlay never loosens: none reads as the permissive default.
-    assert!(
-        overlay_loosenings(None, &overlay(rules(&["amy"], &["main"]), Some(60_000))).is_empty()
-    );
-    let old = overlay(rules(&["amy"], &[]), Some(60_000));
+    assert!(overlay_loosenings(None, &overlay(rules(&["amy"], &["main"]))).is_empty());
+    let old = overlay(rules(&["amy"], &[]));
     assert_eq!(
-        whats(overlay_loosenings(
-            Some(&old),
-            &overlay(rules(&[], &[]), Some(60_000))
-        )),
+        whats(overlay_loosenings(Some(&old), &overlay(rules(&[], &[])))),
         vec!["removes approver `amy`"]
     );
-    assert_eq!(
-        whats(overlay_loosenings(
-            Some(&old),
-            &overlay(rules(&["amy"], &[]), None)
-        )),
-        vec!["removes the deployment gate deadline of 60000 ms"]
-    );
-    assert_eq!(
-        overlay_loosenings(Some(&old), &overlay(rules(&["amy"], &[]), Some(120_000))).len(),
-        1
-    );
-    assert!(
-        overlay_loosenings(Some(&old), &overlay(rules(&["amy"], &[]), Some(60_000))).is_empty()
-    );
+    assert!(overlay_loosenings(Some(&old), &overlay(rules(&["amy"], &[]))).is_empty());
 }
 
 // --- E2: eligibility -------------------------------------------------------
@@ -195,37 +152,6 @@ fn eligibility_loosens_by_opening_up() {
     );
     assert!(eligibility_loosenings(&projects(&["web-*"]), &projects(&["web-a"])).is_empty());
     assert!(eligibility_loosenings(&projects(&["web", "api"]), &projects(&[])).is_empty());
-}
-
-// --- E3: deployment sources ------------------------------------------------
-
-#[test]
-fn only_an_added_source_is_governed() {
-    let argo = source("argocd", "prod");
-    let flux = source("flux", "prod");
-    assert_eq!(
-        whats(deployment_source_additions(
-            &[],
-            std::slice::from_ref(&argo)
-        )),
-        vec!["adds deployment source `argocd` / `prod`"]
-    );
-    assert_eq!(
-        whats(deployment_source_additions(
-            std::slice::from_ref(&argo),
-            &[argo.clone(), flux.clone()]
-        )),
-        vec!["adds deployment source `flux` / `prod`"]
-    );
-    assert!(
-        deployment_source_additions(&[argo.clone(), flux], std::slice::from_ref(&argo)).is_empty()
-    );
-    // A different grouping under the same installation is a different source.
-    assert_eq!(
-        deployment_source_additions(std::slice::from_ref(&argo), &[source("argocd", "staging")])
-            .len(),
-        1
-    );
 }
 
 // --- E4: privilege grants --------------------------------------------------
