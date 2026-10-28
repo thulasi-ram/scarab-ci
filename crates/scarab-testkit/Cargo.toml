@@ -11,10 +11,8 @@ scarab-storage = { workspace = true }
 scarab-forge = { workspace = true }
 scarab-identity = { workspace = true }
 scarab-secrets = { workspace = true }
-# The in-memory `EnvironmentGovernanceStore` (ADR-0071), and the one default
-# deadline it gives a seeded Environment.
+# The in-memory `EnvironmentGovernanceStore` (ADR-0071).
 scarab-project = { workspace = true }
-scarab-deployment = { workspace = true }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
 

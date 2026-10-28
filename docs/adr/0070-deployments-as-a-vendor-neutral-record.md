@@ -1,6 +1,6 @@
 # 0070. Deployments as a vendor-neutral record: what is live, not who approved
 
-- **Status:** Accepted. The MMP is built on main (`crates/scarab-deployment`, migrations
+- **Status:** Superseded by [0074](0074-deployments-leave-core.md) (2026-10-28), except §9 (every gate can fail, holds only its dependents and has its own clock), the step-level `results:` declaration from §7, and the first cut in §13. Before that: Accepted. The MMP is built on main (`crates/scarab-deployment`, migrations
   `0053_deployment_inputs.sql` and `0058_deployment_requests.sql`, the `/v1/orgs/{org}/environments/{env}/deployments` routes). See
   [Implementation horizon](#implementation-horizon) for what is still open.
 - **Date:** 2026-10-22

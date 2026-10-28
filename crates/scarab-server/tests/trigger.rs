@@ -124,7 +124,10 @@ async fn run_number_is_per_repo_sequential() {
     );
 
     // The number rides the run summary (what the runs-list DTO is built from).
-    let summ = db.list_runs_for_tenant("acme", "app", 10).await.unwrap();
+    let summ = db
+        .list_runs_for_tenant("acme", "app", &Default::default(), 10)
+        .await
+        .unwrap();
     assert_eq!(
         summ.iter().find(|s| s.run == r1).unwrap().run_number,
         Some(1),

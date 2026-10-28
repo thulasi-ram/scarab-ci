@@ -1,21 +1,12 @@
-// Plugins (ADR-0072, Deployments MMP d1) — the Settings section where an org
-// admin installs a plugin, sees whether it is running, kills it, and wires
-// what it reports into Environments.
+// Plugins (ADR-0072) — the Settings section where an org admin installs a
+// plugin, sees whether it is running, kills it, and binds its connections.
 //
 // A PluginInstallation is the approval of exactly (image digest, manifest), so
 // the install form asks for a digest and shows what the manifest asks for. The
 // MMP installs first-party plugins only; anything else is the server's 403,
 // shown verbatim. Kill is the switch ADR-0072 §10 promises: it revokes at the
 // token-to-installation mapping, so it bites on the next request rather than
-// when a token expires. Uninstall retires the name forever — a new install
-// under it would silently inherit the old one's Deployment record.
-//
-// "Unmapped groupings" are groupings the plugin reports on that no
-// Environment lists: their reports are dropped. Each one offers to add itself
-// as a source on an org Environment — preselected only when an Environment is
-// named like the grouping; otherwise the admin picks (a guess would route
-// reports somewhere nobody chose). The targets already reported under it
-// reach the board when the plugin re-sends them (within about a minute).
+// when a token expires. Uninstall retires the name forever.
 //
 // "Connections" (d3, ADR-0072 §5) bind each manifest connection slot to the
 // ONE destination the CredentialBroker sends the plugin's reads to, and the
@@ -23,22 +14,25 @@
 // "set" / "not set" — and is typed again on every save, so a destination
 // never inherits a credential entered for another. Plain http is allowed but
 // always flagged.
+//
+// "Storage" (ADR-0074 §7) names one PersistentVolumeClaim an operator created
+// in the plugin namespace; the runtime mounts it read-write into the plugin's
+// Pod. Scarab does not create, back up or read it. Moving it to another claim
+// or path asks for a step-up; adding or removing it does not.
 import { createResource, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { Portal } from "solid-js/web";
 import {
   deletePluginConnection,
+  deletePluginStorage,
   enablePlugin,
   installPlugin,
   killPlugin,
-  listOrgEnvironments,
   listPluginCatalog,
   listPluginConnections,
   listPlugins,
-  listUnmappedGroupings,
-  putOrgEnvironment,
   putPluginConnection,
+  putPluginStorage,
   uninstallPlugin,
-  type OrgEnvironment,
   type PluginCatalogEntry,
   type PluginConnection,
   type PluginInstallation,
@@ -55,14 +49,14 @@ import {
   installNameError,
   runtimeBadge,
   shortDigest,
-  sourceAddedNotice,
   stateBadge,
-  suggestEnvironment,
   toInstallBody,
   ruleLabel,
-  usageLine,
-  withSource,
+  DEFAULT_STORAGE_MOUNT_PATH,
+  STORAGE_NOTE,
+  toStorageBody,
   type BadgeTone,
+  type StorageForm,
 } from "../plugins";
 import { relTime, absTime } from "../fmt";
 import Icon from "./Icon";
@@ -75,16 +69,11 @@ const BADGE: Record<BadgeTone, string> = {
   muted: "badge badge-skipped",
 };
 
-export default function Plugins(props: { org: string; onEnvironmentsChanged?: () => void }) {
+export default function Plugins(props: { org: string }) {
   const [epoch, setEpoch] = createSignal(0);
   const [plugins] = createResource(
     () => ({ org: props.org, epoch: epoch() }),
     (k) => listPlugins(k.org),
-  );
-  // For the unmapped-grouping shortcut; without it the shortcut just hides.
-  const [orgEnvs, { refetch: refetchEnvs }] = createResource(
-    () => props.org,
-    (o) => listOrgEnvironments(o).catch(() => null),
   );
   const [installing, setInstalling] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
@@ -109,7 +98,7 @@ export default function Plugins(props: { org: string; onEnvironmentsChanged?: ()
   const kill = (p: PluginInstallation) => {
     if (
       !window.confirm(
-        `Kill ${p.name}?\n\nThis revokes it immediately: from the next request on, its deployment reports and broker calls are refused, even with a token that has not expired. Nothing is uninstalled — Enable brings it back.`,
+        `Kill ${p.name}?\n\nThis revokes it immediately: from the next request on, its broker calls are refused, even with a token that has not expired. Nothing is uninstalled — Enable brings it back.`,
       )
     )
       return;
@@ -120,28 +109,16 @@ export default function Plugins(props: { org: string; onEnvironmentsChanged?: ()
     void act(() => enablePlugin(props.org, p.name), `Could not enable ${p.name}.`, `${p.name} is enabled again.`);
 
   const uninstall = (p: PluginInstallation) => {
-    const n = p.deployment_sources.length;
     if (
       !window.confirm(
-        `Uninstall ${p.name}?\n\nThe name ${p.name} is retired forever — it can never be installed again, so nobody can inherit its deployment history by reusing it.${
-          n > 0 ? `\n\n${n} environment source${n === 1 ? "" : "s"} naming it will be removed with it.` : ""
-        }`,
+        `Uninstall ${p.name}?\n\nThe name ${p.name} is retired forever — it can never be installed again.`,
       )
     )
       return;
-    setError(null);
-    setNotice(null);
-    uninstallPlugin(props.org, p.name).then(
-      (r) => {
-        const removed = r.removed_deployment_sources.length;
-        setNotice(
-          `${r.name} is uninstalled; its name is retired. ${removed} environment source${removed === 1 ? "" : "s"} removed.`,
-        );
-        reload();
-        void refetchEnvs();
-        if (removed > 0) props.onEnvironmentsChanged?.();
-      },
-      (e) => setError(e instanceof Error ? e.message : `Could not uninstall ${p.name}.`),
+    void act(
+      () => uninstallPlugin(props.org, p.name),
+      `Could not uninstall ${p.name}.`,
+      `${p.name} is uninstalled; its name is retired.`,
     );
   };
 
@@ -170,9 +147,8 @@ export default function Plugins(props: { org: string; onEnvironmentsChanged?: ()
               when={rows().length > 0}
               fallback={
                 <p class="empty">
-                  No plugins installed. A plugin brings vendor knowledge Scarab does not own —
-                  the Argo CD plugin, say, reports what is live on each target into the
-                  Deployment record.
+                  No plugins installed. A plugin connects Scarab to a vendor tool, such as
+                  Argo CD.
                 </p>
               }
             >
@@ -182,15 +158,13 @@ export default function Plugins(props: { org: string; onEnvironmentsChanged?: ()
                     <PluginRow
                       org={props.org}
                       plugin={p}
-                      orgEnvs={orgEnvs() ?? null}
                       onKill={() => kill(p)}
                       onEnable={() => enable(p)}
                       onUninstall={() => uninstall(p)}
-                      onSourceAdded={(msg) => {
+                      onStorageChanged={(msg) => {
+                        setError(null);
                         setNotice(msg);
                         reload();
-                        void refetchEnvs();
-                        props.onEnvironmentsChanged?.();
                       }}
                     />
                   )}
@@ -225,12 +199,7 @@ export default function Plugins(props: { org: string; onEnvironmentsChanged?: ()
             onClose={() => setInstalling(false)}
             onInstalled={(p) => {
               setInstalling(false);
-              const n = p.deployment_sources.length;
-              setNotice(
-                n > 0
-                  ? `${p.name} is installed and already feeds ${n} environment source${n === 1 ? "" : "s"} written for it.`
-                  : `${p.name} is installed. Add it as a source on an environment for its reports to land.`,
-              );
+              setNotice(`${p.name} is installed.`);
               reload();
             }}
           />
@@ -240,22 +209,20 @@ export default function Plugins(props: { org: string; onEnvironmentsChanged?: ()
   );
 }
 
-/** One installation: identity, approval, runtime, and where it reports. */
+/** One installation: identity, approval, runtime, and its connections. */
 function PluginRow(props: {
   org: string;
   plugin: PluginInstallation;
-  orgEnvs: OrgEnvironment[] | null;
   onKill: () => void;
   onEnable: () => void;
   onUninstall: () => void;
-  onSourceAdded: (msg: string) => void;
+  onStorageChanged: (msg: string) => void;
 }) {
   const p = () => props.plugin;
+  const [storageOpen, setStorageOpen] = createSignal(false);
   const killed = () => p().state === "killed";
   const state = () => stateBadge(p().state);
   const runtime = () => runtimeBadge(p().runtime_status);
-  const usage = () => usageLine(p().usage);
-  const [open, setOpen] = createSignal(false);
   const [connectionsOpen, setConnectionsOpen] = createSignal(false);
 
   return (
@@ -325,53 +292,155 @@ function PluginRow(props: {
             </span>
           )}
         </Show>
-        <span class={usage().warn ? "plg-killed" : undefined} title={usage().title}>
-          <Icon icon="database" size={12} />
-          {usage().label}
-        </span>
       </div>
 
       <div class="tok-facts">
-        <span>
-          <Icon icon="waypoints" size={12} />
-          <Show
-            when={p().deployment_sources.length > 0}
-            fallback={"no environment lists it as a source — its reports are dropped"}
-          >
-            <span class="oenv-sources">
-              <For each={p().deployment_sources}>
-                {(s) => (
-                  <span class="mono" title="Environment ← vendor grouping">
-                    {s.environment} ← {s.vendor_grouping}
-                  </span>
-                )}
-              </For>
-            </span>
+        <span title={STORAGE_NOTE}>
+          <Icon icon="database" size={12} />
+          <Show when={p().storage} fallback={<span class="subtle">no storage</span>}>
+            {(s) => (
+              <span class="mono">
+                {s().claim} → {s().mount_path}
+              </span>
+            )}
           </Show>
         </span>
-        <button class="btn btn-ghost btn-sm plg-toggle" onClick={() => setOpen((o) => !o)}>
-          <Icon icon={open() ? "chevron-down" : "chevron-right"} size={12} /> unmapped groupings
+        <button class="btn btn-ghost btn-sm plg-toggle" onClick={() => setStorageOpen((o) => !o)}>
+          <Icon icon={storageOpen() ? "chevron-down" : "chevron-right"} size={12} /> storage
         </button>
-        <Show when={p().manifest.connections.length > 0}>
+      </div>
+
+      <Show when={storageOpen()}>
+        <StorageEditor
+          org={props.org}
+          plugin={p()}
+          onChanged={(msg) => {
+            setStorageOpen(false);
+            props.onStorageChanged(msg);
+          }}
+        />
+      </Show>
+
+      <Show when={p().manifest.connections.length > 0}>
+        <div class="tok-facts">
           <button class="btn btn-ghost btn-sm plg-toggle" onClick={() => setConnectionsOpen((o) => !o)}>
             <Icon icon={connectionsOpen() ? "chevron-down" : "chevron-right"} size={12} /> connections
           </button>
-        </Show>
-      </div>
+        </div>
+      </Show>
 
       <Show when={connectionsOpen()}>
         <Connections org={props.org} installation={p().name} />
       </Show>
-
-      <Show when={open()}>
-        <Unmapped
-          org={props.org}
-          installation={p().name}
-          orgEnvs={props.orgEnvs}
-          onSourceAdded={props.onSourceAdded}
-        />
-      </Show>
     </li>
+  );
+}
+
+/** An installation's storage claim (ADR-0074 §7): what to tell the operator,
+ *  and the form that sets, moves or removes it. */
+function StorageEditor(props: {
+  org: string;
+  plugin: PluginInstallation;
+  onChanged: (msg: string) => void;
+}) {
+  const current = () => props.plugin.storage ?? null;
+  const [form, setForm] = createSignal<StorageForm>({
+    claim: current()?.claim ?? "",
+    mount_path: current()?.mount_path ?? "",
+  });
+  const [saving, setSaving] = createSignal(false);
+  const [error, setError] = createSignal<string | null>(null);
+  const built = () => toStorageBody(form());
+  const set = (k: keyof StorageForm, v: string) => setForm((f) => ({ ...f, [k]: v }));
+  const owner = () => `${props.plugin.org}/${props.plugin.name}`;
+
+  const save = async () => {
+    const body = built().body;
+    if (!body || saving()) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const updated = await putPluginStorage(props.org, props.plugin.name, body);
+      const s = updated.storage;
+      props.onChanged(
+        s ? `${props.plugin.name} mounts ${s.claim} at ${s.mount_path}.` : `${props.plugin.name} has no storage.`,
+      );
+    } catch (e) {
+      setError(e instanceof Error ? e.message : `Could not set ${props.plugin.name}'s storage.`);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const remove = async () => {
+    const s = current();
+    if (!s) return;
+    if (
+      !window.confirm(
+        `Stop mounting ${s.claim} in ${props.plugin.name}?\n\nThe plugin restarts without it. The claim and its data stay in the cluster; Scarab does not delete them.`,
+      )
+    )
+      return;
+    setError(null);
+    try {
+      await deletePluginStorage(props.org, props.plugin.name);
+      props.onChanged(`${props.plugin.name} no longer mounts ${s.claim}; the claim is left as it is.`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : `Could not remove ${props.plugin.name}'s storage.`);
+    }
+  };
+
+  return (
+    <div class="plg-conns">
+      <div class="token-form">
+        <div class="form-r">
+          <label>claim</label>
+          <input
+            class="input mono"
+            placeholder="argocd-state"
+            value={form().claim}
+            onInput={(e) => set("claim", e.currentTarget.value)}
+          />
+          <p class="fieldnote">
+            A PersistentVolumeClaim in the plugin namespace. An operator creates it with the
+            annotation{" "}
+            <span class="mono">
+              {current()?.owner_annotation ?? "scarab.io/plugin-installation"}={owner()}
+            </span>
+            ; until it has that annotation the plugin does not start.
+          </p>
+        </div>
+        <div class="form-r">
+          <label>mount path</label>
+          <input
+            class="input mono"
+            placeholder={DEFAULT_STORAGE_MOUNT_PATH}
+            value={form().mount_path}
+            onInput={(e) => set("mount_path", e.currentTarget.value)}
+          />
+        </div>
+        <p class="fieldnote">
+          <Icon icon="shield-check" size={12} /> {STORAGE_NOTE} Moving it to another claim or path
+          asks you to confirm with your passkey.
+        </p>
+        <Show when={built().error && form().claim.trim() !== ""}>
+          <p class="error">{built().error}</p>
+        </Show>
+        <Show when={error()}>
+          <p class="error">{error()}</p>
+        </Show>
+        <div class="modal-actions">
+          <button class="btn btn-primary btn-sm" disabled={!built().body || saving()} onClick={() => void save()}>
+            {saving() ? "Saving…" : "Save"}
+          </button>
+          <Show when={current()}>
+            <button class="btn btn-ghost btn-sm" onClick={() => void remove()}>
+              Remove
+            </button>
+          </Show>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -392,7 +461,7 @@ function Connections(props: { org: string; installation: string }) {
   };
 
   return (
-    <div class="plg-unmapped">
+    <div class="plg-conns">
       <Show when={error()}>
         <p class="error">{error()}</p>
       </Show>
@@ -478,8 +547,8 @@ function ConnectionRow(props: {
   };
 
   return (
-    <div class="plg-unmapped-row">
-      <span class="mono plg-grouping">{c().slot}</span>
+    <div class="plg-conn-row">
+      <span class="mono plg-slot">{c().slot}</span>
       <span class="mono" title="Every request the plugin sends on this connection goes here, and nowhere else.">
         {c().base_url ?? "no destination"}
       </span>
@@ -580,102 +649,6 @@ function ConnectionRow(props: {
             </button>
           </div>
         </div>
-      </Show>
-    </div>
-  );
-}
-
-/** The groupings an installation reports on that no Environment lists, each
- *  with a shortcut to add it as a source. */
-function Unmapped(props: {
-  org: string;
-  installation: string;
-  orgEnvs: OrgEnvironment[] | null;
-  onSourceAdded: (msg: string) => void;
-}) {
-  const [epoch, setEpoch] = createSignal(0);
-  const [groupings] = createResource(
-    () => ({ org: props.org, name: props.installation, epoch: epoch() }),
-    (k) => listUnmappedGroupings(k.org, k.name),
-  );
-  const [error, setError] = createSignal<string | null>(null);
-  const envs = () => props.orgEnvs ?? [];
-
-  const add = async (grouping: string, envName: string) => {
-    setError(null);
-    try {
-      // Re-read first: the PUT is a FULL replace, and the copy this panel
-      // holds may predate an edit made in the Environments panel since.
-      const env = (await listOrgEnvironments(props.org))?.find((e) => e.name === envName);
-      if (!env) throw new Error(`${envName} is no longer registered.`);
-      const built = withSource(env, props.installation, grouping);
-      if (!built.body) throw new Error(built.error);
-      await putOrgEnvironment(props.org, env.name, built.body);
-      setEpoch((e) => e + 1);
-      props.onSourceAdded(sourceAddedNotice(env.name, props.installation, grouping));
-    } catch (e) {
-      setError(e instanceof Error ? e.message : `Could not add the source to ${envName}.`);
-    }
-  };
-
-  return (
-    <div class="plg-unmapped">
-      <Show when={error()}>
-        <p class="error">{error()}</p>
-      </Show>
-      <Show when={!groupings.loading} fallback={<p class="empty">loading…</p>}>
-        <Show when={!groupings.error} fallback={<p class="error">Could not load unmapped groupings.</p>}>
-          <For
-            each={groupings() ?? []}
-            fallback={<p class="empty">Nothing dropped: every grouping it reports on is mapped.</p>}
-          >
-            {(g) => {
-              // Preselected only on a name match; otherwise blank until the
-              // admin picks — never the first Environment by default.
-              const [pick, setPick] = createSignal(suggestEnvironment(g.vendor_grouping, envs()) ?? "");
-              return (
-                <div class="plg-unmapped-row">
-                  <span class="mono plg-grouping">{g.vendor_grouping}</span>
-                  <span class="subtle" title={`first ${absTime(g.first_at)} · last ${absTime(g.last_at)}`}>
-                    {g.reports} report{g.reports === 1 ? "" : "s"} dropped · last {relTime(g.last_at)} ·{" "}
-                    <span class="mono">{g.last_target_id}</span>
-                  </span>
-                  <Show
-                    when={envs().length > 0}
-                    fallback={<span class="subtle">register an environment above to route it</span>}
-                  >
-                    <span class="plg-add">
-                      <select class="input" value={pick()} onChange={(e) => setPick(e.currentTarget.value)}>
-                        <option value="" disabled>
-                          route to…
-                        </option>
-                        <For each={envs()}>
-                          {(e) => (
-                            <option value={e.name} selected={e.name === pick()}>
-                              {e.name}
-                            </option>
-                          )}
-                        </For>
-                      </select>
-                      <button
-                        class="btn btn-ghost btn-sm"
-                        disabled={!pick()}
-                        title={
-                          pick()
-                            ? `Add ${props.installation} / ${g.vendor_grouping} to ${pick()}'s deployment sources`
-                            : "Pick the environment its reports belong in"
-                        }
-                        onClick={() => pick() && void add(g.vendor_grouping, pick())}
-                      >
-                        <Icon icon="plus" size={12} /> add as source
-                      </button>
-                    </span>
-                  </Show>
-                </div>
-              );
-            }}
-          </For>
-        </Show>
       </Show>
     </div>
   );
@@ -787,8 +760,8 @@ function InstallDialog(props: {
               onInput={(e) => setName(e.currentTarget.value)}
             />
             <p class="fieldnote">
-              A DNS-1123 label: lowercase letters, digits and "-", at most 63. Its reports carry
-              it as their source, and it acts as <span class="mono">plugin:{name() || "<name>"}</span>.
+              A DNS-1123 label: lowercase letters, digits and "-", at most 63. It acts as{" "}
+              <span class="mono">plugin:{name() || "<name>"}</span>.
               Unique in the org and never reused — not even after an uninstall.
             </p>
           </div>

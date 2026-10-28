@@ -267,17 +267,16 @@ async fn webhook_deploys_once_the_project_is_eligible() {
     assert_eq!(runs.len(), 2, "CI and the deploy both ran");
 }
 
-/// git-bug 66171a0: a deploy whose target names a required, default-less
-/// input cannot bind on a push (a webhook supplies no parameters). That is
-/// an admission refusal of that pipeline alone — decided before anything is
-/// persisted — so the repo's ordinary CI still runs.
+/// ADR-0074: a pipeline that still declares `deployment_requests` fails the
+/// Pipeline check, naming the replacement — and, like any file that does not
+/// compile (ADR-0009, below), it fails the whole delivery; nothing runs.
 #[tokio::test]
-async fn a_pipeline_that_cannot_run_is_refused_alone_and_the_rest_still_run() {
-    // Path-sorted before `ci.yaml`, so the loop must get past it.
-    let forge = forge().with_file(".scarab/a-deploy.yaml", UNBINDABLE_DEPLOY);
+async fn a_pipeline_using_the_removed_deployment_record_fails_the_delivery_naming_the_replacement()
+{
+    let forge = forge().with_file(".scarab/a-deploy.yaml", RETIRED_DEPLOY);
     let db = InMemoryDb::new();
     let governance = prod_for_everyone();
-    let outcome = trigger_runs_from_event(
+    let err = trigger_runs_from_event(
         &forge,
         &db,
         &FakeClock::new(1_000),
@@ -285,34 +284,19 @@ async fn a_pipeline_that_cannot_run_is_refused_alone_and_the_rest_still_run() {
         &push(),
     )
     .await
-    .expect("an unbindable deploy target never aborts the delivery");
-    let pipelines: Vec<&str> = outcome
-        .refused
-        .iter()
-        .map(|r| r.pipeline.as_str())
-        .collect();
-    assert_eq!(
-        pipelines,
-        [".scarab/a-deploy.yaml"],
-        "{:?}",
-        outcome.refused
-    );
-    assert_eq!(outcome.refused[0].environment, "prod");
-    assert!(
-        outcome.refused[0].reason.contains("inputs.app"),
-        "names the input: {:?}",
-        outcome.refused[0]
-    );
-    // ci.yaml and deploy.yaml both ran.
-    assert_eq!(outcome.runs.len(), 2, "{outcome:?}");
-    // Nothing of the refused pipeline was persisted.
-    let persisted = db.list_runs(100).await.unwrap();
-    assert_eq!(persisted.len(), 2, "{persisted:?}");
+    .expect_err("a retired field fails the Pipeline check");
+    match &err {
+        scarab_server::TriggerError::Pipeline(msg) => {
+            assert!(msg.contains(scarab_pipeline::RETIRED_DEPLOYMENTS), "{msg}")
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(db.list_runs(100).await.unwrap().is_empty());
 }
 
 /// ADR-0009: a file that fails to compile fails the whole trigger — a repo's
 /// CI is all-or-nothing per delivery, never silently partial. Only the
-/// pre-persist deploy-target binding refusal above is per-pipeline.
+/// Environment refusals are per-pipeline.
 #[tokio::test]
 async fn a_pipeline_that_does_not_compile_still_fails_the_delivery() {
     let forge = forge().with_file(".scarab/broken.yaml", "steps: [ { id: x, image");
@@ -334,20 +318,17 @@ async fn a_pipeline_that_does_not_compile_still_fails_the_delivery() {
 }
 
 /// A deploy whose target reads a required input with no default.
-const UNBINDABLE_DEPLOY: &str = r#"
+const RETIRED_DEPLOY: &str = r#"
 on:
   push: {}
 environment: prod
-interface:
-  inputs:
-    - { name: app, type: string, required: true }
 steps:
   - id: bump
     image: busybox
     command: ["true"]
     results: [version]
     deployment_requests:
-      - target: { source: argocd, id: "${{ inputs.app }}" }
+      - target: { source: argocd, id: web }
         version: version
 "#;
 

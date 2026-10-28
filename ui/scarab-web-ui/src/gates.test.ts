@@ -108,102 +108,27 @@ describe("approvableGates", () => {
   });
 });
 
-// --- slice b, criterion 5: verdicts, waits, holds, reject ------------------
-
-const waitingDeploy = (over: Record<string, unknown> = {}) => ({
-  id: "live",
-  status: "pending",
-  gate: "deployment",
-  needs: ["bump"],
-  attempt_list: [{ id: "a1" }],
-  deployment_gate: {
-    target_source: "argocd",
-    target_id: "web",
-    deployment_status: "in_progress",
-    latest_label: "sync wave 3",
-  },
-  ...over,
-});
+// --- slice b, criterion 5: verdicts and reject -----------------------------
 
 const resolved = (passed: boolean, over: Record<string, unknown> = {}) => ({
   id: "live",
   status: passed ? "succeeded" : "failed",
-  gate: "deployment",
+  gate: "external",
   needs: ["bump"],
   attempt_list: [{ id: "a1" }],
   gate_resolution: {
     passed,
-    reason: passed ? "v1 live on `argocd`/`web`: Healthy" : "ImagePullBackOff",
+    reason: passed ? "smoke tests green" : "ImagePullBackOff",
     attempt: "a1",
   },
   ...over,
 });
 
 describe("gateStatus", () => {
-  it("says what a waiting DeploymentGate waits on: target, status, label", () => {
-    expect(gateStatus(waitingDeploy())).toEqual({
-      tone: "waiting",
-      text: 'waiting on argocd/web (in progress, "sync wave 3")',
-    });
-  });
-
-  it("names the status alone when the source has no label yet", () => {
-    const s = waitingDeploy({
-      deployment_gate: { target_source: "argocd", target_id: "web", deployment_status: "requested" },
-    });
-    expect(gateStatusText(s)).toBe("waiting on argocd/web (requested)");
-  });
-
-  // git-bug ec84c5d: the Deployment's status runs on its Environment's baseline
-  // over its lifetime; a retried gate waits afresh on its own deadline. With
-  // `fails_at`, the line says whose status "stalled" is and when the GATE fails.
-  it("names the Deployment's status apart from when the gate itself fails", () => {
-    const s = waitingDeploy({
-      deployment_gate: {
-        target_source: "argocd",
-        target_id: "web",
-        deployment_status: "stalled",
-        fails_at: 7_320_000,
-      },
-    });
-    const at = (ms: number) => `T+${ms / 1000}s`;
-    expect(gateStatus(s, at)).toEqual({
-      tone: "waiting",
-      text: "waiting on argocd/web (Deployment: stalled · gate fails at T+7320s)",
-    });
-  });
-
-  it("keeps the source's label beside the Deployment's status", () => {
-    const s = waitingDeploy({
-      deployment_gate: {
-        target_source: "argocd",
-        target_id: "web",
-        deployment_status: "in_progress",
-        latest_label: "sync wave 3",
-        fails_at: 60_000,
-      },
-    });
-    expect(gateStatusText(s, (ms) => `@${ms}`)).toBe(
-      'waiting on argocd/web (Deployment: in progress, "sync wave 3" · gate fails at @60000)',
-    );
-  });
-
-  it("says so when the requester's Deployment is not in the record yet", () => {
-    const s = waitingDeploy({ deployment_gate: { target_source: "argocd", target_id: "web" } });
-    expect(gateStatusText(s)).toBe("waiting on argocd/web (no Deployment recorded yet)");
-  });
-
-  it("says the record could not be read, never that no Deployment is recorded", () => {
-    const s = waitingDeploy({
-      deployment_gate: { target_source: "argocd", target_id: "web", record_unreadable: true },
-    });
-    expect(gateStatusText(s)).toBe("waiting on argocd/web (Deployment record could not be read)");
-  });
-
   it("shows a passed verdict with its reason", () => {
     expect(gateStatus(resolved(true))).toEqual({
       tone: "passed",
-      text: "passed: v1 live on `argocd`/`web`: Healthy",
+      text: "passed: smoke tests green",
     });
   });
 
@@ -217,19 +142,6 @@ describe("gateStatus", () => {
       gate_resolution: { passed: false, reason: "wrong build", attempt: "a1", by: "j.lee" },
     });
     expect(gateStatusText(s)).toBe("failed: wrong build (rejected by j.lee)");
-  });
-
-  it("shows a hold with one `held:` prefix, not two", () => {
-    // The server's reason already reads "held: waiting for …".
-    const s = {
-      id: "bump",
-      status: "pending",
-      held: "held: waiting for deployment concurrency on `argocd`/`web` (1/1 in flight)",
-    };
-    expect(gateStatus(s)).toEqual({
-      tone: "held",
-      text: "held: waiting for deployment concurrency on `argocd`/`web` (1/1 in flight)",
-    });
   });
 
   it("has nothing to say for a plain step or an open manual gate", () => {
@@ -259,32 +171,28 @@ describe("isRejectable", () => {
   const statusOf = (s: string) => statuses[s];
 
   it("covers every gate kind once its needs succeeded", () => {
-    for (const kind of ["manual", "timer", "external", "deployment"]) {
+    for (const kind of ["manual", "timer", "external"]) {
       expect(isRejectable(gate("g", "pending", kind, ["bump"]), statusOf)).toBe(true);
     }
   });
 
   it("is false while a need is unfinished — the server 409s 'not reached yet'", () => {
-    expect(isRejectable(gate("g", "pending", "deployment", ["test"]), statusOf)).toBe(false);
+    expect(isRejectable(gate("g", "pending", "external", ["test"]), statusOf)).toBe(false);
   });
 
   it("is false for a settled gate and for a plain step", () => {
     expect(isRejectable(gate("g", "failed", "manual", ["bump"]), statusOf)).toBe(false);
     expect(isRejectable({ status: "pending", needs: ["bump"] }, statusOf)).toBe(false);
   });
-
-  it("never makes a DeploymentGate approvable", () => {
-    expect(isApprovable(gate("g", "pending", "deployment"))).toBe(false);
-  });
 });
 
 describe("actionableGates", () => {
-  it("lists every open gate a human can approve or reject, timer and deployment included", () => {
+  it("lists every open gate a human can approve or reject, timer and external included", () => {
     const steps = [
       gate("approve", "pending"),
       gate("wait", "pending", "timer"),
-      gate("live", "pending", "deployment"),
-      gate("done", "succeeded", "deployment"),
+      gate("live", "pending", "external"),
+      gate("done", "succeeded", "external"),
       { id: "build", status: "pending" },
     ];
     expect(actionableGates(steps).map((s) => s.id)).toEqual(["approve", "wait", "live"]);
@@ -295,7 +203,7 @@ describe("actionableGateIds", () => {
   it("is the same ids, in step order, across polls that replace every step object", () => {
     // Two polls of one run: fresh objects, same gates. The gate bar keys its
     // rows by these, so an open Reject form survives the second poll.
-    const poll = () => [gate("approve", "pending"), gate("live", "pending", "deployment")];
+    const poll = () => [gate("approve", "pending"), gate("live", "pending", "external")];
     const first = poll();
     const second = poll();
     expect(first[1]).not.toBe(second[1]);
@@ -322,14 +230,14 @@ describe("rejectReasonError", () => {
 describe("gateWaitHint", () => {
   const statusOf = (s: string) => (s === "bump" ? "succeeded" : "running");
 
-  it("names a DeploymentGate's target and Deployment", () => {
-    expect(gateWaitHint(waitingDeploy(), statusOf)).toBe(
-      'waiting on argocd/web (in progress, "sync wave 3")',
+  it("says what an external gate waits for once reached", () => {
+    expect(gateWaitHint(gate("live", "pending", "external", ["bump"]), statusOf)).toBe(
+      "waiting for an external release",
     );
   });
 
   it("names unmet needs first", () => {
-    expect(gateWaitHint(waitingDeploy({ needs: ["test"] }), statusOf)).toBe("waiting on test");
+    expect(gateWaitHint(gate("live", "pending", "external", ["test"]), statusOf)).toBe("waiting on test");
   });
 });
 
@@ -375,9 +283,9 @@ describe("inbox row text", () => {
   });
 
   it("reviews a wait no human approves, and names every waiting gate", () => {
-    const r = { status: "suspended", waiting_gates: [g("live", "deployment"), g("soak", "timer")] };
+    const r = { status: "suspended", waiting_gates: [g("live", "external"), g("soak", "timer")] };
     expect(inboxVerb(r)).toBe("review");
-    expect(inboxDetail(r)).toBe("gates live (deployment), soak (timer) waiting");
+    expect(inboxDetail(r)).toBe("gates live (external), soak (timer) waiting");
   });
 
   it("keeps the old wording for a suspended run without waiting_gates", () => {

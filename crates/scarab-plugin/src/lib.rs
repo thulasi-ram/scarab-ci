@@ -19,12 +19,6 @@
 //!   *(image digest, manifest)*; nothing changes without another admin
 //!   action (ADR-0072 §10). A manifest with a field this release does not
 //!   understand is refused, never partly read.
-//! - **Core sets the source.** A report never names its source; the broker
-//!   sets it from the verified ServiceAccount's installation (ADR-0072 §11).
-//!   [`ReportItem`] has no such field and refuses unknown ones.
-//! - **Transitions, in source order** (ADR-0070 §11). Each report carries an
-//!   idempotency key and a sequence per *(installation, DeploymentTarget)*;
-//!   a repeat is dropped and a sequence that is not newer is stale.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -33,7 +27,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 mod connection;
-mod report;
+mod storage;
 mod store;
 
 pub use connection::{
@@ -43,23 +37,18 @@ pub use connection::{
     MAX_PROXY_PATH_CHARS, MAX_PROXY_PATH_SEGMENTS, MAX_PROXY_QUERY_CHARS, MAX_PROXY_QUERY_PARAMS,
 };
 
-pub use report::{
-    OwnershipReportItem, ReportIngest, ReportItem, ReportItemOutcome, ReportOutcome,
-    ReportedStatus, StatusReportItem, MAX_IDEMPOTENCY_KEY_CHARS, MAX_OWNER_PROJECTS,
-    MAX_OWNER_SEGMENT_BYTES, MAX_REPORT_ITEMS, MAX_REPORT_LABEL_CHARS, MAX_REPORT_LINK_CHARS,
-    MAX_REPORT_SEQUENCE, MAX_TARGET_ID_CHARS, MAX_VERSION_CHARS, MAX_VERSION_SCHEME_CHARS,
-};
-pub use store::{
-    DeploymentSourceTarget, EnvironmentTargetsPage, InstallationDeploymentSource,
-    InstallationUsage, PluginStore, PluginStoreError, PluginUninstall, SourceTargetsPage,
-    TargetRouting, UnmappedGrouping, MAX_TARGETS_PER_INSTALLATION,
-    MAX_UNMAPPED_GROUPINGS_PER_INSTALLATION, PAGE_DEFAULT_LIMIT, PAGE_MAX_LIMIT,
-    REPORT_RECEIPT_RETENTION_MS,
+pub use storage::{
+    storage_owner, validate_storage_claim, validate_storage_mount_path, PluginStorage,
+    DEFAULT_PLUGIN_STORAGE_MOUNT_PATH, MAX_STORAGE_CLAIM_CHARS, MAX_STORAGE_MOUNT_PATH_CHARS,
+    PLUGIN_STORAGE_OWNER_ANNOTATION, RESERVED_PLUGIN_MOUNT_PATHS,
 };
 
-/// The longest installation or plugin name: a DNS-1123 label. Installation
-/// names become `DeploymentTarget.source` and plugin names a catalog key;
-/// both name Kubernetes objects in slice (d2).
+pub use store::{
+    PluginStore, PluginStoreError, PluginUninstall, PAGE_DEFAULT_LIMIT, PAGE_MAX_LIMIT,
+};
+
+/// The longest installation or plugin name: a DNS-1123 label. Plugin names
+/// are a catalog key; both name Kubernetes objects in slice (d2).
 pub use scarab_project::MAX_INSTALLATION_NAME_CHARS;
 
 /// How many hex characters a server-minted installation id has.
@@ -103,10 +92,12 @@ pub const PLUGIN_ENV_BROKER_TOKEN_FILE: &str = "SCARAB_BROKER_TOKEN_FILE";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginCapability {
-    /// DeploymentStatusReports and DeploymentTargetProjectOwnership for the
-    /// sources an Environment admits (ADR-0071 §5, ADR-0070 §11).
+    /// Retired by ADR-0074 with the Deployment record: plugins no longer
+    /// report deployments into core. Still parses, so a manifest approved
+    /// before then can be read back, but [`admit_for_mmp`] refuses it by
+    /// name.
     ReportDeployments,
-    /// Read-only Run and Deployment events.
+    /// Read-only Run events.
     SubscribeEvents,
     /// Declare PluginActions humans or Runs may invoke (ADR-0072 §4).
     OfferActions,
@@ -150,13 +141,10 @@ impl fmt::Display for PluginCapability {
     }
 }
 
-/// The capabilities this release can run (ADR-0072, MMP horizon): reporting,
-/// and connections with **read** rules only. Everything else is refused at
+/// The capabilities this release can run (ADR-0072, MMP horizon):
+/// connections with **read** rules only. Everything else is refused at
 /// install, by name, rather than accepted and ignored.
-pub const MMP_ADMITTED_CAPABILITIES: [PluginCapability; 2] = [
-    PluginCapability::ReportDeployments,
-    PluginCapability::UseConnection,
-];
+pub const MMP_ADMITTED_CAPABILITIES: [PluginCapability; 1] = [PluginCapability::UseConnection];
 
 /// An allowed request shape on a PluginConnection (ADR-0072 §5): a method,
 /// a path pattern (`*` matching exactly one segment) and the query keys the
@@ -452,8 +440,8 @@ pub fn admit_for_mmp(manifest: &PluginManifest) -> Result<(), PluginError> {
     Ok(())
 }
 
-/// Whether an installation's reports and broker calls are accepted. The kill
-/// switch (ADR-0072 §10): `Killed` stops both at once, without an upgrade or
+/// Whether an installation's broker calls are accepted. The kill switch
+/// (ADR-0072 §10): `Killed` stops them at once, without an upgrade or
 /// uninstall, and revokes at the token-to-installation mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InstallationState {
@@ -524,10 +512,9 @@ impl RuntimeStatus {
 /// An org's approval to run one pinned digest of a Plugin with its
 /// PluginManifest (ADR-0072 §10).
 ///
-/// `name` is unique per Org, **never reused** there once uninstalled, and is
-/// what reports carry as `DeploymentTarget.source` — a reused name would let
-/// a new installation inherit another's Deployment history and Environment
-/// sources. `id` is server-minted, unique across Orgs, and names the
+/// `name` is unique per Org and **never reused** there once uninstalled — a
+/// reused name would let a new installation inherit another's history.
+/// `id` is server-minted, unique across Orgs, and names the
 /// installation's ServiceAccount, so a reinstall gets a new id and the old
 /// tokens map to nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -552,6 +539,9 @@ pub struct PluginInstallation {
     pub approved_at: i64,
     pub killed_by: Option<String>,
     pub killed_at: Option<i64>,
+    /// The operator-made PersistentVolumeClaim its Pod mounts (ADR-0074 §7);
+    /// `None` = no storage beyond the scratch `/tmp`.
+    pub storage: Option<PluginStorage>,
 }
 
 impl PluginInstallation {
@@ -578,12 +568,22 @@ impl PluginInstallation {
                 self.plugin, self.manifest.plugin
             )));
         }
-        self.manifest.validate_config(&self.config)
+        self.manifest.validate_config(&self.config)?;
+        if let Some(storage) = &self.storage {
+            storage.validate()?;
+        }
+        Ok(())
+    }
+
+    /// What [`PLUGIN_STORAGE_OWNER_ANNOTATION`] must say on its storage
+    /// claim: `<org>/<name>`.
+    pub fn storage_owner(&self) -> String {
+        storage_owner(&self.org, &self.name)
     }
 }
 
 /// An installation's identity (ADR-0072 §3): `plugin:<name>`, tied to no
-/// human. Under it the installation reports, calls the broker, and — once
+/// human. Under it the installation calls the broker, and — once
 /// named an approver (target state) — approves.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PluginPrincipal(String);
@@ -612,7 +612,7 @@ impl fmt::Display for PluginPrincipal {
 }
 
 /// The installation-name rule: a DNS-1123 label (it becomes a Kubernetes
-/// object name in slice d2 and `DeploymentTarget.source` here).
+/// object name in slice d2).
 pub fn validate_installation_name(name: &str) -> Result<(), PluginError> {
     if is_dns1123_label(name) {
         Ok(())
@@ -699,8 +699,8 @@ pub enum PluginError {
     /// The manifest asks for a capability this release cannot run (ADR-0072
     /// implementation horizon). Lists them, comma-separated.
     #[error(
-        "this Scarab release cannot run plugins that ask for: {0} (only report_deployments \
-         and read-only use_connection are available, ADR-0072)"
+        "this Scarab release cannot run plugins that ask for: {0} (only read-only \
+         use_connection is available, ADR-0072; report_deployments was removed by ADR-0074)"
     )]
     CapabilityNotAdmitted(String),
 }
@@ -720,10 +720,7 @@ mod tests {
     fn argo_like() -> PluginManifest {
         PluginManifest {
             plugin: "argocd".into(),
-            capabilities: vec![
-                PluginCapability::ReportDeployments,
-                PluginCapability::UseConnection,
-            ],
+            capabilities: vec![PluginCapability::UseConnection],
             connections: vec![ConnectionSlot {
                 name: "argocd".into(),
                 auth_schemes: vec!["bearer".into()],
@@ -758,6 +755,7 @@ mod tests {
     #[test]
     fn admission_refuses_every_capability_beyond_the_mmp_by_name() {
         for capability in [
+            PluginCapability::ReportDeployments,
             PluginCapability::SubscribeEvents,
             PluginCapability::OfferActions,
             PluginCapability::ContributeUi,
@@ -773,22 +771,23 @@ mod tests {
                 "{capability}"
             );
         }
-        // Reporting alone, with no connection, is admitted too.
-        let report_only = PluginManifest {
-            plugin: "reporter".into(),
-            capabilities: vec![PluginCapability::ReportDeployments],
-            connections: vec![],
-            config_keys: vec![],
-        };
-        assert_eq!(admit_for_mmp(&report_only), Ok(()));
+        // A manifest approved before ADR-0074 still parses, so it can be
+        // read back; only admission refuses it.
+        let json = r#"{"plugin":"argocd","capabilities":["report_deployments"]}"#;
+        let m: PluginManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(m.validate(), Ok(()));
+        assert!(matches!(
+            admit_for_mmp(&m),
+            Err(PluginError::CapabilityNotAdmitted(_))
+        ));
     }
 
     #[test]
     fn a_manifest_with_an_unknown_field_is_refused_not_partly_read() {
-        let json = r#"{"plugin":"argocd","capabilities":["report_deployments"],
+        let json = r#"{"plugin":"argocd","capabilities":["subscribe_events"],
                        "write_rules":[{"method":"POST","path":"/x"}]}"#;
         assert!(serde_json::from_str::<PluginManifest>(json).is_err());
-        let json = r#"{"plugin":"argocd","capabilities":["report_deployments"]}"#;
+        let json = r#"{"plugin":"argocd","capabilities":["subscribe_events"]}"#;
         let m: PluginManifest = serde_json::from_str(json).unwrap();
         assert_eq!(m.validate(), Ok(()));
     }
@@ -860,7 +859,7 @@ mod tests {
     #[test]
     fn connections_and_use_connection_come_together() {
         let mut m = argo_like();
-        m.capabilities = vec![PluginCapability::ReportDeployments];
+        m.capabilities = vec![PluginCapability::SubscribeEvents];
         assert!(matches!(m.validate(), Err(PluginError::InvalidManifest(_))));
         let mut m = argo_like();
         m.connections.clear();
@@ -873,7 +872,7 @@ mod tests {
         let cases: Vec<Mutation> = vec![
             Box::new(|m| m.plugin = "Argo CD".into()),
             Box::new(|m| m.capabilities.clear()),
-            Box::new(|m| m.capabilities.push(PluginCapability::ReportDeployments)),
+            Box::new(|m| m.capabilities.push(PluginCapability::UseConnection)),
             Box::new(|m| m.connections[0].auth_schemes = vec!["basic".into()]),
             Box::new(|m| m.connections[0].auth_schemes.clear()),
             Box::new(|m| m.connections.push(m.connections[0].clone())),

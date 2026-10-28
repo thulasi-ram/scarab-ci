@@ -3,9 +3,10 @@
   What the plugin runtime (ADR-0072 §9) may do — and nothing more.
 
   In the plugin namespace: one ServiceAccount + Deployment per installation,
-  the isolation probe's Pods (and their logs), and the namespace's
+  the isolation probe's Pods (and their logs), the namespace's
   NetworkPolicies (default-deny + plugin-egress + the probe's two
-  allowances). It does NOT get to label namespaces: the runtime only reads the
+  allowances), and read access to PersistentVolumeClaims (a plugin's
+  storage claim, which an operator creates). It does NOT get to label namespaces: the runtime only reads the
   Pod Security level (the get below, on this one namespace), so it can never
   lower it.
 
@@ -41,6 +42,12 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
     verbs: ["get", "list", "create", "patch", "delete"]
+  - apiGroups: [""]
+    # A plugin's storage claim (ADR-0074 §7): read before it is mounted (it
+    # must exist and be annotated for the installation) and to report why
+    # the plugin is waiting. Read only: Scarab never creates or deletes one.
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

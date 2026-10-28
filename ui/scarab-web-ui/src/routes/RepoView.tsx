@@ -3,14 +3,16 @@
 // facts (author · ref · duration) under a header line (sha · status · trigger ·
 // when), fed by the origin fields RunSummaryDto now carries. Duration ticks live
 // for in-flight runs. The runs list filters by status, author, branch, PR,
-// pipeline and environment. The header CTA is contextual to the active tab.
+// pipeline, environment and deploys — environment and deploys on the server
+// (ADR-0074 §2: it is how a Project's older deploys are found), the rest over
+// the loaded page. The header CTA is contextual to the active tab.
 //
 // The active tab and every filter live in the URL query (`?tab=secrets`,
 // `?pipeline=ci&env=production`), not in component signals — so a refresh, a
 // shared link and the back button all land where you were. The defaults (Runs
 // tab, no filter) are the absent params, which keeps the bare repo URL clean.
 import { createResource, createSignal, createEffect, onCleanup, For, Show } from "solid-js";
-import { A, useParams, useNavigate, useSearchParams } from "@solidjs/router";
+import { useParams, useNavigate, useSearchParams } from "@solidjs/router";
 import { recordVisit } from "../visited";
 import {
   listRepoRuns,
@@ -23,13 +25,12 @@ import {
   type ProjectEnvironment,
 } from "../api/client";
 import {
-  concurrencyLabel,
   isPermissive,
-  overlayToForm,
   refLayersLabel,
   rulesSummary,
+  rulesToForm,
   tightenable,
-  toOverlayBody,
+  toProtectionBody,
 } from "../environment-overlays";
 import { relTime, absTime, duration } from "../fmt";
 import { forgeCommitUrl, forgePrUrl } from "../forge";
@@ -43,7 +44,7 @@ import ScopedSecrets from "../components/ScopedSecrets";
 import SecretMatrixEditor from "../components/SecretMatrixEditor";
 import Doodle from "../components/Doodle";
 import AsciiScene from "../components/AsciiScene";
-import { deploymentsHref } from "../deployments";
+import { runEnvironmentOptions, runListFilter } from "../runs-filter";
 import ponderIdle from "../../../brand/ascii/generated/ponder-ponder.json";
 
 type Tab = "runs" | "environments" | "secrets" | "settings";
@@ -119,11 +120,6 @@ export default function RepoView() {
   // Remember this repo for the dashboard's "recently visited" row (browser-local).
   createEffect(() => recordVisit(org(), repo()));
 
-  // Only this repo's tenanted runs, straight from the per-repo endpoint (ADR-0046).
-  const [rows, { refetch }] = createResource(
-    () => ({ org: org(), repo: repo() }),
-    (k): Promise<RunSummary[]> => listRepoRuns(k.org, k.repo, 50),
-  );
   // The repo's forge web base (for commit/PR deep links); shared by all rows.
   const [repoUrl] = createResource(
     () => ({ org: org(), repo: repo() }),
@@ -147,7 +143,8 @@ export default function RepoView() {
     return v === "running" || v === "failed" ? v : "all";
   };
   const setStatusFilter = (f: StatusFilter) => filterSetter("status")(f === "all" ? "" : f);
-  // Origin filters, client-side over the already-fetched rows. `""` = "any";
+  // Origin filters, client-side over the already-fetched rows (the Environment
+  // and Deploys filters are sent to the server instead; see `rows`). `""` = "any";
   // `prFilter` holds the PR number stringified (search params are strings).
   const authorFilter = () => one(search.author);
   const setAuthorFilter = filterSetter("author");
@@ -159,6 +156,31 @@ export default function RepoView() {
   const setPipelineFilter = filterSetter("pipeline");
   const envFilter = () => one(search.env);
   const setEnvFilter = filterSetter("env");
+  // Deploys toggle (`?deploy=1`): only deploy Runs — a pipeline or Step marked
+  // `deploy: true` (ADR-0074 §2). Server-side, like the Environment.
+  const deploysOnly = () => one(search.deploy) === "1";
+  const setDeploysOnly = (on: boolean) => filterSetter("deploy")(on ? "1" : "");
+
+  // Only this repo's tenanted runs, straight from the per-repo endpoint
+  // (ADR-0046). The Environment and Deploys filters are part of the request,
+  // so they fetch the newest matching runs rather than filtering the newest
+  // page.
+  const [rows, { refetch }] = createResource(
+    () => ({ org: org(), repo: repo(), env: envFilter(), deploys: deploysOnly() }),
+    (k): Promise<RunSummary[]> =>
+      listRepoRuns(k.org, k.repo, 50, runListFilter(k.env, k.deploys)),
+  );
+  // The Project's Environments, for the Environment picker's options — the
+  // loaded rows are already one Environment's once the filter is on. A caller
+  // who can't read them still gets the Environments seen on runs.
+  const [projectEnvs] = createResource(
+    () => ({ org: org(), repo: repo() }),
+    (k) =>
+      listEnvironments(k.org, k.repo)
+        .then((es) => es.map((e) => e.name))
+        .catch(() => [] as string[]),
+  );
+
   /** `undefined` = closed; `""` = open with no Environment picked; a name =
    *  open on that Environment (its overlay prefilled). */
   const [envDialog, setEnvDialog] = createSignal<string | undefined>(undefined);
@@ -177,12 +199,14 @@ export default function RepoView() {
 
   // Option sets for the origin dropdowns, derived from whatever the fetched rows
   // actually carry — so you only ever pick a value that exists. A dropdown with
-  // no values is hidden (see the JSX), not shown empty.
+  // no values is hidden (see the JSX), not shown empty. Environments also take
+  // the Project's own list, since the rows are filtered on the server.
   const authors = () => distinct(rows() ?? [], (r) => r.actor).sort();
   const branches = () => distinct(rows() ?? [], branchLabel).sort();
   const prNumbers = () => distinct(rows() ?? [], (r) => r.pr_number).sort((a, b) => b - a);
   const pipelines = () => distinct(rows() ?? [], (r) => r.pipeline).sort();
-  const environments = () => distinct(rows() ?? [], (r) => r.environment).sort();
+  const environments = () =>
+    runEnvironmentOptions(projectEnvs() ?? [], rows() ?? [], envFilter());
 
   const anyFilterOn = () =>
     statusFilter() !== "all" ||
@@ -190,11 +214,12 @@ export default function RepoView() {
     !!branchFilter() ||
     !!prFilter() ||
     !!pipelineFilter() ||
-    !!envFilter();
+    !!envFilter() ||
+    deploysOnly();
 
   const clearFilters = () =>
     setSearch(
-      { status: "", author: "", branch: "", pr: "", pipeline: "", env: "" },
+      { status: "", author: "", branch: "", pr: "", pipeline: "", env: "", deploy: "" },
       { replace: true },
     );
 
@@ -215,7 +240,10 @@ export default function RepoView() {
       if (branch && branchLabel(r) !== branch) return false;
       if (pr && String(r.pr_number ?? "") !== pr) return false;
       if (pipeline && r.pipeline !== pipeline) return false;
+      // Already applied by the server; kept so a page still in flight from
+      // the previous filter never shows under the new one.
       if (env && r.environment !== env) return false;
+      if (deploysOnly() && !r.deploy) return false;
       return true;
     });
   };
@@ -291,6 +319,14 @@ export default function RepoView() {
             )}
           </For>
 
+          <button
+            class={`fpill ${deploysOnly() ? "on" : ""}`}
+            title="only deploy runs: a pipeline or step marked `deploy: true`"
+            onClick={() => setDeploysOnly(!deploysOnly())}
+          >
+            <Icon icon="rocket" size={12} /> deploys
+          </button>
+
           <Show when={pipelines().length > 0}>
             <SearchSelect
               icon="workflow"
@@ -303,11 +339,12 @@ export default function RepoView() {
             />
           </Show>
 
-          {/* Only deploy runs carry an environment (their pipeline declared
-              `environment:`), so this appears once the repo has deployed. */}
+          {/* Only Environment-governed runs carry an environment (their
+              pipeline declared `environment:`), so this appears once the
+              Project has an Environment or a run governed by one. */}
           <Show when={environments().length > 0}>
             <SearchSelect
-              icon="rocket"
+              icon="shield-check"
               clearable
               placeholder="any environment"
               searchPlaceholder="Search environments…"
@@ -367,7 +404,7 @@ export default function RepoView() {
             <Show
               when={filtered().length > 0}
               fallback={
-                (rows() ?? []).length === 0 ? (
+                (rows() ?? []).length === 0 && !envFilter() ? (
                   <div class="empty-scene">
                     <div class="empty-land">
                       <AsciiScene
@@ -413,10 +450,18 @@ export default function RepoView() {
                                 </span>
                               )}
                             </Show>
+                            <Show when={r.deploy}>
+                              <span
+                                class="pfact strong"
+                                title="deploy run: its pipeline or a step is marked `deploy: true`"
+                              >
+                                <Icon icon="rocket" size={12} /> deploy
+                              </span>
+                            </Show>
                             <Show when={r.environment}>
                               {(env) => (
-                                <span class="pfact" title="deploys to environment">
-                                  <Icon icon="rocket" size={12} />
+                                <span class="pfact" title="environment">
+                                  <Icon icon="shield-check" size={12} />
                                   <span class="mono">{env()}</span>
                                 </span>
                               )}
@@ -609,9 +654,7 @@ function RepoEnvironments(props: {
 }
 
 // The history here is APPROVALS — what governance admitted into the
-// environment — not what went live. What is actually live, and how it got
-// there, is the Deployment record (ADR-0070) on /deployments, linked from the
-// panel header.
+// environment — not what went live.
 function EnvPanel(props: {
   org: string;
   repo: string;
@@ -655,9 +698,6 @@ function EnvPanel(props: {
           <Show when={(history() ?? []).length > 0}>
             <span class="subtle mono">last approved {history()![0]!.git_ref}</span>
           </Show>
-          <A class="env-deploy-link" href={deploymentsHref(props.org, props.env.name)}>
-            <Icon icon="rocket" size={12} /> deployments
-          </A>
         </span>
       </div>
       <div class="env-body">
@@ -675,12 +715,6 @@ function EnvPanel(props: {
           <Show when={effective().require_reason}>
             <span class="dotsep">·</span> reason required
           </Show>
-          <Show when={effective().deployment_concurrency != null}>
-            <span class="dotsep">·</span>{" "}
-            <span title="Enforced once deployment requests ship">
-              {concurrencyLabel(effective().deployment_concurrency)}
-            </span>
-          </Show>
         </div>
         <div class="env-layers">
           <div class="env-h-row mono">
@@ -695,15 +729,7 @@ function EnvPanel(props: {
           <div class="env-h-row mono">
             <span class="subtle">{props.repo} overlay</span>{" "}
             <Show when={props.env.overlay} fallback={<span class="subtle">none</span>}>
-              {(o) => (
-                <>
-                  {rulesSummary(o())}
-                  <Show when={props.env.overlay_deployment_gate_deadline_ms != null}>
-                    {" "}· gates stall after{" "}
-                    {Math.round(props.env.overlay_deployment_gate_deadline_ms! / 60_000)} min
-                  </Show>
-                </>
-              )}
+              {(o) => rulesSummary(o())}
             </Show>
             <span class="oenv-actions">
               <Show when={props.env.eligible || props.env.overlay}>
@@ -773,13 +799,11 @@ function EnvDialog(props: {
   );
   const choices = () => tightenable(envs() ?? []);
   const [picked, setPicked] = createSignal(props.initial ?? "");
-  const blank = overlayToForm(null);
+  const blank = rulesToForm(null);
   const [approvers, setApprovers] = createSignal(blank.approvers);
   const [allowedRefs, setAllowedRefs] = createSignal(blank.allowedRefs);
   const [waitTimer, setWaitTimer] = createSignal(blank.waitTimerS);
-  const [concurrency, setConcurrency] = createSignal(blank.concurrency);
   const [requireReason, setRequireReason] = createSignal(blank.requireReason);
-  const [gateDeadline, setGateDeadline] = createSignal(blank.gateDeadlineMinutes);
   const [saving, setSaving] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
 
@@ -787,27 +811,19 @@ function EnvDialog(props: {
   // again on every pick): editing starts from what is stored, never blank.
   createEffect(() => {
     const env = (envs() ?? []).find((e) => e.name === picked());
-    const form = overlayToForm(
-      env?.overlay
-        ? { ...env.overlay, deployment_gate_deadline_ms: env.overlay_deployment_gate_deadline_ms }
-        : null,
-    );
+    const form = rulesToForm(env?.overlay);
     setApprovers(form.approvers);
     setAllowedRefs(form.allowedRefs);
     setWaitTimer(form.waitTimerS);
-    setConcurrency(form.concurrency);
     setRequireReason(form.requireReason);
-    setGateDeadline(form.gateDeadlineMinutes);
   });
 
   const built = () =>
-    toOverlayBody({
+    toProtectionBody({
       approvers: approvers(),
       allowedRefs: allowedRefs(),
       waitTimerS: waitTimer(),
       requireReason: requireReason(),
-      concurrency: concurrency(),
-      gateDeadlineMinutes: gateDeadline(),
     });
   const problem = () => (picked() ? (built().error ?? null) : "Pick an environment.");
 
@@ -904,37 +920,6 @@ function EnvDialog(props: {
               onInput={(e) => setWaitTimer(e.currentTarget.value)}
             />
             <p class="fieldnote">Recorded, not yet enforced.</p>
-          </div>
-          <div class="form-r">
-            <label>concurrency</label>
-            <input
-              class="input"
-              type="number"
-              min="1"
-              placeholder="no limit"
-              value={concurrency()}
-              onInput={(e) => setConcurrency(e.currentTarget.value)}
-            />
-            <p class="fieldnote">
-              In-flight deployments per target; blank = no limit. Enforced once deployment
-              requests ship.
-            </p>
-          </div>
-          <div class="form-r">
-            <label>gate deadline (min)</label>
-            <input
-              class="input"
-              type="number"
-              min="1"
-              step="any"
-              placeholder="the environment's"
-              value={gateDeadline()}
-              onInput={(e) => setGateDeadline(e.currentTarget.value)}
-            />
-            <p class="fieldnote">
-              Only this project's deployment gates, and only if shorter than the
-              environment's deadline.
-            </p>
           </div>
           <div class="form-r">
             <label>require reason</label>

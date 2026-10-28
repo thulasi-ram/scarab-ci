@@ -68,13 +68,23 @@ pub struct PipelineIr {
     /// run is unconstrained. The engine wiring is `Db::set_run_concurrency`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<Concurrency>,
-    /// The deployment environment this pipeline targets, if any (ADR-0024, 0032).
-    /// A pipeline with an `environment:` is a **deploy**: its runs are enforced
-    /// against the environment's protection rules at admission, and they opt out
-    /// of newest-wins auto-cancel (a superseded deploy must not be silently
-    /// cancelled). Absent for ordinary CI pipelines.
+    /// The Environment that governs this pipeline's runs, if any (ADR-0024,
+    /// 0032, 0074 §2): its runs are checked against the Environment's protection
+    /// rules at admission, get its scoped secrets, and opt out of newest-wins
+    /// auto-cancel. Naming an Environment does not mark a run as a deploy; see
+    /// [`PipelineIr::deploy`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<String>,
+    /// `deploy: true` marks this pipeline's runs as **deploy Runs** (ADR-0074
+    /// §2) — what the Runs list's deploy filter selects. Independent of
+    /// `environment:`: an Environment-governed run may be a smoke test or a
+    /// backup, and only the author knows which runs deploy. A Step can carry
+    /// the mark instead ([`StepSpec::deploy`]); see [`PipelineIr::is_deploy`].
+    /// Besides the filter, it changes one thing: a deploy run opts out of
+    /// newest-wins auto-cancel, as an Environment-governed run does, so a newer
+    /// push never cancels a deploy half-way. No admission or secrets.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub deploy: bool,
     /// The operator [`RetentionProfile`] this pipeline's runs age under
     /// (ADR-0065 s2) — a NAME only, resolved against the operator registry at
     /// sweep time (so an operator retune applies retroactively, which is the
@@ -106,6 +116,25 @@ pub struct PipelineIr {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub services: Vec<SharedServiceSpec>,
     pub steps: Vec<StepSpec>,
+}
+
+impl PipelineIr {
+    /// Is a Run of this pipeline a **deploy Run** (ADR-0074 §2)? Yes when the
+    /// pipeline is marked `deploy: true` or any of its Steps is. Static: read
+    /// from the IR when the Run is created.
+    pub fn is_deploy(&self) -> bool {
+        self.deploy || self.steps.iter().any(|s| s.deploy)
+    }
+
+    /// The ids of the Steps marked `deploy: true`, in IR order — empty when
+    /// only the pipeline is marked.
+    pub fn deploy_steps(&self) -> Vec<String> {
+        self.steps
+            .iter()
+            .filter(|s| s.deploy)
+            .map(|s| s.id.clone())
+            .collect()
+    }
 }
 
 /// A pipeline's reuse / launch interface (ADR-0038, ADR-0043) — its explicit
@@ -274,9 +303,16 @@ const CONCURRENCY_POLICIES: [&str; 2] = ["queue", "cancel-in-progress"];
 
 /// The gate kinds a `gate:` step may declare (ADR-0008, 0032): `manual`
 /// (approval), `timer` (wait a duration), `external` (release via API/webhook),
-/// `deployment` (a DeploymentGate, ADR-0070 §8: core resolves it from the
-/// Deployment record — see [`StepSpec::deployment`]).
-const GATE_KINDS: [&str; 4] = ["manual", "timer", "external", "deployment"];
+/// and gates can fail with a reason (ADR-0070 §9). `deployment` was a fourth
+/// kind until ADR-0074 removed the Deployment record; the check refuses it
+/// with [`RETIRED_DEPLOYMENTS`].
+const GATE_KINDS: [&str; 3] = ["manual", "timer", "external"];
+
+/// The Pipeline check's answer to `deployment_requests` and `gate: deployment`,
+/// both removed by ADR-0074: it names what replaces them.
+pub const RETIRED_DEPLOYMENTS: &str = "deployments are no longer recorded by Scarab \
+    (ADR-0074); mark the step `deploy: true` and wait for your CD tool in a step (for \
+    example `argocd app wait`)";
 
 /// A pipeline's `on:` block: trigger kind (e.g. `push`, `pull_request`) → filter.
 /// Kinds are the canonical vocabulary of `scarab_forge::TriggerKind`, kept as
@@ -314,21 +350,18 @@ pub struct StepSpec {
     #[serde(default)]
     pub image: String,
     /// If set, this is a **gate** step (ADR-0008's `kind: gate`): an image-less
-    /// durable suspend point of this kind (`manual`/`timer`/`external`/
-    /// `deployment`). It launches no unit; when its `needs` are satisfied it
+    /// durable suspend point of this kind (`manual`/`timer`/`external`).
+    /// It launches no unit; when its `needs` are satisfied it
     /// waits — holding only its dependents — until it resolves. The engine
     /// wiring is `Db::set_step_gate`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<String>,
-    /// For a `gate: deployment` step (a **DeploymentGate**, ADR-0070 §8):
-    /// the upstream DeploymentRequest it waits on — a Step of this Run that
-    /// it transitively `needs` and that declares `deployment_requests`, and,
-    /// when that Step makes more than one, which target. Core resolves the
-    /// gate from the Deployment record: passed once the Deployment is live,
-    /// failed on a `failed` report, a supersession, or the Environment's
-    /// deadline. Required on that kind, forbidden on every other step.
+    /// Removed by ADR-0074 (a DeploymentGate's reference). Kept as raw data
+    /// only so the Pipeline check can refuse it with [`RETIRED_DEPLOYMENTS`]
+    /// instead of an unknown-field error, and so an IR stored before then
+    /// still decodes. Nothing reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deployment: Option<DeploymentGateRef>,
+    pub deployment: Option<serde_json::Value>,
     /// If set, this is a **clone** step (ADR-0045): first-class source
     /// provisioning. Zero-config by design — repo/ref/SHA/token are implicit
     /// from the run's trigger context; the engine runs the canonical
@@ -381,6 +414,12 @@ pub struct StepSpec {
     /// a path segment.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<String>,
+    /// `deploy: true` marks this Step as the one that deploys (ADR-0074 §2):
+    /// its Run is a deploy Run, and the Run page marks the Step. Not allowed
+    /// on a gate step, which runs nothing. Same effect as
+    /// [`PipelineIr::deploy`].
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub deploy: bool,
     /// Entrypoint/command (empty = the image default).
     #[serde(default)]
     pub command: Vec<String>,
@@ -494,189 +533,17 @@ pub struct StepSpec {
     /// The names of the results this Step declares it writes (ADR-0041 results,
     /// declared per ADR-0070 §7): each is `/scarab/results/<name>.json`. A
     /// declaration, not a filter — a Step that declares nothing keeps the open
-    /// ADR-0041 map. What a declaration buys is a compile-time check: a
-    /// [`deployment_requests`](StepSpec::deployment_requests) entry may only
-    /// read a result the Step declared here, so a typo is rejected before any
-    /// Run instead of failing the Step after it ran.
+    /// ADR-0041 map. What a declaration buys is a compile-time check: every
+    /// `${{ outputs.<this step>.<name> }}` read elsewhere in the Pipeline must
+    /// name a result declared here, so a typo is rejected before any Run
+    /// instead of failing the reading Step at launch.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub results: Vec<String>,
-    /// The DeploymentRequests this Step makes when it succeeds (ADR-0070 §7,
-    /// CONTEXT §4.6): "I changed what should be live on this DeploymentTarget
-    /// to this DeploymentVersion". Recorded by core on Step success, in the same
-    /// transaction as the success itself, with the start of the Step's first
-    /// Attempt in its Take as the request's effective time. Only on an ordinary executed Step of a Deploy
-    /// pipeline (one with an `environment:`), never on a matrixed one.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub deployment_requests: Vec<DeploymentRequestSpec>,
-}
-
-/// One authored DeploymentRequest (ADR-0070 §7). The **target** is static —
-/// known when the Run is created, so admission can refuse a target homed in
-/// another Environment before anything runs — while the **version** and the
-/// **evidence** come from the Step's own results, because only the Step knows
-/// what it pushed.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DeploymentRequestSpec {
-    pub target: DeploymentTargetSpec,
-    /// The name of the declared result holding the DeploymentVersion — a
-    /// non-empty JSON string (a gitops commit, a chart version).
-    pub version: String,
-    /// The names of declared results carrying evidence for the request
-    /// (image digests, typically): each a JSON string or an array of strings.
-    /// Shown with the request, never used to correlate it.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub evidence: Vec<String>,
-}
-
-/// The static half of a DeploymentTarget: the reporting source (a plugin
-/// installation name) and the source's own id for the target. Each part is a
-/// literal or exactly `${{ inputs.<declared input> }}` — resolved once, at Run
-/// creation, against the launch parameters. The Environment is the
-/// pipeline's own `environment:`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DeploymentTargetSpec {
-    pub source: String,
-    pub id: String,
-}
-
-/// Which DeploymentRequest a DeploymentGate waits on (ADR-0070 §8): the
-/// requesting Step's id and, when that Step requests more than one
-/// DeploymentTarget, which one — spelled exactly as the request spells its
-/// `target` (a literal, or the same `${{ inputs.<name> }}`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DeploymentGateRef {
-    pub step: String,
+    /// Removed by ADR-0074 (the Step's DeploymentRequests). Kept as raw data
+    /// only so the Pipeline check can refuse it with [`RETIRED_DEPLOYMENTS`]
+    /// and an IR stored before then still decodes. Nothing reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target: Option<DeploymentTargetSpec>,
-}
-
-/// The DeploymentRequest DeploymentGate `gate` waits on, as the requesting
-/// Step and the request's position in its `deployment_requests` — `None`
-/// when `gate` is not a DeploymentGate or its reference does not resolve
-/// ([`validate`] refuses that). Shared by validation and Run creation, so
-/// both read the reference one way.
-pub fn deployment_gate_request<'a>(
-    ir: &'a PipelineIr,
-    gate: &StepSpec,
-) -> Option<(&'a StepSpec, usize)> {
-    let r = gate.deployment.as_ref()?;
-    let requester = ir.steps.iter().find(|s| s.id == r.step)?;
-    let ordinal = match &r.target {
-        None if requester.deployment_requests.len() == 1 => 0,
-        None => return None,
-        Some(t) => requester
-            .deployment_requests
-            .iter()
-            .position(|q| q.target.source == t.source && q.target.id == t.id)?,
-    };
-    Some((requester, ordinal))
-}
-
-/// Is `ancestor` reachable from `step` by following `needs` edges?
-fn transitively_needs(ir: &PipelineIr, step: &StepSpec, ancestor: &str) -> bool {
-    let by_id: BTreeMap<&str, &StepSpec> = ir.steps.iter().map(|s| (s.id.as_str(), s)).collect();
-    let mut seen: BTreeSet<&str> = BTreeSet::new();
-    let mut stack: Vec<&str> = step.needs.0.iter().map(String::as_str).collect();
-    while let Some(id) = stack.pop() {
-        if id == ancestor {
-            return true;
-        }
-        if seen.insert(id) {
-            if let Some(s) = by_id.get(id) {
-                stack.extend(s.needs.0.iter().map(String::as_str));
-            }
-        }
-    }
-    false
-}
-
-/// A DeploymentGate's reference (ADR-0070 §8), checked at pipeline check:
-///
-/// - `deployment:` only on a `gate: deployment` step, and required there;
-/// - it names a Step this gate transitively `needs` (the request is
-///   recorded when that Step succeeds, so the gate must wait for it) that
-///   declares `deployment_requests`;
-/// - `target` may be omitted only when that Step makes exactly one request,
-///   and otherwise must spell one of its targets exactly;
-/// - not on a matrixed gate.
-///
-/// `gate_after` is the timer's alone and is refused by the gate-kind check.
-fn validate_deployment_gate(ir: &PipelineIr, step: &StepSpec, diagnostics: &mut Vec<String>) {
-    let is_deployment_gate = step.gate.as_deref() == Some("deployment");
-    let Some(r) = &step.deployment else {
-        if is_deployment_gate {
-            diagnostics.push(format!(
-                "step `{}`: a deployment gate must set `deployment: {{ step: <id> }}` — the \
-                 upstream step whose DeploymentRequest it waits on",
-                step.id
-            ));
-        }
-        return;
-    };
-    if !is_deployment_gate {
-        diagnostics.push(format!(
-            "step `{}`: `deployment` is only valid on a `gate: deployment` step",
-            step.id
-        ));
-        return;
-    }
-    if !step.matrix_values.is_empty() {
-        diagnostics.push(format!(
-            "step `{}`: a deployment gate is not supported on a matrixed step",
-            step.id
-        ));
-    }
-    let Some(requester) = ir.steps.iter().find(|s| s.id == r.step) else {
-        diagnostics.push(format!(
-            "step `{}`: `deployment.step` names unknown step `{}` (for a step of an invoked \
-             library, use its namespaced id, e.g. `deploy/bump`)",
-            step.id, r.step
-        ));
-        return;
-    };
-    if !transitively_needs(ir, step, &requester.id) {
-        diagnostics.push(format!(
-            "step `{}`: `deployment.step` `{}` must be a step this gate needs (directly or \
-             transitively) — its DeploymentRequest is recorded when it succeeds",
-            step.id, r.step
-        ));
-    }
-    if requester.deployment_requests.is_empty() {
-        diagnostics.push(format!(
-            "step `{}`: `deployment.step` `{}` makes no DeploymentRequest (it declares no \
-             `deployment_requests`)",
-            step.id, r.step
-        ));
-        return;
-    }
-    match &r.target {
-        None if requester.deployment_requests.len() > 1 => diagnostics.push(format!(
-            "step `{}`: step `{}` makes {} DeploymentRequests — set `deployment.target` to the \
-             one this gate waits on",
-            step.id,
-            r.step,
-            requester.deployment_requests.len()
-        )),
-        Some(t) if deployment_gate_request(ir, step).is_none() => diagnostics.push(format!(
-            "step `{}`: step `{}` makes no DeploymentRequest for target `{}`/`{}`",
-            step.id, r.step, t.source, t.id
-        )),
-        _ => {}
-    }
-}
-
-/// If `text` is exactly one `${{ inputs.<name> }}` interpolation (whitespace
-/// inside the braces tolerated), the input's name. The only interpolation a
-/// DeploymentTarget part may use: anything else (`outputs.*`, `matrix.*`,
-/// `event.*`, an expression, a template with literal text around it) is not
-/// known at Run creation, or not one value.
-pub fn deployment_target_input(text: &str) -> Option<&str> {
-    let inner = text.trim().strip_prefix("${{")?.strip_suffix("}}")?.trim();
-    let name = inner.strip_prefix("inputs.")?;
-    is_identifier(name).then_some(name)
+    pub deployment_requests: Option<serde_json::Value>,
 }
 
 impl StepSpec {
@@ -1175,7 +1042,10 @@ pub fn default_profile<P: NamedProfile>(registry: &[P]) -> Option<&P> {
 /// Validate an operator profile registry: non-empty, unique names and at most
 /// one `default`. `kind` names the registry in the message (a boot-failure
 /// message must say WHICH gitops file to fix).
-pub fn validate_profile_registry<P: NamedProfile>(registry: &[P], kind: &str) -> Result<(), String> {
+pub fn validate_profile_registry<P: NamedProfile>(
+    registry: &[P],
+    kind: &str,
+) -> Result<(), String> {
     let mut names = BTreeSet::new();
     let mut defaults = 0usize;
     for p in registry {
@@ -1334,6 +1204,7 @@ pub fn compile_yaml_with_libs(
         triggers: authored.triggers,
         concurrency: authored.concurrency,
         environment: authored.environment,
+        deploy: authored.deploy,
         retention_profile: authored.retention_profile,
         interface: authored.interface,
         budget: authored.budget,
@@ -1520,15 +1391,17 @@ fn inline_level(
                 step.id
             ));
         }
-        // An invoke step runs nothing, so it writes no results and succeeds as
-        // no one Step: a DeploymentRequest belongs on the library step that
-        // makes the change (ADR-0070 §7).
-        if !step.results.is_empty() || !step.deployment_requests.is_empty() {
+        // An invoke step runs nothing, so it writes no results: declare them
+        // on the library step that writes them.
+        if !step.results.is_empty() {
             diagnostics.push(format!(
-                "step `{}`: an invoke step launches nothing — it must not set `results` or \
-                 `deployment_requests` (declare them on the library step that makes the change)",
+                "step `{}`: an invoke step launches nothing — it must not set `results` \
+                 (declare them on the library step that writes them)",
                 step.id
             ));
+        }
+        if step.deployment_requests.is_some() || step.deployment.is_some() {
+            diagnostics.push(format!("step `{}`: {RETIRED_DEPLOYMENTS}", step.id));
         }
 
         let key = match resolve_lib_path(raw_path) {
@@ -1596,36 +1469,6 @@ fn inline_level(
         let resolved = inline_level(&lib.steps, libs, stack, diagnostics);
         stack.pop();
 
-        // Inside the library, `${{ inputs.<n> }}` in a DeploymentTarget names
-        // one of the LIBRARY's inputs (bound below). One the library does not
-        // declare would survive inlining and bind silently to the caller's
-        // launch input of that name — refused instead (git-bug bbbf618). A
-        // nested library's targets were bound at its own level, so what is
-        // left here is this library's to answer for.
-        for ls in &resolved {
-            let gate_target = ls.deployment.as_ref().and_then(|r| r.target.as_ref());
-            for target in ls
-                .deployment_requests
-                .iter()
-                .map(|req| &req.target)
-                .chain(gate_target)
-            {
-                for (part, text) in [("source", &target.source), ("id", &target.id)] {
-                    if let Some(name) = deployment_target_input(text) {
-                        if !lib.interface.inputs.iter().any(|p| p.name == name) {
-                            diagnostics.push(format!(
-                                "step `{}`: library `{key}` step `{}` deployment request target \
-                                 `{part}` reads `inputs.{name}`, which the library does not \
-                                 declare (declare it under the library's `interface.inputs` \
-                                 and pass it with `with:`)",
-                                step.id, ls.id
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-
         // `matrix` × `invoke` (ADR-0038): a matrix on the invoke step fans out N
         // copies of the whole subgraph, once per coordinate. `expand_step` gives
         // the coordinate instances (id `deploy[svc=api]`, `matrix_values` set,
@@ -1659,6 +1502,12 @@ fn inline_level(
             for ls in &resolved {
                 let mut inst = ls.clone();
                 inst.id = ns(&ls.id);
+                // `deploy: true` on the invoke step, or on the library
+                // pipeline, marks every Step it inlines that runs something
+                // (ADR-0074 §2); a gate can never carry the mark.
+                if (step.deploy || lib.deploy) && !inst.is_gate() {
+                    inst.deploy = true;
+                }
                 // Entry seam: a library root inherits the invoke step's upstreams;
                 // an internal need is namespaced.
                 inst.needs = if ls.needs.0.is_empty() {
@@ -1680,11 +1529,6 @@ fn inline_level(
                             .collect(),
                     );
                 }
-                // A DeploymentGate's reference names a step the way `needs`
-                // does, so it is namespaced the same way.
-                if let Some(r) = &mut inst.deployment {
-                    r.step = namespace_ref(&r.step, &internal, &ns);
-                }
                 // Propagate the invoke coordinate so CEL inside the subgraph can
                 // read it; a library step's own coordinate (added later by the
                 // main matrix pass) wins on key conflict.
@@ -1704,32 +1548,6 @@ fn inline_level(
                     .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
                     .collect();
                 let lib_inputs = params::resolve_params(&lib.interface, &supplied).ok();
-                // A library DeploymentTarget naming one of the LIBRARY's inputs
-                // (`${{ inputs.<lib input> }}`) is bound here to the caller's
-                // `with:` value (or the input's default): after inlining,
-                // `inputs.*` means the top-level pipeline's launch parameters,
-                // which is what validation checks a remaining reference against.
-                // A `with:` value that is itself `${{ inputs.<name> }}` passes
-                // through and binds to the caller's own launch input.
-                if let Some(bound) = &lib_inputs {
-                    // A library DeploymentGate's `target` spells its request's
-                    // target, so it is bound the same way and still matches.
-                    let gate_target = inst.deployment.as_mut().and_then(|r| r.target.as_mut());
-                    for target in inst
-                        .deployment_requests
-                        .iter_mut()
-                        .map(|req| &mut req.target)
-                        .chain(gate_target)
-                    {
-                        for part in [&mut target.source, &mut target.id] {
-                            if let Some(v) =
-                                deployment_target_input(part).and_then(|n| bound.get(n))
-                            {
-                                *part = params::stringify(v);
-                            }
-                        }
-                    }
-                }
                 let param_env: Vec<(String, String)> = match lib_inputs {
                     Some(resolved) => resolved
                         .iter()
@@ -2204,9 +2022,9 @@ fn validate_cache(
         // `.` would make the whole workspace a cache dir (clobbering the
         // clone, which lands at the workspace root); `..` escapes it; `.git*`
         // components would clobber source control state on restore.
-        if d.split('/').any(|c| {
-            c.is_empty() || c == "." || c == ".." || c.starts_with(".git")
-        }) {
+        if d.split('/')
+            .any(|c| c.is_empty() || c == "." || c == ".." || c.starts_with(".git"))
+        {
             diagnostics.push(format!(
                 "step `{step_id}`: cache dir `{dir}` must not contain empty, \
                  `.`, `..`, or `.git*` path components"
@@ -2263,23 +2081,15 @@ fn paths_overlap(a: &str, b: &str) -> bool {
         .all(|(x, y)| x == y || x.contains('*') || y.contains('*'))
 }
 
-/// A Step's declared `results:` and its `deployment_requests` (ADR-0070 §7),
-/// checked at pipeline check so a request that could never be completed is
-/// refused before any Run — not discovered when the Step succeeds:
+/// A Step's declared `results:` (ADR-0070 §7, kept by ADR-0074 §3), checked
+/// at pipeline check:
 ///
 /// - result names are non-empty, unique, and a plain file stem (no `/`, no
 ///   whitespace): each is `/scarab/results/<name>.json`;
-/// - a gate writes no results and makes no request;
-/// - a request needs a Deploy pipeline (`environment:`) — its DeploymentTarget
-///   lives in that Environment;
-/// - not on a matrixed Step: every leg would request the same static target,
-///   so which leg's version is "the" request has no answer;
-/// - `version` and every `evidence` entry name a result the Step declared (no
-///   `results:` = every reference undeclared);
-/// - each target part is non-empty and a literal or exactly
-///   `${{ inputs.<declared input> }}` (see [`deployment_target_input`]);
-/// - at most one request per DeploymentTarget per Step.
-fn validate_deployment_requests(ir: &PipelineIr, step: &StepSpec, diagnostics: &mut Vec<String>) {
+/// - a gate writes no results;
+/// - the fields ADR-0074 removed (`deployment_requests`, a gate's
+///   `deployment:` reference) are refused with [`RETIRED_DEPLOYMENTS`].
+fn validate_results(step: &StepSpec, diagnostics: &mut Vec<String>) {
     let mut declared = BTreeSet::new();
     for name in &step.results {
         if name.trim().is_empty() || name.contains('/') || name.chars().any(char::is_whitespace) {
@@ -2302,71 +2112,57 @@ fn validate_deployment_requests(ir: &PipelineIr, step: &StepSpec, diagnostics: &
             step.id
         ));
     }
-    if step.deployment_requests.is_empty() {
+    if step.deployment_requests.is_some() {
+        diagnostics.push(format!(
+            "step `{}`: `deployment_requests`: {RETIRED_DEPLOYMENTS}",
+            step.id
+        ));
+    }
+    // `gate: deployment` reports once, from the gate-kind check; a stray
+    // `deployment:` on any other step reports here.
+    if step.deployment.is_some() && step.gate.as_deref() != Some("deployment") {
+        diagnostics.push(format!(
+            "step `{}`: `deployment`: {RETIRED_DEPLOYMENTS}",
+            step.id
+        ));
+    }
+}
+
+/// Every `${{ outputs.<step>.<name> }}` read of a Step that declares
+/// `results:` must name a declared result (ADR-0070 §7, kept by ADR-0074 §3),
+/// so a typo fails the Pipeline check instead of the reading Step at launch.
+/// A Step that declares nothing keeps the open ADR-0041 map and is not
+/// checked. Both spellings are read: `outputs.<id>.<name>` and, for a
+/// namespaced id, `outputs["<id>"].<name>`.
+fn validate_output_reads(ir: &PipelineIr, diagnostics: &mut Vec<String>) {
+    let declaring: Vec<&StepSpec> = ir.steps.iter().filter(|s| !s.results.is_empty()).collect();
+    if declaring.is_empty() {
         return;
     }
-    if step.is_gate() {
-        diagnostics.push(format!(
-            "step `{}`: a gate step launches nothing — it must not set `deployment_requests`",
-            step.id
-        ));
-    }
-    if ir.environment.is_none() {
-        diagnostics.push(format!(
-            "step `{}`: `deployment_requests` needs a Deploy pipeline — set the pipeline's \
-             `environment:` (the DeploymentTarget belongs to that Environment)",
-            step.id
-        ));
-    }
-    if !step.matrix_values.is_empty() {
-        diagnostics.push(format!(
-            "step `{}`: `deployment_requests` is not supported on a matrixed step — every leg \
-             would request the same DeploymentTarget",
-            step.id
-        ));
-    }
-    let mut targets = BTreeSet::new();
-    for req in &step.deployment_requests {
-        let refs = std::iter::once(("version", &req.version))
-            .chain(req.evidence.iter().map(|e| ("evidence", e)));
-        for (role, name) in refs {
-            if !declared.contains(name.as_str()) {
-                diagnostics.push(format!(
-                    "step `{}`: deployment request {role} reads result `{name}`, which the step \
-                     does not declare (add it to the step's `results:`)",
-                    step.id
-                ));
-            }
-        }
-        for (part, text) in [("source", &req.target.source), ("id", &req.target.id)] {
-            if text.trim().is_empty() {
-                diagnostics.push(format!(
-                    "step `{}`: deployment request target `{part}` must not be empty",
-                    step.id
-                ));
-            } else if text.contains("${{") || text.contains("}}") {
-                match deployment_target_input(text) {
-                    Some(name) if ir.interface.inputs.iter().any(|p| p.name == name) => {}
-                    Some(name) => diagnostics.push(format!(
-                        "step `{}`: deployment request target `{part}` reads undeclared input \
-                         `inputs.{name}` (declare it under `interface.inputs`)",
-                        step.id
-                    )),
-                    None => diagnostics.push(format!(
-                        "step `{}`: deployment request target `{part}` `{text}` must be a \
-                         literal or exactly `${{{{ inputs.<name> }}}}` — a DeploymentTarget is \
-                         known when the Run is created, never computed from results, the \
-                         matrix or the event",
-                        step.id
-                    )),
+    for t in &ir.steps {
+        for text in interpolatable_strings(t) {
+            for expr in cel::interpolations(text).unwrap_or_default() {
+                for s in &declaring {
+                    let bases = [
+                        format!("outputs.{}", s.id),
+                        format!("outputs[\"{}\"]", s.id),
+                    ];
+                    for base in &bases {
+                        for field in field_accesses(expr, base) {
+                            if !s.results.iter().any(|r| *r == field) {
+                                diagnostics.push(format!(
+                                    "step `{}`: reads `outputs.{}.{field}`, which step `{}` does \
+                                     not declare (it declares results: [{}])",
+                                    t.id,
+                                    s.id,
+                                    s.id,
+                                    s.results.join(", ")
+                                ));
+                            }
+                        }
+                    }
                 }
             }
-        }
-        if !targets.insert((req.target.source.as_str(), req.target.id.as_str())) {
-            diagnostics.push(format!(
-                "step `{}`: two deployment requests name the same target `{}`/`{}`",
-                step.id, req.target.source, req.target.id
-            ));
         }
     }
 }
@@ -2529,7 +2325,12 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
         // name an image. A gate with an image/command is a contradiction.
         match &step.gate {
             Some(kind) => {
-                if !GATE_KINDS.contains(&kind.as_str()) {
+                if kind == "deployment" {
+                    diagnostics.push(format!(
+                        "step `{}`: `gate: deployment`: {RETIRED_DEPLOYMENTS}",
+                        step.id
+                    ));
+                } else if !GATE_KINDS.contains(&kind.as_str()) {
                     diagnostics.push(format!(
                         "step `{}`: unknown gate kind `{kind}` (expected one of {})",
                         step.id,
@@ -2546,6 +2347,15 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                 if step.security.as_ref().is_some_and(|s| !s.is_baseline()) {
                     diagnostics.push(format!(
                         "step `{}`: a gate step launches nothing — it must not set `security`",
+                        step.id
+                    ));
+                }
+                // A gate deploys nothing; the mark belongs on the Step that
+                // makes the change (ADR-0074 §2).
+                if step.deploy {
+                    diagnostics.push(format!(
+                        "step `{}`: a gate step launches nothing — it must not set `deploy` \
+                         (mark the step that deploys)",
                         step.id
                     ));
                 }
@@ -2651,10 +2461,8 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                 }
             }
         }
-        // Declared results and DeploymentRequests (ADR-0070 §7), and the
-        // DeploymentGate's reference to one (§8).
-        validate_deployment_requests(ir, step, &mut diagnostics);
-        validate_deployment_gate(ir, step, &mut diagnostics);
+        // Declared results (ADR-0070 §7) and the fields ADR-0074 removed.
+        validate_results(step, &mut diagnostics);
         // Dangling needs.
         for need in &step.needs.0 {
             if !ids.contains(need.as_str()) {
@@ -2787,6 +2595,9 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
     // non-empty `options` for a choice, a default within those options, and a
     // parsable `validate:` predicate.
     params::validate_param_specs(&ir.interface.inputs, "interface", &mut diagnostics);
+
+    // `${{ outputs.<step>.<name> }}` reads against declared `results:`.
+    validate_output_reads(ir, &mut diagnostics);
 
     // Cycle detection over needs edges (Kahn's algorithm). Only run when the
     // graph is well-formed enough to be meaningful (no dangling edges).
@@ -2959,7 +2770,8 @@ mod tests {
             MAX_STEP_TIMEOUT_SECS + 1
         ));
         assert!(
-            ds.iter().any(|d| d.contains("at most") && d.contains("drain")),
+            ds.iter()
+                .any(|d| d.contains("at most") && d.contains("drain")),
             "the refusal must say WHY (the drain credential), got: {ds:?}"
         );
         let ir = compile(&format!(
@@ -3084,7 +2896,9 @@ mod tests {
         );
         let bare = compile("steps: [{ id: a, image: busybox }]");
         assert!(
-            !serde_json::to_string(&bare).unwrap().contains("retention_profile"),
+            !serde_json::to_string(&bare)
+                .unwrap()
+                .contains("retention_profile"),
             "absent means absent — no null key in every stored IR"
         );
         let errs = errors("retention_profile: \"\"\nsteps: [{ id: a, image: busybox }]");
@@ -3097,21 +2911,43 @@ mod tests {
     #[test]
     fn the_shared_profile_registry_helper_serves_both_profile_kinds() {
         let placement = vec![
-            PlacementProfile { name: "arm64".into(), default: false, k8s: None },
-            PlacementProfile { name: "big".into(), default: true, k8s: None },
+            PlacementProfile {
+                name: "arm64".into(),
+                default: false,
+                k8s: None,
+            },
+            PlacementProfile {
+                name: "big".into(),
+                default: true,
+                k8s: None,
+            },
         ];
-        assert_eq!(profile_named(&placement, "arm64").map(|p| &*p.name), Some("arm64"));
+        assert_eq!(
+            profile_named(&placement, "arm64").map(|p| &*p.name),
+            Some("arm64")
+        );
         assert!(profile_named(&placement, "nope").is_none());
         assert_eq!(default_profile(&placement).map(|p| &*p.name), Some("big"));
         assert!(validate_profile_registry(&placement, "placement").is_ok());
 
         let retention = vec![
-            RetentionProfile { name: "keep".into(), default: true, ..Default::default() },
-            RetentionProfile { name: "keep".into(), default: true, ..Default::default() },
+            RetentionProfile {
+                name: "keep".into(),
+                default: true,
+                ..Default::default()
+            },
+            RetentionProfile {
+                name: "keep".into(),
+                default: true,
+                ..Default::default()
+            },
         ];
         let err = validate_profile_registry(&retention, "retention")
             .expect_err("duplicate names must be refused");
-        assert!(err.contains("retention"), "the message names the registry: {err}");
+        assert!(
+            err.contains("retention"),
+            "the message names the registry: {err}"
+        );
     }
 
     #[test]
@@ -3650,11 +3486,11 @@ mod tests {
             );
         }
         // Mutual prefix-overlap among dirs.
-        assert!(errors(
-            r#"steps: [{ id: b, image: n, cache: { dirs: [a, a/b], key: [l] } }]"#
-        )
-        .iter()
-        .any(|d| d.contains("overlap")));
+        assert!(
+            errors(r#"steps: [{ id: b, image: n, cache: { dirs: [a, a/b], key: [l] } }]"#)
+                .iter()
+                .any(|d| d.contains("overlap"))
+        );
         // outputs ∩ cache.dirs (amendment #4), both directions + glob:
         // equality, an output INSIDE a cache dir, an output that is a PREFIX
         // of a cache dir, and a glob that covers it.
@@ -3685,11 +3521,11 @@ mod tests {
         assert_eq!(b.outputs.as_deref(), Some(["dist".to_string()].as_slice()));
         assert!(b.cache.is_some(), "the disjoint cache survives compile");
         // Key files are workspace-relative.
-        assert!(errors(
-            r#"steps: [{ id: b, image: n, cache: { dirs: [d], key: ["../x"] } }]"#
-        )
-        .iter()
-        .any(|d| d.contains("workspace-relative")));
+        assert!(
+            errors(r#"steps: [{ id: b, image: n, cache: { dirs: [d], key: ["../x"] } }]"#)
+                .iter()
+                .any(|d| d.contains("workspace-relative"))
+        );
     }
 
     #[test]
@@ -4573,6 +4409,82 @@ mod tests {
         }
     }
 
+    // --- deploy marker (ADR-0074 §2) ----------------------------------------
+
+    #[test]
+    fn deploy_marks_a_run_from_the_pipeline_or_any_step() {
+        let unmarked = compile("steps:\n  - { id: test, image: rust }\n");
+        assert!(!unmarked.is_deploy());
+        // An Environment alone does not make a deploy Run.
+        let governed = compile("environment: production\nsteps:\n  - { id: smoke, image: curl }\n");
+        assert!(!governed.is_deploy());
+
+        let pipeline = compile("deploy: true\nsteps:\n  - { id: ship, image: helm }\n");
+        assert!(pipeline.is_deploy());
+        assert!(pipeline.deploy_steps().is_empty(), "no Step is marked");
+
+        let step = compile(
+            r#"
+            steps:
+              - { id: build, image: rust }
+              - { id: ship, image: helm, needs: [build], deploy: true }
+            "#,
+        );
+        assert!(step.is_deploy());
+        assert_eq!(step.deploy_steps(), ["ship"]);
+        // Unmarked fields stay out of the stored IR.
+        let stored = serde_json::to_value(&step).unwrap();
+        assert!(stored.get("deploy").is_none());
+        assert!(stored["steps"][0].get("deploy").is_none());
+        assert_eq!(stored["steps"][1]["deploy"], json!(true));
+    }
+
+    #[test]
+    fn deploy_on_a_gate_step_is_rejected() {
+        match compile_yaml(
+            r#"
+            steps:
+              - { id: approve, gate: manual, deploy: true }
+            "#,
+        ) {
+            Err(PipelineError::Validation(errs)) => {
+                assert!(
+                    errs.iter().any(|e| e.contains("must not set `deploy`")),
+                    "{errs:?}"
+                );
+            }
+            other => panic!("expected validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deploy_on_an_invoke_marks_the_inlined_steps_but_not_gates() {
+        let lib = r#"
+            steps:
+              - { id: approve, gate: manual }
+              - { id: ship, image: helm, needs: [approve] }
+        "#;
+        let marked_lib = lib.replacen("steps:", "deploy: true\n            steps:", 1);
+        for (caller, libs) in [
+            (
+                "steps:\n  - { id: prod, invoke: .scarab/lib/ship.yaml, deploy: true }\n",
+                libs(&[(".scarab/lib/ship.yaml", lib)]),
+            ),
+            (
+                "steps:\n  - { id: prod, invoke: .scarab/lib/ship.yaml }\n",
+                libs(&[(".scarab/lib/ship.yaml", &marked_lib)]),
+            ),
+        ] {
+            let ir = compile_with(caller, &libs);
+            assert_eq!(ir.deploy_steps(), ["prod/ship"], "{caller}");
+        }
+        let plain = compile_with(
+            "steps:\n  - { id: prod, invoke: .scarab/lib/ship.yaml }\n",
+            &libs(&[(".scarab/lib/ship.yaml", lib)]),
+        );
+        assert!(!plain.is_deploy());
+    }
+
     // --- clone step kind + missing-clone lint (ADR-0045) --------------------
 
     #[test]
@@ -5333,390 +5245,169 @@ mod tests {
         );
     }
 
-    // --- deployment_requests (ADR-0070 §7, slice b criterion 1) ---------------
+    // --- ADR-0074: the Deployment record's pipeline fields are refused -------
 
-    /// A Deploy pipeline whose `bump` step requests a Deployment on a target
-    /// named by a launch input, version + evidence from declared results.
-    const DEPLOY_REQUEST: &str = r#"
-        environment: prod
-        interface:
-          inputs: [app]
-        steps:
-          - id: bump
-            image: busybox
-            results: [version, images]
-            deployment_requests:
-              - target: { source: argocd-prod, id: "${{ inputs.app }}" }
-                version: version
-                evidence: [images]
-    "#;
+    const REPLACEMENT: &str = "mark the step `deploy: true` and wait for your CD tool";
 
     #[test]
-    fn a_deployment_request_reading_declared_results_compiles_and_round_trips() {
-        let ir = compile(DEPLOY_REQUEST);
-        let bump = &ir.steps[0];
-        assert_eq!(
-            bump.results,
-            vec!["version".to_string(), "images".to_string()]
-        );
-        assert_eq!(
-            bump.deployment_requests,
-            vec![DeploymentRequestSpec {
-                target: DeploymentTargetSpec {
-                    source: "argocd-prod".into(),
-                    id: "${{ inputs.app }}".into(),
-                },
-                version: "version".into(),
-                evidence: vec!["images".into()],
-            }]
-        );
-        let back: PipelineIr = serde_json::from_str(&serde_json::to_string(&ir).unwrap()).unwrap();
-        assert_eq!(ir, back, "the request rides the stored IR unchanged");
-    }
-
-    /// Criterion 1: an undeclared result is rejected at pipeline check, before
-    /// any Run — for the version and for evidence, and when the step declares
-    /// no `results:` at all.
-    #[test]
-    fn a_deployment_request_reading_an_undeclared_result_is_rejected() {
-        let ds =
-            errors(&DEPLOY_REQUEST.replace("results: [version, images]", "results: [version]"));
-        assert!(
-            ds.iter()
-                .any(|d| d.contains("evidence") && d.contains("`images`")),
-            "undeclared evidence result must be named, got: {ds:?}"
-        );
-        let ds = errors(&DEPLOY_REQUEST.replace("            results: [version, images]\n", ""));
-        assert!(
-            ds.iter()
-                .any(|d| d.contains("version") && d.contains("does not declare")),
-            "no `results:` = every reference undeclared, got: {ds:?}"
-        );
-    }
-
-    /// A DeploymentTarget is static: `${{ outputs.* }}` (known only after a
-    /// step ran) and templates with literal text around an input are refused;
-    /// an input that is not declared is refused too.
-    #[test]
-    fn a_deployment_target_from_outputs_or_a_template_is_rejected() {
-        for bad in [
-            "${{ outputs.plan.app }}",
-            "web-${{ inputs.app }}",
-            "${{ matrix.app }}",
-        ] {
-            let ds = errors(&DEPLOY_REQUEST.replace("${{ inputs.app }}", bad));
-            assert!(
-                ds.iter()
-                    .any(|d| d.contains("must be a literal or exactly")),
-                "target `{bad}` must be refused, got: {ds:?}"
-            );
-        }
-        let ds = errors(&DEPLOY_REQUEST.replace("${{ inputs.app }}", "${{ inputs.ghost }}"));
-        assert!(
-            ds.iter()
-                .any(|d| d.contains("undeclared input `inputs.ghost`")),
-            "got: {ds:?}"
-        );
-        // A literal target is fine.
-        compile(&DEPLOY_REQUEST.replace("\"${{ inputs.app }}\"", "web"));
-    }
-
-    #[test]
-    fn a_deployment_request_without_an_environment_is_rejected() {
-        let ds = errors(&DEPLOY_REQUEST.replace("        environment: prod\n", ""));
-        assert!(
-            ds.iter().any(|d| d.contains("needs a Deploy pipeline")),
-            "got: {ds:?}"
-        );
-    }
-
-    #[test]
-    fn a_deployment_request_on_a_matrixed_step_is_rejected() {
-        let ds = errors(&DEPLOY_REQUEST.replace(
-            "image: busybox\n",
-            "image: busybox\n            matrix: { dimensions: { region: [eu, us] } }\n",
-        ));
-        assert!(
-            ds.iter().any(|d| d.contains("matrixed step")),
-            "got: {ds:?}"
-        );
-    }
-
-    #[test]
-    fn a_gate_or_a_duplicate_target_cannot_request() {
+    fn deployment_requests_are_refused_naming_the_replacement() {
         let ds = errors(
             r#"
             environment: prod
             steps:
-              - id: hold
-                gate: manual
-                results: [v]
-                deployment_requests: [{ target: { source: s, id: t }, version: v }]
-              - id: bump
-                image: busybox
-                results: [v]
-                deployment_requests:
-                  - { target: { source: s, id: t }, version: v }
-                  - { target: { source: s, id: t }, version: v }
-            "#,
-        );
-        assert!(
-            ds.iter()
-                .any(|d| d.contains("`hold`") && d.contains("must not set `deployment_requests`")),
-            "{ds:?}"
-        );
-        assert!(
-            ds.iter()
-                .any(|d| d.contains("`hold`") && d.contains("must not declare `results`")),
-            "{ds:?}"
-        );
-        assert!(
-            ds.iter()
-                .any(|d| d.contains("`bump`") && d.contains("same target")),
-            "{ds:?}"
-        );
-    }
-
-    /// Invoke inlining carries the request; a library target naming one of the
-    /// LIBRARY's inputs is bound to the caller's `with:` value.
-    #[test]
-    fn invoke_inlining_carries_a_deployment_request_and_binds_library_inputs() {
-        let lib = r#"
-            interface:
-              inputs: [app]
-            steps:
               - id: bump
                 image: busybox
                 results: [version]
                 deployment_requests:
-                  - { target: { source: argocd-prod, id: "${{ inputs.app }}" }, version: version }
-        "#;
-        let ir = compile_with(
+                  - { target: { source: argocd, id: web }, version: version }
+            "#,
+        );
+        assert!(
+            ds.iter().any(|d| d.contains("`bump`")
+                && d.contains("deployment_requests")
+                && d.contains("no longer recorded by Scarab (ADR-0074)")
+                && d.contains(REPLACEMENT)),
+            "got: {ds:?}"
+        );
+    }
+
+    #[test]
+    fn a_deployment_gate_is_refused_once_naming_the_replacement() {
+        let ds = errors(
             r#"
             environment: prod
             steps:
-              - { id: deploy, invoke: .scarab/lib/deploy.yaml, with: { app: web } }
-            "#,
-            &libs(&[(".scarab/lib/deploy.yaml", lib)]),
-        );
-        let bump = ir.steps.iter().find(|s| s.id == "deploy/bump").unwrap();
-        assert_eq!(bump.deployment_requests.len(), 1);
-        assert_eq!(bump.deployment_requests[0].target.id, "web");
-    }
-
-    /// git-bug bbbf618: inside a library, `${{ inputs.<n> }}` names one of
-    /// the LIBRARY's inputs. One it does not declare is refused while
-    /// inlining — never left to bind silently to the caller's launch input of
-    /// the same name. A caller's `with:` that passes its own launch input
-    /// through still binds.
-    #[test]
-    fn a_library_target_naming_no_library_input_is_refused() {
-        let lib = r#"
-            interface:
-              inputs: [app]
-            steps:
-              - id: bump
-                image: busybox
-                results: [version]
-                deployment_requests:
-                  - { target: { source: argocd-prod, id: "${{ inputs.region }}" }, version: version }
-        "#;
-        let caller = r#"
-            environment: prod
-            interface:
-              inputs: [region]
-            steps:
-              - { id: deploy, invoke: .scarab/lib/deploy.yaml, with: { app: web } }
-            "#;
-        let ds = errors_with(caller, &libs(&[(".scarab/lib/deploy.yaml", lib)]));
-        assert!(
-            ds.iter().any(|d| d.contains("`deploy`")
-                && d.contains("inputs.region")
-                && d.contains(".scarab/lib/deploy.yaml")),
-            "{ds:?}"
-        );
-
-        // Passing the caller's launch input through the library's own input
-        // is the way to reach it.
-        let through = lib.replace("inputs.region", "inputs.app");
-        let ir = compile_with(
-            &caller.replace("with: { app: web }", r#"with: { app: "${{ inputs.region }}" }"#),
-            &libs(&[(".scarab/lib/deploy.yaml", &through)]),
-        );
-        let bump = ir.steps.iter().find(|s| s.id == "deploy/bump").unwrap();
-        assert_eq!(bump.deployment_requests[0].target.id, "${{ inputs.region }}");
-    }
-
-    // --- DeploymentGate (ADR-0070 §8, slice b criterion 2) -------------------
-
-    /// A Deploy pipeline whose `live` DeploymentGate waits on `bump`'s one
-    /// request, through an intermediate step.
-    const DEPLOY_GATE: &str = r#"
-        environment: prod
-        steps:
-          - id: bump
-            image: busybox
-            results: [version]
-            deployment_requests:
-              - { target: { source: argocd-prod, id: web }, version: version }
-          - { id: smoke, image: busybox, needs: [bump] }
-          - id: live
-            gate: deployment
-            deployment: { step: bump }
-            needs: [smoke]
-    "#;
-
-    #[test]
-    fn a_deployment_gate_on_a_transitive_requester_compiles_and_round_trips() {
-        let ir = compile(DEPLOY_GATE);
-        let live = ir.steps.iter().find(|s| s.id == "live").unwrap();
-        assert_eq!(live.gate.as_deref(), Some("deployment"));
-        assert_eq!(
-            live.deployment,
-            Some(DeploymentGateRef {
-                step: "bump".into(),
-                target: None
-            })
-        );
-        let (requester, ordinal) = deployment_gate_request(&ir, live).unwrap();
-        assert_eq!((requester.id.as_str(), ordinal), ("bump", 0));
-        let back: PipelineIr = serde_json::from_str(&serde_json::to_string(&ir).unwrap()).unwrap();
-        assert_eq!(ir, back, "the reference rides the stored IR unchanged");
-    }
-
-    #[test]
-    fn a_deployment_gate_needs_its_reference_and_only_it_carries_one() {
-        let ds = errors(&DEPLOY_GATE.replace("            deployment: { step: bump }\n", ""));
-        assert!(
-            ds.iter()
-                .any(|d| d.contains("`live`") && d.contains("must set `deployment")),
-            "{ds:?}"
-        );
-        let ds = errors(&DEPLOY_GATE.replace("gate: deployment", "gate: manual"));
-        assert!(
-            ds.iter()
-                .any(|d| d.contains("only valid on a `gate: deployment` step")),
-            "{ds:?}"
-        );
-    }
-
-    #[test]
-    fn a_deployment_gate_must_wait_for_a_requesting_ancestor() {
-        // Not an ancestor: the gate could open before the request exists.
-        let ds = errors(&DEPLOY_GATE.replace("needs: [smoke]", "needs: []"));
-        assert!(
-            ds.iter()
-                .any(|d| d.contains("must be a step this gate needs")),
-            "{ds:?}"
-        );
-        // An ancestor that requests nothing.
-        let ds = errors(
-            &DEPLOY_GATE.replace("deployment: { step: bump }", "deployment: { step: smoke }"),
-        );
-        assert!(
-            ds.iter().any(|d| d.contains("makes no DeploymentRequest")),
-            "{ds:?}"
-        );
-        // No such step.
-        let ds = errors(
-            &DEPLOY_GATE.replace("deployment: { step: bump }", "deployment: { step: ghost }"),
-        );
-        assert!(
-            ds.iter().any(|d| d.contains("names unknown step `ghost`")),
-            "{ds:?}"
-        );
-    }
-
-    #[test]
-    fn a_deployment_gate_names_its_target_when_the_step_requests_several() {
-        let two = DEPLOY_GATE.replace(
-            "              - { target: { source: argocd-prod, id: web }, version: version }\n",
-            concat!(
-                "              - { target: { source: argocd-prod, id: web }, version: version }\n",
-                "              - { target: { source: argocd-prod, id: api }, version: version }\n",
-            ),
-        );
-        let ds = errors(&two);
-        assert!(
-            ds.iter().any(|d| d.contains("set `deployment.target`")),
-            "{ds:?}"
-        );
-        let ds = errors(&two.replace(
-            "deployment: { step: bump }",
-            "deployment: { step: bump, target: { source: argocd-prod, id: ghost } }",
-        ));
-        assert!(
-            ds.iter()
-                .any(|d| d.contains("no DeploymentRequest for target `argocd-prod`/`ghost`")),
-            "{ds:?}"
-        );
-        let ir = compile(&two.replace(
-            "deployment: { step: bump }",
-            "deployment: { step: bump, target: { source: argocd-prod, id: api } }",
-        ));
-        let live = ir.steps.iter().find(|s| s.id == "live").unwrap();
-        assert_eq!(deployment_gate_request(&ir, live).unwrap().1, 1);
-    }
-
-    #[test]
-    fn a_deployment_gate_takes_no_timer_and_no_matrix() {
-        let ds = errors(&DEPLOY_GATE.replace(
-            "gate: deployment\n",
-            "gate: deployment\n            gate_after: 60\n",
-        ));
-        assert!(
-            ds.iter()
-                .any(|d| d.contains("`gate_after` is only valid on a timer gate")),
-            "{ds:?}"
-        );
-        let ds = errors(&DEPLOY_GATE.replace(
-            "gate: deployment\n",
-            "gate: deployment\n            matrix: { dimensions: { region: [eu, us] } }\n",
-        ));
-        assert!(
-            ds.iter()
-                .any(|d| d.contains("deployment gate is not supported on a matrixed step")),
-            "{ds:?}"
-        );
-        // Expiry still bounds the wait (plan Q6): allowed.
-        compile(&DEPLOY_GATE.replace(
-            "gate: deployment\n",
-            "gate: deployment\n            gate_expires_after: 600\n",
-        ));
-    }
-
-    /// Invoke inlining namespaces the reference like `needs`, and binds a
-    /// library-input target the same way as the request's.
-    #[test]
-    fn invoke_inlining_namespaces_a_deployment_gates_reference() {
-        let lib = r#"
-            interface:
-              inputs: [app]
-            steps:
-              - id: bump
-                image: busybox
-                results: [version]
-                deployment_requests:
-                  - { target: { source: argocd-prod, id: "${{ inputs.app }}" }, version: version }
-                  - { target: { source: argocd-prod, id: worker }, version: version }
+              - { id: bump, image: busybox }
               - id: live
                 gate: deployment
-                deployment: { step: bump, target: { source: argocd-prod, id: "${{ inputs.app }}" } }
                 needs: [bump]
-        "#;
-        let ir = compile_with(
+                deployment: { step: bump }
+            "#,
+        );
+        let hits: Vec<_> = ds.iter().filter(|d| d.contains("`live`")).collect();
+        assert_eq!(hits.len(), 1, "one diagnostic for the gate, got: {ds:?}");
+        assert!(
+            hits[0].contains("gate: deployment")
+                && hits[0].contains("ADR-0074")
+                && hits[0].contains(REPLACEMENT),
+            "got: {ds:?}"
+        );
+    }
+
+    #[test]
+    fn deployment_fields_on_an_invoke_step_are_refused() {
+        let lib = "steps: [{ id: bump, image: busybox }]";
+        let ds = errors_with(
             r#"
-            environment: prod
             steps:
-              - { id: deploy, invoke: .scarab/lib/deploy.yaml, with: { app: web } }
+              - id: deploy
+                invoke: .scarab/lib/deploy.yaml
+                deployment_requests: []
             "#,
             &libs(&[(".scarab/lib/deploy.yaml", lib)]),
         );
-        let live = ir.steps.iter().find(|s| s.id == "deploy/live").unwrap();
-        let r = live.deployment.as_ref().unwrap();
-        assert_eq!(r.step, "deploy/bump");
-        assert_eq!(r.target.as_ref().unwrap().id, "web");
-        let (requester, ordinal) = deployment_gate_request(&ir, live).unwrap();
-        assert_eq!((requester.id.as_str(), ordinal), ("deploy/bump", 0));
+        assert!(
+            ds.iter()
+                .any(|d| d.contains("`deploy`") && d.contains(REPLACEMENT)),
+            "got: {ds:?}"
+        );
+    }
+
+    /// An IR stored before ADR-0074 still decodes, so an old Run's pipeline
+    /// can be read back; only the Pipeline check refuses the fields.
+    #[test]
+    fn a_stored_ir_with_the_removed_fields_still_decodes() {
+        let stored = serde_json::json!({
+            "steps": [
+                { "id": "bump", "image": "busybox", "results": ["v"],
+                  "deployment_requests": [{ "target": { "source": "s", "id": "t" }, "version": "v" }] },
+                { "id": "live", "gate": "deployment", "needs": ["bump"],
+                  "deployment": { "step": "bump" } }
+            ]
+        });
+        let ir: PipelineIr = serde_json::from_value(stored).expect("old IR decodes");
+        assert!(ir.steps[0].deployment_requests.is_some());
+        assert!(ir.steps[1].deployment.is_some());
+    }
+
+    // --- declared `results:` checks every `${{ outputs }}` read ---------------
+
+    #[test]
+    fn a_read_of_a_declared_result_compiles() {
+        compile(
+            r#"
+            steps:
+              - { id: bump, image: busybox, results: [images, version] }
+              - id: wait
+                image: argoproj/argocd
+                needs: [bump]
+                command: ["argocd", "app", "wait", "--image", "${{ outputs.bump.images }}"]
+                env: [[V, "${{ outputs.bump.version }}"]]
+            "#,
+        );
+    }
+
+    #[test]
+    fn a_read_of_an_undeclared_result_is_a_compile_error() {
+        for surface in [
+            r#"{ id: wait, image: busybox, needs: [bump], command: ["${{ outputs.bump.imgaes }}"] }"#,
+            r#"{ id: wait, image: busybox, needs: [bump], env: [[I, "${{ outputs.bump.imgaes }}"]] }"#,
+            r#"{ id: wait, image: "reg/${{ outputs.bump.imgaes }}", needs: [bump] }"#,
+        ] {
+            let yaml = format!(
+                "steps:\n  - {{ id: bump, image: busybox, results: [images] }}\n  - {surface}\n"
+            );
+            let ds = errors(&yaml);
+            assert!(
+                ds.iter().any(|d| d.contains("`wait`")
+                    && d.contains("outputs.bump.imgaes")
+                    && d.contains("does not declare")
+                    && d.contains("[images]")),
+                "{surface}: got {ds:?}"
+            );
+        }
+    }
+
+    /// A Step that declares no `results:` keeps the open ADR-0041 map.
+    #[test]
+    fn a_step_without_results_is_not_checked() {
+        compile(
+            r#"
+            steps:
+              - { id: bump, image: busybox }
+              - { id: wait, image: busybox, needs: [bump], command: ["${{ outputs.bump.anything }}"] }
+            "#,
+        );
+    }
+
+    /// A library step's declared results check reads of it through the
+    /// namespaced `outputs["<id>"]` spelling the invoke rewrite produces: an
+    /// exposed output `images` is library step `images`'s result `images`.
+    #[test]
+    fn a_read_through_an_invoke_seam_is_checked_against_declared_results() {
+        let lib = |declared: &str| {
+            format!(
+                "interface:\n  outputs: [images]\nsteps:\n  - {{ id: images, image: busybox, results: [{declared}] }}\n"
+            )
+        };
+        let caller = r#"
+            steps:
+              - { id: deploy, invoke: .scarab/lib/deploy.yaml }
+              - { id: wait, image: busybox, needs: [deploy], command: ["${{ outputs.deploy.images }}"] }
+            "#;
+        let ds = errors_with(
+            caller,
+            &libs(&[(".scarab/lib/deploy.yaml", &lib("digest"))]),
+        );
+        assert!(
+            ds.iter().any(|d| d.contains("`wait`")
+                && d.contains("outputs.deploy/images.images")
+                && d.contains("does not declare")),
+            "got: {ds:?}"
+        );
+        compile_with(
+            caller,
+            &libs(&[(".scarab/lib/deploy.yaml", &lib("images"))]),
+        );
     }
 }

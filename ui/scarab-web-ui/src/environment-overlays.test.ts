@@ -2,47 +2,16 @@ import { describe, it, expect } from "vitest";
 import {
   eligibilityLabel,
   isPermissive,
-  overlayToForm,
   refLayersLabel,
   reportBanner,
   rulesToForm,
   tightenable,
   toEligibilityBody,
-  toOverlayBody,
   toGrantBody,
   toProtectionBody,
-  type OverlayForm,
 } from "./environment-overlays";
 
-const blank = (): OverlayForm => ({ ...rulesToForm(null), gateDeadlineMinutes: "" });
-
-describe("concurrency: blank is no limit, never coerced to 1", () => {
-  it("sends null for a blank field", () => {
-    expect(toProtectionBody(blank()).body?.deployment_concurrency).toBeNull();
-  });
-
-  it("refuses 0 and fractions instead of turning them into 1", () => {
-    for (const concurrency of ["0", "-1", "1.5", "two"]) {
-      const r = toProtectionBody({ ...blank(), concurrency });
-      expect(r.error, concurrency).toMatch(/blank for no limit/);
-    }
-  });
-
-  it("keeps a real limit", () => {
-    expect(toProtectionBody({ ...blank(), concurrency: "3" }).body?.deployment_concurrency).toBe(3);
-  });
-
-  it("round-trips a stored null back to a blank field", () => {
-    const form = rulesToForm({
-      approvers: [],
-      allowed_refs: [],
-      wait_timer_s: 0,
-      require_reason: false,
-      deployment_concurrency: null,
-    });
-    expect(form.concurrency).toBe("");
-  });
-});
+const blank = () => rulesToForm(null);
 
 describe("rules form <-> body", () => {
   it("splits, trims and de-duplicates the lists", () => {
@@ -58,24 +27,12 @@ describe("rules form <-> body", () => {
       allowed_refs: ["refs/heads/main", "refs/tags/*"],
       wait_timer_s: 30,
       require_reason: true,
-      deployment_concurrency: null,
     });
   });
 
   it("refuses a negative or fractional wait", () => {
     expect(toProtectionBody({ ...blank(), waitTimerS: "-1" }).error).toBeDefined();
     expect(toProtectionBody({ ...blank(), waitTimerS: "1.5" }).error).toBeDefined();
-  });
-
-  it("an overlay's gate deadline is minutes in the form, ms on the wire, blank = none", () => {
-    expect(toOverlayBody(blank()).body?.deployment_gate_deadline_ms).toBeNull();
-    expect(toOverlayBody({ ...blank(), gateDeadlineMinutes: "15" }).body?.deployment_gate_deadline_ms).toBe(
-      900_000,
-    );
-    expect(toOverlayBody({ ...blank(), gateDeadlineMinutes: "0" }).error).toBeDefined();
-    expect(overlayToForm({ ...toOverlayBody(blank()).body!, deployment_gate_deadline_ms: 900_000 }).gateDeadlineMinutes).toBe(
-      "15",
-    );
   });
 });
 
@@ -84,7 +41,6 @@ describe("labels", () => {
     const permissive = toProtectionBody(blank()).body!;
     expect(isPermissive(permissive)).toBe(true);
     expect(isPermissive({ ...permissive, require_reason: true })).toBe(false);
-    expect(isPermissive({ ...permissive, deployment_concurrency: 1 })).toBe(false);
   });
 
   it("ref layers are ANDed, never intersected", () => {
