@@ -936,6 +936,102 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/orgs/{org}/policies": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List the org's Policies (ADR-0075 §7) */
+        get: operations["list_org_policies"];
+        put?: never;
+        /** Add an org Policy (ADR-0075 §4, §10) */
+        post: operations["create_org_policy"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/policies/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read an org Policy (ADR-0075 §11) */
+        get: operations["get_org_policy"];
+        /** Replace an org Policy (ADR-0075 §10, §11) */
+        put: operations["update_org_policy"];
+        post?: never;
+        /** Delete an org Policy (ADR-0075 §10) */
+        delete: operations["delete_org_policy"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/policies/{id}/versions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** An org Policy's version history (ADR-0075 §11) */
+        get: operations["list_org_policy_versions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/policy-decisions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The org's PolicyDecision log (ADR-0075 §9) */
+        get: operations["list_org_policy_decisions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/policy-test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Evaluate run.create Policies without enforcing or recording (ADR-0075 §9)
+         * @description Policies: `policy` (a draft, compiled at the org level; a 400 when it
+         *     does not compile), `policy_id` (a stored Policy of this org), or neither
+         *     (the org's and the input's Project's effective Policies, as admission
+         *     consults them). Input: `input`, `decision_id` (its recorded input and
+         *     schema version), or `pipeline` (compiled here with `libs`; no forge
+         *     read).
+         */
+        post: operations["policy_test"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/orgs/{org}/principals": {
         parameters: {
             query?: never;
@@ -945,6 +1041,60 @@ export interface paths {
         };
         /** Search users for a grant or approver entry (ADR-0069) */
         get: operations["search_principals"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/projects/{project}/policies": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List a Project's typed settings (ADR-0075 §7) */
+        get: operations["list_project_policies"];
+        put?: never;
+        /** Add a Project typed setting (ADR-0075 §7, §10) */
+        post: operations["create_project_policy"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/projects/{project}/policies/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read a Project typed setting (ADR-0075 §11) */
+        get: operations["get_project_policy"];
+        /** Replace a Project typed setting (ADR-0075 §10, §11) */
+        put: operations["update_project_policy"];
+        post?: never;
+        /** Delete a Project typed setting (ADR-0075 §10) */
+        delete: operations["delete_project_policy"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/projects/{project}/policies/{id}/versions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** A Project typed setting's version history (ADR-0075 §11) */
+        get: operations["list_project_policy_versions"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1504,6 +1654,23 @@ export interface paths {
          *     log pipeline's broadcast. A terminal run yields the full log and closes.
          */
         get: operations["get_logs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/runs/{id}/policy-decisions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** A Run's PolicyDecisions (ADR-0075 §9) */
+        get: operations["list_run_policy_decisions"];
         put?: never;
         post?: never;
         delete?: never;
@@ -2313,6 +2480,16 @@ export interface components {
              */
             kind: string;
         };
+        /** @description `POST …/policies`. */
+        CreatePolicyRequest: {
+            /**
+             * @description The authored Policy (ADR-0075 §4). At the Project level it must be a
+             *     typed `setting` (§7).
+             */
+            policy: Record<string, never>;
+            /** @description Why, recorded on the PolicyVersion. */
+            reason?: string | null;
+        };
         /**
          * @description `POST /v1/runs` body: an inline pipeline to run immediately, plus any launch
          *     parameters (ADR-0043) declared by the pipeline's `interface`.
@@ -3083,6 +3260,145 @@ export interface components {
              */
             mount_path?: string | null;
         };
+        /** @description One page of the org decision log, newest first. */
+        PolicyDecisionPageDto: {
+            decisions: components["schemas"]["PolicyDecisionRecordDto"][];
+            /** @description Pass as `before` for the next page; absent on the last one. */
+            next?: string | null;
+        };
+        /** @description A recorded PolicyDecision (ADR-0075 §9). */
+        PolicyDecisionRecordDto: {
+            /** Format: int64 */
+            at: number;
+            /** Format: int32 */
+            attempt?: number | null;
+            /**
+             * @description The PolicyDecision: `checkpoint`, `schema_version`, `input`,
+             *     `policy_set_digest`, `results` (one per Policy: `policy_id`,
+             *     `version`, `name`, `level`, `mode`, `outcome`), and `outcome`
+             *     (`{kind: allow}` or `{kind: deny, messages}`).
+             */
+            decision: Record<string, never>;
+            id: string;
+            org: string;
+            project?: string | null;
+            /** @description The Run the decision admitted; absent for a refused `run.create`. */
+            run_id?: string | null;
+            step_id?: string | null;
+        };
+        /** @description A stored Policy, at its current version. */
+        PolicyDto: {
+            /** @description SHA-256 of the Policy's canonical JSON. */
+            content_hash: string;
+            /** Format: int64 */
+            created_at: number;
+            /** @description Deleted Policies keep their history and are not consulted. */
+            deleted: boolean;
+            id: string;
+            /** @description `org` or `project`. */
+            level: string;
+            name: string;
+            org: string;
+            /**
+             * @description The authored Policy (ADR-0075 §4): `name`, `checkpoint`, `match`,
+             *     `mode`, and `rules` or `setting`.
+             */
+            policy: Record<string, never>;
+            /** @description The Project of a Project typed setting; absent at the org level. */
+            project?: string | null;
+            /** Format: int64 */
+            updated_at: number;
+            /**
+             * Format: int64
+             * @description 1 on create; each save, the delete included, adds one. A PUT or
+             *     DELETE names it as `expected_version`.
+             */
+            version: number;
+        };
+        PolicyReadsDto: {
+            name: string;
+            policy_id: string;
+            /** @description Empty when the stored Policy no longer compiles. */
+            rules: components["schemas"]["RuleReadsDto"][];
+            /** Format: int64 */
+            version: number;
+        };
+        /**
+         * @description The Pipeline form of the policy test: what `scarab validate --server`
+         *     sends.
+         */
+        PolicyTestPipeline: {
+            /**
+             * @description Every library the Pipeline invokes, transitively: repository path
+             *     (`.scarab/lib/deploy.yaml`) to source.
+             */
+            libs?: {
+                [key: string]: string;
+            };
+            /**
+             * @description The Pipeline file's repository path; the Pipeline's name when it
+             *     declares none. Default `.scarab/ci.yaml`.
+             */
+            path?: string | null;
+            /** @description The Project the Run would be created in. */
+            project: string;
+            trigger: components["schemas"]["PolicyTestTrigger"];
+            /** @description The Pipeline file's YAML. */
+            yaml: string;
+        };
+        /**
+         * @description `POST /v1/orgs/{org}/policy-test`. Name at most one of `policy` and
+         *     `policy_id` (neither: the Project's effective Policies), and exactly one
+         *     of `input`, `decision_id` and `pipeline`.
+         */
+        PolicyTestRequest: {
+            /** @description A recorded decision of this org, whose input is evaluated again. */
+            decision_id?: string | null;
+            /** @description A `run.create` input, as a PolicyDecision records it. */
+            input?: Record<string, never> | null;
+            pipeline?: null | components["schemas"]["PolicyTestPipeline"];
+            /** @description A draft Policy, compiled at the org level. */
+            policy?: Record<string, never> | null;
+            /** @description A stored Policy of this org (either level). */
+            policy_id?: string | null;
+        };
+        /** @description What `policy-test` answers. Nothing is recorded. */
+        PolicyTestResponse: {
+            /**
+             * @description The PolicyDecision, as admission would record it (see
+             *     [`PolicyDecisionRecordDto::decision`]). A draft Policy has
+             *     `policy_id` "" and `version` 0.
+             */
+            decision: Record<string, never>;
+            /** @description Per evaluated Policy, what each rule reads. */
+            policies: components["schemas"]["PolicyReadsDto"][];
+        };
+        PolicyTestTrigger: {
+            /**
+             * @description `push`, `pull_request`, `tag`, `release`, `comment`, `cron`,
+             *     `manual`, `api` or `upstream`.
+             */
+            kind: string;
+            /** @description The symbolic ref (`refs/heads/main`). */
+            ref?: string | null;
+            sha?: string | null;
+        };
+        /** @description One saved version of a Policy (ADR-0075 §11). */
+        PolicyVersionDto: {
+            /** Format: int64 */
+            at: number;
+            /** @description The Principal who saved it. */
+            author: string;
+            content_hash: string;
+            /** @description This version deleted the Policy. */
+            deleted: boolean;
+            policy: Record<string, never>;
+            reason: string;
+            /** @description The StepUpConfirmation that approved this save, when one was needed. */
+            step_up_ref?: string | null;
+            /** Format: int64 */
+            version: number;
+        };
         /** @description A Principal, as the grant/approver typeahead offers it (ADR-0069 §3). */
         PrincipalDto: {
             /** @description `false` = created by a forge import, not signed into yet. */
@@ -3333,6 +3649,17 @@ export interface components {
              *     see the handler's note on why re-sync never unbinds.
              */
             confirmed: number;
+        };
+        RuleReadsDto: {
+            /** @description The rule's index in `rules`; 0 for a typed setting. */
+            index: number;
+            /** @description `cel` or `typed`. */
+            predicate: string;
+            /**
+             * @description The input fields a CEL rule reads (`trigger.ref`, `steps`); empty for
+             *     a typed setting, which reads Step and gate origins.
+             */
+            reads: string[];
         };
         /** @description `GET /v1/runs` body: the most recent runs, newest first. */
         RunListResponse: {
@@ -3900,6 +4227,17 @@ export interface components {
         /** @description What an uninstall removed. */
         UninstalledPluginDto: {
             name: string;
+        };
+        /** @description `PUT …/policies/{id}`: the whole Policy, replaced. */
+        UpdatePolicyRequest: {
+            /**
+             * Format: int64
+             * @description The version this edit was made against; another stored version is a
+             *     409.
+             */
+            expected_version: number;
+            policy: Record<string, never>;
+            reason?: string | null;
         };
         /** @description One waiting gate of a run in the list view ([`RunSummaryDto::waiting_gates`]). */
         WaitingGateDto: {
@@ -6538,6 +6876,393 @@ export interface operations {
             };
         };
     };
+    list_org_policies: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyDto"][];
+                };
+            };
+            /** @description no Read on the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description policies not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    create_org_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreatePolicyRequest"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyDto"];
+                };
+            };
+            /** @description not a Policy, or it does not compile (its checkpoint is not yet consulted, a CEL error, an effect the checkpoint does not allow) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description policies not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a live Policy here has that name */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_org_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description policy id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyDto"];
+                };
+            };
+            /** @description no Read on the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such Policy in this org, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    update_org_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description policy id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdatePolicyRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyDto"];
+                };
+            };
+            /** @description not a Policy, or it does not compile */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description no such live Policy in this org, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `expected_version` is not the stored version, or the name is taken */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_org_policy: {
+        parameters: {
+            query: {
+                /**
+                 * @description The version the delete was judged against; another stored version is
+                 *     a 409.
+                 */
+                expected_version: number;
+                reason?: string;
+            };
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description policy id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyDto"];
+                };
+            };
+            /** @description not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description no such live Policy in this org, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `expected_version` is not the stored version */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_org_policy_versions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description policy id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyVersionDto"][];
+                };
+            };
+            /** @description no Read on the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such Policy in this org, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_org_policy_decisions: {
+        parameters: {
+            query?: {
+                /** @description At most this many (default and cap 200). */
+                limit?: number;
+                /** @description The `next` of the previous page. */
+                before?: string;
+            };
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyDecisionPageDto"];
+                };
+            };
+            /** @description `before` is not a cursor */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no Read on the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description policies not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    policy_test: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PolicyTestRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyTestResponse"];
+                };
+            };
+            /** @description not one input form, a draft that does not compile, a Pipeline that does not compile, a Run admission refuses before its Policies, or an input that cannot be matched */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no Read on the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such Policy or decision in this org, or policies not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     search_principals: {
         parameters: {
             query: {
@@ -6560,6 +7285,310 @@ export interface operations {
             };
             /** @description not an org admin */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_project_policies: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description project */
+                project: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyDto"][];
+                };
+            };
+            /** @description no Read on the Project */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description policies not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    create_project_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description project */
+                project: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreatePolicyRequest"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyDto"];
+                };
+            };
+            /** @description not a typed setting (ADR-0075 §7), or it does not compile */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a Project admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description policies not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a live Policy here has that name */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_project_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description project */
+                project: string;
+                /** @description policy id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyDto"];
+                };
+            };
+            /** @description no Read on the Project */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such Policy in this Project, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    update_project_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description project */
+                project: string;
+                /** @description policy id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdatePolicyRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyDto"];
+                };
+            };
+            /** @description not a typed setting (ADR-0075 §7), or it does not compile */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a Project admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description no such live Policy in this Project, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `expected_version` is not the stored version, or the name is taken */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_project_policy: {
+        parameters: {
+            query: {
+                /**
+                 * @description The version the delete was judged against; another stored version is
+                 *     a 409.
+                 */
+                expected_version: number;
+                reason?: string;
+            };
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description project */
+                project: string;
+                /** @description policy id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyDto"];
+                };
+            };
+            /** @description not a Project admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description no such live Policy in this Project, or not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `expected_version` is not the stored version */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_project_policy_versions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description project */
+                project: string;
+                /** @description policy id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyVersionDto"][];
+                };
+            };
+            /** @description no Read on the Project */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such Policy in this Project, or not configured */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -7591,6 +8620,42 @@ export interface operations {
         responses: {
             /** @description SSE stream of step log output */
             200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_run_policy_decisions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description run id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyDecisionRecordDto"][];
+                };
+            };
+            /** @description no Read on the Run's Project */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such run */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -3204,6 +3204,520 @@
         ]
       }
     },
+    "/v1/orgs/{org}/policies": {
+      "get": {
+        "tags": [
+          "Policies"
+        ],
+        "summary": "List the org's Policies (ADR-0075 §7)",
+        "operationId": "list_org_policies",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PolicyDto"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "no Read on the org"
+          },
+          "404": {
+            "description": "policies not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "Policies"
+        ],
+        "summary": "Add an org Policy (ADR-0075 §4, §10)",
+        "operationId": "create_org_policy",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreatePolicyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "not a Policy, or it does not compile (its checkpoint is not yet consulted, a CEL error, an effect the checkpoint does not allow)"
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "policies not configured"
+          },
+          "409": {
+            "description": "a live Policy here has that name"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/policies/{id}": {
+      "get": {
+        "tags": [
+          "Policies"
+        ],
+        "summary": "Read an org Policy (ADR-0075 §11)",
+        "operationId": "get_org_policy",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "policy id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "no Read on the org"
+          },
+          "404": {
+            "description": "no such Policy in this org, or not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "Policies"
+        ],
+        "summary": "Replace an org Policy (ADR-0075 §10, §11)",
+        "operationId": "update_org_policy",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "policy id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdatePolicyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "not a Policy, or it does not compile"
+          },
+          "403": {
+            "description": "not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such live Policy in this org, or not configured"
+          },
+          "409": {
+            "description": "`expected_version` is not the stored version, or the name is taken"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "Policies"
+        ],
+        "summary": "Delete an org Policy (ADR-0075 §10)",
+        "operationId": "delete_org_policy",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "policy id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "expected_version",
+            "in": "query",
+            "description": "The version the delete was judged against; another stored version is\na 409.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "reason",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such live Policy in this org, or not configured"
+          },
+          "409": {
+            "description": "`expected_version` is not the stored version"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/policies/{id}/versions": {
+      "get": {
+        "tags": [
+          "Policies"
+        ],
+        "summary": "An org Policy's version history (ADR-0075 §11)",
+        "operationId": "list_org_policy_versions",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "policy id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PolicyVersionDto"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "no Read on the org"
+          },
+          "404": {
+            "description": "no such Policy in this org, or not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/policy-decisions": {
+      "get": {
+        "tags": [
+          "Policies"
+        ],
+        "summary": "The org's PolicyDecision log (ADR-0075 §9)",
+        "operationId": "list_org_policy_decisions",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "At most this many (default and cap 200).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "description": "The `next` of the previous page.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyDecisionPageDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`before` is not a cursor"
+          },
+          "403": {
+            "description": "no Read on the org"
+          },
+          "404": {
+            "description": "policies not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/policy-test": {
+      "post": {
+        "tags": [
+          "Policies"
+        ],
+        "summary": "Evaluate run.create Policies without enforcing or recording (ADR-0075 §9)",
+        "description": "Policies: `policy` (a draft, compiled at the org level; a 400 when it\ndoes not compile), `policy_id` (a stored Policy of this org), or neither\n(the org's and the input's Project's effective Policies, as admission\nconsults them). Input: `input`, `decision_id` (its recorded input and\nschema version), or `pipeline` (compiled here with `libs`; no forge\nread).",
+        "operationId": "policy_test",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PolicyTestRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyTestResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "not one input form, a draft that does not compile, a Pipeline that does not compile, a Run admission refuses before its Policies, or an input that cannot be matched"
+          },
+          "403": {
+            "description": "no Read on the org"
+          },
+          "404": {
+            "description": "no such Policy or decision in this org, or policies not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/orgs/{org}/principals": {
       "get": {
         "tags": [
@@ -3238,6 +3752,446 @@
           },
           "403": {
             "description": "not an org admin"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/projects/{project}/policies": {
+      "get": {
+        "tags": [
+          "Policies"
+        ],
+        "summary": "List a Project's typed settings (ADR-0075 §7)",
+        "operationId": "list_project_policies",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "project",
+            "in": "path",
+            "description": "project",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PolicyDto"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "no Read on the Project"
+          },
+          "404": {
+            "description": "policies not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "Policies"
+        ],
+        "summary": "Add a Project typed setting (ADR-0075 §7, §10)",
+        "operationId": "create_project_policy",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "project",
+            "in": "path",
+            "description": "project",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreatePolicyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "not a typed setting (ADR-0075 §7), or it does not compile"
+          },
+          "403": {
+            "description": "not a Project admin"
+          },
+          "404": {
+            "description": "policies not configured"
+          },
+          "409": {
+            "description": "a live Policy here has that name"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/projects/{project}/policies/{id}": {
+      "get": {
+        "tags": [
+          "Policies"
+        ],
+        "summary": "Read a Project typed setting (ADR-0075 §11)",
+        "operationId": "get_project_policy",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "project",
+            "in": "path",
+            "description": "project",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "policy id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "no Read on the Project"
+          },
+          "404": {
+            "description": "no such Policy in this Project, or not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "Policies"
+        ],
+        "summary": "Replace a Project typed setting (ADR-0075 §10, §11)",
+        "operationId": "update_project_policy",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "project",
+            "in": "path",
+            "description": "project",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "policy id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdatePolicyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "not a typed setting (ADR-0075 §7), or it does not compile"
+          },
+          "403": {
+            "description": "not a Project admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such live Policy in this Project, or not configured"
+          },
+          "409": {
+            "description": "`expected_version` is not the stored version, or the name is taken"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "Policies"
+        ],
+        "summary": "Delete a Project typed setting (ADR-0075 §10)",
+        "operationId": "delete_project_policy",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "project",
+            "in": "path",
+            "description": "project",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "policy id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "expected_version",
+            "in": "query",
+            "description": "The version the delete was judged against; another stored version is\na 409.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "reason",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not a Project admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such live Policy in this Project, or not configured"
+          },
+          "409": {
+            "description": "`expected_version` is not the stored version"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/projects/{project}/policies/{id}/versions": {
+      "get": {
+        "tags": [
+          "Policies"
+        ],
+        "summary": "A Project typed setting's version history (ADR-0075 §11)",
+        "operationId": "list_project_policy_versions",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "project",
+            "in": "path",
+            "description": "project",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "policy id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PolicyVersionDto"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "no Read on the Project"
+          },
+          "404": {
+            "description": "no such Policy in this Project, or not configured"
           }
         },
         "security": [
@@ -4839,6 +5793,55 @@
         "responses": {
           "200": {
             "description": "SSE stream of step log output"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/runs/{id}/policy-decisions": {
+      "get": {
+        "tags": [
+          "Policies"
+        ],
+        "summary": "A Run's PolicyDecisions (ADR-0075 §9)",
+        "operationId": "list_run_policy_decisions",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "run id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PolicyDecisionRecordDto"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "no Read on the Run's Project"
+          },
+          "404": {
+            "description": "no such run"
           }
         },
         "security": [
@@ -6684,6 +7687,27 @@
           }
         }
       },
+      "CreatePolicyRequest": {
+        "type": "object",
+        "description": "`POST …/policies`.",
+        "required": [
+          "policy"
+        ],
+        "properties": {
+          "policy": {
+            "type": "object",
+            "description": "The authored Policy (ADR-0075 §4). At the Project level it must be a\ntyped `setting` (§7)."
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why, recorded on the PolicyVersion."
+          }
+        },
+        "additionalProperties": false
+      },
       "CreateRunRequest": {
         "type": "object",
         "description": "`POST /v1/runs` body: an inline pipeline to run immediately, plus any launch\nparameters (ADR-0043) declared by the pipeline's `interface`.",
@@ -8183,6 +9207,355 @@
         },
         "additionalProperties": false
       },
+      "PolicyDecisionPageDto": {
+        "type": "object",
+        "description": "One page of the org decision log, newest first.",
+        "required": [
+          "decisions"
+        ],
+        "properties": {
+          "decisions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PolicyDecisionRecordDto"
+            }
+          },
+          "next": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Pass as `before` for the next page; absent on the last one."
+          }
+        }
+      },
+      "PolicyDecisionRecordDto": {
+        "type": "object",
+        "description": "A recorded PolicyDecision (ADR-0075 §9).",
+        "required": [
+          "id",
+          "org",
+          "at",
+          "decision"
+        ],
+        "properties": {
+          "at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "attempt": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "decision": {
+            "type": "object",
+            "description": "The PolicyDecision: `checkpoint`, `schema_version`, `input`,\n`policy_set_digest`, `results` (one per Policy: `policy_id`,\n`version`, `name`, `level`, `mode`, `outcome`), and `outcome`\n(`{kind: allow}` or `{kind: deny, messages}`)."
+          },
+          "id": {
+            "type": "string"
+          },
+          "org": {
+            "type": "string"
+          },
+          "project": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "run_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Run the decision admitted; absent for a refused `run.create`."
+          },
+          "step_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "PolicyDto": {
+        "type": "object",
+        "description": "A stored Policy, at its current version.",
+        "required": [
+          "id",
+          "level",
+          "org",
+          "name",
+          "version",
+          "policy",
+          "content_hash",
+          "created_at",
+          "updated_at",
+          "deleted"
+        ],
+        "properties": {
+          "content_hash": {
+            "type": "string",
+            "description": "SHA-256 of the Policy's canonical JSON."
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "deleted": {
+            "type": "boolean",
+            "description": "Deleted Policies keep their history and are not consulted."
+          },
+          "id": {
+            "type": "string"
+          },
+          "level": {
+            "type": "string",
+            "description": "`org` or `project`."
+          },
+          "name": {
+            "type": "string"
+          },
+          "org": {
+            "type": "string"
+          },
+          "policy": {
+            "type": "object",
+            "description": "The authored Policy (ADR-0075 §4): `name`, `checkpoint`, `match`,\n`mode`, and `rules` or `setting`."
+          },
+          "project": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Project of a Project typed setting; absent at the org level."
+          },
+          "updated_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "description": "1 on create; each save, the delete included, adds one. A PUT or\nDELETE names it as `expected_version`.",
+            "minimum": 0
+          }
+        }
+      },
+      "PolicyReadsDto": {
+        "type": "object",
+        "required": [
+          "policy_id",
+          "version",
+          "name",
+          "rules"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "policy_id": {
+            "type": "string"
+          },
+          "rules": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RuleReadsDto"
+            },
+            "description": "Empty when the stored Policy no longer compiles."
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "PolicyTestPipeline": {
+        "type": "object",
+        "description": "The Pipeline form of the policy test: what `scarab validate --server`\nsends.",
+        "required": [
+          "yaml",
+          "project",
+          "trigger"
+        ],
+        "properties": {
+          "libs": {
+            "type": "object",
+            "description": "Every library the Pipeline invokes, transitively: repository path\n(`.scarab/lib/deploy.yaml`) to source.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Pipeline file's repository path; the Pipeline's name when it\ndeclares none. Default `.scarab/ci.yaml`."
+          },
+          "project": {
+            "type": "string",
+            "description": "The Project the Run would be created in."
+          },
+          "trigger": {
+            "$ref": "#/components/schemas/PolicyTestTrigger"
+          },
+          "yaml": {
+            "type": "string",
+            "description": "The Pipeline file's YAML."
+          }
+        },
+        "additionalProperties": false
+      },
+      "PolicyTestRequest": {
+        "type": "object",
+        "description": "`POST /v1/orgs/{org}/policy-test`. Name at most one of `policy` and\n`policy_id` (neither: the Project's effective Policies), and exactly one\nof `input`, `decision_id` and `pipeline`.",
+        "properties": {
+          "decision_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A recorded decision of this org, whose input is evaluated again."
+          },
+          "input": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "A `run.create` input, as a PolicyDecision records it."
+          },
+          "pipeline": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PolicyTestPipeline",
+                "description": "A Pipeline to compile here and build the input from."
+              }
+            ]
+          },
+          "policy": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "A draft Policy, compiled at the org level."
+          },
+          "policy_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A stored Policy of this org (either level)."
+          }
+        },
+        "additionalProperties": false
+      },
+      "PolicyTestResponse": {
+        "type": "object",
+        "description": "What `policy-test` answers. Nothing is recorded.",
+        "required": [
+          "decision",
+          "policies"
+        ],
+        "properties": {
+          "decision": {
+            "type": "object",
+            "description": "The PolicyDecision, as admission would record it (see\n[`PolicyDecisionRecordDto::decision`]). A draft Policy has\n`policy_id` \"\" and `version` 0."
+          },
+          "policies": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PolicyReadsDto"
+            },
+            "description": "Per evaluated Policy, what each rule reads."
+          }
+        }
+      },
+      "PolicyTestTrigger": {
+        "type": "object",
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "`push`, `pull_request`, `tag`, `release`, `comment`, `cron`,\n`manual`, `api` or `upstream`."
+          },
+          "ref": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The symbolic ref (`refs/heads/main`)."
+          },
+          "sha": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "PolicyVersionDto": {
+        "type": "object",
+        "description": "One saved version of a Policy (ADR-0075 §11).",
+        "required": [
+          "version",
+          "policy",
+          "content_hash",
+          "author",
+          "reason",
+          "deleted",
+          "at"
+        ],
+        "properties": {
+          "at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "author": {
+            "type": "string",
+            "description": "The Principal who saved it."
+          },
+          "content_hash": {
+            "type": "string"
+          },
+          "deleted": {
+            "type": "boolean",
+            "description": "This version deleted the Policy."
+          },
+          "policy": {
+            "type": "object"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "step_up_ref": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The StepUpConfirmation that approved this save, when one was needed."
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
       "PrincipalDto": {
         "type": "object",
         "description": "A Principal, as the grant/approver typeahead offers it (ADR-0069 §3).",
@@ -8619,6 +9992,32 @@
             "type": "integer",
             "description": "How many bindings the forge confirms. Reported rather than acted on:\nsee the handler's note on why re-sync never unbinds.",
             "minimum": 0
+          }
+        }
+      },
+      "RuleReadsDto": {
+        "type": "object",
+        "required": [
+          "index",
+          "predicate",
+          "reads"
+        ],
+        "properties": {
+          "index": {
+            "type": "integer",
+            "description": "The rule's index in `rules`; 0 for a typed setting.",
+            "minimum": 0
+          },
+          "predicate": {
+            "type": "string",
+            "description": "`cel` or `typed`."
+          },
+          "reads": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The input fields a CEL rule reads (`trigger.ref`, `steps`); empty for\na typed setting, which reads Step and gate origins."
           }
         }
       },
@@ -9611,6 +11010,32 @@
           }
         }
       },
+      "UpdatePolicyRequest": {
+        "type": "object",
+        "description": "`PUT …/policies/{id}`: the whole Policy, replaced.",
+        "required": [
+          "policy",
+          "expected_version"
+        ],
+        "properties": {
+          "expected_version": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The version this edit was made against; another stored version is a\n409.",
+            "minimum": 0
+          },
+          "policy": {
+            "type": "object"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
       "WaitingGateDto": {
         "type": "object",
         "description": "One waiting gate of a run in the list view ([`RunSummaryDto::waiting_gates`]).",
@@ -9740,6 +11165,10 @@
     {
       "name": "Plugins",
       "description": "PluginInstallations (ADR-0072): the first-party catalog, install and uninstall, the kill switch, and the PluginConnections the CredentialBroker proxies to."
+    },
+    {
+      "name": "Policies",
+      "description": "Policies (ADR-0075): org Policies and Project typed settings with their version history, the PolicyDecision logs, and the policy test API."
     },
     {
       "name": "Secrets",

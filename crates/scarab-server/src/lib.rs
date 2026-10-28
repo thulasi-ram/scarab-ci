@@ -75,6 +75,9 @@ pub mod plugin_runtime;
 /// ADR-0072: PluginInstallations — the first-party catalog, install,
 /// uninstall and the kill switch.
 pub mod plugins;
+/// ADR-0075: the Policy API — org Policies, Project typed settings, the
+/// decision logs and the policy test API.
+pub mod policies;
 pub mod retention;
 mod routes;
 /// Slice b, criterion 5: the Run page's gate resolution per step.
@@ -10145,6 +10148,12 @@ const TAG_GROUPS: &[(&str, &str)] = &[
          CredentialBroker proxies to.",
     ),
     (
+        "Policies",
+        "Policies (ADR-0075): org Policies and Project typed settings with \
+         their version history, the PolicyDecision logs, and the policy test \
+         API.",
+    ),
+    (
         "Secrets",
         "Scoped secrets (org / repo / environment) and the effective-status \
          matrix that resolves them.",
@@ -10196,6 +10205,9 @@ fn tag_for_path(path: &str) -> Option<&'static str> {
         "Auth & Identity"
     } else if matches!(path, "/healthz" | "/readyz" | "/metrics") {
         "System"
+    } else if path.contains("/policies") || path.contains("/policy-") {
+        // Before Runs: `/v1/runs/{id}/policy-decisions` is a Policy read.
+        "Policies"
     } else if path.contains("/plugins") || path.contains("/plugin-catalog") {
         "Plugins"
     } else if path.contains("/environments") || path.contains("/environment-migration-report") {
@@ -10461,6 +10473,21 @@ impl utoipa::Modify for StepUpResponses {
         org_environments::delete_environment_project_privilege_grant,
         org_environments::get_environment_migration_report,
         org_environments::acknowledge_environment_migration_report,
+        policies::list_org_policies,
+        policies::create_org_policy,
+        policies::get_org_policy,
+        policies::update_org_policy,
+        policies::delete_org_policy,
+        policies::list_org_policy_versions,
+        policies::list_project_policies,
+        policies::create_project_policy,
+        policies::get_project_policy,
+        policies::update_project_policy,
+        policies::delete_project_policy,
+        policies::list_project_policy_versions,
+        policies::policy_test,
+        policies::list_org_policy_decisions,
+        policies::list_run_policy_decisions,
         plugins::plugin_catalog,
         plugins::list_plugins,
         plugins::install_plugin,
@@ -10609,6 +10636,18 @@ impl utoipa::Modify for StepUpResponses {
         org_environments::LegacyProtectionRulesDto,
         org_environments::EnvironmentMigrationReportProjectDto,
         org_environments::EnvironmentMigrationReportDto,
+        policies::PolicyDto,
+        policies::PolicyVersionDto,
+        policies::CreatePolicyRequest,
+        policies::UpdatePolicyRequest,
+        policies::PolicyDecisionRecordDto,
+        policies::PolicyDecisionPageDto,
+        policies::PolicyTestRequest,
+        policies::PolicyTestPipeline,
+        policies::PolicyTestTrigger,
+        policies::PolicyTestResponse,
+        policies::PolicyReadsDto,
+        policies::RuleReadsDto,
         plugins::PluginCapabilityDto,
         plugins::RequestRuleDto,
         plugins::ConnectionSlotDto,
