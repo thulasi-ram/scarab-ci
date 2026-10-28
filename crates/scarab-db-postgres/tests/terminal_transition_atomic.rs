@@ -15,15 +15,12 @@
 
 mod common;
 
-use std::collections::BTreeMap;
-
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
-use scarab_deployment::DeploymentStore;
 use scarab_engine::ports::ExecState;
 use scarab_engine::{
-    cancel_run_request, rerun_step, Db, EventPayload, RunDeploymentRequest, RunId, Scheduler,
-    StepId, StepSpec, StepStatus, Timestamp,
+    cancel_run_request, rerun_step, Db, EventPayload, RunId, Scheduler, StepId, StepSpec,
+    StepStatus, Timestamp,
 };
 use scarab_testkit::{FakeClock, FakeExecutor, InMemoryDb};
 use serde_json::json;
@@ -281,71 +278,6 @@ async fn skip_unchanged_and_its_events_are_one_commit() {
     assert_eq!(skipped, 1);
     // Into Succeeded twice overall (its first run, then the skip).
     assert_eq!(transitions_into(&db, "d", StepStatus::Succeeded).await, 2);
-}
-
-/// The deploy success path: the transition, the DeploymentRequest and the
-/// finalization events are one commit — a failed journal write records no
-/// request and leaves the step `Running`; the re-drive records exactly one.
-#[tokio::test]
-async fn a_deploy_success_and_its_events_are_one_commit() {
-    let db = InMemoryDb::new();
-    let (clock, exec) = (FakeClock::new(1_000), FakeExecutor::new());
-    let bump = StepId("bump".into());
-    db.create_run(&run_id(), 2, 1, Timestamp(1_000))
-        .await
-        .unwrap();
-    db.create_step_run(&run_id(), &bump, Some(&spec()), &[], Timestamp(1_000))
-        .await
-        .unwrap();
-    db.store_run_ir(
-        &run_id(),
-        &json!({ "ir_version": 2, "environment": "prod", "steps": [{
-            "id": "bump", "image": "img", "results": ["version", "images"],
-        }] }),
-    )
-    .await
-    .unwrap();
-    db.set_run_deployment_requests(
-        &run_id(),
-        &[RunDeploymentRequest {
-            step: bump.clone(),
-            ordinal: 0,
-            org: "acme".into(),
-            environment: "prod".into(),
-            target_source: "argocd".into(),
-            target_id: "web".into(),
-            version_result: "version".into(),
-            evidence_results: vec!["images".into()],
-            gate_steps: Vec::new(),
-        }],
-    )
-    .await
-    .unwrap();
-    exec.set_results(
-        "bump",
-        BTreeMap::from([
-            ("version".to_string(), json!("v42")),
-            ("images".to_string(), json!("sha256:aaa")),
-        ]),
-    );
-    tick(&db, &clock, &exec).await;
-
-    db.fail_next_event_append(is_step_transitioned);
-    exec.script_outcome(ExecState::Succeeded);
-    tick(&db, &clock, &exec).await;
-    assert!(!db.event_append_failure_armed(), "the crash was injected");
-    every_terminal_step_is_journaled(&db).await;
-    assert_eq!(status_of(&db, "bump").await, StepStatus::Running);
-    assert!(
-        db.inputs("acme", "prod").await.unwrap().is_empty(),
-        "no request without its journaled success"
-    );
-
-    exec.script_outcome(ExecState::Succeeded);
-    tick(&db, &clock, &exec).await;
-    assert_eq!(status_of(&db, "bump").await, StepStatus::Succeeded);
-    every_terminal_step_is_journaled(&db).await;
-    assert_eq!(db.inputs("acme", "prod").await.unwrap().len(), 1);
 }
 
 /// The operator-cancel path: the step's `→ Cancelled` journal write fails;

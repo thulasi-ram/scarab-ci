@@ -18,8 +18,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
-# A report lands in the Deployment record as a DeploymentStatusReport.
-scarab-deployment = { workspace = true }
 # A report's (installation, vendor grouping) IS an EnvironmentDeploymentSource
 # (ADR-0071 §5): one shape rule, owned there.
 scarab-project = { workspace = true }

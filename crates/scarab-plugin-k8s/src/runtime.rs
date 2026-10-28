@@ -5,7 +5,9 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use k8s_openapi::api::apps::v1::Deployment;
-use k8s_openapi::api::core::v1::{ContainerStatus, Namespace, Pod, ServiceAccount};
+use k8s_openapi::api::core::v1::{
+    ContainerStatus, Namespace, PersistentVolumeClaim, Pod, ServiceAccount,
+};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use kube::api::{DeleteParams, ListParams, LogParams, Patch, PatchParams, PostParams};
 use kube::{Api, Client};
@@ -65,6 +67,11 @@ pub enum RuntimeError {
     /// The broker URL's host did not resolve (this pass).
     #[error("resolving the broker: {0}")]
     BrokerUnresolved(String),
+    /// The installation's storage claim cannot be mounted: it is missing, or
+    /// not annotated for this installation (ADR-0074 §7). The workload is
+    /// held at zero replicas until an operator fixes the claim.
+    #[error("{0}")]
+    Storage(String),
 }
 
 fn kube_err(e: kube::Error) -> RuntimeError {
@@ -329,6 +336,12 @@ impl K8sPluginRuntime {
 
     /// Apply installation's ServiceAccount and Deployment (one replica).
     /// `pod_broker_url` is [`Self::pod_broker_url`]'s answer this pass.
+    ///
+    /// With storage (ADR-0074 §7), the claim is checked first, every pass:
+    /// one that is missing or not annotated for this installation is never
+    /// mounted — the workload is scaled to zero and the error says why — so
+    /// a claim created or re-annotated later is checked before any Pod
+    /// mounts it.
     pub async fn ensure(
         &self,
         installation: &PluginInstallation,
@@ -338,6 +351,22 @@ impl K8sPluginRuntime {
             .validate()
             .map_err(|e| RuntimeError::Invalid(e.to_string()))?;
         let name = objects::workload_name(&installation.id);
+        if let Some(storage) = &installation.storage {
+            let claim = self
+                .namespaced::<PersistentVolumeClaim>()
+                .get_opt(&storage.claim)
+                .await
+                .map_err(kube_err)?;
+            if let Some(why) = objects::storage_claim_refusal(
+                &self.config.namespace,
+                installation,
+                storage,
+                claim.as_ref(),
+            ) {
+                self.scale_to_zero(&name).await?;
+                return Err(RuntimeError::Storage(why));
+            }
+        }
         let sa = objects::service_account(&self.config.namespace, installation);
         self.namespaced::<ServiceAccount>()
             .patch(&name, &Self::apply_params(), &Patch::Apply(&sa))
@@ -373,21 +402,7 @@ impl K8sPluginRuntime {
                 .delete(&name, &DeleteParams::default())
                 .await,
         );
-        // A merge patch, not an apply: an apply of `{replicas: 0}` alone
-        // would remove every other field this manager owns.
-        let scale = serde_json::json!({ "spec": { "replicas": 0 } });
-        let scaled_down = gone_is_fine(
-            self.namespaced::<Deployment>()
-                .patch(
-                    &name,
-                    &PatchParams {
-                        field_manager: Some(FIELD_MANAGER.to_string()),
-                        ..Default::default()
-                    },
-                    &Patch::Merge(&scale),
-                )
-                .await,
-        );
+        let scaled_down = self.scale_to_zero(&name).await;
         // `gone_is_fine` already says "kubernetes: …"; keep it said once.
         let detail = |e: RuntimeError| match e {
             RuntimeError::Kube(m) => m,
@@ -405,6 +420,25 @@ impl K8sPluginRuntime {
                 "deleting the ServiceAccount: {revoke}; scaling to zero: {scale}"
             ))),
         }
+    }
+
+    /// Scale the Deployment `name` to zero; a missing one is fine.
+    async fn scale_to_zero(&self, name: &str) -> Result<(), RuntimeError> {
+        // A merge patch, not an apply: an apply of `{replicas: 0}` alone
+        // would remove every other field this manager owns.
+        let scale = serde_json::json!({ "spec": { "replicas": 0 } });
+        gone_is_fine(
+            self.namespaced::<Deployment>()
+                .patch(
+                    name,
+                    &PatchParams {
+                        field_manager: Some(FIELD_MANAGER.to_string()),
+                        ..Default::default()
+                    },
+                    &Patch::Merge(&scale),
+                )
+                .await,
+        )
     }
 
     /// Uninstall: delete the Deployment (its Pods with it) and the
@@ -452,8 +486,9 @@ impl K8sPluginRuntime {
     /// What the cluster has of one installation's workload.
     pub async fn workload_state(
         &self,
-        installation_id: &str,
+        installation: &PluginInstallation,
     ) -> Result<WorkloadState, RuntimeError> {
+        let installation_id = installation.id.as_str();
         let name = objects::workload_name(installation_id);
         let Some(deployment) = self
             .namespaced::<Deployment>()
@@ -506,6 +541,29 @@ impl K8sPluginRuntime {
                             Some(m) if !m.is_empty() => format!("{reason}: {m}"),
                             _ => reason,
                         }));
+                    }
+                }
+            }
+        }
+        // Not up and nothing stuck: an unbound storage claim keeps the Pod
+        // Pending (unschedulable) — say so, naming the claim.
+        if let Some(storage) = &installation.storage {
+            match self
+                .namespaced::<PersistentVolumeClaim>()
+                .get_opt(&storage.claim)
+                .await
+                .map_err(kube_err)?
+            {
+                None => {
+                    return Ok(WorkloadState::Failing(format!(
+                        "storage: PersistentVolumeClaim `{}` does not exist in namespace `{}`; \
+                         Scarab does not create it",
+                        storage.claim, self.config.namespace
+                    )))
+                }
+                Some(claim) => {
+                    if let Some(waiting) = objects::storage_claim_waiting(storage, &claim) {
+                        return Ok(WorkloadState::Starting(waiting));
                     }
                 }
             }

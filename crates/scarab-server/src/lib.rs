@@ -59,7 +59,6 @@ pub mod clone_executor;
 pub mod config;
 pub mod connections_config;
 pub mod converged;
-pub mod deployment_gates;
 pub mod depot_expiry;
 pub mod forge_router;
 pub mod infra_observer;
@@ -68,23 +67,21 @@ pub mod logs;
 pub mod metrics;
 pub mod oauth;
 pub mod oidc;
-/// ADR-0071: the minimal org-level Environment — its admin/read API and the
-/// EnvironmentDeploymentDeadline the Deployment read fold uses.
+/// ADR-0071: the minimal org-level Environment — its admin/read API.
 pub mod org_environments;
-/// ADR-0072: PluginInstallations — the first-party catalog, install,
-/// uninstall, the kill switch — and the read views report ingest feeds.
-pub mod plugins;
 /// ADR-0072 §9: the plugin runtime's leased reconcile loop — namespace
 /// baseline, isolation probe, one workload per installation.
 pub mod plugin_runtime;
-/// Slice b, criterion 5: the Run page's gate resolution, DeploymentGate and
-/// concurrency-hold facts per step.
-mod run_gate_view;
+/// ADR-0072: PluginInstallations — the first-party catalog, install,
+/// uninstall and the kill switch.
+pub mod plugins;
 pub mod retention;
 mod routes;
+/// Slice b, criterion 5: the Run page's gate resolution per step.
+mod run_gate_view;
 pub use routes::{route_table, RouteEntry};
-pub mod step_up;
 pub mod secret_executor;
+pub mod step_up;
 /// `--role workspace`: the ADR-0061 workspace service. Its own router, its own
 /// `/readyz`, and NO durable core — see the module docs.
 pub mod workspaced;
@@ -165,19 +162,11 @@ pub struct AppState {
     /// environment was before ADR-0071, and the per-repo environment reads
     /// answer 404.
     pub environment_governance: Option<Arc<dyn scarab_project::EnvironmentGovernanceStore>>,
-    /// The Deployment record's input log (ADR-0070). `None` disables the
-    /// Deployments endpoints (404) — the board and the Deployments view.
-    pub deployments: Option<Arc<dyn scarab_deployment::DeploymentStore>>,
-    /// Org-level Environments (ADR-0071, MMP step 1): name, deadline and
-    /// EnvironmentDeploymentSources. `None` disables
-    /// `/v1/orgs/{org}/environments[/{env}]` (404), and every Environment's
-    /// Deployments fold with the default deadline.
+    /// Org-level Environments (ADR-0071, MMP step 1). `None` disables
+    /// `/v1/orgs/{org}/environments[/{env}]` (404).
     pub org_environments: Option<Arc<dyn scarab_project::OrgEnvironmentStore>>,
-    /// The PluginInstallation registry and report ingest (ADR-0072). `None`
-    /// disables the plugin endpoints (404) and the broker's authenticated
-    /// routes. (An org Environment's sources are checked against
-    /// installations by the Environment store itself, in its write's
-    /// transaction — c-min F1.)
+    /// The PluginInstallation registry (ADR-0072). `None` disables the plugin
+    /// endpoints (404) and the broker's authenticated routes.
     pub plugins: Option<Arc<dyn scarab_plugin::PluginStore>>,
     /// The same registry on the broker's **own small connection pool**
     /// (ADR-0072, red-team F-1): whatever plugins send, they can exhaust
@@ -185,11 +174,6 @@ pub struct AppState {
     /// and an admin's kill switch use. `None` = the broker uses `plugins`
     /// (a hand-built state).
     pub broker_plugins: Option<Arc<dyn scarab_plugin::PluginStore>>,
-    /// At most one report batch in flight per installation in this process
-    /// (red-team F-1): a second is answered 429 before it takes a database
-    /// connection, so a flood cannot queue behind the installation's row
-    /// lock — the lock a kill needs.
-    pub plugin_ingest_permits: Arc<broker::IngestPermits>,
     /// How many entries the CredentialBroker's journal queue holds between
     /// the read proxy and its writer (ADR-0072 §5). Full, the proxy refuses
     /// to forward (503) rather than forward what it cannot journal.
@@ -306,11 +290,9 @@ impl AppState {
             api_tokens: None,
             environments: None,
             environment_governance: None,
-            deployments: None,
             org_environments: None,
             plugins: None,
             broker_plugins: None,
-            plugin_ingest_permits: Arc::new(broker::IngestPermits::default()),
             broker_journal_queue: broker_proxy::JOURNAL_QUEUE,
             plugin_tokens: None,
             plugin_policy: Arc::new(plugins::PluginPolicy::off()),
@@ -406,19 +388,7 @@ impl AppState {
         self
     }
 
-    /// Enable the Deployments endpoints (ADR-0070): the Environment board and
-    /// the Deployments view, folded from `deployments`' input log.
-    pub fn with_deployments(
-        mut self,
-        deployments: Arc<dyn scarab_deployment::DeploymentStore>,
-    ) -> Self {
-        self.deployments = Some(deployments);
-        self
-    }
-
-    /// Enable the org-level Environment endpoints (ADR-0071), and let each
-    /// Environment's own EnvironmentDeploymentDeadline drive the Deployment
-    /// read fold.
+    /// Enable the org-level Environment endpoints (ADR-0071).
     pub fn with_org_environments(
         mut self,
         org_environments: Arc<dyn scarab_project::OrgEnvironmentStore>,
@@ -815,16 +785,15 @@ pub struct StepDto {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub uses: Vec<String>,
     /// NOT part of the inline IR subset: read only so [`create_run`] can
-    /// refuse a step that declares DeploymentRequests (slice b) instead of
-    /// silently dropping them — they need a Deploy Run (a repo pipeline with
-    /// `environment:`). Never serialized into the stored IR; not in the schema.
+    /// refuse the field ADR-0074 removed with the Deployment record, naming
+    /// its replacement, instead of silently dropping it. Never serialized
+    /// into the stored IR; not in the schema.
     #[serde(default, skip_serializing)]
     #[schema(ignore)]
     pub deployment_requests: Option<serde_json::Value>,
     /// NOT part of the inline IR subset: read only so [`create_run`] can
-    /// refuse a `gate: deployment` step (a DeploymentGate needs a Deploy
-    /// Run's DeploymentRequest to wait on). Never serialized; not in the
-    /// schema.
+    /// refuse a `gate: deployment` step (removed by ADR-0074). Never
+    /// serialized; not in the schema.
     #[serde(default, skip_serializing)]
     #[schema(ignore)]
     pub gate: Option<serde_json::Value>,
@@ -1124,6 +1093,9 @@ pub struct RunSummaryDto {
     /// deploy run, whose pipeline declared `environment:`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub environment: Option<String>,
+    /// Whether this is a **deploy Run** (ADR-0074 §2): its pipeline, or one of
+    /// its Steps, is marked `deploy: true`. Independent of `environment`.
+    pub deploy: bool,
     /// The run's **waiting gates** (git-bug `c489346`): gate steps that are
     /// `Pending`, reached (every need `Succeeded`) and have an open Attempt —
     /// the engine's "waiting gate". Since a waiting gate holds only its
@@ -1140,7 +1112,7 @@ pub struct RunSummaryDto {
 pub struct WaitingGateDto {
     /// The gate step's id.
     pub step: String,
-    /// The gate kind: `manual` / `timer` / `external` / `deployment`.
+    /// The gate kind: `manual` / `timer` / `external`.
     pub kind: String,
     /// When its wait opened (epoch millis): its open Attempt's start.
     pub since: i64,
@@ -1209,6 +1181,7 @@ impl From<scarab_engine::RunSummary> for RunSummaryDto {
             origin_pr_base: s.pr_base,
             pipeline: s.pipeline,
             trigger_title: s.trigger_title,
+            deploy: s.deploy,
             environment: s.environment,
             waiting_gates: Vec::new(),
         }
@@ -1315,8 +1288,8 @@ pub struct StepStatusDto {
     /// UI folds these into the run's graph view.
     #[serde(default)]
     pub needs: Vec<String>,
-    /// `manual`/`timer`/`external`/`deployment` if this step is a gate
-    /// (ADR-0008, ADR-0070 §8), else absent. Gates launch no pod; a waiting
+    /// `manual`/`timer`/`external` if this step is a gate (ADR-0008), else
+    /// absent. Gates launch no pod; a waiting
     /// gate holds only the steps that need it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gate: Option<String>,
@@ -1327,17 +1300,6 @@ pub struct StepStatusDto {
     /// with the latest of `attempt_list` to tell.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gate_resolution: Option<GateResolutionDto>,
-    /// For a `deployment` gate that is waiting right now: the
-    /// DeploymentTarget it waits on and where its Deployment stands. Display
-    /// only — the verdict is core's (ADR-0070 §8). Absent otherwise.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub deployment_gate: Option<DeploymentGateDto>,
-    /// Why this deploy Step is held `pending` by per-DeploymentTarget
-    /// concurrency (ADR-0071 §9), e.g. "held: waiting for deployment
-    /// concurrency on `argocd`/`web` (1/1 in flight)". Derived each read
-    /// (nothing is journalled per scheduler pass). Absent when not held.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub held: Option<String>,
     /// Co-located sidecar services (ADR-0058) this step declares — rendered as
     /// sidecar nodes attached to the step, each with its own log stream (fetched
     /// via `?sidecar=<index>` on the step-logs endpoint). Empty for a step with
@@ -1348,6 +1310,10 @@ pub struct StepStatusDto {
     /// (ADR-0058) — the DAG's service edges. Empty for a step that uses none.
     #[serde(default)]
     pub uses: Vec<String>,
+    /// This Step is marked `deploy: true` (ADR-0074 §2) — the Step of a deploy
+    /// Run that deploys. Omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deploy: bool,
 }
 
 /// How a gate's wait resolved: its `GateResolved` journal entry.
@@ -1355,8 +1321,7 @@ pub struct StepStatusDto {
 pub struct GateResolutionDto {
     /// `true`: the gate passed and its dependents may run.
     pub passed: bool,
-    /// Why — a timer elapsing, a DeploymentGate's "v1 live on …", the
-    /// source's failure label, a rejection's reason.
+    /// Why — a timer elapsing, an expiry, a rejection's reason.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// Unix-ms the verdict was journalled.
@@ -1367,47 +1332,6 @@ pub struct GateResolutionDto {
     /// external gate's token). Absent for a verdict the engine reached.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub by: Option<String>,
-    /// The Deployment a DeploymentGate's verdict was read from (its
-    /// Org-scoped id, as the Deployments view shows it).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub deployment_id: Option<u64>,
-}
-
-/// A waiting DeploymentGate: the DeploymentTarget it waits on and, once its
-/// requester's DeploymentRequest is in the record, where that Deployment
-/// stands (as the Deployments view folds it).
-#[derive(Debug, Serialize, ToSchema)]
-pub struct DeploymentGateDto {
-    pub environment: String,
-    pub target_source: String,
-    pub target_id: String,
-    /// The Deployment the requester's current request landed on.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub deployment_id: Option<u64>,
-    /// The Deployment's own status — on its Environment's **baseline**
-    /// deadline, over the Deployment's lifetime, as the Deployments page
-    /// shows it. Not the gate's clock: a Retry waits afresh while this can
-    /// already read `stalled` (see `fails_at`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub deployment_status: Option<DeploymentStatusDto>,
-    /// When this gate fails `stalled` if nothing decisive is reported first
-    /// (epoch millis): its wait's window opening plus its Project's effective
-    /// gate deadline — the engine's own computation (git-bug `ec84c5d`).
-    /// Absent when unknown (no Deployment, or the deadline could not be read).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fails_at: Option<i64>,
-    /// The DeploymentVersion asked for.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
-    /// The latest source report's label, when it has one.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub latest_label: Option<String>,
-    /// `true` when the Deployment record could not be read for this view (a
-    /// store error, logged): the Deployment fields are then absent because
-    /// they are unknown, not because no Deployment is recorded. Omitted when
-    /// `false`.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub record_unreadable: bool,
 }
 
 /// One of a step's co-located **sidecar services** (ADR-0058) — a throwaway
@@ -1443,10 +1367,7 @@ pub struct AttemptDto {
     /// | `config` | `missing-inputs` (an input snapshot gone from every tier —
     /// Rerun/Retry regenerates it; ticket e140121) | `gate` (a gate's wait
     /// resolved failed — e.g. not released within `gate_expires_after`; the
-    /// reason is in `failure_detail`) | `deployment-request-incomplete` (the
-    /// step exited 0 but its results could not complete a DeploymentRequest
-    /// it declares; never auto-retried; what is missing is in
-    /// `failure_detail`).
+    /// reason is in `failure_detail`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure: Option<String>,
     /// The executor's human-readable cause for a failed attempt (ticket
@@ -1474,9 +1395,6 @@ fn attempt_dto(a: &scarab_engine::Attempt) -> AttemptDto {
             scarab_engine::FailureKind::Config => "config",
             scarab_engine::FailureKind::MissingInputs => "missing-inputs",
             scarab_engine::FailureKind::Gate => "gate",
-            scarab_engine::FailureKind::DeploymentRequestIncomplete => {
-                "deployment-request-incomplete"
-            }
         }
         .to_string()
     });
@@ -1597,10 +1515,7 @@ impl From<DispatchError> for ApiError {
             // does not let this Project deploy — a policy refusal (403) with
             // the actionable text, not a malformed request.
             refused @ (DispatchError::UnknownEnvironment { .. }
-            | DispatchError::NotEligible { .. }
-            | DispatchError::DeploymentTargetElsewhere { .. }) => {
-                ApiError::Denied(refused.to_string())
-            }
+            | DispatchError::NotEligible { .. }) => ApiError::Denied(refused.to_string()),
             other => ApiError::BadRequest(other.to_string()),
         }
     }
@@ -1683,11 +1598,9 @@ async fn create_run(
     let resolved = scarab_pipeline::params::resolve_params(&req.pipeline.interface, &req.params)
         .map_err(|e| ApiError::BadRequest(format!("invalid launch parameters: {e}")))?;
 
-    // Slice b: DeploymentRequests and DeploymentGates need a Deploy Run — a
-    // repo pipeline with `environment:`, whose Run creation resolves and
-    // records the requests. The inline IR has neither the Environment nor the
-    // recording, so accepting them would report success for a deployment that
-    // can never be recorded or waited on: refuse, before any run exists.
+    // ADR-0074 removed DeploymentRequests and DeploymentGates with the
+    // Deployment record: refuse them with the replacement, before any run
+    // exists, rather than drop them silently.
     for step in &req.pipeline.steps {
         let requests = step
             .deployment_requests
@@ -1696,9 +1609,9 @@ async fn create_run(
         let deployment_gate = step.gate.as_ref().and_then(|g| g.as_str()) == Some("deployment");
         if requests || deployment_gate {
             return Err(ApiError::BadRequest(format!(
-                "step `{}`: deployment requests need a Deploy Run (a repo pipeline with \
-                 `environment:`)",
-                step.id
+                "step `{}`: {}",
+                step.id,
+                scarab_pipeline::RETIRED_DEPLOYMENTS
             )));
         }
     }
@@ -2151,6 +2064,19 @@ pub struct ListRunsQuery {
     pub limit: Option<u32>,
 }
 
+/// Query for [`list_repo_runs`]: a page size plus an optional Environment.
+#[derive(Debug, Deserialize)]
+pub struct ListRepoRunsQuery {
+    /// Max runs to return (default [`DEFAULT_RUNS_LIMIT`], capped at [`MAX_RUNS_LIMIT`]).
+    pub limit: Option<u32>,
+    /// Only the deploy runs into this Environment (ADR-0074 §2). Absent = every
+    /// run; present but empty is a 400, never a silent "match nothing".
+    pub environment: Option<String>,
+    /// `true`: only deploy Runs; `false`: only the rest (ADR-0074 §2). Absent =
+    /// every run.
+    pub deploy: Option<bool>,
+}
+
 /// Default page size for `GET /v1/runs`.
 const DEFAULT_RUNS_LIMIT: u32 = 50;
 /// Upper bound so a client can't request an unbounded scan.
@@ -2240,19 +2166,18 @@ async fn get_run(
         .run_snapshot_retention(&run)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let snapshot_retention = snapshot_retention_dto(
-        &retention,
-        st.snapshot_retention_days,
-        st.clock.now().await,
-    );
+    let snapshot_retention =
+        snapshot_retention_dto(&retention, st.snapshot_retention_days, st.clock.now().await);
     // Enrich each step with its sidecar services + shared-service opt-ins (ADR-
     // 0058) from the stored spec, so the FE can render sidecar nodes and `uses`
     // edges and address per-sidecar logs by index. A step with no stored spec
     // (e.g. a gate) carries empty vecs.
-    let mut gate_views = run_gate_view::step_gate_views(&st, &run, status, &steps).await?;
+    let mut gate_views = run_gate_view::step_gate_views(&st, &run, &steps).await?;
+    let deploy_steps = st.db.deploy_steps_of_run(&run).await?;
     let mut step_dtos = Vec::with_capacity(steps.len());
     for s in steps {
         let view = gate_views.remove(&s.step.0).unwrap_or_default();
+        let deploy = deploy_steps.contains(&s.step);
         let (services, uses) = match st.db.step_spec(&run, &s.step).await? {
             Some(spec) => (
                 spec.services
@@ -2276,10 +2201,9 @@ async fn get_run(
             needs: s.needs.into_iter().map(|n| n.0).collect(),
             gate: s.gate_kind,
             gate_resolution: view.gate_resolution,
-            deployment_gate: view.deployment_gate,
-            held: view.held,
             services,
             uses,
+            deploy,
         });
     }
     Ok(Json(RunStatusResponse {
@@ -2737,8 +2661,7 @@ fn rerun_outcome<T>(res: Result<T, RerunError>) -> Result<T, ApiError> {
             e @ (RerunError::NotAManualGate(_)
             | RerunError::GateNotPending { .. }
             | RerunError::GateNotReached { .. }
-            | RerunError::NotARejectableGate(_)
-            | RerunError::NotAReleasableGate(_)),
+            | RerunError::NotARejectableGate(_)),
         ) => Err(ApiError::Conflict(e.to_string())),
         Err(RerunError::Db(e)) => Err(ApiError::Db(e)),
     }
@@ -3020,13 +2943,8 @@ async fn pin_run_snapshots(
     let run = RunId(id);
     let scope = run_scope(&st, &run).await;
     let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
-    if !scarab_engine::pin_run_snapshots(
-        &*st.db,
-        &*st.clock,
-        &run,
-        Some(principal.subject.clone()),
-    )
-    .await?
+    if !scarab_engine::pin_run_snapshots(&*st.db, &*st.clock, &run, Some(principal.subject.clone()))
+        .await?
     {
         return Err(ApiError::NotFound);
     }
@@ -3333,7 +3251,7 @@ async fn list_projects(
             // Recency signal (ADR-0046): the tenant's most recent run, if any.
             let last_run_at = st
                 .db
-                .list_runs_for_tenant(&resolved.org, &resolved.project, 1)
+                .list_runs_for_tenant(&resolved.org, &resolved.project, &Default::default(), 1)
                 .await?
                 .first()
                 .map(|r| r.created_at.0);
@@ -3371,23 +3289,40 @@ async fn list_projects(
     params(
         ("org" = String, Path, description = "org slug"),
         ("repo" = String, Path, description = "project (repo) name"),
-        ("limit" = Option<u32>, Query, description = "max runs (default 50, capped 200)")
+        ("limit" = Option<u32>, Query, description = "max runs (default 50, capped 200)"),
+        ("environment" = Option<String>, Query, description = "only runs governed by this Environment (ADR-0074); applied before `limit`; must not be empty"),
+        ("deploy" = Option<bool>, Query, description = "true: only deploy Runs (pipeline or a Step marked `deploy: true`); false: only the rest; applied before `limit`")
     ),
-    responses((status = 200, body = RunListResponse))
+    responses(
+        (status = 200, body = RunListResponse),
+        (status = 400, description = "`environment` present but empty, or `deploy` not a boolean")
+    )
 )]
 async fn list_repo_runs(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((org, repo)): Path<(String, String)>,
-    Query(q): Query<ListRunsQuery>,
+    Query(q): Query<ListRepoRunsQuery>,
 ) -> Result<Json<RunListResponse>, ApiError> {
     let scope = scarab_identity::Scope::Project {
         org: org.clone(),
         name: repo.clone(),
     };
     authorize_scoped(&st, &headers, Action::Read, Some(&scope)).await?;
+    if q.environment.as_deref() == Some("") {
+        return Err(ApiError::BadRequest(
+            "`environment` must name an Environment; omit it to list every run".into(),
+        ));
+    }
     let limit = q.limit.unwrap_or(DEFAULT_RUNS_LIMIT).min(MAX_RUNS_LIMIT);
-    let runs = st.db.list_runs_for_tenant(&org, &repo, limit).await?;
+    let filter = scarab_engine::RunListFilter {
+        environment: q.environment,
+        deploy: q.deploy,
+    };
+    let runs = st
+        .db
+        .list_runs_for_tenant(&org, &repo, &filter, limit)
+        .await?;
     Ok(Json(RunListResponse {
         runs: run_summaries(&st, runs).await?,
     }))
@@ -4207,8 +4142,7 @@ pub async fn trigger_run_from_event(
 }
 
 /// A deploy pipeline a delivery did not run because its Environment does not
-/// exist in the Org or does not admit the Project (ADR-0071 §2, §10), or its
-/// launch cannot bind a DeploymentTarget (git-bug 66171a0). Reported
+/// exist in the Org or does not admit the Project (ADR-0071 §2, §10). Reported
 /// in the webhook delivery body: for a pipeline whose name the ADR-0071
 /// migration could never see (it had never run), this is the only place the
 /// refusal surfaces besides the server log.
@@ -4232,8 +4166,7 @@ pub struct TriggerOutcome {
 }
 
 /// [`trigger_run_from_event`], also reporting every deploy pipeline refused
-/// as `UnknownEnvironment` / `NotEligible` / `DeploymentTargetElsewhere` /
-/// `DeploymentRequestUnresolved`.
+/// as `UnknownEnvironment` / `NotEligible`.
 pub async fn trigger_runs_from_event(
     forge: &dyn scarab_forge::ForgePort,
     db: &dyn Db,
@@ -4310,17 +4243,9 @@ pub async fn trigger_runs_from_event(
             // Logged AND returned: the delivery body is where a forge's
             // "recent deliveries" view shows it, and for a name the migration
             // could not see (never run before ADR-0071) it is the first sign.
-            // A deploy target its launch cannot bind (git-bug 66171a0) is the
-            // same: that pipeline alone is skipped, the repo's CI still runs.
             Admission::Refused(
                 ref refusal @ (AdmissionRefusal::UnknownEnvironment { ref environment }
-                | AdmissionRefusal::NotEligible { ref environment }
-                | AdmissionRefusal::DeploymentTargetElsewhere {
-                    ref environment, ..
-                }
-                | AdmissionRefusal::DeploymentRequestUnresolved {
-                    ref environment, ..
-                }),
+                | AdmissionRefusal::NotEligible { ref environment }),
             ) => {
                 let reason = admission_refusal_message(refusal, &repo.owner, &repo.name);
                 tracing::warn!(
@@ -4401,22 +4326,6 @@ enum AdmissionRefusal {
     /// The Environment exists but its EnvironmentProjectEligibility does not
     /// admit this Project (ADR-0071 §2).
     NotEligible { environment: String },
-    /// A Step requests a DeploymentTarget that is homed in another
-    /// Environment (slice b, criterion 1; ADR-0070 §7): a target belongs to
-    /// exactly one Environment, so a Run of `environment` may not request it.
-    DeploymentTargetElsewhere {
-        environment: String,
-        step: String,
-        target_source: String,
-        target_id: String,
-        home: String,
-    },
-    /// A Step's DeploymentTarget does not resolve for this launch — it reads
-    /// an input the launch does not supply (a webhook Run supplies none, so a
-    /// required, default-less input never binds), resolves empty, or two
-    /// requests resolve to one target (git-bug 66171a0). Decided before
-    /// anything is persisted; `reason` names the step and the input.
-    DeploymentRequestUnresolved { environment: String, reason: String },
 }
 
 /// The outcome of admitting one compiled pipeline (ADR-0037, ADR-0071 §2):
@@ -4538,15 +4447,6 @@ fn governance_store_err(e: scarab_project::OrgEnvironmentError) -> TriggerError 
 /// anything is persisted. Only an unwired store ([`GovernedRules::Unwired`])
 /// keeps the pre-ADR-0071 permissive reading.
 ///
-/// **Tripwire — admission never reads `owner_projects`.** Eligibility is the
-/// Environment's own record, set by its admin. A DeploymentTarget's
-/// `owner_projects` (DeploymentTargetProjectOwnership, ADR-0071 §4) is
-/// *reported by a plugin* and mirrored for display and for Deployment
-/// requests; it is whoever can write the gitops source, and a deploy Step can
-/// write it into its own commit. Reading it here would let a plugin's report
-/// (or a pipeline's own commit) decide which Projects may deploy. Nothing in
-/// this function, or anything it calls, may consult it.
-///
 /// [`EnvironmentGovernanceStore::deploy_governance`]: scarab_project::EnvironmentGovernanceStore::deploy_governance
 async fn resolve_governance(
     store: Option<&dyn scarab_project::EnvironmentGovernanceStore>,
@@ -4653,28 +4553,9 @@ async fn admit_and_create_run(
         }
     }
 
-    // Slice b, criterion 1 (ADR-0070 §7): resolve each Step's static
-    // DeploymentTargets against the launch parameters, and refuse a Run that
-    // requests a target homed in another Environment — before anything is
-    // persisted, like every other refusal here.
-    let requests = match resolve_deployment_requests(ir, repo, params) {
-        Ok(requests) => requests,
-        Err(refusal) => return Ok(Admission::Refused(refusal)),
-    };
-    if let (Some(store), RunGovernance::Governed { environment, .. }) = (governance, &gov) {
-        if let Some(refusal) =
-            deployment_target_elsewhere(store, &repo.owner, environment, &requests).await?
-        {
-            return Ok(Admission::Refused(refusal));
-        }
-    }
-
     let now = clock.now().await;
     let run = new_run_id();
-    persist_run_from_ir(
-        db, &run, ir, event, path, &gov, excluded, params, &requests, now,
-    )
-    .await?;
+    persist_run_from_ir(db, &run, ir, event, path, &gov, excluded, params, now).await?;
     // Freeze the resolved launch parameters on the run so every step's
     // interpolation (`${{ inputs.… }}`) and `SCARAB_PARAM_*` env re-derive
     // deterministically (ADR-0043 §5).
@@ -4682,154 +4563,6 @@ async fn admit_and_create_run(
         db.set_run_params(&run, params).await?;
     }
     Ok(Admission::Created(run))
-}
-
-/// Every Step's DeploymentRequests (slice b, criterion 1; ADR-0070 §7),
-/// resolved for one Run: the Environment is the pipeline's own, each target
-/// part a literal or its `${{ inputs.<name> }}` bound to the launch parameters
-/// (`params`; for a webhook Run, which supplies none, the interface's
-/// defaults), and each carrying the DeploymentGates that wait on it
-/// (`gate_steps`, criterion 2). Fails closed: a target that does not resolve to a non-empty
-/// value is [`AdmissionRefusal::DeploymentRequestUnresolved`] and no Run is
-/// created — the webhook path skips that pipeline alone (git-bug 66171a0), a
-/// dispatch reports it as a pipeline error.
-fn resolve_deployment_requests(
-    ir: &scarab_pipeline::PipelineIr,
-    repo: &scarab_forge::RepoRef,
-    params: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
-) -> Result<Vec<scarab_engine::RunDeploymentRequest>, AdmissionRefusal> {
-    let Some(environment) = &ir.environment else {
-        // Validation refuses `deployment_requests` without an `environment:`.
-        return Ok(Vec::new());
-    };
-    let defaults;
-    let inputs = match params {
-        Some(p) => p,
-        None => {
-            defaults = scarab_pipeline::params::resolve_params(
-                &ir.interface,
-                &std::collections::BTreeMap::new(),
-            )
-            .unwrap_or_default();
-            &defaults
-        }
-    };
-    let unresolved = |reason: String| AdmissionRefusal::DeploymentRequestUnresolved {
-        environment: environment.clone(),
-        reason,
-    };
-    let mut out = Vec::new();
-    for step in &ir.steps {
-        for (ordinal, req) in step.deployment_requests.iter().enumerate() {
-            let bind = |part: &str, text: &str| -> Result<String, AdmissionRefusal> {
-                let value = match scarab_pipeline::deployment_target_input(text) {
-                    Some(name) => inputs
-                        .get(name)
-                        .map(scarab_pipeline::params::stringify)
-                        .ok_or_else(|| {
-                            unresolved(format!(
-                                "step `{}`: deployment request target `{part}` reads \
-                                 `inputs.{name}`, which this launch does not supply",
-                                step.id
-                            ))
-                        })?,
-                    None => text.to_string(),
-                };
-                if value.trim().is_empty() {
-                    return Err(unresolved(format!(
-                        "step `{}`: deployment request target `{part}` resolved empty",
-                        step.id
-                    )));
-                }
-                Ok(value)
-            };
-            out.push(scarab_engine::RunDeploymentRequest {
-                step: StepId(step.id.clone()),
-                ordinal: ordinal as u32,
-                org: repo.owner.clone(),
-                environment: environment.clone(),
-                target_source: bind("source", &req.target.source)?,
-                target_id: bind("id", &req.target.id)?,
-                version_result: req.version.clone(),
-                evidence_results: req.evidence.clone(),
-                gate_steps: Vec::new(),
-            });
-        }
-    }
-    // Validation's "one request per target per step" compares the AUTHORED
-    // text, so a literal `web` beside `${{ inputs.app }}` with `app=web`
-    // passes it and resolves twice to one target. Refuse that here, before
-    // anything is persisted — never de-duplicate: the two requests may name
-    // different version results, and which one the author meant is theirs to
-    // say. (The store's UNIQUE (run, step, source, id) would otherwise fail
-    // AFTER the run row exists, leaving a stepless Run; the in-memory store
-    // has no such constraint at all.)
-    let mut seen = std::collections::BTreeSet::new();
-    for r in &out {
-        if !seen.insert((
-            r.step.0.as_str(),
-            r.target_source.as_str(),
-            r.target_id.as_str(),
-        )) {
-            return Err(unresolved(format!(
-                "step `{}`: two deployment requests resolve to `{}`/`{}`",
-                r.step.0, r.target_source, r.target_id
-            )));
-        }
-    }
-    // Each DeploymentGate onto the request it waits on (ADR-0070 §8), so the
-    // engine finds it by the gate's id. Validation has resolved every
-    // reference; one that does not resolve stays unattached, and that gate
-    // fails with the reason when it is reached.
-    for gate in &ir.steps {
-        if let Some((requester, ordinal)) = scarab_pipeline::deployment_gate_request(ir, gate) {
-            if let Some(req) = out
-                .iter_mut()
-                .find(|r| r.step.0 == requester.id && r.ordinal as usize == ordinal)
-            {
-                req.gate_steps.push(StepId(gate.id.clone()));
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// The first of `requests` whose DeploymentTarget is homed in an Environment
-/// other than the Run's `environment`
-/// ([`EnvironmentGovernanceStore::deployment_target_homes`]), as a refusal.
-/// A target with no home yet is free: the first Environment to request it
-/// records it.
-///
-/// [`EnvironmentGovernanceStore::deployment_target_homes`]: scarab_project::EnvironmentGovernanceStore::deployment_target_homes
-async fn deployment_target_elsewhere(
-    store: &dyn scarab_project::EnvironmentGovernanceStore,
-    org: &str,
-    environment: &str,
-    requests: &[scarab_engine::RunDeploymentRequest],
-) -> Result<Option<AdmissionRefusal>, TriggerError> {
-    if requests.is_empty() {
-        return Ok(None);
-    }
-    let targets: Vec<(String, String)> = requests
-        .iter()
-        .map(|r| (r.target_source.clone(), r.target_id.clone()))
-        .collect();
-    let homes = store
-        .deployment_target_homes(org, &targets)
-        .await
-        .map_err(governance_store_err)?;
-    Ok(requests.iter().find_map(|r| {
-        let home = homes
-            .iter()
-            .find(|h| h.source == r.target_source && h.id == r.target_id)?;
-        (home.environment != environment).then(|| AdmissionRefusal::DeploymentTargetElsewhere {
-            environment: environment.to_string(),
-            step: r.step.0.clone(),
-            target_source: r.target_source.clone(),
-            target_id: r.target_id.clone(),
-            home: home.environment.clone(),
-        })
-    }))
 }
 
 /// Which trigger a dispatch opts into: a human [`Manual`](DispatchKind::Manual)
@@ -4934,19 +4667,6 @@ pub enum DispatchError {
         project: String,
         environment: String,
     },
-    /// A Step requests a DeploymentTarget homed in another Environment (slice
-    /// b, criterion 1) — fail-closed, no run; the message names the home.
-    #[error(
-        "{}",
-        deployment_target_elsewhere_message(.environment, .step, .target_source, .target_id, .home)
-    )]
-    DeploymentTargetElsewhere {
-        environment: String,
-        step: String,
-        target_source: String,
-        target_id: String,
-        home: String,
-    },
     #[error(transparent)]
     Db(DbError),
 }
@@ -4965,30 +4685,7 @@ fn admission_refusal_message(refusal: &AdmissionRefusal, org: &str, project: &st
         AdmissionRefusal::RefNotAllowed => {
             "the ref is not allowed to deploy to this environment".to_string()
         }
-        AdmissionRefusal::DeploymentTargetElsewhere {
-            environment,
-            step,
-            target_source,
-            target_id,
-            home,
-        } => deployment_target_elsewhere_message(environment, step, target_source, target_id, home),
-        AdmissionRefusal::DeploymentRequestUnresolved { reason, .. } => reason.clone(),
     }
-}
-
-fn deployment_target_elsewhere_message(
-    environment: &str,
-    step: &str,
-    target_source: &str,
-    target_id: &str,
-    home: &str,
-) -> String {
-    format!(
-        "step `{step}` requests DeploymentTarget `{target_source}`/`{target_id}`, which belongs to \
-         environment `{home}`, not `{environment}`: a DeploymentTarget belongs to exactly one \
-         Environment — deploy it from a pipeline whose `environment:` is `{home}`, or an org \
-         admin must route its source to `{environment}` (ADR-0070 §7)"
-    )
 }
 
 fn unknown_environment_message(org: &str, project: &str, environment: &str) -> String {
@@ -5202,24 +4899,6 @@ pub async fn dispatch_run(
             project: repo.name.clone(),
             environment,
         },
-        AdmissionRefusal::DeploymentTargetElsewhere {
-            environment,
-            step,
-            target_source,
-            target_id,
-            home,
-        } => DispatchError::DeploymentTargetElsewhere {
-            environment,
-            step,
-            target_source,
-            target_id,
-            home,
-        },
-        // A dispatch names its inputs: one that leaves a target unbound is
-        // the pipeline error it always was.
-        AdmissionRefusal::DeploymentRequestUnresolved { reason, .. } => {
-            DispatchError::Pipeline(reason)
-        }
     })
 }
 
@@ -5337,7 +5016,6 @@ async fn persist_run_from_ir(
     gov: &RunGovernance,
     excluded: &[String],
     params: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
-    deployment_requests: &[scarab_engine::RunDeploymentRequest],
     now: Timestamp,
 ) -> Result<(), TriggerError> {
     let locked_out = gov.locked_out();
@@ -5412,6 +5090,19 @@ async fn persist_run_from_ir(
         )
         .await?;
     }
+    // The deploy marker (ADR-0074 §2): a Run is a deploy Run when its pipeline
+    // or any Step is marked `deploy: true` — read from the IR once, here. It
+    // drives the Runs list filter and the Run page's deploy-Step mark, and
+    // exempts the Run from newest-wins cancel (below).
+    let is_deploy_run = ir.is_deploy();
+    if is_deploy_run {
+        let steps: Vec<StepId> = ir.deploy_steps().into_iter().map(StepId).collect();
+        db.mark_deploy_run(run, &steps).await?;
+    }
+    // Newest-wins cancel applies only to a Run that is both ungoverned (no
+    // Environment, ADR-0032) and not a deploy Run (ADR-0074 §2): neither an
+    // in-flight Environment run nor an in-flight deploy is disposable.
+    let cancellable = matches!(gov, RunGovernance::Ungoverned) && !is_deploy_run;
     // Concurrency group (ADR-0011, 0032): serialize this run against others in the
     // same group under its policy. The `group` is interpolated here against the
     // run's launch inputs and trigger event (the same CEL machinery as step
@@ -5446,8 +5137,9 @@ async fn persist_run_from_ir(
         // holder — an in-flight production deploy is not disposable. So a governed
         // run always takes the queue-and-wait policy regardless of the pipeline's
         // declared `cancel-in-progress`; only ungoverned CI runs keep newest-wins
-        // cancel. (Mirrors the supersede opt-out below.)
-        let policy = if matches!(gov, RunGovernance::Ungoverned) {
+        // cancel. A deploy Run (ADR-0074 §2) queues the same way. (Mirrors the
+        // supersede opt-out below.)
+        let policy = if cancellable {
             ConcurrencyPolicy::from_wire(&c.policy)
         } else {
             ConcurrencyPolicy::Queue
@@ -5456,20 +5148,13 @@ async fn persist_run_from_ir(
     }
     // Newest-wins auto-cancel (ADR-0032): key non-deploy runs by (repo, ref,
     // pipeline) so a newer run supersedes older in-flight ones. A pipeline that
-    // targets an Environment is a *deploy* and opts out — a superseded deploy
-    // must not be silently cancelled; no key means `superseded_by` never returns
-    // it.
-    if matches!(gov, RunGovernance::Ungoverned) {
+    // targets an Environment, or a deploy Run (ADR-0074 §2), opts out — a
+    // superseded deploy must not be silently cancelled; no key means
+    // `superseded_by` never returns it.
+    if cancellable {
         if let Some(key) = supersede_key(event, pipeline) {
             db.set_supersede_key(run, &key).await?;
         }
-    }
-    // The resolved DeploymentRequests (slice b, criterion 1) travel with the
-    // run — written before any step row exists, so no step can be claimed,
-    // run and succeed without the requests its success must record.
-    if !deployment_requests.is_empty() {
-        db.set_run_deployment_requests(run, deployment_requests)
-            .await?;
     }
     db.append_event(&EventKind {
         version: EVENT_VERSION,
@@ -6402,12 +6087,7 @@ async fn begin_link_identity(
     // provider and the expiry too. Off: the bare session hash, as before —
     // the POST is unguarded then anyway.
     let link = match st.step_up.service() {
-        Some(svc) => svc.link_binding(
-            &flow.state,
-            &session_hash(&sid),
-            &flow.provider,
-            expires_at,
-        ),
+        Some(svc) => svc.link_binding(&flow.state, &session_hash(&sid), &flow.provider, expires_at),
         None => session_hash(&sid),
     };
     let flow = flow.for_link(&link, expires_at);
@@ -6444,12 +6124,7 @@ async fn link_callback(
     let now = st.clock.now().await.0;
     let expires_at = flow.link_expires_at.unwrap_or(i64::MIN);
     let expected = match st.step_up.service() {
-        Some(svc) => svc.link_binding(
-            &flow.state,
-            &session_hash(&sid),
-            &flow.provider,
-            expires_at,
-        ),
+        Some(svc) => svc.link_binding(&flow.state, &session_hash(&sid), &flow.provider, expires_at),
         None => session_hash(&sid),
     };
     if now > expires_at || !scarab_identity::ct_eq(expected.as_bytes(), flow.link.as_bytes()) {
@@ -7145,7 +6820,9 @@ async fn mint_api_token(
 
     let name = req.name.trim();
     if name.is_empty() {
-        return Err(ApiError::BadRequest("token `name` must not be empty".into()));
+        return Err(ApiError::BadRequest(
+            "token `name` must not be empty".into(),
+        ));
     }
     if req.expires_in_days == 0 || req.expires_in_days > scarab_identity::MAX_API_TOKEN_DAYS {
         return Err(ApiError::BadRequest(format!(
@@ -7768,8 +7445,7 @@ async fn approve_gate(
             | RerunError::NotAManualGate(_)
             | RerunError::GateNotPending { .. }
             | RerunError::GateNotReached { .. }
-            | RerunError::NotARejectableGate(_)
-            | RerunError::NotAReleasableGate(_)),
+            | RerunError::NotARejectableGate(_)),
         ) => return Err(ApiError::Conflict(e.to_string())),
         Err(RerunError::Db(e)) => return Err(ApiError::Db(e)),
     }
@@ -7823,8 +7499,7 @@ async fn approve_gate(
             | RerunError::NotAManualGate(_)
             | RerunError::GateNotPending { .. }
             | RerunError::GateNotReached { .. }
-            | RerunError::NotARejectableGate(_)
-            | RerunError::NotAReleasableGate(_)),
+            | RerunError::NotARejectableGate(_)),
         ) => return Err(ApiError::Conflict(e.to_string())),
         Err(RerunError::Db(e)) => return Err(ApiError::Db(e)),
     }
@@ -7894,10 +7569,9 @@ fn gate_reject_reason(reason: &str) -> Result<&str, ApiError> {
 
 /// Reject a waiting gate: fail it with a reason (ADR-0070 §9).
 ///
-/// For any gate — `manual`, `timer`, `external` or `deployment` — that is
-/// pending and reached (every step it needs has succeeded; slice b, criteria 2
-/// and 3). A deployment gate can only be rejected, never approved or
-/// released: core passes it from the Deployment record. The gate's Attempt fails with
+/// For any gate — `manual`, `timer` or `external` — that is pending and
+/// reached (every step it needs has succeeded; slice b, criteria 2 and 3).
+/// The gate's Attempt fails with
 /// the reason and the rejecting principal, its dependents are skipped, and the
 /// run ends `failed`; retrying the gate opens a new wait that asks again.
 ///
@@ -8126,8 +7800,7 @@ async fn release_gate_external(
             | RerunError::NotAManualGate(_)
             | RerunError::GateNotPending { .. }
             | RerunError::GateNotReached { .. }
-            | RerunError::NotARejectableGate(_)
-            | RerunError::NotAReleasableGate(_)),
+            | RerunError::NotARejectableGate(_)),
         ) => Err(ApiError::Conflict(e.to_string())),
         Err(RerunError::Db(e)) => Err(ApiError::Db(e)),
     }
@@ -8473,8 +8146,7 @@ async fn delete_environment(
 /// Legacy approval history (ADR-0070 §1): who approved which run into this
 /// environment, most recent first (ADR-0037). Despite the path, nothing here is
 /// a Deployment — a row is written when a manual gate is approved and records no
-/// target, version or outcome. The Deployment record is
-/// `/v1/orgs/{org}/environments/{env}/deployments`. Kept readable, read-only;
+/// target, version or outcome. Kept readable, read-only;
 /// admission happens in the run's gate-approval path. Read cap.
 #[utoipa::path(get, path = "/v1/repos/{org}/{repo}/environments/{name}/deployments", params(("org" = String, Path, description = "repo owner"), ("repo" = String, Path, description = "repo name"), ("name" = String, Path, description = "Environment name")), summary = "Legacy approval history (ADR-0070 §1)", responses((status = 200, description = "most recent first")))]
 async fn list_deployments(
@@ -8490,470 +8162,6 @@ async fn list_deployments(
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(Json(history))
-}
-
-// ---------------------------------------------------------------------------
-// Deployments (ADR-0070): the vendor-neutral Deployment record, read side.
-// ---------------------------------------------------------------------------
-//
-// Every read refolds the Environment's input log with `scarab-deployment` at
-// the server's `now`, so a status here is always the fold's verdict — none is
-// stored. Org-scoped: a Deployment belongs to an Environment, and an
-// Environment's log is per Org (ADR-0071). Read needs only Read on the Org;
-// until EnvironmentProjectEligibility exists (ADR-0071), a member bound only
-// to a Project is refused.
-
-/// A Deployment's fixed, vendor-neutral status (ADR-0070 §5).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum DeploymentStatusDto {
-    /// Asked for; no source report yet.
-    Requested,
-    InProgress,
-    Live,
-    /// The source gave up.
-    Failed,
-    /// Not converged within the EnvironmentDeploymentDeadline; can recover.
-    Stalled,
-    /// A newer Deployment took its place on the DeploymentTarget. Final.
-    Superseded,
-}
-
-impl From<scarab_deployment::DeploymentStatus> for DeploymentStatusDto {
-    fn from(s: scarab_deployment::DeploymentStatus) -> Self {
-        use scarab_deployment::DeploymentStatus as S;
-        match s {
-            S::Requested => Self::Requested,
-            S::InProgress => Self::InProgress,
-            S::Live => Self::Live,
-            S::Failed => Self::Failed,
-            S::Stalled => Self::Stalled,
-            S::Superseded => Self::Superseded,
-        }
-    }
-}
-
-/// The statuses a source may assert in a report (INV-DEP-6) — a subset of
-/// [`DeploymentStatusDto`], typed apart so the wire says so too.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum SourceAssertedStatusDto {
-    InProgress,
-    Live,
-    Failed,
-}
-
-impl From<scarab_deployment::SourceAssertedStatus> for SourceAssertedStatusDto {
-    fn from(s: scarab_deployment::SourceAssertedStatus) -> Self {
-        use scarab_deployment::SourceAssertedStatus as S;
-        match s {
-            S::InProgress => Self::InProgress,
-            S::Live => Self::Live,
-            S::Failed => Self::Failed,
-        }
-    }
-}
-
-/// The smallest unit a Deployment can independently succeed or fail on.
-/// `source` + `id` are opaque and source-supplied.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct DeploymentTargetDto {
-    pub environment: String,
-    pub source: String,
-    pub id: String,
-}
-
-impl From<&scarab_deployment::DeploymentTarget> for DeploymentTargetDto {
-    fn from(t: &scarab_deployment::DeploymentTarget) -> Self {
-        Self {
-            environment: t.environment.clone(),
-            source: t.source.clone(),
-            id: t.id.clone(),
-        }
-    }
-}
-
-/// A Deploy Run step that requested a Deployment.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct DeploymentRequesterDto {
-    pub run: String,
-    pub step: String,
-    /// Unix-ms the requesting Step started.
-    pub effective_at: i64,
-    /// The Project the run belongs to, when it is stamped and in this Org —
-    /// what a link to the run (`/{org}/{project}/runs/{run}`) needs.
-    pub project: Option<String>,
-    /// Only a claim: the request joined a Deployment a source report created,
-    /// and its Step started after Scarab first saw that Deployment — so it
-    /// did not make it live and does not explain it (ADR-0070 §2).
-    pub claim: bool,
-    /// What the Step offered as evidence for the change — image digests,
-    /// typically — read from its results (ADR-0070 §7). Shown, never used to
-    /// correlate; empty when it declared none.
-    pub evidence: Vec<String>,
-}
-
-/// One stage of a Deployment as its source reported it.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct DeploymentStatusReportDto {
-    pub status: SourceAssertedStatusDto,
-    /// Free-form; shown, never interpreted.
-    pub label: String,
-    /// Where the source shows this stage. Only an `http`/`https` URL is
-    /// passed on; any other scheme reads as absent.
-    pub link: Option<String>,
-    /// Unix-ms Scarab received the report — the time the record is ordered by.
-    pub at: i64,
-    /// Unix-ms the source stamped on it, by its own clock. Display only.
-    /// Present on every recorded report.
-    pub source_at: Option<i64>,
-}
-
-/// One Deployment: a DeploymentVersion made (or asked to be made) live on a
-/// DeploymentTarget, and what was reported about it since (ADR-0070 §2).
-#[derive(Debug, Serialize, ToSchema)]
-pub struct DeploymentDto {
-    /// Org-scoped and stable: the sequence number of the input that created
-    /// it.
-    pub id: u64,
-    pub target: DeploymentTargetDto,
-    /// Opaque, in the source's scheme; compared only for equality.
-    pub version: String,
-    pub status: DeploymentStatusDto,
-    /// In the order their requests arrived, claims included. Who made it
-    /// live is the requesters that are not claims; `unexplained` says
-    /// whether there is one.
-    pub requesters: Vec<DeploymentRequesterDto>,
-    /// The stages, oldest first.
-    pub reports: Vec<DeploymentStatusReportDto>,
-    /// Unix-ms.
-    pub created_at: i64,
-    /// Unix-ms a newer Deployment took its place, if one has.
-    pub superseded_at: Option<i64>,
-    /// Whether it was ever reported live.
-    pub was_ever_live: bool,
-    /// Display term: no Deploy Run's request explains it — a change made
-    /// outside Scarab. It may still carry claims.
-    pub unexplained: bool,
-    /// Display term: requested on a DeploymentTarget its source has never
-    /// reported on.
-    pub unconfirmed: bool,
-}
-
-/// One DeploymentTarget's line on the Environment board.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct EnvironmentBoardRowDto {
-    pub target: DeploymentTargetDto,
-    /// What is live there now, if anything — as this Environment's record
-    /// last heard. When `moved_away` is set it is history: the last thing
-    /// reported live HERE, not what this Environment runs now.
-    pub live: Option<DeploymentDto>,
-    /// The newest Deployment, only when it is not the live one — a change in
-    /// flight, stalled or failed.
-    pub newest: Option<DeploymentDto>,
-    /// Display term **Moved** (ADR-0070 §3), not a status: the target's
-    /// source now routes it to another Environment, or to none. Its record
-    /// here is untouched; a request for it here waits, and stalls, because
-    /// its reports now land elsewhere.
-    pub moved_away: Option<MovedAwayDto>,
-}
-
-/// Where a moved DeploymentTarget's reports go now.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct MovedAwayDto {
-    /// The Environment that lists its source's grouping now; absent = none
-    /// does (unmapped — its reports are dropped).
-    pub now: Option<String>,
-}
-
-/// `GET /v1/orgs/{org}/board` filter.
-#[derive(Debug, Deserialize, utoipa::IntoParams)]
-#[into_params(parameter_in = Query)]
-pub struct EnvironmentBoardQuery {
-    /// Only this Environment's rows; omitted = every Environment with any
-    /// Deployment.
-    pub environment: Option<String>,
-}
-
-/// `GET …/environments/{env}/deployments` filter: one DeploymentTarget's
-/// history (either field narrows on its own), and how many to return.
-#[derive(Debug, Deserialize, utoipa::IntoParams)]
-#[into_params(parameter_in = Query)]
-pub struct DeploymentListQuery {
-    pub target_source: Option<String>,
-    pub target_id: Option<String>,
-    /// At most this many, newest first (default 200, capped at 1000). Bounds
-    /// the response only: the server still folds the Environment's whole log
-    /// to derive each status.
-    pub limit: Option<usize>,
-}
-
-/// [`DeploymentListQuery::limit`]'s default and cap.
-const DEPLOYMENT_LIST_DEFAULT_LIMIT: usize = 200;
-const DEPLOYMENT_LIST_MAX_LIMIT: usize = 1000;
-
-/// Fold one Environment's log as of the server's `now`.
-async fn fold_environment_deployments(
-    st: &AppState,
-    store: &dyn scarab_deployment::DeploymentStore,
-    org: &str,
-    environment: &str,
-) -> Result<scarab_deployment::EnvironmentDeployments, ApiError> {
-    let inputs = store
-        .inputs(org, environment)
-        .await
-        .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;
-    // The Environment's own deadline, or the default for a name with no
-    // OrgEnvironment (ADR-0071).
-    let deadline =
-        org_environments::deadline_from_org_environment(st, org, environment).await?;
-    let now = st.clock.now().await.0;
-    Ok(scarab_deployment::fold_environment(&inputs, now, deadline))
-}
-
-/// The Project of every run that requested one of `views`, in one query for
-/// the whole HTTP request. A run stamped into another Org (or not stamped) is
-/// absent: a link built from this Org's path would point at the wrong run.
-///
-/// Takes a collected slice rather than an iterator: an iterator adapter whose
-/// closure borrows a `DeploymentView`, held across the `.await`, trips rustc's
-/// higher-ranked lifetime check when axum requires the handler future to be
-/// `Send` ("one type is more general than the other").
-async fn requester_projects(
-    st: &AppState,
-    org: &str,
-    views: &[&scarab_deployment::DeploymentView],
-) -> Result<std::collections::HashMap<String, String>, ApiError> {
-    let runs: std::collections::BTreeSet<&str> = views
-        .iter()
-        .flat_map(|v| v.requesters.iter().map(|r| r.requester.run.as_str()))
-        .collect();
-    let runs: Vec<RunId> = runs.into_iter().map(|r| RunId(r.to_string())).collect();
-    let tenants = st.db.run_tenants(&runs).await?;
-    Ok(tenants
-        .into_iter()
-        .filter(|(_, (o, _))| o == org)
-        .map(|(run, (_, project))| (run.0, project))
-        .collect())
-}
-
-/// A source-supplied report link, passed on only if it is an `http(s)` URL.
-/// Sources are untrusted plugins (ADR-0072): a `javascript:` or `data:` link
-/// rendered as an href would run as script on Scarab's origin. Anything else
-/// is dropped rather than escaped — the record keeps it; the API does not
-/// hand it to a browser.
-fn safe_link(link: Option<&str>) -> Option<String> {
-    let link = link?.trim();
-    let scheme_len = link.find(':')?;
-    let scheme = &link[..scheme_len];
-    (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
-        .then(|| link.to_string())
-}
-
-fn deployment_dto(
-    view: &scarab_deployment::DeploymentView,
-    projects: &std::collections::HashMap<String, String>,
-) -> DeploymentDto {
-    DeploymentDto {
-        id: view.id,
-        target: (&view.target).into(),
-        version: view.version.0.clone(),
-        status: view.status.into(),
-        requesters: view
-            .requesters
-            .iter()
-            .map(|r| DeploymentRequesterDto {
-                run: r.requester.run.clone(),
-                step: r.requester.step.clone(),
-                effective_at: r.effective_at,
-                project: projects.get(&r.requester.run).cloned(),
-                claim: r.claim,
-                evidence: r.evidence.clone(),
-            })
-            .collect(),
-        reports: view
-            .reports
-            .iter()
-            .map(|r| DeploymentStatusReportDto {
-                status: r.report.status.into(),
-                label: r.report.label.clone(),
-                link: safe_link(r.report.link.as_deref()),
-                at: r.report.at,
-                source_at: r.source_at,
-            })
-            .collect(),
-        created_at: view.created_at,
-        superseded_at: view.superseded_at,
-        was_ever_live: view.was_ever_live,
-        unexplained: view.unexplained,
-        unconfirmed: view.unconfirmed,
-    }
-}
-
-/// The Environment board (ADR-0070): per DeploymentTarget, what is live and
-/// what is on its way, across the Org's Environments (or one). Rows are
-/// ordered by Environment, then source, then target id. Read on the Org.
-#[utoipa::path(
-    get,
-    path = "/v1/orgs/{org}/board",
-    params(("org" = String, Path, description = "org"), EnvironmentBoardQuery),
-    summary = "The Environment board: what is live on each DeploymentTarget (ADR-0070)",
-    responses(
-        (status = 200, body = [EnvironmentBoardRowDto]),
-        (status = 403, description = "no Read on the org"),
-        (status = 404, description = "deployments not configured")
-    )
-)]
-async fn get_environment_board(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Path(org): Path<String>,
-    Query(q): Query<EnvironmentBoardQuery>,
-) -> Result<Json<Vec<EnvironmentBoardRowDto>>, ApiError> {
-    let scope = rbac_scope(&org, None);
-    authorize_scoped(&st, &headers, Action::Read, Some(&scope)).await?;
-    let store = st.deployments.as_ref().ok_or(ApiError::NotFound)?;
-    let environments = match q.environment {
-        Some(environment) => vec![environment],
-        None => store
-            .environments(&org)
-            .await
-            .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?,
-    };
-    let mut board = Vec::new();
-    for environment in &environments {
-        let folded = fold_environment_deployments(&st, store.as_ref(), &org, environment).await?;
-        board.extend(folded.board);
-    }
-    // One requester lookup for the whole board, not one per Environment.
-    let shown: Vec<_> = board
-        .iter()
-        .flat_map(|row| row.live.iter().chain(row.newest.iter()))
-        .collect();
-    let projects = requester_projects(&st, &org, &shown).await?;
-    let routes = current_target_routes(&st, &org, &board).await?;
-    Ok(Json(
-        board
-            .iter()
-            .map(|row| EnvironmentBoardRowDto {
-                target: (&row.target).into(),
-                live: row.live.as_ref().map(|d| deployment_dto(d, &projects)),
-                newest: row.newest.as_ref().map(|d| deployment_dto(d, &projects)),
-                moved_away: routes
-                    .get(&(row.target.source.clone(), row.target.id.clone()))
-                    .filter(|now| now.as_deref() != Some(row.target.environment.as_str()))
-                    .map(|now| MovedAwayDto { now: now.clone() }),
-            })
-            .collect(),
-    ))
-}
-
-/// Where each board row's target routes now, for the targets a plugin
-/// installation of the Org has reported on (one query for the whole board).
-/// A target only a Deploy Run ever named, or whose source is not an
-/// installation, is absent: nothing routes it, so it cannot have moved.
-async fn current_target_routes(
-    st: &AppState,
-    org: &str,
-    board: &[scarab_deployment::EnvironmentBoardRow],
-) -> Result<std::collections::HashMap<(String, String), Option<String>>, ApiError> {
-    let Some(plugins) = st.plugins.as_deref() else {
-        return Ok(std::collections::HashMap::new());
-    };
-    let targets: std::collections::BTreeSet<(String, String)> = board
-        .iter()
-        .map(|row| (row.target.source.clone(), row.target.id.clone()))
-        .collect();
-    let targets: Vec<(String, String)> = targets.into_iter().collect();
-    Ok(plugins
-        .target_routings(org, &targets)
-        .await
-        .map_err(plugins::plugin_store_api_error)?
-        .into_iter()
-        .map(|r| ((r.installation, r.target_id), r.environment))
-        .collect())
-}
-
-/// An Environment's Deployments, newest first, optionally narrowed to one
-/// DeploymentTarget, at most `limit` of them. Read on the Org.
-#[utoipa::path(
-    get,
-    path = "/v1/orgs/{org}/environments/{env}/deployments",
-    params(
-        ("org" = String, Path, description = "org"),
-        ("env" = String, Path, description = "environment name"),
-        DeploymentListQuery
-    ),
-    summary = "An Environment's Deployments, newest first (ADR-0070)",
-    responses(
-        (status = 200, body = [DeploymentDto]),
-        (status = 403, description = "no Read on the org"),
-        (status = 404, description = "deployments not configured")
-    )
-)]
-async fn list_environment_deployments(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Path((org, env)): Path<(String, String)>,
-    Query(q): Query<DeploymentListQuery>,
-) -> Result<Json<Vec<DeploymentDto>>, ApiError> {
-    let scope = rbac_scope(&org, None);
-    authorize_scoped(&st, &headers, Action::Read, Some(&scope)).await?;
-    let store = st.deployments.as_ref().ok_or(ApiError::NotFound)?;
-    let folded = fold_environment_deployments(&st, store.as_ref(), &org, &env).await?;
-    let shown: Vec<_> = folded
-        .deployments
-        .iter()
-        .filter(|d| {
-            q.target_source
-                .as_ref()
-                .is_none_or(|s| *s == d.target.source)
-                && q.target_id.as_ref().is_none_or(|i| *i == d.target.id)
-        })
-        .take(
-            q.limit
-                .unwrap_or(DEPLOYMENT_LIST_DEFAULT_LIMIT)
-                .min(DEPLOYMENT_LIST_MAX_LIMIT),
-        )
-        .collect();
-    let projects = requester_projects(&st, &org, &shown).await?;
-    Ok(Json(
-        shown
-            .into_iter()
-            .map(|d| deployment_dto(d, &projects))
-            .collect(),
-    ))
-}
-
-/// One Deployment, with its requesters and its reports in order. Read on the
-/// Org.
-#[utoipa::path(
-    get,
-    path = "/v1/orgs/{org}/environments/{env}/deployments/{id}",
-    params(
-        ("org" = String, Path, description = "org"),
-        ("env" = String, Path, description = "environment name"),
-        ("id" = u64, Path, description = "Deployment id")
-    ),
-    summary = "One Deployment and its stages (ADR-0070)",
-    responses(
-        (status = 200, body = DeploymentDto),
-        (status = 403, description = "no Read on the org"),
-        (status = 404, description = "no such Deployment in this Environment")
-    )
-)]
-async fn get_deployment(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Path((org, env, id)): Path<(String, String, u64)>,
-) -> Result<Json<DeploymentDto>, ApiError> {
-    let scope = rbac_scope(&org, None);
-    authorize_scoped(&st, &headers, Action::Read, Some(&scope)).await?;
-    let store = st.deployments.as_ref().ok_or(ApiError::NotFound)?;
-    let folded = fold_environment_deployments(&st, store.as_ref(), &org, &env).await?;
-    let view = folded.get(id).ok_or(ApiError::NotFound)?;
-    let projects = requester_projects(&st, &org, &[view]).await?;
-    Ok(Json(deployment_dto(view, &projects)))
 }
 
 /// The secret coverage matrix for a repo (ADR-0037 D, editable since ADR-0060):
@@ -10316,7 +9524,12 @@ async fn register_repo_webhook(
 ) -> Result<Json<BindRepoResultDto>, ApiError> {
     authorize_org_administer(&st, &headers).await?;
     let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
-    deny_if_config_owned(connections, &id, "webhook registration for its repositories").await?;
+    deny_if_config_owned(
+        connections,
+        &id,
+        "webhook registration for its repositories",
+    )
+    .await?;
     let conn = connections
         .get_connection(&id)
         .await
@@ -10617,20 +9830,15 @@ const TAG_GROUPS: &[(&str, &str)] = &[
     ),
     (
         "Environments",
-        "Org-level Environments (ADR-0071) with their deployment deadline and \
-         sources; per-repo Environments and their protection rules, plus their \
-         legacy approval history.",
-    ),
-    (
-        "Deployments",
-        "The vendor-neutral Deployment record (ADR-0070): what is live on each \
-         DeploymentTarget, how it got there, and the Environment board.",
+        "Org-level Environments (ADR-0071) and their governance; per-repo \
+         Environments and their protection rules, plus their legacy approval \
+         history.",
     ),
     (
         "Plugins",
         "PluginInstallations (ADR-0072): the first-party catalog, install and \
-         uninstall, the kill switch, the vendor groupings no Environment \
-         lists yet, and the PluginConnections the CredentialBroker proxies to.",
+         uninstall, the kill switch, and the PluginConnections the \
+         CredentialBroker proxies to.",
     ),
     (
         "Secrets",
@@ -10686,15 +9894,6 @@ fn tag_for_path(path: &str) -> Option<&'static str> {
         "System"
     } else if path.contains("/plugins") || path.contains("/plugin-catalog") {
         "Plugins"
-    } else if path.starts_with("/v1/orgs/")
-        && (path.contains("/deployments")
-            || path.contains("/deployment-targets")
-            || path.ends_with("/board"))
-    {
-        // Before `/environments`: the Org-level Deployment record shares that
-        // path segment with the repo-scoped legacy approval history, which
-        // stays under Environments.
-        "Deployments"
     } else if path.contains("/environments") || path.contains("/environment-migration-report") {
         "Environments"
     } else if path.contains("/secrets") {
@@ -10958,7 +10157,6 @@ impl utoipa::Modify for StepUpResponses {
         org_environments::delete_environment_project_privilege_grant,
         org_environments::get_environment_migration_report,
         org_environments::acknowledge_environment_migration_report,
-        plugins::environment_deployment_targets,
         plugins::plugin_catalog,
         plugins::list_plugins,
         plugins::install_plugin,
@@ -10966,13 +10164,11 @@ impl utoipa::Modify for StepUpResponses {
         plugins::uninstall_plugin,
         plugins::kill_plugin,
         plugins::enable_plugin,
-        plugins::unmapped_groupings,
+        plugins::put_plugin_storage,
+        plugins::delete_plugin_storage,
         plugins::list_plugin_connections,
         plugins::put_plugin_connection,
         plugins::delete_plugin_connection,
-        get_environment_board,
-        list_environment_deployments,
-        get_deployment,
         secret_matrix,
         silence_secret_cell,
         unsilence_secret_cell,
@@ -11058,7 +10254,6 @@ impl utoipa::Modify for StepUpResponses {
         ExpiredInputDto,
         StepStatusDto,
         GateResolutionDto,
-        DeploymentGateDto,
         StepServiceDto,
         AttemptDto,
         ServiceStatusDto,
@@ -11094,16 +10289,7 @@ impl utoipa::Modify for StepUpResponses {
         MintTokenRequest,
         MintedTokenDto,
         ApiTokenDto,
-        DeploymentDto,
-        DeploymentStatusDto,
-        SourceAssertedStatusDto,
-        DeploymentTargetDto,
-        DeploymentRequesterDto,
-        DeploymentStatusReportDto,
-        EnvironmentBoardRowDto,
-        MovedAwayDto,
         org_environments::OrgEnvironmentDto,
-        org_environments::EnvironmentDeploymentSourceDto,
         org_environments::PutOrgEnvironmentRequest,
         org_environments::EnvironmentEligibilityDto,
         org_environments::ProjectEnvironmentDto,
@@ -11126,13 +10312,11 @@ impl utoipa::Modify for StepUpResponses {
         plugins::PluginCatalogEntryDto,
         plugins::InstallationStateDto,
         plugins::RuntimeStatusDto,
-        plugins::InstallationDeploymentSourceDto,
         plugins::PluginInstallationDto,
-        plugins::PluginUsageDto,
+        plugins::PluginStorageDto,
+        plugins::PluginStorageRequest,
         plugins::InstallPluginRequest,
         plugins::UninstalledPluginDto,
-        plugins::UnmappedGroupingDto,
-        plugins::DeploymentSourceTargetDto,
         plugins::PluginConnectionDto,
         plugins::PutPluginConnectionRequest,
         step_up::OpSummary,

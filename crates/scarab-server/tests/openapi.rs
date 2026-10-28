@@ -30,57 +30,51 @@ fn openapi_document_has_v1_paths_and_ir_schemas() {
     }
 }
 
-/// The Deployment record's read API (ADR-0070) is on the documented surface,
-/// with typed bodies the web UI generates its client from, and grouped apart
-/// from the repo-scoped legacy approval history that shares the word.
+/// ADR-0074 removed the Deployment record: its read API and schemas are off
+/// the documented surface, while the repo-scoped legacy approval history that
+/// shares the word stays with Environments.
 #[test]
-fn openapi_document_has_the_deployment_record() {
+fn openapi_document_has_no_deployment_record() {
     let doc: serde_json::Value = serde_json::from_str(&scarab_server::openapi_json()).unwrap();
 
-    let paths = &doc["paths"];
+    let paths = doc["paths"].as_object().unwrap();
     for p in [
         "/v1/orgs/{org}/board",
         "/v1/orgs/{org}/environments/{env}/deployments",
         "/v1/orgs/{org}/environments/{env}/deployments/{id}",
+        "/v1/orgs/{org}/environments/{env}/deployment-targets",
+        "/v1/orgs/{org}/plugins/{name}/unmapped-groupings",
     ] {
-        let op = &paths[p]["get"];
-        assert!(op.is_object(), "missing GET {p}");
-        assert_eq!(op["tags"], serde_json::json!(["Deployments"]), "{p}");
+        assert!(!paths.contains_key(p), "{p} is still documented");
     }
     assert_eq!(
         paths["/v1/repos/{org}/{repo}/environments/{name}/deployments"]["get"]["tags"],
         serde_json::json!(["Environments"]),
         "the legacy approval history stays with Environments"
     );
-
-    let schemas = &doc["components"]["schemas"];
+    let schemas = doc["components"]["schemas"].as_object().unwrap();
     for s in [
         "DeploymentDto",
         "DeploymentStatusDto",
-        "SourceAssertedStatusDto",
-        "DeploymentTargetDto",
-        "DeploymentRequesterDto",
-        "DeploymentStatusReportDto",
+        "DeploymentGateDto",
         "EnvironmentBoardRowDto",
+        "UnmappedGroupingDto",
+        "DeploymentSourceTargetDto",
     ] {
-        assert!(schemas.get(s).is_some(), "missing schema {s}");
+        assert!(!schemas.contains_key(s), "schema {s} is still documented");
     }
-    assert_eq!(
-        schemas["DeploymentStatusDto"]["enum"],
-        serde_json::json!([
-            "requested",
-            "in_progress",
-            "live",
-            "failed",
-            "stalled",
-            "superseded"
-        ])
+    assert!(
+        doc["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t["name"] != "Deployments"),
+        "no Deployments tag group"
     );
 }
 
 /// Org-level Environments (ADR-0071) are on the documented surface with typed
-/// bodies, grouped with Environments — not with the Deployment record that
-/// shares their path prefix.
+/// bodies, grouped with Environments.
 #[test]
 fn openapi_document_has_org_environments() {
     let doc: serde_json::Value = serde_json::from_str(&scarab_server::openapi_json()).unwrap();
@@ -107,18 +101,19 @@ fn openapi_document_has_org_environments() {
     );
 
     let schemas = &doc["components"]["schemas"];
-    for s in [
-        "OrgEnvironmentDto",
-        "EnvironmentDeploymentSourceDto",
-        "PutOrgEnvironmentRequest",
-    ] {
+    for s in ["OrgEnvironmentDto", "PutOrgEnvironmentRequest"] {
         assert!(schemas.get(s).is_some(), "missing schema {s}");
     }
-    // A full replace: the source list is the one field a caller must state.
-    assert_eq!(
-        schemas["PutOrgEnvironmentRequest"]["required"],
-        serde_json::json!(["deployment_sources"])
-    );
+    // ADR-0074: the Deployment record's fields and schemas are gone.
+    assert!(schemas.get("EnvironmentDeploymentSourceDto").is_none());
+    for field in ["deployment_sources", "deployment_deadline_ms"] {
+        assert!(
+            schemas["OrgEnvironmentDto"]["properties"]
+                .get(field)
+                .is_none(),
+            "OrgEnvironmentDto still has `{field}`"
+        );
+    }
 }
 
 #[test]
@@ -161,7 +156,6 @@ fn openapi_document_has_the_plugin_admin_api_but_not_the_broker() {
         ("/v1/orgs/{org}/plugins/{name}", "delete"),
         ("/v1/orgs/{org}/plugins/{name}/kill", "post"),
         ("/v1/orgs/{org}/plugins/{name}/enable", "post"),
-        ("/v1/orgs/{org}/plugins/{name}/unmapped-groupings", "get"),
         ("/v1/orgs/{org}/plugins/{name}/connections", "get"),
         ("/v1/orgs/{org}/plugins/{name}/connections/{slot}", "put"),
         ("/v1/orgs/{org}/plugins/{name}/connections/{slot}", "delete"),
@@ -170,10 +164,6 @@ fn openapi_document_has_the_plugin_admin_api_but_not_the_broker() {
         assert!(op.is_object(), "missing {method} {p}");
         assert_eq!(op["tags"], serde_json::json!(["Plugins"]), "{method} {p}");
     }
-    assert_eq!(
-        paths["/v1/orgs/{org}/environments/{env}/deployment-targets"]["get"]["tags"],
-        serde_json::json!(["Deployments"])
-    );
     assert!(
         paths
             .as_object()
@@ -191,8 +181,6 @@ fn openapi_document_has_the_plugin_admin_api_but_not_the_broker() {
         "PluginManifestDto",
         "PluginCapabilityDto",
         "UninstalledPluginDto",
-        "UnmappedGroupingDto",
-        "DeploymentSourceTargetDto",
         "PluginConnectionDto",
         "PutPluginConnectionRequest",
     ] {

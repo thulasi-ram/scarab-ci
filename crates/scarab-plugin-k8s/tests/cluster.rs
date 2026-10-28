@@ -30,21 +30,25 @@ use std::panic::AssertUnwindSafe;
 use std::time::{Duration, Instant};
 
 use futures::FutureExt;
+use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::authentication::v1::{TokenRequest, TokenRequestSpec};
 use k8s_openapi::api::core::v1::{
-    Container, Namespace, Pod, PodSpec, ProjectedVolumeSource, Service, ServiceAccount,
-    ServiceAccountTokenProjection, ServicePort, ServiceSpec, Volume, VolumeMount, VolumeProjection,
+    Container, Namespace, PersistentVolumeClaim, PersistentVolumeClaimSpec, Pod, PodSpec,
+    ProjectedVolumeSource, Service, ServiceAccount, ServiceAccountTokenProjection, ServicePort,
+    ServiceSpec, Volume, VolumeMount, VolumeProjection, VolumeResourceRequirements,
 };
 use k8s_openapi::api::networking::v1::{NetworkPolicy, NetworkPolicySpec};
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
-use kube::api::{DeleteParams, ListParams, LogParams, PostParams};
+use kube::api::{DeleteParams, ListParams, LogParams, Patch, PatchParams, PostParams};
 use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::{Api, Client, Config};
 
 use scarab_plugin::{
-    InstallationState, PluginCapability, PluginInstallation, PluginManifest, PluginTokenVerifier,
-    RuntimeStatus, TokenRejected, VerifiedServiceAccount,
+    ConnectionSlot, InstallationState, PluginCapability, PluginInstallation, PluginManifest,
+    PluginStorage, PluginTokenVerifier, RequestRule, RuntimeStatus, TokenRejected,
+    VerifiedServiceAccount, PLUGIN_STORAGE_OWNER_ANNOTATION,
 };
 use scarab_plugin_k8s::objects::{
     restricted_container_security_context, restricted_pod_security_context, DEFAULT_DENY_POLICY,
@@ -412,10 +416,19 @@ fn installation(image: &str) -> PluginInstallation {
         name: "argocd-prod".into(),
         plugin: "argocd".into(),
         image: image.into(),
+        // A manifest `validate()` accepts: `use_connection` needs a slot.
         manifest: PluginManifest {
             plugin: "argocd".into(),
-            capabilities: vec![PluginCapability::ReportDeployments],
-            connections: vec![],
+            capabilities: vec![PluginCapability::UseConnection],
+            connections: vec![ConnectionSlot {
+                name: "argocd".into(),
+                auth_schemes: vec!["bearer".into()],
+                read_rules: vec![RequestRule {
+                    method: "GET".into(),
+                    path: "/api/version".into(),
+                    query: vec![],
+                }],
+            }],
             config_keys: vec![],
         },
         manifest_sha256: "f".repeat(64),
@@ -428,6 +441,7 @@ fn installation(image: &str) -> PluginInstallation {
         approved_at: 1,
         killed_by: None,
         killed_at: None,
+        storage: None,
     }
 }
 
@@ -467,8 +481,10 @@ async fn a_workload_is_admitted_stopped_and_uninstalled() {
                 admitted = Some(pod);
                 break;
             }
-            if let WorkloadState::Failing(why) =
-                runtime.workload_state(INSTALLATION_ID).await.unwrap()
+            if let WorkloadState::Failing(why) = runtime
+                .workload_state(&installation(&probe_image()))
+                .await
+                .unwrap()
             {
                 if why.contains("PodSecurity") {
                     panic!("restricted Pod Security refused the plugin Pod: {why}");
@@ -502,7 +518,10 @@ async fn a_workload_is_admitted_stopped_and_uninstalled() {
 
         runtime.stop(INSTALLATION_ID).await.expect("stop");
         assert_eq!(
-            runtime.workload_state(INSTALLATION_ID).await.unwrap(),
+            runtime
+                .workload_state(&installation(&probe_image()))
+                .await
+                .unwrap(),
             WorkloadState::Stopped
         );
         let sas: Api<ServiceAccount> = Api::namespaced(f.client.clone(), &f.plugins_ns);
@@ -514,7 +533,10 @@ async fn a_workload_is_admitted_stopped_and_uninstalled() {
 
         runtime.uninstall(INSTALLATION_ID).await.expect("uninstall");
         assert_eq!(
-            runtime.workload_state(INSTALLATION_ID).await.unwrap(),
+            runtime
+                .workload_state(&installation(&probe_image()))
+                .await
+                .unwrap(),
             WorkloadState::Absent
         );
         runtime
@@ -577,7 +599,10 @@ async fn in_an_open_namespace_the_self_check_keeps_the_plugin_from_starting() {
         let wait = Duration::from_secs(u64::from(SELF_CHECK_DEADLINE_SECONDS) + 120);
         let started = Instant::now();
         while started.elapsed() < wait {
-            state = runtime.workload_state(INSTALLATION_ID).await.unwrap();
+            state = runtime
+                .workload_state(&installation(&probe_image()))
+                .await
+                .unwrap();
             if matches!(&state, WorkloadState::Failing(why) if why.contains("self-check")) {
                 break;
             }
@@ -847,6 +872,170 @@ async fn token_review_accepts_only_a_live_pods_broker_token() {
             pods.get_opt("token-survivor").await.unwrap().is_some(),
             "the Pod outlived the revocation, so it was the ServiceAccount's deletion"
         );
+    })
+    .await;
+}
+
+/// ADR-0074 §7 on a real cluster: the runtime refuses a storage claim that
+/// is missing or not annotated for the installation (holding the workload,
+/// with the claim named), and mounts an annotated one; Pod Security
+/// `restricted` admits the Pod with the claim; and the Plugin's own Pod
+/// spec (the runtime's template, only its command replaced) can write to
+/// it as uid 65532. kind's default StorageClass binds on first use, so the
+/// claim binds only once a Pod is scheduled.
+#[tokio::test]
+#[ignore]
+async fn a_plugin_pod_mounts_its_annotated_claim_and_can_write_to_it() {
+    if !opted_in() {
+        return;
+    }
+    with_fixture(|f| async move {
+        let (runtime, pod_broker_url) = f.ready_runtime().await;
+        let mut inst = installation(&probe_image());
+        inst.storage = Some(PluginStorage::new("plugin-state", None).unwrap());
+        let claims: Api<PersistentVolumeClaim> = Api::namespaced(f.client.clone(), &f.plugins_ns);
+
+        // Missing: refused, naming the claim; nothing is created.
+        let err = runtime.ensure(&inst, &pod_broker_url).await.unwrap_err();
+        assert!(
+            matches!(&err, RuntimeError::Storage(m) if m.contains("`plugin-state` does not exist")),
+            "{err}"
+        );
+        assert_eq!(
+            runtime.workload_state(&inst).await.unwrap(),
+            WorkloadState::Absent
+        );
+
+        // Present but not annotated for this installation: refused.
+        let mut claim = PersistentVolumeClaim {
+            metadata: ObjectMeta {
+                name: Some("plugin-state".to_string()),
+                ..Default::default()
+            },
+            spec: Some(PersistentVolumeClaimSpec {
+                access_modes: Some(vec!["ReadWriteOnce".to_string()]),
+                resources: Some(VolumeResourceRequirements {
+                    requests: Some(BTreeMap::from([(
+                        "storage".to_string(),
+                        Quantity("64Mi".to_string()),
+                    )])),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        claims
+            .create(&PostParams::default(), &claim)
+            .await
+            .expect("create the claim");
+        let err = runtime.ensure(&inst, &pod_broker_url).await.unwrap_err();
+        assert!(
+            matches!(&err, RuntimeError::Storage(m) if m.contains("acme/argocd-prod")),
+            "{err}"
+        );
+
+        // Annotated by the operator: mounted.
+        claim.metadata.annotations = Some(BTreeMap::from([(
+            PLUGIN_STORAGE_OWNER_ANNOTATION.to_string(),
+            "acme/argocd-prod".to_string(),
+        )]));
+        claims
+            .patch(
+                "plugin-state",
+                &PatchParams::default(),
+                &Patch::Merge(&serde_json::json!({
+                    "metadata": { "annotations": claim.metadata.annotations }
+                })),
+            )
+            .await
+            .expect("annotate the claim");
+        runtime
+            .ensure(&inst, &pod_broker_url)
+            .await
+            .expect("ensure with an annotated claim");
+        let deployment = Api::<Deployment>::namespaced(f.client.clone(), &f.plugins_ns)
+            .get("plugin-0123456789")
+            .await
+            .expect("the Deployment");
+        let template = deployment.spec.unwrap().template;
+        assert!(
+            template
+                .spec
+                .as_ref()
+                .unwrap()
+                .volumes
+                .iter()
+                .flatten()
+                .any(|v| v
+                    .persistent_volume_claim
+                    .as_ref()
+                    .is_some_and(|c| c.claim_name == "plugin-state")),
+            "the applied Deployment mounts the claim"
+        );
+
+        // The runtime's own Pod spec, with a command that writes to the claim
+        // and reads it back, as the Plugin's uid. The Deployment is scaled to
+        // zero first (its ServiceAccount kept), so the writer is the claim's
+        // only user.
+        Api::<Deployment>::namespaced(f.client.clone(), &f.plugins_ns)
+            .patch(
+                "plugin-0123456789",
+                &PatchParams::default(),
+                &Patch::Merge(&serde_json::json!({ "spec": { "replicas": 0 } })),
+            )
+            .await
+            .expect("scale the plugin to zero");
+        let mut spec = template.spec.unwrap();
+        spec.restart_policy = Some("Never".to_string());
+        spec.containers[0].command = Some(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "set -e; id -u; echo written-by-plugin > /data/proof; cat /data/proof".to_string(),
+        ]);
+        let writer = Pod {
+            metadata: ObjectMeta {
+                name: Some("storage-writer".to_string()),
+                labels: template.metadata.and_then(|m| m.labels),
+                ..Default::default()
+            },
+            spec: Some(spec),
+            ..Default::default()
+        };
+        let pods = f.pods();
+        pods.create(&PostParams::default(), &writer)
+            .await
+            .expect("Pod Security `restricted` admits the Plugin Pod with its claim");
+        let wait = Duration::from_secs(u64::from(SELF_CHECK_DEADLINE_SECONDS) + 180);
+        let started = Instant::now();
+        let phase = loop {
+            let phase = pods
+                .get("storage-writer")
+                .await
+                .unwrap()
+                .status
+                .and_then(|s| s.phase)
+                .unwrap_or_default();
+            if phase == "Succeeded" || phase == "Failed" || started.elapsed() > wait {
+                break phase;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        };
+        let log = pods
+            .logs(
+                "storage-writer",
+                &LogParams {
+                    container: Some("plugin".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_or_default();
+        assert_eq!(phase, "Succeeded", "the writer did not succeed: {log}");
+        assert!(log.contains("65532"), "it ran as the Plugin's uid: {log}");
+        assert!(log.contains("written-by-plugin"), "{log}");
+        let bound = claims.get("plugin-state").await.unwrap();
+        assert_eq!(bound.status.and_then(|s| s.phase).as_deref(), Some("Bound"));
     })
     .await;
 }

@@ -1,36 +1,31 @@
 //! The CredentialBroker, as a Plugin reaches it (ADR-0072 §5, §11): the one
-//! address its network allows. Identity, cursors and report ingest live
-//! under `/_scarab/plugin/v1`; Argo CD is read through the broker's proxy at
+//! address its network allows. Identity lives under `/_scarab/plugin/v1`;
+//! Argo CD is read through the broker's proxy at
 //! `/_scarab/plugin/v1/connections/argocd/…`, which adds the Argo token —
 //! this process never holds it.
 //!
 //! The broker token is a projected ServiceAccount token that the kubelet
 //! rotates in place (audience `scarab-broker`, ten-minute TTL), so it is
 //! re-read from its file before **every** request; a cached copy would
-//! expire under a long-lived reporter.
+//! expire under a long-lived plugin.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
-
-use crate::report::ReportItem;
+use serde::Deserialize;
 
 /// Where every broker route lives.
 pub const BROKER_PREFIX: &str = "/_scarab/plugin/v1";
 /// The manifest's connection slot for Argo CD (`manifest.json`).
 pub const ARGOCD_SLOT: &str = "argocd";
-/// `/targets` page size: the contract's maximum.
-const TARGETS_PAGE_LIMIT: usize = 1000;
-/// The largest body read from the broker's own routes (`/whoami`, a
-/// `/targets` page of 1000 cursors, a report batch's results).
+/// The largest body read from the broker's own routes (`/whoami`).
 const MAX_BROKER_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// The largest Argo CD response read through the proxy. Managed resources
 /// carry every resource's target AND live state as JSON strings, so a big
 /// Application is legitimately tens of MiB; past this one it is refused
-/// (that Application stays unreported, the rest carry on) rather than let
-/// one response grow the reporter without bound under its memory limit.
+/// rather than let one response grow the plugin without bound under its
+/// memory limit.
 const MAX_ARGOCD_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// How much of an error body is kept: it is only logged.
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
@@ -86,56 +81,6 @@ pub struct WhoAmI {
     pub principal: String,
     #[serde(default)]
     pub capabilities: Vec<String>,
-}
-
-/// One entry of `GET …/targets`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct TargetCursor {
-    pub target_id: String,
-    pub vendor_grouping: String,
-    #[serde(default)]
-    pub environment: Option<String>,
-    #[serde(default)]
-    pub resend: bool,
-    pub last_sequence: u64,
-    #[serde(default)]
-    pub version_scheme: Option<String>,
-    #[serde(default)]
-    pub last_version: Option<String>,
-    #[serde(default)]
-    pub last_status: Option<String>,
-    #[serde(default)]
-    pub last_label: Option<String>,
-    #[serde(default)]
-    pub owners: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TargetsPage {
-    targets: Vec<TargetCursor>,
-    #[serde(default)]
-    next_after: Option<String>,
-}
-
-/// One item's result, in request order.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ItemResult {
-    /// `accepted`, `duplicate`, `stale`, `unmapped` or `rejected`.
-    pub outcome: String,
-    #[serde(default)]
-    pub input_seq: Option<u64>,
-    #[serde(default)]
-    pub reason: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ReportResults {
-    results: Vec<ItemResult>,
-}
-
-#[derive(Serialize)]
-struct ReportBody<'a> {
-    items: &'a [ReportItem],
 }
 
 /// A client of the broker.
@@ -270,55 +215,6 @@ impl Broker {
     /// Who the broker says this installation is.
     pub async fn whoami(&self) -> Result<WhoAmI, BrokerError> {
         self.get_json("/whoami").await
-    }
-
-    /// Every cursor (or, `resend_only`, every target flagged `resend`), all
-    /// pages (ADR-0070 §11: page by `next_after`).
-    pub async fn targets(&self, resend_only: bool) -> Result<Vec<TargetCursor>, BrokerError> {
-        let mut all = Vec::new();
-        let mut after: Option<String> = None;
-        loop {
-            let limit = TARGETS_PAGE_LIMIT.to_string();
-            let mut query: Vec<(&str, &str)> = vec![("limit", &limit)];
-            if resend_only {
-                query.push(("resend", "true"));
-            }
-            if let Some(a) = after.as_deref() {
-                query.push(("after", a));
-            }
-            let page: TargetsPage = self
-                .get_json(&format!("/targets{}", query_string(&query)))
-                .await?;
-            let done = page.next_after.is_none() || page.targets.is_empty();
-            all.extend(page.targets);
-            if done {
-                return Ok(all);
-            }
-            after = page.next_after;
-        }
-    }
-
-    /// `POST …/reports`: one result per item, in order.
-    pub async fn post_reports(&self, items: &[ReportItem]) -> Result<Vec<ItemResult>, BrokerError> {
-        let resp = self
-            .send(
-                self.http
-                    .post(self.url("/reports"))
-                    .json(&ReportBody { items }),
-                Some(self.request_timeout),
-            )
-            .await?;
-        let bytes = read_capped(resp, MAX_BROKER_BODY_BYTES, false).await?;
-        let results: ReportResults =
-            serde_json::from_slice(&bytes).map_err(|e| BrokerError::Decode(e.to_string()))?;
-        if results.results.len() != items.len() {
-            return Err(BrokerError::Decode(format!(
-                "{} results for {} items",
-                results.results.len(),
-                items.len()
-            )));
-        }
-        Ok(results.results)
     }
 
     fn argocd_url(&self, argo_path: &str, query: &[(&str, &str)]) -> String {

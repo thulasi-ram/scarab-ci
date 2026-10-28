@@ -822,6 +822,17 @@ pub static PLUGIN_CONNECTION_DELETE: Op = op(
     &["path:org", "path:name", "path:slot"],
 );
 
+pub static PLUGIN_STORAGE_DELETE: Op = op(
+    "plugin.storage.delete",
+    "Stop mounting a plugin's storage",
+    Class::Exempt("the plugin loses access to the claim; the claim and its data stay"),
+    "§3 not on the list",
+    ADMIN,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org", "path:name"],
+);
+
 // --- crown jewels, the window satisfies them ---------------------------------
 
 pub static IDENTITY_LINK: Op = op(
@@ -1045,11 +1056,11 @@ pub static GATE_APPROVE: Op = op(
 pub static ENVIRONMENT_PUT: Op = op(
     "environment.put",
     "Write an Environment",
-    Class::Conditional {
-        mode: W,
-        rule: "E3: adds a deployment source",
-    },
-    "§3 EnvironmentDeploymentSources",
+    Class::NotGoverned(
+        "a name and a description; the deployment sources it once governed (E3) went with \
+         ADR-0074",
+    ),
+    "§3 not on the list",
     ADMIN,
     OrgOf::Path("org"),
     &[],
@@ -1107,6 +1118,20 @@ pub static PRIVILEGE_GRANT_PUT: Op = op(
     OrgOf::Path("org"),
     &[],
     &["path:org", "path:env", "path:project"],
+);
+pub static PLUGIN_STORAGE_PUT: Op = op(
+    "plugin.storage.put",
+    "Set a plugin's storage",
+    Class::Conditional {
+        mode: W,
+        rule: "moves existing storage to another claim or mount path; adding storage to an \
+               installation that has none is exempt",
+    },
+    "§3 ADR-0074 §7 plugin storage (AMBIG: closest to a plugin upgrade)",
+    ADMIN,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org", "path:name", "body:/claim"],
 );
 pub static PASSKEY_ADD: Op = op(
     "passkey.add",

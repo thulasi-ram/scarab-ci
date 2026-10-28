@@ -74,7 +74,6 @@ scarab-executor-local = { path = "crates/scarab-executor-local" }
 scarab-testkit = { path = "crates/scarab-testkit" }
 # ADR-0073: the WebAuthn relying-party verifier the step-up ceremony uses.
 scarab-webauthn = { path = "crates/scarab-webauthn" }
-scarab-deployment = { path = "crates/scarab-deployment" }
 scarab-plugin = { path = "crates/scarab-plugin" }
 # ADR-0072 §9/§11: the plugin runtime's Kubernetes adapter (namespace
 # baseline, workloads, isolation probe, TokenReview).

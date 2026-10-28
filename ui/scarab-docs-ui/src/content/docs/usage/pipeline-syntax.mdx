@@ -1,6 +1,6 @@
 ---
 title: Pipeline Syntax
-description: 'How to write a Scarab pipeline: triggers, inputs, steps, CEL expressions, matrix, invoke, results, gates, and retries.'
+description: 'How to write a Scarab pipeline: triggers, inputs, steps, CEL expressions, matrix, invoke, results, gates, deploys, and retries.'
 ---
 
 import Doodle from '../../../components/Doodle.astro';
@@ -334,6 +334,9 @@ result's name is the filename minus `.json`, and the file must hold **valid JSON
   command: ["echo", "release ${{ outputs.version.tag }}"]
 ```
 
+A step can also list the results it writes, with `results: [tag, build]`. The list is a
+declaration, not a filter: a step that declares nothing still publishes every file it writes.
+
 Beyond writing the file, capture needs no setup in the pipeline: on Kubernetes a trusted per-Pod egress sidecar
 drains the step's results back to the control plane. A `build:` step
 emits an `image` result natively (BuildKit writes `--metadata-file /scarab/results/image.json`);
@@ -369,8 +372,10 @@ This section covers only the YAML you author. For the concepts behind them (how 
 stored and scoped, and what an environment governs), see
 [Secrets](/scarab-ci/usage/secrets/) and [Environments](/scarab-ci/usage/environments/).
 
-Referencing a top-level `environment:` makes the pipeline a **deploy**: its runs are enforced
-against that environment's protection rules at admission. **Secrets** a step needs are named with
+A top-level `environment:` puts the pipeline's runs under that environment's governance: they are
+checked against its protection rules at admission, get its scoped secrets, and are never cancelled
+by newest-wins. It does not mark them as deploys; for that, see
+[Deploys: `deploy: true`](#deploys-deploy-true). **Secrets** a step needs are named with
 `secrets: [KEY, ...]`; each key is resolved against the run's scope and made available to the step
 under the same name (a run from a fork's pull request is locked out and receives none).
 
@@ -397,6 +402,67 @@ manual gate is the approval mechanism for a governed environment:
   image: deployer
   needs: [approve]
 ```
+
+Any gate can fail with a reason: by expiry, by a human reject, or by an external gate released
+with `{"passed": false, "reason": "..."}`. A waiting gate holds only the steps that depend on it,
+and each gate has its own clock, measured from when its `needs` finished.
+
+## Deploys: `deploy: true`
+
+`deploy: true` marks the runs that deploy. Set it on the pipeline, and every run of it is a
+**deploy run**:
+
+```yaml
+environment: production
+deploy: true
+```
+
+Or set it on the one step that deploys. The step is marked on the run page, and its run is a
+deploy run:
+
+```yaml
+steps:
+  - id: test
+    image: tester
+  - id: bump
+    image: deployer
+    needs: [test]
+    deploy: true
+```
+
+The mark is separate from `environment:`. A deploy needs no environment, and a run in an
+environment need not deploy. A gate cannot be marked.
+
+A deploy run differs from other runs in two ways:
+
+- **It is never cancelled by newest-wins.** A newer push to the same branch does not cancel it
+  half-way, and its concurrency group queues even if the pipeline declares
+  `concurrency: { group: ..., policy: cancel-in-progress }`. A run that names an environment
+  behaves the same way.
+- **You can filter for it.** The Runs tab has a **deploys** toggle and an Environment filter, and
+  the API takes the same filters:
+  `GET /v1/repos/{org}/{repo}/runs?deploy=true&environment=production`. Both are applied in the
+  database query, so a page holds the newest matching runs, not the matches among the newest
+  page.
+
+A deploy run's green means only that its steps succeeded. With GitOps, the deploy step's success
+means its change merged into the gitops repository; the CD tool applies it later, and the rollout
+can still fail. To keep the run open until the change is live, add a step after the deploy step
+that waits for it. [Deploying with Argo CD](/scarab-ci/usage/deploying-with-argo-cd/) has a
+recipe. Scarab keeps no record of the deploy after the run ends; the CD tool's UI is where you see
+what is live.
+
+To keep two runs from deploying one service at the same time, give the pipeline a concurrency
+group, for example `concurrency: { group: deploy-prod-payments-api }`. A group holds the whole run,
+and it is scoped to the repository, so two repositories that deploy one service do not wait for
+each other.
+
+:::note[`deployment_requests` and `gate: deployment` are gone]
+Scarab 0.2 had a Deployment record: a step field `deployment_requests` and a `gate: deployment`
+that waited for a CD tool to report the change live. Both were removed (ADR-0074). A pipeline that
+still uses them fails the pipeline check; replace the gate with a wait step as shown on
+[Deploying with Argo CD](/scarab-ci/usage/deploying-with-argo-cd/).
+:::
 
 ## Placement & resources
 
@@ -463,4 +529,5 @@ for them.
 - [ADR-0055: Placement profiles: named profiles + baseline + governed `k8s_overlay`](/scarab-ci/tech/adr/0055-placement-profiles/)
 - [ADR-0056: Run Takes and attempt-grain evidence](/scarab-ci/tech/adr/0056-run-takes-and-attempt-grain-evidence/)
 - [ADR-0057: Run provenance: trigger context and origin details](/scarab-ci/tech/adr/0057-run-provenance-trigger-context/)
+- [ADR-0074: Deployments leave core](/scarab-ci/tech/adr/0074-deployments-leave-core/)
 ```
