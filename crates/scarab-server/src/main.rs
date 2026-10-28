@@ -238,7 +238,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 s3.bucket.clone(),
                 &s3.endpoint,
                 &s3.region,
-                s3.static_keys.as_ref().map(|(a, s)| (a.as_str(), s.as_str())),
+                s3.static_keys
+                    .as_ref()
+                    .map(|(a, s)| (a.as_str(), s.as_str())),
             )?,
             StoreConfig::LocalDir(dir) => S3Storage::local(dir)?,
         }
@@ -346,11 +348,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                  are in-Pod into the Depot's packs — ADR-0067, no flush pass)"
             );
             Arc::new(
-                scarab_storage::tiered::TieredCas::new(
-                    Arc::new(client.cache_only_cas()),
-                    cold_cas,
-                )
-                .fall_through_on_warm_error(),
+                scarab_storage::tiered::TieredCas::new(Arc::new(client.cache_only_cas()), cold_cas)
+                    .fall_through_on_warm_error(),
             )
         }
         // No service configured: the object store IS the whole store. The
@@ -381,8 +380,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Kept concrete as well: the same KEK envelope seals pending step-up
     // requests and derives the step-up digest key (ADR-0073 §5).
     let pg_secrets: Arc<scarab_secrets_postgres::PostgresSecrets> = {
-        let s = scarab_secrets_postgres::PostgresSecrets::connect(&database_url, master_keys)
-            .await?;
+        let s =
+            scarab_secrets_postgres::PostgresSecrets::connect(&database_url, master_keys).await?;
         s.migrate().await?;
         // Boot rewrap sweep (f37463a): converge every row to the active key,
         // on EVERY core replica — the per-row CAS makes concurrent sweeps
@@ -435,13 +434,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // before alarming a marked object as torn-cold residue. No Depot
             // configured = loose listing alone, status quo (this handle also
             // being how the drain-less shape is detected).
-            depot_client
-                .as_ref()
-                .map(|c| {
-                    Arc::new(DepotDurableProbe(c.clone()))
-                        as Arc<dyn scarab_server::retention::DepotDurableIndex>
-                }),
-            // Plugin report receipts (ADR-0072 §11): a 7-day idempotency window.
+            depot_client.as_ref().map(|c| {
+                Arc::new(DepotDurableProbe(c.clone()))
+                    as Arc<dyn scarab_server::retention::DepotDurableIndex>
+            }),
+            // The CredentialBroker journal (ADR-0072 §5): its retention window.
             Some(pg.clone() as Arc<dyn scarab_plugin::PluginStore>),
             // Step-up rows (ADR-0073): expired challenges and confirmations,
             // settled requests after 30 days. Never the security event log.
@@ -770,16 +767,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // ("cannot key — disable") rather than falling through to a
                 // loose-only cold read that mis-answers for packed content.
                 Some(Arc::new(scarab_server::retention::CasSnapshots(
-                    widening_cas.clone().unwrap_or_else(|| workspace_cas.clone()),
+                    widening_cas
+                        .clone()
+                        .unwrap_or_else(|| workspace_cas.clone()),
                 ))),
-                // DeploymentGates (ADR-0070 §8): core resolves them from the
-                // Deployment input log, with the deadline the run's Project
-                // has in its Environment (ADR-0071 §3).
-                Some(scarab_server::deployment_gates::ServerDeploymentGates::new(
-                    db.clone(),
-                    pg.clone(),
-                    Some(pg.clone()),
-                )),
                 Some(forge.clone()),
                 // Feed the log pipeline from the executor's live tail (ADR-0013).
                 Some(logs.clone()),
@@ -807,16 +798,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // every Deploy Run. ALWAYS wired here — an unwired store would admit
         // deploys with no rules, which only a hand-built test state may do.
         .with_environment_governance(pg.clone())
-        // The Deployment record's input log (ADR-0070): the Environment board
-        // and the Deployments view fold it on every read.
-        .with_deployments(pg.clone())
-        // Org-level Environments (ADR-0071): their admin API, and the
-        // per-Environment deadline that fold stalls by.
+        // Org-level Environments (ADR-0071): their admin API.
         .with_org_environments(pg.clone())
         // The PluginInstallation registry (ADR-0072). Wired whatever
         // SCARAB_PLUGINS says: it is data — an operator who turned plugins
-        // off can still list, kill and uninstall — and every org Environment
-        // source is checked against it (c-min F1). The policy decides whether
+        // off can still list, kill and uninstall. The policy decides whether
         // installs are accepted.
         .with_plugins(
             pg.clone(),

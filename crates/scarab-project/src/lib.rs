@@ -19,11 +19,8 @@ use serde::{Deserialize, Serialize};
 /// legacy shape the migration reads.
 mod org_environment;
 pub use org_environment::{
-    validate_org_environment_name, EnvironmentDeploymentDeadline, EnvironmentDeploymentSource,
-    OrgEnvironment, OrgEnvironmentError, OrgEnvironmentStore,
-    MAX_ENVIRONMENT_DEPLOYMENT_DEADLINE_MS, MAX_ENVIRONMENT_DEPLOYMENT_SOURCES,
-    MAX_INSTALLATION_NAME_CHARS, MAX_ORG_ENVIRONMENT_DESCRIPTION_CHARS, MAX_VENDOR_GROUPING_CHARS,
-    MIN_ENVIRONMENT_DEPLOYMENT_DEADLINE_MS,
+    validate_org_environment_name, OrgEnvironment, OrgEnvironmentError, OrgEnvironmentStore,
+    MAX_INSTALLATION_NAME_CHARS, MAX_ORG_ENVIRONMENT_DESCRIPTION_CHARS,
 };
 
 /// The org-level Environment's governance model and its pure resolution
@@ -33,19 +30,18 @@ pub use org_environment::{
 mod environment_governance;
 pub use environment_governance::{
     effective_protection, migrate_legacy_environment, AllowedRefConstraint, DeployGovernance,
-    DeploymentTargetHome, EffectiveProtection, EnvironmentGovernanceStore,
-    EnvironmentMigrationAcknowledgement, EnvironmentMigrationReport,
-    EnvironmentMigrationReportProject, EnvironmentProjectEligibility, EnvironmentProjectOverlay,
-    EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord, EnvironmentProtectionRules,
-    LegacyRuleField,
+    EffectiveProtection, EnvironmentGovernanceStore, EnvironmentMigrationAcknowledgement,
+    EnvironmentMigrationReport, EnvironmentMigrationReportProject, EnvironmentProjectEligibility,
+    EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord,
+    EnvironmentProtectionRules, LegacyRuleField,
 };
 
 /// Which Environment governance edits loosen it (ADR-0073 §3): the pure,
 /// fail-closed rules that decide whether a conditional write needs a step-up.
 mod step_up_loosening;
 pub use step_up_loosening::{
-    deployment_source_additions, eligibility_loosenings, glob_subsumes, overlay_loosenings,
-    privilege_grant_loosenings, protection_loosenings, Loosening,
+    eligibility_loosenings, glob_subsumes, overlay_loosenings, privilege_grant_loosenings,
+    protection_loosenings, Loosening,
 };
 
 /// A top-level tenant. Owns Projects. The Scarab tenancy boundary — **not**

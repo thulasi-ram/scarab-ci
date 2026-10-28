@@ -1045,11 +1045,11 @@ pub static GATE_APPROVE: Op = op(
 pub static ENVIRONMENT_PUT: Op = op(
     "environment.put",
     "Write an Environment",
-    Class::Conditional {
-        mode: W,
-        rule: "E3: adds a deployment source",
-    },
-    "§3 EnvironmentDeploymentSources",
+    Class::NotGoverned(
+        "a name and a description; the deployment sources it once governed (E3) went with \
+         ADR-0074",
+    ),
+    "§3 not on the list",
     ADMIN,
     OrgOf::Path("org"),
     &[],

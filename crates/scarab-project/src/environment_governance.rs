@@ -16,23 +16,20 @@
 //!
 //! [`OrgEnvironment`]: crate::OrgEnvironment
 
-use std::num::NonZeroU32;
-
 use async_trait::async_trait;
 
 use crate::{
-    admit_grants_against_whitelist, glob_match, AdmittedGrants, Environment,
-    EnvironmentDeploymentDeadline, GrantRequest, ImageGrant, OrgEnvironment, OrgEnvironmentError,
-    ProtectionRules,
+    admit_grants_against_whitelist, glob_match, AdmittedGrants, Environment, GrantRequest,
+    ImageGrant, OrgEnvironment, OrgEnvironmentError, ProtectionRules,
 };
 
 /// The protection rules an Environment's admin sets as its **baseline**, and
 /// the shape a Project's [`EnvironmentProjectOverlay`] tightens it with
-/// (ADR-0071 §1, §3). The same five rules either way, so a baseline and an
+/// (ADR-0071 §1, §3). The same four rules either way, so a baseline and an
 /// overlay can be compared field by field.
 ///
 /// [`Default`] is the **permissive** rule set — no approvers, any ref, no
-/// timer, no reason, no concurrency limit — which is what the migration gives
+/// timer, no reason — which is what the migration gives
 /// every Environment it creates (ADR-0071 §10 step 1) and what an overlay that
 /// tightens nothing holds.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -49,11 +46,6 @@ pub struct EnvironmentProtectionRules {
     pub wait_timer_s: u32,
     /// A human dispatch (`manual`/`api`) must carry a reason (ADR-0057 §3).
     pub require_reason: bool,
-    /// At most this many in-flight Deployments **per DeploymentTarget**
-    /// (ADR-0071 §9). `None` is **no limit** — concurrency is an explicit
-    /// opt-in — and `NonZeroU32` makes "a limit of 0" (a target nobody can
-    /// ever deploy to) unrepresentable rather than a value to validate.
-    pub deployment_concurrency: Option<NonZeroU32>,
 }
 
 /// One Project's **tighten-only** overlay over one Environment's baseline
@@ -68,11 +60,6 @@ pub struct EnvironmentProjectOverlay {
     /// The Project's name — its repo's forge name (1:1 in v1).
     pub project: String,
     pub rules: EnvironmentProtectionRules,
-    /// A tighter EnvironmentDeploymentDeadline for **this Project's
-    /// DeploymentGates only**. A Deployment's own status keeps the
-    /// baseline's deadline, so one Deployment has one status whoever
-    /// requested it (ADR-0071 §3, ADR-0070 §10).
-    pub deployment_gate_deadline: Option<EnvironmentDeploymentDeadline>,
 }
 
 /// Which Projects an Environment admits Deploy Runs from (ADR-0071 §2).
@@ -224,15 +211,9 @@ pub struct EffectiveProtection {
     pub allowed_refs: AllowedRefConstraint,
     pub wait_timer_s: u32,
     pub require_reason: bool,
-    pub deployment_concurrency: Option<NonZeroU32>,
-    /// The deadline **this Project's DeploymentGates** use. A Deployment's
-    /// status uses the baseline's deadline instead (ADR-0071 §3), so this is
-    /// never the `deadline` handed to `Deployment::status`.
-    pub deployment_gate_deadline: EnvironmentDeploymentDeadline,
 }
 
-/// Fold an Environment's `baseline` (with its `baseline_deployment_deadline`)
-/// and one Project's `overlay` into the rules admission enforces (ADR-0071
+/// Fold an Environment's `baseline` and one Project's `overlay` into the rules admission enforces (ADR-0071
 /// §3). Each field merges so the overlay can **only tighten**:
 ///
 /// - **approvers**: ordered, de-duplicated union (baseline first) — both
@@ -241,14 +222,10 @@ pub struct EffectiveProtection {
 ///   matching any ([`AllowedRefConstraint`]; never a list intersection).
 /// - **wait timer**: the longer.
 /// - **require_reason**: either layer setting it sets it.
-/// - **concurrency**: the lower limit, `None` (no limit) losing to any limit.
-/// - **gate deadline**: the shorter of the baseline's deadline and the
-///   overlay's, if it sets one.
 ///
 /// With no overlay the baseline applies as-is.
 pub fn effective_protection(
     baseline: &EnvironmentProtectionRules,
-    baseline_deployment_deadline: EnvironmentDeploymentDeadline,
     overlay: Option<&EnvironmentProjectOverlay>,
 ) -> EffectiveProtection {
     let mut approvers: Vec<String> = Vec::new();
@@ -268,38 +245,19 @@ pub fn effective_protection(
             .chain(overlay_rules.map(|r| r.allowed_refs.clone())),
     );
 
-    let (wait_timer_s, require_reason, deployment_concurrency) = match overlay_rules {
-        None => (
-            baseline.wait_timer_s,
-            baseline.require_reason,
-            baseline.deployment_concurrency,
-        ),
+    let (wait_timer_s, require_reason) = match overlay_rules {
+        None => (baseline.wait_timer_s, baseline.require_reason),
         Some(o) => (
             baseline.wait_timer_s.max(o.wait_timer_s),
             baseline.require_reason || o.require_reason,
-            // `Option::min` would rank `None` lowest, i.e. "no limit" as the
-            // strictest — exactly backwards — so the two `Some`s are compared
-            // and a lone `Some` wins over `None`.
-            match (baseline.deployment_concurrency, o.deployment_concurrency) {
-                (Some(b), Some(o)) => Some(b.min(o)),
-                (limit, None) | (None, limit) => limit,
-            },
         ),
     };
-
-    let deployment_gate_deadline = overlay
-        .and_then(|o| o.deployment_gate_deadline)
-        .map_or(baseline_deployment_deadline, |d| {
-            d.min(baseline_deployment_deadline)
-        });
 
     EffectiveProtection {
         approvers,
         allowed_refs,
         wait_timer_s,
         require_reason,
-        deployment_concurrency,
-        deployment_gate_deadline,
     }
 }
 
@@ -376,10 +334,9 @@ impl EffectiveProtection {
 /// - **Overlay**: approvers, allowed refs, wait timer and `require_reason`
 ///   carried verbatim, so over the **permissive** baseline the migration
 ///   creates, the Project's effective rules decide exactly as its old rules
-///   did. No gate deadline: the old model had none.
+///   did.
 /// - **Concurrency is dropped** (step 3). The UI stored 1 for every
-///   Environment and nothing ever read it; carrying it would throttle every
-///   DeploymentTarget the day ADR-0071 §9 first reads the rule.
+///   Environment and nothing ever read it.
 /// - **Grant** only when the old whitelist is non-empty or raw overlays were
 ///   permitted (step 5); otherwise `None`, which
 ///   [`EnvironmentProjectPrivilegeGrant::admit_grants`] decides exactly as
@@ -405,9 +362,7 @@ pub fn migrate_legacy_environment(
             allowed_refs: old.allowed_refs.clone(),
             wait_timer_s: old.wait_timer,
             require_reason: old.require_reason,
-            deployment_concurrency: None,
         },
-        deployment_gate_deadline: None,
     };
     let grant = (!old.privileged_images.is_empty() || old.permit_k8s_overlay).then(|| {
         EnvironmentProjectPrivilegeGrant {
@@ -419,19 +374,6 @@ pub fn migrate_legacy_environment(
         }
     });
     (overlay, grant)
-}
-
-/// Where a DeploymentTarget is **homed** now (slice b, criterion 1; ADR-0070
-/// §7): the Environment a Deploy Run must target to request it. A target
-/// belongs to exactly one Environment (CONTEXT §4.6), so a Run of another
-/// Environment that requests it is refused at creation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeploymentTargetHome {
-    /// The reporting source (a plugin installation name).
-    pub source: String,
-    /// The source's own id for the target.
-    pub id: String,
-    pub environment: String,
 }
 
 /// Everything admission needs to decide one Project's Deploy Run into one
@@ -472,11 +414,7 @@ impl DeployGovernance {
 
     /// The rules admission enforces: the baseline merged with the overlay.
     pub fn effective_protection(&self) -> EffectiveProtection {
-        effective_protection(
-            &self.environment.protection,
-            self.environment.deployment_deadline,
-            self.overlay.as_ref(),
-        )
+        effective_protection(&self.environment.protection, self.overlay.as_ref())
     }
 }
 
@@ -672,8 +610,7 @@ impl EnvironmentMigrationReport {
 
 /// Durable store for the governance half of org-level Environments (ADR-0071
 /// §2, §3, §8): baseline protection, eligibility, per-Project overlays and
-/// privilege grants. The Environment itself (name, description, deadline,
-/// sources) is the [`OrgEnvironmentStore`](crate::OrgEnvironmentStore)'s.
+/// privilege grants. The Environment itself (name, description) is the [`OrgEnvironmentStore`](crate::OrgEnvironmentStore)'s.
 ///
 /// The baseline and the eligibility each have **their own write**, never a
 /// field of the whole-Environment replace: that replace is what the c-min
@@ -806,7 +743,7 @@ pub trait EnvironmentGovernanceStore: Send + Sync {
     /// [`put_environment_project_overlay`](Self::put_environment_project_overlay),
     /// refused with [`OrgEnvironmentError::Conflict`] unless the stored
     /// overlay is `expected` (when given): `Some(None)` expects the Project
-    /// to hold none, `Some(Some(o))` expects `o`'s rules and deadline.
+    /// to hold none, `Some(Some(o))` expects `o`'s rules.
     async fn put_environment_project_overlay_expecting(
         &self,
         overlay: &EnvironmentProjectOverlay,
@@ -872,25 +809,6 @@ pub trait EnvironmentGovernanceStore: Send + Sync {
         org: &str,
     ) -> Result<Vec<EnvironmentMigrationReport>, OrgEnvironmentError>;
 
-    /// Where each of `targets` — `(source, target id)` pairs in `org` — is
-    /// homed now ([`DeploymentTargetHome`]): the Environment its source's
-    /// grouping routes to, when the source has reported the target and an
-    /// Environment lists that grouping; otherwise the Environment of the
-    /// target's newest input in the Deployment record; otherwise the
-    /// Environment of the oldest non-terminal Run that already requests it
-    /// (git-bug 9e66f2c: an admitted Run's request claims the target before it
-    /// records anything). A target none of them knows is absent — nothing
-    /// claims it, so any Environment may request it first.
-    ///
-    /// Read at Run creation, never folded: a home is a routing fact, not a
-    /// Deployment's status. Not an ownership check — admission never reads
-    /// `owner_projects` (see `resolve_governance`'s tripwire).
-    async fn deployment_target_homes(
-        &self,
-        org: &str,
-        targets: &[(String, String)],
-    ) -> Result<Vec<DeploymentTargetHome>, OrgEnvironmentError>;
-
     /// Mark one report line reviewed. The first acknowledgement stands, so
     /// a repeat is a no-op that still answers the line. `None` if the
     /// migration wrote no line for that name.
@@ -914,12 +832,6 @@ mod tests {
         xs.iter().map(|s| s.to_string()).collect()
     }
 
-    fn deadline(ms: i64) -> EnvironmentDeploymentDeadline {
-        EnvironmentDeploymentDeadline::new(ms).unwrap()
-    }
-
-    const HOUR: i64 = 3_600_000;
-
     fn rules(approvers: &[&str], allowed_refs: &[&str]) -> EnvironmentProtectionRules {
         EnvironmentProtectionRules {
             approvers: strings(approvers),
@@ -934,7 +846,6 @@ mod tests {
             environment: "prod".into(),
             project: "payments".into(),
             rules,
-            deployment_gate_deadline: None,
         }
     }
 
@@ -957,10 +868,6 @@ mod tests {
             permit_k8s_overlay: false,
             require_reason: false,
         }
-    }
-
-    fn nz(n: u32) -> Option<NonZeroU32> {
-        NonZeroU32::new(n)
     }
 
     // --- EnvironmentProjectEligibility -----------------------------------
@@ -1015,21 +922,18 @@ mod tests {
         let mut b = rules(&["alice"], &["refs/heads/main"]);
         b.wait_timer_s = 30;
         b.require_reason = true;
-        b.deployment_concurrency = nz(2);
-        let e = effective_protection(&b, deadline(HOUR), None);
+        let e = effective_protection(&b, None);
         assert_eq!(e.approvers, strings(&["alice"]));
         assert_eq!(e.allowed_refs.layers(), &[strings(&["refs/heads/main"])]);
         assert_eq!(e.wait_timer_s, 30);
         assert!(e.require_reason);
-        assert_eq!(e.deployment_concurrency, nz(2));
-        assert_eq!(e.deployment_gate_deadline, deadline(HOUR));
     }
 
     #[test]
     fn approvers_are_an_ordered_deduplicated_union() {
         let b = rules(&["alice", "bob", "alice"], &[]);
         let o = overlay(rules(&["carol", "bob"], &[]));
-        let e = effective_protection(&b, deadline(HOUR), Some(&o));
+        let e = effective_protection(&b, Some(&o));
         assert_eq!(e.approvers, strings(&["alice", "bob", "carol"]));
         let approvals = strings(&["alice", "bob"]);
         let err = e.admits("refs/heads/main", &approvals).unwrap_err();
@@ -1045,7 +949,7 @@ mod tests {
         // which reads as "any ref" — the merge must instead admit nothing.
         let b = rules(&[], &["refs/heads/main"]);
         let o = overlay(rules(&[], &["refs/tags/*"]));
-        let e = effective_protection(&b, deadline(HOUR), Some(&o));
+        let e = effective_protection(&b, Some(&o));
         for r in ["refs/heads/main", "refs/tags/v1", "refs/heads/dev", ""] {
             assert!(!e.ref_allowed(r), "{r}");
         }
@@ -1055,7 +959,7 @@ mod tests {
         // Overlapping layers admit only what both admit.
         let b = rules(&[], &["refs/heads/*"]);
         let o = overlay(rules(&[], &["refs/heads/main", "refs/tags/*"]));
-        let e = effective_protection(&b, deadline(HOUR), Some(&o));
+        let e = effective_protection(&b, Some(&o));
         assert!(e.ref_allowed("refs/heads/main"));
         assert!(!e.ref_allowed("refs/heads/dev"));
         assert!(!e.ref_allowed("refs/tags/v1"));
@@ -1063,13 +967,13 @@ mod tests {
 
     #[test]
     fn an_empty_layer_allows_any_ref_and_no_symbolic_ref_needs_every_layer_empty() {
-        let e = effective_protection(&rules(&[], &[]), deadline(HOUR), None);
+        let e = effective_protection(&rules(&[], &[]), None);
         assert!(e.unrestricted_refs());
         assert!(e.admits_protection_ref(None));
         assert!(e.admits_protection_ref(Some("refs/pull/7/head")));
 
         let o = overlay(rules(&[], &["refs/heads/main"]));
-        let e = effective_protection(&rules(&[], &[]), deadline(HOUR), Some(&o));
+        let e = effective_protection(&rules(&[], &[]), Some(&o));
         assert!(e.ref_allowed("refs/heads/main"));
         assert!(!e.ref_allowed("refs/heads/dev"));
         // A cron run has no symbolic ref: refused once any layer restricts.
@@ -1077,42 +981,17 @@ mod tests {
     }
 
     #[test]
-    fn wait_reason_concurrency_and_deadline_take_the_stricter_side() {
+    fn wait_and_reason_take_the_stricter_side() {
         let mut b = rules(&[], &[]);
         b.wait_timer_s = 60;
-        b.deployment_concurrency = nz(3);
-        let mut o = overlay(EnvironmentProtectionRules {
+        let o = overlay(EnvironmentProtectionRules {
             wait_timer_s: 10,
             require_reason: true,
-            deployment_concurrency: nz(1),
             ..Default::default()
         });
-        o.deployment_gate_deadline = Some(deadline(120_000));
-        let e = effective_protection(&b, deadline(HOUR), Some(&o));
+        let e = effective_protection(&b, Some(&o));
         assert_eq!(e.wait_timer_s, 60);
         assert!(e.require_reason);
-        assert_eq!(e.deployment_concurrency, nz(1));
-        assert_eq!(e.deployment_gate_deadline, deadline(120_000));
-
-        // An overlay deadline looser than the baseline never loosens it.
-        o.deployment_gate_deadline = Some(deadline(2 * HOUR));
-        let e = effective_protection(&b, deadline(HOUR), Some(&o));
-        assert_eq!(e.deployment_gate_deadline, deadline(HOUR));
-    }
-
-    #[test]
-    fn concurrency_none_is_no_limit_and_loses_to_any_limit() {
-        let mut b = rules(&[], &[]);
-        let mut o = overlay(rules(&[], &[]));
-        let merged = |b: &EnvironmentProtectionRules, o: &EnvironmentProjectOverlay| {
-            effective_protection(b, deadline(HOUR), Some(o)).deployment_concurrency
-        };
-        assert_eq!(merged(&b, &o), None);
-        o.rules.deployment_concurrency = nz(4);
-        assert_eq!(merged(&b, &o), nz(4));
-        b.deployment_concurrency = nz(2);
-        o.rules.deployment_concurrency = None;
-        assert_eq!(merged(&b, &o), nz(2));
     }
 
     #[test]
@@ -1121,7 +1000,7 @@ mod tests {
             require_reason: true,
             ..Default::default()
         });
-        let e = effective_protection(&rules(&[], &[]), deadline(HOUR), Some(&o));
+        let e = effective_protection(&rules(&[], &[]), Some(&o));
         let err = e.admits_reason(true, false).unwrap_err();
         assert!(err[0].contains("reason is required"));
         assert!(e.admits_reason(true, true).is_ok());
@@ -1215,9 +1094,7 @@ mod tests {
                     allowed_refs: strings(&["main"]),
                     wait_timer_s: 90,
                     require_reason: true,
-                    deployment_concurrency: None,
                 },
-                deployment_gate_deadline: None,
             }
         );
         assert_eq!(g, None);
@@ -1333,44 +1210,19 @@ mod tests {
             .prop_map(|xs| xs.into_iter().map(str::to_string).collect())
     }
 
-    fn concurrency() -> impl Strategy<Value = Option<NonZeroU32>> {
-        prop::option::of(1u32..5).prop_map(|n| n.and_then(NonZeroU32::new))
-    }
-
     fn protection_rules() -> impl Strategy<Value = EnvironmentProtectionRules> {
-        (
-            pick(PEOPLE, 4),
-            pick(PATTERNS, 3),
-            0u32..120,
-            any::<bool>(),
-            concurrency(),
+        (pick(PEOPLE, 4), pick(PATTERNS, 3), 0u32..120, any::<bool>()).prop_map(
+            |(approvers, allowed_refs, wait_timer_s, require_reason)| EnvironmentProtectionRules {
+                approvers,
+                allowed_refs,
+                wait_timer_s,
+                require_reason,
+            },
         )
-            .prop_map(
-                |(approvers, allowed_refs, wait_timer_s, require_reason, c)| {
-                    EnvironmentProtectionRules {
-                        approvers,
-                        allowed_refs,
-                        wait_timer_s,
-                        require_reason,
-                        deployment_concurrency: c,
-                    }
-                },
-            )
-    }
-
-    fn deadline_ms() -> impl Strategy<Value = EnvironmentDeploymentDeadline> {
-        (crate::MIN_ENVIRONMENT_DEPLOYMENT_DEADLINE_MS
-            ..=crate::MAX_ENVIRONMENT_DEPLOYMENT_DEADLINE_MS)
-            .prop_map(deadline)
     }
 
     fn project_overlay() -> impl Strategy<Value = EnvironmentProjectOverlay> {
-        (protection_rules(), prop::option::of(deadline_ms())).prop_map(|(rules, d)| {
-            EnvironmentProjectOverlay {
-                deployment_gate_deadline: d,
-                ..overlay(rules)
-            }
-        })
+        protection_rules().prop_map(overlay)
     }
 
     const DIGESTS: &[&str] = &["sha256:aaaa", "sha256:bbbb"];
@@ -1445,12 +1297,11 @@ mod tests {
         #[test]
         fn an_overlay_only_ever_tightens_the_baseline(
             baseline in protection_rules(),
-            baseline_deadline in deadline_ms(),
             o in project_overlay(),
             approvals in pick(PEOPLE, 3),
         ) {
-            let with = effective_protection(&baseline, baseline_deadline, Some(&o));
-            let without = effective_protection(&baseline, baseline_deadline, None);
+            let with = effective_protection(&baseline, Some(&o));
+            let without = effective_protection(&baseline, None);
 
             for &r in REFS {
                 prop_assert!(!with.ref_allowed(r) || without.ref_allowed(r), "{r}");
@@ -1489,14 +1340,6 @@ mod tests {
             prop_assert!(with.approvers.iter().all(|a| seen.insert(a)), "duplicate approver");
             prop_assert!(with.wait_timer_s >= without.wait_timer_s);
             prop_assert!(!without.require_reason || with.require_reason);
-            // `None` is no limit: the merged limit is never looser.
-            match (with.deployment_concurrency, without.deployment_concurrency) {
-                (_, None) => {}
-                (Some(w), Some(b)) => prop_assert!(w <= b),
-                (None, Some(_)) => prop_assert!(false, "an overlay lifted the baseline's limit"),
-            }
-            prop_assert!(with.deployment_gate_deadline <= baseline_deadline);
-            prop_assert_eq!(without.deployment_gate_deadline, baseline_deadline);
         }
 
         /// ADR-0071 §10 **migration equivalence**: over the permissive
@@ -1507,18 +1350,13 @@ mod tests {
         #[test]
         fn a_migrated_environment_decides_exactly_as_it_did_before(
             old in legacy_protection_rules(),
-            baseline_deadline in deadline_ms(),
             grant_requests in prop::collection::vec(
                 (grant_request(), prop::sample::select(IMAGES), any::<bool>()),
                 1..6,
             ),
         ) {
             let (o, g) = migrate_legacy_environment("acme", "payments", &legacy(old.clone()));
-            let e = effective_protection(
-                &EnvironmentProtectionRules::default(),
-                baseline_deadline,
-                Some(&o),
-            );
+            let e = effective_protection(&EnvironmentProtectionRules::default(), Some(&o));
 
             for &r in REFS {
                 prop_assert_eq!(e.ref_allowed(r), old.ref_allowed(r), "{}", r);
@@ -1560,9 +1398,6 @@ mod tests {
                 old.permit_k8s_overlay
             );
             prop_assert_eq!(e.wait_timer_s, old.wait_timer);
-            // Concurrency is never carried (ADR-0071 §10 step 3).
-            prop_assert_eq!(e.deployment_concurrency, None);
-            prop_assert_eq!(e.deployment_gate_deadline, baseline_deadline);
         }
 
         /// The fail-open regression ADR-0071 §3 names: baseline
@@ -1579,7 +1414,7 @@ mod tests {
         ) {
             baseline.allowed_refs = vec!["refs/heads/main".into()];
             o.rules.allowed_refs = vec!["refs/tags/*".into()];
-            let e = effective_protection(&baseline, deadline(HOUR), Some(&o));
+            let e = effective_protection(&baseline, Some(&o));
             prop_assert!(!e.ref_allowed(&r));
             prop_assert!(!e.unrestricted_refs());
             prop_assert!(!e.admits_protection_ref(None));
