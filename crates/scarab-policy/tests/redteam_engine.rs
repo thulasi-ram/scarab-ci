@@ -733,6 +733,35 @@ fn redteam_the_plugin_default_still_denies_a_run_over_the_caps() {
     assert!(d.is_denied(), "{:?}", d.results);
 }
 
+/// The plugin default caps its messages as a typed setting does: a supplied
+/// input of one gate with 10,000 plugin origins is denied with
+/// `MAX_TYPED_MESSAGES` messages and a count of the rest, not 10,000.
+#[test]
+fn redteam_the_plugin_default_caps_its_messages() {
+    use scarab_policy::evaluate::MAX_TYPED_MESSAGES;
+    let mut input = input_with(1, 0, "ci");
+    let origins: Vec<Value> = (0..10_000)
+        .map(|i| json!({ "kind": "plugin", "name": format!("p{i}"), "content_hash": "ab".repeat(32) }))
+        .collect();
+    input["gates"] = json!([{ "id": "g", "origin": origins, "dependents": [] }]);
+    let d = evaluate_stored(
+        Checkpoint::RunCreate,
+        SCHEMA_VERSION,
+        Ok(&input),
+        None,
+        &ctx(),
+        &[],
+    );
+    assert!(d.is_denied(), "{:?}", d.outcome);
+    let m = d.messages();
+    assert!(m.len() <= MAX_TYPED_MESSAGES + 1, "{} messages", m.len());
+    assert!(m[0].contains("plugin `p0`"), "{m:?}");
+    assert!(
+        m.last().is_some_and(|l| l.contains("and 9990 more")),
+        "{m:?}"
+    );
+}
+
 #[test]
 fn redteam_the_draft_reads_and_cost_are_reported_per_rule() {
     let ir = compile_json(rule_policy("steps.exists(s, s.deploy)")).unwrap();

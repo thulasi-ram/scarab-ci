@@ -17,7 +17,8 @@ use crate::policy::{glob_matches, pattern_matches, sha256_hex, Checkpoint, Effec
 use crate::run_create::{PluginGate, TriggerKind};
 use crate::store::StoredPolicy;
 
-/// The most messages one typed predicate reports; the rest are counted.
+/// The most messages one typed predicate, or the built-in plugin default,
+/// reports; the rest are counted.
 pub const MAX_TYPED_MESSAGES: usize = 10;
 
 /// What a Policy's `match` is evaluated against.
@@ -489,6 +490,11 @@ fn plugin_default(
                 })
                 .collect();
             messages.dedup();
+            if messages.len() > MAX_TYPED_MESSAGES {
+                let more = messages.len() - MAX_TYPED_MESSAGES;
+                messages.truncate(MAX_TYPED_MESSAGES);
+                messages.push(format!("…and {more} more from unlisted plugins."));
+            }
             if messages.is_empty() {
                 PolicyOutcome::Passed
             } else {
