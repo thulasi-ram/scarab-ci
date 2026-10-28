@@ -192,33 +192,28 @@ steps:
     # ...merges the image change into the gitops repository
   - id: live
     needs: [bump]
-    image: quay.io/argoproj/argocd:v2.13.0
+    image: registry.example.com/ci/argocd-jq:v2.13.0   # argocd CLI plus jq
     secrets: [ARGOCD_AUTH_TOKEN]
     env:
-      - [ARGOCD_SERVER, argocd.example.com]
       - [APP, payments-api]
       - [IMAGE, "${{ outputs.bump.image }}"]
     timeout: 1800
-    command:
-      - sh
-      - -c
-      - |
-        set -eu
-        # 1. Wait until Argo has rendered our change. Right after the merge the app is
-        #    often still Synced and Healthy at the previous commit.
-        until argocd app manifests "$APP" --source git | grep -qF "$IMAGE"; do
-          argocd app get "$APP" --refresh >/dev/null; sleep 10
-        done
-        # 2. Wait for the sync to finish and the app to be healthy at that revision.
-        argocd app wait "$APP" --sync --health --operation --timeout 1700
+    command: [sh, -c, "..."]      # the script on the docs page below
 ```
 
 The Step's exit code is the outcome, its log holds Argo's messages, and its `timeout`
-bounds the wait. The documented recipe (docs site, "Deploying with Argo CD") covers the
-two points this example shows and where plain `argocd app wait` goes wrong: check that
-the target contains your image before trusting Synced and Healthy, because in a shared
-gitops repository Argo can be Synced and Healthy at an earlier commit; and let the wait
-fail when Argo's sync operation fails, rather than waiting out the timeout.
+bounds the wait. The script is on the docs site page "Deploying with Argo CD"
+(`ui/scarab-docs-ui/src/content/docs/usage/deploying-with-argo-cd.mdx`). It handles two
+cases a plain `argocd app wait` gets wrong:
+
+- **An earlier commit can look finished.** Right after the merge, Argo is often still
+  Synced and Healthy at the previous commit. The script first waits until the
+  Application's target manifests contain `IMAGE`.
+- **A failed sync never ends the wait.** `argocd app wait --sync --health --operation`
+  (v2.13.0) waits for the sync operation to finish but does not check whether it
+  succeeded; a failed sync leaves the app OutOfSync, and the wait runs to its timeout.
+  The script reads `operationState` and fails as soon as the sync of the current target
+  ends `Failed` or `Error`, or the app is Synced but Degraded.
 
 `helm upgrade --wait` and `kubectl rollout status` need no separate wait Step: the
 deploy Step itself blocks until the rollout finishes.
