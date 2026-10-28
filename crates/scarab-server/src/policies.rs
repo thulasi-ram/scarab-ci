@@ -1282,17 +1282,26 @@ async fn pipeline_input(
     Ok((input, ctx, plugin_gates))
 }
 
-/// A supplied or recorded input with a string over its cap is a 400: the
-/// evaluator would refuse to bind it, and no admission records one.
-fn check_input_strings(input: &Value, schema_version: u32) -> Result<(), ApiError> {
+/// A supplied or recorded input with a string or a list over its cap is a
+/// 400: the evaluator would refuse to bind it, no admission records one, and
+/// the plugin default, which reads the gates without binding them, would
+/// walk an uncapped list whole.
+fn check_input_caps(input: &Value, schema_version: u32) -> Result<(), ApiError> {
+    use scarab_policy::schema::OverCap;
     let Some(schema) = scarab_policy::ir::schema_for(Checkpoint::RunCreate, schema_version) else {
         return Ok(());
     };
-    scarab_policy::schema::check_string_lengths(&schema, input).map_err(|e| {
-        ApiError::BadRequest(format!(
-            "the input's `{}` is {} bytes; a run.create input string is at most {} bytes",
-            e.path, e.len, e.max
-        ))
+    scarab_policy::schema::check_caps(&schema, input).map_err(|e| {
+        ApiError::BadRequest(match e {
+            OverCap::String(e) => format!(
+                "the input's `{}` is {} bytes; a run.create input string is at most {} bytes",
+                e.path, e.len, e.max
+            ),
+            OverCap::List(e) => format!(
+                "the input's `{}` has {} items; a run.create input holds at most {} there",
+                e.path, e.len, e.cap
+            ),
+        })
     })
 }
 
@@ -1341,7 +1350,8 @@ fn reads_of(policies: &[StoredPolicy]) -> Vec<PolicyReadsDto> {
 /// (the org's and the input's Project's effective Policies, as admission
 /// consults them). Input: `input`, `decision_id` (its recorded input and
 /// schema version), or `pipeline` (compiled here with `libs`; no forge
-/// read). A supplied or recorded input with a string over its cap is a 400.
+/// read). A supplied or recorded input with a string or a list over its cap
+/// is a 400.
 /// A Pipeline whose Run is over an input cap is answered as admission
 /// decides it: each matched Policy is an error, which denies when the Policy
 /// is enforced.
@@ -1357,7 +1367,7 @@ fn reads_of(policies: &[StoredPolicy]) -> Vec<PolicyReadsDto> {
     summary = "Evaluate run.create Policies without enforcing or recording (ADR-0075 §9)",
     responses(
         (status = 200, body = PolicyTestResponse),
-        (status = 400, description = "not one input form, a draft that does not compile, a Pipeline that does not compile, a Run admission refuses before its Policies, an input that cannot be matched, or a supplied input with a string over its cap"),
+        (status = 400, description = "not one input form, a draft that does not compile, a Pipeline that does not compile, a Run admission refuses before its Policies, an input that cannot be matched, or a supplied input with a string or a list over its cap"),
         (status = 403, description = "no Read on the org, or a draft `policy` without Administer on the org"),
         (status = 404, description = "no such Policy or decision in this org, or policies not configured")
     )
@@ -1395,7 +1405,7 @@ pub(crate) async fn policy_test(
     // The input (an `Err` when a Pipeline's could not be built), its schema
     // version, what `match` sees, and the Pipeline's plugin gates.
     let (input, schema_version, ctx, plugin_gates) = if let Some(input) = body.input {
-        check_input_strings(&input, run_create::SCHEMA_VERSION)?;
+        check_input_caps(&input, run_create::SCHEMA_VERSION)?;
         let ctx = match_context_of(&input)?;
         (Ok(input), run_create::SCHEMA_VERSION, ctx, None)
     } else if let Some(id) = body.decision_id {
@@ -1416,7 +1426,7 @@ pub(crate) async fn policy_test(
                 "decision `{id}` recorded no input (its Run did not fit an input list cap)"
             )));
         }
-        check_input_strings(&record.decision.input, record.decision.schema_version)?;
+        check_input_caps(&record.decision.input, record.decision.schema_version)?;
         let ctx = match_context_of(&record.decision.input)?;
         let version = record.decision.schema_version;
         (Ok(record.decision.input), version, ctx, None)

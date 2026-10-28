@@ -342,6 +342,25 @@ pub struct StringTooLong {
     pub max: usize,
 }
 
+/// A list of an input with more items than its type's cap.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("`{path}` has {len} items, more than the {cap} a Policy input list may hold")]
+pub struct ListTooLong {
+    /// Where the list is, e.g. `gates` or `steps[3].origin`.
+    pub path: String,
+    pub len: usize,
+    pub cap: u64,
+}
+
+/// A string or a list of an input over its cap.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum OverCap {
+    #[error(transparent)]
+    String(#[from] StringTooLong),
+    #[error(transparent)]
+    List(#[from] ListTooLong),
+}
+
 /// The first string of `input` longer than its field allows, walking the
 /// input as `schema` declares it. A value of the wrong type is left to
 /// binding to report; only lengths are checked here, in time linear in the
@@ -350,9 +369,33 @@ pub fn check_string_lengths(
     schema: &Schema,
     input: &serde_json::Value,
 ) -> Result<(), StringTooLong> {
+    match walk_input(schema, input, false) {
+        Ok(()) => Ok(()),
+        Err(OverCap::String(e)) => Err(e),
+        Err(OverCap::List(_)) => unreachable!("list caps are not checked here"),
+    }
+}
+
+/// The first string or list of `input` over its cap: what
+/// [`check_string_lengths`] checks, and every list against its type's cap
+/// (checked before its items are walked). Binding refuses both, but an input
+/// that is read without binding it (the built-in plugin default reads the
+/// gates directly) is held to the caps by this.
+pub fn check_caps(schema: &Schema, input: &serde_json::Value) -> Result<(), OverCap> {
+    walk_input(schema, input, true)
+}
+
+fn walk_input(schema: &Schema, input: &serde_json::Value, lists: bool) -> Result<(), OverCap> {
     for var in &schema.variables {
         if let Some(v) = input.get(&var.name) {
-            walk_strings(schema, &var.ty, var.max_len, v, &mut var.name.clone())?;
+            walk_strings(
+                schema,
+                &var.ty,
+                var.max_len,
+                v,
+                &mut var.name.clone(),
+                lists,
+            )?;
         }
     }
     Ok(())
@@ -364,19 +407,29 @@ fn walk_strings(
     max_len: usize,
     v: &serde_json::Value,
     path: &mut String,
-) -> Result<(), StringTooLong> {
+    lists: bool,
+) -> Result<(), OverCap> {
     use serde_json::Value as J;
     match (ty, v) {
         (_, J::String(s)) if s.len() > max_len => Err(StringTooLong {
             path: path.clone(),
             len: s.len(),
             max: max_len,
-        }),
+        }
+        .into()),
+        (Type::List { cap, .. }, J::Array(items)) if lists && items.len() as u64 > *cap => {
+            Err(ListTooLong {
+                path: path.clone(),
+                len: items.len(),
+                cap: *cap,
+            }
+            .into())
+        }
         (Type::List { elem, .. }, J::Array(items)) => {
             for (i, item) in items.iter().enumerate() {
                 let at = path.len();
                 path.push_str(&format!("[{i}]"));
-                walk_strings(schema, elem, max_len, item, path)?;
+                walk_strings(schema, elem, max_len, item, path, lists)?;
                 path.truncate(at);
             }
             Ok(())
@@ -387,7 +440,7 @@ fn walk_strings(
                     let at = path.len();
                     path.push('.');
                     path.push_str(&field.name);
-                    walk_strings(schema, &field.ty, field.max_len, fv, path)?;
+                    walk_strings(schema, &field.ty, field.max_len, fv, path, lists)?;
                     path.truncate(at);
                 }
             }

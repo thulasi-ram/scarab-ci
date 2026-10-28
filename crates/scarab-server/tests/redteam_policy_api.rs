@@ -764,6 +764,53 @@ async fn redteam_api_policy_test_refuses_an_input_string_over_its_cap() {
     assert_eq!(st, StatusCode::OK, "{b}");
 }
 
+/// A supplied input with a list over its cap is a 400 naming the list and
+/// the cap, as a string over its cap is: the plugin default reads the
+/// input's gates and origins directly, so an uncapped list would be walked
+/// whole. One at the caps is evaluated.
+#[tokio::test]
+async fn redteam_api_policy_test_refuses_an_input_list_over_its_cap() {
+    let (h, _) = with_policies();
+    let (s, _) = admin(&h).await;
+    create(&h, &s, "/v1/orgs/acme/policies", audit_policy("watch")).await;
+    let plugin = |i: usize| json!({ "kind": "plugin", "name": format!("p{i}"), "content_hash": "ab".repeat(32) });
+    let gate = |i: usize, origins: usize| json!({ "id": format!("g{i}"), "origin": (0..origins).map(plugin).collect::<Vec<_>>(), "dependents": [] });
+    let post = |input: Value| {
+        let (h, s) = (&h, &s);
+        async move {
+            h.cookie(
+                "POST",
+                "/v1/orgs/acme/policy-test",
+                Some(json!({ "input": input })),
+                s,
+            )
+            .await
+        }
+    };
+
+    let mut input = draft_input();
+    input["gates"] = json!([gate(0, 10_000)]);
+    let (st, b) = post(input.clone()).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+    assert!(
+        b.to_string().contains("`gates[0].origin` has 10000 items")
+            && b.to_string().contains("at most 8"),
+        "{b}"
+    );
+
+    input["gates"] = json!((0..33).map(|i| gate(i, 0)).collect::<Vec<_>>());
+    let (st, b) = post(input.clone()).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+    assert!(
+        b.to_string().contains("`gates` has 33 items") && b.to_string().contains("at most 32"),
+        "{b}"
+    );
+
+    input["gates"] = json!((0..32).map(|i| gate(i, 8)).collect::<Vec<_>>());
+    let (st, b) = post(input).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+}
+
 /// A `libs` map of 2,000 unused libraries (~1.5 MB) is compiled away
 /// quickly; a 9-deep invoke chain is a 400.
 #[tokio::test]
