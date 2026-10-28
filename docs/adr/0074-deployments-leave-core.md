@@ -272,6 +272,10 @@ group, is later work if a Pipeline needs it.
 
 ### 7. The plugin system after this
 
+- **CD knowledge lives in CD plugins.** `scarab-plugin-argocd` holds everything that is
+  specific to Argo CD: reading an Application, deciding live or failed, and any future
+  Argo action. Support for another CD tool is another plugin next to it. Core keeps no
+  CD concept.
 - `report_deployments` is removed from the PluginCapability vocabulary.
   `subscribe_events` covers Run events only.
 - `offer_actions`, `plugin_action` and Environment-scoped PluginConnections move from
@@ -305,6 +309,11 @@ group, is later work if a Pipeline needs it.
 
 ## Alternatives considered
 
+- **A separate CD product (`scarab-cd`) that holds the record.** Rejected. It builds the
+  CD tool this ADR keeps Scarab out of, in another repository, and its gate verdicts
+  would make it a second trusted system in the Run path. The deleted code is kept at the
+  tag `archive/deployment-record` (`ebafe41`, the last main commit with the record) in
+  case a CD product is ever justified.
 - **Keep the record and narrow the roadmap** (a non-goal against driving deploys, the
   board moved under Environments). Rejected by the owner: holding a record of what is
   live is the CD scope in question.
