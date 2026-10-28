@@ -8,9 +8,9 @@
   [0071](0071-org-level-environments.md) (org Environments, tighten-only overlays),
   [0073](0073-step-up-confirmation.md) (step-up, loosening rules)
 - **Relates:** [0039](0039-privileged-images.md) (grants), [0055](0055-placement-profiles.md)
-  (`k8s_overlay`), [0038](0038-invoke-and-local-reuse.md) (`invoke`),
+  (`k8s_overlay`, placement), [0038](0038-invoke-and-local-reuse.md) (`invoke`),
   [0074](0074-deployments-leave-core.md) (`deploy: true`), [0049](0049-identity-and-access.md)
-  (RBAC)
+  (RBAC), [0056](0056-run-takes-and-attempt-grain-evidence.md) (Takes, Attempts)
 
 ## Context
 
@@ -19,18 +19,24 @@ Scarab's governance rules are written as code, one feature at a time:
 - Run admission against an Environment: eligibility, allowed refs, approvers
   (`admit_and_create_run`, `crates/scarab-server/src/lib.rs`; `EffectiveProtection`,
   `crates/scarab-project/src/environment_governance.rs`).
-- Step privileges: grants against a per-Project digest whitelist (`admit_step_grants`,
-  `admit_grants_against_whitelist`) and the `k8s_overlay` permission (`admit_k8s_overlay`).
-- Fork pull requests: no secrets, OIDC subject `env=none` (`fork_policy`).
-- Gates: who may approve, release or reject (`approve_gate`, `gate_release_governance`).
+- Step privileges: grants against a per-Project digest whitelist and the `k8s_overlay`
+  permission, checked for every Step at Run creation (`admit_step_grants`,
+  `admit_k8s_overlay`, `lib.rs:5545-5578`).
+- Re-admission at each launch: the Run's Environment rules are checked again before a
+  Step's Pod starts (`ensure_still_admitted`, `crates/scarab-server/src/secret_executor.rs:88-118`).
+- Gates: who may approve, release or reject; allowed refs re-checked when a gate releases
+  (`lib.rs:7801`); a step-up to approve where the Environment names approvers
+  (`lib.rs:7711-7735`); `gate_release_governance`.
+- Fork pull requests: no secrets, OIDC subject `env=none` (`fork_policy`), no build push
+  (`lib.rs:5604`), a read-only clone token (`lib.rs:5537`).
 - Settings changes that loosen governance need a step-up (`crates/scarab-server/src/step_up/`).
 
 Each rule has its own data model, its own UI and its own error text. None can be tried
-before it is enforced, none can be scoped to "these repositories only" unless the feature
+before it is enforced, none can be scoped to particular repositories unless the feature
 added that by hand, and an org cannot add a rule Scarab did not anticipate. The next
 features need more of the same: which libraries and plugins a repository may `invoke`,
-per-repository allow and block lists at the org level, and requirements such as "a
-production deploy that changes a migration needs a second approval".
+per-repository allows and blocks at the org level, and requirements such as "a production
+deploy that changes a migration needs a second approval".
 
 The owner's direction (2026-10-28): one policy engine that covers every governance rule,
 at the org level and on Environments; rules can deny and can also require things; typed
@@ -43,7 +49,7 @@ Two facts shaped the design:
   rules, a message on denial, an audit mode.
 - **The Rust CEL crate has no type checker.** Scarab uses `cel-interpreter` 0.10. Its
   successor, `cel` 0.15 (github.com/cel-rust/cel-rust), adds typed declarations (`Env`,
-  `FunctionDecl`, `TypeRegistry`) but its conformance runner states that type checking is
+  `FunctionDecl`, `TypeRegistry`), but its conformance runner states that type checking is
   not available. `cel-cxx` binds Google's cel-cpp, which has a checker, but brings a C++
   and protobuf build into the control plane; the owner rejected it.
 
@@ -59,32 +65,48 @@ CEL rules (YAML, API)    ─────┘    (typed)       at a PolicyCheckpoi
 
 This mirrors Pipelines, where YAML compiles to a typed IR (ADR-0009). Both frontends
 compile to the same **Policy IR**, and one evaluator runs it. Typed settings compile to
-typed predicates, not to CEL text, so they stay fast, explainable and editable in a form.
-CEL covers what a form cannot express.
+typed predicates, not to CEL text, so a form can still show and edit them. CEL covers
+what a form cannot express.
 
-Every governance rule in the Context list moves into the engine (§9). RBAC stays where it
-is: a role decides whether a Principal may call an API at all, and policy decides what
-that call may do (§8).
+Every governance rule in the Context list moves into the engine, except the
+PolicyInvariants (§6), which stay in code. RBAC stays where it is (§8).
 
 ### 2. PolicyCheckpoints: fixed places with typed inputs
 
 A **PolicyCheckpoint** is a place where Scarab consults the engine. The set is closed and
 grows only with a Scarab release. Each checkpoint publishes a versioned, typed input
-schema:
+schema, generated from the Rust types that build the input, so the schema cannot drift
+from what is passed. Adding a field is compatible; removing or retyping one bumps the
+schema version.
 
 | PolicyCheckpoint | When | Input (abridged) |
 |---|---|---|
-| `run.create` | Run creation, before any Step row | `org`, `project`, `trigger` (kind, ref, sha, fork, actor), `pipeline` (name, `environment`, `deploy`, step summaries), `principal` |
-| `invoke.resolve` | compile, per `invoke` | `invoke.target` (kind: local, library, plugin; name; content hash), `project`, `environment` |
-| `step.admit` | a Step's promotion to Ready | `step` (image, digest, grants, `k8s_overlay`, secrets, placement, `deploy`), `run`, `environment` |
-| `gate.resolve` | approve, reject, release | `gate`, `principal`, `approvals` so far, `run` |
-| `settings.change` | any governance setting, secret, policy, plugin or library change | `action`, `before`, `after`, `principal`, `scope` |
+| `run.create` | Run creation, before any Step row | `org`, `project`, `trigger` (kind, optional symbolic `ref`, `sha`, `fork`, actor), `pipeline` (name, `environment`, `deploy`), `steps` (every Step's static `step.admit` input), `principal`, `time` |
+| `invoke.resolve` | compile, once per `invoke` | `invoke.target` (kind: local, library or plugin; name; content hash), `project`, `environment`, `time` |
+| `step.admit` | every launch of an Attempt (§3) | `step` (image, digest, grants, `k8s_overlay`, secrets, placement, `deploy`, `origin`: the invoke kind, name and content hash it was inlined from), `run`, `environment`, `time` |
+| `gate.resolve` | approve, reject, release | `gate`, optional `principal` (an external release has none), `approvals` in the current wait, `run`, `time` |
+| `settings.change` | any governance setting, secret, policy, plugin or library change | `action`, `before`, `after`, `principal`, `scope`, `time` |
 
-The input schemas are generated from the Rust types that build them, so a checkpoint's
-schema cannot drift from what it passes. They are a public contract: adding a field is
-compatible, removing or retyping one is a breaking change with a schema version bump.
+`time` is part of the input and is recorded with the decision, so a time-window rule
+decides the same way on replay.
 
-### 3. A Policy
+### 3. `step.admit` runs once per Attempt, in the claiming commit
+
+`step.admit` replaces `ensure_still_admitted`. It is decided once per Attempt, including
+automatic retries, which go from Running to Ready without passing promotion
+(`rearm_step`, `crates/scarab-engine/src/scheduler.rs:4759`). The PolicyDecision is
+written as an event in the same commit that claims the Step and records the Attempt,
+keyed by *(run, step, attempt)*. A redelivered launch reads the recorded decision and
+never evaluates again, so a crash between two commits cannot produce a second decision
+under a newer policy. If the policy store cannot be read, the Step stays where it is for
+that tick; it is never admitted without a decision.
+
+`run.create` also evaluates every Step's static `step.admit` input as a preflight. A grant
+or `k8s_overlay` that would be denied refuses the whole Run before any row exists, as
+today (`lib.rs:5545-5578`). The launch-time check still runs, so a policy tightened after
+Run creation applies to Steps not yet launched.
+
+### 4. A Policy
 
 ```yaml
 kind: policy
@@ -92,6 +114,7 @@ name: payments-prod-libraries
 checkpoint: invoke.resolve
 match:                                  # typed selector, evaluated before any rule
   projects: ["payments-*"]
+  except_projects: [payments-sandbox]
   environments: [production]
 mode: enforce                           # or `audit`
 rules:
@@ -100,141 +123,160 @@ rules:
       !(invoke.target.name.startsWith("scarab/") ||
         invoke.target.name in ["acme/deploy-helm"])
     effect: deny
-    message: "${invoke.target.name} is not approved for payments in production"
+    message: "This library is not approved for payments in production."
+    message_expr: '"not approved: " + invoke.target.name'   # optional, type-checked as a string
   - when: invoke.target.kind == "plugin"
     effect: require_approval
-    approvers: { group: platform, count: 1 }
+    approvers: { principals: ["user:alice", "user:bob"], count: 1 }
 ```
 
-- `match` is typed (glob lists over projects, environments, trigger kinds) and cheap, so
-  most policies never evaluate CEL.
-- A rule is `when` (a CEL boolean over the checkpoint's input), an effect, and a message.
+- `match` is typed (glob lists over projects and environments, with typed exceptions,
+  and trigger kinds). Most policies never reach CEL.
+- A rule is `when` (a CEL boolean over the checkpoint's input), an effect, a static
+  `message` and an optional `message_expr` (CEL, checked to return a string). There is no
+  separate templating syntax.
 - A Policy names one checkpoint. A rule that reads a field its checkpoint does not have
-  is rejected when the Policy is saved (§5).
+  is rejected when the Policy is saved (§6).
 
-### 4. PolicyEffects: deny and require
+### 5. PolicyEffects: deny and require
 
-The effects are a closed list:
+| PolicyEffect | Meaning |
+|---|---|
+| `deny` | refuse, with the message |
+| `require_approval` | named Principals must approve (`principals`, `count`) |
+| `require_step_up` | the acting human confirms with a passkey (ADR-0073) |
+| `require_reason` | the actor gives a reason |
 
-| PolicyEffect | Meaning | Valid at |
-|---|---|---|
-| `deny` | refuse, with the message | every checkpoint |
-| `require_approval` | add an approval requirement (who, how many) | `run.create`, `step.admit` (holds the Step), `invoke.resolve` |
-| `require_step_up` | the acting human must confirm with a passkey (ADR-0073) | `settings.change`, `gate.resolve` |
-| `require_reason` | the actor must give a reason | `run.create` (manual), `gate.resolve`, `settings.change` |
+There is no `allow` effect: a decision is allowed when nothing denies it. Allow lists are
+written as "deny unless listed", and per-repository allows as exceptions in the org's own
+Policy (§7). Policies never change a Pipeline or a Step; there is no mutating effect.
 
-There is no `allow` effect: a decision is allowed when nothing denies it. An allow list
-is written as "deny unless listed". Policies never change a Pipeline or a Step; there is
-no mutating effect.
+Where a `require_approval` takes effect depends on the checkpoint:
 
-A `require_approval` at `step.admit` holds the Step behind a gate that the engine adds
-for that Step, with the policy's approvers and message. It uses the gate machinery that
-already exists: its own clock, holding only dependents, expiry, fail with a reason. The
-Run page shows which policy added it.
+| Checkpoint | A `require_approval` becomes |
+|---|---|
+| `run.create`, `invoke.resolve` | a **gate node in the Run's IR**, added when the Run is persisted: before the Run's root Steps (`run.create`), or before the inlined library's or plugin's Steps (`invoke.resolve`). It appears in the DAG, has a stable Step id, and uses the existing gate machinery: its own clock, holding only dependents, expiry from the Policy. |
+| `step.admit` | a **PolicyApprovalHold** on that Step: the Step does not launch until the named Principals approve. It has its own clock and the Policy's expiry, counts approvals per hold, appears as a badge on the Step's node, and is decided per Attempt. No node is added mid-Run. |
+| `gate.resolve` | an addition to that gate's **release quorum**. No gate is added. |
 
-### 5. CEL is type-checked, over a subset
+One approval counts toward every requirement that names its Principal. Groups and roles
+as approvers wait for a group concept in identity (ADR-0049 has none today).
+
+### 6. CEL is type-checked, over a subset
 
 Scarab moves from `cel-interpreter` 0.10 to `cel` 0.15 for parsing, the AST, declarations
 and evaluation, and adds a **type-checking pass** over the 0.15 AST:
 
 - Each checkpoint's schema is declared into the CEL `Env` as typed variables and struct
   types.
-- The checker accepts a subset: field access, literals, comparisons, `&&`, `||`, `!`,
-  `?:`, `in` on lists and maps, string functions (`startsWith`, `endsWith`, `contains`,
-  `matches`), `size`, and the `exists`, `all` and `exists_one` macros over typed lists.
-  Anything else is rejected with "not supported in policies".
-- An expression that type-checks cannot raise a type error at evaluation. Evaluation
-  errors that remain (an absent optional field) deny, with the error in the decision
-  (fail-closed).
-- Expressions have a size and evaluation-cost limit.
+- The subset: field access, `has()`, literals, comparisons, `&&`, `||`, `!`, `?:`, `in` on
+  lists and maps, string functions (`startsWith`, `endsWith`, `contains`, `matches`),
+  `size`, timestamp and duration comparison, and the `exists`, `all` and `exists_one`
+  macros over typed lists. Anything else is rejected with "not supported in policies".
+- `matches` takes a literal pattern only; it is compiled when the Policy is saved.
+- The checker computes a **static cost bound** from macro nesting and the list-size caps
+  each schema declares, and rejects a rule above the limit. `cel` 0.15 has parse limits
+  but no runtime cost tracking.
+- A rule that type-checks cannot raise a type error. It can still fail at evaluation on
+  integer overflow, an index out of range or a missing optional field read without
+  `has()`. Any evaluation error denies, with the error in the decision (fail-closed). The
+  editor warns on optional fields read without `has()`, since a deny rule on `trigger.ref`
+  would otherwise deny every Run that has no ref.
 
-Pipelines' `when:` and `${{ }}` move to `cel` 0.15 too; they stay unchecked until the
+Pipelines' `when:` and `${{ }}` move to `cel` 0.15 too, and stay unchecked until the
 checker covers their contexts.
 
-The checker is offered upstream to cel-rust, whose conformance suite already has
-`check_only` cases waiting for one. If upstream ships its own, Scarab switches to it.
+The checker is offered upstream to cel-rust, whose conformance suite has `check_only`
+cases waiting for one. If upstream ships its own, Scarab switches to it.
 
-**A spike comes first** (§10): the upgrade, the checker for one checkpoint, a dozen real
-policies, and the cel-spec `check_only` cases inside the subset.
-
-### 6. Layers, combination and defaults
+### 7. Layers, combination, invariants and defaults
 
 Policies attach at three levels:
 
 | Level | Written by | May match |
 |---|---|---|
-| Org | org admin | any project, environment |
-| Environment | that Environment's admins | Runs governed by it |
+| Org | org admin | any Project, Environment |
+| Environment | that Environment's admins | Runs it governs |
 | Project | that Project's admins | its own Runs |
 
-- **Combination.** Every Policy whose checkpoint and `match` fit is evaluated. Any
-  `deny` wins, and every deny message is reported. Requirements add up: two
-  `require_approval` effects need both. No layer can remove what another layer adds, so
-  a lower layer can only tighten, as Environment overlays do today (ADR-0071 §3).
-- **PolicyInvariants** are rules in code that no Policy can turn off: the hardened Step
-  baseline (ADR-0039), fork pull requests receiving no secrets and an `env=none` OIDC
-  subject, and that a policy change which loosens governance needs a step-up. The
-  engine runs after them.
+- **Combination.** Every Policy whose checkpoint and `match` fit is evaluated. Any `deny`
+  wins, and every deny message is reported. Requirements add up. No layer can remove
+  what another adds, so a lower layer can only tighten, as Environment overlays do today
+  (ADR-0071 §3).
+- **Per-repository allows** are exceptions inside the Policy that denies:
+  `except_projects` in `match`, typed. A Project cannot exempt itself from an org Policy.
+- **PolicyInvariants** are rules in code that no Policy can turn off, and the engine runs
+  after them:
+  - the hardened Step baseline (ADR-0039);
+  - fork pull requests: no secrets, an `env=none` OIDC subject, no build push, a
+    read-only clone token;
+  - step-up for any `settings.change` that loosens governance, including deleting or
+    editing a Policy (§10) and a default-Policy upgrade that loosens.
 - **Default Policies** ship with Scarab and are installed into every org, as first-party
-  libraries are: editable and removable by an org admin, upgraded independently of the
-  server. Today's built-in governance defaults become default Policies (§9).
-
-### 7. Decisions are recorded, and use the current policies
-
-- Each consultation produces a **PolicyDecision**: the checkpoint, a hash of the input,
-  the policy set version, every matching Policy, its outcome, messages and requirements.
-  Decisions for a Run are stored with the Run and shown on the Run page ("why was this
-  denied"). Decisions for `settings.change` go to the org security log (ADR-0073).
-- A checkpoint uses the policy set **current when it is consulted**. A Policy added or
-  tightened mid-Run applies to the Steps not yet admitted. A Rerun is consulted again.
-  This is what lets a yanked library or a new block take effect at once.
-- `audit` mode evaluates and records "would deny" or "would require" without enforcing,
-  so a Policy can run against real traffic first.
-- A policy test API evaluates a Policy against a stored input (a past decision) or a
-  supplied one, without enforcing.
+  libraries are: editable and removable by an org admin, and upgraded independently of
+  the server. An upgrade is a `settings.change`.
 
 ### 8. RBAC stays separate
 
 A role (ADR-0049) decides whether a Principal may call an API, and is checked first.
-Policy then decides what that call may do: a policy can deny or require on top of a role,
+Policy then decides what that call may do: a Policy can deny or require on top of a role,
 and never grants what the role does not.
 
-### 9. Typed settings compile into the same IR
+### 9. Decisions are recorded, and use the current policies
 
-The existing settings keep their forms and their API, and compile to Policy IR
-predicates instead of running their own code:
-
-| Today | Becomes |
-|---|---|
-| EnvironmentProjectEligibility | `run.create`: deny unless the project is eligible |
-| allowed refs (baseline and overlay) | `run.create`: deny unless the ref matches every layer |
-| approvers, `require_reason` | `gate.resolve` and `run.create` requirements |
-| EnvironmentProjectPrivilegeGrant (digests, `k8s_overlay`) | `step.admit`: deny an ungranted grant or overlay |
-| step-up loosening rules (ADR-0073) | `settings.change`: `require_step_up` |
-
-Fork-PR secret lockout stays a PolicyInvariant (§6), not a setting.
+- Each consultation produces a **PolicyDecision**: the checkpoint, the **input itself with
+  its schema version**, the **PolicySetDigest** (a content hash of every Policy evaluated,
+  across the three layers), every matching Policy with its outcome, messages and
+  requirements. A Run's decisions are stored with the Run and shown on the Run page.
+  `settings.change` decisions go to the org security log (ADR-0073).
+- A checkpoint uses the policies current when it is consulted, once (§3). A Policy added
+  or tightened mid-Run applies to Steps not yet launched.
+- A Rerun recompiles nothing: inlined Steps keep their `origin`, so `step.admit` can deny
+  a Step whose library was yanked or blocked after the Run started.
+- `audit` mode evaluates and records "would deny" or "would require" without enforcing.
+- A policy test API evaluates a Policy against a stored PolicyDecision's input or a
+  supplied one, without enforcing.
 
 ### 10. Changing a policy is governed
 
-Saving a Policy is a `settings.change`. Adding a Policy, or moving one from `audit` to
-`enforce`, tightens. Any other change (editing a rule, deleting a Policy, moving to
-`audit`) counts as loosening and needs a step-up: whether an edited CEL rule is looser
-cannot be decided in general, so the check fails closed, as ADR-0073 does.
+Saving a Policy is a `settings.change`:
+
+- Adding a Policy, or moving one from `audit` to `enforce`, tightens: no step-up.
+- Editing a Policy that is in `audit` mode needs no step-up, since it enforces nothing.
+- Any other change (editing an enforced rule, deleting a Policy, moving to `audit`) counts
+  as loosening and needs a step-up. Whether an edited CEL rule is looser cannot be
+  decided in general, so the check fails closed, as ADR-0073 does.
+- A plugin's kill switch tightens and never needs a step-up.
+
+### 11. Typed settings compile into the same IR
+
+The existing settings keep their forms and their API, and compile to Policy IR predicates
+instead of running their own code. Each move must make the same decisions:
+
+| Today | Becomes |
+|---|---|
+| EnvironmentProjectEligibility (globs) | `run.create`: deny unless the Project is eligible |
+| allowed refs, baseline and each overlay | one `run.create` deny per non-empty layer, unless the symbolic ref matches it; together these keep today's AND across layers (`AllowedRefConstraint`). A Run with no ref is denied where any layer restricts refs. The same check at `gate.resolve` keeps the release-time re-check. |
+| approvers | a `gate.resolve` release quorum on the Environment's existing manual gates: every named Principal, counted per current wait. Adds no gate. |
+| step-up to approve where approvers are named | `gate.resolve`: `require_step_up` |
+| `require_reason` | `run.create` and `gate.resolve`: `require_reason` |
+| EnvironmentProjectPrivilegeGrant (digests, `k8s_overlay`) | `step.admit`, with the `run.create` preflight |
+| `wait_timer_s` | not enforced today (`environment_governance.rs:48`); stays unmapped until it is |
 
 ## Consequences
 
-- One place decides, with one log, one "why", one audit mode and one test API, for every
-  governance rule, including the ones orgs write themselves.
-- Per-repository allow and block lists, library and plugin approval, and requirements
-  such as extra approvals need no feature-specific code.
+- One place decides every governance rule, including the ones orgs write themselves, with
+  one log, one "why", one audit mode and one test API.
+- Per-repository allows and blocks, library and plugin approval, and extra approvals need
+  no feature-specific code.
 - The checkpoint input schemas become a public contract.
 - Scarab owns a CEL type checker for a subset until upstream has one.
-- Moving every existing rule into the engine is a large migration. Each rule moves with
-  a test showing the same decisions before and after, and runs in `audit` beside the
-  old code before the old code is deleted.
-- Evaluating at each checkpoint with current policies means a Run can be admitted under
-  one policy set and have a later Step denied under another. The decision record shows
-  which.
+- Moving every existing rule into the engine is a large migration. Each rule moves with a
+  test showing the same decisions, and runs in `audit` beside the old code before the old
+  code is deleted.
+- A Run admitted under one policy set can have a later Step denied under another. The
+  decision record shows which, with its PolicySetDigest.
+- Decisions store their inputs, which grows the Run's record.
 
 ## Alternatives considered
 
@@ -246,32 +288,40 @@ cannot be decided in general, so the check fails closed, as ADR-0073 does.
 - **OPA / Rego.** Rejected: a separate engine and language, and Rego is harder to bound.
 - **Untyped CEL** (parse-only checks, as Pipelines have today). Rejected: a misspelt field
   in a deny rule would deny at runtime, or never match, with nothing at save time.
-- **Typed settings compiled to CEL text.** Rejected: settings lose their fast, explainable
-  form and gain parsing for nothing.
+- **Typed settings compiled to CEL text.** Rejected: settings would lose their form-backed
+  shape and gain parsing for nothing.
 - **Pinning the policy set at Run creation.** Rejected: a yanked library or an urgent block
-  would not apply to Runs already in flight.
-- **An `allow` effect.** Rejected: with deny-wins it is either redundant or an override,
-  and overrides make a policy set hard to reason about.
+  would not apply to Runs in flight.
+- **An `allow` effect, or Project-level exemptions.** Rejected: with deny-wins an allow is
+  either redundant or an override; exceptions belong to whoever wrote the deny.
+- **Gates added mid-Run for `step.admit` requirements.** Rejected: gates are IR nodes with
+  stable ids, read by expiry, reruns and the DAG view; a PolicyApprovalHold on the Step
+  avoids rewriting the graph during a Run.
 
 ## Implementation horizon
 
 1. **Spike:** `cel` 0.15 upgrade (Pipelines' `when:` and interpolation still pass), the
-   subset checker against `invoke.resolve`'s schema, a dozen policies, the cel-spec
-   `check_only` cases in the subset. Decide on the checker from the result.
+   subset checker with `has()`, literal regexes and the static cost bound, against
+   `invoke.resolve`'s schema; a dozen policies; the cel-spec `check_only` cases inside the
+   subset. Decide on the checker from the result.
 2. **Engine:** Policy IR, evaluator, PolicyDecision records, `audit` mode, the policy test
-   API, org and Project layers, `invoke.resolve` and `run.create`. First users: library
-   and plugin allow and block lists.
-3. **Requirements:** `require_approval` (engine-added gates), `require_reason`,
-   `require_step_up`; `step.admit`, `gate.resolve`, `settings.change`; Environment layer.
-4. **Migration** of §9's settings, one at a time, each in `audit` beside the old code
+   API, org and Project layers, `invoke.resolve` and `run.create`. First users: library and
+   plugin allow and block lists.
+3. **Requirements:** gate nodes from `run.create` and `invoke.resolve`, PolicyApprovalHold,
+   `require_reason`, `require_step_up`; `step.admit` in the claiming commit, `gate.resolve`,
+   `settings.change`; the Environment layer.
+4. **Migration** of §11's settings, one at a time, each in `audit` beside the old code
    first.
-5. **UI:** policy editor with the save-time checker's errors, decision view on the Run
-   page, "would deny" view for `audit` policies.
+5. **UI and docs:** policy editor with the checker's errors, the decision view on the Run
+   page, a "would deny" view for `audit` policies; CONTEXT.md terms (Policy,
+   PolicyCheckpoint, PolicyEffect, PolicyDecision, PolicyInvariant, PolicySetDigest,
+   PolicyApprovalHold).
 
 Open:
 
-- Whether Project admins may write CEL policies, or only org and Environment admins.
-- Whether a Policy may span checkpoints (one name, rules at several), or stays one
-  checkpoint per Policy.
+- Whether Project admins may write CEL rules, or only typed ones.
+- Whether a Policy may span checkpoints, or stays one checkpoint per Policy.
 - Whether policies can also live as files in a governance repository and sync in, with
   the UI read-only for them.
+- Whether `require_approval` should support separation of duties (the Run's actor may not
+  approve).
