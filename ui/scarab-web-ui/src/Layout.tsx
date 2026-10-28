@@ -49,10 +49,6 @@ export default function Layout(props: ParentProps) {
             to sit here; they moved into the user menu, which is where
             per-account controls belong and where they stop competing with
             these two for the eye. */}
-        {/* What is live where (ADR-0070) — an in-app route, so a router link. */}
-        <A class="topbar-link" href="/deployments">
-          Deployments
-        </A>
         <a
           class="topbar-link"
           href="https://thulasi-ram.github.io/scarab-ci/"

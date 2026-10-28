@@ -41,10 +41,7 @@ fn installation(org: &str, name: &str, id: &str) -> PluginInstallation {
         image: format!("ghcr.io/acme/argocd@sha256:{}", "a".repeat(64)),
         manifest: PluginManifest {
             plugin: "argocd".into(),
-            capabilities: vec![
-                PluginCapability::ReportDeployments,
-                PluginCapability::UseConnection,
-            ],
+            capabilities: vec![PluginCapability::UseConnection],
             connections: vec![ConnectionSlot {
                 name: "argocd".into(),
                 auth_schemes: vec!["bearer".into()],

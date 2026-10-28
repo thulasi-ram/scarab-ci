@@ -26,8 +26,7 @@ export type DagStep = {
   gate?: string | null;
   /** This step is marked `deploy: true` (ADR-0074 §2) — the step that deploys. */
   deploy?: boolean;
-  /** A gate's verdict, a waiting DeploymentGate's target + Deployment, or a
-   * deploy step's concurrency hold — the line `gateStatus` (gates.ts) derives.
+  /** A gate's verdict — the line `gateStatus` (gates.ts) derives.
    * Shown as the node's meta line in place of the generic one. */
   note?: GateStatus | null;
   /** When the current (running) attempt started, epoch-ms — drives live elapsed. */

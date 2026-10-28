@@ -20,20 +20,13 @@
 pub mod ports;
 pub mod scheduler;
 
-pub use ports::{
-    Clock, Db, DeploymentConcurrencyHold, DeploymentGateDecision, DeploymentGateWait,
-    DeploymentGates, Executor, LogChunks, SnapshotRetention, WorkspaceSnapshots,
-};
+pub use ports::{Clock, Db, Executor, LogChunks, SnapshotRetention, WorkspaceSnapshots};
 pub use scheduler::{
-    cancel_run_request, deployment_gate_wait, deployment_gate_waits_afresh,
-    deployment_request_first_attempt,
-    gate_approvers, pin_run_snapshots, plan_rerun, record_gate_approval,
-    reject_gate, release_gate, wait_began_at,
-    rerun_step, rerun_step_widened, retry_step, retry_step_widened, run_status_post_key,
-    unpin_run_snapshots,
-    ExpiredInput, PlanReason, PlannedStep, RerunError, RerunPlan, Scheduler, SchedulerError,
-    AttemptTeardown, Supervision, TeardownAttempt, TickHealth, CANCEL_ATTEMPT, CANCEL_RUN,
-    LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS,
+    cancel_run_request, gate_approvers, pin_run_snapshots, plan_rerun, record_gate_approval,
+    reject_gate, release_gate, rerun_step, rerun_step_widened, retry_step, retry_step_widened,
+    run_status_post_key, unpin_run_snapshots, wait_began_at, AttemptTeardown, ExpiredInput,
+    PlanReason, PlannedStep, RerunError, RerunPlan, Scheduler, SchedulerError, Supervision,
+    TeardownAttempt, TickHealth, CANCEL_ATTEMPT, CANCEL_RUN, LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS,
     RUN_STATUS_CHANGED, SUPERSEDE_TEARDOWN,
 };
 
@@ -225,6 +218,12 @@ pub enum FailureKind {
     Infra {
         never_started: bool,
     },
+    /// Also decodes the retired `DeploymentRequestIncomplete` (ADR-0074
+    /// removed it with the Deployment record): no Step fails that way any
+    /// more, but an event already in the log must still replay. It reads back
+    /// as `Step` — like it, a verdict on a Step that ran, never auto-retried —
+    /// and the attempt's `failure_detail` keeps the original reason.
+    #[serde(alias = "DeploymentRequestIncomplete")]
     Step,
     Timeout,
     /// The backend lost the execution (vanished Pod, node stopped reporting).
@@ -250,8 +249,8 @@ pub enum FailureKind {
     /// silently reclassify, which is worse than a loud refusal).
     MissingInputs,
     /// A **gate** resolved *failed* (criterion 3 of slice b; ADR-0047 expiry,
-    /// and the DeploymentGate verdict that rides the same path later): nobody
-    /// released it within `gate_expires_after`, or its oracle said no. The
+    /// ADR-0070 §9): nobody released it within `gate_expires_after`, a person
+    /// rejected it, or an external release said `passed: false`. The
     /// reason is on the attempt's `failure_detail` and the `GateResolved`
     /// event. A verdict, not an infra fault: the gate step goes `Failed`, its
     /// dependents are Skipped, and the run settles `Failed` — never
@@ -260,20 +259,6 @@ pub enum FailureKind {
     /// **Forward-only**, like `MissingInputs`: a binary from before this
     /// variant cannot read an attempt row or event that carries it.
     Gate,
-    /// **DeploymentRequest incomplete** (slice b, criterion 1; ADR-0070 §7):
-    /// the Step exited 0, but a DeploymentRequest it declares could not be
-    /// completed from its own results — the version result is missing or not
-    /// a non-empty string, or an evidence result is missing or not a string /
-    /// array of strings. The author's Step did run, so this is not `Config`
-    /// ("refused before it ran"); it is not `Step` either (the command
-    /// succeeded). The Step goes `Failed`, the run settles `Failed` (never
-    /// `DeadLettered`), and it is **never auto-retried**, even with `retry:` —
-    /// the same command writes the same results, and re-running a deploy Step
-    /// that already pushed its change is the double effect `retry:` warns of.
-    /// Nothing is recorded in the Deployment record for it.
-    ///
-    /// **Forward-only**, like `MissingInputs`.
-    DeploymentRequestIncomplete,
 }
 
 // ---------------------------------------------------------------------------
@@ -437,10 +422,6 @@ pub struct GateResolution {
     /// Who decided (a rejecting principal, `external:{step}`); `None` for a
     /// release, a timer or an expiry.
     pub by: Option<String>,
-    /// A DeploymentGate's verdict: the public id of the Deployment it waited
-    /// on (journalled as `GateResolved.deployment`). `None` for every other
-    /// verdict, a human reject of a DeploymentGate included.
-    pub deployment: Option<u64>,
     /// The wait this verdict is for. `Some(a)` (the scheduler): resolve only
     /// while `a` is still the open wait — a superseded or cancelled wait takes
     /// no verdict. `None` (an API release or reject): close whichever wait is
@@ -515,7 +496,7 @@ pub fn gate_resolution_events(
         attempt: attempt.clone(),
         passed: res.passed,
         reason: Some(res.reason.clone()),
-        deployment: res.deployment,
+        deployment: None,
         by: res.by.clone(),
     });
     out
@@ -1030,247 +1011,6 @@ pub struct DeployContext {
     pub locked_out: bool,
 }
 
-/// One DeploymentRequest of a Deploy Run Step, as resolved when the Run was
-/// created (slice b, criterion 1; ADR-0070 §7): the static DeploymentTarget —
-/// its Environment the Run's own, its `${{ inputs.* }}` parts already bound to
-/// the frozen launch parameters — and the names of the Step results the
-/// DeploymentVersion and the evidence are read from when the Step succeeds.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunDeploymentRequest {
-    pub step: StepId,
-    /// Position in the Step's authored `deployment_requests`.
-    pub ordinal: u32,
-    pub org: String,
-    pub environment: String,
-    pub target_source: String,
-    pub target_id: String,
-    /// The declared result holding the DeploymentVersion.
-    pub version_result: String,
-    /// The declared results holding the evidence, in authored order.
-    pub evidence_results: Vec<String>,
-    /// The DeploymentGates in this Run that wait on this request — filled at
-    /// Run creation from each `gate: deployment` step's `deployment:`
-    /// reference. The engine finds a DeploymentGate's request here.
-    pub gate_steps: Vec<StepId>,
-}
-
-/// What [`Db::finish_step_with_deployment_requests`] did, when it did not
-/// conflict.
-///
-/// [`Db::finish_step_with_deployment_requests`]: crate::ports::Db::finish_step_with_deployment_requests
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DeployStepFinish {
-    /// The success transition, the attempt outcome, the events and every
-    /// request landed, in one commit.
-    Recorded,
-    /// **Nothing** landed (git-bug 9e66f2c): re-checked under the Org's
-    /// Deployment counter lock, a request's DeploymentTarget is homed in
-    /// another Environment — another Run, admitted concurrently, recorded it
-    /// first (or its routing moved since admission). A DeploymentTarget
-    /// belongs to exactly one Environment, so this request is never recorded;
-    /// the caller fails the Step. The first such request, in input order.
-    TargetHomedElsewhere(DeploymentTargetHomedElsewhere),
-}
-
-/// A DeploymentRequest whose DeploymentTarget is homed in an Environment other
-/// than the requesting Run's ([`DeployStepFinish::TargetHomedElsewhere`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeploymentTargetHomedElsewhere {
-    /// The requesting Run's Environment.
-    pub environment: String,
-    pub target_source: String,
-    pub target_id: String,
-    /// The Environment the target is homed in.
-    pub home: String,
-}
-
-impl DeploymentTargetHomedElsewhere {
-    /// The Step's failure detail. Worded as a DeploymentRequest that cannot
-    /// be completed — the class the Step fails with
-    /// ([`FailureKind::DeploymentRequestIncomplete`]): the Step ran, nothing
-    /// is recorded, and it is never auto-retried.
-    pub fn reason(&self) -> String {
-        format!(
-            "DeploymentRequest incomplete: DeploymentTarget `{}`/`{}` is homed in Environment \
-             `{}`, not this Run's `{}` (another Run recorded it there first, after this Run was \
-             admitted); a DeploymentTarget belongs to exactly one Environment, so nothing was \
-             recorded for this step",
-            self.target_source, self.target_id, self.home, self.environment
-        )
-    }
-}
-
-/// Complete a succeeding Step's DeploymentRequests from its own `results`
-/// (slice b, criterion 1; plan Q10): each request's DeploymentVersion is its
-/// version result, which must be a **non-empty JSON string** with no
-/// leading or trailing whitespace (never trimmed: a version is opaque); its evidence is
-/// the concatenation of its evidence results, each a JSON string or an array
-/// of strings. Every request is effective at `effective_at` (the start of the
-/// step's first Attempt in its current Take — see
-/// [`deployment_request_first_attempt`]). `at` inside each input is set to
-/// `effective_at` too — the
-/// store ignores it and stamps its own receipt time.
-///
-/// `Err` is the whole failure detail, starting "DeploymentRequest incomplete:"
-/// and naming every problem, so the author fixes them in one round
-/// ([`DeploymentRequestIncomplete::author_reason`]).
-pub fn deployment_inputs(
-    run: &RunId,
-    step: &StepId,
-    requests: &[RunDeploymentRequest],
-    results: &std::collections::BTreeMap<String, serde_json::Value>,
-    effective_at: Timestamp,
-) -> Result<Vec<scarab_deployment::DeploymentInput>, String> {
-    complete_deployment_inputs(run, step, requests, results, effective_at)
-        .map_err(|incomplete| incomplete.author_reason())
-}
-
-/// Why a succeeding Step's DeploymentRequests could not be completed from
-/// its results: every problem, each naming the result and the target it was
-/// for. How it is worded depends on whether the results were lost in
-/// delivery (git-bug `0cb5895`) — which only the backend can say.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeploymentRequestIncomplete {
-    pub problems: Vec<String>,
-}
-
-impl DeploymentRequestIncomplete {
-    /// The backend delivered the results (or has none to deliver): the
-    /// author's step did not write them.
-    pub fn author_reason(&self) -> String {
-        format!(
-            "DeploymentRequest incomplete: {} (the step exited 0, but a DeploymentRequest it \
-             declares is read from these results — write them to /scarab/results/<name>.json)",
-            self.problems.join("; ")
-        )
-    }
-
-    /// The backend failed to deliver the results — `how`, e.g. "the results
-    /// sidecar `scarab-results-egress` exited 1": the step's own output may
-    /// be fine.
-    pub fn undelivered_reason(&self, how: &str) -> String {
-        format!(
-            "DeploymentRequest incomplete: {} — {how}, so this step's results were not \
-             delivered; the step's own output may be fine — retry the step",
-            self.problems.join("; ")
-        )
-    }
-
-    /// Whether the backend delivered the results could not be checked
-    /// (`why`: a backend error, or the execution's unit is already gone):
-    /// neither the author nor the delivery is blamed.
-    pub fn unchecked_reason(&self, why: &str) -> String {
-        format!(
-            "DeploymentRequest incomplete: {} (the step exited 0; whether its results were \
-             delivered could not be checked: {why}. If the step writes them to \
-             /scarab/results/<name>.json, retry the step)",
-            self.problems.join("; ")
-        )
-    }
-}
-
-/// [`deployment_inputs`], its `Err` the problems themselves, so the caller
-/// can word them for what the backend says about delivery.
-pub fn complete_deployment_inputs(
-    run: &RunId,
-    step: &StepId,
-    requests: &[RunDeploymentRequest],
-    results: &std::collections::BTreeMap<String, serde_json::Value>,
-    effective_at: Timestamp,
-) -> Result<Vec<scarab_deployment::DeploymentInput>, DeploymentRequestIncomplete> {
-    use scarab_deployment::{
-        DeploymentInput, DeploymentRequester, DeploymentTarget, DeploymentVersion,
-    };
-    let mut problems: Vec<String> = Vec::new();
-    let mut inputs = Vec::new();
-    for req in requests {
-        let target = format!("`{}`/`{}`", req.target_source, req.target_id);
-        let version = match results.get(&req.version_result) {
-            None => {
-                problems.push(format!(
-                    "result `{}` (the version for {target}) is missing",
-                    req.version_result
-                ));
-                None
-            }
-            // A DeploymentVersion is opaque and never trimmed: `"v1\n"` would
-            // be a Deployment apart from the plugin's `v1` (git-bug 5f03853).
-            Some(serde_json::Value::String(v)) if !v.trim().is_empty() && v.trim() != v => {
-                problems.push(format!(
-                    "result `{}` (the version for {target}): version has leading/trailing \
-                     whitespace ({v:?}); write it exactly, with nothing around it",
-                    req.version_result
-                ));
-                None
-            }
-            Some(serde_json::Value::String(v)) if !v.trim().is_empty() => Some(v.clone()),
-            Some(other) => {
-                problems.push(format!(
-                    "result `{}` (the version for {target}) must be a non-empty string, got {}",
-                    req.version_result,
-                    json_kind(other)
-                ));
-                None
-            }
-        };
-        let mut evidence = Vec::new();
-        for name in &req.evidence_results {
-            match results.get(name) {
-                None => problems.push(format!(
-                    "result `{name}` (evidence for {target}) is missing"
-                )),
-                Some(serde_json::Value::String(e)) => evidence.push(e.clone()),
-                Some(serde_json::Value::Array(items))
-                    if items.iter().all(serde_json::Value::is_string) =>
-                {
-                    evidence.extend(items.iter().filter_map(|i| i.as_str().map(String::from)));
-                }
-                Some(other) => problems.push(format!(
-                    "result `{name}` (evidence for {target}) must be a string or an array of \
-                     strings, got {}",
-                    json_kind(other)
-                )),
-            }
-        }
-        if let Some(version) = version {
-            inputs.push(DeploymentInput::Request {
-                target: DeploymentTarget {
-                    environment: req.environment.clone(),
-                    source: req.target_source.clone(),
-                    id: req.target_id.clone(),
-                },
-                version: DeploymentVersion(version),
-                requester: DeploymentRequester {
-                    run: run.0.clone(),
-                    step: step.0.clone(),
-                },
-                effective_at: effective_at.0,
-                at: effective_at.0,
-                evidence,
-            });
-        }
-    }
-    if problems.is_empty() {
-        Ok(inputs)
-    } else {
-        Err(DeploymentRequestIncomplete { problems })
-    }
-}
-
-/// A JSON value's kind, for a diagnostic.
-fn json_kind(v: &serde_json::Value) -> &'static str {
-    match v {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "a boolean",
-        serde_json::Value::Number(_) => "a number",
-        serde_json::Value::String(s) if s.is_empty() => "an empty string",
-        serde_json::Value::String(s) if s.trim().is_empty() => "a blank string",
-        serde_json::Value::String(_) => "a string",
-        serde_json::Value::Array(_) => "an array",
-        serde_json::Value::Object(_) => "an object",
-    }
-}
-
 /// The discriminated payload carried by an [`EventKind`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventPayload {
@@ -1352,10 +1092,9 @@ pub enum EventPayload {
     ///   [`FailureKind::Gate`].
     /// - `reason` — the human line: why it failed ("not released within
     ///   300s of its needs finishing"), or how it passed.
-    /// - `deployment` — a DeploymentGate's verdict (ADR-0070 §8): the public
-    ///   id (creating seq) of the Deployment it waited on. `None` for every
-    ///   other gate kind and for a human reject; absent on the wire when
-    ///   `None`.
+    /// - `deployment` — retired with the Deployment record (ADR-0074): a
+    ///   DeploymentGate's verdict carried the Deployment it waited on. Kept
+    ///   only so events already in the log decode; nothing writes it.
     /// - `by` — who decided, when a person or system did: the principal who
     ///   rejected the gate (`reject_gate`), or `external:{step}` for an
     ///   external gate failed by its token. `None` for a release, a timer and
@@ -1664,7 +1403,13 @@ pub fn cache_key(project: &str, resolved: &[(String, String)]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(format!("{}:{}\n", project.len(), project));
     for (path, blob) in pairs {
-        hasher.update(format!("{}:{}\n{}:{}\n", path.len(), path, blob.len(), blob));
+        hasher.update(format!(
+            "{}:{}\n{}:{}\n",
+            path.len(),
+            path,
+            blob.len(),
+            blob
+        ));
     }
     let digest = hasher.finalize();
     let mut hex = String::with_capacity(64);
@@ -1936,8 +1681,7 @@ impl StepRun {
                 | FailureKind::Timeout
                 | FailureKind::Config
                 | FailureKind::MissingInputs
-                | FailureKind::Gate
-                | FailureKind::DeploymentRequestIncomplete,
+                | FailureKind::Gate,
             ) => StepStatus::Failed,
             Some(FailureKind::Infra {
                 never_started: true,
@@ -2091,7 +1835,10 @@ mod tests {
         );
         // And `workspace_inputs` is DERIVED from it (one function, ADR-0007):
         // same filter, same order, hashes instead of ids.
-        assert_eq!(workspace_inputs(&needs, None, &outputs), vec!["hash-b", "hash-c"]);
+        assert_eq!(
+            workspace_inputs(&needs, None, &outputs),
+            vec!["hash-b", "hash-c"]
+        );
         // Explicit `inputs:` resolves through the same filter.
         let inputs = vec![StepId("c".into()), StepId("a".into())];
         assert_eq!(
@@ -2295,49 +2042,30 @@ mod tests {
         assert_eq!(back, payload);
     }
 
-    /// git-bug 5f03853: a DeploymentVersion is opaque, so it is never
-    /// trimmed — `"v1\n"` would be a Deployment apart from the plugin's `v1`.
-    /// Surrounding whitespace is refused instead, and a blank version is
-    /// called blank, not empty.
+    /// ADR-0074 removed the Deployment record, but events it journalled stay
+    /// in the log and must still replay: a `GateResolved` carrying the
+    /// Deployment it waited on, and an attempt failed with the retired
+    /// `DeploymentRequestIncomplete` (read back as `Step`).
     #[test]
-    fn a_version_with_surrounding_whitespace_is_refused_not_trimmed() {
-        let request = RunDeploymentRequest {
-            step: StepId("bump".into()),
-            ordinal: 0,
-            org: "acme".into(),
-            environment: "prod".into(),
-            target_source: "argocd".into(),
-            target_id: "web".into(),
-            version_result: "version".into(),
-            evidence_results: vec![],
-            gate_steps: vec![],
-        };
-        let complete = |version: &str| {
-            complete_deployment_inputs(
-                &RunId("r1".into()),
-                &StepId("bump".into()),
-                std::slice::from_ref(&request),
-                &std::collections::BTreeMap::from([(
-                    "version".to_string(),
-                    serde_json::Value::String(version.into()),
-                )]),
-                Timestamp(0),
-            )
-        };
-        for padded in ["v1\n", " v1", "v1\t"] {
-            let problems = complete(padded).unwrap_err().problems;
-            assert_eq!(problems.len(), 1, "{padded:?}: {problems:?}");
-            assert!(
-                problems[0].contains("version has leading/trailing whitespace"),
-                "{padded:?}: {problems:?}"
-            );
-        }
-        let blank = complete("  ").unwrap_err().problems;
-        assert!(blank[0].contains("got a blank string"), "{blank:?}");
-        let empty = complete("").unwrap_err().problems;
-        assert!(empty[0].contains("got an empty string"), "{empty:?}");
-        assert_eq!(complete("v1").unwrap().len(), 1);
-
-        assert_eq!(json_kind(&serde_json::json!("x")), "a string");
+    fn events_from_the_deployment_record_still_decode() {
+        let gate: EventPayload = serde_json::from_value(serde_json::json!({
+            "GateResolved": {
+                "step": "live", "attempt": "a1", "passed": true,
+                "reason": "live", "deployment": 42
+            }
+        }))
+        .expect("an old GateResolved decodes");
+        assert!(matches!(
+            gate,
+            EventPayload::GateResolved {
+                deployment: Some(42),
+                passed: true,
+                ..
+            }
+        ));
+        let failed: FailureKind =
+            serde_json::from_value(serde_json::json!("DeploymentRequestIncomplete"))
+                .expect("the retired failure kind decodes");
+        assert_eq!(failed, FailureKind::Step);
     }
 }

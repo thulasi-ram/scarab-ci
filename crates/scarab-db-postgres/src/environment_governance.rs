@@ -9,16 +9,15 @@ use async_trait::async_trait;
 use sqlx::Row;
 
 use scarab_project::{
-    DeployGovernance, DeploymentTargetHome, EnvironmentDeploymentDeadline,
-    EnvironmentGovernanceStore, EnvironmentMigrationAcknowledgement, EnvironmentMigrationReport,
-    EnvironmentMigrationReportProject, EnvironmentProjectEligibility, EnvironmentProjectOverlay,
-    EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord, EnvironmentProtectionRules,
-    ImageGrant, OrgEnvironment, OrgEnvironmentError, ProtectionRules,
+    DeployGovernance, EnvironmentGovernanceStore, EnvironmentMigrationAcknowledgement,
+    EnvironmentMigrationReport, EnvironmentMigrationReportProject, EnvironmentProjectEligibility,
+    EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord,
+    EnvironmentProtectionRules, ImageGrant, OrgEnvironment, OrgEnvironmentError, ProtectionRules,
 };
 
 use crate::org_environments::{
-    deployment_sources_of, eligible_project_patterns_of, org_environment_from_row,
-    org_environment_store_err, protection_rules_from_row, ORG_ENVIRONMENT_COLUMNS,
+    eligible_project_patterns_of, org_environment_from_row, org_environment_store_err,
+    protection_rules_from_row, ORG_ENVIRONMENT_COLUMNS,
 };
 use crate::PostgresDb;
 
@@ -43,31 +42,17 @@ fn write_err(e: sqlx::Error, org: &str, environment: &str) -> OrgEnvironmentErro
     }
 }
 
-/// The two rules whose Rust type is wider or narrower than their column, as
-/// the columns hold them. A wait timer above `i32::MAX` seconds (68 years)
-/// is refused rather than clamped: clamping would store a rule nobody set.
-fn rule_columns(
-    rules: &EnvironmentProtectionRules,
-) -> Result<(i32, Option<i32>), OrgEnvironmentError> {
-    let wait_timer_s = i32::try_from(rules.wait_timer_s).map_err(|_| {
+/// The wait timer as its column holds it. A wait timer above `i32::MAX`
+/// seconds (68 years) is refused rather than clamped: clamping would store a
+/// rule nobody set.
+fn wait_timer_column(rules: &EnvironmentProtectionRules) -> Result<i32, OrgEnvironmentError> {
+    i32::try_from(rules.wait_timer_s).map_err(|_| {
         OrgEnvironmentError::Invalid(format!("wait timer must be at most {} seconds", i32::MAX))
-    })?;
-    let deployment_concurrency = rules
-        .deployment_concurrency
-        .map(|n| {
-            i32::try_from(n.get()).map_err(|_| {
-                OrgEnvironmentError::Invalid(format!(
-                    "deployment concurrency must be at most {}",
-                    i32::MAX
-                ))
-            })
-        })
-        .transpose()?;
-    Ok((wait_timer_s, deployment_concurrency))
+    })
 }
 
 const OVERLAY_COLUMNS: &str = "org, environment, project, approvers, allowed_refs, \
-     wait_timer_s, require_reason, deployment_concurrency, deployment_gate_deadline_ms";
+     wait_timer_s, require_reason";
 
 fn overlay_from_row(
     row: &sqlx::postgres::PgRow,
@@ -77,20 +62,11 @@ fn overlay_from_row(
     let project: String = row.get("project");
     let what = format!("overlay {org}/{environment}/{project}");
     let rules = protection_rules_from_row(row, &what)?;
-    let deployment_gate_deadline = row
-        .get::<Option<i64>, _>("deployment_gate_deadline_ms")
-        .map(|ms| {
-            EnvironmentDeploymentDeadline::new(ms).map_err(|e| {
-                OrgEnvironmentError::Store(format!("`{what}` holds an unreadable deadline: {e}"))
-            })
-        })
-        .transpose()?;
     Ok(EnvironmentProjectOverlay {
         org,
         environment,
         project,
         rules,
-        deployment_gate_deadline,
     })
 }
 
@@ -120,85 +96,6 @@ fn grant_from_row(
     })
 }
 
-/// Where each of `targets` is homed in `org` — the one read behind both Run
-/// creation's refusal ([`EnvironmentGovernanceStore::deployment_target_homes`])
-/// and the re-check a Deploy Step's success makes under the Org's counter
-/// lock (`finish_step_with_deployment_requests`; git-bug 9e66f2c). In order:
-///
-/// 1. current routing (the same join `PluginStore::target_routings` makes:
-///    installation → its reported target → the Environment listing that
-///    target's grouping NOW);
-/// 2. else the Environment of the target's newest input
-///    (`deployment_inputs_target_idx`, migration 0058);
-/// 3. else — only with `with_admitted_runs` — the Environment of the oldest
-///    non-terminal Run that requests it (`run_deployment_requests`). Without
-///    this leg a target nobody has recorded yet was admitted into two
-///    Environments, and both then recorded it (git-bug 9e66f2c). The success
-///    re-check leaves it out: there the recorded facts decide, so the first
-///    Run to RECORD a target homes it and a concurrently admitted rival in
-///    another Environment is refused at its own commit.
-///
-/// A target none of them knows is absent.
-pub(crate) async fn target_homes_on(
-    conn: &mut sqlx::PgConnection,
-    org: &str,
-    targets: &[(String, String)],
-    with_admitted_runs: bool,
-) -> Result<Vec<DeploymentTargetHome>, sqlx::Error> {
-    if targets.is_empty() {
-        return Ok(Vec::new());
-    }
-    let (sources, ids): (Vec<&str>, Vec<&str>) = targets
-        .iter()
-        .map(|(source, id)| (source.as_str(), id.as_str()))
-        .unzip();
-    let rows = sqlx::query(
-        "SELECT q.source, q.target_id,
-                COALESCE(
-                    (SELECT routed.environment
-                     FROM plugin_installations i
-                     JOIN deployment_source_targets t
-                       ON t.installation_id = i.id AND t.target_id = q.target_id
-                     JOIN environment_deployment_sources routed
-                       ON routed.org = i.org AND routed.installation = i.name
-                      AND routed.vendor_grouping = t.vendor_grouping
-                     WHERE i.org = $1 AND i.name = q.source
-                     LIMIT 1),
-                    (SELECT d.environment
-                     FROM deployment_inputs d
-                     WHERE d.org = $1 AND d.target_source = q.source
-                       AND d.target_id = q.target_id
-                     ORDER BY d.seq DESC
-                     LIMIT 1),
-                    (SELECT r.environment
-                     FROM run_deployment_requests r
-                     JOIN runs ON runs.id = r.run_id
-                     WHERE $4 AND r.org = $1 AND r.target_source = q.source
-                       AND r.target_id = q.target_id
-                       AND runs.status IN ('pending', 'running', 'suspended')
-                     ORDER BY runs.created_at, r.run_id
-                     LIMIT 1)
-                ) AS environment
-         FROM UNNEST($2::text[], $3::text[]) AS q(source, target_id)",
-    )
-    .bind(org)
-    .bind(&sources)
-    .bind(&ids)
-    .bind(with_admitted_runs)
-    .fetch_all(&mut *conn)
-    .await?;
-    Ok(rows
-        .iter()
-        .filter_map(|r| {
-            Some(DeploymentTargetHome {
-                source: r.get("source"),
-                id: r.get("target_id"),
-                environment: r.get::<Option<String>, _>("environment")?,
-            })
-        })
-        .collect())
-}
-
 /// Begin a read-only transaction that sees **one snapshot** for every
 /// statement. Under the default READ COMMITTED each statement gets its own,
 /// so a governance read racing an admin's eligibility-then-overlay edit could
@@ -223,9 +120,8 @@ async fn stored_environment(
     org: &str,
     environment: &str,
 ) -> Result<OrgEnvironment, OrgEnvironmentError> {
-    let sources = deployment_sources_of(&mut **tx, org, environment).await?;
     let patterns = eligible_project_patterns_of(&mut **tx, org, environment).await?;
-    org_environment_from_row(row, sources, patterns)
+    org_environment_from_row(row, patterns)
 }
 
 /// The split report lines of `org` — all of them, or only `environment`'s —
@@ -240,7 +136,7 @@ async fn migration_report_lines(
         "SELECT r.environment, r.merged_projects, r.referenced_only, r.referencing_projects,
                 r.created_at, r.acknowledged_at, r.acknowledged_by,
                 o.name IS NOT NULL AS environment_exists, o.approvers, o.allowed_refs,
-                o.wait_timer_s, o.require_reason, o.deployment_concurrency
+                o.wait_timer_s, o.require_reason
          FROM environment_migration_report r
          LEFT JOIN org_environments o ON o.org = r.org AND o.name = r.environment
          WHERE r.org = $1 AND ($2::text IS NULL OR r.environment = $2)
@@ -538,7 +434,7 @@ impl EnvironmentGovernanceStore for PostgresDb {
         updated_by: &str,
         updated_at: i64,
     ) -> Result<OrgEnvironment, OrgEnvironmentError> {
-        let (wait_timer_s, deployment_concurrency) = rule_columns(protection)?;
+        let wait_timer_s = wait_timer_column(protection)?;
         let mut tx = self
             .pool()
             .begin()
@@ -556,7 +452,7 @@ impl EnvironmentGovernanceStore for PostgresDb {
         let row = sqlx::query(&format!(
             "UPDATE org_environments SET
                  approvers = $3, allowed_refs = $4, wait_timer_s = $5, require_reason = $6,
-                 deployment_concurrency = $7, updated_at = $8, updated_by = $9
+                 updated_at = $7, updated_by = $8
              WHERE org = $1 AND name = $2
              RETURNING {ORG_ENVIRONMENT_COLUMNS}"
         ))
@@ -566,7 +462,6 @@ impl EnvironmentGovernanceStore for PostgresDb {
         .bind(&protection.allowed_refs)
         .bind(wait_timer_s)
         .bind(protection.require_reason)
-        .bind(deployment_concurrency)
         .bind(updated_at)
         .bind(updated_by)
         .fetch_optional(&mut *tx)
@@ -654,7 +549,7 @@ impl EnvironmentGovernanceStore for PostgresDb {
         updated_by: &str,
         updated_at: i64,
     ) -> Result<(), OrgEnvironmentError> {
-        let (wait_timer_s, deployment_concurrency) = rule_columns(&overlay.rules)?;
+        let wait_timer_s = wait_timer_column(&overlay.rules)?;
         match expected {
             None => {}
             // ADR-0073 §3. An absent row cannot be locked, so each expectation
@@ -665,9 +560,8 @@ impl EnvironmentGovernanceStore for PostgresDb {
                 let inserted = sqlx::query(
                     "INSERT INTO environment_project_overlays
                          (org, environment, project, approvers, allowed_refs, wait_timer_s,
-                          require_reason, deployment_concurrency, deployment_gate_deadline_ms,
-                          updated_at, updated_by)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                          require_reason, updated_at, updated_by)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                      ON CONFLICT (org, environment, project) DO NOTHING",
                 )
                 .bind(&overlay.org)
@@ -677,8 +571,6 @@ impl EnvironmentGovernanceStore for PostgresDb {
                 .bind(&overlay.rules.allowed_refs)
                 .bind(wait_timer_s)
                 .bind(overlay.rules.require_reason)
-                .bind(deployment_concurrency)
-                .bind(overlay.deployment_gate_deadline.map(|d| d.millis()))
                 .bind(updated_at)
                 .bind(updated_by)
                 .execute(self.pool())
@@ -692,17 +584,14 @@ impl EnvironmentGovernanceStore for PostgresDb {
                 };
             }
             Some(Some(old)) => {
-                let (old_wait_timer_s, old_concurrency) = rule_columns(&old.rules)?;
+                let old_wait_timer_s = wait_timer_column(&old.rules)?;
                 let updated = sqlx::query(
                     "UPDATE environment_project_overlays SET
                          approvers = $4, allowed_refs = $5, wait_timer_s = $6,
-                         require_reason = $7, deployment_concurrency = $8,
-                         deployment_gate_deadline_ms = $9, updated_at = $10, updated_by = $11
+                         require_reason = $7, updated_at = $8, updated_by = $9
                      WHERE org = $1 AND environment = $2 AND project = $3
-                       AND approvers = $12 AND allowed_refs = $13 AND wait_timer_s = $14
-                       AND require_reason = $15
-                       AND deployment_concurrency IS NOT DISTINCT FROM $16
-                       AND deployment_gate_deadline_ms IS NOT DISTINCT FROM $17",
+                       AND approvers = $10 AND allowed_refs = $11 AND wait_timer_s = $12
+                       AND require_reason = $13",
                 )
                 .bind(&overlay.org)
                 .bind(&overlay.environment)
@@ -711,16 +600,12 @@ impl EnvironmentGovernanceStore for PostgresDb {
                 .bind(&overlay.rules.allowed_refs)
                 .bind(wait_timer_s)
                 .bind(overlay.rules.require_reason)
-                .bind(deployment_concurrency)
-                .bind(overlay.deployment_gate_deadline.map(|d| d.millis()))
                 .bind(updated_at)
                 .bind(updated_by)
                 .bind(&old.rules.approvers)
                 .bind(&old.rules.allowed_refs)
                 .bind(old_wait_timer_s)
                 .bind(old.rules.require_reason)
-                .bind(old_concurrency)
-                .bind(old.deployment_gate_deadline.map(|d| d.millis()))
                 .execute(self.pool())
                 .await
                 .map_err(org_environment_store_err)?
@@ -735,15 +620,13 @@ impl EnvironmentGovernanceStore for PostgresDb {
         sqlx::query(
             "INSERT INTO environment_project_overlays
                  (org, environment, project, approvers, allowed_refs, wait_timer_s, require_reason,
-                  deployment_concurrency, deployment_gate_deadline_ms, updated_at, updated_by)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                  updated_at, updated_by)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
              ON CONFLICT (org, environment, project) DO UPDATE SET
                  approvers = EXCLUDED.approvers,
                  allowed_refs = EXCLUDED.allowed_refs,
                  wait_timer_s = EXCLUDED.wait_timer_s,
                  require_reason = EXCLUDED.require_reason,
-                 deployment_concurrency = EXCLUDED.deployment_concurrency,
-                 deployment_gate_deadline_ms = EXCLUDED.deployment_gate_deadline_ms,
                  updated_at = EXCLUDED.updated_at,
                  updated_by = EXCLUDED.updated_by",
         )
@@ -754,8 +637,6 @@ impl EnvironmentGovernanceStore for PostgresDb {
         .bind(&overlay.rules.allowed_refs)
         .bind(wait_timer_s)
         .bind(overlay.rules.require_reason)
-        .bind(deployment_concurrency)
-        .bind(overlay.deployment_gate_deadline.map(|d| d.millis()))
         .bind(updated_at)
         .bind(updated_by)
         .execute(self.pool())
@@ -950,21 +831,6 @@ impl EnvironmentGovernanceStore for PostgresDb {
         let report = migration_report_lines(&mut tx, org, None).await?;
         tx.commit().await.map_err(org_environment_store_err)?;
         Ok(report)
-    }
-
-    async fn deployment_target_homes(
-        &self,
-        org: &str,
-        targets: &[(String, String)],
-    ) -> Result<Vec<DeploymentTargetHome>, OrgEnvironmentError> {
-        let mut conn = self
-            .pool()
-            .acquire()
-            .await
-            .map_err(org_environment_store_err)?;
-        target_homes_on(&mut conn, org, targets, true)
-            .await
-            .map_err(org_environment_store_err)
     }
 
     async fn acknowledge_environment_migration_report(

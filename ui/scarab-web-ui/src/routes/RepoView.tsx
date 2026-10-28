@@ -12,7 +12,7 @@
 // shared link and the back button all land where you were. The defaults (Runs
 // tab, no filter) are the absent params, which keeps the bare repo URL clean.
 import { createResource, createSignal, createEffect, onCleanup, For, Show } from "solid-js";
-import { A, useParams, useNavigate, useSearchParams } from "@solidjs/router";
+import { useParams, useNavigate, useSearchParams } from "@solidjs/router";
 import { recordVisit } from "../visited";
 import {
   listRepoRuns,
@@ -25,13 +25,12 @@ import {
   type ProjectEnvironment,
 } from "../api/client";
 import {
-  concurrencyLabel,
   isPermissive,
-  overlayToForm,
   refLayersLabel,
   rulesSummary,
+  rulesToForm,
   tightenable,
-  toOverlayBody,
+  toProtectionBody,
 } from "../environment-overlays";
 import { relTime, absTime, duration } from "../fmt";
 import { forgeCommitUrl, forgePrUrl } from "../forge";
@@ -45,7 +44,6 @@ import ScopedSecrets from "../components/ScopedSecrets";
 import SecretMatrixEditor from "../components/SecretMatrixEditor";
 import Doodle from "../components/Doodle";
 import AsciiScene from "../components/AsciiScene";
-import { deploymentsHref } from "../deployments";
 import { runEnvironmentOptions, runListFilter } from "../runs-filter";
 import ponderIdle from "../../../brand/ascii/generated/ponder-ponder.json";
 
@@ -656,9 +654,7 @@ function RepoEnvironments(props: {
 }
 
 // The history here is APPROVALS — what governance admitted into the
-// environment — not what went live. What is actually live, and how it got
-// there, is the Deployment record (ADR-0070) on /deployments, linked from the
-// panel header.
+// environment — not what went live.
 function EnvPanel(props: {
   org: string;
   repo: string;
@@ -702,9 +698,6 @@ function EnvPanel(props: {
           <Show when={(history() ?? []).length > 0}>
             <span class="subtle mono">last approved {history()![0]!.git_ref}</span>
           </Show>
-          <A class="env-deploy-link" href={deploymentsHref(props.org, props.env.name)}>
-            <Icon icon="rocket" size={12} /> deployments
-          </A>
         </span>
       </div>
       <div class="env-body">
@@ -722,12 +715,6 @@ function EnvPanel(props: {
           <Show when={effective().require_reason}>
             <span class="dotsep">·</span> reason required
           </Show>
-          <Show when={effective().deployment_concurrency != null}>
-            <span class="dotsep">·</span>{" "}
-            <span title="Enforced once deployment requests ship">
-              {concurrencyLabel(effective().deployment_concurrency)}
-            </span>
-          </Show>
         </div>
         <div class="env-layers">
           <div class="env-h-row mono">
@@ -742,15 +729,7 @@ function EnvPanel(props: {
           <div class="env-h-row mono">
             <span class="subtle">{props.repo} overlay</span>{" "}
             <Show when={props.env.overlay} fallback={<span class="subtle">none</span>}>
-              {(o) => (
-                <>
-                  {rulesSummary(o())}
-                  <Show when={props.env.overlay_deployment_gate_deadline_ms != null}>
-                    {" "}· gates stall after{" "}
-                    {Math.round(props.env.overlay_deployment_gate_deadline_ms! / 60_000)} min
-                  </Show>
-                </>
-              )}
+              {(o) => rulesSummary(o())}
             </Show>
             <span class="oenv-actions">
               <Show when={props.env.eligible || props.env.overlay}>
@@ -820,13 +799,11 @@ function EnvDialog(props: {
   );
   const choices = () => tightenable(envs() ?? []);
   const [picked, setPicked] = createSignal(props.initial ?? "");
-  const blank = overlayToForm(null);
+  const blank = rulesToForm(null);
   const [approvers, setApprovers] = createSignal(blank.approvers);
   const [allowedRefs, setAllowedRefs] = createSignal(blank.allowedRefs);
   const [waitTimer, setWaitTimer] = createSignal(blank.waitTimerS);
-  const [concurrency, setConcurrency] = createSignal(blank.concurrency);
   const [requireReason, setRequireReason] = createSignal(blank.requireReason);
-  const [gateDeadline, setGateDeadline] = createSignal(blank.gateDeadlineMinutes);
   const [saving, setSaving] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
 
@@ -834,27 +811,19 @@ function EnvDialog(props: {
   // again on every pick): editing starts from what is stored, never blank.
   createEffect(() => {
     const env = (envs() ?? []).find((e) => e.name === picked());
-    const form = overlayToForm(
-      env?.overlay
-        ? { ...env.overlay, deployment_gate_deadline_ms: env.overlay_deployment_gate_deadline_ms }
-        : null,
-    );
+    const form = rulesToForm(env?.overlay);
     setApprovers(form.approvers);
     setAllowedRefs(form.allowedRefs);
     setWaitTimer(form.waitTimerS);
-    setConcurrency(form.concurrency);
     setRequireReason(form.requireReason);
-    setGateDeadline(form.gateDeadlineMinutes);
   });
 
   const built = () =>
-    toOverlayBody({
+    toProtectionBody({
       approvers: approvers(),
       allowedRefs: allowedRefs(),
       waitTimerS: waitTimer(),
       requireReason: requireReason(),
-      concurrency: concurrency(),
-      gateDeadlineMinutes: gateDeadline(),
     });
   const problem = () => (picked() ? (built().error ?? null) : "Pick an environment.");
 
@@ -951,37 +920,6 @@ function EnvDialog(props: {
               onInput={(e) => setWaitTimer(e.currentTarget.value)}
             />
             <p class="fieldnote">Recorded, not yet enforced.</p>
-          </div>
-          <div class="form-r">
-            <label>concurrency</label>
-            <input
-              class="input"
-              type="number"
-              min="1"
-              placeholder="no limit"
-              value={concurrency()}
-              onInput={(e) => setConcurrency(e.currentTarget.value)}
-            />
-            <p class="fieldnote">
-              In-flight deployments per target; blank = no limit. Enforced once deployment
-              requests ship.
-            </p>
-          </div>
-          <div class="form-r">
-            <label>gate deadline (min)</label>
-            <input
-              class="input"
-              type="number"
-              min="1"
-              step="any"
-              placeholder="the environment's"
-              value={gateDeadline()}
-              onInput={(e) => setGateDeadline(e.currentTarget.value)}
-            />
-            <p class="fieldnote">
-              Only this project's deployment gates, and only if shorter than the
-              environment's deadline.
-            </p>
           </div>
           <div class="form-r">
             <label>require reason</label>

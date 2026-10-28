@@ -2667,7 +2667,6 @@ name = "scarab-db-postgres"
 version = "0.2.2"
 dependencies = [
  "async-trait",
- "scarab-deployment",
  "scarab-engine",
  "scarab-forge",
  "scarab-identity",
@@ -2681,14 +2680,6 @@ dependencies = [
  "sqlx",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "scarab-deployment"
-version = "0.2.2"
-dependencies = [
- "async-trait",
- "proptest",
 ]
 
 [[package]]
@@ -2711,7 +2702,6 @@ name = "scarab-engine"
 version = "0.2.2"
 dependencies = [
  "async-trait",
- "scarab-deployment",
  "scarab-pipeline",
  "serde",
  "serde_json",
@@ -2825,7 +2815,6 @@ name = "scarab-plugin"
 version = "0.2.2"
 dependencies = [
  "async-trait",
- "scarab-deployment",
  "scarab-project",
  "serde",
  "serde_json",
@@ -2930,7 +2919,6 @@ dependencies = [
  "rsa",
  "rustls",
  "scarab-db-postgres",
- "scarab-deployment",
  "scarab-engine",
  "scarab-executor-k8s",
  "scarab-executor-local",
@@ -3001,7 +2989,6 @@ name = "scarab-testkit"
 version = "0.2.2"
 dependencies = [
  "async-trait",
- "scarab-deployment",
  "scarab-engine",
  "scarab-forge",
  "scarab-identity",

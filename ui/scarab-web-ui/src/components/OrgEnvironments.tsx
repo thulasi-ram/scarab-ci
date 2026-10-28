@@ -1,15 +1,15 @@
 // Org-level Environments (ADR-0071) — the Settings section where an org admin
-// runs the places deployments land in. Each Environment has:
+// runs the places deploys land in. Each Environment has:
 //
-//   - its deadline and reporting sources (the whole-Environment form, a FULL
-//     replace: `toPutBody` always sends every field);
+//   - its description (the whole-Environment form, a FULL replace: `toPutBody`
+//     always sends every field);
 //   - its BASELINE protection rules, which every project's Deploy Runs obey;
 //   - its ELIGIBILITY — all projects, or project-name patterns. An empty list
 //     admits no project: eligibility starts closed;
 //   - per-project PRIVILEGE GRANTS (image digests, raw k8s_overlay) — granted
 //     to one project, never to the Environment as a whole.
 //
-// Each of the last three has its own write, so the deadline form can never
+// Each of the last three has its own write, so the description form can never
 // reset them. Projects tighten the baseline themselves (their overlay, on the
 // repository's Environments tab); this page shows those overlays read-only.
 //
@@ -30,7 +30,6 @@ import {
   getMigrationReport,
   listEnvironmentProjects,
   listOrgEnvironments,
-  listPlugins,
   putEnvironmentEligibility,
   putEnvironmentProtection,
   putOrgEnvironment,
@@ -51,22 +50,14 @@ import {
 } from "../environment-overlays";
 import PrincipalSearch from "./PrincipalSearch";
 import { addToList } from "../identities";
-import {
-  deadlineLabel,
-  MAX_DEADLINE_MINUTES,
-  nameError,
-  toForm,
-  toPutBody,
-  type SourceRow,
-} from "../org-environments";
-import { installationChoices } from "../plugins";
+import { nameError, toForm, toPutBody } from "../org-environments";
 import { relTime, absTime } from "../fmt";
 import Icon from "./Icon";
 
-export default function OrgEnvironments(props: { org: string; epoch?: number }) {
+export default function OrgEnvironments(props: { org: string }) {
   const [epoch, setEpoch] = createSignal(0);
   const [environments] = createResource(
-    () => ({ org: props.org, epoch: epoch(), outer: props.epoch }),
+    () => ({ org: props.org, epoch: epoch() }),
     (k) => listOrgEnvironments(k.org),
   );
   /** `undefined` = closed; `null` = creating; an Environment = editing it. */
@@ -76,7 +67,7 @@ export default function OrgEnvironments(props: { org: string; epoch?: number }) 
     { env: OrgEnvironment; part: "baseline" | "eligibility" | "grants" } | undefined
   >(undefined);
   const [report, { refetch: refetchReport }] = createResource(
-    () => ({ org: props.org, epoch: epoch(), outer: props.epoch }),
+    () => ({ org: props.org, epoch: epoch() }),
     (k) => getMigrationReport(k.org).catch(() => null),
   );
   const [error, setError] = createSignal<string | null>(null);
@@ -92,7 +83,7 @@ export default function OrgEnvironments(props: { org: string; epoch?: number }) 
   const remove = async (env: OrgEnvironment) => {
     if (
       !window.confirm(
-        `Delete the ${env.name} environment?\n\nIts deadline and sources go with it. Deployments named ${env.name} would fall back to the default deadline — which is why the server refuses this once ${env.name} has any.`,
+        `Delete the ${env.name} environment?\n\nPipelines naming ${env.name} are refused until it exists again.`,
       )
     )
       return;
@@ -161,7 +152,7 @@ export default function OrgEnvironments(props: { org: string; epoch?: number }) 
             </div>
             <p class="subtle">
               <small>
-                <Icon icon="rocket" size={12} /> An org environment is the place deployments
+                <Icon icon="rocket" size={12} /> An org environment is the place deploys
                 land in, shared by every repository that deploys there. It decides who may
                 deploy (eligibility) and under which rules (the baseline); each repository
                 can only tighten those for itself.
@@ -223,7 +214,7 @@ export default function OrgEnvironments(props: { org: string; epoch?: number }) 
   );
 }
 
-/** One registered Environment: name, deadline, sources, and who last changed it. */
+/** One registered Environment: name, rules, and who last changed it. */
 function EnvironmentRow(props: {
   env: OrgEnvironment;
   onEdit: () => void;
@@ -236,9 +227,6 @@ function EnvironmentRow(props: {
       <div class="tok-head">
         <Icon icon="rocket" size={15} />
         <span class="tok-name mono">{env().name}</span>
-        <span class="tok-role" title="EnvironmentDeploymentDeadline: past this, an unfinished deployment reads stalled">
-          stalls after {deadlineLabel(env().deployment_deadline_ms)}
-        </span>
         <Show when={isPermissive(env().protection)}>
           <span class="tok-role" title="No org-wide rule protects this place yet — only each project's own overlay">
             permissive baseline
@@ -274,20 +262,6 @@ function EnvironmentRow(props: {
           <Icon icon="user" size={12} />
           {eligibilityLabel(env().eligibility)}
         </span>
-        <span>
-          <Icon icon="waypoints" size={12} />
-          <Show when={env().deployment_sources.length > 0} fallback={"no sources may report here"}>
-            <span class="oenv-sources">
-              <For each={env().deployment_sources}>
-                {(s) => (
-                  <span class="mono" title="PluginInstallation / vendor grouping">
-                    {s.installation} / {s.vendor_grouping}
-                  </span>
-                )}
-              </For>
-            </span>
-          </Show>
-        </span>
         <span title={absTime(env().updated_at)}>
           <Icon icon="user" size={12} />
           {env().updated_by} · {relTime(env().updated_at)}
@@ -298,7 +272,7 @@ function EnvironmentRow(props: {
 }
 
 /** Create (no `env`) or edit an Environment. The name is fixed once it exists:
- *  it is the key Deployments and per-repo Environments share. */
+ *  it is the key every pipeline's `environment:` names. */
 function EnvironmentDialog(props: {
   org: string;
   env?: OrgEnvironment;
@@ -310,20 +284,8 @@ function EnvironmentDialog(props: {
   const initial = toForm(props.env);
   const [name, setName] = createSignal(props.env?.name ?? "");
   const [description, setDescription] = createSignal(initial.description);
-  const [minutes, setMinutes] = createSignal(initial.deadlineMinutes);
-  const [sources, setSources] = createSignal<SourceRow[]>(
-    initial.sources.length > 0 ? initial.sources : [{ installation: "", vendor_grouping: "" }],
-  );
   const [saving, setSaving] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
-  // The org's installations, so a source names one that exists (the server
-  // refuses any other with a 400). If they cannot be listed — plugins not
-  // configured, or the call failed — the field falls back to free text.
-  const [installed] = createResource(
-    () => props.org,
-    (o) => listPlugins(o).catch(() => null),
-  );
-  const picker = () => (installed.loading ? null : (installed() ?? null));
 
   onMount(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -340,16 +302,10 @@ function EnvironmentDialog(props: {
     if (props.taken.includes(n)) return `${n} is already registered — edit it instead.`;
     return nameError(n);
   };
-  const built = () =>
-    toPutBody({ description: description(), deadlineMinutes: minutes(), sources: sources() });
-  const problem = () => nameProblem() ?? built().error ?? null;
-
-  const setRow = (i: number, patch: Partial<SourceRow>) =>
-    setSources((rows) => rows.map((r, j) => (j === i ? { ...r, ...patch } : r)));
 
   const save = async () => {
-    const body = built().body;
-    if (!body || problem() || saving()) return;
+    const body = toPutBody({ description: description() }).body;
+    if (nameProblem() || saving()) return;
     setSaving(true);
     setError(null);
     try {
@@ -380,8 +336,8 @@ function EnvironmentDialog(props: {
                 autofocus
               />
               <p class="fieldnote">
-                Exactly the name pipelines and deployments use — case matters. It cannot be
-                changed later.
+                Exactly the name pipelines use — case matters. It cannot be changed
+                later.
               </p>
             </div>
           </Show>
@@ -395,118 +351,17 @@ function EnvironmentDialog(props: {
               onInput={(e) => setDescription(e.currentTarget.value)}
             />
           </div>
-
-          <div class="form-r">
-            <label>deployment deadline</label>
-            <div class="tok-life">
-              <input
-                class="input tok-days"
-                type="number"
-                min="1"
-                step="any"
-                max={MAX_DEADLINE_MINUTES}
-                value={minutes()}
-                onInput={(e) => setMinutes(Number(e.currentTarget.value))}
-              />
-              <span class="tok-life-unit">minutes</span>
-              <For each={[15, 60, 240]}>
-                {(m) => (
-                  <button
-                    class="btn btn-ghost btn-sm"
-                    classList={{ "tok-preset-on": minutes() === m }}
-                    onClick={() => setMinutes(m)}
-                  >
-                    {deadlineLabel(m * 60_000)}
-                  </button>
-                )}
-              </For>
-            </div>
-            <p class="fieldnote">
-              A deployment still requested or in progress after this long reads{" "}
-              <b>stalled</b>. 1 minute to 7 days; set it above your slowest healthy rollout,
-              retries included.
-            </p>
-          </div>
-
-          <div class="form-r">
-            <label>deployment sources</label>
-            <div class="oenv-rows">
-              <For each={sources()}>
-                {(row, i) => (
-                  <div class="oenv-row">
-                    <Show
-                      when={picker()}
-                      fallback={
-                        <input
-                          class="input mono"
-                          placeholder="installation (argocd-prod)"
-                          value={row.installation}
-                          onInput={(e) => setRow(i(), { installation: e.currentTarget.value })}
-                        />
-                      }
-                    >
-                      {(list) => (
-                        <select
-                          class="input mono"
-                          value={row.installation}
-                          onChange={(e) => setRow(i(), { installation: e.currentTarget.value })}
-                        >
-                          <option value="">installation…</option>
-                          <For each={installationChoices(list(), row.installation)}>
-                            {(c) => <option value={c.value}>{c.label}</option>}
-                          </For>
-                        </select>
-                      )}
-                    </Show>
-                    <input
-                      class="input mono"
-                      placeholder="vendor grouping (Argo project)"
-                      value={row.vendor_grouping}
-                      onInput={(e) => setRow(i(), { vendor_grouping: e.currentTarget.value })}
-                    />
-                    <button
-                      class="btn btn-ghost btn-sm"
-                      title="Remove this source"
-                      onClick={() => setSources((rows) => rows.filter((_, j) => j !== i()))}
-                    >
-                      ✕
-                    </button>
-                  </div>
-                )}
-              </For>
-              <div>
-                <button
-                  class="btn btn-ghost btn-sm"
-                  onClick={() => setSources((rows) => [...rows, { installation: "", vendor_grouping: "" }])}
-                >
-                  <Icon icon="plus" size={12} /> add source
-                </button>
-              </div>
-            </div>
-            <p class="fieldnote">
-              Which plugin installation may report into this environment, and for which of
-              its groupings (an Argo CD project, say) — matched exactly. A source reports
-              into one environment only. Reports from anything not listed here are
-              dropped; Settings › Plugins lists the groupings that were.
-            </p>
-            <Show when={picker()?.length === 0}>
-              <p class="fieldnote">
-                No plugins are installed in {props.org} yet — install one under Plugins below
-                before routing it here.
-              </p>
-            </Show>
-          </div>
         </div>
 
         <div class="modal-foot">
-          <Show when={problem()}>
-            <p class="error">{problem()}</p>
+          <Show when={nameProblem()}>
+            <p class="error">{nameProblem()}</p>
           </Show>
           <Show when={error()}>
             <p class="error">{error()}</p>
           </Show>
           <div class="modal-actions">
-            <button class="btn btn-primary" disabled={!!problem() || saving()} onClick={save}>
+            <button class="btn btn-primary" disabled={!!nameProblem() || saving()} onClick={save}>
               {saving() ? "Saving…" : creating() ? "Create environment" : "Save"}
             </button>
             <button class="btn btn-ghost" onClick={props.onClose}>
@@ -530,9 +385,8 @@ function useEscape(onClose: () => void) {
   });
 }
 
-/** The baseline: the five rules every project's deploys here obey. A full
- *  replace (`toProtectionBody` sends every field); concurrency blank = no
- *  limit, never coerced to 1. */
+/** The baseline: the four rules every project's deploys here obey. A full
+ *  replace (`toProtectionBody` sends every field). */
 function BaselineDialog(props: {
   org: string;
   env: OrgEnvironment;
@@ -544,7 +398,6 @@ function BaselineDialog(props: {
   const [approvers, setApprovers] = createSignal(initial.approvers);
   const [allowedRefs, setAllowedRefs] = createSignal(initial.allowedRefs);
   const [waitTimer, setWaitTimer] = createSignal(initial.waitTimerS);
-  const [concurrency, setConcurrency] = createSignal(initial.concurrency);
   const [requireReason, setRequireReason] = createSignal(initial.requireReason);
   const [saving, setSaving] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
@@ -554,7 +407,6 @@ function BaselineDialog(props: {
       allowedRefs: allowedRefs(),
       waitTimerS: waitTimer(),
       requireReason: requireReason(),
-      concurrency: concurrency(),
     });
 
   const save = async () => {
@@ -613,21 +465,6 @@ function BaselineDialog(props: {
               onInput={(e) => setWaitTimer(e.currentTarget.value)}
             />
             <p class="fieldnote">Recorded, not yet enforced.</p>
-          </div>
-          <div class="form-r">
-            <label>concurrency</label>
-            <input
-              class="input"
-              type="number"
-              min="1"
-              placeholder="no limit"
-              value={concurrency()}
-              onInput={(e) => setConcurrency(e.currentTarget.value)}
-            />
-            <p class="fieldnote">
-              In-flight deployments per target; blank = no limit. Enforced once deployment
-              requests ship.
-            </p>
           </div>
           <div class="form-r">
             <label>require reason</label>

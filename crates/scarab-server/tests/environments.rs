@@ -150,7 +150,7 @@ async fn create_environment_for_web(app: &axum::Router, name: &str) {
         app,
         "PUT",
         &format!("/v1/orgs/acme/environments/{name}"),
-        Some(serde_json::json!({ "deployment_sources": [] })),
+        Some(serde_json::json!({})),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{msg}");
@@ -473,10 +473,32 @@ async fn require_reason_persists_and_defaults_off_through_the_api() {
     tdb.cleanup().await;
 }
 
-/// The `CREATE FUNCTION adr0071_backfill()` section of migration 0057,
-/// verbatim — the migration drops the function after its one call, so a test
-/// that replays the backfill re-creates it from the migration's own text.
-fn backfill_function_sql() -> &'static str {
+/// The `CREATE FUNCTION adr0071_backfill()` section of migration 0057 — the
+/// migration drops the function after its one call, so a test that replays
+/// the backfill re-creates it from the migration's own text. Migration 0067
+/// (ADR-0074) dropped the deadline and per-target concurrency columns it
+/// writes, so those are cut from the text; everything else is verbatim.
+fn backfill_function_sql() -> String {
+    let verbatim = backfill_function_sql_0057();
+    let without = verbatim
+        .replace(
+            "description, deployment_deadline_ms, created_at",
+            "description, created_at",
+        )
+        .replace("n.name, '', 3600000, now_ms", "n.name, '', now_ms")
+        .replace(
+            "deployment_concurrency, deployment_gate_deadline_ms, updated_at",
+            "updated_at",
+        )
+        .replace(
+            "NULL, NULL, now_ms, 'migration:adr-0071'",
+            "now_ms, 'migration:adr-0071'",
+        );
+    assert!(!without.contains("deployment_"), "{without}");
+    without
+}
+
+fn backfill_function_sql_0057() -> &'static str {
     const MIGRATION: &str =
         include_str!("../../scarab-db-postgres/migrations/0057_org_environment_governance.sql");
     let start = MIGRATION
@@ -517,7 +539,7 @@ async fn split_report_shows_merged_rules_and_acknowledges_once() {
     }
     // 0057 dropped its one-shot backfill; re-create it from the migration's
     // own text and run it over the pre-migration rows seeded above.
-    sqlx::raw_sql(backfill_function_sql())
+    sqlx::raw_sql(&backfill_function_sql())
         .execute(&tdb.pool)
         .await
         .unwrap();

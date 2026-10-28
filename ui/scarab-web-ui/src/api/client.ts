@@ -543,8 +543,7 @@ export async function deleteEnvironmentOverlay(
 
 /** One approval recorded when a run into an environment was admitted (`at` is
  *  epoch millis). The LEGACY `…/environments/{name}/deployments` route: it
- *  records what was *approved*, not what went live — that is the Deployment
- *  record below (ADR-0070), which this route predates. */
+ *  records what was *approved*, not what went live. */
 export type ApprovalRecord = {
   org: string;
   project: string;
@@ -569,92 +568,18 @@ export async function listApprovalHistory(
   return (await res.json()) as ApprovalRecord[];
 }
 
-// --- Deployments (ADR-0070) — what is live on each DeploymentTarget, and how
-// it got there. Org-scoped: an Environment's Deployments span every Project
-// that deploys into it. ---
-
-/** One Deployment: a version made (or asked to be made) live on a target. */
-export type Deployment = components["schemas"]["DeploymentDto"];
-export type DeploymentStatus = components["schemas"]["DeploymentStatusDto"];
-/** One stage of a Deployment as its source reported it. */
-export type DeploymentReport = components["schemas"]["DeploymentStatusReportDto"];
-/** The Deploy Run step that asked for a Deployment. */
-export type DeploymentRequester = components["schemas"]["DeploymentRequesterDto"];
-export type DeploymentTarget = components["schemas"]["DeploymentTargetDto"];
-/** One target's line on the Environment board: what is live, what is newest. */
-export type BoardRow = components["schemas"]["EnvironmentBoardRowDto"];
-
-/** The caller may not read this org's Deployment record (403). Reading needs
- *  Read on the Org; a member bound only to a Project is refused until
- *  Environment eligibility (ADR-0071) says who may read an Environment. */
-export class DeploymentsForbiddenError extends Error {
-  constructor(readonly org: string) {
-    super(`no read access to ${org}'s deployments`);
-    this.name = "DeploymentsForbiddenError";
-  }
-}
-
-/**
- * The Environment board (`GET /v1/orgs/{org}/board`), every Environment with
- * any Deployment unless `environment` narrows it.
- *
- * `null` when the server has no Deployment record wired (a 404 before it
- * authorizes anything) — "this server does not track deployments", which is
- * not the same answer as "nothing has deployed".
- */
-export async function getEnvironmentBoard(
-  org: string,
-  environment?: string,
-): Promise<BoardRow[] | null> {
-  const { data, error, response } = await api.GET("/v1/orgs/{org}/board", {
-    params: { path: { org }, query: environment ? { environment } : {} },
-  });
-  if (response.status === 404) return null;
-  if (response.status === 403) throw new DeploymentsForbiddenError(org);
-  if (error || !data) {
-    throw new Error(errorText(error) || "failed to load the environment board");
-  }
-  return data;
-}
-
-/** An Environment's Deployments, newest first, optionally one target's only.
- *  `null` = deployments not configured on this server (as above). */
-export async function listEnvironmentDeployments(
-  org: string,
-  env: string,
-  target?: { source: string; id: string },
-): Promise<Deployment[] | null> {
-  const { data, error, response } = await api.GET(
-    "/v1/orgs/{org}/environments/{env}/deployments",
-    {
-      params: {
-        path: { org, env },
-        query: target ? { target_source: target.source, target_id: target.id } : {},
-      },
-    },
-  );
-  if (response.status === 404) return null;
-  if (response.status === 403) throw new DeploymentsForbiddenError(org);
-  if (error || !data) {
-    throw new Error(errorText(error) || `failed to list deployments in ${env}`);
-  }
-  return data;
-}
-
-// --- Org-level Environments (ADR-0071) — the place deployments land in: its
-// deadline and reporting sources (the whole-Environment PUT), and — each with
-// its own write, so that PUT can never reset them — its baseline protection,
-// its eligibility, and each Project's privilege grant. Org admins only. ---
+// --- Org-level Environments (ADR-0071) — the place deploys land in: its
+// description (the whole-Environment PUT), and — each with its own write, so
+// that PUT can never reset them — its baseline protection, its eligibility,
+// and each Project's privilege grant. Org admins only. ---
 
 /** An org-level Environment. */
 export type OrgEnvironment = components["schemas"]["OrgEnvironmentDto"];
-/** A (PluginInstallation, vendor grouping) allowed to report into one. */
-export type EnvironmentDeploymentSource = components["schemas"]["EnvironmentDeploymentSourceDto"];
 /** The PUT body: the whole Environment, replaced. */
 export type PutOrgEnvironmentRequest = components["schemas"]["PutOrgEnvironmentRequest"];
 
 /** The caller may not read this org's Environments (403): reading needs Read
- *  on the Org, as for the Deployment record. */
+ *  on the Org. */
 export class OrgEnvironmentsForbiddenError extends Error {
   constructor(readonly org: string) {
     super(`no read access to ${org}'s environments`);
@@ -683,9 +608,8 @@ export async function listOrgEnvironments(org: string): Promise<OrgEnvironment[]
 
 /**
  * Create or replace an Environment (`PUT /v1/orgs/{org}/environments/{env}`),
- * org admins only. A full replace: send every field. The server's 400 (which
- * rule broke) and 409 (which Environment already lists a source) are passed
- * through verbatim — they are the answer to "why will this not save".
+ * org admins only. A full replace: send every field. The server's 400 is
+ * passed through verbatim — it is the answer to "why will this not save".
  */
 export async function putOrgEnvironment(
   org: string,
@@ -703,7 +627,7 @@ export async function putOrgEnvironment(
 }
 
 /** Delete an Environment (`DELETE /v1/orgs/{org}/environments/{env}`), org
- *  admins only. Refused (409) once it has Deployments. */
+ *  admins only. */
 export async function deleteOrgEnvironment(org: string, env: string): Promise<void> {
   const { error, response } = await api.DELETE("/v1/orgs/{org}/environments/{env}", {
     params: { path: { org, env } },
@@ -800,7 +724,7 @@ export async function acknowledgeMigrationReport(
   return (await res.json()) as MigrationReportLine;
 }
 
-// --- Plugins (ADR-0072, Deployments MMP d1) — an org's PluginInstallations:
+// --- Plugins (ADR-0072) — an org's PluginInstallations:
 // approvals of one pinned digest of a first-party plugin, with a kill switch.
 // Every write's refusal text (403 third-party / 409 name taken or retired) is
 // passed through verbatim — it is the answer to "why will this not install". ---
@@ -809,12 +733,8 @@ export async function acknowledgeMigrationReport(
 export type PluginCatalogEntry = components["schemas"]["PluginCatalogEntryDto"];
 /** An org's approval to run one pinned digest of a plugin. */
 export type PluginInstallation = components["schemas"]["PluginInstallationDto"];
-/** What an uninstall removed with it. */
+/** What an uninstall returns. */
 export type UninstalledPlugin = components["schemas"]["UninstalledPluginDto"];
-/** A grouping an installation reports on that no Environment lists. */
-export type UnmappedGrouping = components["schemas"]["UnmappedGroupingDto"];
-/** A DeploymentTarget a source reports into an Environment, with its owners. */
-export type DeploymentSourceTarget = components["schemas"]["DeploymentSourceTargetDto"];
 
 /** The installable plugins (`GET …/plugin-catalog`); `null` = this server
  *  runs no plugins (404). */
@@ -853,8 +773,8 @@ export async function installPlugin(
   return data;
 }
 
-/** Kill an installation at once (`POST …/plugins/{name}/kill`): its reports
- *  and broker calls are refused from the next request on. */
+/** Kill an installation at once (`POST …/plugins/{name}/kill`): its broker
+ *  calls are refused from the next request on. */
 export async function killPlugin(org: string, name: string): Promise<PluginInstallation> {
   const { data, error, response } = await api.POST("/v1/orgs/{org}/plugins/{name}/kill", {
     params: { path: { org, name } },
@@ -872,8 +792,7 @@ export async function enablePlugin(org: string, name: string): Promise<PluginIns
   return data;
 }
 
-/** Uninstall (`DELETE …/plugins/{name}`). The name is retired for good, and
- *  the Environment sources that named it are removed with it. */
+/** Uninstall (`DELETE …/plugins/{name}`). The name is retired for good. */
 export async function uninstallPlugin(org: string, name: string): Promise<UninstalledPlugin> {
   const { data, error, response } = await api.DELETE("/v1/orgs/{org}/plugins/{name}", {
     params: { path: { org, name } },
@@ -924,61 +843,6 @@ export async function deletePluginConnection(org: string, name: string, slot: st
   if (error || !response.ok) {
     throw new Error(errorText(error) || `could not unbind ${slot} (${response.status})`);
   }
-}
-
-/** A list endpoint's page size. The server pages by key (the next page
- *  starts after the last row), so a page shorter than this is the last. */
-const PAGE_LIMIT = 500;
-/** A bound on how many pages one read follows — far past any real org (an
- *  installation is capped at 10,000 targets), never an endless loop. */
-const MAX_PAGES = 50;
-
-/** The groupings `name` reports on that no Environment lists — reports for
- *  them are dropped (`GET …/plugins/{name}/unmapped-groupings`, every page). */
-export async function listUnmappedGroupings(org: string, name: string): Promise<UnmappedGrouping[]> {
-  const all: UnmappedGrouping[] = [];
-  let after: string | undefined;
-  for (let page = 0; page < MAX_PAGES; page++) {
-    const { data, error, response } = await api.GET("/v1/orgs/{org}/plugins/{name}/unmapped-groupings", {
-      params: { path: { org, name }, query: { after, limit: PAGE_LIMIT } },
-    });
-    if (error || !data) {
-      throw new Error(errorText(error) || `failed to load ${name}'s unmapped groupings (${response.status})`);
-    }
-    all.push(...data);
-    if (data.length < PAGE_LIMIT) break;
-    after = data[data.length - 1]!.vendor_grouping;
-  }
-  return all;
-}
-
-/** An Environment's reported DeploymentTargets and their owners, every page.
- *  `null` when the caller cannot read them (403) or plugins are not
- *  configured (404) — the board then shows no owners rather than an error. */
-export async function listDeploymentTargets(
-  org: string,
-  env: string,
-): Promise<DeploymentSourceTarget[] | null> {
-  const all: DeploymentSourceTarget[] = [];
-  let after: { source: string; id: string } | undefined;
-  for (let page = 0; page < MAX_PAGES; page++) {
-    const { data, error, response } = await api.GET(
-      "/v1/orgs/{org}/environments/{env}/deployment-targets",
-      {
-        params: {
-          path: { org, env },
-          query: { after_source: after?.source, after_target_id: after?.id, limit: PAGE_LIMIT },
-        },
-      },
-    );
-    if (response.status === 403 || response.status === 404) return null;
-    if (error || !data) throw new Error(errorText(error) || `failed to load ${env}'s targets`);
-    all.push(...data);
-    if (data.length < PAGE_LIMIT) break;
-    const last = data[data.length - 1]!;
-    after = { source: last.source, id: last.target_id };
-  }
-  return all;
 }
 
 /** Fetch a run's status + steps (dogfoods `GET /v1/runs/{id}`). */
@@ -1401,7 +1265,7 @@ export async function approveGate(id: string, step: string): Promise<GateApprova
 }
 
 /** Reject a waiting gate — fail it with a reason (`POST …/gates/{step}/reject`,
- * ADR-0070 §9). Any gate kind (`manual`/`timer`/`external`/`deployment`) that is
+ * ADR-0070 §9). Any gate kind (`manual`/`timer`/`external`) that is
  * pending and reached. The gate's Attempt fails with the reason and who
  * rejected it, its dependents are skipped, and the run ends `failed`. The
  * server's own words come back on failure: 400 for a missing/over-long reason,

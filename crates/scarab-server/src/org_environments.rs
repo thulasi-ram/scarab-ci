@@ -1,7 +1,6 @@
 //! Org-level Environments (ADR-0071): the admin and read API for the
-//! [`OrgEnvironment`] — a name, its EnvironmentDeploymentDeadline and its
-//! EnvironmentDeploymentSources — its EnvironmentProjectEligibility, and the
-//! deadline the Deployment read fold uses.
+//! [`OrgEnvironment`] — a name and a description — and its
+//! EnvironmentProjectEligibility.
 //!
 //! Since c-full c2 an OrgEnvironment is what admits Deploy Runs
 //! (`resolve_governance`), so what is written here decides who may deploy
@@ -16,9 +15,7 @@
 //!
 //! The whole-Environment PUT never touches the baseline or the eligibility —
 //! each has its own write — so the c-min form cannot reset either by
-//! omission. A Deployment still needs no OrgEnvironment: a name the
-//! Deployment record uses without one simply gets
-//! [`DEFAULT_DEPLOYMENT_DEADLINE_MS`](scarab_deployment::DEFAULT_DEPLOYMENT_DEADLINE_MS).
+//! omission.
 //!
 //! Reads need Read on the Org and writes Administer on the Org: "org admins
 //! administer Environments" until the RBAC Environment scope lands (ADR-0071
@@ -31,13 +28,11 @@ use axum::{Extension, Json};
 use scarab_engine::DbError;
 use scarab_identity::Action;
 use scarab_project::{
-    deployment_source_additions, eligibility_loosenings, overlay_loosenings,
-    privilege_grant_loosenings, protection_loosenings, DeployGovernance, EffectiveProtection,
-    EnvironmentDeploymentDeadline, EnvironmentDeploymentSource, EnvironmentGovernanceStore,
-    EnvironmentMigrationReport, EnvironmentMigrationReportProject, EnvironmentProjectEligibility,
-    EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord,
-    EnvironmentProtectionRules, ImageGrant, Loosening, OrgEnvironment, OrgEnvironmentError,
-    ProtectionRules,
+    eligibility_loosenings, overlay_loosenings, privilege_grant_loosenings, protection_loosenings,
+    DeployGovernance, EffectiveProtection, EnvironmentGovernanceStore, EnvironmentMigrationReport,
+    EnvironmentMigrationReportProject, EnvironmentProjectEligibility, EnvironmentProjectOverlay,
+    EnvironmentProjectPrivilegeGrant, EnvironmentProjectRecord, EnvironmentProtectionRules,
+    ImageGrant, Loosening, OrgEnvironment, OrgEnvironmentError, ProtectionRules,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -45,40 +40,12 @@ use utoipa::ToSchema;
 use super::{authorize_scoped, rbac_scope, resolve_typed_subject, ApiError, AppState};
 use crate::step_up::GuardCtx;
 
-/// A source allowed to report into an Environment (ADR-0071 §5).
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct EnvironmentDeploymentSourceDto {
-    /// The PluginInstallation's name: a DNS-1123 label (lowercase letters,
-    /// digits, `-`; at most 63), installed in this org — a PUT naming one
-    /// that is not is refused (400).
-    pub installation: String,
-    /// The vendor's grouping that maps into this Environment (an Argo CD
-    /// project, say). Opaque; matched exactly, no wildcards. No leading or
-    /// trailing whitespace (refused, never trimmed).
-    pub vendor_grouping: String,
-}
-
-impl From<&EnvironmentDeploymentSource> for EnvironmentDeploymentSourceDto {
-    fn from(s: &EnvironmentDeploymentSource) -> Self {
-        Self {
-            installation: s.installation.clone(),
-            vendor_grouping: s.vendor_grouping.clone(),
-        }
-    }
-}
-
 /// An org-level Environment in its minimal shape (ADR-0071, MMP step 1).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct OrgEnvironmentDto {
     pub org: String,
     pub name: String,
     pub description: String,
-    /// The EnvironmentDeploymentDeadline: how long a Deployment here may stay
-    /// `requested` or `in_progress` before it reads `stalled`.
-    pub deployment_deadline_ms: i64,
-    /// Sorted by installation, then vendor grouping.
-    pub deployment_sources: Vec<EnvironmentDeploymentSourceDto>,
     /// The baseline every Project's Deploy Runs obey. Read-only here:
     /// written through `…/protection`, never by the whole-Environment PUT.
     pub protection: EnvironmentProtectionRulesDto,
@@ -99,8 +66,6 @@ impl From<&OrgEnvironment> for OrgEnvironmentDto {
             org: e.org.clone(),
             name: e.name.clone(),
             description: e.description.clone(),
-            deployment_deadline_ms: e.deployment_deadline.millis(),
-            deployment_sources: e.deployment_sources.iter().map(Into::into).collect(),
             protection: (&e.protection).into(),
             eligibility: (&e.eligibility).into(),
             created_at: e.created_at,
@@ -112,20 +77,15 @@ impl From<&OrgEnvironment> for OrgEnvironmentDto {
 
 /// `PUT /v1/orgs/{org}/environments/{env}`: the whole Environment, replaced.
 /// An omitted optional field takes its default — it does not keep the stored
-/// value. Unknown fields are refused, so a misspelt field is a 4xx rather
-/// than a silently reset deadline.
+/// value. Unknown fields are refused, so a misspelt field — or one ADR-0074
+/// removed (`deployment_deadline_ms`, `deployment_sources`) — is a 4xx rather
+/// than silently ignored.
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PutOrgEnvironmentRequest {
     /// Free text; omitted = empty.
     #[serde(default)]
     pub description: Option<String>,
-    /// 60000 (1 minute) to 604800000 (7 days); omitted = the server default
-    /// (one hour).
-    #[serde(default)]
-    pub deployment_deadline_ms: Option<i64>,
-    /// The complete list; it replaces the stored one. `[]` clears it.
-    pub deployment_sources: Vec<EnvironmentDeploymentSourceDto>,
 }
 
 /// Protection rules as one layer holds them — an Environment's baseline or a
@@ -140,9 +100,6 @@ pub struct EnvironmentProtectionRulesDto {
     pub wait_timer_s: u32,
     /// A human dispatch must carry a reason (ADR-0057 §3).
     pub require_reason: bool,
-    /// In-flight Deployments per DeploymentTarget; absent = no limit.
-    /// Enforced once deployment requests ship (ADR-0071 §9).
-    pub deployment_concurrency: Option<u32>,
 }
 
 impl From<&EnvironmentProtectionRules> for EnvironmentProtectionRulesDto {
@@ -152,7 +109,6 @@ impl From<&EnvironmentProtectionRules> for EnvironmentProtectionRulesDto {
             allowed_refs: r.allowed_refs.clone(),
             wait_timer_s: r.wait_timer_s,
             require_reason: r.require_reason,
-            deployment_concurrency: r.deployment_concurrency.map(|n| n.get()),
         }
     }
 }
@@ -170,9 +126,6 @@ pub struct EffectiveProtectionDto {
     pub allowed_ref_layers: Vec<Vec<String>>,
     pub wait_timer_s: u32,
     pub require_reason: bool,
-    pub deployment_concurrency: Option<u32>,
-    /// The deadline this Project's DeploymentGates use.
-    pub deployment_gate_deadline_ms: i64,
 }
 
 impl From<&EffectiveProtection> for EffectiveProtectionDto {
@@ -182,8 +135,6 @@ impl From<&EffectiveProtection> for EffectiveProtectionDto {
             allowed_ref_layers: e.allowed_refs.layers().to_vec(),
             wait_timer_s: e.wait_timer_s,
             require_reason: e.require_reason,
-            deployment_concurrency: e.deployment_concurrency.map(|n| n.get()),
-            deployment_gate_deadline_ms: e.deployment_gate_deadline.millis(),
         }
     }
 }
@@ -241,12 +192,8 @@ pub struct ProjectEnvironmentDto {
     pub eligible: bool,
     /// The Environment's baseline, set by an org admin.
     pub baseline: EnvironmentProtectionRulesDto,
-    /// The Environment's EnvironmentDeploymentDeadline.
-    pub deployment_deadline_ms: i64,
     /// This Project's tighten-only overlay, if it has one.
     pub overlay: Option<EnvironmentProtectionRulesDto>,
-    /// The overlay's tighter deadline for this Project's DeploymentGates.
-    pub overlay_deployment_gate_deadline_ms: Option<i64>,
     /// What admission enforces: the baseline merged with the overlay.
     pub effective: EffectiveProtectionDto,
     /// This Project's privileges here, if an admin granted any.
@@ -259,13 +206,7 @@ impl From<&DeployGovernance> for ProjectEnvironmentDto {
             name: g.environment.name.clone(),
             eligible: g.eligible,
             baseline: (&g.environment.protection).into(),
-            deployment_deadline_ms: g.environment.deployment_deadline.millis(),
             overlay: g.overlay.as_ref().map(|o| (&o.rules).into()),
-            overlay_deployment_gate_deadline_ms: g
-                .overlay
-                .as_ref()
-                .and_then(|o| o.deployment_gate_deadline)
-                .map(|d| d.millis()),
             effective: (&g.effective_protection()).into(),
             privilege_grant: g.privilege_grant.as_ref().map(Into::into),
         }
@@ -276,14 +217,6 @@ impl From<&DeployGovernance> for ProjectEnvironmentDto {
 pub(crate) fn org_environment_api_error(e: OrgEnvironmentError) -> ApiError {
     match e {
         OrgEnvironmentError::Invalid(m) => ApiError::BadRequest(m),
-        taken @ OrgEnvironmentError::DeploymentSourceTaken { .. } => {
-            ApiError::Conflict(taken.to_string())
-        }
-        // F1 (c-min audit). The text says what to do, including for a
-        // source written before installations were checked.
-        missing @ OrgEnvironmentError::DeploymentSourceNotInstalled { .. } => {
-            ApiError::BadRequest(missing.to_string())
-        }
         OrgEnvironmentError::NotFound { .. } => ApiError::NotFound,
         // ADR-0071 §3, §8: a Project's overlay or grant pins the Environment.
         in_use @ OrgEnvironmentError::InUse(_) => ApiError::Conflict(in_use.to_string()),
@@ -351,10 +284,8 @@ pub(crate) async fn get_org_environment(
     Ok(Json((&environment).into()))
 }
 
-/// Create or replace an Environment: description, deadline and the whole
-/// source list. Administer on the Org (ADR-0071 §7: org admins administer
-/// Environments). A source another Environment in the org already lists is a
-/// 409 naming that Environment, and nothing changes.
+/// Create or replace an Environment: its description. Administer on the Org
+/// (ADR-0071 §7: org admins administer Environments).
 #[utoipa::path(
     put,
     path = "/v1/orgs/{org}/environments/{env}",
@@ -366,15 +297,13 @@ pub(crate) async fn get_org_environment(
     summary = "Create or replace an org Environment (ADR-0071)",
     responses(
         (status = 200, body = OrgEnvironmentDto),
-        (status = 400, description = "invalid name, deadline or source, or a source naming no installation in the org"),
+        (status = 400, description = "invalid name or description, or an unknown field"),
         (status = 403, description = "not an org admin"),
-        (status = 404, description = "org Environments not configured"),
-        (status = 409, description = "a source is already listed by another Environment")
+        (status = 404, description = "org Environments not configured")
     )
 )]
 pub(crate) async fn put_org_environment(
     State(st): State<AppState>,
-    Extension(guard): Extension<GuardCtx>,
     headers: HeaderMap,
     Path((org, env)): Path<(String, String)>,
     Json(body): Json<PutOrgEnvironmentRequest>,
@@ -382,25 +311,11 @@ pub(crate) async fn put_org_environment(
     let scope = rbac_scope(&org, None);
     let principal = authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
     let store = st.org_environments.as_ref().ok_or(ApiError::NotFound)?;
-    let deployment_deadline = EnvironmentDeploymentDeadline::new(
-        body.deployment_deadline_ms
-            .unwrap_or(scarab_deployment::DEFAULT_DEPLOYMENT_DEADLINE_MS),
-    )
-    .map_err(org_environment_api_error)?;
     let now = st.clock.now().await.0;
     let environment = OrgEnvironment {
         org,
         name: env,
         description: body.description.unwrap_or_default(),
-        deployment_deadline,
-        deployment_sources: body
-            .deployment_sources
-            .into_iter()
-            .map(|s| EnvironmentDeploymentSource {
-                installation: s.installation,
-                vendor_grouping: s.vendor_grouping,
-            })
-            .collect(),
         // Ignored by the store (it keeps or defaults the stored ones): the
         // baseline and the eligibility have their own writes, ADR-0071 §1-2.
         protection: EnvironmentProtectionRules::default(),
@@ -411,42 +326,17 @@ pub(crate) async fn put_org_environment(
         updated_by: principal.subject,
     };
     environment.validate().map_err(org_environment_api_error)?;
-    // ADR-0073 §3 rule E3: a deployment source added is a crown jewel (a new
-    // outside party whose reports this Environment accepts); a create reads
-    // as "no sources before". The write is conditional on the sources read
-    // here, so a change committed in between is a 409, never a loosening
-    // judged against a stale list.
-    let old_sources = store
-        .get_org_environment(&environment.org, &environment.name)
-        .await
-        .map_err(org_environment_api_error)?
-        .map(|e| e.deployment_sources)
-        .unwrap_or_default();
-    step_up_unless_tightening(
-        &st,
-        &guard,
-        deployment_source_additions(&old_sources, &environment.deployment_sources),
-    )
-    .await?;
-    // F1 (c-min audit): the store refuses a source naming no installation in
-    // this org, checked inside its write's transaction with the named
-    // installations locked — a check here, before it, would race an
-    // uninstall (red-team F-10).
     let stored = store
-        .put_org_environment_expecting(&environment, Some(&old_sources))
+        .put_org_environment(&environment)
         .await
         .map_err(org_environment_api_error)?;
     Ok(Json((&stored).into()))
 }
 
-/// Delete an Environment, its sources and its eligibility. Administer on the
-/// Org.
+/// Delete an Environment and its eligibility. Administer on the Org.
 ///
 /// Refused (409) while any Project holds an overlay or privilege grant in
-/// it (ADR-0071 §3, §8: those are never dropped as a side effect), and while
-/// the Deployment record holds anything for the name:
-/// the record is keyed by name, so deleting and re-creating the Environment
-/// would silently re-adopt that history under whatever the new one says.
+/// it (ADR-0071 §3, §8: those are never dropped as a side effect).
 #[utoipa::path(
     delete,
     path = "/v1/orgs/{org}/environments/{env}",
@@ -454,12 +344,12 @@ pub(crate) async fn put_org_environment(
         ("org" = String, Path, description = "org"),
         ("env" = String, Path, description = "environment name")
     ),
-    summary = "Delete an org Environment with no Deployments (ADR-0071)",
+    summary = "Delete an org Environment (ADR-0071)",
     responses(
         (status = 204, description = "deleted"),
         (status = 403, description = "not an org admin"),
         (status = 404, description = "no such Environment, or not configured"),
-        (status = 409, description = "the Environment has Deployments, or project overlays or grants")
+        (status = 409, description = "project overlays or grants still pin the Environment")
     )
 )]
 pub(crate) async fn delete_org_environment(
@@ -470,19 +360,6 @@ pub(crate) async fn delete_org_environment(
     let scope = rbac_scope(&org, None);
     authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
     let store = st.org_environments.as_ref().ok_or(ApiError::NotFound)?;
-    // With no Deployment record wired there is no history to re-adopt.
-    if let Some(deployments) = st.deployments.as_ref() {
-        let with_deployments = deployments
-            .environments(&org)
-            .await
-            .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;
-        if with_deployments.contains(&env) {
-            return Err(ApiError::Conflict(format!(
-                "environment `{env}` has Deployments; an Environment with a deployment \
-                 history cannot be deleted"
-            )));
-        }
-    }
     if store
         .delete_org_environment(&org, &env)
         .await
@@ -619,33 +496,6 @@ pub(crate) async fn put_environment_eligibility(
     Ok(Json((&stored.eligibility).into()))
 }
 
-/// The EnvironmentDeploymentDeadline the Deployment read fold stalls by for
-/// `environment`: its OrgEnvironment's, else (no OrgEnvironment by that name,
-/// or no store wired)
-/// [`DEFAULT_DEPLOYMENT_DEADLINE_MS`](scarab_deployment::DEFAULT_DEPLOYMENT_DEADLINE_MS).
-/// This is the baseline deadline: a Project's tighter overlay deadline, when
-/// overlays exist, applies only to its DeploymentGates (ADR-0071 §3).
-///
-/// A store failure is an error, never a silent fallback: a status folded
-/// against the wrong deadline would read `stalled` (or not) for no reason
-/// anyone could see.
-pub(crate) async fn deadline_from_org_environment(
-    st: &AppState,
-    org: &str,
-    environment: &str,
-) -> Result<scarab_deployment::Millis, ApiError> {
-    let Some(store) = st.org_environments.as_ref() else {
-        return Ok(scarab_deployment::DEFAULT_DEPLOYMENT_DEADLINE_MS);
-    };
-    Ok(store
-        .get_org_environment(org, environment)
-        .await
-        .map_err(org_environment_api_error)?
-        .map_or(scarab_deployment::DEFAULT_DEPLOYMENT_DEADLINE_MS, |e| {
-            e.deployment_deadline.millis()
-        }))
-}
-
 // ---------------------------------------------------------------------------
 // Baseline, overlay and privilege grant (ADR-0071 §1, §3, §8) — c-full c3.
 // ---------------------------------------------------------------------------
@@ -693,11 +543,12 @@ async fn step_up_unless_tightening(
         .await
 }
 
-/// A baseline (`…/protection`) body: the five rules, replaced whole. Every
+/// A baseline (`…/protection`) body: the four rules, replaced whole. Every
 /// field is optional and an omitted one takes the **permissive** default —
 /// never the stored value — so `{}` resets the baseline to permissive.
 /// Unknown fields are refused, so the retired per-repo shape (`wait_timer`,
-/// `concurrency`) is a 400, not a silently ignored rule.
+/// `concurrency`) — and `deployment_concurrency`, which ADR-0074 removed — is
+/// a 400, not a silently ignored rule.
 #[derive(Debug, Default, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PutEnvironmentProtectionRequest {
@@ -714,16 +565,12 @@ pub struct PutEnvironmentProtectionRequest {
     /// A human dispatch must carry a reason (ADR-0057 §3). Omitted = off.
     #[serde(default)]
     pub require_reason: bool,
-    /// In-flight Deployments per DeploymentTarget, at least 1; omitted or
-    /// `null` = no limit. Enforced once deployment requests ship (§9).
-    #[serde(default)]
-    pub deployment_concurrency: Option<u32>,
 }
 
 /// A Project overlay (`…/projects/{project}/overlay`) body: the baseline's
-/// five rules, which can only **tighten** (ADR-0071 §3), plus a tighter
-/// deadline for this Project's DeploymentGates. Replaced whole, omitted =
-/// permissive default, unknown fields refused — as for the baseline.
+/// four rules, which can only **tighten** (ADR-0071 §3). Replaced whole,
+/// omitted = permissive default, unknown fields refused — as for the
+/// baseline.
 #[derive(Debug, Default, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PutEnvironmentProjectOverlayRequest {
@@ -735,12 +582,6 @@ pub struct PutEnvironmentProjectOverlayRequest {
     pub wait_timer_s: u32,
     #[serde(default)]
     pub require_reason: bool,
-    #[serde(default)]
-    pub deployment_concurrency: Option<u32>,
-    /// 60000 to 604800000; applies to this Project's DeploymentGates only,
-    /// and only when shorter than the Environment's. Omitted = none.
-    #[serde(default)]
-    pub deployment_gate_deadline_ms: Option<i64>,
 }
 
 /// A Project's overlay as stored.
@@ -750,8 +591,6 @@ pub struct EnvironmentProjectOverlayDto {
     pub allowed_refs: Vec<String>,
     pub wait_timer_s: u32,
     pub require_reason: bool,
-    pub deployment_concurrency: Option<u32>,
-    pub deployment_gate_deadline_ms: Option<i64>,
 }
 
 impl From<&EnvironmentProjectOverlay> for EnvironmentProjectOverlayDto {
@@ -761,8 +600,6 @@ impl From<&EnvironmentProjectOverlay> for EnvironmentProjectOverlayDto {
             allowed_refs: o.rules.allowed_refs.clone(),
             wait_timer_s: o.rules.wait_timer_s,
             require_reason: o.rules.require_reason,
-            deployment_concurrency: o.rules.deployment_concurrency.map(|n| n.get()),
-            deployment_gate_deadline_ms: o.deployment_gate_deadline.map(|d| d.millis()),
         }
     }
 }
@@ -801,9 +638,9 @@ impl From<&EnvironmentProjectRecord> for EnvironmentProjectDto {
     }
 }
 
-/// The five rules from a request, checked: no empty entry (an empty
-/// approver or ref glob matches nobody, so it is a typo, not a rule), a
-/// concurrency of at least 1, and every approver resolved to the Principal
+/// The four rules from a request, checked: no empty entry (an empty
+/// approver or ref glob matches nobody, so it is a typo, not a rule), and
+/// every approver resolved to the Principal
 /// it names (ADR-0069 §3) — exactly what the retired per-repo PUT checked,
 /// because approvers are matched by exact string at the gate.
 async fn checked_rules(
@@ -812,21 +649,12 @@ async fn checked_rules(
     allowed_refs: Vec<String>,
     wait_timer_s: u32,
     require_reason: bool,
-    deployment_concurrency: Option<u32>,
 ) -> Result<EnvironmentProtectionRules, ApiError> {
     if allowed_refs.iter().any(|r| r.trim().is_empty()) {
         return Err(ApiError::BadRequest(
             "an allowed ref must not be empty".into(),
         ));
     }
-    let deployment_concurrency = match deployment_concurrency {
-        None => None,
-        Some(n) => Some(std::num::NonZeroU32::new(n).ok_or_else(|| {
-            ApiError::BadRequest(
-                "deployment_concurrency must be at least 1; omit it for no limit".into(),
-            )
-        })?),
-    };
     let mut resolved: Vec<String> = Vec::with_capacity(approvers.len());
     for approver in &approvers {
         if approver.trim().is_empty() {
@@ -843,7 +671,6 @@ async fn checked_rules(
         allowed_refs,
         wait_timer_s,
         require_reason,
-        deployment_concurrency,
     })
 }
 
@@ -892,7 +719,7 @@ pub(crate) async fn get_environment_protection(
     summary = "Replace an org Environment's baseline protection rules (ADR-0071 §1)",
     responses(
         (status = 200, body = OrgEnvironmentDto),
-        (status = 400, description = "an approver who is not a Scarab user, an empty entry, or a zero concurrency"),
+        (status = 400, description = "an approver who is not a Scarab user, or an empty entry"),
         (status = 403, description = "not an org admin"),
         (status = 404, description = "no such Environment, or not configured")
     )
@@ -913,7 +740,6 @@ pub(crate) async fn put_environment_protection(
         body.allowed_refs,
         body.wait_timer_s,
         body.require_reason,
-        body.deployment_concurrency,
     )
     .await?;
     // ADR-0073 §3 rule E1: loosening the baseline is a crown jewel.
@@ -1025,7 +851,7 @@ pub(crate) async fn get_environment_project_overlay(
     summary = "Tighten an org Environment for one project (ADR-0071 §3)",
     responses(
         (status = 200, body = EnvironmentProjectOverlayDto),
-        (status = 400, description = "an approver who is not a Scarab user, an empty entry, a zero concurrency or an out-of-range deadline"),
+        (status = 400, description = "an approver who is not a Scarab user, or an empty entry"),
         (status = 403, description = "not an admin of the project or org"),
         (status = 404, description = "no such Environment, or not configured"),
         (status = 409, description = "the project is not eligible for the Environment")
@@ -1052,18 +878,12 @@ pub(crate) async fn put_environment_project_overlay(
              tighten; an org admin must make `{project}` eligible for `{env}` first"
         )));
     }
-    let deployment_gate_deadline = body
-        .deployment_gate_deadline_ms
-        .map(EnvironmentDeploymentDeadline::new)
-        .transpose()
-        .map_err(org_environment_api_error)?;
     let rules = checked_rules(
         &st,
         body.approvers,
         body.allowed_refs,
         body.wait_timer_s,
         body.require_reason,
-        body.deployment_concurrency,
     )
     .await?;
     let overlay = EnvironmentProjectOverlay {
@@ -1071,9 +891,8 @@ pub(crate) async fn put_environment_project_overlay(
         environment: env,
         project,
         rules,
-        deployment_gate_deadline,
     };
-    // ADR-0073 §3 rule E1 plus the gate deadline: loosening an overlay
+    // ADR-0073 §3 rule E1: loosening an overlay
     // (toward the baseline) is a crown jewel; creating one never loosens.
     step_up_unless_tightening(
         &st,

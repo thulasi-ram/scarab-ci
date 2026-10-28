@@ -84,8 +84,7 @@ export default function StepPane(props: {
    * — set when the user clicked this step's docked sidecar chip in the DAG.
    * `null`/absent = the step's main container. */
   focusSidecar?: number | null;
-  /** The step's gate verdict, DeploymentGate wait, or concurrency hold (gates.ts
-   * `gateStatus`) — shown under the stamp. `null` = nothing to say (or viewing
+  /** The step's gate verdict (gates.ts `gateStatus`) — shown under the stamp. `null` = nothing to say (or viewing
    * an older version, which this line does not describe). */
   gateStatus?: GateStatus | null;
 }) {
