@@ -3667,7 +3667,7 @@
           "Policies"
         ],
         "summary": "Evaluate run.create Policies without enforcing or recording (ADR-0075 §9)",
-        "description": "Policies: `policy` (a draft, compiled at the org level; a 400 when it\ndoes not compile), `policy_id` (a stored Policy of this org), or neither\n(the org's and the input's Project's effective Policies, as admission\nconsults them). Input: `input`, `decision_id` (its recorded input and\nschema version), or `pipeline` (compiled here with `libs`; no forge\nread). A supplied or recorded input with a string over its cap is a 400.\nA Pipeline whose Run is over an input cap is answered as admission\ndecides it: each matched Policy is an error, which denies when the Policy\nis enforced.\n\nPermissions: Read on the org for stored Policies (`policy_id`, or\nneither, which is what `scarab validate --server` sends); Administer on\nthe org for a draft `policy`, as saving it would need.",
+        "description": "Policies: `policy` (a draft, compiled at the org level; a 400 when it\ndoes not compile), `policy_id` (a stored Policy of this org), or neither\n(the org's and the input's Project's effective Policies, as admission\nconsults them). Input: `input`, `decision_id` (its recorded input and\nschema version), or `pipeline` (compiled here with `libs`; no forge\nread). A supplied or recorded input with a string or a list over its cap\nis a 400.\nA Pipeline whose Run is over an input cap is answered as admission\ndecides it: each matched Policy is an error, which denies when the Policy\nis enforced.\n\nPermissions: Read on the org for stored Policies (`policy_id`, or\nneither, which is what `scarab validate --server` sends); Administer on\nthe org for a draft `policy`, as saving it would need.",
         "operationId": "policy_test",
         "parameters": [
           {
@@ -3702,7 +3702,7 @@
             }
           },
           "400": {
-            "description": "not one input form, a draft that does not compile, a Pipeline that does not compile, a Run admission refuses before its Policies, an input that cannot be matched, or a supplied input with a string over its cap"
+            "description": "not one input form, a draft that does not compile, a Pipeline that does not compile, a Run admission refuses before its Policies, an input that cannot be matched, or a supplied input with a string or a list over its cap"
           },
           "403": {
             "description": "no Read on the org, or a draft `policy` without Administer on the org"

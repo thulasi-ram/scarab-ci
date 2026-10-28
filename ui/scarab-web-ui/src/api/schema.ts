@@ -1023,7 +1023,8 @@ export interface paths {
          *     (the org's and the input's Project's effective Policies, as admission
          *     consults them). Input: `input`, `decision_id` (its recorded input and
          *     schema version), or `pipeline` (compiled here with `libs`; no forge
-         *     read). A supplied or recorded input with a string over its cap is a 400.
+         *     read). A supplied or recorded input with a string or a list over its cap
+         *     is a 400.
          *     A Pipeline whose Run is over an input cap is answered as admission
          *     decides it: each matched Policy is an error, which denies when the Policy
          *     is enforced.
@@ -7271,7 +7272,7 @@ export interface operations {
                     "application/json": components["schemas"]["PolicyTestResponse"];
                 };
             };
-            /** @description not one input form, a draft that does not compile, a Pipeline that does not compile, a Run admission refuses before its Policies, an input that cannot be matched, or a supplied input with a string over its cap */
+            /** @description not one input form, a draft that does not compile, a Pipeline that does not compile, a Run admission refuses before its Policies, an input that cannot be matched, or a supplied input with a string or a list over its cap */
             400: {
                 headers: {
                     [name: string]: unknown;
