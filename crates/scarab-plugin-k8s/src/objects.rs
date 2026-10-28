@@ -7,9 +7,10 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
 use k8s_openapi::api::core::v1::{
-    Capabilities, Container, EmptyDirVolumeSource, EnvVar, PodSecurityContext, PodSpec,
-    PodTemplateSpec, ProjectedVolumeSource, ResourceRequirements, SeccompProfile, SecurityContext,
-    ServiceAccount, ServiceAccountTokenProjection, Volume, VolumeMount, VolumeProjection,
+    Capabilities, Container, EmptyDirVolumeSource, EnvVar, PersistentVolumeClaim,
+    PersistentVolumeClaimVolumeSource, PodSecurityContext, PodSpec, PodTemplateSpec,
+    ProjectedVolumeSource, ResourceRequirements, SeccompProfile, SecurityContext, ServiceAccount,
+    ServiceAccountTokenProjection, Volume, VolumeMount, VolumeProjection,
 };
 use k8s_openapi::api::networking::v1::{
     IPBlock, NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicyPeer,
@@ -20,8 +21,9 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 
 use scarab_plugin::{
-    service_account_for, PluginInstallation, BROKER_TOKEN_AUDIENCE, PLUGIN_ENV_BROKER_TOKEN_FILE,
-    PLUGIN_ENV_BROKER_URL, RESERVED_CONFIG_KEY_PREFIX,
+    service_account_for, PluginInstallation, PluginStorage, BROKER_TOKEN_AUDIENCE,
+    PLUGIN_ENV_BROKER_TOKEN_FILE, PLUGIN_ENV_BROKER_URL, PLUGIN_STORAGE_OWNER_ANNOTATION,
+    RESERVED_CONFIG_KEY_PREFIX,
 };
 
 use crate::{BrokerPeer, LABEL_INSTALLATION, LABEL_MANAGED_BY, LABEL_PLUGIN_WORKLOAD, MANAGED_BY};
@@ -62,6 +64,13 @@ pub const BROKER_TOKEN_FILE: &str = "token";
 
 /// The unprivileged uid/gid a Plugin runs as (distroless `nonroot`).
 pub const PLUGIN_UID: i64 = 65532;
+
+/// The scratch directory every Plugin gets: the one writable path beside
+/// its storage claim, if it has one.
+pub const PLUGIN_TMP_DIR: &str = "/tmp";
+
+/// The Pod volume an installation's storage claim is mounted from.
+pub const STORAGE_VOLUME: &str = "storage";
 
 /// The CPU ceiling of every container in a Plugin Pod: a spinning (or
 /// compromised) Plugin gets half a core, never the node.
@@ -263,12 +272,18 @@ pub fn baseline_policies(
 
 /// The Pod-level `restricted` profile: non-root, a fixed unprivileged
 /// uid/gid, RuntimeDefault seccomp.
+///
+/// `fsGroup` is the Plugin's gid, so a storage claim whose volume type
+/// supports ownership management is group-writable by the Plugin; with
+/// `OnRootMismatch` the kubelet re-owns it only when its root is not
+/// already the Plugin's, not on every start of a large volume.
 pub fn restricted_pod_security_context() -> PodSecurityContext {
     PodSecurityContext {
         run_as_non_root: Some(true),
         run_as_user: Some(PLUGIN_UID),
         run_as_group: Some(PLUGIN_UID),
         fs_group: Some(PLUGIN_UID),
+        fs_group_change_policy: Some("OnRootMismatch".to_string()),
         seccomp_profile: Some(SeccompProfile {
             type_: "RuntimeDefault".to_string(),
             ..Default::default()
@@ -371,6 +386,65 @@ pub fn deployment(
     )]);
     annotations.extend(template_annotations.clone());
     let quantity = |q: &str| Quantity(q.to_string());
+    let mut volume_mounts = vec![
+        VolumeMount {
+            name: "broker-token".to_string(),
+            mount_path: BROKER_TOKEN_DIR.to_string(),
+            read_only: Some(true),
+            ..Default::default()
+        },
+        // The root is read-only; a Plugin gets a small scratch /tmp and,
+        // if its installation names one, its storage claim.
+        VolumeMount {
+            name: "tmp".to_string(),
+            mount_path: PLUGIN_TMP_DIR.to_string(),
+            ..Default::default()
+        },
+    ];
+    let mut volumes = vec![
+        Volume {
+            name: "broker-token".to_string(),
+            projected: Some(ProjectedVolumeSource {
+                sources: Some(vec![VolumeProjection {
+                    service_account_token: Some(ServiceAccountTokenProjection {
+                        audience: Some(BROKER_TOKEN_AUDIENCE.to_string()),
+                        expiration_seconds: Some(BROKER_TOKEN_EXPIRATION_SECONDS),
+                        path: BROKER_TOKEN_FILE.to_string(),
+                    }),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        Volume {
+            name: "tmp".to_string(),
+            empty_dir: Some(EmptyDirVolumeSource {
+                size_limit: Some(quantity("64Mi")),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    ];
+    // ADR-0074 §7: the operator's claim, read-write. The runtime has
+    // checked it exists and is annotated for this installation
+    // ([`storage_claim_refusal`]) before it applies this.
+    if let Some(storage) = &installation.storage {
+        volume_mounts.push(VolumeMount {
+            name: STORAGE_VOLUME.to_string(),
+            mount_path: storage.mount_path.clone(),
+            read_only: Some(false),
+            ..Default::default()
+        });
+        volumes.push(Volume {
+            name: STORAGE_VOLUME.to_string(),
+            persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                claim_name: storage.claim.clone(),
+                read_only: Some(false),
+            }),
+            ..Default::default()
+        });
+    }
     Deployment {
         metadata: ObjectMeta {
             annotations: Some(annotations),
@@ -424,48 +498,10 @@ pub fn deployment(
                             ])),
                             ..Default::default()
                         }),
-                        volume_mounts: Some(vec![
-                            VolumeMount {
-                                name: "broker-token".to_string(),
-                                mount_path: BROKER_TOKEN_DIR.to_string(),
-                                read_only: Some(true),
-                                ..Default::default()
-                            },
-                            // The root is read-only; a Plugin gets a small
-                            // scratch /tmp and nothing else writable.
-                            VolumeMount {
-                                name: "tmp".to_string(),
-                                mount_path: "/tmp".to_string(),
-                                ..Default::default()
-                            },
-                        ]),
+                        volume_mounts: Some(volume_mounts),
                         ..Default::default()
                     }],
-                    volumes: Some(vec![
-                        Volume {
-                            name: "broker-token".to_string(),
-                            projected: Some(ProjectedVolumeSource {
-                                sources: Some(vec![VolumeProjection {
-                                    service_account_token: Some(ServiceAccountTokenProjection {
-                                        audience: Some(BROKER_TOKEN_AUDIENCE.to_string()),
-                                        expiration_seconds: Some(BROKER_TOKEN_EXPIRATION_SECONDS),
-                                        path: BROKER_TOKEN_FILE.to_string(),
-                                    }),
-                                    ..Default::default()
-                                }]),
-                                ..Default::default()
-                            }),
-                            ..Default::default()
-                        },
-                        Volume {
-                            name: "tmp".to_string(),
-                            empty_dir: Some(EmptyDirVolumeSource {
-                                size_limit: Some(quantity("64Mi")),
-                                ..Default::default()
-                            }),
-                            ..Default::default()
-                        },
-                    ]),
+                    volumes: Some(volumes),
                     ..Default::default()
                 }),
             },
@@ -473,6 +509,75 @@ pub fn deployment(
         }),
         ..Default::default()
     }
+}
+
+/// Why the runtime must not mount `claim` (as read from the plugin
+/// namespace; `None` = it does not exist) for `installation`'s `storage`,
+/// or `None` when it may. The namespace is shared by every Org, so a claim
+/// is mounted only once an operator has annotated it for this installation
+/// ([`PLUGIN_STORAGE_OWNER_ANNOTATION`] = `<org>/<name>`).
+pub fn storage_claim_refusal(
+    namespace: &str,
+    installation: &PluginInstallation,
+    storage: &PluginStorage,
+    claim: Option<&PersistentVolumeClaim>,
+) -> Option<String> {
+    let owner = installation.storage_owner();
+    let annotate = format!("annotated {PLUGIN_STORAGE_OWNER_ANNOTATION}={owner}");
+    let Some(claim) = claim else {
+        return Some(format!(
+            "storage: PersistentVolumeClaim `{}` does not exist in namespace `{namespace}`. \
+             Scarab does not create it: an operator creates it there, {annotate}",
+            storage.claim
+        ));
+    };
+    if claim.metadata.deletion_timestamp.is_some() {
+        return Some(format!(
+            "storage: PersistentVolumeClaim `{}` in namespace `{namespace}` is being deleted",
+            storage.claim
+        ));
+    }
+    let said = claim
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(PLUGIN_STORAGE_OWNER_ANNOTATION));
+    if said != Some(&owner) {
+        return Some(format!(
+            "storage: PersistentVolumeClaim `{}` in namespace `{namespace}` is not {annotate} \
+             ({}), so the plugin does not start with it. The plugin namespace is shared by \
+             every org; the annotation is how an operator says the claim is for this \
+             installation",
+            storage.claim,
+            said.map_or("it has no such annotation".to_string(), |v| format!(
+                "it says `{}`",
+                v.escape_debug()
+            ))
+        ));
+    }
+    None
+}
+
+/// What a Plugin Pod that is not up yet is waiting on, when it is its
+/// storage claim: one that has not bound to a volume. (A claim whose
+/// StorageClass binds on first use stays `Pending` until the Pod is
+/// scheduled, so this is reported as waiting, not failing.)
+pub fn storage_claim_waiting(
+    storage: &PluginStorage,
+    claim: &PersistentVolumeClaim,
+) -> Option<String> {
+    let phase = claim
+        .status
+        .as_ref()
+        .and_then(|s| s.phase.as_deref())
+        .unwrap_or("Pending");
+    (phase != "Bound").then(|| {
+        format!(
+            "waiting for PersistentVolumeClaim `{}` to bind (phase {phase}); Scarab does not \
+             provision it",
+            storage.claim
+        )
+    })
 }
 
 #[cfg(test)]
@@ -509,6 +614,7 @@ mod tests {
             approved_at: 1,
             killed_by: None,
             killed_at: None,
+            storage: None,
         }
     }
 
@@ -663,6 +769,176 @@ mod tests {
             names.iter().filter(|n| **n == "SCARAB_BROKER_URL").count(),
             1
         );
+    }
+
+    fn with_storage(mount_path: Option<&str>) -> PluginInstallation {
+        PluginInstallation {
+            storage: Some(PluginStorage::new("argocd-state", mount_path).unwrap()),
+            ..installation()
+        }
+    }
+
+    /// Without storage a Plugin has the broker token and /tmp, nothing else;
+    /// with it, the claim is one more read-write volume — never a hostPath,
+    /// and the restricted profile is unchanged.
+    #[test]
+    fn storage_adds_one_read_write_claim_volume_and_nothing_else() {
+        let plain = deployment("scarab-plugins", &installation(), BROKER_URL, PROBE_IMAGE);
+        let pod = pod_spec(&plain);
+        let mounts: Vec<_> = pod.containers[0]
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| m.mount_path.as_str())
+            .collect();
+        assert_eq!(mounts, [BROKER_TOKEN_DIR, PLUGIN_TMP_DIR]);
+        assert!(pod
+            .volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|v| v.persistent_volume_claim.is_none()));
+
+        let stored = deployment(
+            "scarab-plugins",
+            &with_storage(Some("/var/lib/argocd")),
+            BROKER_URL,
+            PROBE_IMAGE,
+        );
+        let pod = pod_spec(&stored);
+        let volumes = pod.volumes.as_ref().unwrap();
+        assert_eq!(volumes.len(), 3);
+        let claim = volumes.iter().find(|v| v.name == STORAGE_VOLUME).unwrap();
+        let pvc = claim.persistent_volume_claim.as_ref().unwrap();
+        assert_eq!(pvc.claim_name, "argocd-state");
+        assert_eq!(pvc.read_only, Some(false));
+        assert!(volumes.iter().all(|v| v.host_path.is_none()));
+        let mount = pod.containers[0]
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.name == STORAGE_VOLUME)
+            .unwrap();
+        assert_eq!(mount.mount_path, "/var/lib/argocd");
+        assert_eq!(mount.read_only, Some(false));
+        // The self-check initContainer never sees the claim.
+        assert!(pod.init_containers.as_ref().unwrap()[0]
+            .volume_mounts
+            .is_none());
+        // Same Pod-level profile with and without; the claim is writable by
+        // the Plugin's gid.
+        assert_eq!(pod.security_context, pod_spec(&plain).security_context);
+        let psc = pod.security_context.as_ref().unwrap();
+        assert_eq!(psc.fs_group, Some(PLUGIN_UID));
+        assert_eq!(
+            psc.fs_group_change_policy.as_deref(),
+            Some("OnRootMismatch")
+        );
+        assert_eq!(
+            pod.containers[0].security_context,
+            Some(restricted_container_security_context())
+        );
+    }
+
+    #[test]
+    fn storage_mounts_at_data_by_default() {
+        let d = deployment(
+            "scarab-plugins",
+            &with_storage(None),
+            BROKER_URL,
+            PROBE_IMAGE,
+        );
+        let mount = pod_spec(&d).containers[0]
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.name == STORAGE_VOLUME)
+            .unwrap()
+            .mount_path
+            .clone();
+        assert_eq!(mount, "/data");
+    }
+
+    /// Every path this Deployment mounts itself is one a storage mount path
+    /// may not overlap: the reserved list in `scarab-plugin` covers it.
+    #[test]
+    fn every_runtime_mount_is_reserved_from_storage() {
+        let d = deployment("scarab-plugins", &installation(), BROKER_URL, PROBE_IMAGE);
+        for m in pod_spec(&d).containers[0].volume_mounts.as_ref().unwrap() {
+            assert!(
+                scarab_plugin::validate_storage_mount_path(&m.mount_path).is_err(),
+                "{} must be refused as a storage mount path",
+                m.mount_path
+            );
+        }
+    }
+
+    fn claim(annotation: Option<&str>, phase: Option<&str>) -> PersistentVolumeClaim {
+        PersistentVolumeClaim {
+            metadata: ObjectMeta {
+                name: Some("argocd-state".into()),
+                annotations: annotation.map(|v| {
+                    BTreeMap::from([(PLUGIN_STORAGE_OWNER_ANNOTATION.to_string(), v.to_string())])
+                }),
+                ..Default::default()
+            },
+            status: phase.map(
+                |p| k8s_openapi::api::core::v1::PersistentVolumeClaimStatus {
+                    phase: Some(p.to_string()),
+                    ..Default::default()
+                },
+            ),
+            ..Default::default()
+        }
+    }
+
+    /// The plugin namespace is shared by every Org: a claim is mounted only
+    /// once an operator has annotated it for THIS installation.
+    #[test]
+    fn a_claim_is_mounted_only_when_annotated_for_this_installation() {
+        let inst = with_storage(None);
+        let storage = inst.storage.clone().unwrap();
+        let refusal = |c: Option<&PersistentVolumeClaim>| {
+            storage_claim_refusal("scarab-plugins", &inst, &storage, c)
+        };
+        assert_eq!(refusal(Some(&claim(Some("acme/argocd-prod"), None))), None);
+
+        let missing = refusal(None).unwrap();
+        assert!(
+            missing.contains("`argocd-state` does not exist"),
+            "{missing}"
+        );
+        assert!(missing.contains("Scarab does not create it"), "{missing}");
+        assert!(
+            missing.contains("scarab.io/plugin-installation=acme/argocd-prod"),
+            "{missing}"
+        );
+
+        for other in [
+            None,
+            Some("globex/argocd-prod"),
+            Some("acme/argocd-staging"),
+        ] {
+            let why = refusal(Some(&claim(other, Some("Bound")))).unwrap();
+            assert!(why.contains("`argocd-state`"), "{why}");
+            assert!(why.contains("acme/argocd-prod"), "{why}");
+        }
+    }
+
+    #[test]
+    fn an_unbound_claim_is_waited_on_by_name() {
+        let storage = PluginStorage::new("argocd-state", None).unwrap();
+        assert_eq!(
+            storage_claim_waiting(&storage, &claim(None, Some("Bound"))),
+            None
+        );
+        for phase in [None, Some("Pending"), Some("Lost")] {
+            let why = storage_claim_waiting(&storage, &claim(None, phase)).unwrap();
+            assert!(why.contains("`argocd-state`"), "{why}");
+        }
     }
 
     #[test]

@@ -344,6 +344,18 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "CJ-W",
     ),
     (
+        "PUT",
+        "/v1/orgs/{org}/plugins/{name}/storage",
+        "plugin.storage.put",
+        "COND-W",
+    ),
+    (
+        "DELETE",
+        "/v1/orgs/{org}/plugins/{name}/storage",
+        "plugin.storage.delete",
+        "EX",
+    ),
+    (
         "GET",
         "/v1/orgs/{org}/plugins/{name}/connections",
         "read",

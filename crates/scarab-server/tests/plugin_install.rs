@@ -381,6 +381,121 @@ async fn an_uninstall_retires_the_name() {
     tdb.cleanup().await;
 }
 
+/// ADR-0074 §7: an installation's storage claim is set at install, changed,
+/// cleared and read back over the API, on real Postgres. A shape the runtime
+/// could not mount safely is a 400 and stores nothing.
+#[tokio::test]
+async fn storage_is_set_at_install_changed_and_cleared() {
+    let Some((tdb, pg)) = migrated().await else {
+        return;
+    };
+    let app = apps(pg).public;
+    let plugin = "/v1/orgs/acme/plugins/argocd";
+    let storage_uri = format!("{plugin}/storage");
+
+    // A bad claim or mount path refuses the whole install.
+    for storage in [
+        json!({ "claim": "Not_A_Claim" }),
+        json!({ "claim": "argocd-state", "mount_path": "/tmp/state" }),
+        json!({ "claim": "argocd-state", "mount_path": "/var/run/secrets" }),
+        json!({ "claim": "argocd-state", "mount_path": "/" }),
+        json!({ "claim": "argocd-state", "mount_path": "data" }),
+    ] {
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/orgs/acme/plugins",
+            None,
+            Some(json!({
+                "name": "argocd", "plugin": "argocd", "image": image(), "storage": storage
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{storage}: {body}");
+    }
+    let (status, _) = call(&app, "GET", plugin, None, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "nothing was installed");
+
+    // Installed with a claim and the default mount path.
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/v1/orgs/acme/plugins",
+        None,
+        Some(json!({
+            "name": "argocd", "plugin": "argocd", "image": image(),
+            "storage": { "claim": "argocd-state" }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let want = json!({
+        "claim": "argocd-state",
+        "mount_path": "/data",
+        "owner_annotation": "scarab.io/plugin-installation",
+        "owner_annotation_value": "acme/argocd",
+    });
+    assert_eq!(body["storage"], want);
+    let (_, body) = call(&app, "GET", plugin, None, None).await;
+    assert_eq!(body["storage"], want, "read back from Postgres");
+
+    // Changed: another claim and path.
+    let (status, body) = call(
+        &app,
+        "PUT",
+        &storage_uri,
+        None,
+        Some(json!({ "claim": "argocd-state-v2", "mount_path": "/var/lib/argocd/" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["storage"]["claim"], "argocd-state-v2");
+    assert_eq!(body["storage"]["mount_path"], "/var/lib/argocd");
+
+    // A bad change is refused and changes nothing.
+    let (status, _) = call(
+        &app,
+        "PUT",
+        &storage_uri,
+        None,
+        Some(json!({ "claim": "argocd-state", "mount_path": "/tmp" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (_, body) = call(&app, "GET", plugin, None, None).await;
+    assert_eq!(body["storage"]["claim"], "argocd-state-v2");
+
+    // Cleared, and clearing again is a no-op.
+    for _ in 0..2 {
+        let (status, body) = call(&app, "DELETE", &storage_uri, None, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["storage"], Value::Null);
+    }
+    let (_, body) = call(&app, "GET", plugin, None, None).await;
+    assert_eq!(body["storage"], Value::Null);
+
+    // No such installation.
+    let (status, _) = call(
+        &app,
+        "PUT",
+        "/v1/orgs/acme/plugins/nope/storage",
+        None,
+        Some(json!({ "claim": "argocd-state" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = call(
+        &app,
+        "DELETE",
+        "/v1/orgs/acme/plugins/nope/storage",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    tdb.cleanup().await;
+}
+
 /// Installing, listing and killing need Administer on the Org.
 #[tokio::test]
 async fn a_member_cannot_install_list_or_kill() {

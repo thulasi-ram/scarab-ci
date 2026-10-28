@@ -913,6 +913,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/orgs/{org}/plugins/{name}/storage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Set a plugin installation's storage claim (ADR-0074)
+         * @description Adding storage to an installation that has none needs no step-up; moving
+         *     it to another claim or path does (ADR-0073 §3, window), since that
+         *     re-aims what the plugin reads and writes.
+         */
+        put: operations["put_plugin_storage"];
+        post?: never;
+        /** Stop mounting a plugin installation's storage claim (ADR-0074) */
+        delete: operations["delete_plugin_storage"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/orgs/{org}/principals": {
         parameters: {
             query?: never;
@@ -2562,6 +2585,7 @@ export interface components {
             name: string;
             /** @description The catalog plugin (`argocd`). */
             plugin: string;
+            storage?: null | components["schemas"]["PluginStorageRequest"];
         };
         /**
          * @description Whether an installation's broker calls are accepted.
@@ -3014,6 +3038,7 @@ export interface components {
             runtime_message: string;
             runtime_status: components["schemas"]["RuntimeStatusDto"];
             state: components["schemas"]["InstallationStateDto"];
+            storage?: null | components["schemas"]["PluginStorageDto"];
         };
         /**
          * @description What the plugin asks for — exactly what an admin approves with the
@@ -3024,6 +3049,39 @@ export interface components {
             config_keys: string[];
             connections: components["schemas"]["ConnectionSlotDto"][];
             plugin: string;
+        };
+        /**
+         * @description An installation's storage (ADR-0074 §7): a PersistentVolumeClaim an
+         *     operator created in the plugin namespace. Scarab mounts it read-write; it
+         *     never creates, backs up or reads it.
+         */
+        PluginStorageDto: {
+            /** @description The claim's name in the plugin namespace. */
+            claim: string;
+            /** @description Where the Plugin's container sees it. */
+            mount_path: string;
+            /** @description The annotation the claim must carry before the runtime mounts it… */
+            owner_annotation: string;
+            /**
+             * @description …and its value, `<org>/<installation name>`. The plugin namespace is
+             *     shared by every org; this is how the operator says which
+             *     installation the claim is for.
+             */
+            owner_annotation_value: string;
+        };
+        /** @description `storage` on an install, and `PUT …/plugins/{name}/storage`. */
+        PluginStorageRequest: {
+            /**
+             * @description The PersistentVolumeClaim's name in the plugin namespace (a DNS-1123
+             *     subdomain). Scarab does not create it.
+             */
+            claim: string;
+            /**
+             * @description An absolute path in the Plugin's container; omitted = `/data`. Not
+             *     `/`, and clear of `/tmp`, `/var/run/secrets` and the other paths the
+             *     runtime or the kubelet mounts.
+             */
+            mount_path?: string | null;
         };
         /** @description A Principal, as the grant/approver typeahead offers it (ADR-0069 §3). */
         PrincipalDto: {
@@ -6026,7 +6084,7 @@ export interface operations {
                     "application/json": components["schemas"]["PluginInstallationDto"];
                 };
             };
-            /** @description invalid name or config */
+            /** @description invalid name, config or storage */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -6363,6 +6421,116 @@ export interface operations {
             };
             /** @description no such installation, or plugins not configured */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    put_plugin_storage: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description installation name */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PluginStorageRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PluginInstallationDto"];
+                };
+            };
+            /** @description invalid claim or mount path */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin, or a step-up is required — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description no such installation, or plugins not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the storage changed meanwhile */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_plugin_storage: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description installation name */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PluginInstallationDto"];
+                };
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such installation, or plugins not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the storage changed meanwhile */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

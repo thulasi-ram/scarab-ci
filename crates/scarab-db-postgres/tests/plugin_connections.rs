@@ -63,6 +63,7 @@ fn installation(org: &str, name: &str, id: &str) -> PluginInstallation {
         approved_at: 1_000,
         killed_by: None,
         killed_at: None,
+        storage: None,
     }
 }
 

@@ -130,7 +130,8 @@ impl Baseline {
             Err(
                 e @ (RuntimeError::Kube(_)
                 | RuntimeError::Invalid(_)
-                | RuntimeError::BrokerUnresolved(_)),
+                | RuntimeError::BrokerUnresolved(_)
+                | RuntimeError::Storage(_)),
             ) => Baseline::Unavailable(e.to_string()),
         }
     }
@@ -495,7 +496,7 @@ impl PluginRuntimeLoop {
                         // crucially — the probe that allowed it, so the next
                         // pass does not take it for a fresh install and
                         // re-probe.
-                        Ok(()) => match self.runtime.workload_state(&installation.id).await {
+                        Ok(()) => match self.runtime.workload_state(installation).await {
                             Ok(state) => running_status(&state),
                             Err(e) => (RuntimeStatus::Pending, format!("state unknown: {e}")),
                         },
@@ -556,6 +557,7 @@ mod tests {
             approved_at: 1,
             killed_by: None,
             killed_at: None,
+            storage: None,
         }
     }
 

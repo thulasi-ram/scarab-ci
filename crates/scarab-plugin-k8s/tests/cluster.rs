@@ -428,6 +428,7 @@ fn installation(image: &str) -> PluginInstallation {
         approved_at: 1,
         killed_by: None,
         killed_at: None,
+        storage: None,
     }
 }
 
@@ -467,8 +468,10 @@ async fn a_workload_is_admitted_stopped_and_uninstalled() {
                 admitted = Some(pod);
                 break;
             }
-            if let WorkloadState::Failing(why) =
-                runtime.workload_state(INSTALLATION_ID).await.unwrap()
+            if let WorkloadState::Failing(why) = runtime
+                .workload_state(&installation(&probe_image()))
+                .await
+                .unwrap()
             {
                 if why.contains("PodSecurity") {
                     panic!("restricted Pod Security refused the plugin Pod: {why}");
@@ -502,7 +505,10 @@ async fn a_workload_is_admitted_stopped_and_uninstalled() {
 
         runtime.stop(INSTALLATION_ID).await.expect("stop");
         assert_eq!(
-            runtime.workload_state(INSTALLATION_ID).await.unwrap(),
+            runtime
+                .workload_state(&installation(&probe_image()))
+                .await
+                .unwrap(),
             WorkloadState::Stopped
         );
         let sas: Api<ServiceAccount> = Api::namespaced(f.client.clone(), &f.plugins_ns);
@@ -514,7 +520,10 @@ async fn a_workload_is_admitted_stopped_and_uninstalled() {
 
         runtime.uninstall(INSTALLATION_ID).await.expect("uninstall");
         assert_eq!(
-            runtime.workload_state(INSTALLATION_ID).await.unwrap(),
+            runtime
+                .workload_state(&installation(&probe_image()))
+                .await
+                .unwrap(),
             WorkloadState::Absent
         );
         runtime
@@ -577,7 +586,10 @@ async fn in_an_open_namespace_the_self_check_keeps_the_plugin_from_starting() {
         let wait = Duration::from_secs(u64::from(SELF_CHECK_DEADLINE_SECONDS) + 120);
         let started = Instant::now();
         while started.elapsed() < wait {
-            state = runtime.workload_state(INSTALLATION_ID).await.unwrap();
+            state = runtime
+                .workload_state(&installation(&probe_image()))
+                .await
+                .unwrap();
             if matches!(&state, WorkloadState::Failing(why) if why.contains("self-check")) {
                 break;
             }
