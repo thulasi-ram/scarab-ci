@@ -591,23 +591,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/orgs/{org}/board": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** The Environment board: what is live on each DeploymentTarget (ADR-0070) */
-        get: operations["get_environment_board"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/v1/orgs/{org}/environment-migration-report": {
         parameters: {
             query?: never;
@@ -672,65 +655,11 @@ export interface paths {
         put: operations["put_org_environment"];
         post?: never;
         /**
-         * Delete an org Environment with no Deployments (ADR-0071)
+         * Delete an org Environment (ADR-0071)
          * @description Refused (409) while any Project holds an overlay or privilege grant in
-         *     it (ADR-0071 §3, §8: those are never dropped as a side effect), and while
-         *     the Deployment record holds anything for the name:
-         *     the record is keyed by name, so deleting and re-creating the Environment
-         *     would silently re-adopt that history under whatever the new one says.
+         *     it (ADR-0071 §3, §8: those are never dropped as a side effect).
          */
         delete: operations["delete_org_environment"];
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/orgs/{org}/environments/{env}/deployment-targets": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** An Environment's reported DeploymentTargets and their owners (ADR-0072) */
-        get: operations["environment_deployment_targets"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/orgs/{org}/environments/{env}/deployments": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** An Environment's Deployments, newest first (ADR-0070) */
-        get: operations["list_environment_deployments"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/orgs/{org}/environments/{env}/deployments/{id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** One Deployment and its stages (ADR-0070) */
-        get: operations["get_deployment"];
-        put?: never;
-        post?: never;
-        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -882,9 +811,7 @@ export interface paths {
         /**
          * Install a first-party plugin (ADR-0072)
          * @description Third-party installs are off (403), and so are installs while
-         *     `SCARAB_PLUGINS=off` (409). The response lists any Environment source
-         *     that already named this installation — written before it existed — which
-         *     it now feeds.
+         *     `SCARAB_PLUGINS=off` (409).
          */
         post: operations["install_plugin"];
         delete?: never;
@@ -980,23 +907,6 @@ export interface paths {
         put?: never;
         /** Kill a plugin installation at once (ADR-0072) */
         post: operations["kill_plugin"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/orgs/{org}/plugins/{name}/unmapped-groupings": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** A plugin's vendor groupings no Environment lists (ADR-0071 §5) */
-        get: operations["unmapped_groupings"];
-        put?: never;
-        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -1508,10 +1418,9 @@ export interface paths {
         put?: never;
         /**
          * Reject a waiting gate: fail it with a reason (ADR-0070 §9).
-         * @description For any gate — `manual`, `timer`, `external` or `deployment` — that is
-         *     pending and reached (every step it needs has succeeded; slice b, criteria 2
-         *     and 3). A deployment gate can only be rejected, never approved or
-         *     released: core passes it from the Deployment record. The gate's Attempt fails with
+         * @description For any gate — `manual`, `timer` or `external` — that is pending and
+         *     reached (every step it needs has succeeded; slice b, criteria 2 and 3).
+         *     The gate's Attempt fails with
          *     the reason and the rejecting principal, its dependents are skipped, and the
          *     run ends `failed`; retrying the gate opens a new wait that asks again.
          *
@@ -2088,10 +1997,7 @@ export interface components {
              *     | `config` | `missing-inputs` (an input snapshot gone from every tier —
              *     Rerun/Retry regenerates it; ticket e140121) | `gate` (a gate's wait
              *     resolved failed — e.g. not released within `gate_expires_after`; the
-             *     reason is in `failure_detail`) | `deployment-request-incomplete` (the
-             *     step exited 0 but its results could not complete a DeploymentRequest
-             *     it declares; never auto-retried; what is missing is in
-             *     `failure_detail`).
+             *     reason is in `failure_detail`).
              */
             failure?: string | null;
             /**
@@ -2421,193 +2327,6 @@ export interface components {
             id: string;
         };
         /**
-         * @description One Deployment: a DeploymentVersion made (or asked to be made) live on a
-         *     DeploymentTarget, and what was reported about it since (ADR-0070 §2).
-         */
-        DeploymentDto: {
-            /**
-             * Format: int64
-             * @description Unix-ms.
-             */
-            created_at: number;
-            /**
-             * Format: int64
-             * @description Org-scoped and stable: the sequence number of the input that created
-             *     it.
-             */
-            id: number;
-            /** @description The stages, oldest first. */
-            reports: components["schemas"]["DeploymentStatusReportDto"][];
-            /**
-             * @description In the order their requests arrived, claims included. Who made it
-             *     live is the requesters that are not claims; `unexplained` says
-             *     whether there is one.
-             */
-            requesters: components["schemas"]["DeploymentRequesterDto"][];
-            status: components["schemas"]["DeploymentStatusDto"];
-            /**
-             * Format: int64
-             * @description Unix-ms a newer Deployment took its place, if one has.
-             */
-            superseded_at?: number | null;
-            target: components["schemas"]["DeploymentTargetDto"];
-            /**
-             * @description Display term: requested on a DeploymentTarget its source has never
-             *     reported on.
-             */
-            unconfirmed: boolean;
-            /**
-             * @description Display term: no Deploy Run's request explains it — a change made
-             *     outside Scarab. It may still carry claims.
-             */
-            unexplained: boolean;
-            /** @description Opaque, in the source's scheme; compared only for equality. */
-            version: string;
-            /** @description Whether it was ever reported live. */
-            was_ever_live: boolean;
-        };
-        /**
-         * @description A waiting DeploymentGate: the DeploymentTarget it waits on and, once its
-         *     requester's DeploymentRequest is in the record, where that Deployment
-         *     stands (as the Deployments view folds it).
-         */
-        DeploymentGateDto: {
-            /**
-             * Format: int64
-             * @description The Deployment the requester's current request landed on.
-             */
-            deployment_id?: number | null;
-            deployment_status?: null | components["schemas"]["DeploymentStatusDto"];
-            environment: string;
-            /**
-             * Format: int64
-             * @description When this gate fails `stalled` if nothing decisive is reported first
-             *     (epoch millis): its wait's window opening plus its Project's effective
-             *     gate deadline — the engine's own computation (git-bug `ec84c5d`).
-             *     Absent when unknown (no Deployment, or the deadline could not be read).
-             */
-            fails_at?: number | null;
-            /** @description The latest source report's label, when it has one. */
-            latest_label?: string | null;
-            /**
-             * @description `true` when the Deployment record could not be read for this view (a
-             *     store error, logged): the Deployment fields are then absent because
-             *     they are unknown, not because no Deployment is recorded. Omitted when
-             *     `false`.
-             */
-            record_unreadable?: boolean;
-            target_id: string;
-            target_source: string;
-            /** @description The DeploymentVersion asked for. */
-            version?: string | null;
-        };
-        /** @description A Deploy Run step that requested a Deployment. */
-        DeploymentRequesterDto: {
-            /**
-             * @description Only a claim: the request joined a Deployment a source report created,
-             *     and its Step started after Scarab first saw that Deployment — so it
-             *     did not make it live and does not explain it (ADR-0070 §2).
-             */
-            claim: boolean;
-            /**
-             * Format: int64
-             * @description Unix-ms the requesting Step started.
-             */
-            effective_at: number;
-            /**
-             * @description What the Step offered as evidence for the change — image digests,
-             *     typically — read from its results (ADR-0070 §7). Shown, never used to
-             *     correlate; empty when it declared none.
-             */
-            evidence: string[];
-            /**
-             * @description The Project the run belongs to, when it is stamped and in this Org —
-             *     what a link to the run (`/{org}/{project}/runs/{run}`) needs.
-             */
-            project?: string | null;
-            run: string;
-            step: string;
-        };
-        /**
-         * @description A DeploymentTarget a source reports into an Environment — one whose
-         *     grouping the Environment lists NOW: who reports it, its owners and
-         *     declared version scheme, and its last status as reported HERE.
-         */
-        DeploymentSourceTargetDto: {
-            last_label?: string | null;
-            /** Format: int64 */
-            last_sequence: number;
-            /** @description `in_progress` / `live` / `failed`, as last reported here. */
-            last_status?: string | null;
-            /**
-             * @description The last status reported into THIS Environment; absent when its last
-             *     status went elsewhere (or nowhere) — a status recorded in another
-             *     Environment is never shown as this one's.
-             */
-            last_version?: string | null;
-            /** @description Projects (`org/repo`) that own the target, as the source last said. */
-            owner_projects: string[];
-            /**
-             * Format: int64
-             * @description Unix-ms the owners were last reported.
-             */
-            owners_reported_at?: number | null;
-            /** @description `plugin:<name>`. */
-            principal: string;
-            /**
-             * @description Its source owes a re-send here: the grouping was mapped or moved into
-             *     this Environment after its last status. A running reporter re-sends
-             *     within about a minute (ADR-0070 §11), and it appears on the board.
-             */
-            resend: boolean;
-            /** @description The reporting installation's name — the target's `source`. */
-            source: string;
-            target_id: string;
-            /**
-             * Format: int64
-             * @description Unix-ms.
-             */
-            updated_at: number;
-            vendor_grouping: string;
-            version_scheme?: string | null;
-        };
-        /**
-         * @description A Deployment's fixed, vendor-neutral status (ADR-0070 §5).
-         * @enum {string}
-         */
-        DeploymentStatusDto: "requested" | "in_progress" | "live" | "failed" | "stalled" | "superseded";
-        /** @description One stage of a Deployment as its source reported it. */
-        DeploymentStatusReportDto: {
-            /**
-             * Format: int64
-             * @description Unix-ms Scarab received the report — the time the record is ordered by.
-             */
-            at: number;
-            /** @description Free-form; shown, never interpreted. */
-            label: string;
-            /**
-             * @description Where the source shows this stage. Only an `http`/`https` URL is
-             *     passed on; any other scheme reads as absent.
-             */
-            link?: string | null;
-            /**
-             * Format: int64
-             * @description Unix-ms the source stamped on it, by its own clock. Display only.
-             *     Present on every recorded report.
-             */
-            source_at?: number | null;
-            status: components["schemas"]["SourceAssertedStatusDto"];
-        };
-        /**
-         * @description The smallest unit a Deployment can independently succeed or fail on.
-         *     `source` + `id` are opaque and source-supplied.
-         */
-        DeploymentTargetDto: {
-            environment: string;
-            id: string;
-            source: string;
-        };
-        /**
          * @description Which trigger a dispatch opts into: a human [`Manual`](DispatchKind::Manual)
          *     dispatch (the default) or its programmatic [`Api`](DispatchKind::Api) sibling
          *     (ADR-0043 §4). The named pipeline must declare the matching `on:` trigger to
@@ -2666,38 +2385,9 @@ export interface components {
             allowed_ref_layers: string[][];
             /** @description Baseline approvers, then the overlay's not already listed — all required. */
             approvers: string[];
-            /** Format: int32 */
-            deployment_concurrency?: number | null;
-            /**
-             * Format: int64
-             * @description The deadline this Project's DeploymentGates use.
-             */
-            deployment_gate_deadline_ms: number;
             require_reason: boolean;
             /** Format: int32 */
             wait_timer_s: number;
-        };
-        /** @description One DeploymentTarget's line on the Environment board. */
-        EnvironmentBoardRowDto: {
-            live?: null | components["schemas"]["DeploymentDto"];
-            moved_away?: null | components["schemas"]["MovedAwayDto"];
-            newest?: null | components["schemas"]["DeploymentDto"];
-            target: components["schemas"]["DeploymentTargetDto"];
-        };
-        /** @description A source allowed to report into an Environment (ADR-0071 §5). */
-        EnvironmentDeploymentSourceDto: {
-            /**
-             * @description The PluginInstallation's name: a DNS-1123 label (lowercase letters,
-             *     digits, `-`; at most 63), installed in this org — a PUT naming one
-             *     that is not is refused (400).
-             */
-            installation: string;
-            /**
-             * @description The vendor's grouping that maps into this Environment (an Argo CD
-             *     project, say). Opaque; matched exactly, no wildcards. No leading or
-             *     trailing whitespace (refused, never trimmed).
-             */
-            vendor_grouping: string;
         };
         /**
          * @description Which Projects may run Deploy Runs into an Environment (ADR-0071 §2):
@@ -2772,10 +2462,6 @@ export interface components {
         EnvironmentProjectOverlayDto: {
             allowed_refs: string[];
             approvers: string[];
-            /** Format: int32 */
-            deployment_concurrency?: number | null;
-            /** Format: int64 */
-            deployment_gate_deadline_ms?: number | null;
             require_reason: boolean;
             /** Format: int32 */
             wait_timer_s: number;
@@ -2794,12 +2480,6 @@ export interface components {
             allowed_refs: string[];
             /** @description Principal ids; every one must approve (AND). */
             approvers: string[];
-            /**
-             * Format: int32
-             * @description In-flight Deployments per DeploymentTarget; absent = no limit.
-             *     Enforced once deployment requests ship (ADR-0071 §9).
-             */
-            deployment_concurrency?: number | null;
             /** @description A human dispatch must carry a reason (ADR-0057 §3). */
             require_reason: boolean;
             /**
@@ -2845,18 +2525,9 @@ export interface components {
              *     external gate's token). Absent for a verdict the engine reached.
              */
             by?: string | null;
-            /**
-             * Format: int64
-             * @description The Deployment a DeploymentGate's verdict was read from (its
-             *     Org-scoped id, as the Deployments view shows it).
-             */
-            deployment_id?: number | null;
             /** @description `true`: the gate passed and its dependents may run. */
             passed: boolean;
-            /**
-             * @description Why — a timer elapsing, a DeploymentGate's "v1 live on …", the
-             *     source's failure label, a rejection's reason.
-             */
+            /** @description Why — a timer elapsing, an expiry, a rejection's reason. */
             reason?: string | null;
         };
         /** @description A permission the forge reports as granted. */
@@ -2892,13 +2563,8 @@ export interface components {
             /** @description The catalog plugin (`argocd`). */
             plugin: string;
         };
-        /** @description An Environment source that routes one of the installation's groupings. */
-        InstallationDeploymentSourceDto: {
-            environment: string;
-            vendor_grouping: string;
-        };
         /**
-         * @description Whether an installation's reports and broker calls are accepted.
+         * @description Whether an installation's broker calls are accepted.
          * @enum {string}
          */
         InstallationStateDto: "enabled" | "killed";
@@ -3057,14 +2723,6 @@ export interface components {
              */
             token: string;
         };
-        /** @description Where a moved DeploymentTarget's reports go now. */
-        MovedAwayDto: {
-            /**
-             * @description The Environment that lists its source's grouping now; absent = none
-             *     does (unmapped — its reports are dropped).
-             */
-            now?: string | null;
-        };
         /**
          * @description What a human is asked to confirm: the server-rendered, redacted
          *     description of one operation (shown in the 403, on the confirm page and
@@ -3085,14 +2743,6 @@ export interface components {
              * @description Unix-ms.
              */
             created_at: number;
-            /**
-             * Format: int64
-             * @description The EnvironmentDeploymentDeadline: how long a Deployment here may stay
-             *     `requested` or `in_progress` before it reads `stalled`.
-             */
-            deployment_deadline_ms: number;
-            /** @description Sorted by installation, then vendor grouping. */
-            deployment_sources: components["schemas"]["EnvironmentDeploymentSourceDto"][];
             description: string;
             /**
              * @description Which Projects may deploy here. Read-only here: written through
@@ -3338,11 +2988,6 @@ export interface components {
             config: {
                 [key: string]: string;
             };
-            /**
-             * @description The Environment sources that name this installation — at install,
-             *     the ones written before it existed, which it now feeds.
-             */
-            deployment_sources: components["schemas"]["InstallationDeploymentSourceDto"][];
             /** @description Server-minted, 10 hex; names the installation's ServiceAccount. */
             id: string;
             image: string;
@@ -3354,10 +2999,7 @@ export interface components {
             killed_by?: string | null;
             manifest: components["schemas"]["PluginManifestDto"];
             manifest_sha256: string;
-            /**
-             * @description Unique in the org and never reused; reports carry it as their
-             *     DeploymentTarget `source`.
-             */
+            /** @description Unique in the org and never reused. */
             name: string;
             org: string;
             /** @description The catalog plugin. */
@@ -3372,7 +3014,6 @@ export interface components {
             runtime_message: string;
             runtime_status: components["schemas"]["RuntimeStatusDto"];
             state: components["schemas"]["InstallationStateDto"];
-            usage: components["schemas"]["PluginUsageDto"];
         };
         /**
          * @description What the plugin asks for — exactly what an admin approves with the
@@ -3383,28 +3024,6 @@ export interface components {
             config_keys: string[];
             connections: components["schemas"]["ConnectionSlotDto"][];
             plugin: string;
-        };
-        /**
-         * @description How much of its per-installation caps an installation uses: past one, a
-         *     report about a NEW target (or a new unmapped grouping) is rejected; known
-         *     targets keep reporting.
-         */
-        PluginUsageDto: {
-            /** Format: int64 */
-            max_targets: number;
-            /** Format: int64 */
-            max_unmapped_groupings: number;
-            /**
-             * Format: int64
-             * @description DeploymentTargets it has reported on.
-             */
-            targets: number;
-            /**
-             * Format: int64
-             * @description Groupings counted as reported on with no Environment listing them
-             *     (one an Environment lists since stays counted until its next report).
-             */
-            unmapped_groupings: number;
         };
         /** @description A Principal, as the grant/approver typeahead offers it (ADR-0069 §3). */
         PrincipalDto: {
@@ -3451,11 +3070,6 @@ export interface components {
         ProjectEnvironmentDto: {
             /** @description The Environment's baseline, set by an org admin. */
             baseline: components["schemas"]["EnvironmentProtectionRulesDto"];
-            /**
-             * Format: int64
-             * @description The Environment's EnvironmentDeploymentDeadline.
-             */
-            deployment_deadline_ms: number;
             /** @description What admission enforces: the baseline merged with the overlay. */
             effective: components["schemas"]["EffectiveProtectionDto"];
             /**
@@ -3466,30 +3080,17 @@ export interface components {
             eligible: boolean;
             name: string;
             overlay?: null | components["schemas"]["EnvironmentProtectionRulesDto"];
-            /**
-             * Format: int64
-             * @description The overlay's tighter deadline for this Project's DeploymentGates.
-             */
-            overlay_deployment_gate_deadline_ms?: number | null;
             privilege_grant?: null | components["schemas"]["EnvironmentProjectPrivilegeGrantDto"];
         };
         /**
          * @description A Project overlay (`…/projects/{project}/overlay`) body: the baseline's
-         *     five rules, which can only **tighten** (ADR-0071 §3), plus a tighter
-         *     deadline for this Project's DeploymentGates. Replaced whole, omitted =
-         *     permissive default, unknown fields refused — as for the baseline.
+         *     four rules, which can only **tighten** (ADR-0071 §3). Replaced whole,
+         *     omitted = permissive default, unknown fields refused — as for the
+         *     baseline.
          */
         PutEnvironmentProjectOverlayRequest: {
             allowed_refs?: string[];
             approvers?: string[];
-            /** Format: int32 */
-            deployment_concurrency?: number | null;
-            /**
-             * Format: int64
-             * @description 60000 to 604800000; applies to this Project's DeploymentGates only,
-             *     and only when shorter than the Environment's. Omitted = none.
-             */
-            deployment_gate_deadline_ms?: number | null;
             require_reason?: boolean;
             /** Format: int32 */
             wait_timer_s?: number;
@@ -3505,11 +3106,12 @@ export interface components {
             privileged_images?: components["schemas"]["ImageGrantDto"][];
         };
         /**
-         * @description A baseline (`…/protection`) body: the five rules, replaced whole. Every
+         * @description A baseline (`…/protection`) body: the four rules, replaced whole. Every
          *     field is optional and an omitted one takes the **permissive** default —
          *     never the stored value — so `{}` resets the baseline to permissive.
          *     Unknown fields are refused, so the retired per-repo shape (`wait_timer`,
-         *     `concurrency`) is a 400, not a silently ignored rule.
+         *     `concurrency`) — and `deployment_concurrency`, which ADR-0074 removed — is
+         *     a 400, not a silently ignored rule.
          */
         PutEnvironmentProtectionRequest: {
             /** @description Ref globs (`refs/heads/main`, `refs/tags/*`); empty = any ref. */
@@ -3519,12 +3121,6 @@ export interface components {
              *     merged id is stored as the Principal it now is. All must approve.
              */
             approvers?: string[];
-            /**
-             * Format: int32
-             * @description In-flight Deployments per DeploymentTarget, at least 1; omitted or
-             *     `null` = no limit. Enforced once deployment requests ship (§9).
-             */
-            deployment_concurrency?: number | null;
             /** @description A human dispatch must carry a reason (ADR-0057 §3). Omitted = off. */
             require_reason?: boolean;
             /**
@@ -3536,18 +3132,11 @@ export interface components {
         /**
          * @description `PUT /v1/orgs/{org}/environments/{env}`: the whole Environment, replaced.
          *     An omitted optional field takes its default — it does not keep the stored
-         *     value. Unknown fields are refused, so a misspelt field is a 4xx rather
-         *     than a silently reset deadline.
+         *     value. Unknown fields are refused, so a misspelt field — or one ADR-0074
+         *     removed (`deployment_deadline_ms`, `deployment_sources`) — is a 4xx rather
+         *     than silently ignored.
          */
         PutOrgEnvironmentRequest: {
-            /**
-             * Format: int64
-             * @description 60000 (1 minute) to 604800000 (7 days); omitted = the server default
-             *     (one hour).
-             */
-            deployment_deadline_ms?: number | null;
-            /** @description The complete list; it replaces the stored one. `[]` clears it. */
-            deployment_sources: components["schemas"]["EnvironmentDeploymentSourceDto"][];
             /** @description Free text; omitted = empty. */
             description?: string | null;
         };
@@ -3997,12 +3586,6 @@ export interface components {
              */
             retention_days: number;
         };
-        /**
-         * @description The statuses a source may assert in a report (INV-DEP-6) — a subset of
-         *     [`DeploymentStatusDto`], typed apart so the wire says so too.
-         * @enum {string}
-         */
-        SourceAssertedStatusDto: "in_progress" | "live" | "failed";
         /** @description One step (IR subset): the step contract is an OCI `image` + `command`. */
         StepDto: {
             command?: string[];
@@ -4108,21 +3691,13 @@ export interface components {
              */
             attempt_list?: components["schemas"]["AttemptDto"][];
             attempts: number;
-            deployment_gate?: null | components["schemas"]["DeploymentGateDto"];
             /**
-             * @description `manual`/`timer`/`external`/`deployment` if this step is a gate
-             *     (ADR-0008, ADR-0070 §8), else absent. Gates launch no pod; a waiting
+             * @description `manual`/`timer`/`external` if this step is a gate (ADR-0008), else
+             *     absent. Gates launch no pod; a waiting
              *     gate holds only the steps that need it.
              */
             gate?: string | null;
             gate_resolution?: null | components["schemas"]["GateResolutionDto"];
-            /**
-             * @description Why this deploy Step is held `pending` by per-DeploymentTarget
-             *     concurrency (ADR-0071 §9), e.g. "held: waiting for deployment
-             *     concurrency on `argocd`/`web` (1/1 in flight)". Derived each read
-             *     (nothing is journalled per scheduler pass). Absent when not held.
-             */
-            held?: string | null;
             id: string;
             /**
              * @description Upstream step ids this step depends on — the DAG in-edges (ADR-0006). The
@@ -4257,32 +3832,10 @@ export interface components {
         /** @description What an uninstall removed. */
         UninstalledPluginDto: {
             name: string;
-            /** @description The Environment sources that named it — removed with it. */
-            removed_deployment_sources: components["schemas"]["InstallationDeploymentSourceDto"][];
-        };
-        /** @description A grouping the installation reports on that no Environment lists. */
-        UnmappedGroupingDto: {
-            /**
-             * Format: int64
-             * @description Unix-ms.
-             */
-            first_at: number;
-            /**
-             * Format: int64
-             * @description Unix-ms.
-             */
-            last_at: number;
-            last_target_id: string;
-            /**
-             * Format: int64
-             * @description Reports dropped for it so far.
-             */
-            reports: number;
-            vendor_grouping: string;
         };
         /** @description One waiting gate of a run in the list view ([`RunSummaryDto::waiting_gates`]). */
         WaitingGateDto: {
-            /** @description The gate kind: `manual` / `timer` / `external` / `deployment`. */
+            /** @description The gate kind: `manual` / `timer` / `external`. */
             kind: string;
             /**
              * Format: int64
@@ -5525,48 +5078,6 @@ export interface operations {
             };
         };
     };
-    get_environment_board: {
-        parameters: {
-            query?: {
-                /**
-                 * @description Only this Environment's rows; omitted = every Environment with any
-                 *     Deployment.
-                 */
-                environment?: string;
-            };
-            header?: never;
-            path: {
-                /** @description org */
-                org: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["EnvironmentBoardRowDto"][];
-                };
-            };
-            /** @description no Read on the org */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description deployments not configured */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
     get_environment_migration_report: {
         parameters: {
             query?: never;
@@ -5741,38 +5252,22 @@ export interface operations {
                     "application/json": components["schemas"]["OrgEnvironmentDto"];
                 };
             };
-            /** @description invalid name, deadline or source, or a source naming no installation in the org */
+            /** @description invalid name or description, or an unknown field */
             400: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content?: never;
             };
-            /** @description not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            /** @description not an org admin */
             403: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content: {
-                    "application/json": components["schemas"]["StepUpRefusal"];
-                };
+                content?: never;
             };
             /** @description org Environments not configured */
             404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description a source is already listed by another Environment */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
-            429: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -5817,7 +5312,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description the Environment has Deployments, or project overlays or grants */
+            /** @description project overlays or grants still pin the Environment */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -5826,144 +5321,6 @@ export interface operations {
             };
             /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
             429: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    environment_deployment_targets: {
-        parameters: {
-            query?: {
-                /**
-                 * @description Start after this target — the last row of the previous page: its
-                 *     `source` …
-                 */
-                after_source?: string;
-                /** @description … and its `target_id`. Both or neither. */
-                after_target_id?: string;
-                /**
-                 * @description Page size: default 500, at most 1000. A page shorter than this is
-                 *     the last.
-                 */
-                limit?: number;
-            };
-            header?: never;
-            path: {
-                /** @description org */
-                org: string;
-                /** @description environment name */
-                env: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["DeploymentSourceTargetDto"][];
-                };
-            };
-            /** @description no Read on the org */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description plugins not configured */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    list_environment_deployments: {
-        parameters: {
-            query?: {
-                target_source?: string;
-                target_id?: string;
-                /**
-                 * @description At most this many, newest first (default 200, capped at 1000). Bounds
-                 *     the response only: the server still folds the Environment's whole log
-                 *     to derive each status.
-                 */
-                limit?: number;
-            };
-            header?: never;
-            path: {
-                /** @description org */
-                org: string;
-                /** @description environment name */
-                env: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["DeploymentDto"][];
-                };
-            };
-            /** @description no Read on the org */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description deployments not configured */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    get_deployment: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description org */
-                org: string;
-                /** @description environment name */
-                env: string;
-                /** @description Deployment id */
-                id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["DeploymentDto"];
-                };
-            };
-            /** @description no Read on the org */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description no such Deployment in this Environment */
-            404: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -6180,7 +5537,7 @@ export interface operations {
                     "application/json": components["schemas"]["EnvironmentProjectOverlayDto"];
                 };
             };
-            /** @description an approver who is not a Scarab user, an empty entry, a zero concurrency or an out-of-range deadline */
+            /** @description an approver who is not a Scarab user, or an empty entry */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -6477,7 +5834,7 @@ export interface operations {
                     "application/json": components["schemas"]["OrgEnvironmentDto"];
                 };
             };
-            /** @description an approver who is not a Scarab user, an empty entry, or a zero concurrency */
+            /** @description an approver who is not a Scarab user, or an empty entry */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -6985,52 +6342,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["PluginInstallationDto"];
-                };
-            };
-            /** @description not an org admin */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description no such installation, or plugins not configured */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    unmapped_groupings: {
-        parameters: {
-            query?: {
-                /** @description Start after this grouping — the last one of the previous page. */
-                after?: string;
-                /**
-                 * @description Page size: default 500, at most 1000. A page shorter than this is
-                 *     the last.
-                 */
-                limit?: number;
-            };
-            header?: never;
-            path: {
-                /** @description org */
-                org: string;
-                /** @description installation name */
-                name: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["UnmappedGroupingDto"][];
                 };
             };
             /** @description not an org admin */

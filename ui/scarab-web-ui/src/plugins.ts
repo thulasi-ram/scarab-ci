@@ -1,14 +1,12 @@
-// Plugin installations (ADR-0072, Deployments MMP d1), as the UI has to reason
-// about them. Pure — no DOM, no fetch — so the Settings › Plugins panel, the
-// Environment dialog's source picker, the Deployments board and their tests
-// agree on what a form sends and what a badge says.
+// Plugin installations (ADR-0072), as the UI has to reason about them. Pure —
+// no DOM, no fetch — so the Settings › Plugins panel and its tests agree on
+// what a form sends and what a badge says.
 //
 // A PluginInstallation is an org's approval of exactly (image digest,
 // manifest). The MMP installs first-party plugins only, pinned by digest; the
 // server refuses anything else with a 403 whose text is shown verbatim. These
 // helpers only let the form say what is wrong before the round trip — where
 // the two could disagree the server wins.
-import { toForm, toPutBody, type OrgEnvironmentBody, type OrgEnvironmentLike } from "./org-environments";
 
 /** A PluginInstallation name: a DNS-1123 label, as the server checks it. */
 const DNS1123_LABEL = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
@@ -99,15 +97,15 @@ export function toInstallBody(
 export type BadgeTone = "ok" | "motion" | "danger" | "muted";
 export type Badge = { label: string; tone: BadgeTone; title: string };
 
-/** Whether core accepts the installation's reports and broker calls. */
+/** Whether core accepts the installation's broker calls. */
 export function stateBadge(state: string): Badge {
   return state === "killed"
     ? {
         label: "killed",
         tone: "danger",
-        title: "Killed: its reports and broker calls are refused until an admin enables it again.",
+        title: "Killed: its broker calls are refused until an admin enables it again.",
       }
-    : { label: "enabled", tone: "ok", title: "Enabled: its reports and broker calls are accepted." };
+    : { label: "enabled", tone: "ok", title: "Enabled: its broker calls are accepted." };
 }
 
 const RUNTIME: Record<string, Badge> = {
@@ -148,121 +146,7 @@ export function imageRepository(image: string): string {
   return at >= 0 ? image.slice(0, at) : image;
 }
 
-/**
- * Which org Environment an unmapped grouping most likely belongs to: the one
- * whose name IS the grouping (exactly, then ignoring case — Argo projects
- * are commonly named after the environment). `null` when nothing matches:
- * guessing further would route reports somewhere nobody chose.
- */
-export function suggestEnvironment(
-  grouping: string,
-  envs: readonly Pick<OrgEnvironmentLike, "name">[],
-): string | null {
-  const exact = envs.find((e) => e.name === grouping);
-  if (exact) return exact.name;
-  const folded = envs.find((e) => e.name.toLowerCase() === grouping.toLowerCase());
-  return folded?.name ?? null;
-}
-
-/**
- * The full PUT body that adds `installation / grouping` as a source of
- * `env`, keeping everything else the Environment has (the PUT is a full
- * replace). An error when the source is already listed there.
- */
-export function withSource(
-  env: OrgEnvironmentLike,
-  installation: string,
-  grouping: string,
-): { body: OrgEnvironmentBody; error?: undefined } | { body?: undefined; error: string } {
-  const form = toForm(env);
-  if (form.sources.some((s) => s.installation === installation && s.vendor_grouping === grouping)) {
-    return { error: `${env.name} already lists ${installation} / ${grouping}.` };
-  }
-  return toPutBody({ ...form, sources: [...form.sources, { installation, vendor_grouping: grouping }] });
-}
-
-/** One option of the Environment dialog's installation picker. */
-export type InstallationChoice = { value: string; label: string };
-
-/**
- * The installation picker's options: every installation in the org (a killed
- * one is still a valid source — killing is not uninstalling), plus the row's
- * current value if it names something not installed, so an existing source
- * is shown rather than silently blanked (the server will refuse to save it).
- */
-export function installationChoices(
-  installed: readonly { name: string; state: string }[],
-  current: string,
-): InstallationChoice[] {
-  const choices = installed
-    .map((i) => ({ value: i.name, label: i.state === "killed" ? `${i.name} (killed)` : i.name }))
-    .sort((a, b) => a.value.localeCompare(b.value));
-  if (current && !installed.some((i) => i.name === current)) {
-    choices.unshift({ value: current, label: `${current} (not installed)` });
-  }
-  return choices;
-}
-
-/** A DeploymentTarget's key on the board: `source/target_id`. */
-export const targetKey = (source: string, id: string) => `${source}/${id}`;
-
-/** Owners per target, from an Environment's reported DeploymentTargets. A
- *  target whose source has not reported owners is absent, not empty. */
-export function targetOwners(
-  targets: readonly { source: string; target_id: string; owner_projects: readonly string[] }[],
-): Map<string, readonly string[]> {
-  const owners = new Map<string, readonly string[]>();
-  for (const t of targets) {
-    if (t.owner_projects.length > 0) owners.set(targetKey(t.source, t.target_id), t.owner_projects);
-  }
-  return owners;
-}
-
-/**
- * The note a board row carries when its target's source now routes it
- * somewhere else — the display term **Moved** (ADR-0070 §3), not a status.
- * The row's history stays; what was live here is no longer what this
- * Environment runs.
- */
-export function movedAwayNote(moved: { now?: string | null }): { label: string; title: string } {
-  return moved.now
-    ? {
-        label: `moved — now: ${moved.now}`,
-        title: `Its source now reports this target into ${moved.now}. Its history here stays; a request for it here will stall, because its reports land in ${moved.now}.`,
-      }
-    : {
-        label: "moved — unmapped",
-        title:
-          "No environment lists its source's grouping any more, so its reports are dropped. Its history here stays.",
-      };
-}
-
-/** What adding `installation / grouping` to `env` tells the admin: the
- *  targets already reported under it are not on the board yet — the plugin
- *  re-sends them when it next polls (within about a minute). */
-export function sourceAddedNotice(env: string, installation: string, grouping: string): string {
-  return `${env} now takes ${installation} / ${grouping}. Targets it already reports there appear on the board within ~60 s, as the plugin re-sends their current state.`;
-}
-
-/** An installation's use of its per-installation caps, as one line. `warn`
- *  from 90%: past a cap, a NEW target (or unmapped grouping) is refused. */
-export function usageLine(u: {
-  targets: number;
-  max_targets: number;
-  unmapped_groupings: number;
-  max_unmapped_groupings: number;
-}): { label: string; warn: boolean; title: string } {
-  const n = (x: number) => x.toLocaleString("en-US");
-  const warn = u.targets >= 0.9 * u.max_targets || u.unmapped_groupings >= 0.9 * u.max_unmapped_groupings;
-  return {
-    label: `${n(u.targets)} / ${n(u.max_targets)} targets · ${n(u.unmapped_groupings)} / ${n(u.max_unmapped_groupings)} unmapped groupings`,
-    warn,
-    title:
-      "Per-installation caps: past one, a report about a NEW target (or a new unmapped grouping) is rejected; targets it already reports keep reporting.",
-  };
-}
-
-// --- PluginConnections (ADR-0072 §5, Deployments MMP d3) -------------------
+// --- PluginConnections (ADR-0072 §5) ----------------------------------------
 // An admin binds each manifest connection slot to the ONE destination the
 // broker may send the plugin's requests to, and the credential it adds. The
 // credential is write-only: the server never returns it, so the form only

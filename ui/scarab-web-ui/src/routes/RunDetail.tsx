@@ -290,7 +290,7 @@ export default function RunDetail() {
         reused,
         needs: s.needs ?? [],
         gate: s.gate,
-        // The gate verdict / DeploymentGate wait / concurrency hold line. It
+        // The gate verdict line. It
         // describes the run NOW, so it is dropped while viewing an older
         // version (the statuses there are a replay; this is not).
         note: tv ? null : gateStatus(s),
@@ -566,9 +566,8 @@ export default function RunDetail() {
   // every gate carries its own action; there is deliberately no run-level
   // "approve" button, which would be ambiguous about what it approved.
   //
-  // Reject is offered for every gate kind (a DeploymentGate can only be
-  // rejected — core passes it), beside Approve on manual gates; a gate whose
-  // needs are unmet lists with both disabled (the server 409s it).
+  // Reject is offered for every gate kind, beside Approve on manual gates; a
+  // gate whose needs are unmet lists with both disabled (the server 409s it).
   const pendingGates = () => actionableGates(run()?.steps ?? []);
   // What the gate bar iterates: IDs, which survive a poll that replaces every
   // step object, so an open row (and its Reject form) is never re-mounted.

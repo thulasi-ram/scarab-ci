@@ -3,26 +3,19 @@
 // repository's Environments tab and their tests agree on what a form sends
 // and what a line says.
 //
-// Two layers carry the same five rules: an Environment's BASELINE (org
+// Two layers carry the same four rules: an Environment's BASELINE (org
 // admins) and a Project's tighten-only OVERLAY (that Project's admins). The
 // server merges them into the EFFECTIVE rules; the UI never re-implements
 // that merge — it shows the server's `effective` block — so the only logic
 // here is form <-> body, and labels.
-//
-// Concurrency is the one rule whose blank is meaningful: blank = NO LIMIT
-// (ADR-0071 §9, concurrency is an explicit opt-in). The retired per-repo form
-// defaulted it to 1 and coerced a blank or 0 to 1, which is how every legacy
-// environment came to "store 1" nobody chose — so a blank is sent as `null`,
-// and 0 is an error, never quietly turned into 1.
 
-/** The five rules as the server serialises one layer. Structural, so the
+/** The four rules as the server serialises one layer. Structural, so the
  *  generated DTOs satisfy it without this module importing the schema. */
 export type RulesLike = {
   approvers: readonly string[];
   allowed_refs: readonly string[];
   wait_timer_s: number;
   require_reason: boolean;
-  deployment_concurrency?: number | null;
 };
 
 /** One rules layer as the form holds it — strings, possibly half typed. */
@@ -34,34 +27,18 @@ export type RulesForm = {
   /** Seconds. */
   waitTimerS: string;
   requireReason: boolean;
-  /** Blank = no limit. */
-  concurrency: string;
 };
 
-/** An overlay's form: the rules plus a tighter DeploymentGate deadline. */
-export type OverlayForm = RulesForm & {
-  /** Minutes; blank = none (the Environment's deadline applies). */
-  gateDeadlineMinutes: string;
-};
-
-/** The baseline PUT body (`…/environments/{env}/protection`). */
+/** The baseline PUT body (`…/environments/{env}/protection`), and an
+ *  overlay's (`…/projects/{project}/overlay`). */
 export type ProtectionBody = {
   approvers: string[];
   allowed_refs: string[];
   wait_timer_s: number;
   require_reason: boolean;
-  deployment_concurrency: number | null;
 };
 
-/** The overlay PUT body (`…/projects/{project}/overlay`). */
-export type OverlayBody = ProtectionBody & { deployment_gate_deadline_ms: number | null };
-
 type Built<T> = { body: T; error?: undefined } | { body?: undefined; error: string };
-
-const MINUTE_MS = 60_000;
-/** The server's EnvironmentDeploymentDeadline bounds. */
-const MIN_DEADLINE_MS = MINUTE_MS;
-const MAX_DEADLINE_MS = 7 * 24 * 60 * MINUTE_MS;
 
 /** A comma list, trimmed, blanks dropped, duplicates removed (in order). */
 export function splitList(s: string): string[] {
@@ -80,34 +57,15 @@ export function rulesToForm(rules?: RulesLike | null): RulesForm {
     allowedRefs: (rules?.allowed_refs ?? []).join(", "),
     waitTimerS: String(rules?.wait_timer_s ?? 0),
     requireReason: rules?.require_reason ?? false,
-    concurrency: rules?.deployment_concurrency == null ? "" : String(rules.deployment_concurrency),
   };
 }
 
-/** The overlay form for a stored overlay, or a blank one. */
-export function overlayToForm(
-  overlay?: (RulesLike & { deployment_gate_deadline_ms?: number | null }) | null,
-): OverlayForm {
-  const ms = overlay?.deployment_gate_deadline_ms;
-  return { ...rulesToForm(overlay), gateDeadlineMinutes: ms == null ? "" : String(ms / MINUTE_MS) };
-}
-
-/** The baseline body for `form`, or the first reason it cannot be sent. */
+/** The baseline (or overlay) body for `form`, or the first reason it cannot
+ *  be sent. */
 export function toProtectionBody(form: RulesForm): Built<ProtectionBody> {
   const wait = form.waitTimerS.trim() === "" ? 0 : Number(form.waitTimerS);
   if (!Number.isInteger(wait) || wait < 0) {
     return { error: "The wait timer must be a whole number of seconds (0 or more)." };
-  }
-  const c = form.concurrency.trim();
-  let deployment_concurrency: number | null = null;
-  if (c !== "") {
-    const n = Number(c);
-    if (!Number.isInteger(n) || n < 1) {
-      return {
-        error: "Concurrency must be a whole number of at least 1 — leave it blank for no limit.",
-      };
-    }
-    deployment_concurrency = n;
   }
   return {
     body: {
@@ -115,38 +73,19 @@ export function toProtectionBody(form: RulesForm): Built<ProtectionBody> {
       allowed_refs: splitList(form.allowedRefs),
       wait_timer_s: wait,
       require_reason: form.requireReason,
-      deployment_concurrency,
     },
   };
 }
 
-/** The overlay body for `form`, or the first reason it cannot be sent. */
-export function toOverlayBody(form: OverlayForm): Built<OverlayBody> {
-  const rules = toProtectionBody(form);
-  if (!rules.body) return rules;
-  const d = form.gateDeadlineMinutes.trim();
-  let deployment_gate_deadline_ms: number | null = null;
-  if (d !== "") {
-    const minutes = Number(d);
-    const ms = Math.round(minutes * MINUTE_MS);
-    if (!Number.isFinite(minutes) || ms < MIN_DEADLINE_MS || ms > MAX_DEADLINE_MS) {
-      return { error: "The gate deadline must be between 1 minute and 7 days — or blank." };
-    }
-    deployment_gate_deadline_ms = ms;
-  }
-  return { body: { ...rules.body, deployment_gate_deadline_ms } };
-}
-
-/** The rules protect nothing: no approver, any ref, no wait, no reason, no
- *  limit — the baseline the migration gave every Environment (ADR-0071
- *  §10 step 1). Shown as a warning: set a baseline. */
+/** The rules protect nothing: no approver, any ref, no wait, no reason — the
+ *  baseline the migration gave every Environment (ADR-0071 §10 step 1).
+ *  Shown as a warning: set a baseline. */
 export function isPermissive(rules: RulesLike): boolean {
   return (
     rules.approvers.length === 0 &&
     rules.allowed_refs.length === 0 &&
     rules.wait_timer_s === 0 &&
-    !rules.require_reason &&
-    rules.deployment_concurrency == null
+    !rules.require_reason
   );
 }
 
@@ -159,11 +98,6 @@ export function refLayersLabel(layers: readonly (readonly string[])[]): string {
   return restricting.map((l) => l.join(" | ")).join("  AND  ");
 }
 
-/** Concurrency in words. */
-export function concurrencyLabel(n?: number | null): string {
-  return n == null ? "no limit" : `at most ${n} in flight per target`;
-}
-
 /** One-line summary of a layer's rules. */
 export function rulesSummary(rules: RulesLike): string {
   const parts = [
@@ -172,7 +106,6 @@ export function rulesSummary(rules: RulesLike): string {
   ];
   if (rules.wait_timer_s > 0) parts.push(`${rules.wait_timer_s}s wait`);
   if (rules.require_reason) parts.push("reason required");
-  if (rules.deployment_concurrency != null) parts.push(concurrencyLabel(rules.deployment_concurrency));
   return parts.join(" · ");
 }
 

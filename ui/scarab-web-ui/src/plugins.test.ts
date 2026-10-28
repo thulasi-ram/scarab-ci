@@ -7,18 +7,11 @@ import {
   ruleLabel,
   isInsecureHttp,
   toConnectionBody,
-  movedAwayNote,
-  sourceAddedNotice,
-  usageLine,
-  installationChoices,
   installNameError,
   runtimeBadge,
   shortDigest,
   stateBadge,
-  suggestEnvironment,
-  targetOwners,
   toInstallBody,
-  withSource,
 } from "./plugins";
 
 const REPO = "ghcr.io/acme/scarab-plugin-argocd";
@@ -111,95 +104,6 @@ describe("shortDigest", () => {
 
   it("leaves a tag-pinned image alone", () => {
     expect(shortDigest(`${REPO}:dev`)).toBe(`${REPO}:dev`);
-  });
-});
-
-describe("unmapped grouping → source", () => {
-  const prod = {
-    name: "production",
-    description: "customer-facing",
-    deployment_deadline_ms: 30 * 60_000,
-    deployment_sources: [{ installation: "argocd", vendor_grouping: "production" }],
-  };
-
-  it("suggests the Environment named like the grouping, and nothing else", () => {
-    expect(suggestEnvironment("production", [prod])).toBe("production");
-    expect(suggestEnvironment("Production", [prod])).toBe("production");
-    expect(suggestEnvironment("prod", [prod])).toBeNull();
-  });
-
-  it("appends the source and keeps everything the Environment had", () => {
-    expect(withSource(prod, "argocd-us", "production")).toEqual({
-      body: {
-        description: "customer-facing",
-        deployment_deadline_ms: 30 * 60_000,
-        deployment_sources: [
-          { installation: "argocd", vendor_grouping: "production" },
-          { installation: "argocd-us", vendor_grouping: "production" },
-        ],
-      },
-    });
-  });
-
-  it("refuses a source the Environment already lists", () => {
-    expect(withSource(prod, "argocd", "production").error).toMatch(/already lists/);
-  });
-});
-
-describe("installationChoices", () => {
-  it("lists installations, marking killed ones and keeping an uninstalled current value", () => {
-    expect(
-      installationChoices(
-        [
-          { name: "argocd-us", state: "killed" },
-          { name: "argocd", state: "enabled" },
-        ],
-        "flux",
-      ),
-    ).toEqual([
-      { value: "flux", label: "flux (not installed)" },
-      { value: "argocd", label: "argocd" },
-      { value: "argocd-us", label: "argocd-us (killed)" },
-    ]);
-  });
-});
-
-describe("targetOwners", () => {
-  it("indexes owners by source/target, skipping targets with none reported", () => {
-    const owners = targetOwners([
-      { source: "argocd", target_id: "orders-api", owner_projects: ["acme/orders-api"] },
-      { source: "argocd", target_id: "messaging", owner_projects: [] },
-    ]);
-    expect(owners.get("argocd/orders-api")).toEqual(["acme/orders-api"]);
-    expect(owners.has("argocd/messaging")).toBe(false);
-  });
-});
-
-describe("movedAwayNote", () => {
-  it("names where the target went, or says it is unmapped", () => {
-    expect(movedAwayNote({ now: "prod" }).label).toBe("moved — now: prod");
-    expect(movedAwayNote({ now: null }).label).toBe("moved — unmapped");
-    expect(movedAwayNote({}).label).toBe("moved — unmapped");
-  });
-});
-
-describe("sourceAddedNotice", () => {
-  it("says the already-reported targets appear within about a minute", () => {
-    expect(sourceAddedNotice("staging", "argocd", "staging")).toMatch(
-      /^staging now takes argocd \/ staging\. .*within ~60 s/,
-    );
-  });
-});
-
-describe("usageLine", () => {
-  const usage = { targets: 12, max_targets: 10000, unmapped_groupings: 2, max_unmapped_groupings: 1000 };
-  it("shows both caps", () => {
-    expect(usageLine(usage).label).toBe("12 / 10,000 targets · 2 / 1,000 unmapped groupings");
-    expect(usageLine(usage).warn).toBe(false);
-  });
-  it("warns from 90% of either cap", () => {
-    expect(usageLine({ ...usage, targets: 9000 }).warn).toBe(true);
-    expect(usageLine({ ...usage, unmapped_groupings: 900 }).warn).toBe(true);
   });
 });
 
