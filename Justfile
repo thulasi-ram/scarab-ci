@@ -33,6 +33,12 @@ docs:
     npm --prefix ui/scarab-docs-ui install
     npm --prefix ui/scarab-docs-ui run dev
 
+# Build the docs site once, the way docs.yml does (npm ci + astro build into
+# ui/scarab-docs-ui/dist). The prebuild step syncs CONTEXT.md and docs/adr.
+docs-build:
+    npm --prefix ui/scarab-docs-ui ci
+    npm --prefix ui/scarab-docs-ui run build
+
 # Bring up the full dev stack and start scarab-server against it.
 up:
     bash deploy/local-proc/up.sh
