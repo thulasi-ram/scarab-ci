@@ -75,6 +75,14 @@ pub struct PipelineIr {
     /// cancelled). Absent for ordinary CI pipelines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<String>,
+    /// `deploy: true` marks this pipeline's runs as **deploy Runs** (ADR-0074
+    /// §2) — what the Runs list's deploy filter selects. Independent of
+    /// `environment:`: an Environment-governed run may be a smoke test or a
+    /// backup, and only the author knows which runs deploy. A Step can carry
+    /// the mark instead ([`StepSpec::deploy`]); see [`PipelineIr::is_deploy`].
+    /// A marker only — it changes no scheduling, concurrency or admission.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub deploy: bool,
     /// The operator [`RetentionProfile`] this pipeline's runs age under
     /// (ADR-0065 s2) — a NAME only, resolved against the operator registry at
     /// sweep time (so an operator retune applies retroactively, which is the
@@ -106,6 +114,25 @@ pub struct PipelineIr {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub services: Vec<SharedServiceSpec>,
     pub steps: Vec<StepSpec>,
+}
+
+impl PipelineIr {
+    /// Is a Run of this pipeline a **deploy Run** (ADR-0074 §2)? Yes when the
+    /// pipeline is marked `deploy: true` or any of its Steps is. Static: read
+    /// from the IR when the Run is created.
+    pub fn is_deploy(&self) -> bool {
+        self.deploy || self.steps.iter().any(|s| s.deploy)
+    }
+
+    /// The ids of the Steps marked `deploy: true`, in IR order — empty when
+    /// only the pipeline is marked.
+    pub fn deploy_steps(&self) -> Vec<String> {
+        self.steps
+            .iter()
+            .filter(|s| s.deploy)
+            .map(|s| s.id.clone())
+            .collect()
+    }
 }
 
 /// A pipeline's reuse / launch interface (ADR-0038, ADR-0043) — its explicit
@@ -381,6 +408,12 @@ pub struct StepSpec {
     /// a path segment.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<String>,
+    /// `deploy: true` marks this Step as the one that deploys (ADR-0074 §2):
+    /// its Run is a deploy Run, and the Run page marks the Step. Not allowed
+    /// on a gate step, which runs nothing. A marker only, like
+    /// [`PipelineIr::deploy`].
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub deploy: bool,
     /// Entrypoint/command (empty = the image default).
     #[serde(default)]
     pub command: Vec<String>,
@@ -1334,6 +1367,7 @@ pub fn compile_yaml_with_libs(
         triggers: authored.triggers,
         concurrency: authored.concurrency,
         environment: authored.environment,
+        deploy: authored.deploy,
         retention_profile: authored.retention_profile,
         interface: authored.interface,
         budget: authored.budget,
@@ -1659,6 +1693,12 @@ fn inline_level(
             for ls in &resolved {
                 let mut inst = ls.clone();
                 inst.id = ns(&ls.id);
+                // `deploy: true` on the invoke step, or on the library
+                // pipeline, marks every Step it inlines that runs something
+                // (ADR-0074 §2); a gate can never carry the mark.
+                if (step.deploy || lib.deploy) && !inst.is_gate() {
+                    inst.deploy = true;
+                }
                 // Entry seam: a library root inherits the invoke step's upstreams;
                 // an internal need is namespaced.
                 inst.needs = if ls.needs.0.is_empty() {
@@ -2546,6 +2586,15 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                 if step.security.as_ref().is_some_and(|s| !s.is_baseline()) {
                     diagnostics.push(format!(
                         "step `{}`: a gate step launches nothing — it must not set `security`",
+                        step.id
+                    ));
+                }
+                // A gate deploys nothing; the mark belongs on the Step that
+                // makes the change (ADR-0074 §2).
+                if step.deploy {
+                    diagnostics.push(format!(
+                        "step `{}`: a gate step launches nothing — it must not set `deploy` \
+                         (mark the step that deploys)",
                         step.id
                     ));
                 }
@@ -4571,6 +4620,82 @@ mod tests {
             }
             other => panic!("expected validation error, got {other:?}"),
         }
+    }
+
+    // --- deploy marker (ADR-0074 §2) ----------------------------------------
+
+    #[test]
+    fn deploy_marks_a_run_from_the_pipeline_or_any_step() {
+        let unmarked = compile("steps:\n  - { id: test, image: rust }\n");
+        assert!(!unmarked.is_deploy());
+        // An Environment alone does not make a deploy Run.
+        let governed = compile("environment: production\nsteps:\n  - { id: smoke, image: curl }\n");
+        assert!(!governed.is_deploy());
+
+        let pipeline = compile("deploy: true\nsteps:\n  - { id: ship, image: helm }\n");
+        assert!(pipeline.is_deploy());
+        assert!(pipeline.deploy_steps().is_empty(), "no Step is marked");
+
+        let step = compile(
+            r#"
+            steps:
+              - { id: build, image: rust }
+              - { id: ship, image: helm, needs: [build], deploy: true }
+            "#,
+        );
+        assert!(step.is_deploy());
+        assert_eq!(step.deploy_steps(), ["ship"]);
+        // Unmarked fields stay out of the stored IR.
+        let stored = serde_json::to_value(&step).unwrap();
+        assert!(stored.get("deploy").is_none());
+        assert!(stored["steps"][0].get("deploy").is_none());
+        assert_eq!(stored["steps"][1]["deploy"], json!(true));
+    }
+
+    #[test]
+    fn deploy_on_a_gate_step_is_rejected() {
+        match compile_yaml(
+            r#"
+            steps:
+              - { id: approve, gate: manual, deploy: true }
+            "#,
+        ) {
+            Err(PipelineError::Validation(errs)) => {
+                assert!(
+                    errs.iter().any(|e| e.contains("must not set `deploy`")),
+                    "{errs:?}"
+                );
+            }
+            other => panic!("expected validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deploy_on_an_invoke_marks_the_inlined_steps_but_not_gates() {
+        let lib = r#"
+            steps:
+              - { id: approve, gate: manual }
+              - { id: ship, image: helm, needs: [approve] }
+        "#;
+        let marked_lib = lib.replacen("steps:", "deploy: true\n            steps:", 1);
+        for (caller, libs) in [
+            (
+                "steps:\n  - { id: prod, invoke: .scarab/lib/ship.yaml, deploy: true }\n",
+                libs(&[(".scarab/lib/ship.yaml", lib)]),
+            ),
+            (
+                "steps:\n  - { id: prod, invoke: .scarab/lib/ship.yaml }\n",
+                libs(&[(".scarab/lib/ship.yaml", &marked_lib)]),
+            ),
+        ] {
+            let ir = compile_with(caller, &libs);
+            assert_eq!(ir.deploy_steps(), ["prod/ship"], "{caller}");
+        }
+        let plain = compile_with(
+            "steps:\n  - { id: prod, invoke: .scarab/lib/ship.yaml }\n",
+            &libs(&[(".scarab/lib/ship.yaml", lib)]),
+        );
+        assert!(!plain.is_deploy());
     }
 
     // --- clone step kind + missing-clone lint (ADR-0045) --------------------
