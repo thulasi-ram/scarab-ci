@@ -7,17 +7,16 @@ import Doodle from '../../../components/Doodle.astro';
 
 <Doodle icon="wrench" size={200} rotate={8} opacity={0.18} top="7rem" right="-2rem" />
 
-Scarab's day-to-day development loop is **proc-mode**: `scarab-server` runs straight from the
-working tree as a host process, backed by a compose Postgres + MinIO and a local kind cluster for
-step Pods. This gives you a fast cycle that rebuilds and reruns with no image to publish. Everything is
-driven by `Justfile` recipes over `deploy/local-proc/`. Prefer them over
-docker/kind/kubectl invocations you assemble by hand, since they encode the right env, an isolated kubeconfig, and the
-colima safety guards.
+This page covers the day-to-day development loop, **proc-mode**, and the `.env` file it reads.
+In proc-mode `scarab-server` runs straight from the working tree as a host process, backed by a
+compose Postgres + MinIO and a local kind cluster for step Pods, so you rebuild and rerun without
+publishing an image. `Justfile` recipes over `deploy/local-proc/` drive all of it. Use them rather
+than typing docker/kind/kubectl commands yourself: they set the right env, an isolated kubeconfig,
+and the colima safety guards.
 
 For a guided first run see [Run locally](/scarab-ci/get-started/run-locally/); to deploy the
 packaged Helm chart inside the cluster instead, see
-[Installation](/scarab-ci/get-started/deploy-helm/). This page is the reference for the proc-mode
-mechanics and the `.env` those recipes read.
+[Installation](/scarab-ci/get-started/deploy-helm/).
 
 ## Prerequisites
 
@@ -36,7 +35,7 @@ hold secrets), so seed it from the committed template on first run:
 cp deploy/local-proc/.env.example deploy/local-proc/.env
 ```
 
-You don't strictly need to do this by hand: `just up`, `just serve`, and `just ui` each create the
+You usually don't need to: `just up`, `just serve`, and `just ui` each create the
 `.env` from `.env.example` if it's missing, then `source` it. Copy it yourself only when you want to
 edit values before the first run.
 
@@ -70,7 +69,7 @@ Key settings for development only:
   container's 5432, so it won't clash with a Postgres already on 5432). Migrations run on connect.
 - **`SCARAB_S3_*`** point at the compose MinIO: the S3 API on **9000** and the `scarab-logs` bucket
   (the console is on **9001**). `SCARAB_NAMESPACE=scarab` is where step Pods launch in kind.
-- **`SCARAB_API_URL`** is consumed by the Vite dev server (`just ui`); Vite refuses to guess it.
+- **`SCARAB_API_URL`** is read by the Vite dev server (`just ui`); Vite refuses to guess it.
 
 `KUBECONFIG` is *not* in the file; it's dynamic per run and set by the recipes to
 `deploy/local-proc/.kubeconfig`. For the full catalogue of every `SCARAB_*` knob and what each does,

@@ -7,13 +7,12 @@ import Doodle from '../../../components/Doodle.astro';
 
 <Doodle icon="waypoints" size={210} rotate={-8} opacity={0.17} top="7rem" right="-2rem" />
 
-Scarab is a Kubernetes-native CI engine: every pipeline step runs as a Pod, so
-you always need a **Kubernetes cluster** to run against. That cluster can live on
-your laptop (kind / colima) or be a real, remote/production cluster. Either
-works.
+This page covers what Scarab needs and the two ways to bring it up. Every
+pipeline step runs as a Pod, so either way you need a **Kubernetes cluster**:
+kind or colima on your laptop works, and so does a remote production cluster.
 
-There are two ways to bring Scarab up. Neither is a toy version of the other;
-pick the one that fits what you're doing.
+Neither way is a cut-down version of the other; pick the one that fits what
+you're doing.
 
 If you only want to see what Scarab looks like, there is a third option that
 installs nothing: the [live demo](https://demo-scarab.ahiravan.dev/). Sign
@@ -46,13 +45,13 @@ Whichever path you choose, `scarab-server` needs:
 - **Postgres**: the durable store that all run state and coordination go
   through; without it the server serves the API only.
 - **An S3-compatible object store** (AWS S3 or in-cluster MinIO) for logs,
-  artifacts, and the content-addressed workspace snapshots reruns restore; a
-  fallback to a local directory exists for lightweight local runs.
+  artifacts, and the content-addressed workspace snapshots that reruns restore
+  from. For lightweight local runs it can fall back to a local directory.
 - **A Kubernetes namespace with RBAC** so it can launch one Pod per pipeline step.
 
-The [Installation](/scarab-ci/get-started/deploy-helm/) page wires all three up
-through the chart; the [Run locally](/scarab-ci/get-started/run-locally/) recipes
-stand them up for you on your machine.
+[Installation](/scarab-ci/get-started/deploy-helm/) sets all three up through
+the chart; the [Run locally](/scarab-ci/get-started/run-locally/) recipes start
+them for you on your machine.
 
 ## References
 

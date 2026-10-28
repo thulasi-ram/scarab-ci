@@ -1,6 +1,6 @@
 ---
 title: Pipeline Syntax
-description: 'Writing Scarab pipelines: YAML frontend, the typed IR, CEL expressions, invoke, and matrix.'
+description: 'How to write a Scarab pipeline: triggers, inputs, steps, CEL expressions, matrix, invoke, results, gates, and retries.'
 ---
 
 import Doodle from '../../../components/Doodle.astro';
@@ -9,12 +9,13 @@ import Doodle from '../../../components/Doodle.astro';
 
 ## The model, in brief
 
-A **step** is the basic unit of work: an OCI **image** plus a **command** (a contract)
-that Scarab runs as a single Kubernetes **Pod**. A **pipeline** is a group of steps, plus how they
+A **step** is the basic unit of work: an OCI **image** plus a **command** (the step contract),
+which Scarab runs as a single Kubernetes **Pod**. A **pipeline** is a group of steps, plus how they
 are triggered and wired together. Structurally a pipeline is a **flat recursive DAG**
 (`Pipeline → Step`).
 
-The DSL itself is a **typed IR**; YAML is a frontend and **CEL** provides expressions.
+You write YAML, with **CEL** for expressions, and Scarab compiles it to a **typed IR**, which is
+the DSL proper.
 `invoke` reuses a library pipeline by inlining it into the caller's DAG at compile time.
 `matrix` is a modifier that fans a step out over a set of inputs.
 
@@ -70,8 +71,8 @@ steps:
     command: ["cargo", "check"]
 ```
 
-The rest of this page covers each part in turn, from triggers and interface, through
-the step shape, wiring, and reuse, to deploys and operational concerns.
+The rest of this page goes through each part: triggers and inputs, the step shape, wiring and
+reuse, deploys, and the operational settings.
 
 ## Triggers: `on:`
 
@@ -106,8 +107,8 @@ on:
 
 ## Interface: `interface.inputs` (and `outputs`)
 
-A pipeline declares its typed launch parameters under `interface.inputs`. This is the same
-interface an `invoke` caller satisfies with `with:`, one contract for both launching and reuse. A
+A pipeline declares its typed launch parameters under `interface.inputs`. An `invoke` caller
+fills in the same interface with `with:`, so launching and reuse share one contract. A
 bare string is shorthand for a required string; the map form is fully typed:
 
 ```yaml
@@ -162,7 +163,7 @@ A step names the secrets it needs with `secrets: [KEY, ...]` (resolution and sco
     - "*.txt"
 ```
 
-Privilege above the hardened baseline is requested per step under `security:`. `run_as_root` is
+A step asks for privilege above the hardened baseline under `security:`. `run_as_root` is
 self-service (root inside the unprivileged sandbox, with its capabilities already dropped, does not escape it);
 `add_capabilities` and `privileged` are governed and take effect only if the environment whitelists
 the image digest.
@@ -183,7 +184,7 @@ Some steps are **kinds** with no image that the engine runs on your behalf (you 
 
 ### The `clone` step
 
-Source is fetched by a built-in **`clone` step**. It needs no configuration by design: the repo,
+A built-in **`clone` step** fetches the source. It needs no configuration by design: the repo,
 ref, resolved SHA, and token all come from the run's trigger context, so `clone: {}` is the common
 case. Downstream steps inherit the cloned workspace through ordinary `needs`.
 
@@ -198,8 +199,8 @@ case. Downstream steps inherit the cloned workspace through ordinary `needs`.
     lfs: true
 ```
 
-Scarab is multi-forge: GitHub and Forgejo are both supported adapters; the `clone` step is
-identical across them.
+GitHub and Forgejo both have supported adapters, and the `clone` step is identical for
+either.
 
 ## Ordering: `needs`
 
@@ -247,7 +248,7 @@ A `when:` CEL guard skips a step whose predicate is false; expressions read the 
 ## Reuse: `invoke`
 
 `invoke` inlines a **library** pipeline (under `.scarab/lib/` by convention) into the caller's DAG
-at compile time, not a runtime call.
+at compile time; it is not a runtime call.
 It is local only, and will stay that way: repo-relative paths, read at the caller's ref; no `../` escape and no
 cross-repo references (cross-repo causation is `on: upstream`). The invoked steps are namespaced
 by the invoke step's id (`deploy/plan`, `deploy/url`), and `matrix` on an invoke step fans out the
@@ -317,7 +318,7 @@ result's name is the filename minus `.json`, and the file must hold **valid JSON
   command: ["echo", "release ${{ outputs.version.tag }}"]
 ```
 
-Otherwise, capture needs no setup in the pipeline: on Kubernetes a trusted per-Pod egress sidecar
+Beyond writing the file, capture needs no setup in the pipeline: on Kubernetes a trusted per-Pod egress sidecar
 drains the step's results back to the control plane. A `build:` step
 emits an `image` result natively (BuildKit writes `--metadata-file /scarab/results/image.json`);
 its author writes nothing.
@@ -420,14 +421,14 @@ side effect that is neither will fire twice.
   retry: { on: failure, max: 3 }
 ```
 
-Re-execution that a human initiates is modelled as **Takes**: a *rerun* re-executes a run from
+Re-execution that a person starts is modelled as **Takes**: a *rerun* re-executes a run from
 the top, a *retry* resumes from a failed step, and an earlier attempt becomes *superseded* or
-*shadowed* by the newer one. The UI shows these in a run's history. There is nothing to
-author for them.
+*shadowed* by the newer one. The UI shows these in a run's history. You don't write anything
+for them.
 
 ## References
 
-- [ADR-0006: Pipeline ontology: flat recursive DAG](/scarab-ci/tech/adr/0006-pipeline-ontology/)
+- [ADR-0006: Pipeline model: flat recursive DAG](/scarab-ci/tech/adr/0006-pipeline-ontology/)
 - [ADR-0008: Step contract: OCI image + convention + built-in kinds](/scarab-ci/tech/adr/0008-step-contract/)
 - [ADR-0009: DSL: typed Pipeline IR + YAML frontend + CEL](/scarab-ci/tech/adr/0009-dsl-ir-yaml-cel/)
 - [ADR-0014: Secrets: envelope-encrypted Postgres + pluggable providers](/scarab-ci/tech/adr/0014-secrets/)

@@ -7,15 +7,15 @@ import Doodle from '../../../components/Doodle.astro';
 
 <Doodle icon="package" size={210} rotate={11} opacity={0.17} top="7rem" right="-2rem" />
 
-Scarab is Kubernetes-only by design, so Helm is the install path for a cluster. The chart deploys
-`scarab-server` (one binary,
-selectable roles) with the RBAC it needs to launch one Pod per step in its namespace.
+You install Scarab on a cluster with its Helm chart; Scarab is Kubernetes-only by design. The
+chart deploys `scarab-server` (one binary, selectable roles) with the RBAC it needs to launch one
+Pod per step in its namespace.
 
 The **same chart** targets any Kubernetes: a local kind/colima cluster or a real, live cluster.
 `just local-helm` (below) is a convenience recipe that installs this chart on colima; a live
 cluster uses the same `helm upgrade --install` with your own Postgres, object store, and
-credentials. The chart is new and will get more production hardening with use, but nothing in it
-is local-only.
+credentials. The chart is new and will get more production hardening as people use it, but
+nothing in it is local-only.
 
 ## The chart
 
@@ -81,7 +81,7 @@ keeps reporting the gap.
 
 ## Key values
 
-Only keys that exist in `values.yaml`:
+Every key in this table exists in `values.yaml`:
 
 | Key | Default | Notes |
 |-----|---------|-------|

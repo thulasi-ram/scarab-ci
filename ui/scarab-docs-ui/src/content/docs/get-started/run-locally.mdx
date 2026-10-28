@@ -7,9 +7,9 @@ import Doodle from '../../../components/Doodle.astro';
 
 <Doodle icon="terminal" size={200} rotate={-10} opacity={0.18} top="7rem" right="-2rem" />
 
-The repo ships a one-command dev harness (a `Justfile` over `deploy/local-proc/`) that runs
-`scarab-server` straight from the tree, giving you a loop that rebuilds and reruns with no image to
-publish. It runs the durable core end-to-end on your machine. To deploy the packaged chart
+This page gets the whole stack running on your machine and pushes a pipeline through it. One
+command (a `Justfile` over `deploy/local-proc/`) runs `scarab-server` straight from the tree, so
+you can rebuild and rerun without publishing an image. To deploy the packaged chart
 instead (on kind/colima or a live cluster), see [Installation](/scarab-ci/get-started/deploy-helm/);
 the [Overview](/scarab-ci/get-started/overview/) compares the two paths.
 
@@ -39,8 +39,8 @@ just up      # Postgres + MinIO + kind + scarab-server (background)
 just demo    # submit a one-step pipeline and watch it run to completion
 ```
 
-This posts a pipeline to the running server and follows it to a terminal state. It is the smallest
-end-to-end run, and it survives killing the control plane mid-run.
+This posts a pipeline to the running server and follows it until it finishes. It's the smallest
+end-to-end run, and it survives you killing the control plane partway through.
 
 ## Iterate
 
@@ -66,9 +66,9 @@ streamed over SSE, is a follow-up.
 
 ## What just happened
 
-The server persisted every step transition to Postgres as a durable state machine. Kill the
-control plane mid-run and bring it back: the run resumes from where it stopped rather than
-restarting. That is the main guarantee Scarab makes.
+The server wrote every step transition to Postgres, where the run lives as a durable state
+machine. Try it: kill the control plane mid-run and bring it back. The run resumes from where it
+stopped instead of starting over. That is the main guarantee Scarab makes.
 
 ## References
 

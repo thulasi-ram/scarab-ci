@@ -1,6 +1,6 @@
 ---
 title: Scarab
-description: A modern CI engine for Kubernetes. It is a CI that plugs into your forge, on a control plane that keeps each run as saved state instead of a running process. Written in Rust.
+description: A modern CI engine for Kubernetes that plugs into your forge. The control plane keeps each run as saved state rather than a running process, so a restart doesn't lose it. Written in Rust.
 template: splash
 hero:
   layout: split-left
@@ -27,13 +27,15 @@ hero:
 
 import AsciiScene from '../../components/AsciiScene.astro';
 
-CI tools tend to fall into two camps. **Workflow engines** (Argo, Tekton, Temporal) have a
-durable core that survives a crash, but they aren't a CI on their own: forge integration, in-repo config,
-PR checks, identity, secrets, the DSL, and the UI are all yours to build. **CIs that live in your
-forge** (GitHub Actions, GitLab, Woodpecker, Drone) hand you all of that, but underneath, the
-orchestrator is a plain job runner. If the control plane restarts partway through a run, the run is
-orphaned or starts over. Scarab is built to be **both at once**: a forge CI with everything included,
-on a control plane that saves each run as durable **state**, so a restart does not lose it.
+Scarab gives you a CI that lives in your forge (pipelines in your repo, PR checks, secrets,
+approvals, a UI) on a control plane that saves each run as durable **state**. If the control
+plane restarts partway through a run, the run carries on from its last completed step.
+
+Most CI tools give you one half of that. **Workflow engines** (Argo, Tekton, Temporal) have a
+durable core that survives a crash, but forge integration, in-repo config, PR checks, identity,
+secrets, the DSL and the UI are all yours to build. **CIs that live in your forge** (GitHub
+Actions, GitLab, Woodpecker, Drone) hand you all of that, but underneath they are plain job
+runners: if the control plane restarts mid-run, the run is orphaned or starts over.
 
 ![The Scarab dashboard: an action inbox of runs paused on a gate, recently visited repos shown as pass/fail status cards, and the repo list sorted by what you touched last](../../assets/dashboard.jpg)
 
@@ -83,14 +85,14 @@ on a control plane that saves each run as durable **state**, so a restart does n
     <dt class="sc-home-spec-key">identity</dt>
     <dd class="sc-home-spec-body">
       <p class="sc-home-spec-claim">No long-lived cloud keys.</p>
-      <p class="sc-home-spec-support">OIDC that isn't tied to one forge, with Scarab acting as its own OIDC issuer so runs can federate into your cloud without long-lived keys. Adapters for GitHub and Forgejo are implemented today. See Status.</p>
+      <p class="sc-home-spec-support">Scarab acts as its own OIDC issuer, so a run can federate into your cloud with a token Scarab mints for it instead of a long-lived key. The identity isn't tied to one forge; adapters for GitHub and Forgejo are implemented today. See Status.</p>
     </dd>
   </div>
   <div class="sc-home-spec-row">
     <dt class="sc-home-spec-key">the DSL</dt>
     <dd class="sc-home-spec-body">
-      <p class="sc-home-spec-claim">A typed language, not templated YAML.</p>
-      <p class="sc-home-spec-support">A typed intermediate representation with a YAML frontend and CEL expressions. Every pipeline compiles to one flat recursive DAG: <code>invoke</code> handles reuse, and matrix is a modifier on a step.</p>
+      <p class="sc-home-spec-claim">YAML that compiles to a typed language.</p>
+      <p class="sc-home-spec-support">You write YAML with CEL expressions, and Scarab compiles it to a typed intermediate representation. Every pipeline becomes one flat recursive DAG: <code>invoke</code> handles reuse, and matrix is a modifier on a step.</p>
     </dd>
   </div>
 </dl>
@@ -103,9 +105,8 @@ As pipelines get longer and more autonomous (agents, review gates that sit open 
 workflows that span days), "the job died, click re-run" stops being good enough. Scarab can hold
 a paused run at almost no cost and pick up exactly where it left off, and it keeps an event log that
 only ever grows, so you can see everything that happened.
-Agent-driven development needs this kind of foundation more than it needs a nicer YAML dialect.
-Scarab itself is built with AI: a small team writing systems software at a pace that used to need
-many more people.
+We also build Scarab with AI tools: a small team writing systems software at a pace that used to
+need many more people.
 
 ![A Scarab run: the step DAG, live logs, and an event timeline showing a retried step and the run paused on a manual deploy gate](../../assets/run-detail.jpg)
 
@@ -144,8 +145,8 @@ workspace suite passes locally). **Implemented:** the GitHub adapter (it ingests
 posts commit statuses) and a Forgejo adapter, so more than one forge is supported; Pod execution
 on a live Kubernetes cluster (`scarab-executor-k8s`, with cluster tests); the results-egress
 sidecar image (`docker/sidecar/`); and CI that runs the Rust suite on every push
-(`.github/workflows/ci.yml`). None of it is yet hardened at scale. The core is proven,
-and the integrations around it are implemented but not yet proven under production load.
+(`.github/workflows/ci.yml`). None of it is hardened at scale yet: the core is proven, and
+the integrations around it are implemented but not yet proven under production load.
 :::
 
 ## References
