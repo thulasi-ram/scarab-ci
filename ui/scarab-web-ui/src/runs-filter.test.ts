@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { environmentQuery, runEnvironmentOptions } from "./runs-filter";
+import { runEnvironmentOptions, runListFilter } from "./runs-filter";
 
 describe("runEnvironmentOptions", () => {
   it("keeps every Project Environment when the loaded runs are one Environment's", () => {
@@ -27,9 +27,17 @@ describe("runEnvironmentOptions", () => {
   });
 });
 
-describe("environmentQuery", () => {
-  it("omits the parameter when no Environment is selected (an empty value is a 400)", () => {
-    expect(environmentQuery("")).toBeUndefined();
-    expect(environmentQuery("production")).toBe("production");
+describe("runListFilter", () => {
+  it("sends nothing when no filter is on (an empty environment is a 400)", () => {
+    expect(runListFilter("", false)).toEqual({});
+  });
+
+  it("sends deploy only as true — the toggle off means every run, not the non-deploys", () => {
+    expect(runListFilter("", true)).toEqual({ deploy: true });
+    expect("deploy" in runListFilter("production", false)).toBe(false);
+  });
+
+  it("combines the Environment and the Deploys toggle", () => {
+    expect(runListFilter("production", true)).toEqual({ environment: "production", deploy: true });
   });
 });

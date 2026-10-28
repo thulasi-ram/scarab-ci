@@ -3,9 +3,9 @@
 // facts (author · ref · duration) under a header line (sha · status · trigger ·
 // when), fed by the origin fields RunSummaryDto now carries. Duration ticks live
 // for in-flight runs. The runs list filters by status, author, branch, PR,
-// pipeline and environment — environment on the server (ADR-0074 §2: it is how
-// a Project's older deploys are found), the rest over the loaded page. The
-// header CTA is contextual to the active tab.
+// pipeline, environment and deploys — environment and deploys on the server
+// (ADR-0074 §2: it is how a Project's older deploys are found), the rest over
+// the loaded page. The header CTA is contextual to the active tab.
 //
 // The active tab and every filter live in the URL query (`?tab=secrets`,
 // `?pipeline=ci&env=production`), not in component signals — so a refresh, a
@@ -46,7 +46,7 @@ import SecretMatrixEditor from "../components/SecretMatrixEditor";
 import Doodle from "../components/Doodle";
 import AsciiScene from "../components/AsciiScene";
 import { deploymentsHref } from "../deployments";
-import { environmentQuery, runEnvironmentOptions } from "../runs-filter";
+import { runEnvironmentOptions, runListFilter } from "../runs-filter";
 import ponderIdle from "../../../brand/ascii/generated/ponder-ponder.json";
 
 type Tab = "runs" | "environments" | "secrets" | "settings";
@@ -146,7 +146,7 @@ export default function RepoView() {
   };
   const setStatusFilter = (f: StatusFilter) => filterSetter("status")(f === "all" ? "" : f);
   // Origin filters, client-side over the already-fetched rows (the Environment
-  // filter is sent to the server instead; see `rows`). `""` = "any";
+  // and Deploys filters are sent to the server instead; see `rows`). `""` = "any";
   // `prFilter` holds the PR number stringified (search params are strings).
   const authorFilter = () => one(search.author);
   const setAuthorFilter = filterSetter("author");
@@ -158,14 +158,19 @@ export default function RepoView() {
   const setPipelineFilter = filterSetter("pipeline");
   const envFilter = () => one(search.env);
   const setEnvFilter = filterSetter("env");
+  // Deploys toggle (`?deploy=1`): only deploy Runs — a pipeline or Step marked
+  // `deploy: true` (ADR-0074 §2). Server-side, like the Environment.
+  const deploysOnly = () => one(search.deploy) === "1";
+  const setDeploysOnly = (on: boolean) => filterSetter("deploy")(on ? "1" : "");
 
   // Only this repo's tenanted runs, straight from the per-repo endpoint
-  // (ADR-0046). The Environment filter is part of the request, so picking one
-  // fetches that Environment's newest runs rather than filtering the newest
+  // (ADR-0046). The Environment and Deploys filters are part of the request,
+  // so they fetch the newest matching runs rather than filtering the newest
   // page.
   const [rows, { refetch }] = createResource(
-    () => ({ org: org(), repo: repo(), env: envFilter() }),
-    (k): Promise<RunSummary[]> => listRepoRuns(k.org, k.repo, 50, environmentQuery(k.env)),
+    () => ({ org: org(), repo: repo(), env: envFilter(), deploys: deploysOnly() }),
+    (k): Promise<RunSummary[]> =>
+      listRepoRuns(k.org, k.repo, 50, runListFilter(k.env, k.deploys)),
   );
   // The Project's Environments, for the Environment picker's options — the
   // loaded rows are already one Environment's once the filter is on. A caller
@@ -211,11 +216,12 @@ export default function RepoView() {
     !!branchFilter() ||
     !!prFilter() ||
     !!pipelineFilter() ||
-    !!envFilter();
+    !!envFilter() ||
+    deploysOnly();
 
   const clearFilters = () =>
     setSearch(
-      { status: "", author: "", branch: "", pr: "", pipeline: "", env: "" },
+      { status: "", author: "", branch: "", pr: "", pipeline: "", env: "", deploy: "" },
       { replace: true },
     );
 
@@ -237,8 +243,9 @@ export default function RepoView() {
       if (pr && String(r.pr_number ?? "") !== pr) return false;
       if (pipeline && r.pipeline !== pipeline) return false;
       // Already applied by the server; kept so a page still in flight from
-      // the previous Environment never shows under the new one.
+      // the previous filter never shows under the new one.
       if (env && r.environment !== env) return false;
+      if (deploysOnly() && !r.deploy) return false;
       return true;
     });
   };
@@ -314,6 +321,14 @@ export default function RepoView() {
             )}
           </For>
 
+          <button
+            class={`fpill ${deploysOnly() ? "on" : ""}`}
+            title="only deploy runs: a pipeline or step marked `deploy: true`"
+            onClick={() => setDeploysOnly(!deploysOnly())}
+          >
+            <Icon icon="rocket" size={12} /> deploys
+          </button>
+
           <Show when={pipelines().length > 0}>
             <SearchSelect
               icon="workflow"
@@ -326,12 +341,12 @@ export default function RepoView() {
             />
           </Show>
 
-          {/* Only deploy runs carry an environment (their pipeline declared
-              `environment:`), so this appears once the Project has an
-              Environment or a run that deployed into one. */}
+          {/* Only Environment-governed runs carry an environment (their
+              pipeline declared `environment:`), so this appears once the
+              Project has an Environment or a run governed by one. */}
           <Show when={environments().length > 0}>
             <SearchSelect
-              icon="rocket"
+              icon="shield-check"
               clearable
               placeholder="any environment"
               searchPlaceholder="Search environments…"
@@ -437,10 +452,18 @@ export default function RepoView() {
                                 </span>
                               )}
                             </Show>
+                            <Show when={r.deploy}>
+                              <span
+                                class="pfact strong"
+                                title="deploy run: its pipeline or a step is marked `deploy: true`"
+                              >
+                                <Icon icon="rocket" size={12} /> deploy
+                              </span>
+                            </Show>
                             <Show when={r.environment}>
                               {(env) => (
-                                <span class="pfact" title="deploys to environment">
-                                  <Icon icon="rocket" size={12} />
+                                <span class="pfact" title="environment">
+                                  <Icon icon="shield-check" size={12} />
                                   <span class="mono">{env()}</span>
                                 </span>
                               )}
