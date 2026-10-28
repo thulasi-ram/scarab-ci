@@ -84,22 +84,44 @@ in production".
 This becomes a non-goal in CONTEXT.md §3: *Scarab is not a CD tool. It governs and runs
 the Run that deploys, and it keeps no state about deployments between Runs.*
 
-### 2. A Deploy Run is a Run whose Pipeline names an Environment
+### 2. A Pipeline or a Step marks itself as a deploy; an Environment only governs
 
-`environment:` stays the mark. A Run that sets it is a Deploy Run, and the mark brings:
+Naming an Environment does not make a Run a deploy. Many things happen inside an
+Environment: a smoke test that needs staging secrets, a backup that needs prod
+credentials, a deploy. So the two are separate.
+
+**`environment:` governs.** A Run whose Pipeline names an Environment gets:
 
 - admission against the Environment: EnvironmentProjectEligibility, protection rules,
   approvers and `allowed_refs` (ADR-0037, ADR-0071 §2, §3);
 - Environment-scoped secrets (ADR-0071 §6) and per-Project privilege grants (§8);
-- no newest-wins cancel: a Deploy Run carries no supersede key, and its concurrency group
-  always queues (`crates/scarab-server/src/lib.rs:5444-5466`). A newer push never
-  cancels a deploy half-way.
+- no newest-wins cancel: it carries no supersede key, and its concurrency group always
+  queues (`crates/scarab-server/src/lib.rs:5444-5466`).
 
-Users find a Project's deploys by filtering its Runs by Environment. The Runs tab has
-that filter today, but it filters only the page of Runs already fetched
-(`ui/scarab-web-ui/src/routes/RepoView.tsx:185`, `:218`), and `GET` on the runs list
-takes only `limit`. The runs list API gains an `environment` filter so older deploys can
-be found. There is no separate Deployments screen.
+**`deploy: true` marks a deploy.** It can be set on the Pipeline, or on a Step:
+
+```yaml
+environment: production
+deploy: true            # every Run of this Pipeline is a deploy
+```
+
+```yaml
+steps:
+  - id: test
+  - id: bump
+    needs: [test]
+    deploy: true        # this Step is the deploy; the Run is a Deploy Run
+```
+
+A **Deploy Run** is a Run whose Pipeline is marked, or which has a marked Step. This is
+decided at Run creation from the Pipeline and stored on the Run. A **Deploy Step** is a
+marked Step. A gate cannot be marked. Marking a deploy needs no Environment.
+
+The Runs list API and the Runs tab filter by `deploy` and by `environment`, in the
+database query, and together. Today the Runs tab filters only the page of Runs already
+fetched (`ui/scarab-web-ui/src/routes/RepoView.tsx:185`, `:218`), and `GET` on the runs
+list takes only `limit`. The Run list marks Deploy Runs, and the Run page marks the
+Deploy Step. There is no separate Deployments screen.
 
 ### 3. What is deleted
 
@@ -153,7 +175,7 @@ journaled per Attempt. An external gate can still be released with
 
 ### 5. Waiting until the change is live is a PluginAction Step
 
-The Argo CD plugin offers a PluginAction, `wait-live`. A Deploy Run runs it as a
+The Argo CD plugin offers a PluginAction, `wait-live`. A Run runs it as a
 `plugin_action` Step (ADR-0072 §4) after the Step that makes the change:
 
 ```yaml
@@ -229,7 +251,7 @@ are not built: today `plugin_connections` has no Environment column
 (`0056_plugin_connections.sql`), and the plugin picks a connection by slot
 (`crates/scarab-server/src/broker_proxy.rs`, `/connections/{slot}/…`). A Run with no
 Environment gets no connection, so a `plugin_action` that reads through the broker
-needs a Deploy Run, and the Pipeline check says so.
+needs a Run that names an Environment, and the Pipeline check says so.
 
 **Who may read what.** Any Project eligible for the Environment can read any Application
 its Environment's connection can see. The Argo token's own RBAC is the bound; the
@@ -261,8 +283,8 @@ team can write its own wait Step, or use `helm upgrade --wait` or
 
 The per-DeploymentTarget hold is deleted. A Pipeline that must not deploy one service
 twice at once sets a concurrency group (ADR-0032), for example
-`concurrency: { group: deploy-prod-payments-api }`. Deploy Runs always queue on their
-group (§2).
+`concurrency: { group: deploy-prod-payments-api }`. A Run that names an Environment
+always queues on its group (§2).
 
 Two limits follow. A group holds the whole Run rather than one Step. And group keys are
 prefixed with the repository (`crates/scarab-server/src/lib.rs:5440-5443`), so two
@@ -276,6 +298,13 @@ group, is later work if a Pipeline needs it.
   specific to Argo CD: reading an Application, deciding live or failed, and any future
   Argo action. Support for another CD tool is another plugin next to it. Core keeps no
   CD concept.
+- **Plugins bring their own storage.** A PluginInstallation may name a
+  PersistentVolumeClaim that its operator created in the plugins namespace, and the
+  plugin runtime mounts it into the plugin's Pod. A plugin that needs a database reaches
+  it through a `delivered` PluginConnection (ADR-0072 §6, not built). Scarab does not
+  provision, migrate, back up or read that storage, and it is outside Scarab's durability
+  claims. A CD plugin that wants a record of what is live, or a board of it, keeps it
+  there and shows it through `contribute_ui` once that tier is built.
 - `report_deployments` is removed from the PluginCapability vocabulary.
   `subscribe_events` covers Run events only.
 - `offer_actions`, `plugin_action` and Environment-scoped PluginConnections move from
@@ -287,8 +316,8 @@ group, is later work if a Pipeline needs it.
 
 ## Consequences
 
-- Core no longer holds deployment state. CONTEXT.md §4.6 shrinks to the Deploy Run,
-  and the board goes away.
+- Core no longer holds deployment state. CONTEXT.md §4.6 shrinks to the Deploy Run
+  and Deploy Step, and the board goes away.
 - A Deploy Run's green means what its Steps checked. A GitOps Pipeline without a wait
   Step is green when the merge lands, as it was before ADR-0070. The docs and examples
   show the wait Step.
@@ -339,12 +368,15 @@ group, is later work if a Pipeline needs it.
    poll, Environment-scoped PluginConnections with per-invocation read credentials, and
    the Argo plugin's `wait-live` built on `assess.rs` and `version.rs`. Verified live with
    `just plugin-verify` against the fake Argo it uses today.
-2. **The Runs list's `environment` filter** in the API and the Runs tab.
+2. **`deploy: true`** on Pipelines and Steps, stored on the Run, and the Runs list's
+   `deploy` and `environment` filters in the API and the Runs tab.
 3. **Delete** what §3 lists, as one change with one full gate run, with the Pipeline
    check error for `deployment_requests` and `gate: deployment`. Grep found neither in
    `.scarab/dogfood.yaml` or the example Pipelines, so no Pipeline in the repository
    needs switching.
-4. **Docs:** CONTEXT.md §3 (the non-goal), §4.1 and §4.6, and the docs site's
+4. **Plugin storage:** the PersistentVolumeClaim reference on a PluginInstallation and
+   its mount in the plugin runtime (`crates/scarab-plugin-k8s`).
+5. **Docs:** CONTEXT.md §3 (the non-goal), §4.1 and §4.6, and the docs site's
    `environments.mdx`, `overview.mdx`, `deploy-helm.mdx` and `index.mdx`, which mention
    the board and DeploymentGates.
 
