@@ -15,8 +15,9 @@
 //! - [`check`]: the type checker over the AST `cel` 0.15 parses, with the
 //!   `has()` guard warning, literal regexes and the static cost bound. It and
 //!   every evaluation run on a large-stack thread.
-//! - [`eval`]: evaluation of one checked rule with `cel` 0.15, any error
-//!   denying.
+//! - [`eval`]: binding a checkpoint input as CEL variables and evaluating
+//!   one checked `when` with `cel` 0.15 (`matches()` compiled once per
+//!   pattern per evaluation); [`evaluate`](mod@evaluate) is its caller.
 
 pub mod check;
 pub mod eval;

@@ -1,8 +1,10 @@
 //! Realistic `run.create` policies: the ones that must check and decide as
 //! expected, and the ones the checker must refuse with a useful message.
 
-use scarab_policy::check::{check, MAX_COST};
-use scarab_policy::eval::{compile_rule, evaluate_rule, RuleOutcome};
+use scarab_policy::check::{check, Diagnostic, MAX_COST};
+use scarab_policy::evaluate::{evaluate, MatchContext, PolicyOutcome};
+use scarab_policy::ir::{compile, Level, PolicyIr};
+use scarab_policy::policy::{Checkpoint, Policy};
 use scarab_policy::run_create::{
     schema, ForgeToken, Gate, GateKind, Org, Origin, OriginKind, Pipeline, Project, RunCreateInput,
     Step, Trigger, TriggerKind, UpstreamGate,
@@ -126,6 +128,70 @@ fn with_steps(steps: Vec<Step>) -> RunCreateInput {
     RunCreateInput {
         steps: cap(steps),
         ..base()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// One rule through the production path: a one-rule enforced org Policy,
+// `ir::compile`d and `evaluate::evaluate`d against the input as JSON.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq)]
+enum RuleOutcome {
+    /// `when` was false.
+    DoesNotApply,
+    /// `when` was true: the Policy denied with this message.
+    Applies { message: String },
+    /// Evaluation failed, so the Policy denied.
+    DeniedOnError { error: String },
+}
+
+struct Rule {
+    ir: PolicyIr,
+}
+
+impl Rule {
+    fn warnings(&self) -> impl Iterator<Item = &Diagnostic> {
+        self.ir.warnings()
+    }
+}
+
+/// `schema` is `run_create::schema()`, the one `compile` checks against.
+fn compile_rule(schema: &Schema, when: &str, message: &str) -> Result<Rule, Vec<Diagnostic>> {
+    assert_eq!(schema.checkpoint, "run.create");
+    let policy = Policy::from_json(serde_json::json!({
+        "name": "rule",
+        "checkpoint": "run.create",
+        "mode": "enforce",
+        "rules": [{ "when": when, "effect": "deny", "message": message }]
+    }))
+    .expect("a valid Policy");
+    compile(&policy, Level::Org).map(|ir| Rule { ir })
+}
+
+fn evaluate_rule(_schema: &Schema, rule: &Rule, input: &RunCreateInput) -> RuleOutcome {
+    let ctx = MatchContext {
+        project: input.project.name.clone(),
+        environment: input.pipeline.environment.clone(),
+        trigger_kind: input.trigger.kind,
+    };
+    let input = serde_json::to_value(input).expect("serialises");
+    let d = evaluate(
+        Checkpoint::RunCreate,
+        scarab_policy::run_create::SCHEMA_VERSION,
+        &input,
+        &ctx,
+        std::slice::from_ref(&rule.ir),
+    );
+    match &d.results[0].outcome {
+        PolicyOutcome::Passed => RuleOutcome::DoesNotApply,
+        PolicyOutcome::Denied { messages } => RuleOutcome::Applies {
+            message: messages.join("; "),
+        },
+        PolicyOutcome::Error { message } => RuleOutcome::DeniedOnError {
+            error: message.clone(),
+        },
+        other => panic!("an enforced, matched Policy: {other:?}"),
     }
 }
 

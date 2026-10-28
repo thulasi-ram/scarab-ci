@@ -15,69 +15,12 @@ use cel::extractors::This;
 use cel::objects::{Key, Map};
 use cel::{Context, ExecutionError, Value};
 
-use crate::check::{check, check_limits, on_cel_stack, parse, Checked, Diagnostic};
+use crate::check::{check_limits, parse};
 use crate::schema::{Schema, Type};
 
-/// One rule of a Policy, checked. Its message is static (ADR-0075 §4): the
-/// decision stores the input, which shows what the rule matched.
-#[derive(Debug)]
-pub struct Rule {
-    pub when: Checked,
-    pub message: String,
-}
-
-impl Rule {
-    pub fn warnings(&self) -> impl Iterator<Item = &Diagnostic> {
-        self.when.warnings.iter()
-    }
-}
-
-/// Checks a rule's `when`, which must return a bool.
-pub fn compile_rule(schema: &Schema, when: &str, message: &str) -> Result<Rule, Vec<Diagnostic>> {
-    let when = check(schema, when, &Type::Bool)?;
-    Ok(Rule {
-        when,
-        message: message.to_string(),
-    })
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum RuleOutcome {
-    /// `when` was false: the rule's effect does not apply.
-    DoesNotApply,
-    /// `when` was true: the rule's effect applies, with this message.
-    Applies { message: String },
-    /// Evaluation failed. Whatever the rule's effect, the decision is deny.
-    DeniedOnError { message: String, error: String },
-}
-
-/// Evaluates `rule` against `input`. Any error, in binding the input or in
-/// evaluating `when`, denies (ADR-0075 §6). Runs on the large-stack thread
-/// ([`on_cel_stack`]).
-pub fn evaluate_rule<I: serde::Serialize + Sync>(
-    schema: &Schema,
-    rule: &Rule,
-    input: &I,
-) -> RuleOutcome {
-    let denied = |error: String| RuleOutcome::DeniedOnError {
-        message: rule.message.clone(),
-        error,
-    };
-    let context = || bind(schema, input);
-    match on_cel_stack(|| {
-        let context = context().map_err(|e| format!("input does not match the schema: {e}"))?;
-        evaluate_when(&rule.when.source, &context)
-    }) {
-        Ok(Ok(true)) => RuleOutcome::Applies {
-            message: rule.message.clone(),
-        },
-        Ok(Ok(false)) => RuleOutcome::DoesNotApply,
-        Ok(Err(e)) | Err(e) => denied(e),
-    }
-}
-
 /// Parses a checked `when` again and evaluates it against `context`. Call it
-/// only on the [`on_cel_stack`] thread: the parsed program is dropped here.
+/// only on the [`on_cel_stack`](crate::check::on_cel_stack) thread: the
+/// parsed program is dropped here.
 ///
 /// Each `x.matches(pattern)` is evaluated through the context's
 /// [`MATCHES_FN`] (see [`bind`]), not `cel`'s own `matches`, which compiles
