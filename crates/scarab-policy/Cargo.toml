@@ -21,10 +21,11 @@ scarab-pipeline = { workspace = true }
 # root manifest): a Policy's content hash and the PolicySetDigest (ADR-0075
 # §9, §11) are SHA-256 over canonical JSON, domain facts a decision records.
 sha2 = { workspace = true }
-# Admitted per ADR-0031 (I/O-free library). Both are already in the tree as
-# dependencies of `cel` itself, at these versions, so naming them adds no crate:
-# `regex` compiles a `matches()` pattern when the rule is checked, with the same
-# engine `cel` evaluates it with; `chrono` builds the `cel::Value::Timestamp`
-# a checkpoint's `time` is bound as. Neither reads the clock here.
-regex = "1"
-chrono = { version = "0.4", default-features = false, features = ["alloc", "serde"] }
+# Admitted per ADR-0031 (I/O-free library, listed for pure crates in the
+# root manifest). Both are already in the tree as dependencies of `cel`
+# itself, so naming them adds no crate: `regex` compiles a `matches()`
+# pattern, at check time and once per evaluation, with the engine `cel`
+# evaluates it with; `chrono` builds the `cel::Value::Timestamp` a
+# checkpoint's `time` is bound as. Neither reads the clock here.
+regex = { workspace = true }
+chrono = { workspace = true }
