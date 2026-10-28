@@ -158,7 +158,7 @@ Where a `require_approval` takes effect depends on the checkpoint:
 | Checkpoint | A `require_approval` becomes |
 |---|---|
 | `run.create`, `invoke.resolve` | a **gate node in the Run's IR**, added when the Run is persisted: before the Run's root Steps (`run.create`), or before the inlined library's or plugin's Steps (`invoke.resolve`). It appears in the DAG, has a stable Step id, and uses the existing gate machinery: its own clock, holding only dependents, expiry from the Policy. |
-| `step.admit` | a **PolicyApprovalHold** on that Step: the Step does not launch until the named Principals approve. It has its own clock and the Policy's expiry, counts approvals per hold, appears as a badge on the Step's node, and is decided per Attempt. No node is added mid-Run. |
+| `step.admit` | a **PolicyApprovalHold** on that Step: the Step does not launch until the named Principals approve. It has its own clock and the Policy's expiry, counts approvals per hold, appears as a badge on the Step's node, and is decided per Attempt. No node is added mid-Run. The per-DeploymentTarget concurrency hold that ADR-0074 deleted had the same shape (a Step held at promotion, counted by the suspend rule, its reason shown on the Run page); its code is at tag `archive/deployment-record` and is the starting point. |
 | `gate.resolve` | an addition to that gate's **release quorum**. No gate is added. |
 
 One approval counts toward every requirement that names its Principal.
