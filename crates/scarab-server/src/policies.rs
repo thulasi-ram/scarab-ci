@@ -278,11 +278,24 @@ pub struct PolicyTestTrigger {
     /// `push`, `pull_request`, `tag`, `release`, `comment`, `cron`,
     /// `manual`, `api` or `upstream`.
     pub kind: String,
-    /// The symbolic ref (`refs/heads/main`).
+    /// The symbolic ref, as admission sees it: `refs/heads/main` for a push
+    /// or a dispatch, `refs/pull/<n>/head` for a pull request,
+    /// `refs/tags/<tag>` for a tag or release. Required for those kinds;
+    /// `comment`, `cron` and `upstream` have none.
     #[serde(default, rename = "ref")]
     pub r#ref: Option<String>,
     #[serde(default)]
     pub sha: Option<String>,
+    /// The forge account that caused the event. Default: the caller for
+    /// `manual` and `api` (as a dispatch is), none otherwise.
+    #[serde(default)]
+    pub actor: Option<String>,
+    /// A pull request from a fork; `pull_request` only. Default false.
+    #[serde(default)]
+    pub fork: bool,
+    /// The dispatch reason; `manual` and `api` only. Default none.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 /// What `policy-test` answers. Nothing is recorded.
@@ -1055,85 +1068,173 @@ fn match_context_of(input: &Value) -> Result<MatchContext, ApiError> {
     })
 }
 
-/// The input of the Pipeline form: compiled here from the sent sources, the
-/// Environment resolved as admission resolves it, and a refusal admission
-/// would make before consulting Policies answered as a 400.
+/// The forge event admission would see for the Pipeline form's trigger.
+fn test_event(
+    t: PolicyTestTrigger,
+    repo: scarab_forge::RepoRef,
+    caller: &str,
+) -> Result<scarab_forge::Event, ApiError> {
+    use scarab_forge::Event;
+    let kind: TriggerKind = serde_json::from_value(Value::String(t.kind.clone()))
+        .map_err(|_| ApiError::BadRequest(format!("`{}` is not a trigger kind", t.kind)))?;
+    let bad = |m: String| ApiError::BadRequest(m);
+    let dispatched = matches!(kind, TriggerKind::Manual | TriggerKind::Api);
+    if t.fork && kind != TriggerKind::PullRequest {
+        return Err(bad(
+            "only a pull_request trigger can come from a fork".into()
+        ));
+    }
+    if t.reason.is_some() && !dispatched {
+        return Err(bad("only a manual or api trigger carries a reason".into()));
+    }
+    let needs_ref = || {
+        t.r#ref
+            .clone()
+            .ok_or_else(|| bad(format!("a {} trigger needs `ref`", t.kind)))
+    };
+    let tag_of = || {
+        let r = needs_ref()?;
+        r.strip_prefix("refs/tags/")
+            .filter(|tag| !tag.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                bad(format!(
+                    "a {} trigger's ref is refs/tags/<tag>, not {r}",
+                    t.kind
+                ))
+            })
+    };
+    let sha = t.sha.clone().unwrap_or_default();
+    let actor = match (&t.actor, dispatched) {
+        (Some(a), _) => a.clone(),
+        (None, true) => caller.to_string(),
+        (None, false) => String::new(),
+    };
+    Ok(match kind {
+        TriggerKind::Push => Event::Push {
+            actor,
+            repo,
+            r#ref: needs_ref()?,
+            after: sha,
+            message: String::new(),
+        },
+        TriggerKind::PullRequest => {
+            let r = needs_ref()?;
+            let number = r
+                .strip_prefix("refs/pull/")
+                .and_then(|rest| rest.strip_suffix("/head"))
+                .and_then(|n| n.parse::<u64>().ok())
+                .ok_or_else(|| {
+                    bad(format!(
+                        "a pull_request trigger's ref is refs/pull/<n>/head, as admission sees \
+                         it, not {r}"
+                    ))
+                })?;
+            Event::PullRequest {
+                actor,
+                repo,
+                number,
+                head: sha,
+                title: String::new(),
+                base: String::new(),
+                fork: t.fork,
+            }
+        }
+        TriggerKind::Tag => Event::Tag {
+            actor,
+            repo,
+            tag: tag_of()?,
+        },
+        TriggerKind::Release => Event::Release {
+            actor,
+            repo,
+            tag: tag_of()?,
+        },
+        TriggerKind::Manual => Event::Manual {
+            actor,
+            repo,
+            r#ref: needs_ref()?,
+            sha,
+            reason: t.reason,
+        },
+        TriggerKind::Api => Event::Api {
+            actor,
+            repo,
+            r#ref: needs_ref()?,
+            sha,
+            reason: t.reason,
+        },
+        TriggerKind::Comment | TriggerKind::Cron | TriggerKind::Upstream if t.r#ref.is_some() => {
+            return Err(bad(format!("a {} trigger has no ref", t.kind)))
+        }
+        TriggerKind::Comment => Event::Comment {
+            actor,
+            repo,
+            issue: 0,
+            body: String::new(),
+        },
+        TriggerKind::Cron => Event::Cron {
+            schedule: String::new(),
+        },
+        TriggerKind::Upstream => Event::Upstream {
+            repo,
+            run: String::new(),
+        },
+    })
+}
+
+/// The input of the Pipeline form: compiled here from the sent sources,
+/// then built through the code admission runs (`admission_before_policies`,
+/// `run_create_facts`, `run_create_input`), so the input evaluated is the
+/// one admission would record for the same event. A refusal admission makes
+/// before consulting Policies is a 400.
 async fn pipeline_input(
     st: &AppState,
     org: &str,
     caller: &str,
     p: PolicyTestPipeline,
 ) -> Result<(Value, MatchContext), ApiError> {
-    let kind: TriggerKind = serde_json::from_value(Value::String(p.trigger.kind.clone()))
-        .map_err(|_| ApiError::BadRequest(format!("`{}` is not a trigger kind", p.trigger.kind)))?;
+    let repo = scarab_forge::RepoRef {
+        owner: org.to_string(),
+        name: p.project.clone(),
+    };
+    let event = test_event(p.trigger, repo.clone(), caller)?;
     let (yaml, libs) = (p.yaml, p.libs);
     let ir = blocking(move || scarab_pipeline::compile_yaml_with_libs(&yaml, &libs))
         .await?
         .map_err(|e| ApiError::BadRequest(format!("the Pipeline does not compile: {e}")))?;
 
-    // As admission (`resolve_governance` and the ref check): an Environment
-    // the org does not have, or that does not admit the Project or ref,
-    // refuses the Run before any Policy is consulted.
-    if let (Some(env), Some(gov)) = (&ir.environment, st.environment_governance.as_deref()) {
-        let refused = |why: String| {
-            ApiError::BadRequest(format!(
-                "admission refuses this Run before its Policies are consulted: {why}"
-            ))
-        };
-        let g = gov
-            .deploy_governance(org, &p.project, env)
-            .await
-            .map_err(|e| ApiError::Db(DbError::Other(format!("environment governance: {e}"))))?
-            .ok_or_else(|| refused(format!("org `{org}` has no environment `{env}`")))?;
-        if !g.eligible {
-            return Err(refused(format!(
-                "environment `{env}` does not admit project `{}`",
-                p.project
-            )));
+    let refused = |why: String| {
+        ApiError::BadRequest(format!(
+            "admission refuses this Run before its Policies are consulted: {why}"
+        ))
+    };
+    let gov = match crate::admission_before_policies(
+        st.environment_governance.as_deref(),
+        &event,
+        &ir,
+        &repo,
+    )
+    .await
+    {
+        Ok(Ok(gov)) => gov,
+        Ok(Err(refusal)) => {
+            return Err(refused(crate::admission_refusal_message(
+                &refusal, org, &repo.name,
+            )))
         }
-        if !g
-            .effective_protection()
-            .admits_protection_ref(p.trigger.r#ref.as_deref())
-        {
-            return Err(refused(format!(
-                "environment `{env}` does not allow this ref"
-            )));
-        }
-    }
+        Err(crate::TriggerError::ReasonRequired(m)) => return Err(refused(m)),
+        Err(crate::TriggerError::Db(e)) => return Err(ApiError::Db(e)),
+        Err(e) => return Err(ApiError::Db(DbError::Other(e.to_string()))),
+    };
 
-    // A dispatch's actor is the caller, as `dispatch_run` makes it.
-    let dispatched = matches!(kind, TriggerKind::Manual | TriggerKind::Api);
-    let principal = dispatched.then(|| caller.to_string());
-    let trigger = run_create::Trigger {
-        kind,
-        r#ref: p.trigger.r#ref,
-        sha: p.trigger.sha,
-        fork: false,
-        actor: principal.clone(),
-        principal: principal.clone(),
-        reason: None,
-    };
+    let path = p.path.unwrap_or_else(|| ".scarab/ci.yaml".to_string());
     let now = st.clock.now().await.0;
-    let time = scarab_policy::schema::Timestamp::from_unix_millis(now)
-        .ok_or_else(|| ApiError::BadRequest(format!("the time {now} is out of range")))?;
-    let ctx = MatchContext {
-        project: p.project.clone(),
-        environment: ir.environment.clone(),
-        trigger_kind: kind,
-    };
-    let facts = run_create::RunCreateFacts {
-        org: org.to_string(),
-        project: p.project,
-        trigger,
-        pipeline_path: p.path.unwrap_or_else(|| ".scarab/ci.yaml".to_string()),
-        environment: ir.environment.clone(),
-        principal,
-        time,
-    };
-    let input = run_create::input_from_pipeline(&ir, facts)
+    let (facts, ctx) = crate::run_create_facts(&event, &path, &repo, &gov, now);
+    let facts = facts.map_err(ApiError::BadRequest)?;
+    let input = blocking(move || crate::run_create_input(&ir, facts))
+        .await?
         .map_err(|e| ApiError::BadRequest(format!("the Run cannot be checked: {e}")))?;
-    let input = serde_json::to_value(input)
-        .map_err(|e| ApiError::Db(DbError::Other(format!("run.create input: {e}"))))?;
     Ok((input, ctx))
 }
 

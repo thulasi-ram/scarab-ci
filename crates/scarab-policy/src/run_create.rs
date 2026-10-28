@@ -288,6 +288,23 @@ pub fn uses_environment_authority(
         || ir.deploy
 }
 
+/// Refuses a Run over [`MAX_STEPS`] Steps or [`MAX_GATES`] gates, in time
+/// linear in its size. [`input_from_pipeline`] checks this first, before any
+/// work that grows faster than the Run: a Pipeline that compiles to 100,000
+/// Steps is refused here.
+pub fn check_run_caps(ir: &scarab_pipeline::PipelineIr) -> Result<(), CapExceeded> {
+    let run = || "the Run".to_string();
+    let gate_count = ir.steps.iter().filter(|s| s.is_gate()).count();
+    let step_count = ir.steps.len() - gate_count;
+    if step_count > MAX_STEPS {
+        return Err(cap_message(&run, step_count, "Steps", MAX_STEPS));
+    }
+    if gate_count > MAX_GATES {
+        return Err(cap_message(&run, gate_count, "gates", MAX_GATES));
+    }
+    Ok(())
+}
+
 /// Builds the `run.create` input of a compiled Pipeline (ADR-0075 §2). Every
 /// Step is listed, including ones a `when:` guard will skip: they are part
 /// of the Run. Gates are listed under `gates`, every other Step under
@@ -299,18 +316,8 @@ pub fn input_from_pipeline(
 ) -> Result<RunCreateInput, CapExceeded> {
     use std::collections::HashMap;
 
-    // The Run-level caps first, before any work that grows with the Run: a
-    // Pipeline that compiles to 100,000 Steps is refused here, in time
-    // linear in its size.
+    check_run_caps(ir)?;
     let run = || "the Run".to_string();
-    let gate_count = ir.steps.iter().filter(|s| s.is_gate()).count();
-    let step_count = ir.steps.len() - gate_count;
-    if step_count > MAX_STEPS {
-        return Err(cap_message(&run, step_count, "Steps", MAX_STEPS));
-    }
-    if gate_count > MAX_GATES {
-        return Err(cap_message(&run, gate_count, "gates", MAX_GATES));
-    }
 
     // Each Step's transitive upstream gates, as a bit set over the gates
     // (at most MAX_GATES, so one u64), in O(Steps × needs). Steps are

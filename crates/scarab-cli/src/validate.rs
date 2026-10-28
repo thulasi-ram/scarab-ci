@@ -9,8 +9,9 @@
 //! (`POST /v1/orgs/{org}/policy-test`, ADR-0075 §2 and §9) what the
 //! `run.create` Policies would decide for a Run of this Pipeline in
 //! `--project`, for the given trigger (by default a push to the current
-//! branch). Nothing is enforced or recorded. A rule that reads the trigger
-//! is labelled with the trigger it was decided for.
+//! branch). Nothing is enforced or recorded. A rule that reads the trigger,
+//! the Principal or the time is labelled with the trigger it was decided
+//! for.
 //!
 //! `--server` has no default and no environment variable: a `SCARAB_SERVER`
 //! in the environment never turns an offline check into a network call.
@@ -50,13 +51,29 @@ pub struct ValidateArgs {
     /// The trigger to evaluate for (with `--server`).
     #[arg(long, default_value = "push", value_parser = EVENTS)]
     pub event: String,
-    /// The trigger's symbolic ref (with `--server`). Default: the current
-    /// branch, as `refs/heads/<branch>`.
-    #[arg(long, requires = "server")]
+    /// The trigger's symbolic ref as admission sees it (with `--server`).
+    /// Default: the current branch, as `refs/heads/<branch>`, for `push`,
+    /// `manual` and `api`. `tag` needs it (`refs/tags/<tag>`);
+    /// `pull_request` needs it (`refs/pull/<n>/head`) or `--pr`.
+    #[arg(long, requires = "server", conflicts_with = "pr")]
     pub r#ref: Option<String>,
+    /// The pull request number, for `--event pull_request`: the ref is
+    /// `refs/pull/<n>/head`.
+    #[arg(long, requires = "server")]
+    pub pr: Option<u64>,
     /// The trigger's commit (with `--server`). Default: `git rev-parse HEAD`.
     #[arg(long, requires = "server")]
     pub sha: Option<String>,
+    /// The forge account that caused the event (with `--server`). Default:
+    /// you, for `manual` and `api`; none for the others.
+    #[arg(long, requires = "server")]
+    pub actor: Option<String>,
+    /// A pull request from a fork (with `--event pull_request`).
+    #[arg(long, requires = "server")]
+    pub fork: bool,
+    /// The dispatch reason (with `--event manual` or `api`).
+    #[arg(long, requires = "server")]
+    pub reason: Option<String>,
 }
 
 /// A Pipeline file read from disk with the libraries it invokes.
@@ -209,12 +226,37 @@ pub async fn run(args: ValidateArgs) -> i32 {
     println!("ok: {} step(s), ir v{}", ir.steps.len(), ir.ir_version);
 
     let dir = file_dir(&args.file);
+    if args.pr.is_some() && args.event != "pull_request" {
+        eprintln!("error: --pr is for --event pull_request");
+        return 2;
+    }
+    if args.fork && args.event != "pull_request" {
+        eprintln!("error: --fork is for --event pull_request");
+        return 2;
+    }
+    if args.reason.is_some() && !matches!(args.event.as_str(), "manual" | "api") {
+        eprintln!("error: --reason is for --event manual or api");
+        return 2;
+    }
     let git_ref = match args.r#ref.clone() {
         Some(r) => r,
         None if args.event == "tag" => {
             eprintln!("error: --event tag needs --ref (e.g. refs/tags/v1.0.0)");
             return 2;
         }
+        // A pull request's Run is admitted on refs/pull/<n>/head, never on
+        // its branch: deciding for refs/heads/<branch> would answer for a
+        // ref no pull request Run has.
+        None if args.event == "pull_request" => match args.pr {
+            Some(n) => format!("refs/pull/{n}/head"),
+            None => {
+                eprintln!(
+                    "error: --event pull_request needs --pr <number> (or --ref \
+                     refs/pull/<n>/head)"
+                );
+                return 2;
+            }
+        },
         None => match git(&dir, &["symbolic-ref", "-q", "HEAD"]) {
             Some(r) => r,
             None => {
@@ -231,6 +273,15 @@ pub async fn run(args: ValidateArgs) -> i32 {
     let mut trigger = json!({ "kind": args.event, "ref": git_ref });
     if let Some(sha) = sha {
         trigger["sha"] = json!(sha);
+    }
+    if let Some(actor) = &args.actor {
+        trigger["actor"] = json!(actor);
+    }
+    if args.fork {
+        trigger["fork"] = json!(true);
+    }
+    if let Some(reason) = &args.reason {
+        trigger["reason"] = json!(reason);
     }
     let body = json!({
         "pipeline": {
@@ -250,8 +301,18 @@ pub async fn run(args: ValidateArgs) -> i32 {
     print_answer(&answer, &args.event, &git_ref)
 }
 
-/// Print each Policy's result, label the rules that read the trigger, and
-/// the overall outcome. 0 on allow, 1 on deny.
+/// Whether a rule reading input field `f` gets an answer that depends on
+/// more than the Pipeline file: the trigger, the Principal creating the Run
+/// (absent for a webhook), or the time.
+fn is_situational(f: &str) -> bool {
+    ["trigger", "principal", "time"]
+        .iter()
+        .any(|v| f == *v || f.strip_prefix(v).is_some_and(|rest| rest.starts_with('.')))
+}
+
+/// Print each Policy's result, label the rules whose answer depends on the
+/// trigger, the Principal or the time, and the overall outcome. 0 on allow,
+/// 1 on deny.
 fn print_answer(answer: &Value, event: &str, git_ref: &str) -> i32 {
     let s = crate::security::sanitize;
     let decision = &answer["decision"];
@@ -289,7 +350,7 @@ fn print_answer(answer: &Value, event: &str, git_ref: &str) -> i32 {
                 .into_iter()
                 .flatten()
                 .filter_map(Value::as_str)
-                .filter(|f| *f == "trigger" || f.starts_with("trigger."))
+                .filter(|f| is_situational(f))
                 .collect();
             // The most specific fields: `trigger` is dropped when
             // `trigger.ref` is there too.
@@ -303,8 +364,13 @@ fn print_answer(answer: &Value, event: &str, git_ref: &str) -> i32 {
                 .map(|f| s(f))
                 .collect();
             if !trigger_reads.is_empty() {
+                let at = if trigger_reads.iter().any(|f| f == "time") {
+                    ", at the server's current time"
+                } else {
+                    ""
+                };
                 println!(
-                    "  rule {} reads {}: decided for {} on {}",
+                    "  rule {} reads {}: decided for {} on {}{at}",
                     rule["index"].as_u64().unwrap_or(0),
                     trigger_reads.join(", "),
                     s(event),
@@ -335,6 +401,29 @@ fn print_answer(answer: &Value, event: &str, git_ref: &str) -> i32 {
                 s(other.unwrap_or("none"))
             );
             1
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_situational;
+
+    /// A rule over the Principal or the time is labelled like one over the
+    /// trigger: its answer depends on more than the Pipeline file.
+    #[test]
+    fn rules_over_the_trigger_the_principal_or_the_time_are_labelled() {
+        for f in ["trigger", "trigger.ref", "principal", "time"] {
+            assert!(is_situational(f), "{f}");
+        }
+        for f in [
+            "steps",
+            "pipeline.deploy",
+            "project.name",
+            "timeline",
+            "principals",
+        ] {
+            assert!(!is_situational(f), "{f}");
         }
     }
 }

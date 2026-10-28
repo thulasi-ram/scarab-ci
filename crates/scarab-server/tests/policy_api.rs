@@ -578,6 +578,120 @@ async fn policy_test_evaluates_every_form_and_records_nothing() {
     assert_eq!(page["decisions"][0]["id"], json!(decision_id));
 }
 
+const PR_YAML: &str = r#"
+on:
+  push: {}
+  pull_request: {}
+steps:
+  - { id: test, image: busybox, command: ["true"] }
+  - { id: ship, invoke: .scarab/lib/deploy.yaml, needs: [test] }
+"#;
+
+/// The policy test API builds its input through admission's own code: for
+/// the same event, the input it evaluates is the input admission recorded
+/// (the time aside, which is each one's clock).
+#[tokio::test]
+async fn policy_test_evaluates_the_input_admission_records() {
+    let (h, policies) = with_policies();
+    let (s, _) = admin(&h).await;
+    create(
+        &h,
+        &s,
+        "/v1/orgs/acme/policies",
+        json!({
+            "name": "watch-forks",
+            "checkpoint": "run.create",
+            "mode": "audit",
+            "rules": [{ "when": "trigger.fork", "effect": "deny", "message": "a fork" }]
+        }),
+    )
+    .await;
+    let forge = FakeForge::new()
+        .with_file(".scarab/ci.yaml", PR_YAML)
+        .with_file(".scarab/lib/deploy.yaml", LIB)
+        .with_commit("refs/heads/main", SHA);
+    let repo = RepoRef {
+        owner: "acme".into(),
+        name: "web".into(),
+    };
+    let fork_pr = Event::PullRequest {
+        actor: "mallory".into(),
+        repo,
+        number: 7,
+        head: SHA.into(),
+        title: "fix".into(),
+        base: "main".into(),
+        fork: true,
+    };
+    let cases = [
+        (
+            push(),
+            json!({ "kind": "push", "ref": "refs/heads/main", "sha": SHA, "actor": "octocat" }),
+        ),
+        (
+            fork_pr,
+            json!({
+                "kind": "pull_request", "ref": "refs/pull/7/head", "sha": SHA,
+                "actor": "mallory", "fork": true
+            }),
+        ),
+    ];
+    let without_time = |mut v: Value| {
+        assert!(v["time"].is_string(), "{v}");
+        v.as_object_mut().unwrap().remove("time");
+        v
+    };
+    for (event, trigger) in cases {
+        let outcome = trigger_runs_from_event(
+            &forge,
+            h.db.as_ref(),
+            &FakeClock::new(1_000),
+            AdmissionPorts::default().with_policies(policies.as_ref()),
+            &event,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.runs.len(), 1, "audit mode admits it");
+        let recorded = policies.org_decisions("acme", 1, None).await.unwrap()[0]
+            .decision
+            .input
+            .clone();
+
+        let mut form = pipeline_form();
+        form["yaml"] = json!(PR_YAML);
+        form["trigger"] = trigger;
+        let (st, b) = h
+            .cookie(
+                "POST",
+                "/v1/orgs/acme/policy-test",
+                Some(json!({ "pipeline": form })),
+                &s,
+            )
+            .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(
+            without_time(b["decision"]["input"].clone()),
+            without_time(recorded),
+            "{}",
+            event.trigger_kind().as_str()
+        );
+    }
+
+    // A pull request's ref is the one admission sees, not its branch.
+    let mut form = pipeline_form();
+    form["trigger"] = json!({ "kind": "pull_request", "ref": "refs/heads/fix" });
+    let (st, b) = h
+        .cookie(
+            "POST",
+            "/v1/orgs/acme/policy-test",
+            Some(json!({ "pipeline": form })),
+            &s,
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+    assert!(b.to_string().contains("refs/pull/<n>/head"), "{b}");
+}
+
 #[tokio::test]
 async fn decision_logs_page_the_org_and_list_a_runs_own() {
     let (h, policies) = with_policies();

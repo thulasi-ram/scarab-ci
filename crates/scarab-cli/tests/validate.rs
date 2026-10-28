@@ -221,6 +221,40 @@ async fn server_dry_run_denies_the_library_with_the_policys_message() {
     );
 }
 
+/// A pull request's Run is admitted on `refs/pull/<n>/head`, never on its
+/// branch, so the CLI does not default a pull request to the current branch.
+#[tokio::test(flavor = "multi_thread")]
+async fn server_dry_run_of_a_pull_request_decides_for_its_pull_ref() {
+    let base = serve().await;
+    let dir = repo();
+    let args = [
+        "validate",
+        ".scarab/ci.yaml",
+        "--server",
+        &base,
+        "--org",
+        "acme",
+        "--project",
+        "web",
+        "--event",
+        "pull_request",
+    ];
+    let out = output(scarab(&dir, &args)).await;
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("--pr"), "{stderr}");
+
+    let mut with_pr = args.to_vec();
+    with_pr.extend(["--pr", "7", "--fork"]);
+    let out = output(scarab(&dir, &with_pr)).await;
+    let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("decided for pull_request on refs/pull/7/head"),
+        "{stdout}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn server_dry_run_without_a_project_is_a_usage_error() {
     let base = serve().await;

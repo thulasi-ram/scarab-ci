@@ -4613,42 +4613,10 @@ async fn admit_and_create_run(
         .repo()
         .ok_or_else(|| TriggerError::Pipeline("event carries no repository".into()))?;
 
-    // ADR-0037/0039, ADR-0071: resolve the run's governance once (a deploy
-    // pipeline targets an Environment; an ordinary CI run does not) — refusing
-    // an unknown Environment or an ineligible Project outright. Then reject a
-    // disallowed ref at creation (enforced even without an approver gate) and
-    // admit per-step privilege grants against the Project's grant.
-    let gov = match resolve_governance(ports.governance, event, ir, repo).await? {
+    let gov = match admission_before_policies(ports.governance, event, ir, repo).await? {
         Ok(gov) => gov,
         Err(refusal) => return Ok(Admission::Refused(refusal)),
     };
-    if let Some(p) = gov.protection() {
-        // ADR-0037: match allowed_refs against the *symbolic* branch/tag ref
-        // (`refs/heads/main`, `refs/tags/*`, …), NOT the immutable commit the
-        // config is read at (`git_ref` above is a SHA for push/dispatch). An event
-        // with no symbolic ref (cron/comment/upstream) is admitted only where no
-        // layer restricts refs — fail-closed.
-        if !p.admits_protection_ref(event.protection_ref().as_deref()) {
-            return Ok(Admission::Refused(AdmissionRefusal::RefNotAllowed));
-        }
-
-        // ADR-0057 §3: a `require_reason` environment blocks a reasonless human
-        // dispatch (manual/api) at the admission gate — a third guardrail beside
-        // allowed_refs/approvers. `trigger_title()` is `None` exactly when a
-        // manual/api dispatch carried no non-blank reason (slice C's canonical
-        // empty-reason signal); push/PR/tag/release/cron/upstream are exempt via
-        // `is_human_dispatch == false`. Unlike a disallowed ref (a refusal the
-        // webhook path skips), a missing reason is an answerable request —
-        // surface it fail-closed with a clear diagnostic (like a missing approval).
-        let is_human_dispatch = matches!(
-            event.trigger_kind(),
-            scarab_forge::TriggerKind::Manual | scarab_forge::TriggerKind::Api
-        );
-        if let Err(violations) = p.admits_reason(is_human_dispatch, event.trigger_title().is_some())
-        {
-            return Err(TriggerError::ReasonRequired(violations.join("; ")));
-        }
-    }
 
     let now = clock.now().await;
     let run = new_run_id();
@@ -4671,6 +4639,56 @@ async fn admit_and_create_run(
         db.set_run_params(&run, params).await?;
     }
     Ok(Admission::Created(run))
+}
+
+/// The admission checks a Run passes before its `run.create` Policies are
+/// consulted: resolve the target Environment's governance (refusing an
+/// unknown Environment or an ineligible Project), then the Environment's
+/// allowed refs and `require_reason`. Shared by [`admit_and_create_run`] and
+/// the policy test API, so both answer for the same Run the same way.
+async fn admission_before_policies(
+    governance: Option<&dyn scarab_project::EnvironmentGovernanceStore>,
+    event: &scarab_forge::Event,
+    ir: &scarab_pipeline::PipelineIr,
+    repo: &scarab_forge::RepoRef,
+) -> Result<Result<RunGovernance, AdmissionRefusal>, TriggerError> {
+    // ADR-0037/0039, ADR-0071: resolve the run's governance once (a deploy
+    // pipeline targets an Environment; an ordinary CI run does not) — refusing
+    // an unknown Environment or an ineligible Project outright. Then reject a
+    // disallowed ref at creation (enforced even without an approver gate) and
+    // admit per-step privilege grants against the Project's grant.
+    let gov = match resolve_governance(governance, event, ir, repo).await? {
+        Ok(gov) => gov,
+        Err(refusal) => return Ok(Err(refusal)),
+    };
+    if let Some(p) = gov.protection() {
+        // ADR-0037: match allowed_refs against the *symbolic* branch/tag ref
+        // (`refs/heads/main`, `refs/tags/*`, …), NOT the immutable commit the
+        // config is read at (`git_ref` above is a SHA for push/dispatch). An event
+        // with no symbolic ref (cron/comment/upstream) is admitted only where no
+        // layer restricts refs — fail-closed.
+        if !p.admits_protection_ref(event.protection_ref().as_deref()) {
+            return Ok(Err(AdmissionRefusal::RefNotAllowed));
+        }
+
+        // ADR-0057 §3: a `require_reason` environment blocks a reasonless human
+        // dispatch (manual/api) at the admission gate — a third guardrail beside
+        // allowed_refs/approvers. `trigger_title()` is `None` exactly when a
+        // manual/api dispatch carried no non-blank reason (slice C's canonical
+        // empty-reason signal); push/PR/tag/release/cron/upstream are exempt via
+        // `is_human_dispatch == false`. Unlike a disallowed ref (a refusal the
+        // webhook path skips), a missing reason is an answerable request —
+        // surface it fail-closed with a clear diagnostic (like a missing approval).
+        let is_human_dispatch = matches!(
+            event.trigger_kind(),
+            scarab_forge::TriggerKind::Manual | scarab_forge::TriggerKind::Api
+        );
+        if let Err(violations) = p.admits_reason(is_human_dispatch, event.trigger_title().is_some())
+        {
+            return Err(TriggerError::ReasonRequired(violations.join("; ")));
+        }
+    }
+    Ok(Ok(gov))
 }
 
 /// A PolicyStore failure: refuse the Run (fail closed) rather than admit it
@@ -4730,6 +4748,56 @@ fn run_create_trigger(
     (trigger, principal)
 }
 
+/// What a `run.create` consultation of `event` knows besides the Pipeline,
+/// and what the Policies' `match` is evaluated against (ADR-0075 §2). The
+/// facts are an `Err` when `now_ms` is out of range. Shared by admission
+/// and the policy test API.
+fn run_create_facts(
+    event: &scarab_forge::Event,
+    path: &str,
+    repo: &scarab_forge::RepoRef,
+    gov: &RunGovernance,
+    now_ms: i64,
+) -> (
+    Result<scarab_policy::run_create::RunCreateFacts, String>,
+    scarab_policy::evaluate::MatchContext,
+) {
+    let environment = match gov {
+        RunGovernance::Governed { environment, .. } => Some(environment.clone()),
+        RunGovernance::Ungoverned => None,
+    };
+    let (trigger, principal) = run_create_trigger(event);
+    let ctx = scarab_policy::evaluate::MatchContext {
+        project: repo.name.clone(),
+        environment: environment.clone(),
+        trigger_kind: trigger.kind,
+    };
+    let facts = scarab_policy::schema::Timestamp::from_unix_millis(now_ms)
+        .ok_or_else(|| format!("the time {now_ms} is out of range"))
+        .map(|time| scarab_policy::run_create::RunCreateFacts {
+            org: repo.owner.clone(),
+            project: repo.name.clone(),
+            trigger,
+            pipeline_path: path.to_string(),
+            environment,
+            principal,
+            time,
+        });
+    (facts, ctx)
+}
+
+/// The `run.create` input of `ir`, as a PolicyDecision records it; an `Err`
+/// names the list cap the Run does not fit. CPU work: call it off the async
+/// workers.
+fn run_create_input(
+    ir: &scarab_pipeline::PipelineIr,
+    facts: scarab_policy::run_create::RunCreateFacts,
+) -> Result<serde_json::Value, String> {
+    let input =
+        scarab_policy::run_create::input_from_pipeline(ir, facts).map_err(|e| e.to_string())?;
+    serde_json::to_value(input).map_err(|e| e.to_string())
+}
+
 /// Consults the `run.create` Policies of `repo`'s org and Project for a
 /// compiled Pipeline about to become Run `run` (ADR-0075 §2, §7, §9).
 ///
@@ -4753,7 +4821,7 @@ async fn consult_run_create(
     run: &RunId,
     now: scarab_engine::Timestamp,
 ) -> Result<Result<(), AdmissionRefusal>, TriggerError> {
-    use scarab_policy::evaluate::{evaluate_stored, MatchContext, PolicyOutcome};
+    use scarab_policy::evaluate::{evaluate_stored, PolicyOutcome};
     use scarab_policy::policy::{Checkpoint, Mode};
     use scarab_policy::run_create;
 
@@ -4765,35 +4833,17 @@ async fn consult_run_create(
         return Ok(Ok(()));
     }
 
-    let environment = match gov {
-        RunGovernance::Governed { environment, .. } => Some(environment.clone()),
-        RunGovernance::Ungoverned => None,
-    };
-    let (trigger, principal) = run_create_trigger(event);
-    let ctx = MatchContext {
-        project: repo.name.clone(),
-        environment: environment.clone(),
-        trigger_kind: trigger.kind,
-    };
-    let input = scarab_policy::schema::Timestamp::from_unix_millis(now.0)
-        .ok_or_else(|| format!("the time {} is out of range", now.0))
-        .and_then(|time| {
-            let facts = run_create::RunCreateFacts {
-                org: repo.owner.clone(),
-                project: repo.name.clone(),
-                trigger,
-                pipeline_path: path.to_string(),
-                environment,
-                principal,
-                time,
-            };
-            run_create::input_from_pipeline(ir, facts).map_err(|e| e.to_string())
-        })
-        .and_then(|i| serde_json::to_value(i).map_err(|e| e.to_string()));
-
-    // CEL runs on the engine's own large-stack thread; keep that join off
-    // the async workers.
+    let (facts, ctx) = run_create_facts(event, path, repo, gov, now.0);
+    // Building the input and evaluating it are CPU work; both run off the
+    // async workers. The Run-level caps are checked here first, so a Run
+    // that cannot be checked is not copied to get there.
+    let job = facts.and_then(|facts| {
+        run_create::check_run_caps(ir)
+            .map(|()| (ir.clone(), facts))
+            .map_err(|e| e.to_string())
+    });
     let decision = tokio::task::spawn_blocking(move || {
+        let input = job.and_then(|(ir, facts)| run_create_input(&ir, facts));
         evaluate_stored(
             Checkpoint::RunCreate,
             run_create::SCHEMA_VERSION,
