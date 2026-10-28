@@ -117,6 +117,11 @@ A **Deploy Run** is a Run whose Pipeline is marked, or which has a marked Step. 
 decided at Run creation from the Pipeline and stored on the Run. A **Deploy Step** is a
 marked Step. A gate cannot be marked. Marking a deploy needs no Environment.
 
+A Deploy Run is exempt from newest-wins cancel in the same way as a Run that names an
+Environment: it carries no supersede key, and its concurrency group queues even when the
+Pipeline declares `cancel-in-progress`. A newer push never cancels a deploy half-way.
+The mark changes nothing else.
+
 The Runs list API and the Runs tab filter by `deploy` and by `environment`, in the
 database query, and together. Today the Runs tab filters only the page of Runs already
 fetched (`ui/scarab-web-ui/src/routes/RepoView.tsx:185`, `:218`), and `GET` on the runs
