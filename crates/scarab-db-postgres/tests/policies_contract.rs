@@ -48,6 +48,7 @@ contract_test!(versions_and_optimistic_concurrency, versions_and_occ);
 contract_test!(names_are_unique_among_live_policies, unique_names);
 contract_test!(effective_is_org_then_project, effective_policies);
 contract_test!(decisions_round_trip_and_page, decisions);
+contract_test!(names_order_bytewise_in_both_stores, bytewise_name_order);
 
 fn body(name: &str, checkpoint: &str, when: &str) -> Policy {
     Policy::from_json(json!({
@@ -204,6 +205,36 @@ async fn unique_names(s: &dyn PolicyStore) {
         names,
         [("p7".into(), "a".into()), ("p6".into(), "b".into())]
     );
+}
+
+/// Both stores order names by their bytes, not by a database collation
+/// (under en_US, `a-x` sorts before `B-x` and `-` is ignored): the order of
+/// a decision's results and deny messages is the same in both.
+async fn bytewise_name_order(s: &dyn PolicyStore) {
+    for (id, name) in [
+        ("p1", "a-x"),
+        ("p2", "B-x"),
+        ("p3", "ab"),
+        ("p4", "a_x"),
+        ("p5", "a.x"),
+    ] {
+        s.create(&new(id, org("acme"), body(name, "run.create", "true")))
+            .await
+            .unwrap();
+    }
+    let names = |v: Vec<scarab_policy::store::StoredPolicy>| -> Vec<String> {
+        v.into_iter().map(|p| p.name).collect()
+    };
+    let bytewise = ["B-x", "a-x", "a.x", "a_x", "ab"];
+    assert_eq!(
+        names(
+            s.effective("acme", None, Checkpoint::RunCreate)
+                .await
+                .unwrap()
+        ),
+        bytewise
+    );
+    assert_eq!(names(s.list(&org("acme")).await.unwrap()), bytewise);
 }
 
 async fn effective_policies(s: &dyn PolicyStore) {

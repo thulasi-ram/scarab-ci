@@ -186,7 +186,7 @@ pub trait PolicyStore: Send + Sync {
     /// A Policy by id, deleted or not.
     async fn get(&self, id: &str) -> Result<Option<StoredPolicy>, PolicyStoreError>;
 
-    /// The live Policies attached at exactly `scope`, by name.
+    /// The live Policies attached at exactly `scope`, by name (bytewise).
     async fn list(&self, scope: &PolicyScope) -> Result<Vec<StoredPolicy>, PolicyStoreError>;
 
     /// Every version of a Policy, oldest first; empty when there is none.
@@ -200,7 +200,8 @@ pub trait PolicyStore: Send + Sync {
 
     /// The live Policies at `checkpoint` that a consultation in `project` of
     /// `org` evaluates: the org's own, and `project`'s when given. Org
-    /// Policies first, then by name.
+    /// Policies first, then by name, compared bytewise (not by a database
+    /// collation).
     async fn effective(
         &self,
         org: &str,

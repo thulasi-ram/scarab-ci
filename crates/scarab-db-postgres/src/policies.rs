@@ -304,7 +304,7 @@ impl PolicyStore for PostgresDb {
         let rows = sqlx::query(&format!(
             "SELECT {POLICY_COLUMNS} FROM policies \
              WHERE org = $1 AND project IS NOT DISTINCT FROM $2 AND NOT deleted \
-             ORDER BY name"
+             ORDER BY name COLLATE \"C\""
         ))
         .bind(scope.org())
         .bind(scope.project())
@@ -353,7 +353,7 @@ impl PolicyStore for PostgresDb {
             "SELECT {POLICY_COLUMNS} FROM policies \
              WHERE org = $1 AND checkpoint = $2 AND NOT deleted \
                AND (project IS NULL OR project = $3) \
-             ORDER BY project IS NOT NULL, name"
+             ORDER BY project IS NOT NULL, name COLLATE \"C\""
         ))
         .bind(org)
         .bind(checkpoint.as_str())
