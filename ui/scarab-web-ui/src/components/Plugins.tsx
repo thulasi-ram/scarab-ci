@@ -14,10 +14,16 @@
 // "set" / "not set" — and is typed again on every save, so a destination
 // never inherits a credential entered for another. Plain http is allowed but
 // always flagged.
+//
+// "Storage" (ADR-0074 §7) names one PersistentVolumeClaim an operator created
+// in the plugin namespace; the runtime mounts it read-write into the plugin's
+// Pod. Scarab does not create, back up or read it. Moving it to another claim
+// or path asks for a step-up; adding or removing it does not.
 import { createResource, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { Portal } from "solid-js/web";
 import {
   deletePluginConnection,
+  deletePluginStorage,
   enablePlugin,
   installPlugin,
   killPlugin,
@@ -25,6 +31,7 @@ import {
   listPluginConnections,
   listPlugins,
   putPluginConnection,
+  putPluginStorage,
   uninstallPlugin,
   type PluginCatalogEntry,
   type PluginConnection,
@@ -45,7 +52,11 @@ import {
   stateBadge,
   toInstallBody,
   ruleLabel,
+  DEFAULT_STORAGE_MOUNT_PATH,
+  STORAGE_NOTE,
+  toStorageBody,
   type BadgeTone,
+  type StorageForm,
 } from "../plugins";
 import { relTime, absTime } from "../fmt";
 import Icon from "./Icon";
@@ -150,6 +161,11 @@ export default function Plugins(props: { org: string }) {
                       onKill={() => kill(p)}
                       onEnable={() => enable(p)}
                       onUninstall={() => uninstall(p)}
+                      onStorageChanged={(msg) => {
+                        setError(null);
+                        setNotice(msg);
+                        reload();
+                      }}
                     />
                   )}
                 </For>
@@ -200,8 +216,10 @@ function PluginRow(props: {
   onKill: () => void;
   onEnable: () => void;
   onUninstall: () => void;
+  onStorageChanged: (msg: string) => void;
 }) {
   const p = () => props.plugin;
+  const [storageOpen, setStorageOpen] = createSignal(false);
   const killed = () => p().state === "killed";
   const state = () => stateBadge(p().state);
   const runtime = () => runtimeBadge(p().runtime_status);
@@ -276,6 +294,33 @@ function PluginRow(props: {
         </Show>
       </div>
 
+      <div class="tok-facts">
+        <span title={STORAGE_NOTE}>
+          <Icon icon="database" size={12} />
+          <Show when={p().storage} fallback={<span class="subtle">no storage</span>}>
+            {(s) => (
+              <span class="mono">
+                {s().claim} → {s().mount_path}
+              </span>
+            )}
+          </Show>
+        </span>
+        <button class="btn btn-ghost btn-sm plg-toggle" onClick={() => setStorageOpen((o) => !o)}>
+          <Icon icon={storageOpen() ? "chevron-down" : "chevron-right"} size={12} /> storage
+        </button>
+      </div>
+
+      <Show when={storageOpen()}>
+        <StorageEditor
+          org={props.org}
+          plugin={p()}
+          onChanged={(msg) => {
+            setStorageOpen(false);
+            props.onStorageChanged(msg);
+          }}
+        />
+      </Show>
+
       <Show when={p().manifest.connections.length > 0}>
         <div class="tok-facts">
           <button class="btn btn-ghost btn-sm plg-toggle" onClick={() => setConnectionsOpen((o) => !o)}>
@@ -288,6 +333,114 @@ function PluginRow(props: {
         <Connections org={props.org} installation={p().name} />
       </Show>
     </li>
+  );
+}
+
+/** An installation's storage claim (ADR-0074 §7): what to tell the operator,
+ *  and the form that sets, moves or removes it. */
+function StorageEditor(props: {
+  org: string;
+  plugin: PluginInstallation;
+  onChanged: (msg: string) => void;
+}) {
+  const current = () => props.plugin.storage ?? null;
+  const [form, setForm] = createSignal<StorageForm>({
+    claim: current()?.claim ?? "",
+    mount_path: current()?.mount_path ?? "",
+  });
+  const [saving, setSaving] = createSignal(false);
+  const [error, setError] = createSignal<string | null>(null);
+  const built = () => toStorageBody(form());
+  const set = (k: keyof StorageForm, v: string) => setForm((f) => ({ ...f, [k]: v }));
+  const owner = () => `${props.plugin.org}/${props.plugin.name}`;
+
+  const save = async () => {
+    const body = built().body;
+    if (!body || saving()) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const updated = await putPluginStorage(props.org, props.plugin.name, body);
+      const s = updated.storage;
+      props.onChanged(
+        s ? `${props.plugin.name} mounts ${s.claim} at ${s.mount_path}.` : `${props.plugin.name} has no storage.`,
+      );
+    } catch (e) {
+      setError(e instanceof Error ? e.message : `Could not set ${props.plugin.name}'s storage.`);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const remove = async () => {
+    const s = current();
+    if (!s) return;
+    if (
+      !window.confirm(
+        `Stop mounting ${s.claim} in ${props.plugin.name}?\n\nThe plugin restarts without it. The claim and its data stay in the cluster; Scarab does not delete them.`,
+      )
+    )
+      return;
+    setError(null);
+    try {
+      await deletePluginStorage(props.org, props.plugin.name);
+      props.onChanged(`${props.plugin.name} no longer mounts ${s.claim}; the claim is left as it is.`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : `Could not remove ${props.plugin.name}'s storage.`);
+    }
+  };
+
+  return (
+    <div class="plg-conns">
+      <div class="token-form">
+        <div class="form-r">
+          <label>claim</label>
+          <input
+            class="input mono"
+            placeholder="argocd-state"
+            value={form().claim}
+            onInput={(e) => set("claim", e.currentTarget.value)}
+          />
+          <p class="fieldnote">
+            A PersistentVolumeClaim in the plugin namespace. An operator creates it with the
+            annotation{" "}
+            <span class="mono">
+              {current()?.owner_annotation ?? "scarab.io/plugin-installation"}={owner()}
+            </span>
+            ; until it has that annotation the plugin does not start.
+          </p>
+        </div>
+        <div class="form-r">
+          <label>mount path</label>
+          <input
+            class="input mono"
+            placeholder={DEFAULT_STORAGE_MOUNT_PATH}
+            value={form().mount_path}
+            onInput={(e) => set("mount_path", e.currentTarget.value)}
+          />
+        </div>
+        <p class="fieldnote">
+          <Icon icon="shield-check" size={12} /> {STORAGE_NOTE} Moving it to another claim or path
+          asks you to confirm with your passkey.
+        </p>
+        <Show when={built().error && form().claim.trim() !== ""}>
+          <p class="error">{built().error}</p>
+        </Show>
+        <Show when={error()}>
+          <p class="error">{error()}</p>
+        </Show>
+        <div class="modal-actions">
+          <button class="btn btn-primary btn-sm" disabled={!built().body || saving()} onClick={() => void save()}>
+            {saving() ? "Saving…" : "Save"}
+          </button>
+          <Show when={current()}>
+            <button class="btn btn-ghost btn-sm" onClick={() => void remove()}>
+              Remove
+            </button>
+          </Show>
+        </div>
+      </div>
+    </div>
   );
 }
 

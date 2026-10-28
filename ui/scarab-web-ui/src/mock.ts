@@ -800,11 +800,18 @@ const pluginInstallation = (
   killed_at: null,
   killed_by: null,
   manifest: argocdManifest,
+  storage: null,
   ...o,
 });
 const plugins: PluginInstallationDto[] = [
   pluginInstallation("argocd", "4f2a1c9e7b3d", {
     runtime_message: "watching 6 applications",
+    storage: {
+      claim: "argocd-state",
+      mount_path: "/data",
+      owner_annotation: "scarab.io/plugin-installation",
+      owner_annotation_value: "acme/argocd",
+    },
   }),
   pluginInstallation("argocd-us", "d81e6b02c4aa", {
     state: "killed",
@@ -1333,6 +1340,21 @@ function route(pathname: string, search: string, method: string): Response | nul
       );
     }
     return json(plugins);
+  }
+  if ((m = p.match(/^\/v1\/orgs\/[^/]+\/plugins\/([^/]+)\/storage$/))) {
+    const found = plugins.find((x) => x.name === decodeURIComponent(m![1]!));
+    if (!found) return new Response("no such installation", { status: 404 });
+    if (method === "DELETE") return json({ ...found, storage: null });
+    // The body is not visible here; echo the default claim as mounted.
+    return json({
+      ...found,
+      storage: {
+        claim: `${found.name}-state`,
+        mount_path: "/data",
+        owner_annotation: "scarab.io/plugin-installation",
+        owner_annotation_value: `${found.org}/${found.name}`,
+      },
+    });
   }
   if ((m = p.match(/^\/v1\/orgs\/[^/]+\/plugins\/([^/]+)\/connections(?:\/([^/]+))?$/))) {
     const found = plugins.find((x) => x.name === decodeURIComponent(m![1]!));
