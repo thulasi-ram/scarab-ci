@@ -1,10 +1,8 @@
-//! The reporter's configuration, from its environment.
+//! The plugin's configuration, from its environment.
 //!
-//! Two kinds of variable reach a Plugin Pod (ADR-0072 §9, slice d2's
-//! `plugin_env`): core's own, `SCARAB_BROKER_URL` and
-//! `SCARAB_BROKER_TOKEN_FILE`, set last so no config value can re-aim them;
-//! and the installation's approved `config_keys` (`manifest.json`):
-//! `ARGOCD_UI_URL` and `OWNER_ANNOTATION`.
+//! Core sets two variables on a Plugin Pod (ADR-0072 §9, slice d2's
+//! `plugin_env`), last, so no config value can re-aim them:
+//! `SCARAB_BROKER_URL` and `SCARAB_BROKER_TOKEN_FILE`.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -12,35 +10,16 @@ use std::time::Duration;
 /// Where the kubelet projects the broker token (slice d2's
 /// `BROKER_TOKEN_DIR`/`BROKER_TOKEN_FILE`), if the env does not say.
 pub const DEFAULT_TOKEN_FILE: &str = "/var/run/secrets/scarab/broker/token";
-/// The Application annotation that lists its owner Projects (owner default
-/// 11), as `org/repo, org/repo`.
-pub const DEFAULT_OWNER_ANNOTATION: &str = "scarab.io/owner-projects";
 
 #[derive(Debug, Clone)]
 pub struct Config {
     /// The broker, by IP (a Plugin has no DNS).
     pub broker_url: String,
     pub token_file: PathBuf,
-    /// Argo CD's UI, for each report's link; unset = no link.
-    pub argocd_ui_url: Option<String>,
-    pub owner_annotation: String,
-    /// How long changes to one Application are coalesced before it is
-    /// assessed: Argo rewrites an Application several times a second during
-    /// a sync, and each write is a stream event.
-    pub debounce: Duration,
-    /// How often `GET /targets?resend=true` is polled — at least once a
-    /// minute (ADR-0070 §11).
-    pub resend_poll: Duration,
-    /// Reconnect backoff: doubles from `backoff_min` to `backoff_max`.
-    pub backoff_min: Duration,
-    pub backoff_max: Duration,
-    /// A watch stream silent this long is assumed half-open and re-opened
-    /// (with a fresh list, so nothing is missed).
-    pub stream_idle_reconnect: Duration,
-    /// Every request but the watch stream.
+    /// How often the plugin checks it can still reach the broker and Argo CD.
+    pub check_interval: Duration,
+    /// Every request.
     pub request_timeout: Duration,
-    /// On SIGTERM: how long a last flush of pending reports may take.
-    pub shutdown_flush: Duration,
 }
 
 impl Config {
@@ -49,15 +28,8 @@ impl Config {
         Self {
             broker_url: broker_url.into(),
             token_file: token_file.into(),
-            argocd_ui_url: None,
-            owner_annotation: DEFAULT_OWNER_ANNOTATION.to_string(),
-            debounce: Duration::from_secs(2),
-            resend_poll: Duration::from_secs(30),
-            backoff_min: Duration::from_secs(1),
-            backoff_max: Duration::from_secs(60),
-            stream_idle_reconnect: Duration::from_secs(600),
+            check_interval: Duration::from_secs(60),
             request_timeout: Duration::from_secs(30),
-            shutdown_flush: Duration::from_secs(5),
         }
     }
 
@@ -80,12 +52,7 @@ impl Config {
         }
         let token_file =
             set("SCARAB_BROKER_TOKEN_FILE").unwrap_or_else(|| DEFAULT_TOKEN_FILE.into());
-        let mut cfg = Self::new(broker_url, token_file);
-        cfg.argocd_ui_url = set("ARGOCD_UI_URL");
-        if let Some(a) = set("OWNER_ANNOTATION") {
-            cfg.owner_annotation = a;
-        }
-        Ok(cfg)
+        Ok(Self::new(broker_url, token_file))
     }
 }
 
@@ -105,14 +72,8 @@ mod tests {
         };
         assert!(Config::from_lookup(env(&[])).is_err());
         assert!(Config::from_lookup(env(&[("SCARAB_BROKER_URL", "10.0.0.1:8090")])).is_err());
-        let cfg = Config::from_lookup(env(&[
-            ("SCARAB_BROKER_URL", "http://10.0.0.1:8090"),
-            ("ARGOCD_UI_URL", "https://argo.example"),
-        ]))
-        .unwrap();
+        let cfg =
+            Config::from_lookup(env(&[("SCARAB_BROKER_URL", "http://10.0.0.1:8090")])).unwrap();
         assert_eq!(cfg.token_file, PathBuf::from(DEFAULT_TOKEN_FILE));
-        assert_eq!(cfg.owner_annotation, DEFAULT_OWNER_ANNOTATION);
-        assert_eq!(cfg.argocd_ui_url.as_deref(), Some("https://argo.example"));
-        assert!(cfg.resend_poll <= Duration::from_secs(60), "ADR-0070 §11");
     }
 }

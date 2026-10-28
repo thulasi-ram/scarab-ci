@@ -9,9 +9,11 @@
 //! `#[ignore = "redteam: BROKE …"]`, so the suite stays green and the break
 //! stays reproducible with `--run-ignored all`.
 //!
-//! Harness: the `deployment_concurrency.rs` shape — the real scheduler on
-//! the `FakeExecutor`, the server's DeploymentGates oracle wired as the
-//! driver wires it, every scenario against real Postgres (`pg`, skipped when
+//! The per-DeploymentTarget hold these attacks also checked went with the
+//! Deployment record (ADR-0074); the teardowns they pin stay.
+//!
+//! Harness: the real scheduler on the `FakeExecutor`, every scenario against
+//! real Postgres (`pg`, skipped when
 //! `SCARAB_TEST_DATABASE_URL` is unset) and the in-memory twins
 //! (`inmemory`). The crash-between-writes attacks use the in-memory
 //! fault-injection seams (`fail_next_event_append`, `arm_toctou_race`),
@@ -20,31 +22,26 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use serde_json::json;
 
 use scarab_db_postgres::PostgresDb;
-use scarab_deployment::DeploymentStore;
 use scarab_engine::ports::{ExecHandle, ExecState, FailureClass};
 use scarab_engine::{
     cancel_run_request, rerun_step, Attempt, AttemptId, AttemptOutcome, Clock, Db, DbError,
-    DeployContext, EventPayload, OutboxId, OutboxMessage, RunDeploymentRequest, RunId, RunStatus,
-    Scheduler, StepId, StepRun, StepSpec, StepStatus, Timestamp, LAUNCH_STEP, RUN_STATUS_CHANGED,
+    DeployContext, EventPayload, OutboxId, OutboxMessage, RunId, RunStatus, Scheduler, StepId,
+    StepRun, StepSpec, StepStatus, Timestamp, LAUNCH_STEP, RUN_STATUS_CHANGED,
 };
 use scarab_project::{
-    EnvironmentDeploymentDeadline, EnvironmentGovernanceStore, EnvironmentProjectEligibility,
-    EnvironmentProjectOverlay, EnvironmentProtectionRules, OrgEnvironment, OrgEnvironmentStore,
+    EnvironmentGovernanceStore, EnvironmentProjectEligibility, OrgEnvironment, OrgEnvironmentStore,
 };
-use scarab_server::deployment_gates::ServerDeploymentGates;
-use scarab_testkit::{FakeClock, FakeExecutor, InMemoryDb, InMemoryEnvironmentGovernance};
+use scarab_testkit::{FakeClock, FakeExecutor, InMemoryDb};
 
 const ORG: &str = "acme";
 const ENV: &str = "prod";
 const PROJECT: &str = "web";
 const T0: i64 = 1_000;
-const WEB: &str = "web";
 
 fn id(s: &str) -> StepId {
     StepId(s.into())
@@ -71,14 +68,13 @@ struct World {
     db: Arc<dyn Db>,
     /// The in-memory twin itself, for its fault-injection seams.
     mem: Option<Arc<InMemoryDb>>,
-    oracle: ServerDeploymentGates,
     clock: FakeClock,
     exec: FakeExecutor,
     pg: Option<common::TestDb>,
 }
 
 impl World {
-    async fn pg(limit: Option<u32>) -> Option<World> {
+    async fn pg() -> Option<World> {
         let tdb = common::fresh_db().await?;
         let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
         pg.migrate().await.unwrap();
@@ -86,8 +82,6 @@ impl World {
             org: ORG.into(),
             name: ENV.into(),
             description: String::new(),
-            deployment_deadline: EnvironmentDeploymentDeadline::new(5 * 60_000).unwrap(),
-            deployment_sources: Vec::new(),
             protection: Default::default(),
             eligibility: EnvironmentProjectEligibility::AllProjects,
             created_at: 1,
@@ -105,53 +99,20 @@ impl World {
         )
         .await
         .unwrap();
-        let governance: Arc<dyn EnvironmentGovernanceStore> = pg.clone();
-        Some(World::new(pg.clone(), pg, None, governance, limit, Some(tdb)).await)
+        Some(World::new(pg, None, Some(tdb)))
     }
 
-    async fn inmemory(limit: Option<u32>) -> World {
+    async fn inmemory() -> World {
         let db = Arc::new(InMemoryDb::new());
-        let governance: Arc<dyn EnvironmentGovernanceStore> =
-            Arc::new(InMemoryEnvironmentGovernance::new().with_environment(
-                ORG,
-                ENV,
-                EnvironmentProjectEligibility::AllProjects,
-            ));
-        World::new(db.clone(), db.clone(), Some(db), governance, limit, None).await
+        World::new(db.clone(), Some(db), None)
     }
 
-    async fn new(
-        db: Arc<dyn Db>,
-        store: Arc<dyn DeploymentStore>,
-        mem: Option<Arc<InMemoryDb>>,
-        governance: Arc<dyn EnvironmentGovernanceStore>,
-        limit: Option<u32>,
-        pg: Option<common::TestDb>,
-    ) -> World {
-        governance
-            .put_environment_project_overlay(
-                &EnvironmentProjectOverlay {
-                    org: ORG.into(),
-                    environment: ENV.into(),
-                    project: PROJECT.into(),
-                    rules: EnvironmentProtectionRules {
-                        deployment_concurrency: limit.map(|n| NonZeroU32::new(n).unwrap()),
-                        ..Default::default()
-                    },
-                    deployment_gate_deadline: None,
-                },
-                "amy",
-                1,
-            )
-            .await
-            .unwrap();
-        let oracle = ServerDeploymentGates::new(db.clone(), store, Some(governance));
+    fn new(db: Arc<dyn Db>, mem: Option<Arc<InMemoryDb>>, pg: Option<common::TestDb>) -> World {
         let exec = FakeExecutor::new();
         exec.set_results("bump", BTreeMap::from([("version".into(), json!("v1"))]));
         World {
             db,
             mem,
-            oracle,
             clock: FakeClock::new(T0),
             exec,
             pg,
@@ -178,33 +139,13 @@ impl World {
         db.create_step_run(&run, &id("bump"), Some(&spec()), &[], now)
             .await
             .unwrap();
-        let mut bump = json!({
-            "id": "bump", "image": "busybox", "results": ["version"],
-            "deployment_requests": [
-                { "target": { "source": "argocd", "id": WEB }, "version": "version" }
-            ] });
+        let mut bump = json!({ "id": "bump", "image": "busybox", "results": ["version"] });
         if let Some(max) = retry {
             bump["retry"] = json!({ "max": max });
         }
         db.store_run_ir(
             &run,
             &json!({ "ir_version": 2, "environment": ENV, "steps": [bump] }),
-        )
-        .await
-        .unwrap();
-        db.set_run_deployment_requests(
-            &run,
-            &[RunDeploymentRequest {
-                step: id("bump"),
-                ordinal: 0,
-                org: ORG.into(),
-                environment: ENV.into(),
-                target_source: "argocd".into(),
-                target_id: WEB.into(),
-                version_result: "version".into(),
-                evidence_results: Vec::new(),
-                gate_steps: Vec::new(),
-            }],
         )
         .await
         .unwrap();
@@ -245,13 +186,7 @@ impl World {
     }
 
     async fn tick(&self) {
-        let gates = self.oracle.for_tick();
-        let isolated = self
-            .scheduler()
-            .with_deployments(Some(&gates))
-            .tick_all()
-            .await
-            .unwrap();
+        let isolated = self.scheduler().tick_all().await.unwrap();
         assert!(isolated.is_empty(), "{isolated:?}");
     }
 
@@ -292,19 +227,6 @@ impl World {
         );
     }
 
-    async fn assert_held(&self, run: &str) {
-        let bump = self.step(run, "bump").await;
-        assert_eq!(
-            bump.status,
-            StepStatus::Pending,
-            "{run}'s bump must be held while another Run's deploy unit is still alive"
-        );
-        assert!(
-            bump.attempts.is_empty(),
-            "a held step never starts: {bump:?}"
-        );
-    }
-
     fn torn_down(&self, h: &str) -> bool {
         self.exec.cancelled_handles().iter().any(|c| c == h)
     }
@@ -313,11 +235,11 @@ impl World {
 /// Run `scenario` against Postgres (`pg`) and the in-memory twins
 /// (`inmemory`). `$ignore` marks a BROKE attack on both.
 macro_rules! both {
-    ($scenario:ident, $limit:expr) => {
+    ($scenario:ident) => {
         mod $scenario {
             #[tokio::test]
             async fn pg() {
-                match super::World::pg($limit).await {
+                match super::World::pg().await {
                     Some(w) => super::$scenario(w).await,
                     None => eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset"),
                 }
@@ -325,16 +247,16 @@ macro_rules! both {
 
             #[tokio::test]
             async fn inmemory() {
-                super::$scenario(super::World::inmemory($limit).await).await
+                super::$scenario(super::World::inmemory().await).await
             }
         }
     };
-    ($scenario:ident, $limit:expr, ignore = $why:literal) => {
+    ($scenario:ident, ignore = $why:literal) => {
         mod $scenario {
             #[tokio::test]
             #[ignore = $why]
             async fn pg() {
-                match super::World::pg($limit).await {
+                match super::World::pg().await {
                     Some(w) => super::$scenario(w).await,
                     None => eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset"),
                 }
@@ -343,7 +265,7 @@ macro_rules! both {
             #[tokio::test]
             #[ignore = $why]
             async fn inmemory() {
-                super::$scenario(super::World::inmemory($limit).await).await
+                super::$scenario(super::World::inmemory().await).await
             }
         }
     };
@@ -356,9 +278,9 @@ macro_rules! both {
 // `cancel:{run}`. The outbox key is UNIQUE forever (a dispatched row keeps
 // it). A cancelled Run can be rerun (reopen Cancelled → Running), so the
 // SECOND cancel of the same Run enqueues nothing: the rerun's Pod is never
-// torn down, and — no pending intent — never holds its DeploymentTarget.
+// torn down.
 // ---------------------------------------------------------------------------
-async fn second_cancel_after_rerun_tears_down_and_holds(w: World) {
+async fn second_cancel_after_rerun_tears_down(w: World) {
     w.seed_deploy("ra", None).await;
     w.running_on("ra", "bump", "a1").await;
 
@@ -397,8 +319,6 @@ async fn second_cancel_after_rerun_tears_down_and_holds(w: World) {
     w.ticks(1).await;
     assert_eq!(w.step("ra", "bump").await.status, StepStatus::Cancelled);
 
-    // The held Run on the same target must wait for a2's Pod to be gone.
-    w.seed_deploy("rb", None).await;
     w.ticks(2).await;
     assert!(
         w.torn_down(&handle("ra", "bump", "a2")),
@@ -406,10 +326,9 @@ async fn second_cancel_after_rerun_tears_down_and_holds(w: World) {
          collapsed onto the first cancel's dispatched row (cancelled: {:?})",
         w.exec.cancelled_handles()
     );
-    w.assert_held("rb").await;
     w.finish().await;
 }
-both!(second_cancel_after_rerun_tears_down_and_holds, Some(1));
+both!(second_cancel_after_rerun_tears_down);
 
 // ---------------------------------------------------------------------------
 // A2 — the cancel's teardown runs BEFORE the claimed step's launch.
@@ -418,12 +337,11 @@ both!(second_cancel_after_rerun_tears_down_and_holds, Some(1));
 // The operator cancels. Another replica's `reconcile_cancellations` runs
 // first: a1 has no handle, so the intent is retired as "gone". The launch
 // intent is then processed: `process_launch_intent` has no status guard, so
-// it launches a Pod for a Cancelled step — never torn down, never held.
+// it launches a Pod for a Cancelled step — never torn down.
 // ---------------------------------------------------------------------------
 async fn a_launch_landing_after_the_cancel_teardown_is_torn_down(w: World) {
     w.seed_deploy("ra", None).await;
-    let gates = w.oracle.for_tick();
-    let s = w.scheduler().with_deployments(Some(&gates));
+    let s = w.scheduler();
     // Leader admits + claims; the launch is not processed yet.
     for _ in 0..3 {
         s.admit(&rid("ra")).await.unwrap();
@@ -457,35 +375,29 @@ async fn a_launch_landing_after_the_cancel_teardown_is_torn_down(w: World) {
         w.exec.cancelled_handles()
     );
     // Fix round 2: the launch now checks the step first, so no Pod is ever
-    // created for the Cancelled step and nothing is left alive to hold the
-    // target. The hold is owed only while a launched unit is being torn
-    // down — `a_cancel_landing_while_the_launch_is_in_flight_…` covers that.
-    w.seed_deploy("rb", None).await;
-    w.ticks(2).await;
-    if launched > 0 {
-        w.assert_held("rb").await;
-    }
+    // created for the Cancelled step.
     w.finish().await;
 }
-both!(a_launch_landing_after_the_cancel_teardown_is_torn_down, Some(1));
+both!(a_launch_landing_after_the_cancel_teardown_is_torn_down);
 
 // ---------------------------------------------------------------------------
 // A2' (fix round 2) — the cancel lands WHILE the launch is in flight: after
 // the launch's own status check, before its handle is recorded. Another
 // replica drains the cancel's teardown in that window and finds no handle,
 // so retires it as "gone". The Pod then exists for a Cancelled step: the
-// launch must tear it down itself, and its DeploymentTarget must stay held
-// while it terminates.
+// launch must tear it down itself.
 // ---------------------------------------------------------------------------
-async fn a_cancel_landing_while_the_launch_is_in_flight_tears_it_down_and_holds(w: World) {
+async fn a_cancel_landing_while_the_launch_is_in_flight_tears_it_down(w: World) {
     w.seed_deploy("ra", None).await;
     let db = w.db.clone();
     w.exec.during_next_launch(Box::new(move || {
         Box::pin(async move {
             let clock = FakeClock::new(T0);
-            assert!(cancel_run_request(&*db, &clock, &rid("ra"), Some("amy".into()))
-                .await
-                .unwrap());
+            assert!(
+                cancel_run_request(&*db, &clock, &rid("ra"), Some("amy".into()))
+                    .await
+                    .unwrap()
+            );
             // Replica B (its own executor client) drains the teardown first.
             let replica_b = FakeExecutor::new();
             Scheduler::new(&*db, &clock, &replica_b, "replica-b")
@@ -507,29 +419,16 @@ async fn a_cancel_landing_while_the_launch_is_in_flight_tears_it_down_and_holds(
     assert_eq!(w.exec.launch_count(&ExecHandle(h.clone())), 1);
     assert_eq!(w.run_status("ra").await, RunStatus::Cancelled);
 
-    w.ticks(1).await;
-    w.seed_deploy("rb", None).await;
-    w.ticks(2).await;
+    w.ticks(3).await;
     assert!(
         w.torn_down(&h),
         "a Pod launched while its step was being cancelled was never torn down \
          (cancelled: {:?})",
         w.exec.cancelled_handles()
     );
-    w.assert_held("rb").await;
-    // Once it is gone, the hold ends.
-    w.ticks(3).await;
-    let bump_b = w.step("rb", "bump").await;
-    assert!(
-        matches!(bump_b.status, StepStatus::Ready | StepStatus::Running),
-        "the hold ends once the unit is gone: {bump_b:?}"
-    );
     w.finish().await;
 }
-both!(
-    a_cancel_landing_while_the_launch_is_in_flight_tears_it_down_and_holds,
-    Some(1)
-);
+both!(a_cancel_landing_while_the_launch_is_in_flight_tears_it_down);
 
 // ---------------------------------------------------------------------------
 // A3 — crash INSIDE the cancel, after its teardown intent (in-memory seam).
@@ -574,25 +473,20 @@ async fn a_cancel_failing_after_its_intent_neither_kills_a_live_run_nor_orphans(
             .await
             .unwrap()
     );
-    w.ticks(1).await;
-    w.seed_deploy("rb", None).await;
-    w.ticks(2).await;
+    w.ticks(3).await;
     assert!(
         w.torn_down(&handle("ra", "bump", "a2")),
         "re-sent cancel wrote no intent: a2 orphaned (a1 killed while the Run was still \
          Running: {a1_killed}; cancelled: {:?})",
         w.exec.cancelled_handles()
     );
-    w.assert_held("rb").await;
     w.finish().await;
 }
 
 #[tokio::test]
 async fn a_cancel_failing_after_its_intent_neither_kills_a_live_run_nor_orphans_inmemory() {
-    a_cancel_failing_after_its_intent_neither_kills_a_live_run_nor_orphans(
-        World::inmemory(Some(1)).await,
-    )
-    .await
+    a_cancel_failing_after_its_intent_neither_kills_a_live_run_nor_orphans(World::inmemory().await)
+        .await
 }
 
 // ---------------------------------------------------------------------------
@@ -607,7 +501,7 @@ async fn a_cancel_failing_after_its_intent_neither_kills_a_live_run_nor_orphans_
 #[tokio::test]
 #[ignore = "redteam: BROKE crash between cancel's step commits and its run commit — advance settles the run Failed, re-sent cancel is a no-op"]
 async fn a_cancel_interrupted_before_its_run_commit_still_ends_cancelled() {
-    let w = World::inmemory(None).await;
+    let w = World::inmemory().await;
     w.seed_deploy("ra", None).await;
     w.running_on("ra", "bump", "a1").await;
     w.mem().fail_next_event_append(|p| {
@@ -642,14 +536,12 @@ async fn a_cancel_interrupted_before_its_run_commit_still_ends_cancelled() {
 // (in-memory `arm_toctou_race`: the CAS sees it flip to Running/a1).
 //
 // The cancel's step CAS conflicts and is skipped; the Run still goes
-// Cancelled. `bump` is left Running in a Cancelled Run. The hold legs:
-// leg 1 needs a non-terminal Run; leg 2 (pending CANCEL_RUN) needs the Step
-// to be `cancelled`. Neither counts it, though its Pod is alive and its
-// teardown is pending.
+// Cancelled. `bump` is left Running in a Cancelled Run, its Pod alive and
+// its teardown pending.
 // ---------------------------------------------------------------------------
 #[tokio::test]
-async fn a_step_claimed_mid_cancel_still_holds_its_target() {
-    let w = World::inmemory(Some(1)).await;
+async fn a_step_claimed_mid_cancel_ends_terminal() {
+    let w = World::inmemory().await;
     w.seed_deploy("ra", None).await;
     w.mem().arm_toctou_race(&id("bump"), &aid("a1"));
     assert!(
@@ -671,16 +563,15 @@ async fn a_step_claimed_mid_cancel_still_holds_its_target() {
     .unwrap();
     // Its Pod lingers through every teardown check of this test.
     w.exec.linger_after_cancel(50);
-    w.ticks(1).await;
-    w.seed_deploy("rb", None).await;
-    w.ticks(2).await;
+    w.ticks(3).await;
     let bump = w.step("ra", "bump").await;
     // Fix round 2: the cancel now retries the raced step to `Cancelled`, and
-    // the launch checks the step first, so no Pod is created for it and there
-    // is nothing alive to hold the target. Held only if one was launched.
-    if w.exec.launch_count(&ExecHandle(handle("ra", "bump", "a1"))) > 0 {
-        w.assert_held("rb").await;
-    }
+    // the launch checks the step first, so no Pod is created for it.
+    assert_eq!(
+        w.exec.launch_count(&ExecHandle(handle("ra", "bump", "a1"))),
+        0,
+        "no Pod for a Cancelled step"
+    );
     assert!(
         bump.status.is_terminal(),
         "half-cancelled limbo: {bump:?} in a Cancelled Run"
@@ -700,7 +591,7 @@ async fn a_step_claimed_mid_cancel_still_holds_its_target() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn a_rerun_failing_after_its_teardown_intent_does_not_fail_the_run() {
-    let w = World::inmemory(None).await;
+    let w = World::inmemory().await;
     w.seed_deploy("ra", None).await;
     w.running_on("ra", "bump", "a1").await;
     w.mem().fail_next_event_append(|p| {
@@ -797,7 +688,7 @@ async fn the_last_status_post_matches_a_rerun_runs_final_status(w: World) {
     );
     w.finish().await;
 }
-both!(the_last_status_post_matches_a_rerun_runs_final_status, None);
+both!(the_last_status_post_matches_a_rerun_runs_final_status);
 
 // ---------------------------------------------------------------------------
 // A8 — attempt order a9 / a10 / a100 under a clock running BACKWARDS
@@ -869,7 +760,7 @@ async fn attempts_order_by_number_alone_everywhere(w: World) {
 mod attempts_order_by_number_alone_everywhere {
     #[tokio::test]
     async fn pg() {
-        match super::World::pg(None).await {
+        match super::World::pg().await {
             Some(w) => super::attempts_order_by_number_alone_everywhere(w).await,
             None => eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset"),
         }
@@ -880,7 +771,7 @@ mod attempts_order_by_number_alone_everywhere {
     /// (fixed in round 2).
     #[tokio::test]
     async fn inmemory() {
-        super::attempts_order_by_number_alone_everywhere(super::World::inmemory(None).await).await
+        super::attempts_order_by_number_alone_everywhere(super::World::inmemory().await).await
     }
 }
 
@@ -939,51 +830,49 @@ async fn results_posts_land_only_on_the_running_frontier(w: World) {
         .is_empty());
     w.finish().await;
 }
-both!(results_posts_land_only_on_the_running_frontier, None);
+both!(results_posts_land_only_on_the_running_frontier);
 
 // ---------------------------------------------------------------------------
 // A10 — the plain cancel path the ticket pinned, with a Pod that NEVER
-// terminates: the hold must last the whole poison ceiling and then end with
-// a TeardownAbandoned that says "still terminating", not "failed".
+// terminates: the teardown is retried for the whole poison ceiling and then
+// ends with a TeardownAbandoned that says "still terminating", not "failed".
 // ---------------------------------------------------------------------------
-async fn a_pod_that_never_terminates_holds_until_the_ceiling(w: World) {
+async fn a_pod_that_never_terminates_is_abandoned_at_the_ceiling(w: World) {
     w.seed_deploy("ra", None).await;
     w.running_on("ra", "bump", "a1").await;
-    w.seed_deploy("rb", None).await;
-    w.ticks(2).await;
-    w.assert_held("rb").await;
 
     w.exec.linger_after_cancel(u32::MAX);
     assert!(cancel_run_request(&*w.db, &w.clock, &rid("ra"), None)
         .await
         .unwrap());
-    // Nine teardown checks: still terminating, still held.
+    let abandoned = |w: &World| {
+        let db = w.db.clone();
+        async move {
+            db.events(&rid("ra"))
+                .await
+                .unwrap()
+                .into_iter()
+                .filter_map(|e| match e.kind {
+                    EventPayload::Raw(v) if v["event"] == "TeardownAbandoned" => {
+                        v["reason"].as_str().map(str::to_string)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<String>>()
+        }
+    };
+    // Nine teardown checks: still terminating, not abandoned yet.
     w.ticks(9).await;
-    w.assert_held("rb").await;
-    // The tenth abandons the teardown; the hold ends with an honest diagnostic.
+    assert!(abandoned(&w).await.is_empty(), "abandoned too early");
+    assert!(w.torn_down(&handle("ra", "bump", "a1")));
+    // The tenth abandons the teardown, with a diagnostic that says why.
     w.ticks(3).await;
-    let bump_b = w.step("rb", "bump").await;
-    assert!(
-        matches!(bump_b.status, StepStatus::Ready | StepStatus::Running),
-        "the hold ends at the ceiling: {bump_b:?}"
-    );
-    let abandoned: Vec<String> =
-        w.db.events(&rid("ra"))
-            .await
-            .unwrap()
-            .into_iter()
-            .filter_map(|e| match e.kind {
-                EventPayload::Raw(v) if v["event"] == "TeardownAbandoned" => {
-                    v["reason"].as_str().map(str::to_string)
-                }
-                _ => None,
-            })
-            .collect();
+    let abandoned = abandoned(&w).await;
     assert_eq!(abandoned.len(), 1, "{abandoned:?}");
     assert!(abandoned[0].contains("still terminating"), "{abandoned:?}");
     w.finish().await;
 }
-both!(a_pod_that_never_terminates_holds_until_the_ceiling, Some(1));
+both!(a_pod_that_never_terminates_is_abandoned_at_the_ceiling);
 
 // ---------------------------------------------------------------------------
 // A11 — a crash at every write of a terminal step transition (586187a):
@@ -993,7 +882,7 @@ both!(a_pod_that_never_terminates_holds_until_the_ceiling, Some(1));
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn a_finalize_crash_rolls_back_and_the_redrive_journals_once() {
-    let w = World::inmemory(None).await;
+    let w = World::inmemory().await;
     w.seed_plain("rp").await;
     w.running_on("rp", "build", "a1").await;
     w.mem().fail_next_event_append(|p| {

@@ -529,7 +529,7 @@ seed_environments() {
       ;;
   esac
   curl -sf -X PUT "$base/v1/orgs/$org/environments/$env_name" -H 'content-type: application/json' \
-    -d '{"description":"seeded by just up (local-proc) for the dogfood pipeline","deployment_sources":[]}' \
+    -d '{"description":"seeded by just up (local-proc) for the dogfood pipeline"}' \
     >/dev/null || fail_with_log "seeding org Environment $org/$env_name failed"
   curl -sf -X PUT "$base/v1/orgs/$org/environments/$env_name/eligibility" \
     -H 'content-type: application/json' -d '{"all_projects":true}' >/dev/null \

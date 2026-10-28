@@ -51,6 +51,52 @@ impl Status {
     }
 }
 
+/// The longest label, in characters.
+pub const MAX_LABEL_CHARS: usize = 512;
+
+/// Unicode format characters a label never keeps (they change how text
+/// reads without being seen).
+fn is_invisible_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
+}
+
+/// A one-line label: Argo's messages are often multi-line. Whitespace and
+/// control characters collapse to one space, invisible format characters go,
+/// and the result is cut to [`MAX_LABEL_CHARS`].
+pub fn clean_label(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len().min(MAX_LABEL_CHARS * 4));
+    let mut pending_space = false;
+    for c in raw.chars() {
+        if is_invisible_format(c) {
+            continue;
+        }
+        if c.is_whitespace() || c.is_control() {
+            pending_space = !out.is_empty();
+            continue;
+        }
+        if pending_space {
+            out.push(' ');
+            pending_space = false;
+        }
+        out.push(c);
+    }
+    if out.chars().count() > MAX_LABEL_CHARS {
+        out = out.chars().take(MAX_LABEL_CHARS - 1).collect();
+        out.push('…');
+    }
+    out
+}
+
 /// A status and the label that explains it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Assessment {
@@ -61,7 +107,7 @@ pub struct Assessment {
 fn assessment(status: Status, label: impl Into<String>) -> Assessment {
     Assessment {
         status,
-        label: crate::report::clean_label(&label.into()),
+        label: clean_label(&label.into()),
     }
 }
 

@@ -698,7 +698,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   gap: 8px;
 }
 .gate-reject .input { width: 18rem; max-width: 50vw; padding: 3px 8px; font-size: 12px; }
-/* A gate verdict / DeploymentGate wait / concurrency hold (slice b, crit. 5):
+/* A gate verdict (slice b, crit. 5):
  * the step pane's status line and the DAG node's meta tint. */
 .gate-status {
   padding: 2px 12px 8px;
@@ -709,7 +709,6 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 }
 .gate-status.passed, .dnode-meta.gnote.passed { color: var(--emerald); }
 .gate-status.failed, .dnode-meta.gnote.failed { color: var(--danger); }
-.gate-status.held, .dnode-meta.gnote.held { color: var(--copper); }
 .run-toolbar .btn-sm {
   display: inline-flex;
   align-items: center;
@@ -1696,15 +1695,9 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .env-layers .env-h-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .env-h-row { font-size: 12px; color: var(--sage); }
 .ok-mark { color: var(--ok); margin: 0 4px; }
-/* The legacy approval list is labelled as such, and the panel header links to
-   the Deployment record (ADR-0070) — what is actually live. */
+/* The legacy approval list is labelled as such. */
 .env-h-meta { display: inline-flex; align-items: center; gap: 12px; }
 .env-h-title { font-size: 10.5px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted-sage); }
-.env-deploy-link {
-  display: inline-flex; align-items: center; gap: 5px;
-  color: var(--sage); text-decoration: none;
-}
-.env-deploy-link:hover { color: var(--emerald); }
 
 /* ---- settings / secrets bodies ---- */
 .settings-body, .secrets-body { padding: 16px; display: flex; flex-direction: column; gap: 12px; }
@@ -3250,7 +3243,6 @@ h1, .crumb-head, .run-title {
 .oenv-report-h .btn { margin-left: auto; }
 .oenv-report-projects { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
 .oenv-desc { font-size: 12.5px; color: var(--sage); }
-.oenv-sources { display: inline-flex; gap: 10px; flex-wrap: wrap; }
 .oenv-rows { display: grid; gap: 6px; }
 .oenv-row { display: grid; grid-template-columns: 1fr 1fr auto; gap: 6px; align-items: center; }
 @media (max-width: 560px) {
@@ -3259,27 +3251,28 @@ h1, .crumb-head, .run-title {
 }
 /* ---- Plugins (ADR-0072) ---- */
 /* Same block rhythm again; a plugin row adds a runtime line, the kill state,
-   and an expandable list of the groupings whose reports are being dropped. */
+   and an expandable list of its connections. */
 .plg-enabled { color: var(--emerald); }
 .plg-killed { color: var(--danger); }
 .plg-msg { color: var(--sage); }
 .plg-toggle { margin-left: auto; }
-.plg-unmapped {
+.plg-conns {
   display: grid; gap: 7px;
   margin-left: 6px; padding: 4px 0 2px 12px;
   border-left: 1px dotted var(--border);
 }
-.plg-unmapped .empty, .plg-unmapped .error { margin: 0; }
-.plg-unmapped-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 12px; }
-.plg-grouping { color: var(--soft-white); font-size: 12.5px; }
-.plg-add { margin-left: auto; display: inline-flex; gap: 6px; align-items: center; }
-.plg-add select.input { width: auto; padding-top: 3px; padding-bottom: 3px; font-size: 12px; }
+.plg-conns .empty, .plg-conns .error { margin: 0; }
+.plg-conn-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 12px; }
+.plg-slot { color: var(--soft-white); font-size: 12.5px; }
 .plg-caps { display: flex; gap: 6px; flex-wrap: wrap; }
-/* A board target's owners, under its label (ADR-0072 ownership reports). */
-.dep-owners { font-size: 11px; color: var(--muted-sage); margin-top: 2px; }
-
-/* A name the Deployment record carries with no org Environment behind it. */
-.fpill.oenv-unregistered { border-style: dashed; }
+/* A manifest capability on the install dialog: edged, not filled. */
+.dep-tag {
+  font-family: var(--font-mono); font-size: 9.5px;
+  text-transform: uppercase; letter-spacing: 0.7px;
+  border: 1px dotted currentColor; border-radius: 3px; padding: 1px 5px;
+  white-space: nowrap;
+}
+.dep-tag-muted { color: var(--muted-sage); }
 .fpill.oenv-unregistered:not(.on) { color: var(--muted-sage); }
 
 /* ---- the one-time reveal ---- */
@@ -3345,42 +3338,6 @@ h1, .crumb-head, .run-title {
   font-size: 10.5px; color: var(--sage);
   border: 1px dotted var(--border); border-radius: 3px; padding: 0 5px;
 }
-
-/* ---- Deployments (ADR-0070) ---- */
-/* Tables sit inside a .panel, which already draws the frame. */
-.dep-table { border: none; border-radius: 0; }
-.dep-pad { padding: 12px 16px; margin: 0; }
-.dep-envs { margin-top: 8px; }
-.dep-cell { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.dep-table td .dep-target,
-.dep-table td.dep-target,
-.dep-table td.dep-version,
-.dep-table td .dep-version { color: var(--soft-white); }
-.dep-chev { width: 28px; padding-right: 0 !important; color: var(--muted-sage); }
-.dep-run { color: var(--sage); text-decoration: none; border-bottom: 1px dotted var(--border); }
-.dep-run[href]:hover { color: var(--emerald); border-bottom-color: var(--emerald); }
-/* Display terms, edged not filled — they annotate a status, never replace it. */
-.dep-tag {
-  font-family: var(--font-mono); font-size: 9.5px;
-  text-transform: uppercase; letter-spacing: 0.7px;
-  border: 1px dotted currentColor; border-radius: 3px; padding: 1px 5px;
-  white-space: nowrap;
-}
-.dep-tag-warn { color: var(--copper); }
-.dep-tag-muted { color: var(--muted-sage); }
-.dep-table tbody tr.dep-reports-row { cursor: default; }
-.dep-table tbody tr.dep-reports-row:hover { background: none; }
-.dep-table tbody tr.dep-reports-row td { padding-top: 0; }
-.dep-reports {
-  display: grid; gap: 7px;
-  margin-left: 28px; padding: 10px 12px;
-  border-left: 1px dotted var(--border);
-}
-.dep-report { display: flex; align-items: center; gap: 10px; font-size: 13px; flex-wrap: wrap; }
-.dep-label { color: var(--soft-white); }
-.dep-link { font-size: 11.5px; color: var(--sage); text-decoration: none; }
-.dep-link:hover { color: var(--emerald); }
-.dep-at { margin-left: auto; font-size: 11.5px; }
 
 /* ════════════════════════════════════════════════════════════════════════
    Step-up confirmation (ADR-0073) — the confirm dialog, Account → Security,

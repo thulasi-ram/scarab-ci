@@ -1,12 +1,10 @@
-//! `scarab-plugin-argocd`: the reporter process. Configuration is the Pod's
-//! environment ([`scarab_plugin_argocd::Config::from_env`]); logs are JSON
-//! lines on stdout (`RUST_LOG` filters, default `info`).
+//! `scarab-plugin-argocd`: the plugin process ([`scarab_plugin_argocd::standby`]).
+//! Configuration is the Pod's environment
+//! ([`scarab_plugin_argocd::Config::from_env`]); logs are JSON lines on
+//! stdout (`RUST_LOG` filters, default `info`).
 //!
 //! SIGTERM (a kill switch scaling the Deployment to zero, an upgrade, a node
-//! drain) stops the loop gracefully: one bounded attempt to deliver queued
-//! reports, then exit 0. Nothing is lost by exiting early — the next start
-//! re-seeds from the broker's cursors and re-derives any undelivered report
-//! from Argo CD's current state.
+//! drain) stops the loop and exits 0. The process keeps no state.
 
 use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
@@ -30,8 +28,6 @@ async fn main() {
     tracing::info!(
         broker = %cfg.broker_url,
         token_file = %cfg.token_file.display(),
-        owner_annotation = %cfg.owner_annotation,
-        ui = cfg.argocd_ui_url.as_deref().unwrap_or("(none)"),
         "argocd: starting"
     );
 

@@ -15,38 +15,33 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::json;
 
 use scarab_db_postgres::PostgresDb;
-use scarab_deployment::DeploymentStore;
 use scarab_engine::ports::{ExecHandle, ExecState, Executor};
 use scarab_engine::ExecError;
 use scarab_engine::{
     cancel_run_request, rerun_step, Attempt, AttemptId, AttemptOutcome, Clock, Db, DeployContext,
-    EventKind, EventPayload, OutboxId, OutboxMessage, RunDeploymentRequest, RunId, RunStatus,
-    Scheduler, ServiceStatus, StepId, StepRun, StepSpec, StepStatus, Timestamp, CANCEL_ATTEMPT,
-    CANCEL_RUN, EVENT_VERSION, LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS, RUN_STATUS_CHANGED,
+    EventKind, EventPayload, OutboxId, OutboxMessage, RunId, RunStatus, Scheduler, ServiceStatus,
+    StepId, StepRun, StepSpec, StepStatus, Timestamp, CANCEL_ATTEMPT, CANCEL_RUN, EVENT_VERSION,
+    LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS, RUN_STATUS_CHANGED,
 };
 use scarab_forge::{ForgePort, StatusState};
 use scarab_project::{
-    EnvironmentDeploymentDeadline, EnvironmentGovernanceStore, EnvironmentProjectEligibility,
-    EnvironmentProjectOverlay, EnvironmentProtectionRules, OrgEnvironment, OrgEnvironmentStore,
+    EnvironmentGovernanceStore, EnvironmentProjectEligibility, OrgEnvironment, OrgEnvironmentStore,
 };
-use scarab_server::deployment_gates::ServerDeploymentGates;
 use scarab_server::drain_forge_statuses;
 use scarab_testkit::{
-    FakeClock, FakeExecutor, FakeForge, InMemoryDb, InMemoryEnvironmentGovernance, LaunchHook,
+    FakeClock, FakeExecutor, FakeForge, InMemoryDb, InMemoryEnvironmentGovernance,
 };
 
 const ORG: &str = "acme";
 const ENV: &str = "prod";
 const PROJECT: &str = "web";
 const T0: i64 = 1_000;
-const WEB: &str = "web";
 
 fn id(s: &str) -> StepId {
     StepId(s.into())
@@ -75,18 +70,14 @@ fn handle(run: &str, step: &str, attempt: &str) -> String {
 // Executors
 // ===========================================================================
 
-/// Wraps the shared FakeExecutor. Two seams:
-/// - `create_then_fail`: the next N launches CREATE the unit (the inner
-///   launch is recorded) and then return `Err` — the k8s shape of a
-///   `pods.create` the apiserver accepted followed by a failed
-///   `ensure_step_secrets` (lib.rs launch) or a lost create response.
-/// - `during_delivery_check`: a one-shot hook run inside the next
-///   `results_delivery_failure` (awaited by `succeed_step` between its
-///   frontier read and `finalize_step`'s commit).
+/// Wraps the shared FakeExecutor. One seam, `create_then_fail`: the next N
+/// launches CREATE the unit (the inner launch is recorded) and then return
+/// `Err` — the k8s shape of a `pods.create` the apiserver accepted followed
+/// by a failed `ensure_step_secrets` (lib.rs launch) or a lost create
+/// response.
 struct SeamExec {
     inner: Arc<FakeExecutor>,
     create_then_fail: Mutex<u32>,
-    on_delivery: Mutex<Option<LaunchHook>>,
 }
 
 impl SeamExec {
@@ -94,7 +85,6 @@ impl SeamExec {
         Self {
             inner,
             create_then_fail: Mutex::new(0),
-            on_delivery: Mutex::new(None),
         }
     }
 }
@@ -139,10 +129,6 @@ impl Executor for SeamExec {
         &self,
         handle: &ExecHandle,
     ) -> Result<Option<String>, ExecError> {
-        let hook = self.on_delivery.lock().unwrap().take();
-        if let Some(f) = hook {
-            f().await;
-        }
         self.inner.results_delivery_failure(handle).await
     }
     async fn workspace_provisioning(
@@ -166,16 +152,14 @@ impl Executor for SeamExec {
 #[allow(dead_code)]
 struct World {
     db: Arc<dyn Db>,
-    store: Arc<dyn DeploymentStore>,
     governance: Arc<dyn EnvironmentGovernanceStore>,
-    oracle: ServerDeploymentGates,
     clock: FakeClock,
     exec: Arc<FakeExecutor>,
     pg: Option<common::TestDb>,
 }
 
 impl World {
-    async fn pg(limit: Option<u32>) -> Option<World> {
+    async fn pg() -> Option<World> {
         let tdb = common::fresh_db().await?;
         let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
         pg.migrate().await.unwrap();
@@ -183,8 +167,6 @@ impl World {
             org: ORG.into(),
             name: ENV.into(),
             description: String::new(),
-            deployment_deadline: EnvironmentDeploymentDeadline::new(5 * 60_000).unwrap(),
-            deployment_sources: Vec::new(),
             protection: Default::default(),
             eligibility: EnvironmentProjectEligibility::AllProjects,
             created_at: 1,
@@ -203,10 +185,10 @@ impl World {
         .await
         .unwrap();
         let governance: Arc<dyn EnvironmentGovernanceStore> = pg.clone();
-        Some(World::new(pg.clone(), pg, governance, limit, Some(tdb)).await)
+        Some(World::new(pg, governance, Some(tdb)))
     }
 
-    async fn inmemory(limit: Option<u32>) -> World {
+    async fn inmemory() -> World {
         let db = Arc::new(InMemoryDb::new());
         let governance: Arc<dyn EnvironmentGovernanceStore> =
             Arc::new(InMemoryEnvironmentGovernance::new().with_environment(
@@ -214,42 +196,19 @@ impl World {
                 ENV,
                 EnvironmentProjectEligibility::AllProjects,
             ));
-        World::new(db.clone(), db, governance, limit, None).await
+        World::new(db, governance, None)
     }
 
-    async fn new(
+    fn new(
         db: Arc<dyn Db>,
-        store: Arc<dyn DeploymentStore>,
         governance: Arc<dyn EnvironmentGovernanceStore>,
-        limit: Option<u32>,
         pg: Option<common::TestDb>,
     ) -> World {
-        governance
-            .put_environment_project_overlay(
-                &EnvironmentProjectOverlay {
-                    org: ORG.into(),
-                    environment: ENV.into(),
-                    project: PROJECT.into(),
-                    rules: EnvironmentProtectionRules {
-                        deployment_concurrency: limit.map(|n| NonZeroU32::new(n).unwrap()),
-                        ..Default::default()
-                    },
-                    deployment_gate_deadline: None,
-                },
-                "amy",
-                1,
-            )
-            .await
-            .unwrap();
-        let oracle =
-            ServerDeploymentGates::new(db.clone(), store.clone(), Some(governance.clone()));
         let exec = Arc::new(FakeExecutor::new());
         exec.set_results("bump", BTreeMap::from([("version".into(), json!("v1"))]));
         World {
             db,
-            store,
             governance,
-            oracle,
             clock: FakeClock::new(T0),
             exec,
             pg,
@@ -273,26 +232,7 @@ impl World {
         db.store_run_ir(
             &run,
             &json!({ "ir_version": 2, "environment": ENV, "steps": [{
-                "id": deploy_step, "image": "busybox", "results": ["version"],
-                "deployment_requests": [
-                    { "target": { "source": "argocd", "id": WEB }, "version": "version" }
-                ] }] }),
-        )
-        .await
-        .unwrap();
-        db.set_run_deployment_requests(
-            &run,
-            &[RunDeploymentRequest {
-                step: id(deploy_step),
-                ordinal: 0,
-                org: ORG.into(),
-                environment: ENV.into(),
-                target_source: "argocd".into(),
-                target_id: WEB.into(),
-                version_result: "version".into(),
-                evidence_results: Vec::new(),
-                gate_steps: Vec::new(),
-            }],
+                "id": deploy_step, "image": "busybox", "results": ["version"] }] }),
         )
         .await
         .unwrap();
@@ -371,13 +311,7 @@ impl World {
     }
 
     async fn tick(&self) {
-        let gates = self.oracle.for_tick();
-        let isolated = self
-            .scheduler()
-            .with_deployments(Some(&gates))
-            .tick_all()
-            .await
-            .unwrap();
+        let isolated = self.scheduler().tick_all().await.unwrap();
         assert!(isolated.is_empty(), "{isolated:?}");
     }
 
@@ -390,8 +324,7 @@ impl World {
     /// Admission only (leader `sched`): claims Ready steps, mints their
     /// attempts and enqueues launch intents — no launch drain.
     async fn admit(&self, run: &str) {
-        let gates = self.oracle.for_tick();
-        let s = self.scheduler().with_deployments(Some(&gates));
+        let s = self.scheduler();
         for _ in 0..3 {
             s.admit(&rid(run)).await.unwrap();
         }
@@ -442,27 +375,27 @@ impl World {
 }
 
 macro_rules! both {
-    ($scenario:ident, $limit:expr) => {
+    ($scenario:ident) => {
         mod $scenario {
             #[tokio::test]
             async fn pg() {
-                match super::World::pg($limit).await {
+                match super::World::pg().await {
                     Some(w) => super::$scenario(w).await,
                     None => eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset"),
                 }
             }
             #[tokio::test]
             async fn inmemory() {
-                super::$scenario(super::World::inmemory($limit).await).await
+                super::$scenario(super::World::inmemory().await).await
             }
         }
     };
-    ($scenario:ident, $limit:expr, ignore = $why:literal) => {
+    ($scenario:ident, ignore = $why:literal) => {
         mod $scenario {
             #[tokio::test]
             #[ignore = $why]
             async fn pg() {
-                match super::World::pg($limit).await {
+                match super::World::pg().await {
                     Some(w) => super::$scenario(w).await,
                     None => eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset"),
                 }
@@ -470,7 +403,7 @@ macro_rules! both {
             #[tokio::test]
             #[ignore = $why]
             async fn inmemory() {
-                super::$scenario(super::World::inmemory($limit).await).await
+                super::$scenario(super::World::inmemory().await).await
             }
         }
     };
@@ -483,8 +416,7 @@ macro_rules! both {
 // retry window. `drain_attempt_teardowns` waits (`Launching`) while the
 // launch key is pending — but the redelivered launch is refused by
 // `launch_still_wanted` and dispatched WITHOUT a teardown, so the drain then
-// retires "gone". The created unit is never torn down and the target's hold
-// ends while it runs.
+// retires "gone". The created unit is never torn down.
 // ---------------------------------------------------------------------------
 async fn a_unit_created_by_a_failed_launch_is_torn_down_after_a_cancel(w: World) {
     w.seed_deploy("ra").await;
@@ -513,36 +445,24 @@ async fn a_unit_created_by_a_failed_launch_is_torn_down_after_a_cancel(w: World)
     assert!(cancel_run_request(&*w.db, &w.clock, &rid("ra"), None)
         .await
         .unwrap());
-    w.ticks(4).await;
-    w.seed_deploy("rb").await;
-    w.ticks(3).await;
-    let rb = w.step("rb", "bump").await;
+    w.ticks(7).await;
     assert!(
         w.torn_down(&h),
         "ra's a1 unit (created by a launch that then errored) was never torn down after \
          the cancel: the redelivered launch was refused without a teardown and the \
-         CANCEL_ATTEMPT then retired as gone (cancelled: {:?}); rb's bump on the same \
-         target is {:?} on {:?}",
-        w.exec.cancelled_handles(),
-        rb.status,
-        rb.attempts
-            .iter()
-            .map(|a| a.id.0.clone())
-            .collect::<Vec<_>>()
+         CANCEL_ATTEMPT then retired as gone (cancelled: {:?})",
+        w.exec.cancelled_handles()
     );
     w.finish().await;
 }
-both!(
-    a_unit_created_by_a_failed_launch_is_torn_down_after_a_cancel,
-    Some(1)
-);
+both!(a_unit_created_by_a_failed_launch_is_torn_down_after_a_cancel);
 
 // ---------------------------------------------------------------------------
 // F2 — the round-3 claim: a cancel landing while a launch is IN FLIGHT. The
 // drain sees no handle but a pending `launch:` key → `Launching` (retried);
 // the launch records its handle, sees it is unwanted, finds the attempt
 // already owed (stamped Cancelled) and dispatches; the next drain tears the
-// unit down. The rival is held meanwhile.
+// unit down.
 // ---------------------------------------------------------------------------
 async fn a_launch_in_flight_across_the_cancel_is_waited_out(w: World) {
     w.seed_deploy("ra").await;
@@ -571,26 +491,12 @@ async fn a_launch_in_flight_across_the_cancel_is_waited_out(w: World) {
         w.pending("cancel:ra:bump/a1").await,
         "the CANCEL_ATTEMPT was retired while its launch was in flight"
     );
-    // While it is pending a rival on the target is held.
-    w.seed_deploy("rb").await;
-    {
-        let gates = w.oracle.for_tick();
-        let s = w.scheduler().with_deployments(Some(&gates));
-        for _ in 0..3 {
-            s.admit(&rid("rb")).await.unwrap();
-        }
-    }
-    assert_eq!(
-        w.step("rb", "bump").await.status,
-        StepStatus::Pending,
-        "rb admitted while ra's in-flight launch was unresolved"
-    );
     w.ticks(3).await;
     assert!(w.torn_down(&h), "{:?}", w.exec.cancelled_handles());
     assert!(!w.pending("cancel:ra:bump/a1").await);
     w.finish().await;
 }
-both!(a_launch_in_flight_across_the_cancel_is_waited_out, Some(1));
+both!(a_launch_in_flight_across_the_cancel_is_waited_out);
 
 // ---------------------------------------------------------------------------
 // F3 — the same in-flight launch, but it outlives the teardown's poison
@@ -640,80 +546,8 @@ async fn a_launch_outliving_the_teardown_ceiling_is_still_torn_down(w: World) {
 }
 both!(
     a_launch_outliving_the_teardown_ceiling_is_still_torn_down,
-    Some(1),
     ignore = "redteam: BROKE F3 — late launch after an abandoned CANCEL_ATTEMPT is 'owed' to a dead intent"
 );
-
-// ---------------------------------------------------------------------------
-// F4 — AttemptFrontier::Any at FINALIZE (R2-E3's ABA, one site over).
-// `succeed_step` reads the frontier (a1, Running), then — for a deploy step
-// whose results cannot complete its request — awaits the backend's
-// `results_delivery_failure` before `finalize_step`'s CAS. In that await the
-// Run is cancelled, drained, rerun, and a2 claimed + launched. The CAS
-// `Running → Failed` is status-only (`AttemptFrontier::Any`), so it matches
-// a2's Running and finalizes the STEP on a1's stale verdict.
-// ---------------------------------------------------------------------------
-async fn a_stale_verdict_cannot_finalize_the_reruns_step(w: World) {
-    // `dep` has no scripted results → DeploymentRequestIncomplete path.
-    w.seed_deploy_with("rd", "dep").await;
-    w.running_on("rd", "dep", "a1").await;
-    w.exec.script_outcome(ExecState::Succeeded);
-    let seam = SeamExec::new(w.exec.clone());
-    {
-        let db = w.db.clone();
-        let exec = w.exec.clone();
-        *seam.on_delivery.lock().unwrap() = Some(Box::new(move || {
-            Box::pin(async move {
-                let clock = FakeClock::new(T0);
-                assert!(cancel_run_request(&*db, &clock, &rid("rd"), None)
-                    .await
-                    .unwrap());
-                let b = Scheduler::new(&*db, &clock, &*exec, "sched").with_outbox_visibility_ms(0);
-                b.reconcile_cancellations().await.unwrap();
-                rerun_step(&*db, &clock, &rid("rd"), &id("dep"), None)
-                    .await
-                    .unwrap();
-                for _ in 0..3 {
-                    b.admit(&rid("rd")).await.unwrap();
-                }
-                b.reconcile().await.unwrap();
-            })
-        }));
-    }
-    Scheduler::new(&*w.db, &w.clock, &seam, "sched")
-        .with_outbox_visibility_ms(0)
-        .reconcile()
-        .await
-        .unwrap();
-    let a2 = handle("rd", "dep", "a2");
-    assert!(w.launched(&a2), "precondition: the rerun launched a2");
-    let after_finalize = w.step("rd", "dep").await.status;
-    w.ticks(3).await;
-    eprintln!(
-        "F4: right after the stale finalize dep={after_finalize:?}; after 3 ticks run={:?} \
-         dep={:?} a2 torn down={}",
-        w.run_status("rd").await,
-        w.step("rd", "dep").await.status,
-        w.torn_down(&a2)
-    );
-    let dep = w.step("rd", "dep").await;
-    let outcome = |n: &str| dep.attempts.iter().find(|a| a.id.0 == n).map(|a| a.outcome);
-    assert!(
-        dep.status == StepStatus::Running
-            && outcome("a2") == Some(AttemptOutcome::Running)
-            && outcome("a1") == Some(AttemptOutcome::Cancelled),
-        "a1's late verdict finalized the rerun's step: step {:?} (run {:?}) while a2 is \
-         outcome {:?} with its unit live and no teardown owed; a1's Cancelled stamp is now \
-         {:?} (cancelled handles: {:?})",
-        dep.status,
-        w.run_status("rd").await,
-        outcome("a2"),
-        outcome("a1"),
-        w.exec.cancelled_handles()
-    );
-    w.finish().await;
-}
-both!(a_stale_verdict_cannot_finalize_the_reruns_step, None);
 
 // ---------------------------------------------------------------------------
 // F5 — the R2-E1 class for SHARED SERVICES. The services-only CANCEL_RUN
@@ -758,7 +592,7 @@ async fn a_stale_services_cancel_spares_the_reruns_services(w: World) {
     );
     w.finish().await;
 }
-both!(a_stale_services_cancel_spares_the_reruns_services, None);
+both!(a_stale_services_cancel_spares_the_reruns_services);
 
 // ---------------------------------------------------------------------------
 // F6 — the random-nonce CANCEL_RUN key. A re-sent operator cancel, and a
@@ -798,7 +632,7 @@ async fn a_resent_cancel_enqueues_one_services_teardown(w: World) {
     assert_eq!(rows.len(), 1, "the second cancel's own row only: {rows:?}");
     w.finish().await;
 }
-both!(a_resent_cancel_enqueues_one_services_teardown, None);
+both!(a_resent_cancel_enqueues_one_services_teardown);
 
 // ---------------------------------------------------------------------------
 // F7 — a step claimed (Running) but not yet minted when the cancel lands.
@@ -865,7 +699,6 @@ async fn an_attempt_minted_after_its_cancel_is_not_left_running(w: World) {
 }
 both!(
     an_attempt_minted_after_its_cancel_is_not_left_running,
-    None,
     ignore = "redteam: BROKE F7 — attempt minted after cancel stays Running forever"
 );
 
@@ -907,7 +740,7 @@ async fn a_legacy_cancel_run_tears_down_its_attempt(w: World) {
     assert!(!w.pending("cancel:rp").await);
     w.finish().await;
 }
-both!(a_legacy_cancel_run_tears_down_its_attempt, None);
+both!(a_legacy_cancel_run_tears_down_its_attempt);
 
 async fn a_legacy_cancel_run_pending_across_a_rerun_still_tears_down_a1(w: World) {
     w.seed_plain("rp").await;
@@ -934,7 +767,6 @@ async fn a_legacy_cancel_run_pending_across_a_rerun_still_tears_down_a1(w: World
 }
 both!(
     a_legacy_cancel_run_pending_across_a_rerun_still_tears_down_a1,
-    None,
     ignore = "redteam: BROKE F8 — legacy CANCEL_RUN drain only honours the LATEST attempt"
 );
 
@@ -1008,7 +840,6 @@ async fn two_replicas_cannot_leave_a_settled_runs_check_pending(w: World) {
 }
 both!(
     two_replicas_cannot_leave_a_settled_runs_check_pending,
-    None,
     ignore = "redteam: BROKE F9 — status_post_superseded is check-then-act across replicas"
 );
 
@@ -1044,4 +875,4 @@ async fn a_redelivered_start_post_after_a_cancel_is_retired(w: World) {
     );
     w.finish().await;
 }
-both!(a_redelivered_start_post_after_a_cancel_is_retired, None);
+both!(a_redelivered_start_post_after_a_cancel_is_retired);

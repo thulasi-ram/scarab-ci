@@ -167,7 +167,7 @@ async fn grants_and_approvers_must_name_an_existing_principal() {
         &app,
         "PUT",
         "/v1/orgs/acme/environments/prod",
-        Some(serde_json::json!({ "deployment_sources": [] })),
+        Some(serde_json::json!({})),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{msg}");
