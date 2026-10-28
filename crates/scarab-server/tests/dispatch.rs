@@ -274,6 +274,65 @@ async fn dispatch_rejects_a_pipeline_that_does_not_opt_into_manual() {
     );
 }
 
+// --- CEL size limits (git-bug af7ef4d) ----------------------------------------
+
+/// A `when:` the CEL parser would overflow its stack on must be a submit-time
+/// error naming the limit, and one just under the limit must still compile
+/// and evaluate. Before the fix, either could abort the server process: the
+/// parser recurses once per `+` link, and an overflow cannot be caught.
+#[tokio::test]
+async fn dispatch_rejects_an_oversized_when_and_runs_one_at_the_limit() {
+    let limit = scarab_pipeline::cel::MAX_EXPRESSION_BYTES;
+    let chain = |len: usize| {
+        let mut s = "1".to_string();
+        while s.len() + 2 <= len - 4 {
+            s.push_str("+1");
+        }
+        format!("{s} > 0")
+    };
+    let pipeline = |when: &str| {
+        format!("on: {{ manual: {{}} }}\nsteps:\n  - id: build\n    image: busybox\n    when: \"{when}\"\n")
+    };
+    let dispatch = |forge: scarab_testkit::FakeForge, db: Arc<InMemoryDb>| async move {
+        let clock = FakeClock::new(1_000);
+        dispatch_run(
+            &forge,
+            db.as_ref(),
+            &clock,
+            None,
+            "alice".into(),
+            repo(),
+            "refs/heads/main".into(),
+            "ci".into(),
+            std::collections::BTreeMap::new(),
+            DispatchKind::Manual,
+            None,
+        )
+        .await
+    };
+
+    let db = Arc::new(InMemoryDb::new());
+    let over =
+        scarab_testkit::FakeForge::new().with_file(".scarab/ci.yaml", pipeline(&chain(limit + 1)));
+    let err = dispatch(over, db.clone())
+        .await
+        .expect_err("an oversized `when:` must be rejected");
+    let msg = err.to_string();
+    assert!(matches!(err, DispatchError::Pipeline(_)), "{err:?}");
+    assert!(msg.contains("step `build`: when"), "{msg}");
+    assert!(msg.contains("the limit is 4096 bytes"), "{msg}");
+    assert!(
+        db.list_runs(100).await.unwrap().is_empty(),
+        "no run created"
+    );
+
+    let at = scarab_testkit::FakeForge::new().with_file(".scarab/ci.yaml", pipeline(&chain(limit)));
+    dispatch(at, db.clone())
+        .await
+        .expect("a `when:` at the limit compiles and evaluates");
+    assert_eq!(db.list_runs(100).await.unwrap().len(), 1);
+}
+
 // --- params fail-closed -------------------------------------------------------
 
 #[tokio::test]

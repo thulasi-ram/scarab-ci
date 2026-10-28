@@ -16,28 +16,175 @@ use cel_interpreter::{Context, Program};
 
 use crate::PipelineError;
 
-/// Compile a CEL expression, containing the panic hazard in the parser.
+/// The longest CEL expression accepted, in bytes. The same cap ADR-0075 sets
+/// for policy rules. Applies to each `when:`, each matrix `exclude`, each
+/// parameter `validate`, and each `${{ … }}` on its own.
+pub const MAX_EXPRESSION_BYTES: usize = 4096;
+
+/// The deepest bracket nesting (`(`, `[`, `{` combined) accepted in a CEL
+/// expression. Brackets inside string literals and `//` comments do not count.
+pub const MAX_EXPRESSION_NESTING: usize = 64;
+
+/// Stack size of the thread that parses and evaluates CEL.
 ///
-/// `cel-parser` (antlr4rust 0.3.0-rc2) reaches an `unreachable!()` on some
-/// malformed inputs — e.g. a trailing binary operator (`1 +`) — instead of
-/// returning a `ParseError`. A malformed *user* pipeline must be a submit-time
-/// validation error, never a control-plane crash (the durability ethos), so we
-/// catch the unwind and turn it into [`PipelineError::Cel`]. (The parser's own
-/// stderr note on the caught panic is harmless.)
-fn compile(expr: &str) -> Result<Program, PipelineError> {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Program::compile(expr))) {
-        Ok(Ok(program)) => Ok(program),
-        Ok(Err(e)) => Err(PipelineError::Cel(format!("`{expr}`: {e}"))),
-        Err(_) => Err(PipelineError::Cel(format!(
-            "`{expr}`: malformed expression"
-        ))),
+/// The parser (`cel-parser`, antlr4rust) and the evaluator recurse once per
+/// nesting level *and* once per link of a left-recursive chain (`1+1+1…`,
+/// `a.b.b…`, `l[0][0]…`). A stack overflow aborts the whole process, and
+/// `catch_unwind` cannot stop it, so an expression a repository author wrote
+/// could take down the control plane. The caps above bound the depth; this
+/// stack holds the deepest expression they allow. Measured worst case for a
+/// 4 KiB expression (a 2,048-link `1+1+…` chain, parse + evaluate + drop):
+/// about 1.3 MiB in release and about 70 MiB in an unoptimised (debug) build,
+/// where the antlr parser's frames are much larger (a 64-deep `((…))` alone
+/// takes about 9 MiB there). A tokio worker thread has 2 MiB: release would
+/// leave little room for the caller's frames, and debug does not fit. The
+/// stack is reserved address space; only the pages an expression touches are
+/// committed. Measured cost of the extra thread: about 57 µs per call in
+/// release on an M-series Mac (69 µs against 12 µs inline for a two-clause
+/// guard), which is small next to the Postgres writes around each caller.
+const CEL_STACK_BYTES: usize = if cfg!(debug_assertions) {
+    256 << 20
+} else {
+    64 << 20
+};
+
+/// The expression as quoted in an error: whole when short, else its start.
+fn shown(expr: &str) -> String {
+    const MAX: usize = 80;
+    if expr.len() <= MAX {
+        return expr.to_string();
     }
+    let mut end = MAX;
+    while !expr.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &expr[..end])
+}
+
+/// Reject an expression the parser could not handle safely, before parsing
+/// it: longer than [`MAX_EXPRESSION_BYTES`], or with brackets nested deeper
+/// than [`MAX_EXPRESSION_NESTING`].
+fn check_limits(expr: &str) -> Result<(), PipelineError> {
+    if expr.len() > MAX_EXPRESSION_BYTES {
+        return Err(PipelineError::Cel(format!(
+            "`{}`: expression is {} bytes; the limit is {MAX_EXPRESSION_BYTES} bytes",
+            shown(expr),
+            expr.len()
+        )));
+    }
+    let depth = max_nesting(expr);
+    if depth > MAX_EXPRESSION_NESTING {
+        return Err(PipelineError::Cel(format!(
+            "`{}`: brackets nest {depth} deep; the limit is {MAX_EXPRESSION_NESTING}",
+            shown(expr)
+        )));
+    }
+    Ok(())
+}
+
+/// The deepest `(` / `[` / `{` nesting in `expr`, skipping string and bytes
+/// literals (CEL's `'…'`, `"…"`, triple-quoted, and `r`/`b`-prefixed forms)
+/// and `//` comments, which is where the parser does not see brackets either.
+fn max_nesting(expr: &str) -> usize {
+    let b = expr.as_bytes();
+    let (mut i, mut depth, mut max) = (0, 0usize, 0usize);
+    while i < b.len() {
+        match b[i] {
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                max = max.max(depth);
+                i += 1;
+            }
+            b')' | b']' | b'}' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            q @ (b'\'' | b'"') => i = skip_string(b, i, q),
+            _ => i += 1,
+        }
+    }
+    max
+}
+
+/// Given `b[open]` is a quote `q`, return the index just past the literal it
+/// opens (or `b.len()` if it is unterminated). Follows the CEL lexer: a raw
+/// literal (`r`/`R` prefix, possibly with `b`/`B`) has no escapes; a
+/// single-quoted literal ends at a newline; a triple-quoted one spans lines.
+fn skip_string(b: &[u8], open: usize, q: u8) -> usize {
+    // The prefix letters directly before the quote, if they are not the tail
+    // of a longer identifier (`bar'x'` is the identifier `bar` then `'x'`).
+    let mut p = open;
+    while p > 0 && open - p < 2 && matches!(b[p - 1], b'r' | b'R' | b'b' | b'B') {
+        p -= 1;
+    }
+    let prefix_ok = p == 0 || !(b[p - 1].is_ascii_alphanumeric() || b[p - 1] == b'_');
+    let raw = prefix_ok && b[p..open].iter().any(|c| matches!(c, b'r' | b'R'));
+    let triple = b.get(open + 1) == Some(&q) && b.get(open + 2) == Some(&q);
+    let mut i = open + if triple { 3 } else { 1 };
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\\' && !raw {
+            i += 2;
+        } else if c == q && (!triple || (b.get(i + 1) == Some(&q) && b.get(i + 2) == Some(&q))) {
+            return i + if triple { 3 } else { 1 };
+        } else if !triple && (c == b'\n' || c == b'\r') {
+            return i;
+        } else {
+            i += 1;
+        }
+    }
+    b.len()
+}
+
+/// Compile `expr` and run `f` on the result, on a thread whose stack holds
+/// the deepest expression the limits allow (see [`CEL_STACK_BYTES`]). The
+/// program is also dropped there: dropping its tree recurses too.
+///
+/// It also contains the panic hazard in the parser: `cel-parser` (antlr4rust
+/// 0.3.0-rc2) reaches an `unreachable!()` on some malformed inputs — e.g. a
+/// trailing binary operator (`1 +`) — instead of returning a `ParseError`. A
+/// malformed *user* pipeline must be a submit-time validation error, never a
+/// control-plane crash, so a panic on the CEL thread becomes
+/// [`PipelineError::Cel`]. (The parser's own stderr note on it is harmless.)
+fn with_program<T: Send>(
+    expr: &str,
+    f: impl FnOnce(&Program) -> Result<T, PipelineError> + Send,
+) -> Result<T, PipelineError> {
+    check_limits(expr)?;
+    let run = || {
+        let program = Program::compile(expr)
+            .map_err(|e| PipelineError::Cel(format!("`{}`: {e}", shown(expr))))?;
+        f(&program)
+    };
+    std::thread::scope(|scope| {
+        let handle = std::thread::Builder::new()
+            .name("scarab-cel".into())
+            .stack_size(CEL_STACK_BYTES)
+            .spawn_scoped(scope, run)
+            .map_err(|e| {
+                PipelineError::Cel(format!(
+                    "`{}`: cannot start the CEL thread: {e}",
+                    shown(expr)
+                ))
+            })?;
+        handle.join().unwrap_or_else(|_| {
+            Err(PipelineError::Cel(format!(
+                "`{}`: malformed expression",
+                shown(expr)
+            )))
+        })
+    })
 }
 
 /// Parse-check a CEL expression without evaluating it. Used at submit time so a
 /// malformed `when:` / interpolation is rejected before a Run ever starts.
 pub fn check(expr: &str) -> Result<(), PipelineError> {
-    compile(expr).map(|_| ())
+    with_program(expr, |_| Ok(()))
 }
 
 /// Check every `${{ … }}` expression embedded in `template` (and that each is
@@ -52,15 +199,16 @@ pub fn check_interpolation(template: &str) -> Result<(), PipelineError> {
 /// Evaluate `expr` against a JSON object `ctx` (each top-level key becomes a CEL
 /// variable), returning the result as JSON.
 pub fn eval(expr: &str, ctx: &serde_json::Value) -> Result<serde_json::Value, PipelineError> {
-    let program = compile(expr)?;
-    let mut context = Context::default();
-    bind(&mut context, ctx, expr)?;
-    let value = program
-        .execute(&context)
-        .map_err(|e| PipelineError::Cel(format!("`{expr}`: {e}")))?;
-    value
-        .json()
-        .map_err(|e| PipelineError::Cel(format!("`{expr}`: {e:?}")))
+    with_program(expr, |program| {
+        let mut context = Context::default();
+        bind(&mut context, ctx, expr)?;
+        let value = program
+            .execute(&context)
+            .map_err(|e| PipelineError::Cel(format!("`{}`: {e}", shown(expr))))?;
+        value
+            .json()
+            .map_err(|e| PipelineError::Cel(format!("`{}`: {e:?}", shown(expr))))
+    })
 }
 
 /// Evaluate `expr` as a boolean guard (for `when:` and matrix predicates).
@@ -69,7 +217,8 @@ pub fn eval_bool(expr: &str, ctx: &serde_json::Value) -> Result<bool, PipelineEr
     match eval(expr, ctx)? {
         serde_json::Value::Bool(b) => Ok(b),
         other => Err(PipelineError::Cel(format!(
-            "`{expr}`: expected a boolean, got `{other}`"
+            "`{}`: expected a boolean, got `{other}`",
+            shown(expr)
         ))),
     }
 }
@@ -123,15 +272,16 @@ fn bind(context: &mut Context, ctx: &serde_json::Value, expr: &str) -> Result<()
     match ctx {
         serde_json::Value::Object(map) => {
             for (k, v) in map {
-                context
-                    .add_variable(k.clone(), v.clone())
-                    .map_err(|e| PipelineError::Cel(format!("`{expr}`: binding `{k}`: {e}")))?;
+                context.add_variable(k.clone(), v.clone()).map_err(|e| {
+                    PipelineError::Cel(format!("`{}`: binding `{k}`: {e}", shown(expr)))
+                })?;
             }
             Ok(())
         }
         serde_json::Value::Null => Ok(()),
         _ => Err(PipelineError::Cel(format!(
-            "`{expr}`: context must be a JSON object"
+            "`{}`: context must be a JSON object",
+            shown(expr)
         ))),
     }
 }
@@ -175,5 +325,139 @@ mod tests {
     fn unterminated_interpolation_is_rejected() {
         assert!(check_interpolation("oops ${{ x ").is_err());
         assert!(check_interpolation("ok ${{ x }} done").is_ok());
+    }
+
+    // --- size and nesting limits (git-bug af7ef4d) --------------------------
+    //
+    // A stack overflow in the CEL parser or evaluator aborts the process, so
+    // every case below runs on a 2 MiB thread — the stack of a tokio worker,
+    // which is where the server calls into this module. Before the fix, each
+    // of these aborted the test binary (in debug; the 1,000-paren case also in
+    // release) instead of failing.
+
+    /// Run `f` on a thread with a tokio worker's default stack.
+    fn on_worker_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(f)
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    /// `head` followed by as many `unit`s as fit in `len` bytes.
+    fn chain(head: &str, unit: &str, len: usize) -> String {
+        let mut s = head.to_string();
+        while s.len() + unit.len() <= len {
+            s.push_str(unit);
+        }
+        s
+    }
+
+    fn nested(open: &str, close: &str, depth: usize) -> String {
+        format!("{}1{}", open.repeat(depth), close.repeat(depth))
+    }
+
+    fn limits_ctx() -> serde_json::Value {
+        json!({ "t": true, "f": false, "x": 1, "l": [[1]], "a": {} })
+    }
+
+    #[test]
+    fn nesting_at_the_limit_evaluates_and_one_more_is_rejected() {
+        on_worker_stack(|| {
+            let ctx = limits_ctx();
+            let at = nested("(", ")", MAX_EXPRESSION_NESTING);
+            assert_eq!(eval(&at, &ctx).unwrap(), json!(1));
+            let lists = nested("[", "]", MAX_EXPRESSION_NESTING);
+            assert!(eval(&lists, &ctx).is_ok());
+
+            for over in [
+                nested("(", ")", MAX_EXPRESSION_NESTING + 1),
+                nested("[", "]", MAX_EXPRESSION_NESTING + 1),
+                // The shape that aborted a release build of cel 0.10.
+                nested("(", ")", 1000),
+            ] {
+                let err = check(&over).unwrap_err().to_string();
+                assert!(err.contains("the limit is 64"), "{err}");
+            }
+            // Mixed bracket kinds count together.
+            let mixed = format!("{}1{}", "([".repeat(33), "])".repeat(33));
+            assert!(check(&mixed)
+                .unwrap_err()
+                .to_string()
+                .contains("nest 66 deep"));
+        });
+    }
+
+    #[test]
+    fn longest_left_recursive_chains_evaluate_without_overflowing() {
+        on_worker_stack(|| {
+            let ctx = limits_ctx();
+            let max = MAX_EXPRESSION_BYTES;
+            let links = (max as u64 - 1) / 2 + 1;
+            // `1+1+…` is the deepest per byte: one parser level per 2 bytes.
+            assert_eq!(eval(&chain("1", "+1", max), &ctx).unwrap(), json!(links));
+            assert_eq!(eval(&chain("x", "+x", max), &ctx).unwrap(), json!(links));
+            assert_eq!(eval(&chain("1", "*1", max), &ctx).unwrap(), json!(1));
+            assert_eq!(eval(&chain("t", "&&t", max), &ctx).unwrap(), json!(true));
+            assert_eq!(eval(&chain("f", "||f", max), &ctx).unwrap(), json!(false));
+            // Member, index and comparison chains parse; evaluating them fails
+            // at the first missing field or type mismatch — an error, not an abort.
+            for deep in [
+                chain("a", ".b", max),
+                chain("l", "[0]", max),
+                chain("1", "<1", max),
+            ] {
+                check(&deep).unwrap();
+                assert!(eval(&deep, &ctx).is_err());
+            }
+            let ternary = format!("{}1", "t?1:".repeat((max - 1) / 4));
+            assert_eq!(eval(&ternary, &ctx).unwrap(), json!(1));
+            // A long flat list literal.
+            let list = format!("size({}])", chain("[1", ",1", max - 7));
+            assert!(list.len() <= max);
+            assert!(eval(&list, &ctx).is_ok());
+        });
+    }
+
+    #[test]
+    fn expression_over_the_size_limit_is_rejected_before_parsing() {
+        on_worker_stack(|| {
+            check(&chain("1", "+1", MAX_EXPRESSION_BYTES)).unwrap();
+            // 10 KB: the chain the ADR-0075 spike found aborts cel 0.15 in release.
+            for over in [
+                chain("1", "+1", MAX_EXPRESSION_BYTES + 2),
+                chain("a", ".b", 10_000),
+            ] {
+                let err = check(&over).unwrap_err().to_string();
+                assert!(err.contains("the limit is 4096 bytes"), "{err}");
+                // The error quotes the start of the expression, not all of it.
+                assert!(err.len() < 200, "{err}");
+            }
+            let template = format!("img:${{{{ {} }}}}", chain("1", "+1", 5000));
+            let err = check_interpolation(&template).unwrap_err().to_string();
+            assert!(err.contains("the limit is 4096 bytes"), "{err}");
+        });
+    }
+
+    #[test]
+    fn brackets_in_strings_and_comments_do_not_count_towards_nesting() {
+        let deep = "(".repeat(100);
+        assert_eq!(max_nesting(&format!("'{deep}' == x")), 0);
+        assert_eq!(max_nesting(&format!("\"{deep}\" == x")), 0);
+        assert_eq!(max_nesting(&format!("'''a'b\n{deep}''' == x")), 0);
+        assert_eq!(max_nesting(&format!("b'{deep}' == x")), 0);
+        assert_eq!(max_nesting(&format!("// it's {deep}\nx")), 0);
+        // An escaped quote does not end the string...
+        assert_eq!(max_nesting(&format!(r"'\'{deep}' == x")), 0);
+        // ...except in a raw string, where `\` is literal, so the brackets
+        // after its closing quote count.
+        assert_eq!(max_nesting(&format!(r"r'\' + ({deep}")), 101);
+        // `bar` is an identifier, not a raw/bytes prefix.
+        assert_eq!(max_nesting(&format!(r"bar'\'' + {deep}")), 100);
+        // A single-quoted string cannot span lines; what follows is code.
+        assert_eq!(max_nesting(&format!("'unterminated\n{deep}")), 100);
+        assert_eq!(max_nesting("(a[b]{c[d]})"), 3);
+        on_worker_stack(move || check(&format!("'{deep}' == 'x'")).unwrap());
     }
 }
