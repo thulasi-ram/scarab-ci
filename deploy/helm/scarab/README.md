@@ -364,10 +364,14 @@ renders two versions and fails if any immutable StatefulSet field differs.
 ## Plugins (`plugins`, ADR-0072)
 
 Off by default. `plugins.enabled=true` runs the plugin runtime: Scarab manages
-one Deployment per installed plugin (e.g. the first-party Argo CD reporter) in
-the shared `plugins.namespace`, and plugins talk to Scarab only through the
-**CredentialBroker**: a second listener on `plugins.brokerPort`, exposed by
-the ClusterIP Service `<fullname>-broker` and never through the ingress.
+one Deployment per installed plugin in the shared `plugins.namespace`, and
+plugins talk to Scarab only through the **CredentialBroker**: a second listener
+on `plugins.brokerPort`, exposed by the ClusterIP Service `<fullname>-broker`
+and never through the ingress. No built plugin capability acts on Scarab yet
+(ADR-0074 removed the Argo CD reporter), so you need this only to work on a
+plugin. A plugin that needs storage brings its own: a PersistentVolumeClaim you
+create in `plugins.namespace`, which the runtime mounts and Scarab never
+manages.
 
 It renders the namespace (labelled Pod Security `restricted`; set
 `plugins.createNamespace=false` to bring your own, with that label), a Role

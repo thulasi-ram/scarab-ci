@@ -97,6 +97,15 @@ Every key in this table exists in `values.yaml`:
 
 See `deploy/helm/scarab/README.md` and `values.yaml` for every value.
 
+### Plugins
+
+`plugins.enabled` (default `false`) turns on the plugin runtime: a shared plugin namespace, the
+CredentialBroker and the RBAC they need. No built plugin capability acts on Scarab yet (ADR-0074),
+so you don't need it to run pipelines or deploys; leave it off unless you are working on a plugin.
+A plugin that needs storage brings its own: you create a PersistentVolumeClaim in the plugin
+namespace and the plugin runtime mounts it. Scarab doesn't provision, back up or read that
+volume.
+
 ## A minimal `values.yaml`
 
 An example override for a real cluster, where Postgres and S3 credentials come from a Secret you
@@ -159,3 +168,4 @@ kind cluster.
 ## References
 
 - [ADR-0005: Tenancy & deployment: Kubernetes as the only backend](/scarab-ci/tech/adr/0005-tenancy-and-k8s-only/)
+- [ADR-0074: Deployments leave core](/scarab-ci/tech/adr/0074-deployments-leave-core/)
