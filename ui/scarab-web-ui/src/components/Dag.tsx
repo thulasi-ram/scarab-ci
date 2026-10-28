@@ -24,6 +24,8 @@ export type DagStep = {
   reused?: boolean;
   needs: string[];
   gate?: string | null;
+  /** This step is marked `deploy: true` (ADR-0074 §2) — the step that deploys. */
+  deploy?: boolean;
   /** A gate's verdict, a waiting DeploymentGate's target + Deployment, or a
    * deploy step's concurrency hold — the line `gateStatus` (gates.ts) derives.
    * Shown as the node's meta line in place of the generic one. */
@@ -522,6 +524,11 @@ export default function Dag(props: {
                       </Show>
                       <Show when={s.gate}>
                         <Icon icon="timer" size={12} class="dnode-gate" />
+                      </Show>
+                      <Show when={s.deploy}>
+                        <span class="dnode-gate" title="deploy step (`deploy: true`)">
+                          <Icon icon="rocket" size={12} />
+                        </span>
                       </Show>
                       <Show when={s.status === "running"}>
                         <span class="dnode-prog" />

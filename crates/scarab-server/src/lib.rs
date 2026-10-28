@@ -1124,6 +1124,9 @@ pub struct RunSummaryDto {
     /// deploy run, whose pipeline declared `environment:`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub environment: Option<String>,
+    /// Whether this is a **deploy Run** (ADR-0074 §2): its pipeline, or one of
+    /// its Steps, is marked `deploy: true`. Independent of `environment`.
+    pub deploy: bool,
     /// The run's **waiting gates** (git-bug `c489346`): gate steps that are
     /// `Pending`, reached (every need `Succeeded`) and have an open Attempt —
     /// the engine's "waiting gate". Since a waiting gate holds only its
@@ -1209,6 +1212,7 @@ impl From<scarab_engine::RunSummary> for RunSummaryDto {
             origin_pr_base: s.pr_base,
             pipeline: s.pipeline,
             trigger_title: s.trigger_title,
+            deploy: s.deploy,
             environment: s.environment,
             waiting_gates: Vec::new(),
         }
@@ -1348,6 +1352,10 @@ pub struct StepStatusDto {
     /// (ADR-0058) — the DAG's service edges. Empty for a step that uses none.
     #[serde(default)]
     pub uses: Vec<String>,
+    /// This Step is marked `deploy: true` (ADR-0074 §2) — the Step of a deploy
+    /// Run that deploys. Omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deploy: bool,
 }
 
 /// How a gate's wait resolved: its `GateResolved` journal entry.
@@ -2151,6 +2159,19 @@ pub struct ListRunsQuery {
     pub limit: Option<u32>,
 }
 
+/// Query for [`list_repo_runs`]: a page size plus an optional Environment.
+#[derive(Debug, Deserialize)]
+pub struct ListRepoRunsQuery {
+    /// Max runs to return (default [`DEFAULT_RUNS_LIMIT`], capped at [`MAX_RUNS_LIMIT`]).
+    pub limit: Option<u32>,
+    /// Only the deploy runs into this Environment (ADR-0074 §2). Absent = every
+    /// run; present but empty is a 400, never a silent "match nothing".
+    pub environment: Option<String>,
+    /// `true`: only deploy Runs; `false`: only the rest (ADR-0074 §2). Absent =
+    /// every run.
+    pub deploy: Option<bool>,
+}
+
 /// Default page size for `GET /v1/runs`.
 const DEFAULT_RUNS_LIMIT: u32 = 50;
 /// Upper bound so a client can't request an unbounded scan.
@@ -2250,9 +2271,11 @@ async fn get_run(
     // edges and address per-sidecar logs by index. A step with no stored spec
     // (e.g. a gate) carries empty vecs.
     let mut gate_views = run_gate_view::step_gate_views(&st, &run, status, &steps).await?;
+    let deploy_steps = st.db.deploy_steps_of_run(&run).await?;
     let mut step_dtos = Vec::with_capacity(steps.len());
     for s in steps {
         let view = gate_views.remove(&s.step.0).unwrap_or_default();
+        let deploy = deploy_steps.contains(&s.step);
         let (services, uses) = match st.db.step_spec(&run, &s.step).await? {
             Some(spec) => (
                 spec.services
@@ -2280,6 +2303,7 @@ async fn get_run(
             held: view.held,
             services,
             uses,
+            deploy,
         });
     }
     Ok(Json(RunStatusResponse {
@@ -3333,7 +3357,7 @@ async fn list_projects(
             // Recency signal (ADR-0046): the tenant's most recent run, if any.
             let last_run_at = st
                 .db
-                .list_runs_for_tenant(&resolved.org, &resolved.project, 1)
+                .list_runs_for_tenant(&resolved.org, &resolved.project, &Default::default(), 1)
                 .await?
                 .first()
                 .map(|r| r.created_at.0);
@@ -3371,23 +3395,40 @@ async fn list_projects(
     params(
         ("org" = String, Path, description = "org slug"),
         ("repo" = String, Path, description = "project (repo) name"),
-        ("limit" = Option<u32>, Query, description = "max runs (default 50, capped 200)")
+        ("limit" = Option<u32>, Query, description = "max runs (default 50, capped 200)"),
+        ("environment" = Option<String>, Query, description = "only runs governed by this Environment (ADR-0074); applied before `limit`; must not be empty"),
+        ("deploy" = Option<bool>, Query, description = "true: only deploy Runs (pipeline or a Step marked `deploy: true`); false: only the rest; applied before `limit`")
     ),
-    responses((status = 200, body = RunListResponse))
+    responses(
+        (status = 200, body = RunListResponse),
+        (status = 400, description = "`environment` present but empty, or `deploy` not a boolean")
+    )
 )]
 async fn list_repo_runs(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((org, repo)): Path<(String, String)>,
-    Query(q): Query<ListRunsQuery>,
+    Query(q): Query<ListRepoRunsQuery>,
 ) -> Result<Json<RunListResponse>, ApiError> {
     let scope = scarab_identity::Scope::Project {
         org: org.clone(),
         name: repo.clone(),
     };
     authorize_scoped(&st, &headers, Action::Read, Some(&scope)).await?;
+    if q.environment.as_deref() == Some("") {
+        return Err(ApiError::BadRequest(
+            "`environment` must name an Environment; omit it to list every run".into(),
+        ));
+    }
     let limit = q.limit.unwrap_or(DEFAULT_RUNS_LIMIT).min(MAX_RUNS_LIMIT);
-    let runs = st.db.list_runs_for_tenant(&org, &repo, limit).await?;
+    let filter = scarab_engine::RunListFilter {
+        environment: q.environment,
+        deploy: q.deploy,
+    };
+    let runs = st
+        .db
+        .list_runs_for_tenant(&org, &repo, &filter, limit)
+        .await?;
     Ok(Json(RunListResponse {
         runs: run_summaries(&st, runs).await?,
     }))
@@ -5412,6 +5453,19 @@ async fn persist_run_from_ir(
         )
         .await?;
     }
+    // The deploy marker (ADR-0074 §2): a Run is a deploy Run when its pipeline
+    // or any Step is marked `deploy: true` — read from the IR once, here. It
+    // drives the Runs list filter and the Run page's deploy-Step mark, and
+    // exempts the Run from newest-wins cancel (below).
+    let is_deploy_run = ir.is_deploy();
+    if is_deploy_run {
+        let steps: Vec<StepId> = ir.deploy_steps().into_iter().map(StepId).collect();
+        db.mark_deploy_run(run, &steps).await?;
+    }
+    // Newest-wins cancel applies only to a Run that is both ungoverned (no
+    // Environment, ADR-0032) and not a deploy Run (ADR-0074 §2): neither an
+    // in-flight Environment run nor an in-flight deploy is disposable.
+    let cancellable = matches!(gov, RunGovernance::Ungoverned) && !is_deploy_run;
     // Concurrency group (ADR-0011, 0032): serialize this run against others in the
     // same group under its policy. The `group` is interpolated here against the
     // run's launch inputs and trigger event (the same CEL machinery as step
@@ -5446,8 +5500,9 @@ async fn persist_run_from_ir(
         // holder — an in-flight production deploy is not disposable. So a governed
         // run always takes the queue-and-wait policy regardless of the pipeline's
         // declared `cancel-in-progress`; only ungoverned CI runs keep newest-wins
-        // cancel. (Mirrors the supersede opt-out below.)
-        let policy = if matches!(gov, RunGovernance::Ungoverned) {
+        // cancel. A deploy Run (ADR-0074 §2) queues the same way. (Mirrors the
+        // supersede opt-out below.)
+        let policy = if cancellable {
             ConcurrencyPolicy::from_wire(&c.policy)
         } else {
             ConcurrencyPolicy::Queue
@@ -5456,10 +5511,10 @@ async fn persist_run_from_ir(
     }
     // Newest-wins auto-cancel (ADR-0032): key non-deploy runs by (repo, ref,
     // pipeline) so a newer run supersedes older in-flight ones. A pipeline that
-    // targets an Environment is a *deploy* and opts out — a superseded deploy
-    // must not be silently cancelled; no key means `superseded_by` never returns
-    // it.
-    if matches!(gov, RunGovernance::Ungoverned) {
+    // targets an Environment, or a deploy Run (ADR-0074 §2), opts out — a
+    // superseded deploy must not be silently cancelled; no key means
+    // `superseded_by` never returns it.
+    if cancellable {
         if let Some(key) = supersede_key(event, pipeline) {
             db.set_supersede_key(run, &key).await?;
         }

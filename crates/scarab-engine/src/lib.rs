@@ -147,6 +147,21 @@ pub struct RunSummary {
     /// context. `None` for ordinary CI runs.
     #[serde(default)]
     pub environment: Option<String>,
+    /// Whether this is a **deploy Run** (ADR-0074 §2): its pipeline, or one of
+    /// its Steps, is marked `deploy: true`. Decided once at creation from the
+    /// IR. Independent of `environment`.
+    #[serde(default)]
+    pub deploy: bool,
+}
+
+/// Filters for a Project's runs list (`GET /v1/repos/{org}/{repo}/runs`),
+/// applied in the query before the page `limit`. Each `None` is "any".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunListFilter {
+    /// Only runs governed by this Environment (ADR-0074 §2).
+    pub environment: Option<String>,
+    /// Only deploy Runs (`Some(true)`) or only the rest (`Some(false)`).
+    pub deploy: Option<bool>,
 }
 
 /// Lifecycle status of a single step.

@@ -4415,6 +4415,24 @@
               "format": "int32",
               "minimum": 0
             }
+          },
+          {
+            "name": "environment",
+            "in": "query",
+            "description": "only runs governed by this Environment (ADR-0074); applied before `limit`; must not be empty",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "deploy",
+            "in": "query",
+            "description": "true: only deploy Runs (pipeline or a Step marked `deploy: true`); false: only the rest; applied before `limit`",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
           }
         ],
         "responses": {
@@ -4427,6 +4445,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "`environment` present but empty, or `deploy` not a boolean"
           }
         },
         "security": [
@@ -9451,7 +9472,8 @@
           "id",
           "status",
           "created_at",
-          "duration_ms"
+          "duration_ms",
+          "deploy"
         ],
         "properties": {
           "actor": {
@@ -9464,6 +9486,10 @@
           "created_at": {
             "type": "integer",
             "format": "int64"
+          },
+          "deploy": {
+            "type": "boolean",
+            "description": "Whether this is a **deploy Run** (ADR-0074 §2): its pipeline, or one of\nits Steps, is marked `deploy: true`. Independent of `environment`."
           },
           "duration_ms": {
             "type": "integer",
@@ -10045,6 +10071,10 @@
           "attempts": {
             "type": "integer",
             "minimum": 0
+          },
+          "deploy": {
+            "type": "boolean",
+            "description": "This Step is marked `deploy: true` (ADR-0074 §2) — the Step of a deploy\nRun that deploys. Omitted when false."
           },
           "deployment_gate": {
             "oneOf": [

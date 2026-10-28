@@ -129,6 +129,7 @@ const summary = (
 ): RunSummaryDto => ({
   duration_ms: 0,
   created_at: ago(60000),
+  deploy: false,
   ...o,
 });
 const runs = [
@@ -179,9 +180,11 @@ const strip = (pattern: string) =>
       status: c === "x" ? "failed" : c === "c" ? "cancelled" : "succeeded",
       duration_ms: 40000 + ((i * 37) % 11) * 22000,
       created_at: ago((i + 1) * 900000),
-      // Every third run is a deploy — a pipeline with `environment:` — so the
-      // runs list's pipeline/environment filters have something to offer.
+      // Every third run is a deploy — marked `deploy: true`, with an
+      // `environment:` — so the runs list's pipeline/environment/deploys
+      // filters have something to offer.
       pipeline: i % 3 === 2 ? "deploy" : "ci",
+      deploy: i % 3 === 2,
       ...(i % 3 === 2 ? { environment: i % 2 ? "production" : "staging" } : {}),
     })),
   });
@@ -484,6 +487,8 @@ const deployGate = (id: string, needs: string, status: string, a1: number, outco
 });
 const deployBump = (id: string, at: number) => ({
   id,
+  // The step that changes what is live — its pipeline marks it `deploy: true`.
+  deploy: true,
   status: "succeeded",
   attempts: 1,
   needs: [],
@@ -1503,7 +1508,22 @@ function route(pathname: string, search: string, method: string): Response | nul
 
   // /v1/repos/{org}/{repo}/runs
   if ((m = p.match(/^\/v1\/repos\/[^/]+\/([^/]+)\/runs$/))) {
-    return json(repoRuns[m[1]] ?? strip("ooooooooooooo"));
+    const { runs } = repoRuns[m[1]] ?? strip("ooooooooooooo");
+    // `?environment=` and `?deploy=` filter before `limit`, as the server
+    // does; an empty environment is a 400.
+    const q = new URLSearchParams(search);
+    const env = q.get("environment");
+    if (env === "") {
+      return new Response("`environment` must name an Environment", { status: 400 });
+    }
+    const deploy = q.get("deploy");
+    const matching = runs.filter(
+      (r) =>
+        (env == null || r.environment === env) &&
+        (deploy == null || r.deploy === (deploy === "true")),
+    );
+    const limit = Number(q.get("limit") ?? 50);
+    return json({ runs: matching.slice(0, limit) });
   }
   // /v1/repos/{org}/{repo}/environments
   if ((m = p.match(/^\/v1\/repos\/[^/]+\/([^/]+)\/environments$/))) {

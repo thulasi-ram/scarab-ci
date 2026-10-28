@@ -363,6 +363,31 @@ impl Db for PostgresDb {
         }))
     }
 
+    async fn mark_deploy_run(&self, run: &RunId, steps: &[StepId]) -> Result<(), DbError> {
+        let steps: Vec<&str> = steps.iter().map(|s| s.0.as_str()).collect();
+        sqlx::query("UPDATE runs SET is_deploy_run = TRUE, deploy_steps = $2 WHERE id = $1")
+            .bind(&run.0)
+            .bind(&steps)
+            .execute(self.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn deploy_steps_of_run(&self, run: &RunId) -> Result<Vec<StepId>, DbError> {
+        let row = sqlx::query("SELECT deploy_steps FROM runs WHERE id = $1")
+            .bind(&run.0)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(row
+            .map(|r| r.get::<Vec<String>, _>("deploy_steps"))
+            .unwrap_or_default()
+            .into_iter()
+            .map(StepId)
+            .collect())
+    }
+
     async fn set_step_output(
         &self,
         run: &RunId,
@@ -1361,7 +1386,7 @@ impl Db for PostgresDb {
         let rows = sqlx::query(
             "SELECT id, status, created_at, updated_at, tenant_org, tenant_project, run_number,
                     origin_trigger_kind, origin_actor, origin_ref, origin_sha, origin_pr_number,
-                    origin_pr_base, pipeline, trigger_title, deploy_environment
+                    origin_pr_base, pipeline, trigger_title, deploy_environment, is_deploy_run
              FROM runs
              ORDER BY created_at DESC, id DESC
              LIMIT $1",
@@ -1377,19 +1402,26 @@ impl Db for PostgresDb {
         &self,
         org: &str,
         project: &str,
+        filter: &scarab_engine::RunListFilter,
         limit: u32,
     ) -> Result<Vec<RunSummary>, DbError> {
+        // A NULL parameter disengages its filter. Both apply in the WHERE,
+        // before the LIMIT, so a filtered page is the newest matches.
         let rows = sqlx::query(
             "SELECT id, status, created_at, updated_at, tenant_org, tenant_project, run_number,
                     origin_trigger_kind, origin_actor, origin_ref, origin_sha, origin_pr_number,
-                    origin_pr_base, pipeline, trigger_title, deploy_environment
+                    origin_pr_base, pipeline, trigger_title, deploy_environment, is_deploy_run
              FROM runs
              WHERE tenant_org = $1 AND tenant_project = $2
+               AND ($3::text IS NULL OR deploy_environment = $3)
+               AND ($4::boolean IS NULL OR is_deploy_run = $4)
              ORDER BY created_at DESC, id DESC
-             LIMIT $3",
+             LIMIT $5",
         )
         .bind(org)
         .bind(project)
+        .bind(filter.environment.as_deref())
+        .bind(filter.deploy)
         .bind(limit as i64)
         .fetch_all(self.pool())
         .await
@@ -3569,6 +3601,7 @@ fn run_summary_from_row(r: sqlx::postgres::PgRow) -> Result<RunSummary, DbError>
         pipeline: r.get::<Option<String>, _>("pipeline"),
         trigger_title: r.get::<Option<String>, _>("trigger_title"),
         environment: r.get::<Option<String>, _>("deploy_environment"),
+        deploy: r.get::<bool, _>("is_deploy_run"),
     })
 }
 
