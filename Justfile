@@ -514,23 +514,14 @@ plugin-kube-tests filter="":
         --run-ignored all --no-fail-fast
     fi
 
-# LIVE first-party Argo CD reporter (ADR-0072, ADR-0070 §11) on the proc-mode
-# kind cluster: builds the reporter image and kind-loads it, brings the stack up
-# with plugins on and the dev-only tag knob, runs a fake Argo CD on the host,
-# installs the plugin through the API, binds its connection, lists its project
-# in an Environment, and drives the fake through sync → hook failure → retries
-# exhausted → fix while polling the Environment's Deployments; then asserts the
-# isolation probe passed and that the kill switch makes the broker answer 403
-# and scales the workload to 0. Asserts the ISOLATED kubeconfig's context is
+# LIVE first-party Argo CD Plugin (ADR-0072) on the proc-mode kind cluster:
+# builds the plugin image and kind-loads it, brings the stack up with plugins on
+# and the dev-only tag knob, runs a fake Argo CD on the host, installs the plugin
+# through the API and binds its connection; then asserts the isolation probe
+# passed, the Pod read Argo CD through the broker's read proxy with the bound
+# credential, and that the kill switch makes the broker answer 403 and scales
+# the workload to 0. Asserts the ISOLATED kubeconfig's context is
 # kind-scarab-dev before any cluster command. Leaves the stack up (`just down`).
-# Before the kill switch, the Deploy Run leg (slice b): a REAL Forgejo
-# (deploy/local-forgejo/up.sh, left running) holds `.scarab/deploy.yaml`, bound
-# declaratively via SCARAB_CONNECTIONS; Run A (r3) requests a Deployment and its
-# DeploymentGate passes when the fake syncs it, Run B (r4) fails its gate on the
-# exhausted migrate hook. PLUGIN_VERIFY_DEPLOY_RUN=0 skips it;
-# PLUGIN_VERIFY_DEPLOY_EXECUTOR=local (default) | k8s picks where `bump` runs
-# (k8s = a kind Pod + the results sidecar — the production path; it binds the
-# unauthenticated dev API on 0.0.0.0 — see the script header).
 # Usage: `just plugin-verify` | `KEEP=1 just plugin-verify` (keep the fake Argo).
 plugin-verify:
     bash deploy/local-proc/plugin-verify.sh
