@@ -2841,6 +2841,8 @@ dependencies = [
  "futures",
  "reqwest",
  "scarab-db-postgres",
+ "scarab-engine",
+ "scarab-forge",
  "scarab-plugin",
  "scarab-server",
  "scarab-testkit",

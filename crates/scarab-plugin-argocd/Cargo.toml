@@ -58,6 +58,10 @@ scarab-server = { path = "../scarab-server" }
 scarab-db-postgres = { workspace = true }
 scarab-plugin = { workspace = true }
 scarab-testkit = { workspace = true }
+# tests/invocations.rs drives a plugin_action Step's Attempt with the real
+# scheduler, dispatched through the real admission path.
+scarab-engine = { workspace = true }
+scarab-forge = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
 futures = { workspace = true }

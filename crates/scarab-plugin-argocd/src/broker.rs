@@ -4,11 +4,18 @@
 //! `/_scarab/plugin/v1/connections/argocd/…`, which adds the Argo token —
 //! this process never holds it.
 //!
+//! Polling PluginActions (ADR-0074 §5) are pulled from
+//! `/_scarab/plugin/v1/invocations` with a long poll
+//! ([`Broker::poll_invocations`]) and answered with [`Broker::answer`]. The
+//! plugin keeps no state between answers: it decides each from the
+//! invocation's inputs and the vendor's current state.
+//!
 //! The broker token is a projected ServiceAccount token that the kubelet
 //! rotates in place (audience `scarab-broker`, ten-minute TTL), so it is
 //! re-read from its file before **every** request; a cached copy would
 //! expire under a long-lived reporter.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -137,6 +144,62 @@ struct ReportResults {
 struct ReportBody<'a> {
     items: &'a [ReportItem],
 }
+
+/// The Attempt an invocation belongs to (ADR-0021): the idempotency key
+/// for anything the action does.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+pub struct Fence {
+    pub run: String,
+    pub step: String,
+    pub attempt: String,
+}
+
+/// One invocation of a PluginAction, leased to this replica until
+/// `lease_expires_at` (Unix ms). Unanswered by then, it is offered again.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Invocation {
+    pub id: String,
+    pub fence: Fence,
+    pub action: String,
+    pub inputs: BTreeMap<String, serde_json::Value>,
+    pub lease_expires_at: i64,
+    /// The label of this invocation's last `pending` answer.
+    #[serde(default)]
+    pub last_label: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InvocationsPage {
+    invocations: Vec<Invocation>,
+}
+
+/// An answer to one invocation.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum Answer {
+    /// Not decided yet; `label` says where it stands. Core offers the
+    /// invocation again after the action's poll interval.
+    Pending { label: String },
+    /// Done; `results` become the Step's results (at most 64 KiB as JSON).
+    Succeeded {
+        results: BTreeMap<String, serde_json::Value>,
+    },
+    /// Done, and the Step fails for `reason`.
+    Failed { reason: String },
+}
+
+/// What the broker did with an answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum AnswerOutcome {
+    Accepted,
+    /// The invocation's Attempt was cancelled, retried or superseded:
+    /// nothing was recorded. Stop working on it.
+    Stale,
+}
+
+/// The longest a long poll may wait, as the broker caps it.
+pub const MAX_POLL_WAIT: Duration = Duration::from_secs(30);
 
 /// A client of the broker.
 #[derive(Clone)]
@@ -319,6 +382,40 @@ impl Broker {
             )));
         }
         Ok(results.results)
+    }
+
+    /// `GET …/invocations`: wait up to `wait` (capped at [`MAX_POLL_WAIT`])
+    /// for invocations of this installation's actions and lease them. Empty
+    /// when the wait ended with nothing to offer: poll again.
+    pub async fn poll_invocations(&self, wait: Duration) -> Result<Vec<Invocation>, BrokerError> {
+        let wait = wait.min(MAX_POLL_WAIT);
+        let resp = self
+            .send(
+                self.http
+                    .get(self.url(&format!("/invocations?wait={}", wait.as_secs())))
+                    .header(reqwest::header::ACCEPT, "application/json"),
+                // The server holds the request for `wait`; the timeout is on top.
+                Some(wait + self.request_timeout),
+            )
+            .await?;
+        let bytes = read_capped(resp, MAX_BROKER_BODY_BYTES, false).await?;
+        let page: InvocationsPage =
+            serde_json::from_slice(&bytes).map_err(|e| BrokerError::Decode(e.to_string()))?;
+        Ok(page.invocations)
+    }
+
+    /// `POST …/invocations/{id}/answer`.
+    pub async fn answer(&self, id: &str, answer: &Answer) -> Result<AnswerOutcome, BrokerError> {
+        let resp = self
+            .send(
+                self.http
+                    .post(self.url(&format!("/invocations/{}/answer", encode_component(id))))
+                    .json(answer),
+                Some(self.request_timeout),
+            )
+            .await?;
+        let bytes = read_capped(resp, MAX_BROKER_BODY_BYTES, false).await?;
+        serde_json::from_slice(&bytes).map_err(|e| BrokerError::Decode(e.to_string()))
     }
 
     fn argocd_url(&self, argo_path: &str, query: &[(&str, &str)]) -> String {
