@@ -84,3 +84,34 @@ fn a_list_over_its_cap_names_the_cap() {
          Run is refused"
     );
 }
+
+/// The deepest invoke chain the compiler admits fits the `origin` cap, so a
+/// Run is never refused for nesting its compiler accepted.
+#[test]
+fn the_deepest_invoke_chain_fits_the_origin_cap() {
+    let depth = scarab_pipeline::MAX_INVOKE_DEPTH;
+    let mut libs = std::collections::BTreeMap::new();
+    for i in 0..depth {
+        let src = if i + 1 < depth {
+            format!(
+                "steps: [{{ id: s{i}, invoke: .scarab/lib/l{}.yaml }}]",
+                i + 1
+            )
+        } else {
+            format!("steps: [{{ id: s{i}, image: busybox }}]")
+        };
+        libs.insert(format!(".scarab/lib/l{i}.yaml"), src);
+    }
+    let ir = scarab_pipeline::compile_yaml_with_libs(
+        "steps: [{ id: t, invoke: .scarab/lib/l0.yaml }]",
+        &libs,
+    )
+    .expect("a chain at the cap compiles");
+    let input = input_from_pipeline(&ir, facts()).expect("fits the origin cap");
+    let input = serde_json::to_value(input).unwrap();
+    assert_eq!(input["steps"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        input["steps"][0]["origin"].as_array().unwrap().len(),
+        scarab_policy::run_create::MAX_ORIGIN
+    );
+}

@@ -1364,8 +1364,9 @@ fn resolve_lib_path(raw: &str) -> Result<String, String> {
 /// Hard cap on `invoke` nesting depth (ADR-0038 termination corollary). A chain
 /// deeper than this is rejected at compile — real libraries nest 1–3 levels; the
 /// cap is a backstop against pathological (or generated) recursion, alongside
-/// cycle detection.
-const MAX_INVOKE_DEPTH: usize = 8;
+/// cycle detection. A Step's `origin` chain has at most this many links;
+/// `scarab_policy::run_create::MAX_ORIGIN` is this constant.
+pub const MAX_INVOKE_DEPTH: usize = 8;
 
 /// Inline every `invoke:` step (ADR-0038) into a flat step list with no invoke
 /// steps left. **Recursive**: a library that itself invokes is expanded to full

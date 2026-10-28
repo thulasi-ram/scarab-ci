@@ -24,9 +24,9 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const MAX_STEPS: usize = 512;
 /// The most gates a Run may have.
 pub const MAX_GATES: usize = 32;
-/// The longest invoke chain: `scarab-pipeline` rejects nesting deeper than 8
-/// (its `MAX_INVOKE_DEPTH`), so a chain has at most 8 targets.
-pub const MAX_ORIGIN: usize = 8;
+/// The longest invoke chain: `scarab-pipeline` rejects nesting deeper than
+/// its `MAX_INVOKE_DEPTH`, so a chain has at most that many targets.
+pub const MAX_ORIGIN: usize = scarab_pipeline::MAX_INVOKE_DEPTH;
 /// The most gates upstream of one Step, counted transitively.
 pub const MAX_UPSTREAM_GATES: usize = MAX_GATES;
 /// The most capability grants one Step may request.
