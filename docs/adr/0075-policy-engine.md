@@ -286,14 +286,21 @@ and evaluation, and adds a **type-checking pass** over the 0.15 AST:
 - Each checkpoint's schema is declared into the CEL `Env` as typed variables and struct
   types.
 - The subset: field access, `has()` on a field (`has(run.trigger.ref)`; an optional
-  top-level variable is tested with `!= null`), literals, comparisons, `&&`, `||`, `!`,
-  `?:`, `in` on lists and maps, string functions (`startsWith`, `endsWith`, `contains`,
+  top-level variable is tested with `!= null`), literals, comparisons of scalars, enums,
+  timestamps and durations, `&&`, `||`, `!`, `?:`, `in` with a scalar on the left and a
+  list or map on the right, string functions (`startsWith`, `endsWith`, `contains`,
   `matches`), `size`, timestamp and duration comparison, and the `exists`, `all` and
   `exists_one` macros over typed lists. Anything else is rejected with "not supported in
   policies". Arithmetic, string concatenation, indexing, conversions, map iteration and
   time-of-day functions (`getHours()`) are outside the subset, so a time-window rule
   compares absolute timestamps; daily windows need a later addition.
-- `matches` takes a literal pattern only; it is compiled when the Policy is saved.
+- `matches` takes a literal pattern only; it is compiled when the Policy is saved, and
+  once per evaluation. A rule may use at most 8 distinct patterns, a Policy 32.
+- Comparing two lists, maps or structs (`==`, `!=`, `in`) is outside the subset: it costs
+  as much as the values are deep, which the cost bound cannot see.
+- Every string in a checkpoint input has a length cap (1 KiB for names, ids, refs and
+  image references; 4 KiB for free text such as a dispatch reason), so string functions
+  cost a bounded amount. An input over a cap is refused when a Policy applies.
 - The checker computes a **static cost bound** from macro nesting and the list-size caps
   each schema declares, and rejects a rule above the limit. `cel` 0.15 has parse limits
   but no runtime cost tracking.
@@ -382,7 +389,8 @@ and never grants what the role does not.
 - `audit` mode evaluates and records "would deny" or "would require" without enforcing.
 - A policy test API evaluates a Policy against a stored PolicyDecision's input or a
   supplied one, without enforcing and without recording. `scarab validate --server` uses
-  it (§2).
+  it (§2). Evaluating stored Policies needs read access to the org; evaluating a draft
+  Policy body needs the org admin role, since it runs CEL the caller wrote.
 
 ### 10. Changing a policy is governed by the route table
 
