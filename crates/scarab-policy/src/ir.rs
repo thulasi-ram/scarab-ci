@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::check::{check, Diagnostic};
+use crate::check::{check_in, Diagnostic, PolicyPatterns};
 use crate::policy::{Body, Checkpoint, Effect, Match, Mode, Policy, TypedSetting};
 use crate::schema::{Schema, Type};
 
@@ -22,6 +22,8 @@ pub const MAX_LIST: usize = 256;
 pub const MAX_TEXT_LEN: usize = 1024;
 /// The most distinct `matches()` patterns one Policy may use across its
 /// rules; one rule uses at most [`MAX_PATTERNS`](crate::check::MAX_PATTERNS).
+/// The checker refuses the first pattern past it, before compiling it
+/// ([`PolicyPatterns`]).
 pub const MAX_POLICY_PATTERNS: usize = 32;
 
 /// Where a Policy attaches (ADR-0075 §7). The Environment layer is not built.
@@ -168,7 +170,9 @@ pub fn compile(policy: &Policy, level: Level) -> Result<PolicyIr, Vec<Diagnostic
                 ));
             }
             let mut out = Vec::new();
-            let mut patterns = std::collections::BTreeSet::new();
+            // Shared by every rule: each distinct pattern is compiled once,
+            // and the Policy's cap is applied before compiling one more.
+            let mut patterns = PolicyPatterns::default();
             for (i, rule) in rules.iter().enumerate() {
                 let at = format!("rules[{i}]");
                 if !policy.checkpoint.allows(&rule.effect) {
@@ -187,38 +191,25 @@ pub fn compile(policy: &Policy, level: Level) -> Result<PolicyIr, Vec<Diagnostic
                     "a message",
                     &mut errors,
                 );
-                match check(&schema, &rule.when, &Type::Bool) {
-                    Ok(checked) => {
-                        patterns.extend(checked.patterns);
-                        out.push(RuleIr {
-                            predicate: Predicate::Cel(CelPredicate {
-                                source: checked.source,
-                                cost: checked.cost,
-                                warnings: checked
-                                    .warnings
-                                    .into_iter()
-                                    .map(|w| located(w, &format!("{at}.when")))
-                                    .collect(),
-                                reads: checked.reads.into_iter().collect(),
-                            }),
-                            effect: rule.effect.clone(),
-                            message: rule.message.clone(),
-                        })
-                    }
+                match check_in(&schema, &rule.when, &Type::Bool, &mut patterns) {
+                    Ok(checked) => out.push(RuleIr {
+                        predicate: Predicate::Cel(CelPredicate {
+                            source: checked.source,
+                            cost: checked.cost,
+                            warnings: checked
+                                .warnings
+                                .into_iter()
+                                .map(|w| located(w, &format!("{at}.when")))
+                                .collect(),
+                            reads: checked.reads.into_iter().collect(),
+                        }),
+                        effect: rule.effect.clone(),
+                        message: rule.message.clone(),
+                    }),
                     Err(ds) => {
                         errors.extend(ds.into_iter().map(|d| located(d, &format!("{at}.when"))))
                     }
                 }
-            }
-            if patterns.len() > MAX_POLICY_PATTERNS {
-                errors.push(Diagnostic::at(
-                    "rules",
-                    format!(
-                        "a Policy uses at most {MAX_POLICY_PATTERNS} distinct matches() \
-                         patterns; this one uses {}",
-                        patterns.len()
-                    ),
-                ));
             }
             out
         }

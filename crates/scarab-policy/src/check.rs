@@ -30,8 +30,10 @@
 //! call scans a bounded string. `matches()` costs 2 because its pattern is
 //! compiled once per evaluation, not once per call (`eval::evaluate_when`);
 //! `cel`'s own `matches` compiles on every call and is never the one
-//! evaluated. A rule uses at most [`MAX_PATTERNS`] distinct patterns, each
-//! compiled under [`MAX_PATTERN_BYTES`], so compiling them is bounded too.
+//! evaluated. A rule uses at most [`MAX_PATTERNS`] distinct patterns and a
+//! Policy at most [`MAX_POLICY_PATTERNS`](crate::ir::MAX_POLICY_PATTERNS),
+//! each compiled once per Policy check ([`PolicyPatterns`]) under
+//! [`MAX_PATTERN_BYTES`], so compiling them is bounded too.
 //!
 //! **Stack.** Parsing, checking and evaluating run on a thread with a large
 //! stack ([`on_cel_stack`]), after a length and bracket-depth pre-check: a
@@ -164,8 +166,29 @@ pub fn on_cel_stack<T: Send>(f: impl FnOnce() -> T + Send) -> Result<T, String> 
 /// Parses `source` and checks it against `schema`, expecting `expected` (bool
 /// for a `when`; [`Type::Dyn`] accepts any result type).
 pub fn check(schema: &Schema, source: &str, expected: &Type) -> Result<Checked, Vec<Diagnostic>> {
+    check_in(schema, source, expected, &mut PolicyPatterns::default())
+}
+
+/// The `matches()` patterns one Policy's rules have used so far, each with
+/// its compile error if it has one. A pattern is compiled the first time any
+/// rule of the Policy uses it, and the Policy's cap
+/// ([`MAX_POLICY_PATTERNS`](crate::ir::MAX_POLICY_PATTERNS)) is applied
+/// before compiling one more, so checking a Policy compiles at most that
+/// many patterns whatever its rules repeat.
+#[derive(Debug, Default)]
+pub struct PolicyPatterns {
+    seen: std::collections::BTreeMap<String, Option<String>>,
+}
+
+/// [`check`], as one rule of a Policy whose earlier rules used `patterns`.
+pub fn check_in(
+    schema: &Schema,
+    source: &str,
+    expected: &Type,
+    patterns: &mut PolicyPatterns,
+) -> Result<Checked, Vec<Diagnostic>> {
     check_limits(source)?;
-    on_cel_stack(|| check_on_this_thread(schema, source, expected))
+    on_cel_stack(|| check_on_this_thread(schema, source, expected, patterns))
         .unwrap_or_else(|e| Err(vec![at_start(source, format!("does not parse: {e}"))]))
 }
 
@@ -173,10 +196,12 @@ fn check_on_this_thread(
     schema: &Schema,
     source: &str,
     expected: &Type,
+    policy_patterns: &mut PolicyPatterns,
 ) -> Result<Checked, Vec<Diagnostic>> {
     let program = parse(source)?;
     let mut checker = Checker {
         schema,
+        policy_patterns,
         info: program.source_info(),
         scopes: Vec::new(),
         guards: Vec::new(),
@@ -277,10 +302,21 @@ pub const MAX_PATTERN_BYTES: usize = 1 << 20;
 /// under [`MAX_PATTERN_BYTES`] can take milliseconds to compile.
 pub const MAX_PATTERNS: usize = 8;
 
+/// How many `matches()` patterns this process has compiled, at check time
+/// and at evaluation: what the regression tests for one compile per pattern
+/// count.
+static REGEX_COMPILES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[doc(hidden)]
+pub fn regex_compiles() -> u64 {
+    REGEX_COMPILES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Compiles a `matches()` pattern, under [`MAX_PATTERN_BYTES`]: at check
 /// time to validate it, and at evaluation once per pattern
 /// (`eval::evaluate_when`).
 pub(crate) fn pattern(p: &str) -> Result<regex::Regex, regex::Error> {
+    REGEX_COMPILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     regex::RegexBuilder::new(p)
         .size_limit(MAX_PATTERN_BYTES)
         .build()
@@ -332,6 +368,8 @@ impl MacroKind {
 
 struct Checker<'a> {
     schema: &'a Schema,
+    /// The patterns the Policy's rules have used, this one included.
+    policy_patterns: &'a mut PolicyPatterns,
     info: &'a SourceInfo,
     /// Iteration variables in scope, innermost last.
     scopes: Vec<(String, Type)>,
@@ -749,8 +787,31 @@ impl Checker<'_> {
                             ),
                         ));
                     }
-                    self::pattern(p)
-                        .map_err(|err| self.diag(pattern, format!("invalid pattern: {err}")))?;
+                    let compiled = match self.policy_patterns.seen.get(p) {
+                        Some(compiled) => compiled.clone(),
+                        None => {
+                            // Also counted before compiling: a Policy over
+                            // its cap compiles no more than the cap.
+                            let cap = crate::ir::MAX_POLICY_PATTERNS;
+                            if self.policy_patterns.seen.len() >= cap {
+                                return Err(self.diag(
+                                    pattern,
+                                    format!(
+                                        "a Policy uses at most {cap} distinct matches() \
+                                         patterns across its rules"
+                                    ),
+                                ));
+                            }
+                            let compiled = self::pattern(p).err().map(|e| e.to_string());
+                            self.policy_patterns
+                                .seen
+                                .insert(p.to_string(), compiled.clone());
+                            compiled
+                        }
+                    };
+                    if let Some(err) = compiled {
+                        return Err(self.diag(pattern, format!("invalid pattern: {err}")));
+                    }
                     self.patterns.insert(p.to_string());
                 }
                 Ok((Type::Bool, add(&[cr, 2])))

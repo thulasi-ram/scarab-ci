@@ -594,8 +594,9 @@ fn redteam_many_distinct_large_patterns_are_capped() {
     compile_json(policy_of(MAX_POLICY_PATTERNS / MAX_PATTERNS)).expect("32 patterns");
     let errs = compile_json(policy_of(MAX_POLICY_PATTERNS / MAX_PATTERNS + 1)).unwrap_err();
     assert!(
-        errs.iter().any(|e| e
-            .contains("a Policy uses at most 32 distinct matches() patterns; this one uses 40")),
+        errs.iter()
+            .any(|e| e
+                .contains("a Policy uses at most 32 distinct matches() patterns across its rules")),
         "{errs:?}"
     );
 }

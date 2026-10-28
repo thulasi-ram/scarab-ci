@@ -7,7 +7,6 @@
 //! becomes a CEL `timestamp`.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cel::common::ast::{EntryExpr, Expr, IdedEntryExpr, IdedExpr};
@@ -43,14 +42,8 @@ pub(crate) fn evaluate_when(source: &str, context: &Context<'_, '_>) -> Result<b
 /// besides.
 const MATCHES_FN: &str = "@scarab.matches";
 
-/// How many regexes evaluation has compiled in this process: what the
-/// regression test for one compile per pattern per evaluation counts.
-static REGEX_COMPILES: AtomicU64 = AtomicU64::new(0);
-
 #[doc(hidden)]
-pub fn regex_compiles() -> u64 {
-    REGEX_COMPILES.load(Ordering::Relaxed)
-}
+pub use crate::check::regex_compiles;
 
 /// Renames every `x.matches(pattern)` call to [`MATCHES_FN`]. `cel` resolves
 /// a member overload ahead of a context function, so the call has to be
@@ -103,10 +96,9 @@ fn matches_fn() -> impl Fn(This<Arc<String>>, Arc<String>) -> Result<Value, Exec
     let compiled: Mutex<HashMap<String, Result<regex::Regex, String>>> = Mutex::default();
     move |This(text), pattern| {
         let mut compiled = compiled.lock().unwrap_or_else(|e| e.into_inner());
-        let re = compiled.entry(pattern.to_string()).or_insert_with(|| {
-            REGEX_COMPILES.fetch_add(1, Ordering::Relaxed);
-            crate::check::pattern(&pattern).map_err(|e| e.to_string())
-        });
+        let re = compiled
+            .entry(pattern.to_string())
+            .or_insert_with(|| crate::check::pattern(&pattern).map_err(|e| e.to_string()));
         match re {
             Ok(re) => Ok(Value::Bool(re.is_match(&text))),
             Err(e) => Err(ExecutionError::function_error(
