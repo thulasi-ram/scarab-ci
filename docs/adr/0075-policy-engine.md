@@ -154,8 +154,10 @@ PolicyInvariant (§7) and has no `audit` period; the release notes list it as a 
 change.
 
 `run.create` also evaluates every Step's static `step.admit` input as a preflight. A grant
-or `k8s_overlay` that would be denied refuses the whole Run before any row exists, as
-today (`lib.rs:5230-5311`). The launch-time check still runs, so a policy tightened after
+or `k8s_overlay` that would be denied refuses the whole Run before any row exists. Today
+the webhook and dispatch paths check grants inside the per-Step loop of
+`persist_run_from_ir`, after the Run row is created (`lib.rs:5022`, `5252`, `5311`), so a
+refusal leaves a partial Run; the preflight closes that gap. The launch-time check still runs, so a policy tightened after
 Run creation applies to Steps not yet launched.
 
 ### 4. A Policy
@@ -513,7 +515,11 @@ gates may run here", compile to `run.create` denies over `origin`.
    admits string `+`; both go with the 2026-10-29 pass. Remaining for production, about
    1,500 to 2,000 lines: map and nested-struct schemas, string-length caps in the cost
    bound, several errors per check, parsing on a large-stack thread, editor-shaped
-   diagnostics. Upstream would want full CEL typing, so the checker stays in Scarab for
+   diagnostics. Moving the spike to the `run.create` input (2026-10-29) set the list caps
+   to 512 Steps, 8 `origin` entries (the invoke depth limit), 32 gates and secrets, 16
+   grants and 8 placement profiles, and raised the cost limit to 100,000 so that §4's
+   example passes (cost 75,265); one 512-by-64 evaluation took about 11 ms in a release
+   build. A Run larger than the caps is refused when any `run.create` Policy applies. Upstream would want full CEL typing, so the checker stays in Scarab for
    now; its type core and tests could seed an upstream checker.
 2. **Engine:** Policy IR, evaluator, PolicyDecision records, `audit` mode, the policy test
    API and `scarab validate --server`, org and Project layers, `run.create`. First users:
