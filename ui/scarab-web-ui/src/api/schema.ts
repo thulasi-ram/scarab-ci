@@ -1027,6 +1027,10 @@ export interface paths {
          *     A Pipeline whose Run is over an input cap is answered as admission
          *     decides it: each matched Policy is an error, which denies when the Policy
          *     is enforced.
+         *
+         *     Permissions: Read on the org for stored Policies (`policy_id`, or
+         *     neither, which is what `scarab validate --server` sends); Administer on
+         *     the org for a draft `policy`, as saving it would need.
          */
         post: operations["policy_test"];
         delete?: never;
