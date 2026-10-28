@@ -212,6 +212,9 @@ pub trait PolicyStore: Send + Sync {
     /// when a `step.admit` decision for the same Attempt exists.
     async fn record_decision(&self, record: &DecisionRecord) -> Result<String, PolicyStoreError>;
 
+    /// One recorded decision by id.
+    async fn decision(&self, id: &str) -> Result<Option<DecisionRecord>, PolicyStoreError>;
+
     /// A Run's decisions, oldest first.
     async fn decisions_for_run(
         &self,

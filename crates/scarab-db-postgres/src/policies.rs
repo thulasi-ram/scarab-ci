@@ -400,6 +400,17 @@ impl PolicyStore for PostgresDb {
         Ok(record.id.clone())
     }
 
+    async fn decision(&self, id: &str) -> Result<Option<DecisionRecord>, PolicyStoreError> {
+        let row = sqlx::query(&format!(
+            "SELECT {DECISION_COLUMNS} FROM policy_decisions WHERE id = $1"
+        ))
+        .bind(id)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(store_err)?;
+        row.as_ref().map(decision_from_row).transpose()
+    }
+
     async fn decisions_for_run(
         &self,
         run_id: &str,

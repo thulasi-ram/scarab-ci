@@ -503,6 +503,9 @@ impl PolicyStore for FailingPolicies {
     async fn record_decision(&self, _: &DecisionRecord) -> Result<String, PolicyStoreError> {
         unreachable!()
     }
+    async fn decision(&self, _: &str) -> Result<Option<DecisionRecord>, PolicyStoreError> {
+        unreachable!()
+    }
     async fn decisions_for_run(&self, _: &str) -> Result<Vec<DecisionRecord>, PolicyStoreError> {
         unreachable!()
     }

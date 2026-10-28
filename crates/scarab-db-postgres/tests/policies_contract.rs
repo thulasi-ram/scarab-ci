@@ -321,6 +321,8 @@ async fn decisions(s: &dyn PolicyStore) {
         [allowed.clone(), later.clone()]
     );
     assert!(s.decisions_for_run("run-9").await.unwrap().is_empty());
+    assert_eq!(s.decision("d2").await.unwrap(), Some(refused.clone()));
+    assert_eq!(s.decision("d9").await.unwrap(), None);
 
     // The org log: newest first, ties by id, paged by cursor.
     let page = s.org_decisions("acme", 0, None).await.unwrap();

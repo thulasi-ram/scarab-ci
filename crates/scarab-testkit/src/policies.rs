@@ -234,6 +234,11 @@ impl PolicyStore for InMemoryPolicies {
         Ok(record.id.clone())
     }
 
+    async fn decision(&self, id: &str) -> Result<Option<DecisionRecord>, PolicyStoreError> {
+        let st = self.state.lock().unwrap();
+        Ok(st.decisions.iter().find(|d| d.id == id).cloned())
+    }
+
     async fn decisions_for_run(
         &self,
         run_id: &str,
