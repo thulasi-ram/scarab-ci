@@ -110,7 +110,7 @@ credential or outbound channel, which turns a 5-minute window into permanent acc
 - adding, removing or resetting passkeys.
 
 They are rare, so the friction is small, and a per-action WebAuthn challenge can show
-exactly what is being confirmed. As built, **every** PluginConnection write is
+what is being confirmed. As built, **every** PluginConnection write is
 always-ask, not only a destination change: the one write route sets the destination
 together with the rest.
 
@@ -168,7 +168,7 @@ prunes it; who sees which rows is in Implementation notes.
 `SCARAB_STEP_UP` is `enforce` in production, with **no `off` or `log` mode**: the
 protection cannot be quietly disabled. Unset or blank means `enforce`; any other value
 refuses boot. `SCARAB_DEV_INSECURE` (local dev, every caller an Owner) implies off
-unless `SCARAB_STEP_UP=enforce` is set explicitly (for testing passkeys locally), so the
+unless `SCARAB_STEP_UP=enforce` is set (for testing passkeys locally), so the
 dev stack, `just plugin-verify` and the test suite keep working. As built, two more boot
 checks:
 - enforced step-up needs an `https` `SCARAB_PUBLIC_URL` (plain `http` only on

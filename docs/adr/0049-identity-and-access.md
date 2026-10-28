@@ -53,8 +53,8 @@ so it works out of the box without hand-assigning everyone. But:
 - The import **seeds/refreshes** native bindings; the **native binding is
   authoritative** — a manual grant/revoke is never clobbered by a re-sync.
 - Authorization on the hot path reads **only native bindings** — never a live
-  forge API call. This keeps authz forge-agnostic and multi-forge-clean (an Org
-  spanning GitHub *and* Forgejo has one coherent role model).
+  forge API call. This keeps authz forge-agnostic: an Org
+  spanning GitHub *and* Forgejo has one role model.
 
 ### Tenancy scoping (follows from the above)
 

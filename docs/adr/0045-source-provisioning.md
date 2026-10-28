@@ -75,10 +75,10 @@ The CAS snapshot includes `.git`, not only the working tree.
 
 - Stripping `.git` would silently break `git describe`/`rev-parse` versioning
   (a large fraction of real builds) and make the full-history forensic case
-  impossible. Retaining it is essential context.
+  impossible. Retaining it keeps both working.
 - Per-file merkle CAS over `.git` packfiles dedups *across runs* well (stable
   history → identical packfiles → only new objects transfer). It cannot dedup
-  *within* a repacked packfile — exactly the content-defined-chunking
+  *within* a repacked packfile — the content-defined-chunking
   optimization ADR-0029 already parks as "later," so v1 is consistent with it.
 - Skip-if-unchanged (ADR-0027) stays intact: the implicit whole-workspace hash
   changing on every commit is *correct* (new commit = re-run); a step wanting
@@ -133,7 +133,7 @@ arbitrary image can't guarantee.
   identical source.
 - A **vanished pinned SHA** (force-pushed away / ref deleted between attempts)
   is a **terminal, diagnostic failure** (`SourceUnavailable`), not a retry loop —
-  the SHA will not come back. Its message says so explicitly: the commit this
+  the SHA will not come back. Its message says so: the commit this
   run was pinned to no longer exists on the forge, which **signals an upstream
   integrity anomaly** (history rewritten / ref deleted), not routine churn.
   Reported loudly; dead-letters with that reason once the ADR-0020 dead-letter

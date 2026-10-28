@@ -110,7 +110,7 @@ on:
 
 A pipeline declares its typed launch parameters under `interface.inputs`. An `invoke` caller
 fills in the same interface with `with:`, so launching and reuse share one contract. A
-bare string is shorthand for a required string; the map form is fully typed:
+bare string is shorthand for a required string; the map form sets the type, whether it is required, a default and a description:
 
 ```yaml
 on:

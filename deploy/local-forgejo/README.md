@@ -19,7 +19,7 @@ Three similar guesses were still unverified:
 |---|---|
 | `/user/repos` response shape + pagination (the bind pick-list depends on it) | seeding **more repos than fit on one page** and asserting the whole set comes back |
 | `config.secret` is accepted, and Forgejo then signs with it | a real delivery whose signature `verify_signature` accepts — the same check `/webhooks/forgejo` does |
-| the push payload spelling (`owner.username` vs `owner.login`) | normalizing a delivery Forgejo actually sent |
+| the push payload spelling (`owner.username` vs `owner.login`) | normalizing a delivery Forgejo sent |
 
 ## Running it
 

@@ -90,7 +90,7 @@ so a reader sees the change where it applies and the original reasoning stays re
 | [0072](0072-plugins-a-governed-extension-point.md) | **Plugins**: a second extension point beside Steps (0008 and 0038's rejections stand) — digest-pinned out-of-process image + closed capability manifest, PluginPrincipal (two-key gate approval), PluginActions as `plugin_action` Steps, CredentialBroker with per-action write rules, `framed`/`trusted_dom` UI tiers, StepUpConfirmation, isolated `scarab-plugins` namespace with a fail-closed probe, signed publishers + operator ceiling + kill switch | Accepted |
 | [0073](0073-step-up-confirmation.md) | **Step-up confirmation**: a passkey (WebAuthn) is the step-up (GitHub/Forgejo re-login never counts; enroll at first crown-jewel op, first passkey only after a fresh login); the crown-jewel list incl. irreversible destruction; fixed 5-min window + always-ask credential/channel minting; 403 `step_up_required`; StepUpConfirmationRequest (agents/CLI → one-time exact-action link confirmed by their own human); OrgSecurityEventLog incl. refusals; enforced from day one with `scarab security setup/status` + server break-glass; hand-rolled WebAuthn RP on `ring`, one classified route table | Accepted |
 
-> For *features* deliberately deferred until demand appears (as opposed to ADRs
+> For *features* deferred until demand appears (as opposed to ADRs
 > to be written), see [`docs/followups.md`](../followups.md).
 
 ## Open / deferred (to be written when their slice begins)

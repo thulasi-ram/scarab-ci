@@ -59,12 +59,12 @@ Scarab is a *tool*, and a tool needs a published site. The forces:
    Astro content-collection glob (or symlink) and the API reference from `../../openapi.json` via
    `starlight-openapi`, both at build time. No duplicated markdown; ADRs stay authored in `docs/`.
 
-4. **IA is operator-primary, published accurately.** Sidebar: **Home** (landing: the durability
+4. **IA is operator-primary, and the nav matches what has shipped.** Sidebar: **Home** (landing: the durability
    pitch, screenshots) · **Get Started** (Run locally — real today; Deploy with Helm — **stub**;
    done: real since the chart shipped in `deploy/helm/scarab/`) ·
    **Guides** (pipeline authoring; grows as slices land) · **Configure** (ENV/config reference) ·
    **Reference** (API, auto-generated) · **Tech** (`CONTEXT.md` + ADRs, sourced in place). Pages
-   exist in the nav only when backed by shipped reality; aspirational pages are clearly-marked
+   exist in the nav only when backed by shipped reality; aspirational pages are labelled
    stubs, never a broken headline.
 
 5. **Hosting = GitHub Pages, release-gated.** Build in a `.github/workflows/` Action and publish to
@@ -103,7 +103,7 @@ Scarab is a *tool*, and a tool needs a published site. The forces:
 - **± The doodle system is a decoupled generator, not site-build coupling.** DESIGN.md's SolidJS
   runtime component is *not* reused; instead a standalone script rough.js-processes source SVGs
   **once** and commits the output. This removes rough.js from the site's runtime and build
-  entirely (the site only serves static SVGs), so the only real work is the one-time generator +
+  (the site only serves static SVGs), so the only real work is the one-time generator +
   a small client motion script; the framework-port risk goes away.
 - **− Release-gated publishing means the site stays dark until the first `v*` tag** (mitigated by
   `workflow_dispatch`). Between tags the published Tech section lags `main` — acceptable, and
@@ -121,7 +121,7 @@ Scarab is a *tool*, and a tool needs a published site. The forces:
   off-stack; its differentiators (versioning, i18n, blog, plugin marketplace) are all deferred
   needs. Starlight covers everything we need now at a fraction of the weight, and stays Vite-native.
 - **mdBook (Rust-idiomatic)** — rejected: strong for a book, but weak at the landing/screenshot job
-  we explicitly want and has no built-in OpenAPI support.
+  we want and has no built-in OpenAPI support.
 - **Separate docs repo** — rejected: would force syncing `docs/adr/**` and `openapi.json` across
   repos (submodule/copy/publish-artifact), pure overhead for a solo pre-1.0 project, and it drifts out of date.
   In-repo keeps a single source of truth.

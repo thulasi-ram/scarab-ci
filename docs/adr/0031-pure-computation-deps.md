@@ -25,12 +25,12 @@ depend on `sqlx`, `kube`, `reqwest`, `object_store`, `axum`, `tokio`, cloud SDKs
 Pure, total, deterministic computation libraries (CEL evaluation, hashing, parsing such as
 `serde_yaml`) are allowed.
 
-- The compiler still enforces the important edge: an **infra** crate named in a pure crate's
+- The compiler still enforces this edge: an **infra** crate named in a pure crate's
   manifest remains a build-time bug — that property is unchanged.
 - Adding a pure-computation dependency is a deliberate act: it must be justified in the PR/commit
   and, ideally, be `#![forbid(unsafe_code)]`-friendly and free of ambient I/O.
 - Determinism for DST ([0017](0017-testing-strategy.md)) is preserved: no wall-clock/RNG means
-  fakes still fully control the world.
+  fakes still control the world.
 
 ### Amendment (2026-07-27): facades, not just computation
 
@@ -43,7 +43,7 @@ clock, process or runtime, so it passes the I/O test on the merits while failing
 
 **A no-op-by-default facade is admissible on the same terms as pure computation**, with one
 addition: the *backend* behind it is still infra and stays out. So `tracing` is allowed in a pure
-crate; `tracing-subscriber`, which actually writes, is not.
+crate; `tracing-subscriber`, which writes, is not.
 
 The motivating case is `scarab-storage`'s `TieredCas` ([0061](0061-workspace-data-path.md)): a
 warm-tier write failure must **succeed** the caller, because the cold tier is the durability
@@ -67,5 +67,5 @@ catches them.
 - **Keep the literal four-crate allowlist; wrap CEL behind a port + adapter** — preserves the
   letter of 0016 but adds indirection and a dyn boundary around pure computation; rejected as
   ceremony without benefit.
-- **Feature-gate CEL inside the crate** — reintroduces optional-infra-in-domain, the very thing
+- **Feature-gate CEL inside the crate** — reintroduces optional-infra-in-domain, which
   0016 rejected.

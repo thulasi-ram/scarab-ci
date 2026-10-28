@@ -32,7 +32,7 @@
 > **Three carve-outs.** (a) The **fence-residue sweep** is extracted from `sweep_exports_once`
 > **first** — the ledger and drain-record TTLs live inside it and are still needed. (b)
 > **`changeset.rs` and its test tier stay**: it is the only code anywhere that reads an `overlayfs`
-> upper layer, it was finally executed 2026-08-02, and it is exactly what a revived laziness effort
+> upper layer, it was finally executed 2026-08-02, and it is what a revived laziness effort
 > would want. (c) The **reflink support** (`reflink-copy`) stays — a future local cache wants it.
 >
 > **What survives of this ADR: the platform facts** — the measured kernel/PSA/overlayfs/NFS
@@ -73,13 +73,13 @@ a node a Step Pod is already running on.
 > to `nfs-utils` as the per-node prerequisite of part 2**, not something this rule excludes. Its
 > node plugin ships its own NFS client and mounts in the host mount namespace, so it makes the
 > delivery path work on nodes whose image has no `mount.nfs` at all (Bottlerocket, hardened AMIs
-> — exactly the population red-team #1 names as the risk). The choice an operator faces is
+> — the population red-team #1 names as the risk). The choice an operator faces is
 > therefore **"a node package Scarab cannot install" vs "an upstream chart Scarab does not
-> version"**, and this ADR deliberately does not make it for them.
+> version"**, and this ADR leaves it to them.
 >
 > **The trap, recorded so whoever picks it up does not discover it in a benchmark.**
 > `csi-driver-nfs` declares a real `fsGroupPolicy`, which invites kubelet to **recursively chown
-> the whole mount** on Pod start — walking every inherited path and thereby destroying exactly the
+> the whole mount** on Pod start — walking every inherited path and thereby destroying the
 > laziness the Export exists to buy (and defeating the caching argument below). Using it requires
 > `fsGroupChangePolicy: OnRootMismatch`, or no `fsGroup` at all. This is the same fact as red-team
 > #4 seen from the other side: the in-tree NFS plugin's `Managed: false` is *why* fsGroup does not
@@ -93,7 +93,7 @@ a node a Step Pod is already running on.
 Both halves of that sentence are true and the conclusion drawn from them is not, because **the
 Pod was never going to be the thing arranging the mount.** In Kubernetes the privileged mounter
 is **kubelet**: a Pod *declares* a volume and kubelet performs the mount on its behalf. So an
-entirely unprivileged Pod can have an exotic filesystem at `/workspace` without holding any
+unprivileged Pod can have an exotic filesystem at `/workspace` without holding any
 capability at all. 0061's ten "Alternatives considered" are all about transport and topology and
 none of them asks where the mount could come from instead.
 
@@ -156,7 +156,7 @@ live mountpoint that fails every operation. This is designed for below, not disc
 | generic `ephemeral` (inline PVC template) | allowed | **allowed** |
 
 > **Amended 2026-08-02 — three rows the first version of this table did not have, and one of them
-> changes what part 2's delivery may be.** `restricted`'s volume-type allow-list is exactly
+> changes what part 2's delivery may be.** `restricted`'s volume-type allow-list is
 > `configMap, csi, downwardAPI, emptyDir, ephemeral, persistentVolumeClaim, projected, secret`.
 > So **`csi:` and generic `ephemeral` are PSA-legal at `restricted` too** — the table as written
 > implied a PVC was the only legal envelope for an exotic volume, and it is not; it is one of
@@ -166,7 +166,7 @@ live mountpoint that fails every operation. This is designed for below, not disc
 > which is why the `LocalPath` delivery below reaches a production cluster as a `local` PV and
 > only ever as `hostPath` in dev.
 
-Two things follow. `baseline` — not `restricted` — is the level orgs actually set as a cluster
+Two things follow. `baseline` — not `restricted` — is the level orgs set as a cluster
 default, because `restricted` breaks too much; so the population that cannot run a privileged
 sidecar is every enforcing cluster, not a minority of them. And **a PVC is the PSA-legal envelope
 for a volume type that is otherwise forbidden**, because `persistentVolumeClaim` is on
@@ -264,7 +264,7 @@ Per Step, the service mounts `overlayfs` with the Farm as **lowerdir** and a per
 bound to a per-Step PersistentVolume with an NFS source, mounted at `/workspace`.
 
 The Step Pod holds **no privilege, no capability, and no PSA exception**. It does not fetch, and
-there is nothing to copy back. Reads fault over the network only for what the Step actually opens
+there is nothing to copy back. Reads fault over the network only for what the Step opens
 — which is the laziness part 2 of 0061 wanted, obtained from kubelet instead of from a driver.
 Delivery **as a PVC rather than an inline `nfs:` volume is required**, not a style choice: the table
 above shows inline `nfs:` is denied at `restricted` and the PVC is not.
@@ -275,7 +275,7 @@ a tuning choice** (probed 2026-08-02 on this machine). A kind node — `kindest/
 `systemd` to *run* `rpc.statd`, so a mount that defaults to **v3** fails with *"rpc.statd is not
 running"*. `-o vers=4` and an unqualified mount that negotiates 4.2 both succeed. An unpinned PV
 therefore works or does not depending on what the client's default happens to be on that node —
-exactly the infrastructure quirk the governing principle exists to keep away from authors. (`nolock`
+the infrastructure quirk the governing principle exists to keep away from authors. (`nolock`
 is the alternative for a deployment that must stay on v3; the pin is the default.)
 
 > **Amended 2026-08-02 — delivery has three options, and NFS is only one of them.**
@@ -291,7 +291,7 @@ is the alternative for a deployment that must stay on v3; the pin is the default
 >   (the Depot's data mount carries `CAP_SYS_ADMIN` and `Bidirectional` propagation) and handed to
 >   a **co-located** Step as a `local` PV — PSA-legal at `restricted`, unlike `hostPath`, which the
 >   amended table above shows is denied at `baseline`. No network, no NFS, no server. The Step is
->   pinned to the Depot's node by affinity, which is precisely why **this is a dev/single-node
+>   pinned to the Depot's node by affinity, which is why **this is a dev/single-node
 >   setup and not the production default**: it caps a Run's throughput at one node and it writes
 >   a placement constraint onto every Step, which is the fight with [0055](0055-placement-profiles.md)
 >   part 4 already refuses to pick.
@@ -336,7 +336,7 @@ directory renames need refusing" while part 2 required supporting them, which is
 mistake that ships as a defect rather than a disagreement.
 
 **3. The change set is the upper layer, exactly.**
-An `overlayfs` upper directory contains precisely the paths the Step touched, put there by the
+An `overlayfs` upper directory contains the paths the Step touched and no others, put there by the
 kernel. The drain reads the upper, hashes only those files, folds them into the CAS and returns a
 new snapshot root — **all on the service's own local disk, with no network in the path.**
 
@@ -374,7 +374,7 @@ Two further measured refinements, because they decide what has to be supported r
 tolerated. A **file** rename is exact — it appears as a whiteout plus a full copy, with no
 `redirect` — so `redirect` is a **directory** phenomenon only, and a `redirect` on anything else is
 a shape we do not understand and must refuse. And `redirect_dir=on` *is* honoured when passed at
-mount time even though the module default is off, so a directory rename really does reach the drain
+mount time even though the module default is off, so a directory rename does reach the drain
 in production. Copy-up also stamps `origin` on files and `impure` on their parent directories, which
 must be **tolerated as bookkeeping** — treat them as unsupported markers and every real drain fails
 on its first edited file.
@@ -393,7 +393,7 @@ consequences the drain must honour, each of which fails *silently* if it does no
   that ancestor's **lower** coordinate, not its merged one; resolving against the merged parent
   grafts nothing and loses a subtree without erroring. A leading `/` is the kernel's encoding for
   *overlay-root*-relative, which is how a cross-parent rename is recorded — so an absolute redirect
-  must be **resolved, not rejected**, or the design refuses precisely the renames part 2 requires
+  must be **resolved, not rejected**, or the design refuses the renames part 2 requires
   it to support.
 
 **Durability is not local, and the cold upload stays on the critical path.** The paragraph above
@@ -401,7 +401,7 @@ says the fold happens "with no network in the path", which is true of the *fold*
 imply something false about the *Attempt*. The service's own disk **is the warm tier**, and
 [0061](0061-workspace-data-path.md) part 4 requires a Workspace Snapshot to be durable before an
 Attempt is `Succeeded`, while 0061's retention table says warm is bounded by space, evicts, and
-promises nothing. 0061 also rejected exactly the shortcut this wording invited: *"writing warm-first
+promises nothing. 0061 also rejected the shortcut this wording invited: *"writing warm-first
 and letting the service tier onward would make durability depend on the warm tier, which part
 4 forbids."*
 
@@ -412,7 +412,7 @@ otherwise — so a green Attempt always has its snapshot in the tier that makes 
 
 The reason this is affordable, and it is the whole argument: **what gets uploaded is now only the
 change set.** Today's drain ships the *entire* workspace over the `exec` tar tunnel whether it
-changed or not. So an Export that folds locally and then uploads what the Step actually wrote moves
+changed or not. So an Export that folds locally and then uploads what the Step wrote moves
 **strictly less** than the status quo, while keeping a durability guarantee the status quo also has.
 The cold leg is a real cost and it is booked here rather than discovered in a benchmark: it is one
 upload per Step, sized by the change set, on the critical path to `Succeeded`.
@@ -468,7 +468,7 @@ layer is the change set. The only difference is **where writes land in the inter
 
 The service needs `CAP_SYS_ADMIN` to mount `overlayfs`. That is one **operator-installed
 StatefulSet** — the exception storage operators are routinely granted, on the node the constraint
-explicitly permits — and it is *preferred*, not required. The interface is "give me a tree-shaped
+permits — and it is *preferred*, not required. The interface is "give me a tree-shaped
 writable view of a snapshot on the service's disk", with three backends:
 
 The two axes are independent — how the Farm is built, and whether an `overlayfs` sits on top of it —
@@ -500,9 +500,9 @@ opposite assumption.
 
 **The rung table above is missing a row, and the omission looks accidental.** The *Farm* ladder's top
 rung is `reflink`, and a Farm and its Exports live on **one filesystem** by construction — part 1
-puts farms on the warm volume precisely so a clone cannot cross a filesystem boundary. So "a writable
+puts farms on the warm volume so that a clone cannot cross a filesystem boundary. So "a writable
 copy of the Farm" could be a **CoW clone** of it: nearly free, metadata-exact per entry, and correct
-for exactly the reason the overlay rung is correct, since copy-on-write independence is what a reflink
+for the same reason the overlay rung is correct, since copy-on-write independence is what a reflink
 provides. That would make the unprivileged Export rung nearly as cheap as the privileged one wherever
 the filesystem clones, which materially weakens the case for `CAP_SYS_ADMIN` being *preferred*. What
 it would not change is the change set: that stays the stat-cache approximation, which remains the real
@@ -518,7 +518,7 @@ pairing unrepresentable in the type rather than to document against it. The less
 every row of every ladder in this ADR: **if two rungs need different drains, the rung must choose the
 drain.**
 
-**What refusing the capability actually costs.** The first version of this sentence said "never
+**What refusing the capability costs.** The first version of this sentence said "never
 correctness, and never a second code path", which was wrong on both halves and was corrected once to
 say the rungs differ in *correctness*. That was true of the stat cache **as first built** and is no
 longer true of it, so here is the settled position.
@@ -567,7 +567,7 @@ is a simplification.
 **Snapshot Farm** — the immutable, shared, tree-shaped view of one Workspace Snapshot on the
 workspace service's disk, built by `reflink` where the filesystem offers it and by local copy where
 it does not. (Not hardlinks — see the measurement above; the first draft of this ADR said hardlinks
-and was wrong.) Defined here and **deliberately kept out of
+and was wrong.) Defined here and **kept out of
 [CONTEXT.md](../../CONTEXT.md)**: it is a cache implementation, not domain language, and the
 glossary is a glossary.
 
@@ -607,7 +607,7 @@ per Step is the same order of object churn.
 - **`/workspace` does not move**, measured, so no authored pipeline changes.
 - **Writes cross the network in the default configuration.** This is the last structural cost and
   it is smaller than it sounds: today's drain ships the **entire** workspace over the `exec` tar
-  tunnel whether it changed or not, where an Export ships only the bytes the Step actually wrote,
+  tunnel whether it changed or not, where an Export ships only the bytes the Step wrote,
   once, at write time. **The risk is operation count, not byte volume** — NFS charges a round-trip
   per file operation, and a build that creates, writes and `fsync`s many small files pays latency
   per file that no bandwidth fixes. That is what part 5 exists for and what the spike must measure.
@@ -651,7 +651,7 @@ per Step is the same order of object churn.
   is not ceremony.
 - **A warm, content-indexed pool of block PVCs handed to Step Pods** — better than laziness on its
   best axis, since a pre-populated volume moves **0%** of a tree where laziness moves 5%, and it is
-  PSA-clean. Rejected because it re-binds volumes to short-lived Pods, which is precisely what
+  PSA-clean. Rejected because it re-binds volumes to short-lived Pods, which is what
   0061 part 1 designed away: *"Every problem PVCs have here… comes from binding volumes to
   short-lived pods. Bind them to the long-lived thing instead and all of it goes away."* Attach is
   5–20 s on EBS-class storage and detach wedges when a spot node goes; volumes are AZ-pinned, so
@@ -726,7 +726,7 @@ It also found the following, which are recorded here rather than quietly fixed b
 what the design must do. Each is filed.
 
 1. **kubelet needs an NFS client on every Step node — CONFIRMED, and it weakens the main claim.**
-   The delivery path had never actually been mounted. When it was: PV bound, PSA admitted the Pod,
+   The delivery path had never been mounted. When it was: PV bound, PSA admitted the Pod,
    the scheduler placed it, then kubelet failed with *"you might need a /sbin/mount.nfs helper
    program"* and the Pod hung in `ContainerCreating` **forever**. The colima node has no `nfs-utils`.
    So "the Pod needs nothing and kubelet does the mount" is true of *privilege* and false of
@@ -749,7 +749,7 @@ what the design must do. Each is filed.
    > - **The delivery path then mounted, on colima k3s.** A PV with an `nfs:` source (server = the
    >   node's own INTERNAL-IP, `192.168.5.1`) + PVC + consumer Pod went `Running` → `Succeeded` in
    >   **~6 s**, mounted `vers=3`, and the Pod **read and wrote through it**. kubelet did the mount,
-   >   exactly as part 2 claims.
+   >   as part 2 claims.
    > - **kind needs nothing at all.** The default `kindest/node` (v1.36.1, what
    >   `deploy/local-proc/kind.yaml` creates) already ships `/sbin/mount.nfs`, `mount.nfs4` and
    >   `rpc.statd` — no install, no custom node image, no `kind.yaml` change. The one catch is the
@@ -798,9 +798,9 @@ what the design must do. Each is filed.
    > the s4 restart-adoption code's remaining obligation.
 3. **Part 3's "no network in the path" collides with 0061 part 4 — CONFIRMED (documents).** Folding a
    change set into the CAS on the service's own disk lands it in the **warm** tier, and 0061 part 4
-   requires durability before `Succeeded` while 0061 explicitly forbids relying on warm for
+   requires durability before `Succeeded` while 0061 forbids relying on warm for
    durability. So either part 4 weakens or a cold upload stays on the critical path — and this ADR
-   books neither. Unbooked cost, exactly what 0061's own "price of seeding the warm tier" section
+   books neither. Unbooked cost, which 0061's own "price of seeding the warm tier" section
    exists to avoid repeating.
 
    **Answered: part 4 stands verbatim and the cold upload is on the critical path**, booked in part 3
@@ -840,7 +840,7 @@ what the design must do. Each is filed.
    > merged root reporting the **new** mode while the kernel's permission check still uses the
    > **old** one — an unprivileged `rename(2)` of a lower directory fails `EACCES` against a merged
    > root that displays `0777`. Chmod through the *merged* path fixes it immediately, which is the
-   > tell; ordering the change before the mount avoids the state entirely.
+   > tell; ordering the change before the mount avoids the state.
 5. **The fence is weaker than the word "capability" implies — PLAUSIBLE.** A userspace NFSv4 client
    needs no privilege, no PV and no kubelet, and can assert any uid; a probe mounted with
    `noresvport`, so the privileged-port defence never engaged. First-mount pinning pins the **node**,
@@ -862,7 +862,7 @@ what the design must do. Each is filed.
    latency exercises none of: `EXDEV`/redirect correctness, whiteout and opaque handling in the drain,
    eviction under a live mount, restart with live Exports, or cross-AZ behaviour. Its rung guard
    covers reflink and `overlayfs` but not `redirect_dir`, not which drain ran, and not whether the
-   mount was actually NFS. A spike shaped only to produce a number will produce one.
+   mount was NFS. A spike shaped only to produce a number will produce one.
 
    > **Amended 2026-08-02 — a spike shaped to falsify was run instead, and it falsified two things.**
    > The stage-2a spike produced **no ops/sec number at all** and was worth more than one:
@@ -873,7 +873,7 @@ what the design must do. Each is filed.
    > ops/sec row stays open and stays 2b's; it is now the *only* remaining reason to run a
    > number-shaped spike.
 
-## Open — deliberately not decided here
+## Open — not decided here
 
 ### Stage 2 — what still stands between here and an Export-delivered `/workspace`
 
@@ -887,8 +887,8 @@ vague. Each row names what it is blocked on, the gate that proves it, and its si
 > gone, and with them the reason to do the two halves together. **Split stage 2 at the delivery
 > interface**: the *correctness* of the Export — the overlay rung executing, a real kernel-produced
 > upper reaching `read_change_set`, `redirect_dir`/`EXDEV` through a live mount — has nothing to do
-> with NFS, and waiting on a transport to test it is what kept the exact path unexecuted (the most
-> important caveat on this ADR, below). 2a buys that today on `local-helm`. 2b is then a transport
+> with NFS, and waiting on a transport to test it is what kept the exact path unexecuted (the exact-path
+> caveat on this ADR's status, below). 2a buys that today on `local-helm`. 2b is then a transport
 > change against a path already known to be correct.
 
 **2a — the delivery interface and a co-located, NFS-free path.** No server, no NFS client, no new
@@ -910,7 +910,7 @@ protocol. This is what unblocks the correctness half.
 > 1. **The mount.** `export.rs:501-508`'s exact option string mounted **first try** from a
 >    privileged Pod with `hostPath` + `mountPropagation: Bidirectional` (that Pod's `/warm` was
 >    already `shared`); the kernel echoed `+uuid=on,nouserxattr`.
-> 2. **Propagation escapes the Pod — the critical unknown.** The overlay appears in the
+> 2. **Propagation escapes the Pod — the unknown the delivery depends on.** The overlay appears in the
 >    **node's** `/proc/1/mounts` with `findmnt PROPAGATION=shared`. The whole `LocalPath` delivery
 >    rested on this and it had never been observed.
 > 3. **PSA `restricted` admits the delivery.** A `local` PV (nodeAffinity → colima) + PVC was
@@ -925,7 +925,7 @@ protocol. This is what unblocks the correctness half.
 >    holds under a real Step, which is the claim this ADR is built on.
 >
 > **De-risked by this spike** — the kernel and mount behaviour the `LocalPath` delivery row depends
-> on (rows 1–4 of the chain are exactly its gate's preconditions), and the `0ad393c` exact-path row's *inputs*: a kernel-produced
+> on (rows 1–4 of the chain are its gate's preconditions), and the `0ad393c` exact-path row's *inputs*: a kernel-produced
 > upper carrying every marker shape the reader must handle now demonstrably exists and has been
 > characterised on the colima node `local-helm` runs on.
 >
@@ -939,14 +939,14 @@ protocol. This is what unblocks the correctness half.
 > **Requirements this puts on production code.** Each is a constraint, not a note:
 >
 > - **`read_change_set` requires `CAP_SYS_ADMIN` or it is silent data loss.** Without it `listxattr`
->   **omits** the `trusted.*` names entirely — no error, no hint — so a renamed directory reads as
+>   **omits** the `trusted.*` names — no error, no hint — so a renamed directory reads as
 >   *"delete `docs`, create empty `documentation`"* and the contents are lost, because upper's
->   `documentation` really **is** empty and the files live in lower behind the redirect. This is
+>   `documentation` **is** empty and the files live in lower behind the redirect. This is
 >   the omission-shaped sibling of part 3's `ENODATA` discussion, and **the existing guard does
 >   cover it**: `changeset.rs`'s `require_marker_privilege()` reads `CapEff` from
 >   `/proc/self/status` and returns `NoSysAdmin` before walking whenever `Markers::Overlay` is
 >   requested — a capability check, not a `getxattr` probe, so silent omission cannot slip past it.
->   The obligation that remains is on the *deployment*: the Depot must actually hold the capability
+>   The obligation that remains is on the *deployment*: the Depot must hold the capability
 >   wherever an overlay-rung drain runs, or every such drain refuses.
 > - **`hostPath` is refused under PSA `restricted`** — exact message: `restricted volume type
 >   "hostPath"`. The `local` PV + PVC is the **only** admissible delivery; `hostPath` is a dev-only
@@ -967,13 +967,13 @@ protocol. This is what unblocks the correctness half.
 > otherwise.
 >
 > **Still untested.** Multi-node — the cluster is single-node, so the `local` PV's
-> `nodeAffinity` was never really exercised and node-pinning remains asserted rather than shown;
+> `nodeAffinity` was never tested against a second node and node-pinning remains asserted rather than shown;
 > **concurrent Steps on one Export**; and **kubelet restart mid-Step**.
 
 **Node pinning is what makes 2a a dev/single-node setup rather than the production default**, and
 it must not be allowed to look like a shipping answer: it caps a Run at one node's throughput and
 writes a placement constraint onto every Step, which fights [0055](0055-placement-profiles.md) in
-precisely the way part 4 refuses to. 2a is a **test and dogfood** delivery that happens to be real.
+the way part 4 refuses to. 2a is a **test and dogfood** delivery that happens to be real.
 
 **2b — the transport.** Everything only a network filesystem can answer, now **locally verifiable**
 (red-team #1 amendment: colima mounts NFS, kind's node image already can).
@@ -991,8 +991,8 @@ precisely the way part 4 refuses to. 2a is a **test and dogfood** delivery that 
 None of the 2b rows can be answered by 2a, and that is the reason 2b exists rather than being
 folded away: they are all properties of a network protocol, and `LocalPath` has no network.
 
-- **The exact path has never executed, and every green test exercises the approximate one.** This is
-  the most important caveat on this ADR's status and it is easy to miss, because the code is written,
+- **The exact path has never executed, and every green test exercises the approximate one.** This
+  caveat is easy to miss, because the code is written,
   reviewed and tested. Part 3's argument — that the rungs "do not differ in correctness" because the
   upper layer is the kernel's own record — rests entirely on the **overlay** rung. Reaching it needs
   a privileged Linux host with a Rust toolchain, which nothing in this repo's loop has: the dogfood
@@ -1052,7 +1052,7 @@ folded away: they are all properties of a network protocol, and `LocalPath` has 
   error**: the service-side overlay is mounted on the *workspace service*, so a module parameter
   would be one node — the one the constraint already permits — not every Step node.
 
-  **The real reason it cannot be used, which is a different fact entirely:**
+  **The real reason it cannot be used, which is a different fact:**
 
   ```
   mount -o index=on,nfs_export=on,metacopy=on  →  refused: conflicting options
@@ -1072,7 +1072,7 @@ folded away: they are all properties of a network protocol, and `LocalPath` has 
 - **Automatic Cache detection for lockfile-derived trees** — recognising `node_modules`, `.venv`,
   vendored `~/.m2` and the pip/uv caches from their lockfiles and routing them through
   [0007](0007-data-passing-model.md)'s **Cache** instead of the Workspace, so that less is subject
-  to the write cost at all. Deliberately **not** decided in this ADR: it is a heuristic whose
+  to the write cost at all. **Not** decided in this ADR: it is a heuristic whose
   failure mode is wrong output (`target/` is Cache-shaped when the next Step rebuilds and an
   *output* when the next Step consumes a binary), and it deserves its own trade-off record rather
   than riding along on a transport decision.

@@ -46,7 +46,7 @@ dedupes identical files, but a build output churns by design, so dedup does not 
 **What the classes cost is ecosystem-dependent, and this is estimated rather than measured.** It is
 labelled an estimate on purpose. These ADRs have already been burned by a probe that was read as
 answering a question it never asked, and the opposite mistake is an assumption that later gets read
-as a measurement. We deliberately chose *not* to measure the dogfood repo, because a pre-release project
+as a measurement. We chose *not* to measure the dogfood repo, because a pre-release project
 measuring one Rust repository would over-fit the design to a sample of one, and because the mix
 differs per organisation — which is itself the argument for the knobs below.
 
@@ -74,7 +74,7 @@ enough to know what produced a given snapshot.
 **1. `Cache` becomes real, as an explicit, author-declared, keyed directory cache.**
 An author names directories to cache and a key (a lockfile hash, typically). The cache is restored at
 Step start and saved at Step end. Best-effort, evictable, **never evidence** — a miss is slower and
-never wrong, which is what lets it sit outside the durability rules entirely.
+never wrong, which is what lets it sit outside the durability rules.
 
 This **implements [0007](0007-data-passing-model.md) as originally written** and reverses nothing: the
 amendment forbids making Cache *mandatory for speed*, not making it available. 0007 already specified
@@ -96,7 +96,7 @@ it as keyed and author-declared.
 > If `cache_entries` provenance shows the median warm lifetime of a saved tree is **shorter than the
 > median key lifetime** (the lockfile-change interval), caches are dying before reuse, and the
 > re-derive spend (miss-rate × cold-build minutes) can be priced against pack-row + object-storage
-> cost. The `saved_at` refresh and the fetcher's hit/miss log lines built here are exactly that
+> cost. The `saved_at` refresh and the fetcher's hit/miss log lines built here are that
 > instrumentation.
 >
 > **Caveat at replicaCount > 1: cache hits assume `replicaCount = 1`.** Warm is replica-local and a
@@ -105,7 +105,7 @@ it as keyed and author-declared.
 > degrades to the tolerated miss. Follow-up filed as git-bug `12e2f6b` (warmth-affinity restore
 > routing OR durable cache copies, priced with this arithmetic).
 
-**2. A Cache is another content-addressed tree**, so it rides
+**2. A Cache is another content-addressed tree**, so it reuses
 [0062](0062-workspace-export-lazy-without-node-driver.md)'s Snapshot Farm and Workspace Export
 machinery. A Step that touches 5% of `node_modules` materialises 5% of it. Cache differs from a
 Workspace Snapshot only in its **retention semantics**, not in its storage or its transport.
@@ -126,14 +126,14 @@ Workspace Snapshot only in its **retention semantics**, not in its storage or it
 >   at file grain, with no key negotiation at all. That is a *better* justification than the one it
 >   replaces, and unlike it, it is still true.
 > - **The dependency.** The **Snapshot Farm and Workspace Export machinery** is being **deleted**
->   (0066 point 10, with three carve-outs). A Cache rides the **CAS and the eager feed**, like
+>   (0066 point 10, with three carve-outs). A Cache uses the **CAS and the eager feed**, like
 >   everything else. Point 3's argument against shared mutable cache mounts is unaffected — it turns
 >   on **concurrency**, not on materialisation cost — but its closing sentence, *"laziness gives
 >   mount-like performance with none of the concurrency hazard"*, must be reread as the eager feed's
->   0.54 ms/file, which is the number that actually answers the "copying a 1 GB tree is brutal"
+>   0.54 ms/file, which is the number that answers the "copying a 1 GB tree is brutal"
 >   objection.
 >
-> **And point 8 gains a specific job.** The `RetentionProfile`'s **warm space budget** is exactly the
+> **And point 8 gains a specific job.** The `RetentionProfile`'s **warm space budget** is the
 > knob 0066 point 4's layered warm eviction needs: a **size watermark**, never a TTL, because space is
 > the bound an operator controls and the one already instrumented. 0066 also records that **nothing
 > sweeps warm today at all**, so that knob has no effect until its arm of the sweeper exists.
@@ -141,7 +141,7 @@ Workspace Snapshot only in its **retention semantics**, not in its storage or it
 **3. A keyed directory cache, not a shared mutable cache mount.** BuildKit-style
 `--mount=type=cache` was considered and rejected on **concurrency**, not cost: a shared mutable
 directory means two concurrent Runs both writing `~/.cargo/registry` or `node_modules`, which is
-contention at best and corruption at worst. BuildKit serialises cache mounts for exactly this reason,
+contention at best and corruption at worst. BuildKit serialises cache mounts for this reason,
 and serialising CI steps on a shared cache is an availability problem that grows with usage. The usual
 argument for a mount — that copying a 1 GB tree per Step is brutal — is answered by (2): laziness
 gives mount-like performance with none of the concurrency hazard.
@@ -161,7 +161,7 @@ workspace" as a rule. Naive pipelines keep paying for retention. That is accepte
 rather than failing"*, with affordances that must state which they are — *"Rerun this step"* versus
 *"Inputs expired — this re-runs from `clone`"*. Losing a snapshot to eviction or expiry is the same
 event with a different cause, so it needs **no new Attempt outcome**. A `Corrupted` state was proposed
-and is not needed: the Attempt really did succeed, and what is unavailable is its *evidence*.
+and is not needed: the Attempt did succeed, and what is unavailable is its *evidence*.
 
 **Because a human is in the loop, the engine needs no notion of a Step being pure.** An earlier
 draft of this reasoning required a purity property — safe-to-re-run versus effectful — to stop the
@@ -179,7 +179,7 @@ only make it if told.
 **7. Checkout is not a special case.** It was assumed to be the one thing needing re-derivation, and
 [0029](0029-workspace-cas.md)'s **per-file** merkle CAS says otherwise: consecutive commits share
 every unchanged blob, so retaining source across a hundred Runs costs roughly one copy of the
-repository plus the deltas, and Runs on the same SHA share it entirely.
+repository plus the deltas, and Runs on the same SHA share all of it.
 
 | class | cheap to keep? | cheap to re-derive? |
 |---|---|---|
@@ -193,7 +193,7 @@ never be re-run — but it is not the default.
 
 **8. Knobs are operator-defined and author-selectable: a `RetentionProfile`.**
 Because the right mix differs per organisation, retention is tunable — and tunable by the **operator**,
-copying [0055](0055-placement-profiles.md)'s `PlacementProfile` exactly. An operator-owned,
+the same way as [0055](0055-placement-profiles.md)'s `PlacementProfile`. An operator-owned,
 cluster-scoped named bundle in gitops carries the warm space budget, the per-class TTLs, which
 directories are Cache-eligible, and the drop-and-re-derive thresholds. A Pipeline may **name** a
 profile; it never defines the values. No byte cost enters authored YAML, so the governing principle
@@ -203,7 +203,7 @@ per-Run escape hatch for investigations.
 > **Implementation note (2026-08-26, git-bug 6499fb1 + 82c5775):** `RetentionProfile` shipped
 > **TTL-only** — name, `default`, and the four per-class TTLs (each falling back to the flat
 > `SCARAB_RETENTION_*` env knobs); the warm space budget, Cache-eligible directories and
-> drop-and-re-derive thresholds are deliberately **not parsed** until something consumes them (an
+> drop-and-re-derive thresholds are **not parsed** until something consumes them (an
 > inert knob misleads whoever sets it), so the bundle grows with its consumers rather than ahead of them. The
 > committed-pack expiry pass this ADR's retention grain feeds now **exists**
 > (`crates/scarab-server/src/depot_expiry.rs`): it resolves the pipeline-named profile out of
@@ -223,8 +223,8 @@ per-Run escape hatch for investigations.
 - **Shared mutable cache mounts.** See (3). Rejected on concurrency.
 - **Author-tunable retention values in pipeline YAML.** Maximum flexibility and the performance tax the
   amendment forbids. Rejected.
-- **Operator-only retention with no author involvement at all.** Cleanest against the principle, and it
-  leaves an author who really needs a snapshot kept with no recourse. Rejected in favour of
+- **Operator-only retention with no author involvement at all.** Fits the principle best, and it
+  leaves an author who needs a snapshot kept with no recourse. Rejected in favour of
   name-a-profile plus the existing manual pin.
 - **A system that decides per edge whether to retain or re-derive, autonomously.** Attractive, and it
   is what "the system pays" would suggest. Rejected for now because it requires the purity property
@@ -256,5 +256,5 @@ per-Run escape hatch for investigations.
 - [0050](0050-retention-and-gc.md) — retention classes and the sweeper
 - [0055](0055-placement-profiles.md) — the operator-owned named-profile pattern `RetentionProfile` copies
 - [0061](0061-workspace-data-path.md) — the governing principle, the retention table, the widened rerun
-- [0062](0062-workspace-export-lazy-without-node-driver.md) — the Farm/Export machinery a Cache was first meant to reuse (deleted by [0066](0066-the-depot-is-a-cache.md); a Cache now rides the CAS and the eager feed)
+- [0062](0062-workspace-export-lazy-without-node-driver.md) — the Farm/Export machinery a Cache was first meant to reuse (deleted by [0066](0066-the-depot-is-a-cache.md); a Cache now uses the CAS and the eager feed)
 - [0064](0064-durability-tiering-and-the-write-path.md) — what must be durable before `Succeeded`

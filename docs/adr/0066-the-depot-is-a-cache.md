@@ -62,7 +62,7 @@ premise inverted.
 
 ### Object storage is a soft, recommended requirement (git-bug `42d997c`)
 
-With object storage Scarab is fully featured. Without it the Depot is a warm-only cache offering a
+With object storage Scarab has every feature. Without it the Depot is a warm-only cache offering a
 bounded **recent window**, with every degradation disclosed rather than silent — the mode
 [0064](0064-durability-tiering-and-the-write-path.md) part 4 already supports and part 5 already
 stamps (`attempts.output_durability` = `warm-only`).
@@ -101,8 +101,8 @@ Depot exactly twice — at **Init** (fetch) and at the **end** (drain). A Depot 
 a 40-minute build is **invisible to that build**.
 
 We have that property **because the lazy feed is cancelled.** A lazily-mounted workspace makes every
-running Pod continuously dependent on the Depot for the whole Step, and the failure mode is not a
-clean error: `20e8786` measured nfs-ganesha's actual semantics, and a vanished server wedged a test
+running Pod continuously dependent on the Depot for the whole Step, and the failure mode is not an
+error return: `20e8786` measured nfs-ganesha's semantics, and a vanished server wedged a test
 client **unkillably** in `nfs4_proc_destroy_session`. A design where a Depot restart can leave
 uninterruptible processes on Step nodes cannot support "block and retry" at all.
 
@@ -116,7 +116,7 @@ completed build's evidence because the storage service was rescheduled is the ex
 
 ### The invariant was already written down, and violated twice
 
-[0061](0061-workspace-data-path.md):261-262 says it plainly:
+[0061](0061-workspace-data-path.md):261-262 says:
 
 > The service's volume is a cache, and a cache that survives a Pod roll is a latency win, not a
 > durability one.
@@ -173,24 +173,24 @@ a storage Pod was rescheduled.
 The tempting fix is to make the record durable somewhere. Both durable options were rejected:
 
 - **Postgres.** Breaks the Depot's **no-database** invariant — the Depot is the same binary in a
-  different role precisely because it never connects to Postgres
+  different role because it never connects to Postgres
   ([CONTEXT.md](../../CONTEXT.md) §4.4).
 - **Object storage.** Absent in warm-only, which would couple a **core path** to the **optional**
-  tier — exactly inverting `42d997c`'s decision.
+  tier — inverting `42d997c`'s decision.
 - **[0063](0063-step-logs-on-the-data-depot.md) part 6's volume-identity marker**, extended to say
   *"this replica is not the one that took your drain"*. **Strictly better** than absence-as-transient,
   and **not worth it yet** — it can be added later without changing anything decided here, because it
   only ever converts a retry into a faster, more legible retry.
 
 So the record stays replica-local and its absence is treated as **transient**. That is only sound if
-re-driving the drain is actually idempotent, which was verified link by link rather than
+re-driving the drain is idempotent, which was verified link by link rather than
 assumed:
 
 | link | why a re-drive is safe |
 |---|---|
 | the drain reads `/workspace` **after** the step container exited | content is frozen; a second read sees the same bytes |
 | a re-drive re-`PUT`s **every tree unconditionally** | no tree is assumed present from a prior run |
-| `/have` reports **every blob missing** on a fresh replica | so the re-drive re-uploads exactly what that replica lacks |
+| `/have` reports **every blob missing** on a fresh replica | so the re-drive re-uploads what that replica lacks |
 | the **409** fires only for an existing **SUCCESS** record | a partial or absent record does not block the retry |
 | once `ANNOTATION_WS_ROOT` is patched, the **`already` guard** skips the leg | so a *succeeded* drain is never redone |
 
@@ -260,7 +260,7 @@ it.** Two comments look false in warm-only and are not:
   (`crates/scarab-storage/src/tiered.rs:567-569`)
 - `note_warm_write_failure`'s *"the snapshot IS durable"* (`crates/scarab-storage/src/tiered.rs:242`)
 
-They are **incomplete, not wrong**: exactly true with object storage, wrong **only** in warm-only.
+They are **incomplete, not wrong**: true with object storage, wrong **only** in warm-only.
 **Qualify them; do not delete them.** They are the clearest existing statement of why eviction is safe
 in the normal case, and a reader who finds them deleted learns nothing.
 
@@ -296,14 +296,14 @@ Attempt is stamped `warm-only`), so pins protect only **in-flight** work rather 
 > decision. Reachability survives only as the class ordering's cheap Depot-side proxy: committed
 > presence in `depot_pack_members`.
 
-**The budget is a size watermark, not a TTL.** Space is what the operator actually controls, it is
+**The budget is a size watermark, not a TTL.** Space is what the operator controls, it is
 what is already instrumented (the warm-size gauge walks the volume), and it is the only bound that
 degrades predictably. A TTL bounds nothing when the fill rate changes.
 
 **One piece of UI must change with this.** `ui/scarab-web-ui/src/snapshot-retention.ts:129-131`
 promises that eviction *"only ever makes a rerun slower, never wrong"*. That is true with object
 storage and false in warm-only — the same asymmetry [0064](0064-durability-tiering-and-the-write-path.md)
-part 5 handles for durability. **It must become tier-aware, exactly like the durability stamp**, and
+part 5 handles for durability. **It must become tier-aware, like the durability stamp**, and
 for the same reason: the same UI string cannot describe two deployments with different guarantees.
 
 ### 5. Deferred storage candidates, recorded so nobody re-evaluates them from scratch.
@@ -319,9 +319,9 @@ undocumented "we looked at it" costs the next person the whole evaluation again.
 | **Kraken** | **Rejected** | — |
 
 **SeaweedFS is supported now, with zero code change** — it is S3-compatible, so it is a `StoreConfig`
-value. Its Haystack-style needle layout suits **millions of small blobs**, which is precisely our
+value. Its Haystack-style needle layout suits **millions of small blobs**, which is our
 shape, and it has real replication and erasure coding. **Document it beside MinIO and Ceph RGW, and
-label it explicitly untested-by-us** — "compatible" is a protocol claim, not an endorsement we have
+label it untested-by-us** — "compatible" is a protocol claim, not an endorsement we have
 earned.
 
 **JuiceFS is deferred and named**, and that is the point of naming it: **if laziness ever revives, the
@@ -332,14 +332,14 @@ the cost is known rather than hypothetical.
 **Dragonfly is deferred because it answers a question we have not asked.** It solves **origin
 saturation under concurrent fan-out** — many Pods pulling the same content at once. Our benchmark
 (`4ce7f2c`) was **single-client**, so saturation is **unmeasured**. A P2P mesh bought on an unmeasured
-premise is exactly the mistake 0061 s0 made in the other direction.
+premise is the mistake 0061 s0 made in the other direction.
 
 **Kraken is rejected**: archived upstream, so it fails the maintained-library rule. *(Moderate
 confidence — verify the archival before citing this at anyone.)*
 
 **Why all four are one decision rather than four:** every one of them optimises **the
 feed**, which the measurement just made the **smaller** leg, along the **concurrency** axis rather
-than the **per-file** axis we actually measured. So **the gate is one experiment, not four
+than the **per-file** axis we measured. So **the gate is one experiment, not four
 evaluations**: measure N concurrent fetches of the same snapshot. And if saturation *is* found, reach
 first for an **unprivileged per-node Depot cache DaemonSet** (`wsfetch` hits `$NODE_IP`) before a P2P
 mesh — same benefit, an order of magnitude less machinery.
@@ -373,7 +373,7 @@ describes. So packing's main downside — losing random access to an individual 
 longer pay for anything**. And it helps **both** legs, feed and drain, which nothing else on this list
 does.
 
-**The critical gap, and the reason this is gated rather than decided: the cold flush is unmeasured.**
+**The gap, and the reason this is gated rather than decided: the cold flush is unmeasured.**
 `flush_to_cold` (Depot → object storage) was **not** covered by `4ce7f2c`, which measured
 client → Depot **over loopback**. The flush **gates `Succeeded`**
 ([0064](0064-durability-tiering-and-the-write-path.md) part 2) and runs against **real S3**, not
@@ -448,7 +448,7 @@ the author reads it as their code being slow and raises a limit that was never t
 case (a blocked Init no longer eats the build's budget), the queueing case, and the *"failed as
 `Timeout` having never run"* misclassification.
 
-**The Run budget is left alone**, deliberately — it is a wall-clock spend limit on a whole Run, and
+**The Run budget is left alone**: it is a wall-clock spend limit on a whole Run, and
 splitting *that* clock is a different question with a different owner.
 
 ### 10. Delete the Export / Farm / change-set machinery — with three carve-outs.
@@ -472,7 +472,7 @@ are the entry points; a `&dyn` call cannot conjure one).
 
 **Dormant code is not free**, and the three costs are concrete rather than aesthetic:
 
-- **Live HTTP routes are attack surface.** We Browse-gated `/v1/exports*` last week precisely because
+- **Live HTTP routes are attack surface.** We Browse-gated `/v1/exports*` last week because
   **any fence token could `DELETE` another fence's Export**. Unused code with a live route is not
   unused.
 - **Every refactor pays to keep it compiling** — a tax levied on work that has nothing to do with it.
@@ -489,7 +489,7 @@ rather than keeping.
   ageing out. Deleting the sweep with its host file would silently remove a cleanup nobody is
   watching.
 - **(b) Keep `changeset.rs` and its test tier.** It is the **only code anywhere** that reads an
-  `overlayfs` upper layer, it was **finally executed on 2026-08-02**, and it is **exactly** what a
+  `overlayfs` upper layer, it was **finally executed on 2026-08-02**, and it is what a
   revived laziness effort would want. Deleting a just-proven capability to save a file is a bad trade.
 - **(c) Keep the reflink primitive** (now `reflink-copy`). A future **local** cache — the per-node
   Depot cache of point 5, or a warm-tier snapshot fast path — wants it, and it is small.
@@ -510,7 +510,7 @@ Cancelling laziness raises a fair question: should we adopt BLAKE3 *now*, so tha
 answer is no, but the reasoning matters more than the verdict, because the instinct behind the
 question (do not paint yourself into a corner on an irreversible choice) is right.
 
-**We use SHA-256** (`sha2`, declared in the pure-domain allow-block precisely because hashing is a
+**We use SHA-256** (`sha2`, declared in the pure-domain allow-block because hashing is a
 pure function; see [0029](0029-workspace-cas.md) and [0031](0031-crate-boundaries.md)). BLAKE3 appears
 nowhere in the workspace.
 
@@ -553,7 +553,7 @@ speculative:
   a shared Postgres). The obvious HA answer, and it is what a storage service usually does. **Rejected
   on the invariant**: the moment a replica holds something unique, HA needs consensus, eviction needs
   a durability check, and spot preemption becomes a data-loss event. Every one of those problems is
-  bought back by the very thing that was supposed to solve them. Recorded because it was yesterday's
+  bought back by the thing that was supposed to solve them. Recorded because it was yesterday's
   answer — shard-by-fence with a drain protocol (`6cb4a27`) — and cancelling the lazy feed is what
   made the simpler shape available.
 - **Put the drain record in Postgres.** One table, and the problem disappears. **Rejected**: it breaks

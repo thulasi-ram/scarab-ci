@@ -4,7 +4,7 @@ How we describe Scarab in public copy (README, docs, taglines, posts). The
 architecture is decided in [ADR-0001](adr/0001-ci-as-durable-execution.md).
 This doc is about the wording, and about not claiming more than the code proves.
 
-It is based on a code audit (the durability tests were actually run) and a
+It is based on a code audit (we ran the durability tests) and a
 review of nine competitors. The conclusion comes first.
 
 ## Conclusion: "durable execution" is how it's built, not the headline
@@ -22,7 +22,7 @@ durable execution passes none of them:
 - **Not visible to most users.** Most users are on hosted SaaS (GitHub.com,
   GitLab.com, CircleCI) and never see a control plane crash. "Our control plane
   resumes after a restart" answers a question they have never asked.
-- **Not fully proven yet.** The part our code proves (Postgres crash/resume and
+- **Only partly proven so far.** The part our code proves (Postgres crash/resume and
   exactly-once, in [`crash_resume.rs`](../crates/scarab-db-postgres/tests/crash_resume.rs),
   which runs against real Postgres) is the part the durable workflow engines already have. The
   part that would set us apart is not proven: the control-plane crash test with a real Pod in
@@ -131,8 +131,8 @@ forge-native CI without enterprise overhead. Woodpecker's limits shaped it just
 as much: the many backends it has to support, and the pace a volunteer project
 can keep up. Supporting only Kubernetes drops the extra backends on purpose
 ([ADR-0005](adr/0005-tenancy-and-k8s-only.md)), and the durable core addresses
-the orphaned-build problem that Woodpecker and Drone operators actually hit.
-Show respect and say plainly where we differ; never take a swipe.
+the orphaned-build problem that Woodpecker and Drone operators hit.
+Show respect and say where we differ; never take a swipe.
 
 ## Claims we don't make (the code or the market won't back them)
 

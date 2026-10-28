@@ -52,7 +52,7 @@ helm upgrade --install scarab deploy/helm/scarab -n scarab \
   --set secrets.existingSecret=scarab-env --set scarab.s3.bucket=scarab-logs
 ```
 
-On EKS you can drop the S3 keys entirely: leave `SCARAB_S3_ACCESS_KEY` /
+On EKS you can drop the S3 keys: leave `SCARAB_S3_ACCESS_KEY` /
 `SCARAB_S3_SECRET_KEY` unset and Scarab uses AWS's ambient credential chain
 (IRSA, Pod Identity, instance role). Annotate both ServiceAccounts with the
 role, because the server and the workspace StatefulSet both reach the bucket:
@@ -315,7 +315,7 @@ Why it is built this way:
   secret would serve every step's inputs to anything that can reach the port, so
   the chart renders nothing rather than an open service.
 
-Operating it: `/readyz` is *warm writable + cold reachable*, deliberately not the
+Operating it: `/readyz` is *warm writable + cold reachable*, not the
 control plane's database check. The warm tier is bounded by **space**: an LRU
 sweep runs every 60 seconds and, once `scarab_workspace_warm_used_bytes` passes
 `scarab_workspace_warm_budget_bytes` (`workspace.warmBudgetBytes`, default 90%

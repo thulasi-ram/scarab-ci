@@ -31,11 +31,11 @@ Avoid the syntax argument by separating the semantic core from the surface synta
 - The **API pipeline schema *is* the IR** ([0012](0012-api-surface.md)); the **UI reads/writes
   the same IR**, so the UI dogfoods the API with one type system end to end.
 - Early, schema-driven validation; surface syntax can evolve without engine churn.
-- The real design work is the IR schema plus a deliberately *small* CEL binding.
+- The real design work is the IR schema plus a *small* CEL binding.
 
 ## Alternatives considered
 
 - **Code-first SDK (Dagger/Pulumi)** — the strongest typing, but "pipeline = program with a build
   step"; heavier than the 80% want. May become a *frontend* later.
-- **CUE as primary** — powerful, steep curve/small community.
+- **CUE as primary** — expressive constraint language, steep curve/small community.
 - **Plain YAML + `${{ }}` templating** — familiar, but rebuilds the mess we're avoiding.

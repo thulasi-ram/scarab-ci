@@ -41,8 +41,8 @@ mechanism it needs (grouping many small objects into one) is something the cold 
 ### The measurement that makes a direct write affordable
 
 [0066](0066-the-depot-is-a-cache.md)'s own numbers: the drain is **2.68 ms/file cold** and the cost
-is **per-request, not per-byte**: 8.19 MB in 5360 ms is absurd as bandwidth and exactly right as
-~2000 round trips. Object storage has **no batch PUT**, which is why
+is **per-request, not per-byte**: 8.19 MB in 5360 ms is absurd as bandwidth and what
+~2000 round trips at 2.68 ms cost. Object storage has **no batch PUT**, which is why
 [0066](0066-the-depot-is-a-cache.md) point 7 named packing *"the only lever"* on the per-object bill
 and deferred it to a later ADR.
 
@@ -95,7 +95,7 @@ stays and half goes:
 - **connects:** yes, to the same database, for **derived, rebuildable** reads and writes only;
 - **migrates:** never. The control plane owns every table's DDL, so a Depot rolled ahead of the
   control plane cannot half-migrate anything. That is the deployment-ordering property the guard
-  was really protecting.
+  was protecting.
 
 The DB credential already arrives in the Depot's environment via the shared Secret and is currently
 ignored (`statefulset-workspace.yaml`: *"the role simply ignores it"*), so this adds no new
@@ -135,7 +135,7 @@ Reachability still begins at the commit pack (part 8), which is written last.
 
 ### 5. The Depot streams the pack through; the pod never holds a storage credential
 
-The pod uploads to the Depot exactly as it does today. The Depot:
+The pod uploads to the Depot as it does today. The Depot:
 
 1. **verifies each member against its address** — the existing integrity boundary, unmoved. This is
    the one check no reader-side verification can replace, because only the Depot sees a
@@ -161,11 +161,11 @@ workspace before uploading anything, so it computes the trimmed closure locally 
 
 - `durable` → streamed into the pack;
 - `cache-only` → kept on the Depot's local disk, **unpromised and evictable**, which preserves the
-  post-hoc "what did this build actually produce" view without paying storage for scratch.
+  post-hoc "what did this build produce" view without paying storage for scratch.
 
 This keeps [0007](0007-step-outputs.md)'s amendment intact: `outputs:` remains a **precision** tool,
 never something an author declares for speed. The system pays the wire cost of the untrimmed
-remainder, exactly as it does today.
+remainder, as it does today.
 
 ### 7. Pack boundaries: size-capped, always closed at the drain
 
@@ -282,12 +282,12 @@ window sized from the step timeout; see `retry_window` in
   own I/O.
 - Packing needs a **dual-read migration**: look up the index, fall back to the loose object. Existing
   content stays loose; nothing is rewritten.
-- **Compaction policy is deliberately not decided here.** Part 7's drain-aligned boundary is the bet
+- **Compaction policy is not decided here.** Part 7's drain-aligned boundary is the bet
   that retention will reclaim most packs wholesale and compaction can be deferred until measured.
 
 **Scope this ADR does not carry.** Making the object store mandatory is a wide, mechanical change:
 config defaults, `values.yaml`'s empty `bucket`, ~28 test sites that boot a local directory,
-`crash_resume.rs` (which explicitly clears every `SCARAB_S3_*` variable), and CI (`ci.yml` has no
+`crash_resume.rs` (which clears every `SCARAB_S3_*` variable), and CI (`ci.yml` has no
 MinIO and `kind.yml` runs the live tier on a local directory). Note also that **no workflow runs
 `helm lint` or `helm template`**, so chart changes have no CI coverage at all today. (Done:
 `ci.yml` and `kind.yml` both start MinIO, and the `chart` job in `.github/workflows/image.yml`
@@ -301,11 +301,11 @@ touches the chart.)
   does make `replicaCount > 1` correct. Rejected as the *endpoint* because it keeps four kinds of
   replica-local state alive, and every later feature has to keep respecting them: eviction needs
   pins, scale-down needs draining, and a hot replica needs balancing. Affinity is retained here as
-  an optimisation precisely because it is cheap; it is refused as the correctness mechanism.
+  an optimisation because it is cheap; it is refused as the correctness mechanism.
 - **Move the drain record and ledger to Postgres, leave the write path alone.** Fixes two of the four
   states and leaves the other two — the pre-flush blob window and `/have`'s per-replica answer. The
   second is the expensive one: an 8× drain regression on the leg already measured as the bottleneck.
-- **Adopt the Bazel remote-execution CAS protocol.** Its shape matches ours almost exactly:
+- **Adopt the Bazel remote-execution CAS protocol.** Most of its shape maps onto ours:
   `FindMissingBlobs` is `/have`, `GetTree` is `/flat`, batch read/write is the wire work the
   transfer handoff was going to invent, and its digest carries a size, which is part 9's problem
   solved at the format level. One rejection ground originally claimed here was **wrong** and is
@@ -314,7 +314,7 @@ touches the chart.)
   `SymlinkNode` and `Directory`. The caveats are real but smaller: property support is
   server-dependent (a server may `INVALID_ARGUMENT` names it does not accept), and populated
   properties enter the `Directory` digest — the same coupling our `TreeEntry` already has. What
-  actually rules the protocol out: the tree hash **is** the recorded snapshot identity, so changing
+  rules the protocol out: the tree hash **is** the recorded snapshot identity, so changing
   the tree format changes every historical Run's root; and REAPI has no equivalent of the fence
   ledger, the `durable`/`cache-only` label, or the commit-pack atomic boundary: the parts of this
   ADR that carry its guarantees. **The design lessons are adopted (batch shape, size available
@@ -328,10 +328,10 @@ touches the chart.)
   that motivated it is **false**: the isolation grain is already the *container*, not the pod
   (`executor-k8s/src/lib.rs`: *"they are mounted into different containers … so neither credential's
   presence implies the other's"*), so the untrusted step container never sees the Depot token and a
-  storage credential could ride the same tmpfs-Secret mechanism today. The real obstacle is
+  storage credential could use the same tmpfs-Secret mechanism today. The real obstacle is
   request count: `/flat` is documented *"Not optional"* because without it a 50 000-file checkout is
   50 000 sequential round trips, and `/have` batches 5 000 hashes into one call. Direct reads
-  reinstate exactly the cost [0061](0061-workspace-data-path.md) and
+  reinstate the cost [0061](0061-workspace-data-path.md) and
   [0066](0066-the-depot-is-a-cache.md) were spent removing.
 - **One pack per drain, any size** — best possible retention grouping, but a large Step yields a
   multi-gigabyte object and reading three files means ranging into it. Part 7's cap is the
@@ -349,7 +349,7 @@ is still unbuilt. None of these reverse a decision; two refine one.
   oversized member its **own single-member pack** instead — no loose-durable side channel, so pack
   footers alone describe every durable byte. The refinement is deliberate (one code path, one
   way for packs to describe themselves) and this note is its record.
-- **Parts 8 and 11, where the operational reads happen:** the *authority* is the bucket exactly as
+- **Parts 8 and 11, where the operational reads happen:** the *authority* is the bucket as
   written — the commit pack is written last and carries the receipt, the ledger and the index. But
   the **operational read path is the Postgres rows** (`depot_drain_records`, `depot_fence_writes`,
   `depot_pack_members`): `GET /v1/drains` and closure validation read rows, not the commit pack,

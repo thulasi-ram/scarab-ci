@@ -50,7 +50,7 @@ prerequisite for logs existing.
 > **Amended 2026-08-03 by [0066](0066-the-depot-is-a-cache.md) — the Depot may be where log bytes
 > *pass through*, never where they are *durable*.** This part says the Depot "owns them", and 0066's
 > governing invariant is that **the Depot is definitionally a cache** — anything that makes it a
-> system of record is a defect. Logs on a replica's volume are precisely that.
+> system of record is a defect. Logs on a replica's volume are such a defect.
 >
 > **And the argument is HA, not merely the absence of object storage.** [0066](0066-the-depot-is-a-cache.md)
 > point 3 makes fence affinity a correctness requirement at N > 1: the control plane pins a Run to one
@@ -82,12 +82,12 @@ unique so there is no dedup to win, hashing every chunk costs something for noth
 offset index is still required to reassemble the stream. **So the Depot's volume hosts two stores**,
 the CAS and the log namespace, and that is by design.
 
-**3. Postgres keeps the byte-offset index and nothing else**, exactly as 0013 has it. Bodies never
+**3. Postgres keeps the byte-offset index and nothing else**, as 0013 has it. Bodies never
 enter the database.
 
 **4. Live tail is untouched.** `log_tail.rs` in the control plane tails Pod stdout and calls
 `LogService::append`, which broadcasts in-process for SSE. Only the **durable** write redirects to
-the Depot; replay reads from it. The split is clean because the tailing process and the storing
+the Depot; replay reads from it. The split is cheap because the tailing process and the storing
 process were already separate concerns in one binary.
 
 **5. Logs are space-bounded and evictable, and absence is loud.** They sit on a bounded volume and
@@ -108,7 +108,7 @@ branches, and the third one is what this part is about:
 
 **The eviction record explains the third branch; it must never be what triggers it.** Consulting the
 sweeper's record first and streaming whatever is on disk when no row is found gets this backwards, and it
-fails exactly where it matters: a volume that was lost or reprovisioned was never evicted by
+fails where it matters: a volume that was lost or reprovisioned was never evicted by
 anybody, so there is no row to find, and the reader gets the blank pane this decision exists to
 prevent. Nor can that case be caught by detecting the loss — **a volume's loss is not observable as
 an event.** A fresh empty volume is indistinguishable from one that never held data; there is no "I
@@ -123,9 +123,9 @@ pattern here is cheaper than finding it a third time.
 **6. The Depot says at boot whether its volume is the one the index describes.** A marker written on
 first init and recorded alongside the index; on boot, a missing or mismatched marker means the volume
 is new. Without it, an operator's only evidence is a trickle of individually unremarkable per-Run
-absences — each correctly reported, none of them saying *the storage under this Depot is not the
+absences — each true on its own, none of them saying *the storage under this Depot is not the
 storage this database describes*. This is one clear warning at the moment it becomes true, and
-deliberately **not** a claim on any Attempt's record: per-Attempt durability is what tiering carries
+**not** a claim on any Attempt's record: per-Attempt durability is what tiering carries
 ([0064](0064-durability-tiering-and-the-write-path.md) part 5) for the classes that can be
 re-derived. Logs do not carry it. The operator configures a durable sink or does not, and a log that
 is gone is gone for wanted and unwanted reasons alike — a distinction with no available action behind
@@ -170,7 +170,7 @@ under `crates/scarab-server/src/`, the chart still ships `statefulset-workspace.
 `Justfile` still has `workspace-logs` and `workspace-status`. The repo `CLAUDE.md` uses the
 names the code has.)
 
-**Deliberately not renamed**, because they are correctly named: **Workspace**, **Workspace
+**Not renamed**, because the names still fit: **Workspace**, **Workspace
 Snapshot** and **Workspace Export** are domain terms about workspaces;
 `SCARAB_WORKSPACE_TOKEN_SECRET` mints the token a Step Pod presents to read *workspace snapshots*
 and its claims are literally snapshot `roots`, so it is the workspace token rather than the Depot's
@@ -206,7 +206,7 @@ of the existing one — a decision for then, not a rename now.
   deliberate. 0064 stamps a class that can be *re-derived*, where knowing "this one was never
   archived" tells a reader which Runs are worth re-running; for logs there is no recompute path, so
   the stamp distinguishes two states with the same available action — none. The engine would also be
-  second-guessing a choice it delegated: a warm-only deployment is supported precisely because
+  second-guessing a choice it delegated: a warm-only deployment is supported because
   durability is the operator's cost decision. Part 5's disclosure duty is met by absence being loud
   at read time and by part 6 being loud at boot. Note that the data needed is already *present* (part
   8's pin requires per-chunk sink-acknowledgement state), so this is a decision about what to
@@ -234,13 +234,13 @@ of the existing one — a decision for then, not a rename now.
   stop implying it measures only the CAS (git-bug `1a9df08`, which already covers the Farm half of
   the same drift).
 
-## Open — deliberately not decided here
+## Open — not decided here
 
 **Whether logs already in the object store stay readable after the move.** [0013](0013-history-and-observability.md)'s
 arrangement puts bodies in the object store and offsets in Postgres. This ADR redirects both the write
 and the read to the Depot, so for an Attempt written *before* the move the offsets stay valid and the
-bytes stay exactly where they are — in a store the read path no longer consults. Nothing is
-corrupted. The logs simply become unreachable, and part 5 reports them, correctly, as gone.
+bytes stay where they are — in a store the read path no longer consults. Nothing is
+corrupted. The logs become unreachable, and part 5 reports them as gone.
 
 Three candidates, none chosen:
 
@@ -248,7 +248,7 @@ Three candidates, none chosen:
    read path for a set of rows that only shrinks.
 2. **Copy the bytes onto the Depot once**, at startup or as a one-shot job — with the usual
    restart-safety and partial-copy questions a migration always brings.
-3. **Declare pre-migration logs dropped** and let part 5 report them accurately.
+3. **Declare pre-migration logs dropped** and let part 5 report them as gone.
 
 **Why this can wait:** nothing is released, so the affected population is dogfood Runs, and part 5
 already makes the outcome visible rather than mysterious, which is the property whose absence made
@@ -258,7 +258,7 @@ against logs that have since been written, pinned and swept.
 
 **Whoever lands the slice decides this by default.** Implementing [0063](0063-step-logs-on-the-data-depot.md)
 part 1 without reading this section selects option 3, silently. That is an acceptable outcome and an
-unacceptable way to arrive at it, so `72dfe6f` says so explicitly.
+unacceptable way to arrive at it, so `72dfe6f` says so.
 
 ## References
 

@@ -70,7 +70,7 @@ Reuse splits by trust boundary, and each side uses a mechanism we already have:
 - **No new subsystem, no marketplace, no SDK.** The OCI registry is the plugin ecosystem
   ([0008](0008-step-contract.md)); `.scarab/lib` is the module ecosystem (local); vendoring bridges
   them. Maximally consistent with the design principle "fewer concepts, strictly more power".
-- **`invoke` must actually be built** (it does not exist): the step kind, compile-time inlining with
+- **`invoke` must be built** (it does not exist): the step kind, compile-time inlining with
   the corollaries above, and an explicit `inputs:`/`outputs:` interface validated at compile
   (explicit over ambient — consistent with the secret-scope stance in [0037](0037-environment-governance.md)).
 - **`matrix` × `invoke` needs no extra work:** because `matrix` ([0023](0023-dag-shape.md)) is an orthogonal
@@ -85,7 +85,7 @@ Reuse splits by trust boundary, and each side uses a mechanism we already have:
 
 - **A runtime sub-pipeline object** (a StepRun owning child StepRuns) — matches a naive reading of
   [0025](0025-cross-pipeline-orchestration.md)'s "nesting," but introduces a new durable object shape
-  that [0006](0006-pipeline-ontology.md) explicitly called "sugar, not structure." Rejected; the
+  that [0006](0006-pipeline-ontology.md) called "sugar, not structure." Rejected; the
   real runtime lineage boundary is `on: upstream`.
 - **Remote `invoke`** (`invoke: github.com/org/repo//lib@sha`) — convenient, but reopens the trust
   boundary: un-vendored third-party *composition* flattens into your Run with full scope. Rejected in

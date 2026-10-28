@@ -29,7 +29,7 @@ code*, and *who/what caused it*. Today the run read models (runs list +
 The gap that motivated this ADR: the runs list and run header show a bare
 commit sha and `push`/`manual`, with **no human-readable context** — you can't
 tell *what* a push changed or *why* someone dispatched a run without leaving
-Scarab. The normalized `Event` (ADR-0046, `scarab-forge`) deliberately discards
+Scarab. The normalized `Event` (ADR-0046, `scarab-forge`) discards
 this: `Event::Push` keeps only `{actor, repo, ref, after}` (no message),
 `Event::PullRequest` only `{actor, repo, number, head, fork}` (no title/base), and
 `Event::Manual`/`Api` have no reason. The data exists in every forge's webhook
@@ -38,7 +38,7 @@ it is thrown away at normalization.
 
 The origin-stamping work (migration `0028_run_origin.sql`; no dedicated ADR) set
 the precedent for origin facts: **discrete, independently-nullable columns, never
-a bundle blob**, extracting *exactly the facts the UI shows*. This ADR extends
+a bundle blob**, extracting *only the facts the UI shows*. This ADR extends
 that model rather than inventing a new one.
 
 ## Decision
@@ -66,7 +66,7 @@ wanted, that is the trigger to revisit discrete columns.
 
 Bounds: store the **subject line only** for commits (drop the body). Truncate
 `trigger_title` to a fixed cap server-side (**200 chars**), on a **char/grapheme
-boundary** (never mid-UTF-8-sequence), and store the value **clean — no ellipsis
+boundary** (never mid-UTF-8-sequence), and store the value **with no ellipsis
 marker**. The DB holds exactly the first 200 chars; the UI owns the overflow signal
 (tooltip / clamp). 200 covers effectively every real subject/PR title (GitHub
 hard-limits PR titles at 256, soft-wraps subjects at ~72); the cap is an
@@ -130,13 +130,13 @@ a global switch and not a dispatch-endpoint check:
   there reuses the exact ADR-0037 machinery; checking it at dispatch would force
   the endpoint to compile the IR and duplicate admission.
 - The check fires iff **`env.require_reason && trigger_kind ∈ {manual, api} &&
-  reason is empty`**. Scoped to `manual`/`api` deliberately: those are the
+  reason is empty`**. Scoped to `manual`/`api`: those are the
   human-initiated deploys where a person could type a justification. `push` /
   `pull_request` / `tag` / `release` carry their own intrinsic headline (commit
   subject / PR title / tag) and are exempt — the audit target is "someone
   hand-clicked deploy-to-prod without saying why," not "block automated
   triggers." `cron` / `upstream` (machine-initiated, no human to prompt) are
-  likewise exempt. A blocked run reports the violation exactly like a missing
+  likewise exempt. A blocked run reports the violation like a missing
   approval.
 
 ### 4. Read models + UI
@@ -164,7 +164,7 @@ a global switch and not a dispatch-endpoint check:
 
 ### Analysis — other provenance details considered
 
-Enumerated so each is accepted/deferred explicitly:
+Enumerated so that none is accepted or deferred by omission:
 
 1. **Commit author vs pusher** — GitHub distinguishes `head_commit.author` from
    `sender`. Actor today = sender. **Deferred** — one "who" is enough for v1;
@@ -214,7 +214,7 @@ Enumerated so each is accepted/deferred explicitly:
 
 - Migration `0032_run_trigger_title.sql` — nullable `runs.trigger_title TEXT` and
   `runs.origin_pr_base TEXT` (no backfill — pre-migration runs show no headline /
-  base, exactly as origin/pipeline degrade). A separate migration adds
+  base, as origin/pipeline degrade). A separate migration adds
   `require_reason` to the environment protection-rules storage.
 - `Event` enum changes ripple to both adapters + their tests, the trigger/webhook
   path, and the dispatch API. This is the bulk of the work and the main risk
@@ -236,7 +236,7 @@ The seven open questions, as resolved in the `/grill-with-docs` session:
 1. **One `trigger_title` vs discrete vs JSON** → **one column**, display-only. No
    per-facet filtering foreseen; discrete columns are the fallback if it is.
 2. **Commit subject vs full message; cap** → **subject-line only**, 200-char
-   server cap, char-boundary-safe, stored clean (no ellipsis; UI owns overflow).
+   server cap, char-boundary-safe, stored with no ellipsis (UI owns overflow).
 3. **PR base branch** → **included now** as discrete `origin_pr_base`, rendered
    `base ← head`.
 4. **Manual reason optional or required** → **optional at dispatch**, with
@@ -255,7 +255,7 @@ The seven open questions, as resolved in the `/grill-with-docs` session:
 ## Amendment (2026-07-21): run identity — internal id vs. run number, and the gutter layout
 
 Implementing §4 raised two follow-on decisions the original ADR left implicit:
-*what a run's id actually is*, and *where the headline sits*. Both are resolved
+*what a run's id is*, and *where the headline sits*. Both are resolved
 here. Explored visually against the running UI before committing.
 
 ### 1. Two identifiers, two jobs
@@ -290,12 +290,12 @@ ids keep v4 — they are not sortable keys.
 transaction as `MAX(run_number)+1` scoped to `(org, project)`, guarded by a
 `UNIQUE (org, project, run_number)` constraint (retry-on-conflict). Rejected
 alternatives: a **global** sequence (leaks total run volume across tenants, and
-needs cross-tenant coordination — GitHub/GitLab number *per repo* for exactly
+needs cross-tenant coordination — GitHub/GitLab number *per repo* for
 this reason) and **sequential-as-the-primary-key** (enumerable + inverts the
 in-process mint-then-persist flow). Gaps are acceptable (a rolled-back creation
 may burn a number, as on every forge). **Untenanted / inline runs** (`POST
 /v1/runs` with no org/project) get a **null** run number — they have no repo to
-number within, and degrade in the UI exactly as pre-stamping origin does.
+number within, and degrade in the UI as pre-stamping origin does.
 
 ### 2. Read models + migration
 

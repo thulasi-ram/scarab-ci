@@ -27,7 +27,7 @@ Neither of the two existing channels can carry it, because of how each is built.
 
 **Logs are the Pod's stdout.** `Executor::log_stream` is the k8s log endpoint and
 nothing else. A Pod that never started never printed, so the log stream is empty
-*precisely because of* the condition an operator is trying to diagnose. The
+*because of* the condition an operator is trying to diagnose. The
 correlation is perfect and backwards: the worse the failure, the less the log
 pane says. `log_tail.rs` already detects this (`NOT_READY_GRACE`,
 `STUCK_WARN_INTERVAL`) and sends it to `tracing::warn!` — the server's own log,
@@ -76,14 +76,14 @@ run.
 
 ### 2. Emission is not observation
 
-Polling and appending run on deliberately different cadences. One fence is
+Polling and appending run on different cadences. One fence is
 polled every 30s; an event is written only when the condition **changes** —
 once at onset, once when it clears or the attempt ends.
 
 This is a performance requirement, not tidiness. The run's event log is walked in full on the
 scheduler's hot path: `settle_failed_attempt` scans every event of the run to
 count `AttemptStarted` against the retry budget. A per-poll diagnostic would tax
-exactly the runs already in trouble, and would get *worse* the longer they
+the runs already in trouble, and would get *worse* the longer they
 stayed in trouble. A Pod stuck for the full hour costs two rows.
 
 The closing event carries `held_ms` and `observations`, and the UI leads with
@@ -92,13 +92,13 @@ duration. The count is an artifact of the kubelet's backoff schedule; "stuck in
 
 Change is keyed on `(reason, message)`, not `reason` alone: the same
 `FailedScheduling` label carrying first insufficient CPU and later an untolerated
-taint is a different problem, and it is exactly the transition worth
+taint is a different problem, and it is the transition worth
 seeing.
 
 ### 3. Narrative, never authoritative
 
 Nothing in the engine folds `StepInfraCondition`. Admission, the retry budget and
-completion all ignore it and must keep ignoring it. The verdict stays entirely
+completion all ignore it and must keep ignoring it. The verdict stays
 with `Executor::poll` and the scheduler; the observer only describes.
 
 ### 4. The terminal stamp stays

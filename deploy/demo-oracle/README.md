@@ -126,7 +126,7 @@ world-readable on a public box.
 was up baked 79 lines of kube-proxy / kube-router / flannel runtime chains into
 the file, including stale `kube-dns … has no endpoints -j REJECT` rules, which
 `netfilter-persistent` then restores **at boot, before k3s starts**. kube-proxy
-full-syncs and heals it, but a persisted DNS reject is exactly the kind of
+full-syncs and heals it, but a persisted DNS reject is the kind of
 failure that section is meant to prevent. The save is now skipped when k3s is
 already installed.
 
@@ -178,7 +178,7 @@ Rough budget of the 12 GB:
 
 `steps.yaml` caps a step at 2 GiB by default and 4 GiB by request, and gives
 every container a 250m CPU **request** so the scheduler queues step Pods rather
-than packing two cores past what fits. There is deliberately **no CPU limit** (see the
+than packing two cores past what fits. There is **no CPU limit** (see the
 comments in that file): a CPU limit throttles the wsfetch drain's hashing, and
 the step's own wall-clock deadline (`stepTimeoutSecs: 1800`) is the real bound.
 
@@ -188,7 +188,7 @@ spikes: an in-Pod `cargo check`, and the drain hashing and uploading
 classifies **Transient**, and the retry burns both cores again on a run that
 dies the same way.
 
-### Retention is deliberately short
+### Retention is shorter than the default
 
 Set through `scarab.extraEnv` (the chart has no stanza for these; the names are
 `SCARAB_RETENTION_*` from `crates/scarab-server/src/config.rs`):
@@ -326,7 +326,7 @@ uses managed Postgres.
 
 A LimitRange applies to every Pod in its namespace; there is no way to scope one
 to "just the step Pods". In the release namespace it would also hit the workspace
-StatefulSet, and the default it injects is exactly what the chart warns against
+StatefulSet, and the default it injects is what the chart warns against
 there: a CPU limit throttles the drain's hashing, and the drain clock is already
 the liveness bound. Two namespaces let step Pods be capped without capping
 the data plane too.

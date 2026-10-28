@@ -68,7 +68,7 @@ binding step *is* the missing **repo→Project onboarding** flow.
   its bound Projects, and credential/delivery health; offers a **"Manage on GitHub →"** deep
   link and a **re-sync** action (re-fetch `installation_repositories` to heal a missed
   webhook). Auto-bind is untouched.
-- **Forgejo is fully in-product.** Admin creates a connection (`base_url` + credential), binds
+- **Forgejo is set up in the product.** Admin creates a connection (`base_url` + credential), binds
   repos (**creating Projects**), and registers per-repo webhooks ([0046] `register_webhook`).
 
 ### D. A connection has exactly one owner: config **or** DB — never both
@@ -122,7 +122,7 @@ both known GitHub App misconfigurations look like. Both fail *silently*:
   while the Run itself goes green, so the forge never shows a check.
 
 So a **preflight** — `GET /v1/connections/{id}/preflight` — mints the app's credential, asks
-the forge what it is *actually* granted and subscribed to, and diffs that against what
+the forge what it is granted and subscribed to, and diffs that against what
 Scarab needs. It rests on three decisions:
 
 - **The requirement set is data, in one place** (`scarab-forge::preflight`, keyed by
@@ -145,7 +145,7 @@ Scarab needs. It rests on three decisions:
 
 ## Consequences
 
-- Forgejo becomes **actually onboardable** from the product for the first time — the [0046]
+- Forgejo becomes **onboardable** from the product for the first time — the [0046]
   multi-adapter promise works in practice, not only in the model.
 - Org and Environment secrets get a real editing home; the [0037] matrix stops being read-only
   and becomes the single mental model for "what resolves where."
@@ -171,7 +171,7 @@ Scarab needs. It rests on three decisions:
   for the matrix-as-editor.
 - **Observe-only connections** — small, but re-displays GitHub facts already implicit and
   leaves Forgejo unusable. Rejected; the value is the onboarding flow.
-- **Config seeds, UI overrides win** — reads as flexible but is exactly the dual-write drift
+- **Config seeds, UI overrides win** — reads as flexible but is the dual-write drift
   trap: IaC and the running system disagree with no authority. Rejected for single-owner.
 - **Rename `SecretScope::Repo → Project` + `project=` API param** — more internally consistent
   but broad mechanical churn across crates for a concept users never see, risking collision

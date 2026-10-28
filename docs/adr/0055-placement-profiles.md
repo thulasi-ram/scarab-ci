@@ -43,7 +43,7 @@ Two kinds of leak must both be avoided, not just one:
 
 A named-profile reference has no k8s leak but a bounded topology leak (the profile name). Raw
 k8s has both. `size:` tiers ([0026]) are a third, separate mistake: they hide a *magnitude*
-(cpu/mem) the author would rather state exactly.
+(cpu/mem) the author would rather state as a number.
 
 ## Decision
 
@@ -92,7 +92,7 @@ pipeline involvement.
 - **`k8s_overlay: { … }`** (on a step) — a raw pod-spec fragment, strategic-merged onto the
   generated Pod **last** (so it wins). The `k8s_` prefix is deliberate: it makes the
   dependency on the k8s backend obvious (a pipeline using it will not run on the local/dev executor).
-- It **carries no authority** — exactly like `add_capabilities`/`privileged` in [0039]. At
+- It **carries no authority** — like `add_capabilities`/`privileged` in [0039]. At
   admission the engine checks whether the run's target Environment permits raw overlays:
   - **permitted** → merged onto the Pod;
   - **not permitted** → the run is **rejected, fail-closed** (never silently dropped).
@@ -136,7 +136,7 @@ pipeline involvement.
 ## Alternatives considered
 
 - **Capability matching** (job declares `runs_on: [arm64, critical]` *needs*; profiles
-  advertise `provides: [...]`; the engine matches). Eliminates the topology leak entirely, but
+  advertise `provides: [...]`; the engine matches). Eliminates the topology leak, but
   adds a matcher, tie-break rules, and a shared capability vocabulary — more machinery than a
   single cluster warrants. Composing *named* profiles (C, plural) captures most of the
   compositional benefit (orthogonal arch/tier/gpu profiles) without a matcher; the leak it
@@ -146,12 +146,12 @@ pipeline involvement.
   leaks, and the exact fragility that forced ACME's two admission controllers. Rejected;
   survives only as the governed `k8s_overlay` for Case 2.
 - **`size:` named tiers** ([0026], CircleCI `resource_class`) — hides the magnitude the author
-  wants to state precisely and invites cost-blindness. Dropped.
+  wants to state as a number and invites cost-blindness. Dropped.
 - **Placement as an `Environment` field** ([0037] entity) — placement is per-step and
   mandatory-by-cluster even for runs that target *no* Environment (a PR-test step still needs
   the toleration). Binding it to the optional, pipeline-level Environment would leave un-placed
   steps. Placement is its own cluster-scoped concern.
-- **Fully resource-derived placement** (no placement field; pool chosen from cpu/mem) — elegant
+- **Resource-derived placement** (no placement field; pool chosen from cpu/mem) — works
   for magnitudes, but cannot express a qualitative business tier (`critical`), which is not a
   number. Kept as a possible future routing convenience, not the primary interface.
 - **Naming: `pool` / `RunProfile` / `AllocationProfile` / `provision_config`.** `pool` leaks

@@ -31,7 +31,7 @@ The comment at `tiered.rs:250` says so in as many words: *"Cold first: this is t
 `Succeeded`."*
 
 Two problems with that mechanism came out of building [0062](0062-workspace-export-lazy-without-node-driver.md)'s
-drain, and one came out of checking what actually backs each tier.
+drain, and one came out of checking what backs each tier.
 
 **The per-blob cold round-trip is the cost this whole line of ADRs exists to remove.**
 `TieredCas::ingest` is:
@@ -98,7 +98,7 @@ which is a perfectly good cold tier, and accept nothing else. The guarantee come
 and `st_dev` measures one half of it.
 
 **4. Where there is no independent cold tier, the Depot degrades gracefully rather than refusing.**
-Warm gates `Succeeded`, and the deployment says clearly that its durability is warm-only: at
+Warm gates `Succeeded`, and the deployment says that its durability is warm-only: at
 startup, and stamped on the record (below). Refusing to boot was considered and rejected — it
 re-imposes object storage as a prerequisite, which [0061](0061-workspace-data-path.md) declines to do
 even for the CAS ("an operator's cost decision, not an engine decision").
@@ -117,7 +117,7 @@ the three tier strings the Depot serialises everywhere — `FlushResponse.tier`,
 `NULL` means unknown (an Attempt from before this slice, or a flush answered by an older Depot
 during deploy skew) — recorded as unknown, never defaulted.
 
-### The amendment to 0061 part 4, stated plainly
+### The amendment to 0061 part 4
 
 Part 4 as written is unconditional, and allowing `Succeeded` on warm alone contradicts it — 0061's own
 retention table says warm "promises none". So this **amends part 4**, and the amendment is marked in
@@ -135,7 +135,7 @@ version — success implying an archive that was never written. Disclosure plus 
 preserves the invariant under a weaker mechanism, which is why this is an amendment rather than a
 retreat.
 
-0061 also explicitly forbade a related thing, and that prohibition **stands**:
+0061 also forbade a related thing, and that prohibition **stands**:
 
 > *"writing warm-first and letting the service tier onward would make durability depend on the warm
 > tier, which part 4 forbids."*
@@ -190,10 +190,10 @@ accepted; the read leg still refuses it.
 
 - **Keep cold-first per blob (status quo).** The invariant comes free and needs no disclosure
   mechanism. Rejected on cost: a network round-trip per file on the critical path, plus a second full
-  walk, is precisely the per-file cost 0061 and 0062 exist to eliminate.
+  walk, is the per-file cost 0061 and 0062 exist to eliminate.
 - **Warm-first with asynchronous archival, `Succeeded` on warm.** The fastest option, and the one
   first proposed in the discussion that produced this ADR. Rejected: it makes durability depend on warm,
-  which is what part 4 forbids and what 0061 named explicitly. It also requires the
+  which is what part 4 forbids and what 0061 named. It also requires the
   machinery that follows from that choice — an eviction pin for un-archived snapshots, and a state
   for an Attempt whose evidence was lost after it went green, which would mean a `Succeeded` Attempt
   becoming un-green *after downstream Steps consumed it and the forge already showed a checkmark*.

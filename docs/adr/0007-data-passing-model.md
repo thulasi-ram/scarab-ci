@@ -33,15 +33,15 @@ merged content-addressed workspace of its `needs` (GHA ergonomics). It *may* dec
 - Workspace mechanism is per-file merkle CAS ([0029](0029-workspace-cas.md)).
 - More concepts to learn than a 2-concept minimal model; we think it is worth it.
 
-## Amendment (2026-07-25) — explicit workspace I/O is fully built
+## Amendment (2026-07-25) — explicit workspace I/O is built
 
 Both halves of "explicit-on-demand" now ship:
 
 - **`inputs:`** (2026-07-24) — a subset of `needs` whose workspaces flow in; also sharpens the
   rerun invalidation signature (`workspace_inputs` / `input_signature`).
 - **`outputs:`** (2026-07-25) — the workspace-relative paths a step publishes downstream.
-  Authored paths ride the step Pod (`scarab.io/workspace-outputs`), and the egress leg prunes the
-  post-step snapshot to exactly those paths via `scarab_storage::prune_tree`. **Fail-closed:** a
+  Authored paths are written to the step Pod as an annotation (`scarab.io/workspace-outputs`), and the egress leg prunes the
+  post-step snapshot to only those paths via `scarab_storage::prune_tree`. **Fail-closed:** a
   declared path the step did not produce fails the step with a permanent, author-fixable verdict
   (`FailureClass::Config`) — never a quietly narrower publish.
 
@@ -68,9 +68,9 @@ optimisation, not a rule authors must learn.
 
 Also note the vocabulary split in [CONTEXT.md](../../CONTEXT.md): the mutable filesystem a
 Step runs in is a **Workspace**; the immutable content-addressed tree on the DAG edge — the
-thing this ADR's `inputs:`/`outputs:` actually govern — is a **Workspace Snapshot**.
+thing this ADR's `inputs:`/`outputs:` govern — is a **Workspace Snapshot**.
 
-## Amendment (2026-08-26) — fan-in merge semantics, stated exactly
+## Amendment (2026-08-26) — fan-in merge semantics
 
 "The merged content-addressed workspace of its `needs`" above left *merged* undefined. It has one
 meaning, now pinned: the workspace is built by replaying each consumed input's Workspace Snapshot,

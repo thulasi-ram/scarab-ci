@@ -58,7 +58,7 @@ features come from it: resuming a run, restarting a single step, approval gates 
 restart, and an event log you can inspect. It matters most as pipelines get longer and more
 autonomous (agents, multi-day workflows, long review gates),
 where "the job died, click re-run" is no longer good enough. Scarab holds a suspended
-run at near-zero cost and resumes exactly where it paused.
+run at near-zero cost and resumes where it paused.
 
 **Lineage.** Scarab's design owes a lot to [Woodpecker](https://woodpecker-ci.org/), a lean,
 forge-native CI without enterprise overhead. Woodpecker's limits shaped it just as much: the
@@ -231,7 +231,7 @@ Requires `docker`, `kind`, `kubectl`, `cargo`, and `python3`. The kind cluster's
 kubeconfig is written to `deploy/local-proc/.kubeconfig` and used only via
 `KUBECONFIG`, so Scarab never touches an ambient (e.g. production) context.
 Postgres is published on **55432** to avoid clashing with a host Postgres on
-5432. Config is entirely env-driven (`SCARAB_DATABASE_URL`, `SCARAB_S3_*`,
+5432. All config comes from environment variables (`SCARAB_DATABASE_URL`, `SCARAB_S3_*`,
 `KUBECONFIG`, `SCARAB_NAMESPACE`) — see `Justfile` and `deploy/local-proc/`.
 
 Without Docker/kind, the server still runs API-only against a local Postgres and

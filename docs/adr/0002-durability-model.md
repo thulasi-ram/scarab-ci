@@ -14,7 +14,7 @@ could ("resume a `docker build` from the middle") would undermine the whole desi
 
 ## Decision
 
-Draw the durability boundary explicitly:
+Draw the durability boundary:
 
 - **Durable & exactly-once:** the DAG state machine (which steps ran, exit codes, output
   manifests) and the append-only event log.
@@ -27,7 +27,7 @@ Draw the durability boundary explicitly:
 Therefore: **Resume** = re-drive the DAG from the last durably-recorded state (finished steps
 stay finished, zero user work). **Restart step** = re-run the black-box container.
 
-We explicitly **do not** adopt Concourse's "resource" (put/get) model as a core concept; the
+We **do not** adopt Concourse's "resource" (put/get) model as a core concept; the
 output-commit protocol is reserved in the IR for later, not built now.
 
 ## Consequences

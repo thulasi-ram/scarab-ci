@@ -10,7 +10,7 @@
 ## Context
 
 Slices 3–5 are being built by an unattended loop. To avoid mid-run guessing, this ADR fixes the
-important *implementation* choices those slices' ADRs left open. These are defaults consistent
+*implementation* choices those slices' ADRs left open. These are defaults consistent
 with the accepted ADRs; two (GitHub auth, OIDC subject) were confirmed with the maintainer.
 
 ## Decision
@@ -40,7 +40,7 @@ with the accepted ADRs; two (GitHub auth, OIDC subject) were confirmed with the 
 - **Concurrency group:** key = a CEL-interpolated string from the IR (`concurrency.group`); policy
   `concurrency.policy ∈ {queue, cancel-in-progress}`, default `queue`. Durable slot/queue rows.
 - **Auto-cancel superseded:** ON by default for non-deploy pipelines, keyed by (repo, ref,
-  pipeline); OFF when the pipeline targets an Environment (deploy) or explicitly opts out.
+  pipeline); OFF when the pipeline targets an Environment (deploy) or opts out.
 - **Fairness/backpressure:** per-project max concurrent runs (config, default 20) + a global
   max-in-flight (config, default effectively unbounded); excess waits durably in queue. Integer
   `priority` (higher first), default 0.

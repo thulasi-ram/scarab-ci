@@ -16,7 +16,7 @@ documented this scaling limit).
 
 The deciding factor: because [0002](0002-durability-model.md) rejects deterministic step replay,
 a general durable-execution engine would be used for ~20% of its power at 100% of its
-operational and conceptual cost. The slice we actually need — a crash-safe DAG state machine
+operational and conceptual cost. The slice we need — a crash-safe DAG state machine
 with a reliable work queue and idempotent dispatch — is small and well-understood on Postgres.
 
 ## Decision

@@ -38,4 +38,4 @@ decisions. Recorded together for traceability; each may be split into its own AD
 
 ## Alternatives considered
 
-- Deferring these entirely — leaves obvious gaps; recording the defaults now avoids drift.
+- Deferring these — leaves obvious gaps; recording the defaults now avoids drift.

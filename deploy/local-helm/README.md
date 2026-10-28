@@ -33,7 +33,7 @@ plus a fallback path means two code paths to reason about.
 Its token secret is generated once into `deploy/local-helm/.workspace-token-secret`
 (gitignored) rather than per deploy. The control plane issues tokens with it and
 the service verifies them, so a value that rotated on every `just local-helm`
-would invalidate every in-flight Step's credential mid-run and look exactly like
+would invalidate every in-flight Step's credential mid-run and look like
 the service being down. It **must not** equal `SCARAB_RESULTS_TOKEN_SECRET`;
 `deploy.sh` refuses if it does.
 
@@ -81,7 +81,7 @@ just local-helm              # ghcr `edge`
 just local-helm sha-<sha>    # a published SHA; refused if it predates ADR-0061
 ```
 
-There is deliberately **no flag that disables the workspace service** to work
+There is **no flag that disables the workspace service** to work
 around this, and none should be added. ADR-0061 puts it in the standard path in
 every deployment mode because a fast path plus a fallback path means two code
 paths to reason about. If `workspace.enabled=false` became a documented workaround, the
@@ -187,7 +187,7 @@ deploy/local-helm/reseed.sh                     # fresh DB only: register the in
 > the colima **Kubernetes** node. If a Pod reports `ErrImageNeverPull` /
 > `ImagePullBackOff`, the node can't see the local build (colima's k8s reads
 > containerd, not the Docker store). Prefer the ghcr path, or import the images
-> into the node's store. The pull paths avoid this entirely (the node pulls from
+> into the node's store. The pull paths avoid this (the node pulls from
 > ghcr directly).
 `deploy.sh` renders a transient Helm values file from `.env` (passed as a file rather
 than `--set`, and deleted on exit, so secrets stay off the CLI and off disk). `reseed.sh` reads the webhook secret from the

@@ -6,7 +6,7 @@
 
 ## Context
 
-The most important distinction, and one almost no CI models, is **infra failure vs step
+The distinction this ADR turns on, and one almost no CI models, is **infra failure vs step
 failure**. On k8s, infra failures (eviction, OOM, spot reclaim, image-pull backoff) are
 *common* and safe to retry; step failures (process exit ≠ 0) mean the user's code failed and
 retrying usually burns minutes and hides flakiness.

@@ -69,7 +69,7 @@ it becomes the evidence unit. Logs (`log_chunks`) already comply.
   workspace inheritance), whose semantics are unchanged.
 - **`attempts.consumed JSONB`** — a map `upstream step → attempt id` stamped at
   attempt launch: which upstream attempt's outputs/workspace this attempt
-  actually consumed. Recorded, not inferred — after a mid-run restart, `test@2`
+  consumed. Recorded, not inferred — after a mid-run restart, `test@2`
   consumed `build@2` while a smart-skipped `deploy` still stands on `build@1`;
   that mixed frontier is now recorded durably instead of reconstructed from timestamps.
 - **Artifacts become immutable per attempt**: key
@@ -86,7 +86,7 @@ it becomes the evidence unit. Logs (`log_chunks`) already comply.
 - **Snapshot-at-boundary**: a closed Take's view is the run frozen at the
   instant of the restart press. An attempt straddling the boundary (started in
   Take 1, finished in Take 2) shows as *running* in Take 1 — the state a
-  bystander actually observed — with a "finished in Take 2 →" affordance.
+  bystander observed — with a "finished in Take 2 →" affordance.
   Outcome-absorbing attribution was rejected: it reintroduces take
   bookkeeping and can render a state that never existed at any wall-clock
   moment.
@@ -119,7 +119,7 @@ frontiers from the event log it already fetches.
 ## Alternatives considered
 
 - **GHA-style run-level attempt counter** — wrong unit for per-step restart;
-  forces whole-run re-execution semantics Scarab deliberately avoids (0027).
+  forces whole-run re-execution semantics Scarab avoids (0027).
 - **Stored `take_version` column** — derivable from the event log; storing it
   couples the engine to a read-model concept and invites drift.
 - **Latest-wins evidence + provenance tag only** — cheaper, but keeps
@@ -137,11 +137,11 @@ found the two history controls (a `Take` dropdown + a per-step attempt strip)
 were presented as confusing **peers**. This amendment fixes the user-facing model
 and sharpens the re-execution vocabulary. It changes **no execution semantics**;
 `superseded`, `shadowed`, and the `cascade` cause are all derived client-side
-from the existing event log, exactly as Takes are.
+from the existing event log, as Takes are.
 
 ### One mental model: the run is a timeline; the pipeline is its fixed shape
 
-The pipeline is *space* (what runs after what); the run is *time* (what actually
+The pipeline is *space* (what runs after what); the run is *time* (what
 happened). Every step **try** (Attempt) is kept, immutable, read-only, until the
 run's TTL. "Take"/"attempt" are **internal words** and are never shown
 verbatim; the user sees a **row per rerun** and a per-step **tries** strip.
@@ -161,7 +161,7 @@ failed step is just a `rerun` of a terminal step (one human control on the
 screen, not two). This *confirms and generalizes* the original "every restart
 mints a Take": a rerun of a dead-lettered step is a real new version — the
 "before" is *the run that died*, the "after" is *the run revived and continued* —
-so `restart_step` correctly emits `RunRestartRequested` on **every** press,
+so `restart_step` emits `RunRestartRequested` on **every** press,
 regardless of the target's prior status. (Auto-retry emits no boundary.)
 
 ### Attempt causes gain `cascade`
@@ -193,7 +193,7 @@ The DAG, the selected step's evidence (logs/results/outputs/files), and a
 **version-aware Artifacts footer** merge into a single `PIPELINE` component:
 
 - **zoom out** = an **always-present version dropdown** on the component header
-  (rich rows: cause + time + result; single-version state reads "latest · live").
+  (each row: cause + time + result; single-version state reads "latest · live").
 - **zoom in** = the selected step's **tries** strip, chips labelled by cause
   (auto-retry / you reran / ⟵ cascade) and outcome (✗ / ⊘ superseded / shadowed).
 
@@ -384,7 +384,7 @@ Recorded so the design is not lost. (Done: built in the web-UI "redesign stages
 1–4", commits `f761f72`…`fc60556`. Two controls changed shape later: the version
 rail became `VersionDropdown.tsx` and the filmstrip became `AttemptsDropdown.tsx`,
 both under `ui/scarab-web-ui/src/components/`.) One screen
-that is really a **3-axis selector (version × step × try)** feeding five evidence
+that is a **3-axis selector (version × step × try)** feeding five evidence
 views (Logs / Results / Outputs / Workspace, plus run-level Artifacts). Each
 control is chosen by the **cardinality** of its axis:
 

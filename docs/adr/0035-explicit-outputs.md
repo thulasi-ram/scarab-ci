@@ -24,7 +24,7 @@ workspace it publishes. Absent = the whole workspace (the implicit default).
   travels in the run's stored IR (self-describing, [0022](0022-run-versioning.md)).
 - **Enforced on the live-workspace path.** The restriction happens at the
   post-step CAS snapshot ([0029](0029-workspace-cas.md)): the executor ingests
-  only the declared paths, so the output tree hash reflects exactly them. That
+  only the declared paths, so the output tree hash reflects only them. That
   ingest is part of the live k8s post-step workspace path, so enforcement lands
   with it; the executor reads `outputs:` from the run IR. (done: built 2026-07-25;
   the k8s executor reads the paths from the `scarab.io/workspace-outputs` Pod
@@ -32,7 +32,7 @@ workspace it publishes. Absent = the whole workspace (the implicit default).
   [0007](0007-data-passing-model.md) amendment.)
 - **Not in the REST DTO.** Like `inputs:`/`gate:`/`concurrency:`, `outputs:` is
   authored via a committed `.scarab` (`compile_yaml`), not the inline
-  `POST /v1/runs` IR-subset DTO — that subset stays deliberately small.
+  `POST /v1/runs` IR-subset DTO — that subset stays small.
 
 ## Consequences
 

@@ -13,7 +13,7 @@
 ## Context
 
 ADR-0020 set the *policy* (infra auto-retry, step retry opt-in, timeouts,
-dead-letter, forward-progress guarantee) but it is entirely **unimplemented**
+dead-letter, forward-progress guarantee) but none of it is **implemented**
 (2026-07-16 audit): `finish_attempt` with the `Infra` branch is dead code
 (`engine/src/lib.rs:588-618`), the scheduler hardcodes every failure as
 `FailureKind::Step` (`scheduler.rs:635`), `retry` is not expressible in the IR,

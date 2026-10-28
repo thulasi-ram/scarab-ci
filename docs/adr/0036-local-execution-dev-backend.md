@@ -32,7 +32,7 @@ multi-backend abstraction beyond the single `Executor` port that already exists.
 "Local dev against a cluster" remains **kind** (Kubernetes-in-Docker) on the k8s
 adapter, the real backend.
 
-Consequences for its semantics (a dev tool, so deliberately narrower than k8s):
+Consequences for its semantics (a dev tool, so narrower than k8s):
 
 - **Idempotent-on-fence within a process** (re-launching the same `{run, step,
   attempt}` re-attaches rather than double-spawning), matching the k8s adapter's
@@ -55,7 +55,7 @@ Consequences for its semantics (a dev tool, so deliberately narrower than k8s):
 
 ## Alternatives considered
 
-- **Drop host-process exec entirely; `local` == kind** — strictly honors [0005]'s
+- **Drop host-process exec; `local` == kind** — strictly honors [0005]'s
   letter, but forfeits a cluster-free inner loop and Docker-free engine tests.
 - **Promote local to a real backend** — reintroduces the multi-backend baggage
   [0005] exists to shed. Rejected.

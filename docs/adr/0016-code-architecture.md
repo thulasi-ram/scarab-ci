@@ -23,7 +23,7 @@ distinctions are *which* edges are abstracted (time, executor, crash, not just t
   `cel-interpreter` (0031's original case — evaluating a conditional is a domain rule); `sha2`
   ([0029](0029-workspace-cas.md) defines a snapshot **as** the SHA-256 merkle root of its
   canonical tree bytes, so the content address is a domain fact and the digest belongs where
-  that fact is defined); and `tracing` (a *facade* — see 0031's amendment). What actually writes
+  that fact is defined); and `tracing` (a *facade* — see 0031's amendment). What writes
   stays infra: `tracing-subscriber` is installed only by the composition root, and anything
   keyed by a deployment secret (`hmac`) belongs to a boundary. **Adapters are separate vendor
   crates**

@@ -21,8 +21,8 @@ The chosen mark: **emerald wings, gold body, transparent inside the circle**
 - **Light variant** — `scarab-emblem` — **ink outline**, gold body. For white /
   cream / navy / mid backgrounds.
 - **Dark variant** — `scarab-emblem-dark` — **gold outline**, deep-gold body
-  (keeps the beetle's internal lines visible against the fill). For black / very
-  dark backgrounds, where an ink outline would vanish.
+  (keeps the beetle's internal lines visible against the fill). For black /
+  near-black backgrounds, where an ink outline would vanish.
 
 Each ships full-aspect (`viewBox 0 0 2196 1952`) and centered-square
 (`128 -10 1920 1920`) for icons.
@@ -65,7 +65,7 @@ raster fallback.
 - **Backgrounds:** the light emblem's ink outline disappears on black — use the
   dark variant there (or the theme-aware `favicon.svg`, which flips automatically).
 - **Small sizes:** the emblem is detailed line-art. At a true 16px tab it softens;
-  32px+ and the SVG favicon (which most modern/hidpi contexts use) are crisp.
+  32px+ and the SVG favicon (which most browsers and hidpi screens use) are crisp.
 - **Regenerating rasters:** rendered at 1024px via Quick Look on white *and*
   black, then alpha reconstructed from the two mattes (exact anti-aliased
   transparency for multi-color art). See the generator notes in the repo history.

@@ -25,13 +25,13 @@ answer that is clear about its limits.
   **no-op** *for systems that cooperate*.
 - **Recomputation** is skipped/cheap via content-addressing ([0029](0029-workspace-cas.md)).
 - **Limits:** steps with non-idempotent, non-cooperating effects are the **author's
-  responsibility**, and the docs say so plainly. The full exactly-once **commit protocol
+  responsibility**, and the docs say so. The full exactly-once **commit protocol
   remains reserved in the IR** for later.
 
 ## Consequences
 
 - Materially reduces double-effect risk without a new top-level concept.
-- The at-least-once contract ([0002](0002-durability-model.md)) is stated plainly to users.
+- The at-least-once contract ([0002](0002-durability-model.md)) is stated to users.
 - Ties into retry ([0020](0020-retry-and-failure.md)) and restart
   ([0027](0027-restart-semantics.md)).
 

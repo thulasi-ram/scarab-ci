@@ -43,7 +43,7 @@ GHA-ergonomics ([0007](0007-data-passing-model.md)).
 - Compile-time `when:` and the runtime cascade are now one mechanism (mark
   `Skipped`), not two divergent ones.
 - `select_steps` (remove + drop edges) is replaced by `excluded_steps` (report
-  ids); pruning never drops edges, which is exactly what makes transitive skip
+  ids); pruning never drops edges, which is what makes transitive skip
   work.
 
 ## Alternatives considered

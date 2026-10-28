@@ -63,7 +63,7 @@ Two new tables:
 
 - `principals(id PK, display_name, created_at, claimed_at, merged_into)`
   - `id` **is** the `Principal.subject` every existing consumer already stores.
-  - `claimed_at` is `NULL` until someone has actually signed in as the Principal
+  - `claimed_at` is `NULL` until someone has signed in as the Principal
     (see §4).
   - `merged_into` is set when the Principal has been folded into another (§5).
   - **Rows are never deleted.** An id, once minted, is never minted again.
@@ -180,7 +180,7 @@ asserts `email_verified` could mint a global Owner.
 
 **Login.** Login takes a provider id: `?provider=` on `GET /v1/auth/login`, or
 `provider` on `POST /v1/auth/login`. If omitted, the only provider or the
-`unqualified_ids` one is used. The id rides in the existing one-shot state
+`unqualified_ids` one is used. The id is carried in the existing one-shot state
 cookie, so there is still **one** callback URL and registered OAuth apps keep
 working. `GET /v1/auth/providers` (unauthenticated) lists ids and names for the
 login page.
@@ -221,7 +221,7 @@ connections store.
    - An empty listing never prunes.
 
 Because the identity is pinned at import by `external_id`, whoever signs in with
-that forge account claims exactly those roles, and nobody else does. Claiming is
+that forge account claims those roles, and nobody else does. Claiming is
 atomic: `UPDATE principals SET claimed_at = now() WHERE id = $1 AND claimed_at
 IS NULL`. The team does not have to sign in before an admin can import them.
 
@@ -278,7 +278,7 @@ owners matcher, scoped per provider and gated on `email_verified`.
 
 `GET /v1/me` gains `identities: [{provider, handle}]`.
 
-### 7. What deliberately stays a string
+### 7. What stays a string
 
 - **Actor** (CONTEXT): for webhook runs it is the forge `sender.login`. It stays
   a forge fact, is never a Principal, and is never compared to one.

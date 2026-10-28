@@ -18,7 +18,7 @@ this because a top-level pipeline has **no way to declare launch parameters**:
   the actor; `trigger_run_from_event` treats `manual`/`api`/`cron` as repo-less
   and returns nothing for them.
 - `POST /v1/runs` takes a **full inline pipeline IR**, is **repo-less**, and is
-  **baseline-only** — it bypasses Environment, secrets, and admission entirely.
+  **baseline-only** — it bypasses Environment, secrets, and admission.
 - The only declared-parameter concept, `PipelineIr::interface.inputs`
   ([0038](0038-invoke-and-local-reuse.md)), is scoped to `invoke` and documented
   as *"irrelevant on a top-level triggered pipeline"*. It is also untyped
@@ -61,7 +61,7 @@ The word "inputs" stays overloaded in the IR for continuity, but docs/UI say
   (bounded multi-select), added only when a concrete non-matrix consumer appears.
 - **`required` is a static boolean.** Mandatory-vs-optional must be knowable from
   the compiled IR alone with **zero evaluation**, or the UI cannot render it
-  deterministically. Dynamic/CEL-computed requiredness is explicitly out.
+  deterministically. Dynamic/CEL-computed requiredness is out of scope.
 - **`required: true` ⇒ no `default`** (launcher must supply).
   **`required: false` ⇒ `default` is mandatory.** Consequence: **every declared
   parameter always resolves to a value**, so `${{ inputs.<name> }}` is *total* —
@@ -157,7 +157,7 @@ constant, *not* `step_results`).
   declaration served by a ref-scoped describe endpoint.
 - **Manual/API launch is unified with the trigger path**, so deploys dispatched
   from a button inherit Environment governance automatically; `manual` graduates from
-  an enum variant to a fully supported trigger.
+  an enum variant to a supported trigger.
 - **One parameter model** spans invoke-reuse and launch — fewer concepts, one
   `coerce`, one env convention, one CEL binding.
 - **New surface:** typed `interface.inputs` (expand-only, version-stamped IR
@@ -192,7 +192,7 @@ constant, *not* `step_results`).
   ref), interface-parsing duplicated in JS (works around invariant #5), and,
   fatally for this option, manual runs stay repo-less, so a *deploy* dispatched manually gets
   **no Environment/secrets/admission**. Manual dispatch's main use case is
-  exactly a deploy.
+  a deploy.
 - **String-only parameters** — rejected: reduces the UI to naked text boxes (the
   Woodpecker soup we are escaping) and reintroduces 0041's lexicographic footgun
   in guards.

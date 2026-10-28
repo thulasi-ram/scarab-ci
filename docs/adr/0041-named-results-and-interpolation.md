@@ -82,7 +82,7 @@ small structures. This avoids a guaranteed later string→typed migration.
 
 `interface: { outputs: [url] }` means **"expose the result named `url` emitted by
 the library step `url`."** Output name = step id = result name — one word, no
-mapping layer. This is exactly what [0038](0038-invoke-and-local-reuse.md)'s
+mapping layer. This is what [0038](0038-invoke-and-local-reuse.md)'s
 compile check already enforces (an exposed output must be a real library step
 id), now given runtime meaning. The compiler records, per invoke, the
 exposed-name → **concrete inlined step** (`deploy` exposing `url` → inlined step

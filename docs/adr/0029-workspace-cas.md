@@ -19,7 +19,7 @@ Downstream materializes by pulling only files it lacks.
 
 - **Dedup** across steps *and* runs; **incremental transfer** (only changed files move);
   taking a snapshot is a matter of hashing.
-- This is exactly the foundation that skip-if-unchanged and smart invalidation need.
+- This is the foundation that skip-if-unchanged and smart invalidation need.
 - **v1 pragmatism:** a plain tar-snapshot is acceptable as a throwaway for the Slice-1
   walking skeleton, upgraded to merkle CAS in Slice 2 when multi-step passing appears.
 

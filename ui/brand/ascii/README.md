@@ -142,7 +142,7 @@ two source rows it straddles.
 
 **Take the ink from the dominant row; never blend the two.** Brand layers are
 assigned by hue, and a mix of two layers does not land between them; it lands
-somewhere else entirely. Laying the shell's gold highlight over the emerald at 0.73 of a
+somewhere else. Laying the shell's gold highlight over the emerald at 0.73 of a
 cell mixes to `rgb(170,189,117)`, which `classify()` sorts into the gray LIMB
 layer, so a naive fractional blit paints a gray stripe across the shell at every
 peak of the bob. Resolving per cell keeps interior seams crisp and lets only the

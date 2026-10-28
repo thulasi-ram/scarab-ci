@@ -9,8 +9,8 @@
 
 ## Context
 
-Because the DAG is durable, content-addressed, and records exactly what produced what, two
-modern security features take *very little extra work*, where most CIs bolt them on
+Because the DAG is durable, content-addressed, and records what produced what, two
+security features take *little extra work*, where most CIs bolt them on
 painfully.
 
 ## Decision

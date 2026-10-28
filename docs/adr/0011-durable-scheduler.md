@@ -30,7 +30,7 @@ ships the full set per the grilling decision).
 
 ## Consequences
 
-- Rich CI UX (serialize prod, auto-cancel, fair-share) that k8s alone cannot provide.
+- CI UX (serialize prod, auto-cancel, fair-share) that k8s alone cannot provide.
 - The queue/groups are durable rows — trivial given [0003](0003-durability-substrate-postgres.md).
 - Cancellation and gates ([0008](0008-step-contract.md)) share the same durable machinery.
 

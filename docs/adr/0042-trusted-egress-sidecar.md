@@ -85,7 +85,7 @@ egress). Teardown deletes the Pod only after the results row is durable.
 
 ## Consequences
 
-- **Scarab's first co-located trusted helper** — deliberately the *smallest* one: per-Pod,
+- **Scarab's first co-located trusted helper** — the *smallest* one: per-Pod,
   ephemeral, credential-isolated, and adopted **only** because every agentless path through the k8s API
   is lossy for data. It is a small piece of the runner-agent pattern, not a standing per-node
   agent, so the control plane stays agentless and k8s stays a replaceable backend.
@@ -97,7 +97,7 @@ egress). Teardown deletes the Pod only after the results row is durable.
 - **The local backend is unchanged** — it reads results files directly; the `Executor` port hides
   the difference. Backends share the *authoring* interface (`/scarab/results/*.json`) and differ
   on egress.
-- **Logs and results are now explicitly different channels** by reliability class: logs use the
+- **Logs and results are now different channels** by reliability class: logs use the
   best-effort k8s API tail ([0013](0013-history-and-observability.md)); results use the acked
   sidecar path. Neither contaminates the other.
 
@@ -127,4 +127,4 @@ egress). Teardown deletes the Pod only after the results row is durable.
   [0041](0041-named-results-and-interpolation.md)).
 - **The step calls the results API directly (no sidecar)** — rejected: that hands the untrusted
   container a control-plane credential and an egress path, breaking [0038](0038-invoke-and-local-reuse.md)'s
-  isolation. The sidecar exists precisely to hold the credential outside the untrusted container.
+  isolation. The sidecar exists to hold the credential outside the untrusted container.

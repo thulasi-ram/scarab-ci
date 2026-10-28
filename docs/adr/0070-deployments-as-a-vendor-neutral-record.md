@@ -148,7 +148,7 @@ version the source will never report.
 The first-party Argo plugin's default scheme is **the set of image references in the pod
 templates of the Application's target manifests**: what Argo rendered from git (its
 `manifests`, or the `targetState` of its managed resources), not what is running. It is
-deliberately **not** `status.summary.images`, which is collected from live Pods: during a
+**not** `status.summary.images`, which is collected from live Pods: during a
 rolling update it is the union of old and new, it includes sidecars a mutating webhook
 injected, Sync-hook Job Pods flicker in and out of it, and a scale-to-zero app has an
 empty set. Each of those would create a spurious Deployment that supersedes the requested
@@ -178,7 +178,7 @@ Artifact digests attach to a Deployment as **evidence**, zero or more, never as 
 **The known weakness is equality-only correlation**, which forces the requester to predict
 how the source will render its change. The leading alternative, to be evaluated with real
 data, is **source acknowledgement**: the source maps a request, or the commit that carried
-it, to the version it actually rendered, in the style of GitHub Deployments. The
+it, to the version it rendered, in the style of GitHub Deployments. The
 observed-only board (Implementation horizon, step 2) exists partly to gather that
 evidence before DeploymentGates bake a scheme into Steps.
 
@@ -287,7 +287,7 @@ steps:
   times are control-plane times, and the effective time is clamped to be no later than
   the request's receipt time; a source's clock never enters the comparison. If the key's
   newest Deployment is already final, the request still **joins it as history** when core
-  first received that Deployment at or after the effective time: the source simply got
+  first received that Deployment at or after the effective time: the source got
   there before the request was recorded. Only an *older* final Deployment makes the
   request a genuine rollback (INV-DEP-11).
 - **Scheme check.** A version that does not fit the target's published scheme id (§4), or
@@ -359,7 +359,7 @@ So a report received *while the succeeding deploy Attempt was still running*, af
 started and before the gate's Attempt existed, counts. A `failed` then fails the gate
 with the source's label, and a `live` then passes it, instead of the gate waiting out its
 deadline. The owner decided this on 2026-10-24 (git-bug `fce05da`): the gap between the
-deploy Step's start and the gate's start is exactly what the gate must not miss. A report
+deploy Step's start and the gate's start is what the gate must not miss. A report
 received before that Attempt started is history to the gate.
 
 The stall deadline runs from the window start too, so for a first wait it runs from the
@@ -518,7 +518,7 @@ behaviour is the same across CD tools:
 - Report `failed` **only when the source has given up**: it will not progress without
   intervention. For Argo, that means retries are exhausted or the sync was terminated by
   timeout. Until then, report `in_progress` with the reason as the label.
-- Report `live` **only when the requested DeploymentVersion is actually serving**:
+- Report `live` **only when the requested DeploymentVersion is serving**:
   applied and healthy at that version, where the source can tell. For Argo, that is
   synced to a target whose version is the requested one, and healthy.
 - `live → failed` is allowed.
@@ -646,8 +646,8 @@ cut** keeps ADR-0037's one Environment per Run. Promotion is chained Deploy Runs
   that has a DeploymentGate waiting in it: the gates of one Environment share one fold per
   tick. "Transitions only" (§11) bounds the log's growth; an incremental fold or a
   snapshot is a known follow-up (git-bug `1f2163f`).
-- Ordering by receipt time makes the reporter contract's "source order, never replay"
-  rule essential (§8).
+- Ordering by receipt time makes the order depend on the reporter contract's
+  "source order, never replay" rule (§8).
 - Known gaps this ADR does not close: approvers are opt-in, so an Environment with
   approvers does not force a gate into a Pipeline that omits one (git-bug `cd43bf3`); and
   external gate release skips `admits()` (git-bug `220917f`). Both matter more once gates

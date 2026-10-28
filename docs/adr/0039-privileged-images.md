@@ -42,13 +42,13 @@ Two facts force the shape of the decision:
    - **`privileged`** — full privileged container. The blunt "node-level power" escape hatch of
      last resort; loud and rare.
 
-   **Explicitly out / deferred, and *never folded into* `privileged`** (they are independent grants,
+   **Out / deferred, and *never folded into* `privileged`** (they are independent grants,
    not levels of one scale — `privileged` does **not** include the host namespaces):
    - `cluster-access` (in-cluster k8s API) — **out**. Deploys reach a target cluster via
      **kubeconfig-as-a-secret** ([0037](0037-environment-governance.md)); Scarab's own cluster API
      is off-limits to step pods.
    - `host-path` — deferred (rootless BuildKit already removed the docker-socket reason;
-     `privileged` reaches it if really needed).
+     `privileged` reaches it if needed).
    - `host-network` / `host-pid` / `host-ipc` — **provisionally a hard no**: `hostNetwork` →
      node metadata endpoint → node IAM credential theft → cloud-account compromise. If ever
      added, behind a louder opt-in than the others and/or hard-tenant isolation.
@@ -85,7 +85,7 @@ Two facts force the shape of the decision:
 6. **Enforcement.** **Admission** (in the engine; [0037](0037-environment-governance.md) moved it
    there) computes the **admitted grant-set** as a pure function of `{the run's Environment whitelist,
    the step's request, the fork-lockout flag}`. The admitted set flows to the **executor**, which
-   applies **exactly** it to the Pod `SecurityContext` and **fail-closes** — it never applies an
+   applies that set and nothing more to the Pod `SecurityContext` and **fail-closes** — it never applies an
    escalation admission did not approve.
 
 ## Consequences

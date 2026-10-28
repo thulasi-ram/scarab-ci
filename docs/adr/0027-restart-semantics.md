@@ -21,12 +21,12 @@ happens downstream? This is where content-addressing ([0004](0004-execution-topo
   change** (never silently skipped); ties into fencing ([0021](0021-double-effect-fencing.md)).
 - **Manual overrides:** `force-cascade` (re-run all downstream, ignore cache) and
   `force-skip`/isolated (only this step, for those who know better).
-- Skipped steps are **shown explicitly** in the UI/timeline, so "smart" never means "mysterious."
+- Skipped steps are **shown** in the UI/timeline, so "smart" never means "mysterious."
 
 ## Consequences
 
 - "Restart the flaky lint step" costs nothing downstream; "restart the build with a fix"
-  cascades to exactly what changed. This is where users see durable execution pay off.
+  cascades only to what changed. This is where users see durable execution pay off.
 - Requires reliable per-step input/output hashing (merkle CAS).
 
 ## Alternatives considered
@@ -42,7 +42,7 @@ wrong when it was written**, by twelve days. Admission has compared each step's
 recomputed input signature against the one it last consumed since `7ea905d`
 (2026-07-12, migration `0013`) — see `Scheduler::tick`, "Skip-if-unchanged": it
 skips the match, emits `StepSkipped`, and carries the prior output forward.
-`crates/scarab-db-postgres/tests/restart.rs` asserts exactly that, and has passed
+`crates/scarab-db-postgres/tests/restart.rs` asserts that, and has passed
 throughout.
 
 The amendment is left in place, struck through, rather than deleted, because the
@@ -98,4 +98,4 @@ Two consequences for this ADR's own promises:
   before identities existed has none, and the comparison then falls back to its
   root — so such a step re-runs where it might have been skipped. Wasteful, never
   wrong. The reverse default (assume unchanged) would skip a step whose inputs
-  really had changed, which is not a slow build but a wrong one.
+  had changed, which is not a slow build but a wrong one.

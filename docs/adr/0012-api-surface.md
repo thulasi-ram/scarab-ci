@@ -8,7 +8,7 @@
 
 "API-first, UI dogfoods the API" only counts if the UI uses the **same** API that third parties
 (CLI, automation, webhooks, bots) use. So we must pick **one** primary API that serves both a
-rich nested UI and casual third-party automation. GraphQL suits the UI but is a poor common
+UI that reads nested data and casual third-party automation. GraphQL suits the UI but is a poor common
 format for CLIs/curl/webhooks; gRPC-first needs grpc-web proxying and is awkward for casual
 consumers. REST is what every client already speaks, and good enough for the UI with
 `expand`/`include`.

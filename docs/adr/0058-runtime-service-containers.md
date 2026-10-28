@@ -35,7 +35,7 @@ Two further tensions shape the design:
 - **A shared, mutable, long-lived DB is unfenced external state.** [0021](0021-double-effect-fencing.md)
   neutralises the double-effect hazard for durable step I/O via fencing tokens and per-Attempt
   evidence isolation. A DB that one step seeds and another reads has *no fence* and is *not durable
-  state* in the [0007](0007-data-passing-model.md) sense — exactly the hazard the model contains.
+  state* in the [0007](0007-data-passing-model.md) sense — the hazard the model contains.
 
 ## Decision
 
@@ -93,12 +93,12 @@ steps:
 
 - **Explicit `uses:` opt-in, not ambient reachability.** Woodpecker/GHA make every step reach the
   service because their steps already share a network; Scarab's Pods are network-isolated, so
-  ambient would mean a hole for *every* Pod. `uses:` scopes the network-policy hole to exactly the
+  ambient would mean a hole for *every* Pod. `uses:` scopes the network-policy hole to only the
   opt-in Pods (least-privilege), tells the scheduler which steps to readiness-gate, and documents
   the dependency. Hostname = the declared `name` (`db:5432`), matching the label-as-hostname
   convention of GHA/Woodpecker.
 - **Eager birth, Run-scoped teardown.** The service starts at **Run start** (services are run
-  setup; the small idle cost is accepted for a clean mental model over lazy birth). It is torn down
+  setup; the small idle cost is accepted because "the service lives for the whole Run" is easier to reason about than lazy birth). It is torn down
   when the Run — that Take — reaches terminal, via namespace-per-run teardown
   ([0050](0050-retention-and-gc.md)), **not a refcount**. The readiness *gate* still applies only to
   opt-in steps: a step without `uses: [db]` never waits on `db`.
@@ -108,7 +108,7 @@ steps:
   violate the isolation Takes guarantee.
 - **Unfenced external mutable state.** A Shared service is *not* durable state and is *not* fenced.
   Intra-Take idempotency across auto-retries and parallel writers is a **step-author contract**
-  ([0021](0021-double-effect-fencing.md)) — exactly the rule for any other external effect
+  ([0021](0021-double-effect-fencing.md)) — the same rule as for any other external effect
   (`terraform apply`, `docker push`). Scarab provisions the container; it does **not** promise
   exactly-once semantics against it.
 
@@ -122,7 +122,7 @@ as root to fix perms) nonetheless run **non-root here without any grant**: the e
 image's built-in service uid and sets `fsGroup` so the ephemeral `emptyDir` is group-writable — the
 standard k8s non-root pattern, keeping the service inside the restricted baseline. `run-as-root`
 survives only as a **self-service escape hatch** (sandbox-bound) for the rare image that
-cannot run non-root — deliberately *not* the default path, because root-in-container is exactly what
+cannot run non-root — *not* the default path, because root-in-container is what
 the restricted baseline (and k8s PSS `restricted`, OpenShift's random-uid, rootless runtimes) is
 moving away from. No "services are magically trusted" exemption.
 
@@ -138,7 +138,7 @@ moving away from. No "services are magically trusted" exemption.
 - **Mid-run death → fail-closed, no auto-rerun.** If a healthy Shared service dies mid-run, the
   opt-in steps fail and their descendants cascade ([0027](0027-restart-semantics.md)); non-opt-in
   steps proceed. The engine does **not** auto-recover, because the property that makes auto-retry
-  sound elsewhere — durable, fenced inputs — is exactly what a Shared service lacks: a fresh
+  sound elsewhere — durable, fenced inputs — is what a Shared service lacks: a fresh
   (empty) instance would give a green retry over corrupt state. Correct recovery means re-running
   every writer from the first, against a fresh instance — which *is* a new Take, i.e. a **human
   Rerun** (the per-Take model already provisions a fresh instance and re-runs from the chosen
@@ -175,7 +175,7 @@ Neither form is a DAG node (amends [0008](0008-step-contract.md)).
 - **Matrix:** a matrixed Step's Sidecars multiply per instance (each instance's Pod gets its own);
   Shared services are pipeline-level and are **not** multiplied by a Step's matrix.
 - The durable data plane ([0007](0007-data-passing-model.md)) remains the supported way to pass
-  state between steps; a Shared DB is explicitly *scaffolding*, not a state channel.
+  state between steps; a Shared DB is *scaffolding*, not a state channel.
 
 ## Alternatives considered
 

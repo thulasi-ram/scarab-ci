@@ -24,7 +24,7 @@ Portable by default, with no ceiling for power users. Infra lives in admin confi
 
 ## Consequences
 
-- IR stays agnostic and multi-frontend-friendly; pipelines are clean.
+- IR stays agnostic and multi-frontend-friendly; pipeline files carry labels, not k8s specifics.
 - Admins own the label→k8s mapping (one place).
 - The raw overlay is an explicit, discouraged-by-default escape hatch.
 

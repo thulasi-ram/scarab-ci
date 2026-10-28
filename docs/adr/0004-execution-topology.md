@@ -18,7 +18,7 @@ one k8s object that can be recreated, but then the workspace has to survive acro
 storage** (per-file merkle CAS, [0029](0029-workspace-cas.md)):
 
 - A step ≈ pure: `inputs (workspace-hash + params) → outputs (new workspace-hash + artifacts)`.
-- **Restart step** = recreate that Pod (clean, addressable). **Skip-if-unchanged** caching
+- **Restart step** = recreate that Pod (no leftover state, addressable). **Skip-if-unchanged** caching
   and **smart invalidation** ([0027](0027-restart-semantics.md)) come from the same
   content-addressing.
 - **Direct dispatch, no polling agents:** the executor creates k8s objects itself.
@@ -48,7 +48,7 @@ second (and last)" stateful dependency. The implementation routed the whole work
 *through* the control plane over `kubectl exec`, contradicting the control-plane / data-plane
 split promised here. [0061](0061-workspace-data-path.md) replaces it with a per-failure-domain
 **workspace service** plus a **Scarab node driver** doing lazy materialisation — a third
-stateful component, accepted deliberately — and reduces the control plane's involvement to
+stateful component, accepted — and reduces the control plane's involvement to
 exchanging root hashes.
 
 ## Alternatives considered

@@ -65,7 +65,7 @@ alternative.
 - A small **durable per-Run failure signal** is needed (timestamp of first consecutive failure, or a
   counter) to drive the bound — new Run state.
 - The driver's per-tick log enumerates the isolated per-Run failures; a Run that dead-letters from
-  *persistent tick failure* needs a diagnostic clearly distinct from a step dead-letter.
+  *persistent tick failure* needs a diagnostic distinct from a step dead-letter.
 - More error plumbing inside `tick_all`; the outer-`Result`-vs-inner-`Vec` split must stay clear so
   "fatal tick failure" and "isolated per-Run failure" never blur.
 
@@ -102,11 +102,11 @@ number and shape as [0058](0058-runtime-service-containers.md)'s `service_ready_
 independent of tick frequency, so re-tuning the interval can't silently re-tune the bound.
 
 **The failure signal is IN-MEMORY per replica** (`TickHealth`, threaded like
-[`Supervision`](0056-run-takes-and-attempt-grain-evidence.md)) — deliberately *not* durable, which
+[`Supervision`](0056-run-takes-and-attempt-grain-evidence.md)) — *not* durable, which
 reverses this ADR's own Consequences note. A durable marker is only safe if a matching "recovered"
 marker is written on the healthy path too; skip it and a stale marker from a long-healed episode
 makes the next single blip look like a deadline-crossing streak and dead-letters a healthy Run.
-Writing the recovery marker instead puts an append on every clean tick of every Run — a permanent
+Writing the recovery marker instead puts an append on every successful tick of every Run — a permanent
 cost on the hot path to sharpen a bound that only matters for Runs already broken. In-memory fails
 the other way: a restart or failover resets the streak, so a poison Run dead-letters *later* than
 the bound, never sooner. A control plane restarting faster than 5 minutes is a louder problem than

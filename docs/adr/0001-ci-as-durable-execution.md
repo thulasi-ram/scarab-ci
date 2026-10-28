@@ -29,7 +29,7 @@ integration and Kubernetes are *means*, not the point.
 - The hard engineering investment goes into the durable orchestrator and proving its
   correctness (see [0017](0017-testing-strategy.md)).
 - Marketing/positioning line: *"Your pipeline is a workflow that survives crashes."*
-- We must state the limits of durability plainly (see [0002](0002-durability-model.md),
+- We must state the limits of durability (see [0002](0002-durability-model.md),
   [0021](0021-double-effect-fencing.md)) or the claim backfires.
 
 ## Alternatives considered

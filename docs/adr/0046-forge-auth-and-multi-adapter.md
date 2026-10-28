@@ -57,8 +57,8 @@ to the Scarab run) is **required**, not the current hardcoded `None`
 (`crates/scarab-server/src/lib.rs:1659-1661`).
 
 - The GitHub adapter **may** enrich internally to the Checks API — inline PR
-  annotations (fed by ADR-0008 structured-emit diagnostics), rich output,
-  richer conclusions — without the port knowing. Forgejo ignores what it can't
+  annotations (fed by ADR-0008 structured-emit diagnostics), a Markdown summary,
+  more conclusion values (`neutral`, `action_required`, …) — without the port knowing. Forgejo ignores what it can't
   render.
 - **Follow-up (GitHub-only, not v1 core):** wire Checks *action buttons* and
   `rerequested`/`requested_action` webhooks to Scarab's restart-a-step and
@@ -115,7 +115,7 @@ backoff live inside each adapter.
 - A new agnostic port method for scoped checkout credentials (ADR-0045 S4 is
   this capability, not "installation token").
 - Base URL becomes adapter config even for GitHub (GHES).
-- Two adapters + a contract-test suite is more v1 work, bought deliberately to
+- Two adapters + a contract-test suite is more v1 work, bought to
   guarantee forge-agnosticism.
 
 ## Alternatives considered

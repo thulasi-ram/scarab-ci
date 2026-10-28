@@ -47,7 +47,7 @@ unresumable (a break at 90% starts over); routed through the cluster's most cont
 component, competing with the control traffic that keeps the cluster alive; funnelled through
 one `scarab-server` process that must also hold and hash every byte; and it moves the *whole*
 workspace in both directions regardless of what changed. Object storage clients have the
-opposite properties on every line — *in principle*; the client we actually wrote does not (s0
+opposite properties on every line — *in principle*; the client we wrote does not (s0
 again: `materialize`/`ingest` walk the tree one file at a time and await a round-trip each, so
 they have no parallelism either). No measurement is required to reject this path — only to
 size the win.
@@ -155,7 +155,7 @@ bytes. Helper containers become Scarab-owned images rather than `busybox` doorst
 >   file not found" is a named image/control-plane **skew** failure, and so is **exit 0 with no
 >   record** — a stale wsfetch has no subcommands, ignores the `drain` argv, runs fetch and
 >   exits 0 having published nothing, while a current binary always POSTs its record before
->   exiting 0 — reported promptly and clearly, never a hang until the step budget runs out; everything else re-drives
+>   exiting 0 — reported promptly, never a hang until the step budget runs out; everything else re-drives
 >   under the 5-minute escalation clock).
 > - `ws-timing` moved to **v2**: the control plane keeps `exec_drain_ms` / `cold_flush_ms` /
 >   `total_ms`; `files`, `tree_bytes`, `blobs_uploaded`, `bytes_uploaded`, `have_hits`,
@@ -163,7 +163,7 @@ bytes. Helper containers become Scarab-owned images rather than `busybox` doorst
 >   `tar_bytes` / `tar_unpack_ms` / `walk_ms` died with the tunnel.
 >
 > Still live, on purpose: the **artifact-harvest** tunnel (`harvest_artifacts` — the last
-> `exec` tar, framed and fail-closed). Artifacts ride an independent store with an independent
+> `exec` tar, framed and fail-closed). Artifacts go to an independent store with an independent
 > lifecycle; moving them onto the Depot is a filed follow-up ("artifacts ride the Depot"), not
 > part of this slice.
 
@@ -173,9 +173,9 @@ durability puts a claim in the durable record that the record cannot back — th
 this product may not do.
 
 > **Amended by [0064](0064-durability-tiering-and-the-write-path.md) (2026-07-28) — conditional on
-> the tiers a deployment actually has.** The rule above is unconditional, and the retention table
+> the tiers a deployment has.** The rule above is unconditional, and the retention table
 > below says warm "promises none", so an Attempt succeeding on warm alone contradicts it. 0064 allows
-> exactly that **where no independent cold tier is configured** — and the test is `st_dev` of the cold
+> that **where no independent cold tier is configured** — and the test is `st_dev` of the cold
 > directory against the warm one, because `StoreConfig::LocalDir` may point at the warm volume itself,
 > in which case "written to cold" licenses nothing. A second PVC is a real cold tier; a `LocalDir`
 > beside the CAS is not.
@@ -185,7 +185,7 @@ this product may not do.
 > mechanism for that, not the point of it. A deployment that *declares* "durability here is warm's"
 > and then succeeds on warm makes a smaller, true claim — so 0064 requires the degraded guarantee to be
 > stated at startup **and stamped on the Attempt**, since a deployment's tiers change over time while
-> its old records do not. What this paragraph was really protecting against is the **silent** version,
+> its old records do not. What this paragraph was protecting against is the **silent** version,
 > and disclosure removes it.
 >
 > The related prohibition three paragraphs into "the price of seeding the warm tier" — that writing
@@ -238,7 +238,7 @@ Two tiers, two policies, so eviction can never break a promise:
 > "GC deletes from cold and leaves warm" bullet calls *"the only thing that will ever reclaim it"*).
 > **It is now the gating gap**, for two reasons this ADR could not see:
 >
-> - **Warm-only makes it critical.** With no cold tier there is no second copy, so what warm
+> - **Warm-only makes eviction lose data.** With no cold tier there is no second copy, so what warm
 >   evicts is what a rerun loses — a bounded *recent window* rather than a latency event. An
 >   unbounded, unswept warm tier in that mode is not a cache with a soft edge; it is a volume that
 >   fills and then fails writes.
@@ -249,7 +249,7 @@ Two tiers, two policies, so eviction can never break a promise:
 > **And plain LRU is not the mechanism.** 0066 replaces it with a layered policy: evict **unreachable**
 > content first (point the existing mark walk at warm — no new machinery), then, *only where a cold
 > tier exists*, evict reachable-but-cold-backed content by recency; and in warm-only over the mark,
-> **refuse writes loudly** rather than evict. Recency is the part deferred, and deliberately: for
+> **refuse writes loudly** rather than evict. Recency is the part deferred, because for
 > immutable content `list_objects` gives least-recently-**written**, which is meaningless, so true LRU
 > needs an access index that is only worth building if reachability-first proves insufficient. The
 > budget stays a **size watermark**, never a TTL — space is the bound an operator controls and the one
@@ -264,7 +264,7 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
 ## Consequences
 
 - **A third stateful component.** [0004](0004-execution-topology.md) called object storage
-  "the second (and last)". That is now wrong, deliberately. Accepted because one standard
+  "the second (and last)". This ADR overturns that. Accepted because one standard
   path beats a fast path plus a fallback path.
 - ~~**A privileged node driver becomes an install prerequisite**~~ — **withdrawn with part 2
   ([0062](0062-workspace-export-lazy-without-node-driver.md)).** It was booked here as an
@@ -308,8 +308,8 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
   > record stays replica-local but its **absence becomes transient rather than `FatalConfig`**, so a
   > lost replica costs a re-drive instead of a permanently red build; the re-drive is idempotent by
   > construction (the drain reads a frozen `/workspace`, re-`PUT`s every tree unconditionally, and
-  > `/have` reports everything missing on a fresh replica). Warm-only is not a violation once it is
-  > read correctly: it does not make the Depot the system of record, it means there **is** no system
+  > `/have` reports everything missing on a fresh replica). Warm-only is not a violation:
+  > it does not make the Depot the system of record, it means there **is** no system
   > of record for workspaces in that deployment — disclosed per Attempt via
   > `attempts.output_durability`.
   >
@@ -335,11 +335,11 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
 - **Browse** ([0056](0056-run-takes-and-attempt-grain-evidence.md)) reads snapshots from the
   service **and falls through to object storage when the service cannot answer**, which keeps
   working after the Run's nodes are gone — on spot, that is within minutes, and a live-volume
-  design would show a blank pane exactly when people look. The fall-through is the second half
+  design would show a blank pane when people look. The fall-through is the second half
   of the sentence and it is not a caveat: the control plane already holds object-store
   credentials, so going direct crosses no trust boundary and creates no second data path for
   Steps. It is the literal reading of "a warm miss is slower, never wrong", and it is the
-  **opposite** of a Step Pod, which must fail closed because it deliberately has no credentials
+  **opposite** of a Step Pod, which must fail closed because it has no credentials
   ([0042](0042-trusted-egress-sidecar.md)).
 
   For a while this bullet was false rather than merely incomplete: the composition root handed
@@ -360,7 +360,7 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
 - **One RWO PVC per Run** — a detach-then-attach cycle at every boundary (tens of seconds
   each way on EBS-class storage), and on spot a volume stuck on a reclaimed node is routine
   rather than exceptional. Only pays off under co-location, which is excluded.
-- **RWX PVC per Run** — avoids the attach/detach cycle, but NFS-class storage is slowest at exactly
+- **RWX PVC per Run** — avoids the attach/detach cycle, but NFS-class storage is slowest at
   our file shape (many small files: checkouts, `node_modules`), and it is a much heavier
   prerequisite than the driver.
 - **PVC clone / VolumeSnapshot per Step** — good on copy-on-write storage (Ceph,
@@ -384,7 +384,7 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
   measurement; **s0 answers it: not yet, and not for this reason.** The measured cost is
   per-file round-trip count, and a cache is a second-order fix for that — it lowers the
   latency of a round-trip that lazy materialisation would not have made at all, and it only
-  ever helps on a hit, which is precisely what Karpenter denies. Do the first-order work
+  ever helps on a hit, which is what Karpenter denies. Do the first-order work
   (lazy reads, then concurrency/batching in the CAS legs) and re-measure; a cache tier
   evaluated before that would be credited with wins that belong to the cheaper fix.
 - **Fat helper with eager parallel fetch, no driver** — removes the `exec` tunnel and needs no
@@ -397,7 +397,7 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
 - **Naming a specific object-storage product or zone topology** — an operator's cost decision,
   not an engine decision.
 
-## Open — deliberately not decided here
+## Open — not decided here
 
 - **Measurement — of the win, not of the premise. DONE (s0); it changed the slice order.**
   Two claims were kept separate on purpose: *"the `exec` tar path is the wrong design"* is
@@ -455,11 +455,11 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
   > boundary, a per-drain memory bill proportional to the largest workspace times drain
   > concurrency. ws-timing v2 keeps the leg observable, but no fresh latency claim is made here.
 - **Concurrency in the CAS legs — s2, the slice s0's numbers created. DONE; it moved the
-  bottleneck out of object storage entirely.** s0's own consequence paragraph names this:
+  bottleneck out of object storage.** s0's own consequence paragraph names this:
   *"concurrency and batching in the CAS legs are worth more today than the tunnel deletion,
   and are cheap enough to be worth doing even before the service exists."* Both legs now run
   with bounded parallelism (`SCARAB_CAS_CONCURRENCY`, default 32), and both emit the byte/dedup
-  counters s0 explicitly could not obtain from outside — `Cas::ingest` hashes and does its own
+  counters s0 could not obtain from outside — `Cas::ingest` hashes and does its own
   `head`/`put` per blob *internally*, so a decorator could separate neither hashing from
   storage nor bytes-uploaded from bytes-deduped-away. Harvest everything with:
 
@@ -482,7 +482,7 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
 
   Read the *shares*, not only the multipliers. **`materialize` is no longer the dominant cost of a
   feed leg** — 83% → 26% at 2000 files. `ingest` improved far less and is still 75–81% of a drain;
-  the counters say exactly why, and it is not the object store (below).
+  the counters say why, and it is not the object store (below).
 
   One number moved the *wrong* way and is reported because it changes an argument: **the feed
   leg's `tar_pack` rose from 1102 ms to ~4700 ms.** Nothing in that code changed. The server
@@ -520,7 +520,7 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
   limit still buys is peak memory. A *remote* object store, with a real network in the path,
   would move that knee to the right — hence a knob and not a constant.
 
-  **The counters show the bottleneck has moved, and this is the most important finding.** With the
+  **The counters show the bottleneck has moved.** With the
   round-trips overlapped, `store_ms` — a sum over concurrent requests, so it legitimately exceeds
   the leg's wall clock; the *ratio* is the reading — runs 15–90× the leg's duration. **The object
   store is now essentially hidden.** What is left is `fs_ms`: the local filesystem on the control
@@ -541,8 +541,8 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
      ends up 4× cheaper than the read leg despite moving the same bytes.
   2. What remains is `std::fs` called from inside the futures, and `buffer_unordered` polls every
      in-flight future from **one** task — so local I/O is serialised even though the network is
-     not. Moving the read/write halves onto a blocking pool is the next win. Deliberately left
-     out: it makes this adapter require a runtime to be present, a real coupling to decide on its
+     not. Moving the read/write halves onto a blocking pool is the next win. Left
+     out because it makes this adapter require a runtime to be present, a real coupling to decide on its
      own merits rather than as a side effect of a perf change.
   3. At 250 files, `hash_ms` is 340–348 ms of a ~500–970 ms leg — 36–67%. That is a *debug* build
      (`just up` builds debug; the release harness hashes the same 8.19 MB in ~30 ms), so it is an
@@ -577,7 +577,7 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
   Measured, not reasoned about: the CAS tree entry carried only `name` and `target`, so a
   round-trip silently dropped every mode (an executable came back `0644`) and every mtime
   (reset to the moment of checkout), and `ingest` *failed outright* on a symlink to a
-  directory. So cross-Step incremental compilation was already degraded today, exactly as
+  directory. So cross-Step incremental compilation was already degraded today, as
   suspected, independently of this ADR. Fixed rather than characterised: a tree entry now
   carries `mode` + `mtime_ms`, and a symlink is a blob holding the link target marked
   `MODE_SYMLINK` — git's layout. Blobs stay addressed by their bytes alone, so metadata costs
@@ -591,7 +591,7 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
   asks. s7 went further and argued the consequence was harmless — *"Cost **not** paid: nothing
   decision-relevant — restart skip-if-unchanged compares the recorded snapshot roots of
   upstream steps that did **not** re-run, which are byte-identical strings regardless."* That
-  sentence excluded from consideration **exactly the case skip-if-unchanged exists for**: an
+  sentence excluded from consideration **the case skip-if-unchanged exists for**: an
   ancestor that *did* re-run and produced the same output. The live kube tier then measured it
   (git-bug `945b1f4`): two Attempts writing byte-identical content produced roots differing in
   `mtime_ms` alone. Recorded here because the mistake generalises: listing the cases a cost
@@ -639,8 +639,8 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
 
   Also considered and rejected: **carrying mtimes forward from a baseline** — on ingest, reuse
   the previous snapshot's mtime for any path whose content is unchanged. This is the only
-  scheme that keeps *one* digest and stays safe, and it is elegant: it makes a root
-  reproducible *and* keeps every timestamp truthful about when content last changed. It loses
+  scheme that keeps *one* digest and stays safe: it makes a root
+  reproducible *and* keeps every timestamp at the time its content last changed. It loses
   on this ADR's own retention model. The baseline is a snapshot, snapshots expire (warm by
   space, cold by TTL), and when the baseline is gone the mtimes revert to wall clock and the
   root moves again. A determinism guarantee that decays with retention, silently, is the
@@ -669,7 +669,7 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
     > hashes it compared came from one statically-linked `canonical_tree_bytes` executing in
     > one process — `WorkspaceClient::put_tree` canonicalises client-side — so no pair of real
     > tiers could ever disagree, and the "version skew between deployed binaries" it claimed to
-    > guard was never in its comparison. The check now lives where the two binaries actually
+    > guard was never in its comparison. The check now lives where the two binaries
     > meet: the Depot's `PUT /v1/cas/trees` re-serialises the parsed body through **its own**
     > linked `canonical_tree_bytes` and answers a distinct `400` ("canonicalisation skew") on
     > a byte difference — the client's serialiser versus the Depot's, which is the comparison
@@ -692,7 +692,7 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
   > "tier onward" this bullet forbade — the flush is synchronous with respect to success and
   > it is commanded by the caller, not left to the service — so the invariant the prohibition
   > protected (warm never silently licenses `Succeeded`) survives in the flush contract. The
-  > original reasoning below is kept: it correctly priced the cold-first shape, and points 1–3
+  > original reasoning below is kept: it priced the cold-first shape, and that price still holds; points 1–3
   > describe the shape this amendment retires (point 2's double cold write disappears with it;
   > the flush's existence probe is the `exists` check point 2 filed). The Depot being on
   > the durability path means a Depot outage **may fail Attempts — promptly and with a named
@@ -704,7 +704,7 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
      the drain leg at **88% local filesystem** — reading every file in order to hash it — so
      this roughly doubles that leg. Both alternatives are worse: a merkle-level copy cannot be
      made concurrent inside a pure domain crate (no `futures` dependency), so it would be one
-     sequential round-trip per file, which is precisely the pattern s0 identified as the
+     sequential round-trip per file, which is the pattern s0 identified as the
      dominant cost and this ADR forbids the new path from reproducing; and writing warm-first
      and letting the service tier onward would make durability depend on the warm tier,
      which part 4 forbids. Removing the second walk needs a port change — a `Cas` that writes
@@ -730,7 +730,7 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
   **Answered by [0062](0062-workspace-export-lazy-without-node-driver.md) part 3, and the "same
   privileged mount" premise was wrong.** The upper layer does not have to be on the *node*. With
   the `overlayfs` mount on the workspace service — over a hardlink Snapshot Farm, verified on
-  ext4 — the upper directory holds precisely the paths the Step touched, put there by the kernel,
+  ext4 — the upper directory holds the paths the Step touched and no others, put there by the kernel,
   and the drain reads it locally with no network in the path. So the drain becomes **exact rather
   than approximate**, which also retires the hazard in the unprivileged approximation that was
   going to be built instead (a `(size, mtime)` stat cache, whose failure mode is silently

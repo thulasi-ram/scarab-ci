@@ -46,6 +46,6 @@ token = HMAC-SHA256(server_secret, "{run}:{step}")
 
 - **Per-gate stored random token** (generate at creation, store, expose via the
   API) — supports per-gate revocation, but adds generation, a column, and a
-  retrieval path; deferred until per-gate revocation is actually needed.
+  retrieval path; deferred until per-gate revocation is needed.
 - **Reuse `…/approve` under RBAC** — no machine-friendly auth; conflates
   `external` with `manual`.

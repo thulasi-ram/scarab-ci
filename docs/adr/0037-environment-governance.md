@@ -63,7 +63,7 @@ environment *governs* it, regardless of what the YAML says (the GHA model).
 
 - Lookup walks the scope chain **`env → repo → org`, most-specific wins** (implements
   [0014]'s inheritance; today's store is exact-match only). A value shared across
-  environments lives **once** at repo/org scope; only values that actually differ are
+  environments lives **once** at repo/org scope; only values that differ are
   stored per-environment.
 - Pipelines reference secrets **by key, environment-agnostically** (`${{ secrets.X }}`).
   Resolution picks the value by the run's target environment — no `_staging`/`_prod`
@@ -111,7 +111,7 @@ environment's `approvers`); `external` release stays token-authed ([0034]).
 - Deploy approval becomes durable, auditable, and unforgeable: it is authenticated gate
   state on the event log, not a caller assertion. Restart-safe by construction.
 - Prod credentials exist **only** under the gated environment and cannot be relocated by
-  editing pipeline YAML, so the separation of duties actually holds.
+  editing pipeline YAML, so the separation of duties holds.
 - Pipelines become portable across environments; the target, not the pipeline, selects
   secret values.
 - New surface: `GateApproved` event + gate accumulation; a scope-chain resolver; the
