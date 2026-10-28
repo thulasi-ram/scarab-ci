@@ -244,7 +244,11 @@ group, is later work if a Pipeline needs it.
   CD concept.
 - **Plugins bring their own storage.** A PluginInstallation may name a
   PersistentVolumeClaim that its operator created in the plugins namespace, and the
-  plugin runtime mounts it into the plugin's Pod. A plugin that needs a database reaches
+  plugin runtime mounts it into the plugin's Pod (default `/data`). Every org's plugins
+  share that namespace, so the runtime mounts a claim only when it carries the
+  annotation `scarab.io/plugin-installation=<org>/<installation>`; otherwise the plugin
+  is scaled to zero with an error naming the claim. Moving storage to another claim or
+  path needs a step-up; adding or removing it does not. A plugin that needs a database reaches
   it through a `delivered` PluginConnection (ADR-0072 §6, not built). Scarab does not
   provision, migrate, back up or read that storage, and it is outside Scarab's durability
   claims. A CD plugin that wants a record of what is live, or a board of it, keeps it
