@@ -11,33 +11,33 @@ gaps left after Slice 4.
 
 ## Context
 
-[0024] made Environment a first-class entity carrying protection rules, but the
+[0024] made Environment its own entity carrying protection rules, but the
 implementation left real gaps: `ProtectionRules.approvers`/`wait_timer`/`secret_scope`/
 `oidc_subject` are **stored and never read** at runtime; deploy admission trusts a
 **caller-supplied** `approvals` list (`DeployRequest.approvals`) rather than any
 authenticated state; secret lookup is **exact-scope only** (no `org→repo→env`
 inheritance despite [0014]); and env-scoped secret **resolution is never wired into
 the live run path** (`resolve_step_secrets` is test-only). A `manual` gate, meanwhile,
-is a genuine durable suspend point but records **no approver identity**.
+is a real durable suspend point but records **no approver identity**.
 
 The value of Environment is not any single rule. It is that **one reference —
 `environment: prod` — pulls in a governed bundle (approval + secrets + allowed-refs +
 OIDC subject), defined once by an admin and reused across pipelines.** That removes the
-per-pipeline wiring taxation, and — because rules live in an admin-owned entity, not the
-pipeline YAML — it gives separation of duties: a pipeline author *requests* a deploy; the
+per-pipeline wiring work. And because rules live in an admin-owned entity rather than the
+pipeline YAML, it gives separation of duties: a pipeline author *requests* a deploy; the
 environment *governs* it, regardless of what the YAML says (the GHA model).
 
 ## Decision
 
 ### A. Environment is the governed bundle; protection is optional
 
-- Environment stays a first-class entity in `scarab-projects`, edited only with
+- Environment stays its own entity in `scarab-projects`, edited only with
   `Administer` RBAC. A pipeline **references** it by name (`PipelineIr.environment`,
   pipeline-level: **one run targets one environment** — step-level multi-env deferred).
 - **Protection rules are optional per environment.** An environment with no rules
-  (typical `staging`) is a frictionless label: secrets are scoped to it, but no
+  (typical `staging`) is a plain label: secrets are scoped to it, but no
   approval, no ref restriction. An environment with reviewers (`prod`) is gated. Same
-  entity, opt-in governance — low-stakes targets pay nothing.
+  entity, opt-in governance; low-stakes targets pay nothing.
 
 ### B. Approval is a gate; admission runs at the point of use
 
@@ -59,7 +59,7 @@ environment *governs* it, regardless of what the YAML says (the GHA model).
 
 - Lookup walks the scope chain **`env → repo → org`, most-specific wins** (implements
   [0014]'s inheritance; today's store is exact-match only). A value shared across
-  environments lives **once** at repo/org scope; only values that genuinely differ are
+  environments lives **once** at repo/org scope; only values that actually differ are
   stored per-environment.
 - Pipelines reference secrets **by key, environment-agnostically** (`${{ secrets.X }}`).
   Resolution picks the value by the run's target environment — no `_staging`/`_prod`
@@ -101,7 +101,7 @@ environment's `approvers`); `external` release stays token-authed ([0034]).
 - Deploy approval becomes durable, auditable, and unforgeable: it is authenticated gate
   state on the event log, not a caller assertion. Restart-safe by construction.
 - Prod credentials exist **only** under the gated environment and cannot be relocated by
-  editing pipeline YAML — the separation-of-duties boundary is real.
+  editing pipeline YAML, so the separation of duties actually holds.
 - Pipelines become portable across environments; the target, not the pipeline, selects
   secret values.
 - New surface: `GateApproved` event + gate accumulation; a scope-chain resolver; the

@@ -7,7 +7,7 @@
 ## Context
 
 Step-level `when:` guards ([0009](0009-dsl-ir-yaml-cel.md)) decide whether a step
-runs. The open question ([0027](0027-restart-semantics.md) neighbourhood, deferred
+runs. The open question (related to [0027](0027-restart-semantics.md), deferred
 from slice 4) was what happens to a guarded-off step's **descendants**.
 
 The earlier pure-lowering `select_steps` *removed* a `when:false` step and

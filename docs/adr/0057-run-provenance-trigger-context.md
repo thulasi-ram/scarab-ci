@@ -67,7 +67,7 @@ wanted, that is the trigger to revisit discrete columns.
 Bounds: store the **subject line only** for commits (drop the body). Truncate
 `trigger_title` to a fixed cap server-side (**200 chars**), on a **char/grapheme
 boundary** (never mid-UTF-8-sequence), and store the value **clean — no ellipsis
-marker**. The DB holds honest "first 200 chars"; the UI owns the overflow signal
+marker**. The DB holds exactly the first 200 chars; the UI owns the overflow signal
 (tooltip / clamp). 200 covers effectively every real subject/PR title (GitHub
 hard-limits PR titles at 256, soft-wraps subjects at ~72); the cap is an
 anti-bloat backstop, not the display truncation.
@@ -84,7 +84,7 @@ each adapter from the webhook payload:
 - `Manual { …, reason: Option<String> }` and `Api { …, reason: Option<String> }`
   — the dispatch reason.
 
-The fields ride the **shared `Event`** (no side-channel provenance struct):
+The fields go on the **shared `Event`** (no side-channel provenance struct):
 `Event` is already where each adapter produces the normalized facts, in the same
 payload-parse pass; a side-channel would parse twice and thread a second value
 everywhere `Event` flows. Both adapter crates (`scarab-forge-github`,
@@ -94,7 +94,7 @@ extended with fixtures carrying a message/title/base. The server stamps
 `set_run_pipeline`) via a small `trigger_title(event) -> Option<String>`
 extractor.
 
-**Security boundary (load-bearing — do not undo):** these provenance fields are
+**Security boundary (important — do not undo):** these provenance fields are
 **deliberately excluded from `Event::context()`** — the flat JSON that feeds CEL
 trigger-matching and `${{ }}` interpolation. They flow *only* adapter → `Event`
 field → `trigger_title` / origin column → DTO → UI, never into the matching /
@@ -102,13 +102,13 @@ interpolation map. Rationale in "Grill outcomes" Q6/Q7: `${{ event.message }}`
 spliced into a `run:` script is the GitHub-Actions script-injection class, and
 shell has no context-free escape (the sink — quoted / unquoted / env / arg — is
 unknowable at template time). `Comment.body` *is* in `context()` because
-comment-command triggers structurally need to match it; `message`/`title`/`base`
-have no matching or interpolation use, so exposing them would be pure attack
-surface with zero benefit. Enriching `Event` therefore leaves the *matching
+comment-command triggers have to match on it; `message`/`title`/`base`
+have no matching or interpolation use, so exposing them would add attack
+surface for no benefit. Enriching `Event` therefore leaves the *matching
 context* byte-for-byte as lean as today. A code comment at `context()` states
 this invariant.
 
-### 3. Manual dispatch reason — a first-class input, environment-gated
+### 3. Manual dispatch reason: a dedicated input, environment-gated
 
 `POST /v1/repos/{org}/{repo}/dispatch` (and the inline `POST /v1/runs`) accept an
 optional `reason: String`. The web UI's **New-run** form (`RunPipeline`) grows a
@@ -136,7 +136,7 @@ a global switch and not a dispatch-endpoint check:
   subject / PR title / tag) and are exempt — the audit target is "someone
   hand-clicked deploy-to-prod without saying why," not "block automated
   triggers." `cron` / `upstream` (machine-initiated, no human to prompt) are
-  likewise exempt. A blocked run surfaces the violation exactly like a missing
+  likewise exempt. A blocked run reports the violation exactly like a missing
   approval.
 
 ### 4. Read models + UI
@@ -152,12 +152,12 @@ a global switch and not a dispatch-endpoint check:
   cell** (kind on top, title beneath), truncated with a full-text tooltip. PR
   rows read `base ← head` in the ref/commit cluster (a discrete origin fact, not
   folded into `trigger_title`).
-- **Placement is Trigger-cell only** on both surfaces. Promoting the headline to
+- **Placement is Trigger-cell only** on both screens. Promoting the headline to
   a run-detail **H1 subtitle** is deferred — pure layout, no data-model impact;
   revisit if the headline reads buried once live.
 - Display remains defense-in-depth: SolidJS auto-escapes (a fork PR's title is
   attacker-controlled), and the value is already subject-only + capped. Any
-  *future* need to surface the headline into a typed sink (Slack body, PR-comment
+  *future* need to put the headline into a typed sink (Slack body, PR-comment
   template) uses a purpose-built template that encodes for *that* format — never
   a blanket `context()` exposure.
 
@@ -174,7 +174,7 @@ Enumerated so each is accepted/deferred explicitly:
    the `before` sha (not currently in `Event::Push`). **Deferred** — the commit
    deep-link already exists; add only if requested.
 4. **Actor / author avatar** — pure UI polish, needs a forge user→avatar lookup
-   (new port surface). **Deferred.**
+   (a new port API). **Deferred.**
 5. **Event timestamp** (when the push/PR happened) — nearly always == run
    `created_at`. **Skipped** (redundant).
 6. **PR action** (opened / synchronize / reopened) — marginal for display.
@@ -188,7 +188,7 @@ Enumerated so each is accepted/deferred explicitly:
   but violates origin-stamping's "discrete columns, not a bundle" and pushes
   kind-branching into the UI. Rejected.
 - **Three discrete columns** (`commit_message`/`pr_title`/`dispatch_reason`) —
-  more honest per-kind, but they occupy the same UI slot and only one is ever
+  more explicit per kind, but they occupy the same UI slot and only one is ever
   non-null per run. Rejected for flatness; re-open only if a per-facet
   search/filter (commit-message vs PR-title) is wanted.
 - **Fetch on read** (call the forge for the message/title at render time) —
@@ -196,14 +196,14 @@ Enumerated so each is accepted/deferred explicitly:
   data is immutable, so stamp-at-creation is correct.
 - **Provenance fields in `Event::context()` with sanitize-and-escape** — debated
   and rejected (Grill Q6). Shell has no context-free escape at template time; it
-  is the GitHub-Actions `pull_request` script-injection class, which the incumbent
+  is the GitHub-Actions `pull_request` script-injection class, which GitHub Actions
   mitigates by *routing to a data sink*, not by escaping. Escape belongs at
   *known* sinks (display, typed templates); the un-encodable shell-interpolation
   map gets **exclusion**, not escaping.
 - **Requiredness as a global switch or a dispatch-endpoint check** — rejected.
   Global punishes the common frictionless dispatch; the dispatch endpoint can't
   know the target Environments without compiling the IR. Per-Environment at the
-  admission gate is the correct seam (mirrors `approvers`).
+  admission gate is the correct place (mirrors `approvers`).
 - **Provenance on a side-channel to keep `Event` lean** — rejected (Grill Q7).
   The leanness that mattered is the *matching context*, preserved by the Q6
   exclusion; a side-channel would double-parse and thread a parallel value
@@ -224,8 +224,8 @@ Enumerated so each is accepted/deferred explicitly:
   to set; off by default so existing environments are unaffected.
 - **Security invariant:** provenance fields never enter `Event::context()`
   (comment at the call site; enforced by review). Display paths escape + truncate.
-- No behavior change to scheduling — provenance is display/audit only, never
-  load-bearing (same contract as origin stamping). The one behavioral addition is
+- No behavior change to scheduling — provenance is display/audit only, and nothing
+  depends on it (same contract as origin stamping). The one behavioral addition is
   `require_reason`, which can *block* a manual/api deploy at a gated environment.
 
 ## Grill outcomes (resolved 2026-07-20)
@@ -253,7 +253,7 @@ The seven open questions, as resolved in the `/grill-with-docs` session:
 
 ## Amendment (2026-07-21): run identity — internal id vs. run number, and the gutter layout
 
-Implementing §4 surfaced two follow-on decisions the original ADR left implicit:
+Implementing §4 raised two follow-on decisions the original ADR left implicit:
 *what a run's id actually is*, and *where the headline sits*. Both are resolved
 here. Explored visually against the running UI before committing.
 
@@ -315,12 +315,12 @@ cells, so nothing aligned. **Resolved layout (supersedes that placement):**
   a ragged grid.
 - The **per-repo run number `#N` sits in a fixed left gutter**, vertically
   centered — sequential, so it scans straight down a list, and a tight fixed
-  column. This is the shared row's identity anchor.
+  column. It is how you identify the row.
 - Still **one shared component** across the runs-list row and the run-detail
   context bar (the ADR's original intent, now literal — `variant` only adapts the
   surrounding chrome). The old `TriggerCell` is subsumed into it.
 - The **internal UUIDv7** is not shown in list rows (the number is the handle
-  there). It surfaces only where you reach for it: a **click-to-copy id** in the
+  there). It appears only where you need it: a **click-to-copy id** in the
   run-detail bar, the run-detail **breadcrumb** (`repo › #N`), and the URL.
 - `base ← head` (§4) is unchanged.
 

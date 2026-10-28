@@ -24,8 +24,8 @@ the DAG mid-run and expands the state space.
 
 ## Consequences
 
-- v1 engine, DST, and UI stay simple (bounded DAG) without cornering dynamic later.
-- Dynamic fan-out reuses the `invoke` recursion primitive ([0006](0006-pipeline-ontology.md)).
+- v1 engine, DST, and UI stay simple (bounded DAG) without ruling out dynamic fan-out later.
+- Dynamic fan-out reuses `invoke` recursion ([0006](0006-pipeline-ontology.md)).
 
 ## Alternatives considered
 

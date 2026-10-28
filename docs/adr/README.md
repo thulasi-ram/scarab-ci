@@ -1,28 +1,28 @@
 # Architecture Decision Records
 
-These ADRs record the **load-bearing decisions** for Scarab, captured in a design grilling
-session on 2026-07-12. Each is written in a light [MADR](https://adr.github.io/madr/) style:
+These ADRs record the main decisions behind Scarab, captured in a design review session
+on 2026-07-12. Each is written in a light [MADR](https://adr.github.io/madr/) style:
 **Context → Decision → Consequences → Alternatives considered**.
 
-They are the *why*. The *what* (ubiquitous language, system overview) lives in
+They explain *why*. The *what* (the domain vocabulary and a system overview) is in
 [`../../CONTEXT.md`](../../CONTEXT.md).
 
 ## Status lifecycle
 
 `Proposed` → `Accepted` → (`Superseded by NNNN` | `Deprecated`). All ADRs below are
-`Accepted` unless noted. A decision changes by writing a **new** ADR that supersedes the
-old one — never by editing history (mirrors our version-tolerance principle).
+`Accepted` unless noted. A decision changes when a **new** ADR supersedes the old
+one. We don't edit history (the same idea as our version-tolerance principle).
 
 ## Index
 
 | ADR | Title | Status |
 |---|---|---|
-| [0001](0001-ci-as-durable-execution.md) | CI as durable execution (the wedge) + non-goals | Accepted |
+| [0001](0001-ci-as-durable-execution.md) | CI as durable execution + non-goals | Accepted |
 | [0002](0002-durability-model.md) | Durability model: durable DAG orchestrator + at-least-once steps | Accepted |
-| [0003](0003-durability-substrate-postgres.md) | Durability substrate: own it — DBOS pattern on Postgres (Rust) | Accepted |
+| [0003](0003-durability-substrate-postgres.md) | Durability layer: build our own, DBOS-style on Postgres (Rust) | Accepted |
 | [0004](0004-execution-topology.md) | Execution topology: pod-per-step + content-addressed workspace | Accepted (data path superseded by 0061) |
 | [0005](0005-tenancy-and-k8s-only.md) | Tenancy & deployment; Kubernetes as the only backend | Accepted |
-| [0006](0006-pipeline-ontology.md) | Pipeline ontology: flat recursive DAG | Accepted |
+| [0006](0006-pipeline-ontology.md) | Pipeline model: flat recursive DAG | Accepted |
 | [0007](0007-data-passing-model.md) | Data-passing model: Workspace / Result / Artifact / Cache | Accepted |
 | [0008](0008-step-contract.md) | Step contract: OCI image + convention + built-in kinds | Accepted (amended by 0058) |
 | [0009](0009-dsl-ir-yaml-cel.md) | DSL: typed Pipeline IR + YAML frontend + CEL | Accepted |
@@ -40,7 +40,7 @@ old one — never by editing history (mirrors our version-tolerance principle).
 | [0021](0021-double-effect-fencing.md) | Double-effect hazard: fencing tokens + idempotency contract | Accepted |
 | [0022](0022-upgrades-and-versioning.md) | Upgrades & schema evolution: version-tolerant from day one | Accepted |
 | [0023](0023-dag-shape.md) | DAG shape: static matrix v1, dynamic reserved | Accepted |
-| [0024](0024-environments.md) | Environments: first-class with protection rules | Accepted |
+| [0024](0024-environments.md) | Environments: a built-in entity with protection rules | Accepted |
 | [0025](0025-cross-pipeline-orchestration.md) | Cross-pipeline orchestration: nest vs trigger | Accepted (amended by 0038) |
 | [0026](0026-resource-and-placement.md) | Resource & placement model | Accepted (refined by 0055) |
 | [0027](0027-restart-semantics.md) | Restart semantics: content-addressed smart invalidation | Accepted |
@@ -74,7 +74,7 @@ old one — never by editing history (mirrors our version-tolerance principle).
 | [0056](0056-run-takes-and-attempt-grain-evidence.md) | Run Takes (derived, human-boundary version lens) + attempt-grain evidence (results/workspace/artifacts/consumption keyed by attempt; restart & re-adoption events) | Accepted |
 | [0058](0058-runtime-service-containers.md) | Runtime service containers: co-located **Sidecar** (default, fenced-by-inheritance) + Run-scoped **Shared** (opt-in `uses:`, per-Take instance, unfenced) — not DAG nodes (amends 0008) | Accepted |
 | [0059](0059-tick-fault-isolation.md) | Per-run scheduler-tick fault isolation (one poison Run can't stall the fleet) + bounded per-Run failures → dead-letter (generalizes 0058 Fix A/B) | Accepted |
-| [0060](0060-org-settings-connections-and-secret-management.md) | Global Settings surface: connection lifecycle (Forgejo onboarding + GitHub observe/re-sync), org/env secret editing via the effective-status matrix, IaC-or-UI connections with single-owner precedence | Accepted |
+| [0060](0060-org-settings-connections-and-secret-management.md) | Global Settings: connection lifecycle (Forgejo onboarding + GitHub observe/re-sync), org/env secret editing via the effective-status matrix, IaC-or-UI connections with single-owner precedence | Accepted |
 | [0061](0061-workspace-data-path.md) | Workspace data path: per-AZ workspace service + Scarab node driver with lazy materialisation; control plane leaves the data path (supersedes 0004's data path, not its topology) | Accepted (**part 2, the node driver, superseded by 0062**; **part 4 amended by 0064**) |
 | [0062](0062-workspace-export-lazy-without-node-driver.md) | Workspace Export: lazy materialisation with no DaemonSet — `overlayfs` over a **reflink-or-copy** Snapshot Farm on the Data Depot (hardlinks withdrawn on measurement), mounted by kubelet as a per-Step PVC; the change set is the upper layer; optional node-side write accelerator | Accepted |
 | [0063](0063-step-logs-on-the-data-depot.md) | Step logs live on the **Data Depot**, not the object store and not the CAS: object storage stops being a silent prerequisite, external log systems are additional sinks only, eviction is loud and pinned until a sink acks; renames the workspace service → **Data Depot** | Accepted |

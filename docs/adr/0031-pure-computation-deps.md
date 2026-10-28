@@ -11,15 +11,15 @@
 domain crates, illustrated by an *allowlist* of four crates
 (`serde`/`serde_json`/`thiserror`/`async-trait`). Slice 2 needs **CEL** for `when:`,
 interpolation, and matrix predicates ([0009](0009-dsl-ir-yaml-cel.md)). A CEL evaluator
-(e.g. `cel-interpreter`) is **pure computation** — total, typed, sandboxed, no I/O — yet a
+(e.g. `cel-interpreter`) is **pure computation** (total, typed, sandboxed, no I/O), yet a
 literal four-crate allowlist would ban it, forcing an awkward port+adapter around what is
-really just a function `(&str, &Context) -> Value`.
+only a function `(&str, &Context) -> Value`.
 
 ## Decision
 
 **The purity boundary is *no I/O and no infra*, not *no dependencies*.** A crate may live in a
 pure domain crate (`scarab-engine`/`-pipeline`/`-forge`/`-identity`/`-secrets`/`-storage`/
-`-projects`) iff it performs **no I/O and pulls no infra**: specifically it must not touch the
+`-projects`) if and only if it performs **no I/O and pulls no infra**: specifically it must not touch the
 network, filesystem, clock/RNG, processes, or an async runtime, and must not (transitively)
 depend on `sqlx`, `kube`, `reqwest`, `object_store`, `axum`, `tokio`, cloud SDKs, or similar.
 Pure, total, deterministic computation libraries (CEL evaluation, hashing, parsing such as
@@ -50,7 +50,7 @@ warm-tier write failure must **succeed** the caller, because the cold tier is th
 promise — so the entire observable behaviour of that branch is a log line. Denying the domain a
 facade would have forced the choice between swallowing the failure silently (the "silent facade"
 this codebase refuses) and inventing a port + adapter whose only implementation writes to
-stderr. Neither is architecture; both are ceremony.
+stderr. Both are ceremony, with no architectural value.
 
 The same reasoning does **not** extend to metrics or error-reporting clients that buffer, batch,
 or open a socket even nominally — those are backends wearing a facade's name, and the I/O test

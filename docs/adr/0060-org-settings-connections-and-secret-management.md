@@ -1,4 +1,4 @@
-# 0060. Org settings surface: connection lifecycle, org/env secret editing, IaC-or-UI connections
+# 0060. Org settings: connection lifecycle, org/env secret editing, IaC-or-UI connections
 
 - **Status:** Accepted
 - **Date:** 2026-07-24
@@ -10,8 +10,8 @@
 
 ## Context
 
-Three governance concerns exist in the model and (for secrets) the API, but have **no
-management surface**, so they are unreachable in the product:
+Three governance concerns exist in the model and (for secrets) the API, but there is
+**nowhere in the product to manage them**:
 
 1. **Org-scoped secrets** — the top of the `env → repo → org` inheritance chain
    ([0014]/[0037]). `/v1/secrets` already supports org scope, but the web-ui `RepoSecrets`
@@ -29,19 +29,19 @@ management surface**, so they are unreachable in the product:
 
 A prior decision fixes the tenancy framing: **there is exactly one Org** (single-tenant
 *experience*), but `Org` stays the model's RBAC/secret inheritance root ([0049]/[0037]) — we
-do **not** collapse the concept, we just never build org navigation. "Org settings" is
-therefore the settings of the one org, surfaced as a single global **Settings** area.
+do **not** collapse the concept; we never build org navigation. "Org settings" is
+therefore the settings of the one org, shown as a single global **Settings** area.
 
 ## Decision
 
 ### A. A single global **Settings** area (org-scoped), `Administer`-gated
 
-A new top-level `/settings` route holds the org-scoped surfaces: **Connections** and **Org
+A new top-level `/settings` route holds the org-scoped pages: **Connections** and **Org
 Secrets**. It is enforced at `Administer` on the Org ([0049]) and the nav entry is **hidden**
 from non-admins (nothing there is actionable or informative for them). There is **no org
 switcher** — one implicit Org.
 
-### B. Secret editing is a unified, scope-dimensioned surface; the matrix *is* the editor
+### B. One secret editor for every scope: the matrix becomes the editor
 
 - **Org secrets** live in global Settings (org scope, the inheritance root).
 - **Repo + Environment secret values** live in the Project's **Secrets tab**, where the
@@ -59,7 +59,7 @@ switcher** — one implicit Org.
 
 ### C. Connection lifecycle: full onboarding, asymmetric by forge
 
-A new `/v1/connections` surface (list / create / delete) plus `bind_repo` / `unbind_repo` /
+A new `/v1/connections` API (list / create / delete) plus `bind_repo` / `unbind_repo` /
 `register_webhook`, because for any forge without installation-style auto-registration the
 binding step *is* the missing **repo→Project onboarding** flow.
 
@@ -86,7 +86,7 @@ Connections may be provisioned two ways, and each connection is owned by exactly
 
 Credential resolution is one path — **env-override → `SecretProvider`** — i.e. today's
 `connection_credential()` generalized. The `_forge` pseudo-org stays an internal mechanism,
-never surfaced to users.
+never shown to users.
 
 Three details the single-owner rule forces, settled while building it:
 
@@ -112,25 +112,25 @@ Three details the single-owner rule forces, settled while building it:
 *(Addendum, 2026-07-26 — git-bug `90644c6`.)*
 
 `GET /v1/connections` reports `credential_present`. That catches a credential that is
-**gone**; it cannot catch a credential that is **present and insufficient**, which is the
-shape both known GitHub App misconfigurations take — and both fail *silently*:
+**gone**; it cannot catch a credential that is **present and insufficient**, which is what
+both known GitHub App misconfigurations look like. Both fail *silently*:
 
 - **An empty webhook-event subscription.** GitHub delivers `installation` /
   `installation_repositories` regardless of the subscription list, so the connection
   registers itself, `GET /v1/repos` lists Projects, and no push ever starts a run.
 - **A missing `statuses:write` grant.** Every status post 403s inside the status pipeline
-  while the Run itself goes green, so the forge simply never shows a check.
+  while the Run itself goes green, so the forge never shows a check.
 
 So a **preflight** — `GET /v1/connections/{id}/preflight` — mints the app's credential, asks
 the forge what it is *actually* granted and subscribed to, and diffs that against what
-Scarab needs. Three decisions carry it:
+Scarab needs. It rests on three decisions:
 
 - **The requirement set is data, in one place** (`scarab-forge::preflight`, keyed by
   `ForgeKind`), with severity (`required` = a core promise breaks; `recommended` = an
   authored feature does) and, per entry, *what silently breaks without it*. A diff is only
   maintainable if the required side is a table rather than strings scattered across the
   adapter, the API and the UI copy.
-- **The port observes; the domain judges.** `ForgePort::describe_capabilities` reports
+- **The port only reports; the domain decides what is missing.** `ForgePort::describe_capabilities` reports
   granted permissions and subscribed events and nothing more; it defaults to `Unsupported`,
   so a forge that cannot be introspected reads as **unknown** rather than as an empty grant
   set (which the diff would report as "everything is missing"). GitHub answers from
@@ -146,10 +146,10 @@ Scarab needs. Three decisions carry it:
 ## Consequences
 
 - Forgejo becomes **actually onboardable** from the product for the first time — the [0046]
-  multi-adapter promise is delivered, not just modelled.
+  multi-adapter promise works in practice, not only in the model.
 - Org and Environment secrets get a real editing home; the [0037] matrix stops being read-only
   and becomes the single mental model for "what resolves where."
-- New surface: `GET/POST/DELETE /v1/connections`, `bind_repo`/`unbind_repo`/`register_webhook`
+- New API and UI: `GET/POST/DELETE /v1/connections`, `bind_repo`/`unbind_repo`/`register_webhook`
   endpoints, `GET /v1/connections/{id}/preflight` (part E), a `connections:` config schema, an
   editable-matrix component, and a global Settings route. `SecretScope::Repo` is untouched.
 - The two silent GitHub App misconfigurations stop being a documentation problem: they are

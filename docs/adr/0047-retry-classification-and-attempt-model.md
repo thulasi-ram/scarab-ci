@@ -22,7 +22,7 @@ places where ADR-0020's policy was too coarse.
 
 A step is an opaque black box (ADR-0002), so only the **executor adapter** can
 classify a failure — it alone observes the *execution conditions* around the box.
-The `Executor` port surfaces a **`FailureClass { Infra, Step, Timeout }`** derived
+The `Executor` port reports a **`FailureClass { Infra, Step, Timeout }`** derived
 from observable state (k8s Pod status; local: process signal vs exit code), not a
 bare exit code. The pure engine is a **consumer** of the class — it never
 inspects k8s. The k8s mapping extends the `pod_state` logic c9660bd already
@@ -63,13 +63,13 @@ infra failure silently assumes every step is retry-safe. Split it:
 - Side-effect safety is **at-least-once** (CONTEXT §2): the monotonic fence
   protects **cooperating** sinks (generation/idempotency-key checks — k8s, a
   registry keyed by digest, a DB fencing column). **Non-cooperating** effects
-  (a bare `POST`, email, Slack, some `terraform` backends) **transcend the
-  token** and *will* double-fire on retry. No token can prevent that.
-- Therefore `retry:` carries an **honest warning at the opt-in point**: *"retry
+  (a bare `POST`, email, Slack, some `terraform` backends) **are beyond the
+  token's reach** and *will* double-fire on retry. No token can prevent that.
+- Therefore `retry:` carries an **explicit warning at the opt-in point**: *"retry
   re-runs the whole step at-least-once; enable only if the step is idempotent or
   fenced against a cooperating sink."* Never over-promise safety.
 
-### `retry:` IR surface
+### `retry:` IR syntax
 
 `retry: { on: failure, max: N }` (ADR-0020's syntax), currently not expressible
 (`scarab-pipeline` has no `retry`). `on` selects post-start-infra/step/timeout;
@@ -78,14 +78,14 @@ never-started infra retries independently of it.
 ### Timeouts
 
 - **Step:** kubelet **`activeDeadlineSeconds`** is primary — enforced by the
-  kubelet, so a hung Pod dies even if the control plane is down (surfaces as
+  kubelet, so a hung Pod dies even if the control plane is down (shows up as
   `DeadlineExceeded` → `Timeout` class); plus an engine-side backstop, and the
   local executor's own kill-timer. **Default 1h, per-step overridable
   (`timeout:`), globally configurable** — a default is mandatory (it closes the
   "hung Pod wedges the run forever" hole). Not auto-retried (post-start,
   assertion-gated).
 - **Run:** **no default wall-clock timeout** — a run suspended weeks on a gate is
-  the *wedge*, not a hang. Forward progress rests on step timeouts + gate expiry.
+  the *core feature*, not a hang. Forward progress rests on step timeouts + gate expiry.
   A run budget is **opt-in** and counts **active time only** (excludes
   gate-suspended duration).
 - **Gate:** the existing auto-release *timer* (auto-approve after a wait) plus an
@@ -119,6 +119,6 @@ today's infinite redelivery of a permanently-failing message
 
 - **Uniform auto-retry any failure (ADR-0020 literal):** silently assumes all
   steps are retry-safe; re-runs doomed user code. Refined away.
-- **Opt-in retry for *all* classes incl. never-started:** honest but poor
+- **Opt-in retry for *all* classes incl. never-started:** correct but poor
   ergonomics — a registry blip would fail every build until authors add `retry:`.
   Rejected; never-started is unconditionally safe to auto-heal.

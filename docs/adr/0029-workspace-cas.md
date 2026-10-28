@@ -18,8 +18,8 @@ tree, store files individually keyed by content hash; a snapshot = the **root tr
 Downstream materializes by pulling only files it lacks.
 
 - **Dedup** across steps *and* runs; **incremental transfer** (only changed files move);
-  snapshotting is just hashing.
-- This is the exact substrate skip-if-unchanged and smart-invalidation need.
+  taking a snapshot is a matter of hashing.
+- This is exactly the foundation that skip-if-unchanged and smart invalidation need.
 - **v1 pragmatism:** a plain tar-snapshot is acceptable as a throwaway for the Slice-1
   walking skeleton, upgraded to merkle CAS in Slice 2 when multi-step passing appears.
 
@@ -30,6 +30,6 @@ Downstream materializes by pulling only files it lacks.
 
 ## Alternatives considered
 
-- **Tar-snapshot per step** — trivial, coarse, no dedup; weak content-addressing story.
+- **Tar-snapshot per step** — trivial, coarse, no dedup; weak content addressing.
 - **Content-defined chunking (restic-style)** — best sub-file dedup, most complex; later
   optimization for large-binary workspaces.

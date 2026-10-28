@@ -592,7 +592,7 @@ chart-immutable:
 check:
     cargo check --workspace
 
-# Re-assert the substrate facts ADR-0062 rests on (kube context must be `colima`).
+# Re-assert the platform facts ADR-0062 rests on (kube context must be `colima`).
 #
 # ADR-0062 picks its design because of a handful of kernel and PodSecurity
 # behaviours — Bidirectional needs privilege, `baseline` already forbids it,

@@ -6,10 +6,10 @@
 
 ## Context
 
-The single most wedge-defining UX behavior: when a user restarts step X (or X auto-retries),
-X produces a fresh Attempt with a new output; downstream steps consumed X's *old* output. What
+The UX behavior that matters most for durable execution: when a user restarts step X (or X
+auto-retries), X produces a fresh Attempt with a new output; downstream steps consumed X's *old* output. What
 happens downstream? This is where content-addressing ([0004](0004-execution-topology.md),
-[0029](0029-workspace-cas.md)) pays its dividend.
+[0029](0029-workspace-cas.md)) pays off.
 
 ## Decision
 
@@ -20,13 +20,13 @@ happens downstream? This is where content-addressing ([0004](0004-execution-topo
 - **Side-effecting steps have no meaningful skip hash** → they **always re-run on upstream
   change** (never silently skipped); ties into fencing ([0021](0021-double-effect-fencing.md)).
 - **Manual overrides:** `force-cascade` (re-run all downstream, ignore cache) and
-  `force-skip`/isolated (just this step, for those who know better).
-- Skipped steps are **surfaced explicitly** in the UI/timeline — "smart" never means "mysterious."
+  `force-skip`/isolated (only this step, for those who know better).
+- Skipped steps are **shown explicitly** in the UI/timeline, so "smart" never means "mysterious."
 
 ## Consequences
 
 - "Restart the flaky lint step" costs nothing downstream; "restart the build with a fix"
-  cascades precisely to what changed — the visible payoff of the wedge.
+  cascades to exactly what changed. This is where users see durable execution pay off.
 - Requires reliable per-step input/output hashing (merkle CAS).
 
 ## Alternatives considered
@@ -60,8 +60,8 @@ retroactively made it accurate — which is the worst possible way for a false
 claim to survive review, because by the time anyone checked the behaviour, the
 behaviour agreed with it.
 
-The mechanism of the original error is worth naming, because it is cheap to
-repeat: `rerun_step` genuinely does not compare output hashes. It re-arms the
+The original error is worth spelling out, because it is easy to
+repeat: it is true that `rerun_step` does not compare output hashes. It re-arms the
 invalidation set to `Pending` and stops. The comparison lives in **admission**,
 which decides per step whether a `Pending` step runs. Reading the rerun entry
 point and finding no comparison is a correct reading of that function and a wrong
@@ -70,9 +70,9 @@ amendment asserting that something is not built must name where it looked** — 
 "not built" is a claim about a behaviour, so it needs a behavioural check, not a
 reading of one function.
 
-`force-skip` and `force-cascade` remain genuinely unbuilt, and the "inputs
-unchanged" surface exists on the event log (`StepSkipped`) but not yet as a
-first-class UI affordance.
+`force-skip` and `force-cascade` really are still unbuilt, and the "inputs
+unchanged" signal exists on the event log (`StepSkipped`) but not yet as a
+dedicated UI feature.
 
 ## Amendment (2026-07-27) — invalidation compares content identity, not snapshot roots
 

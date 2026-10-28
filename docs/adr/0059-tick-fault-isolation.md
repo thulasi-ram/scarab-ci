@@ -7,7 +7,7 @@
 
 ## Context
 
-The scheduler tick (`Scheduler::tick_all`) is the durable heartbeat of the fleet: each cycle it
+The scheduler tick (`Scheduler::tick_all`) is the durable loop that drives the whole fleet: each cycle it
 walks every active Run and drives it forward (reconcile shared services → admit → advance), plus a
 few cross-run reconcile passes (`reconcile`, `reconcile_cancellations`, `reconcile_supersessions`).
 
@@ -28,13 +28,13 @@ But it is a **point fix, not the general property**, and two gaps remain:
 
 2. **Swallowed per-Run errors retry forever, unbounded.** A collected `reconcile_services` error is
    logged by the driver and retried next tick with no bound. For a *transient* error (a db blip, a
-   since-fixed control-plane bug) that is precisely the resilience we want — it self-heals on a later
+   since-fixed control-plane bug) that is what we want: it recovers on a later
    tick. But a *persistent* per-Run error (e.g. a `teardown_service` that always fails) now hot-loops
-   indefinitely with no dead-letter — brushing the "forward progress **or** explicit dead-letter"
+   indefinitely with no dead-letter — close to breaking the "forward progress **or** explicit dead-letter"
    invariant (CONTEXT §7.1). This is the same class of gap [0058](0058-runtime-service-containers.md)'s
    Fix A closed for service *launch* errors, by bounding them with the service-startup deadline.
 
-The tick is the forward-progress engine for the whole fleet; its fault-isolation model deserves to be
+The tick is the forward-progress engine for the whole fleet; its fault-isolation model should be
 a deliberate, documented invariant rather than an accident of which call sites happen to use `?`.
 
 ## Decision (proposed)
@@ -46,7 +46,7 @@ another Run's progress.** `admit` and `advance` get the same collect-and-continu
 `reconcile_services` already has; the returned `Vec<(RunId, SchedulerError)>` carries them all for the
 `scarab-server` driver to log (the engine stays pure — it returns the errors, it does not log them).
 
-**2. Genuinely tick-global failures stay fatal (the outer `Result`).** `db.active_runs()` and
+**2. Tick-global failures stay fatal (the outer `Result`).** `db.active_runs()` and
 cross-run passes *not* attributable to a single Run legitimately abort the tick and retry next cycle —
 they are infrastructural, not per-Run poison. Where a cross-run pass *can* attribute a failure to one
 Run's data, it should isolate that Run rather than abort.
@@ -61,12 +61,12 @@ alternative.
 ## Consequences
 
 - "One Run cannot stall the scheduler" becomes a real, testable guarantee — provable by the
-  crash/poison-interleaving tests the durability wedge already licenses (CONTEXT §8).
+  crash/poison-interleaving tests the durable design already makes possible (CONTEXT §8).
 - A small **durable per-Run failure signal** is needed (timestamp of first consecutive failure, or a
   counter) to drive the bound — new Run state.
 - The driver's per-tick log enumerates the isolated per-Run failures; a Run that dead-letters from
   *persistent tick failure* needs a diagnostic clearly distinct from a step dead-letter.
-- More error plumbing inside `tick_all`; the outer-`Result`-vs-inner-`Vec` split must stay legible so
+- More error plumbing inside `tick_all`; the outer-`Result`-vs-inner-`Vec` split must stay clear so
   "fatal tick failure" and "isolated per-Run failure" never blur.
 
 ## Open questions (to grill)
@@ -113,9 +113,9 @@ the bound, never sooner. A control plane restarting faster than 5 minutes is a l
 a late dead-letter. Revisit only if a real poison Run is observed surviving repeated failovers.
 
 **Cross-run passes: per-*item* isolation for the teardown drains.** `reconcile_cancellations` and
-`reconcile_supersessions` now isolate per outbox message, because they could genuinely wedge the
+`reconcile_supersessions` now isolate per outbox message, because they could stall the
 fleet *permanently*: a `SUPERSEDE_TEARDOWN` payload that no longer deserializes made `BadPayload`
-abort the tick — for every Run — on that cycle and every future one. Failed *processing* now rides
+abort the tick — for every Run — on that cycle and every future one. Failed *processing* now falls under
 ADR-0047's existing `MAX_DELIVERY_ATTEMPTS` ceiling (`abandon_poison_message`), which retires the
 message with a `TeardownAbandoned` diagnostic and, like `settle_teardown`, never touches the Run's
 own state. `db.active_runs()` and the outbox claim itself stay tick-fatal — infrastructural, per

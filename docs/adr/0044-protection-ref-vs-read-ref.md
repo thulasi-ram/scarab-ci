@@ -56,7 +56,7 @@ Split the two ref meanings explicitly.
 
 ## Consequences
 
-- **`allowed_refs` finally gates by branch** — the headline fix — on the push,
+- **`allowed_refs` finally gates by branch** (the main fix) on the push,
   dispatch, and PR paths, at both enforcement points. Regression tests assert a
   `feature`-branch run is denied a `refs/heads/main`-scoped env and a `main` run
   is admitted while still pinning the resolved SHA; these tests fail against the
@@ -75,6 +75,6 @@ Split the two ref meanings explicitly.
 - **Normalize inside `ref_allowed`** (strip to a SHA, or fuzzy-match) — pushes
   ref semantics into the pure `scarab-projects` matcher and guesses; the ref
   meaning belongs to the event, which is where `protection_ref` lives.
-- **A single canonical ref on every event** — collapses the two genuinely
+- **A single canonical ref on every event** — collapses the two
   different needs (immutable read point vs symbolic branch) that this ADR exists
   to separate.

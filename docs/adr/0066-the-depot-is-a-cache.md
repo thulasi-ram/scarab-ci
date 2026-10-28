@@ -9,7 +9,7 @@
   Export/Farm machinery), [0063](0063-step-logs-on-the-data-depot.md) (**amends where log bytes
   land**), [0064](0064-durability-tiering-and-the-write-path.md) (the tier stamp this reuses
   unchanged), [0065](0065-retention-cache-and-rederivation.md) (**amends its point 2's rationale**),
-  [0051](0051-multi-replica-operation.md) (multi-replica — for the *control plane*; the Depot's story
+  [0051](0051-multi-replica-operation.md) (multi-replica — for the *control plane*; the Depot's design
   is new here), [0013](0013-history-and-observability.md) (**amends "bodies never"**),
   [0047](0047-retry-classification-and-attempt-model.md) (the failure classes the clocks split into)
 
@@ -31,9 +31,9 @@ together they change what the Data Depot **is** rather than how one of its legs 
 
 ### The measurement inverted the remaining premise (git-bug `4ce7f2c`)
 
-[0061](0061-workspace-data-path.md) s0 priced the feed as the expensive leg and part 2 — lazy
-materialisation — as the load-bearing fix. [0062](0062-workspace-export-lazy-without-node-driver.md)
-then spent an enormous amount of design on delivering laziness without a node driver. A benchmark of
+[0061](0061-workspace-data-path.md) s0 priced the feed as the expensive leg and part 2 (lazy
+materialisation) as the main fix. [0062](0062-workspace-export-lazy-without-node-driver.md)
+then spent a lot of design work on delivering laziness without a node driver. A benchmark of
 the real `workspaced::router` over the real `WorkspaceClient` says the premise no longer holds:
 
 | leg | per file | at 50k files |
@@ -42,17 +42,17 @@ the real `workspaced::router` over the real `WorkspaceClient` says the premise n
 | cold drain | **2.68 ms** | **~134 s** |
 
 The feed is roughly **10× cheaper** than 0061 s0 measured, and **the drain is now 5× the feed.** The
-cheap leg got cheap enough that the expensive leg changed identity.
+feed got cheap enough that the drain is now the expensive leg.
 
-The composition of the feed finishes the argument. Of its 1076 ms (2000 files), only **434 ms is blob
+Where the feed's time goes settles it. Of its 1076 ms (2000 files), only **434 ms is blob
 GETs**; **55% is local filesystem writes** — and a lazy mount pays those writes anyway, on first read.
 So laziness could at best defer a minority share of an already-cheap leg, in exchange for a
 privileged mount, a per-node prerequisite, an NFS server and the machinery in
 [0062](0062-workspace-export-lazy-without-node-driver.md).
 
-**The lazy feed is therefore cancelled and the eager `scarab-wsfetch` init container stays.** That is
-not a retreat to the status quo; it is the status quo winning on measurement, which is the precedent
-0061 set when its own central premise inverted.
+**The lazy feed is therefore cancelled and the eager `scarab-wsfetch` init container stays.** The status
+quo stays because it won on measurement, following the precedent 0061 set when its own central
+premise inverted.
 
 ### Object storage is a soft, recommended requirement (git-bug `42d997c`)
 
@@ -61,19 +61,19 @@ bounded **recent window**, with every degradation disclosed rather than silent �
 [0064](0064-durability-tiering-and-the-write-path.md) part 4 already supports and part 5 already
 stamps (`attempts.output_durability` = `warm-only`).
 
-Logs are the exception, and the exception has a principled shape. They are the only class in the data
+Logs are the exception, for a clear reason. They are the only class in the data
 plane with **no recompute path** ([0063](0063-step-logs-on-the-data-depot.md)); workspaces are
 reproducible from the forge. So logs fall back to **compressed blobs in Postgres**, which is already a
 mandatory dependency, rather than to a volume that dies with a Pod.
 
 > **Guarantee what cannot be recreated; degrade what can.**
 
-That single sentence is why logs and workspaces take opposite decisions in the same deployment.
+That rule is why logs and workspaces take opposite decisions in the same deployment.
 
 ### We are not resilient today (git-bug `e140121`)
 
 Verified 2026-08-03: a **20–30 second Depot outage during Init dead-letters Runs.** The chain is
-short and every link is real:
+short and every link is in the code:
 
 1. `scarab-wsfetch` uses a bare `reqwest::Client::new()` — **no retry, no timeout**
    (`crates/scarab-workspace-client/src/lib.rs:151`).
@@ -94,16 +94,16 @@ makes this safe is a *structural* property rather than a policy: with an eager f
 Depot exactly twice — at **Init** (fetch) and at the **end** (drain). A Depot outage in the middle of
 a 40-minute build is **invisible to that build**.
 
-That property was **bought by cancelling the lazy feed.** A lazily-mounted workspace makes every
+We have that property **because the lazy feed is cancelled.** A lazily-mounted workspace makes every
 running Pod continuously dependent on the Depot for the whole Step, and the failure mode is not a
 clean error: `20e8786` measured nfs-ganesha's actual semantics, and a vanished server wedged a test
 client **unkillably** in `nfs4_proc_destroy_session`. A design where a Depot restart can leave
-uninterruptible processes on Step nodes cannot have a "block and retry" story at all.
+uninterruptible processes on Step nodes cannot support "block and retry" at all.
 
 Retry windows are sized as a **fraction of the Step timeout**, so the cost of waiting is proportional
 to the work at risk rather than a fixed number someone has to defend.
 
-**Waiting is not free, and this ADR does not pretend otherwise.** The argument for blocking is that
+**Waiting is not free.** The argument for blocking is that
 the alternative is worse at both boundaries, for different reasons: at **Init** nothing has been done
 yet, so waiting costs only latency; at **drain** the work is *already done*, and discarding a
 completed build's evidence because the storage service was rescheduled is the expensive mistake.
@@ -122,16 +122,15 @@ Two changes since then made the Depot a **system of record** for something:
 - **warm-only** made the warm tier the only copy of a Workspace Snapshot.
 
 Neither was wrong at the time and neither is being reverted. But an invariant that is stated in one
-ADR and quietly contradicted by two changes is not an invariant — it is a comment. This ADR makes it
-load-bearing again.
+ADR and quietly contradicted by two changes is only a comment. This ADR makes it
+binding again.
 
 ## Decision
 
-### 1. The Depot is definitionally a cache. Anything that makes it a system of record is a defect.
+### 1. The Depot is by definition a cache. Anything that makes it a system of record is a defect.
 
-This is not a preference or a design goal. It is **the invariant every other decision here is judged
-against**, and the reason to state it that strongly is that it makes three separately hard problems
-trivially correct at the same time:
+It is **the invariant every other decision here is judged against**. We state it this strongly
+because it makes three separately hard problems simple to get right at the same time:
 
 | hard problem | why the cache invariant dissolves it |
 |---|---|
@@ -142,17 +141,17 @@ trivially correct at the same time:
 Every one of those is a problem other systems solve with machinery. We solve them by refusing to put
 anything irreplaceable on the Depot.
 
-**The consequence is accepted and documented, not apologised for: HA requires object storage.** If
-the only copy of a snapshot is one replica's disk, no amount of replica count buys availability for
-it. That is a coherent position rather than a gap, because of the next paragraph.
+**The accepted, documented consequence: HA requires object storage.** If the only copy of a
+snapshot is one replica's disk, no amount of replica count buys availability for it. That is a
+consistent position rather than a gap, for the reason in the next paragraph.
 
 **Warm-only does not mean "the Depot is the system of record".** It means there **is** no system of
 record for workspaces in that deployment — which is a smaller, true claim, disclosed per Attempt
 through [0064](0064-durability-tiering-and-the-write-path.md)'s existing
 `attempts.output_durability` / `DurabilityTier`. No new vocabulary is needed; 0064 already built the
-disclosure and this ADR simply declines to build a second one.
+disclosure and this ADR does not build a second one.
 
-**So the two violations get repaired rather than blessed**: point 2 makes the drain record
+**So the two violations are fixed rather than accepted**: point 2 makes the drain record
 self-healing, and point 4 makes eviction reachability-driven. After both, a replica's disk again holds
 only things that can be recreated.
 
@@ -178,7 +177,7 @@ The tempting fix is to make the record durable somewhere. Both durable options w
   only ever converts a retry into a faster, more legible retry.
 
 So the record stays replica-local and its absence is treated as **transient**. That is only sound if
-re-driving the drain is genuinely idempotent, which was verified in the strong sense rather than
+re-driving the drain is actually idempotent, which was verified link by link rather than
 assumed:
 
 | link | why a re-drive is safe |
@@ -189,7 +188,7 @@ assumed:
 | the **409** fires only for an existing **SUCCESS** record | a partial or absent record does not block the retry |
 | once `ANNOTATION_WS_ROOT` is patched, the **`already` guard** skips the leg | so a *succeeded* drain is never redone |
 
-**Accepted cost, booked explicitly:** a genuinely stale helper image — one whose drain will never
+**Accepted cost:** a stale helper image — one whose drain will never
 succeed — now takes **five minutes** to fail instead of failing instantly. That is the price of not
 misclassifying a rescheduled replica as a configuration error, and it is the right way round: a slow
 true negative beats a fast false one.
@@ -211,7 +210,7 @@ ClusterIP, **one fence's blobs scatter across replicas.** `post_drain`'s closure
 against **one** replica's ledger and **one** replica's warm tier, finds most of the snapshot missing,
 and fails.
 
-**This is not a rare interleaving. It is every drain, as soon as you scale past one replica.**
+**This is not a rare interleaving: it happens on every drain once you run more than one replica.**
 
 **And the validation cannot be relaxed to make the problem go away** — the ledger check *is* the
 cross-fence exfiltration fix from `e58ce1f`. Weakening it to tolerate scatter would restore the
@@ -233,7 +232,7 @@ security hole in order to fix an availability one.
 **No new column, no hash ring, no schema migration.** The choice is recorded where the Pod already
 records everything else about its data path.
 
-**Costs, both real:**
+**Costs:**
 
 - **The Service must become headless** for per-pod DNS. And
   `deploy/helm/scarab/templates/service-workspace.yaml` currently carries the comment *"Deliberately
@@ -241,7 +240,7 @@ records everything else about its data path.
   the code.** A stale rationale left beside a reversed decision is worse than no comment, because the
   next reader trusts it.
 - **`WorkspaceFetch.url` stops being one field stamped identically into every Pod.** It becomes a
-  per-Run value, which is a small but genuine widening of what the launch path computes.
+  per-Run value, which is a small but real widening of what the launch path computes.
 
 **Inert at N = 1**, which is every deployment today — so this is buildable and testable before anyone
 scales.
@@ -276,8 +275,8 @@ Attempt is stamped `warm-only`), so pins protect only **in-flight** work rather 
    once and read a thousand times looks identical to a blob written once and never touched. **This is
    the step we defer**, gated on measuring whether (1) suffices.
 3. **In warm-only, over the mark: refuse writes, loudly.** There is no (2) available, and warm
-   `ENOSPC` there means **the snapshot is nowhere**. A loud refusal at the boundary is the honest
-   outcome; a silent partial write is not.
+   `ENOSPC` there means **the snapshot is nowhere**. A loud refusal at the boundary tells the truth;
+   a silent partial write does not.
 
 > **Status (2026-08-26, git-bug cba7165): built, in its post-[0067](0067-the-pack-is-the-record.md)
 > form — and the deferral in (2) is resolved.** With every durable byte bucket-backed and warm-only
@@ -295,7 +294,7 @@ Attempt is stamped `warm-only`), so pins protect only **in-flight** work rather 
 what is already instrumented (the warm-size gauge walks the volume), and it is the only bound that
 degrades predictably. A TTL bounds nothing when the fill rate changes.
 
-**One product surface must change with this.** `ui/scarab-web-ui/src/snapshot-retention.ts:129-131`
+**One piece of UI must change with this.** `ui/scarab-web-ui/src/snapshot-retention.ts:129-131`
 promises that eviction *"only ever makes a rerun slower, never wrong"*. That is true with object
 storage and false in warm-only — the same asymmetry [0064](0064-durability-tiering-and-the-write-path.md)
 part 5 handles for durability. **It must become tier-aware, exactly like the durability stamp**, and
@@ -319,7 +318,7 @@ shape, and it has real replication and erasure coding. **Document it beside MinI
 label it explicitly untested-by-us** — "compatible" is a protocol claim, not an endorsement we have
 earned.
 
-**JuiceFS is deferred and named**, and naming it is the whole value: **if laziness ever revives, the
+**JuiceFS is deferred and named**, and that is the point of naming it: **if laziness ever revives, the
 answer is JuiceFS plus its CSI driver, not a rebuild of the ganesha path.** It needs the privileged
 CSI DaemonSet that [0062](0062-workspace-export-lazy-without-node-driver.md) already priced out, so
 the cost is known rather than hypothetical.
@@ -332,7 +331,7 @@ premise is exactly the mistake 0061 s0 made in the other direction.
 **Kraken is rejected**: archived upstream, so it fails the maintained-library rule. *(Moderate
 confidence — verify the archival before citing this at anyone.)*
 
-**The framing that makes all four one decision rather than four:** every one of them optimises **the
+**Why all four are one decision rather than four:** every one of them optimises **the
 feed**, which the measurement just made the **smaller** leg, along the **concurrency** axis rather
 than the **per-file** axis we actually measured. So **the gate is one experiment, not four
 evaluations**: measure N concurrent fetches of the same snapshot. And if saturation *is* found, reach
@@ -351,7 +350,7 @@ One request per file has a bill as well as a latency:
 *(Pricing from memory — flag as needing verification before it is quoted at anyone.)*
 
 The reason this belongs in the same ADR as the latency argument: **it scales on the same axis** — file
-count. Anything that reduces the number of objects reduces both. That is the bridge to point 7.
+count. Anything that reduces the number of objects reduces both. That leads to point 7.
 
 ### 7. Packing: promoted from deferred to **the next ADR**, gated on measuring the cold flush.
 
@@ -359,9 +358,8 @@ count. Anything that reduces the number of objects reduces both. That is the bri
 managed job over a pre-existing inventory, not a way to write 50k new objects in one call. So **the
 only lever is packing** many blobs into one object with an index.
 
-**The key insight — and the reason this is now tractable when it was not before:**
-
-> **Laziness was the only reason to address blobs individually.**
+**Why this is now tractable when it was not before:** laziness was the only reason to address
+blobs individually.
 
 With eager materialisation, every read is *"give me this whole snapshot"*. `/flat` already returns the
 **entire manifest in one call**, and we then make 50k requests to fetch what that one response
@@ -369,14 +367,14 @@ describes. So packing's main downside — losing random access to an individual 
 longer pay for anything**. And it helps **both** legs, feed and drain, which nothing else on this list
 does.
 
-**Critical gap, and the reason this is gated rather than decided: the cold flush is unmeasured.**
+**The gap, and the reason this is gated rather than decided: the cold flush is unmeasured.**
 `flush_to_cold` (Depot → object storage) was **not** covered by `4ce7f2c`, which measured
 client → Depot **over loopback**. The flush **gates `Succeeded`**
 ([0064](0064-durability-tiering-and-the-write-path.md) part 2) and runs against **real S3**, not
 loopback. **Measure it first, as a sizing input** — pack size, index granularity and whether packing
 is worth its costs all depend on numbers nobody has.
 
-**Packing's real costs, to be carried explicitly by that ADR rather than discovered during it:**
+**Packing's costs, which that ADR must address up front rather than discover along the way:**
 
 - **(a) A durable global `hash → (pack, offset, len)` index**, realistically **Postgres**. This loses
   the property that **the bucket is self-describing** — that a fresh Depot pointed at an existing
@@ -395,7 +393,7 @@ is worth its costs all depend on numbers nobody has.
 lookup replaces the network `HEAD`, which **subsumes** the near-term cheap win and also addresses
 `1d4b3ce`'s serial per-blob `warm_has` walk on the drain's critical path.
 
-**Why it needs its own ADR with a migration story, rather than being decided here:** it is a change to
+**Why it needs its own ADR with a migration plan, rather than being decided here:** it is a change to
 the **frozen canonical on-disk form**, and it carries a **cross-binary skew tripwire** — a Depot and a
 control plane at different versions must not disagree about how bytes are addressed.
 
@@ -417,9 +415,7 @@ key negotiation at all.
 
 **This is a live bug, independent of everything else in this ADR.** The engine backstop is anchored at
 **Attempt claim** time (`crates/scarab-engine/src/scheduler.rs:1645-1652`), which is **before
-dispatch**. Therefore:
-
-> **Queueing delay already bills the Step's timeout.**
+dispatch**. So queueing delay already bills the Step's timeout.
 
 On a busy cluster, a Step that waits ten minutes for a slot starts with **ten minutes less** than its
 author asked for. When it overruns, it surfaces as `Timeout` with **no hint that waiting caused it** —
@@ -432,7 +428,7 @@ the author reads it as their code being slow and raises a limit that was never t
 - A new **nullable** `attempts.execution_started_at`, stamped by the scheduler **the first time
   `poll` reports the step container running and the column is `NULL`**.
 - **No executor API change** — the executor **already** tracks the step container specifically, in
-  order to detect its termination for the drain. The signal exists; it is simply not recorded.
+  order to detect its termination for the drain. The signal exists; it just is not recorded.
 - The **engine backstop re-anchors** to `execution_started_at`, so the author's `timeout:` measures
   execution.
 - A new **provisioning deadline** (generous default) covers **scheduling, image pull and the feed**,
@@ -483,7 +479,7 @@ rather than keeping.
 **Three carve-outs, in order:**
 
 - **(a) Extract the fence-residue sweep from `sweep_exports_once` *first*.** The **ledger** and
-  **drain-record** TTLs live inside it and are **load-bearing** — point 2 depends on drain records
+  **drain-record** TTLs live inside it and are **required**: point 2 depends on drain records
   ageing out. Deleting the sweep with its host file would silently remove a cleanup nobody is
   watching.
 - **(b) Keep `changeset.rs` and its test tier.** It is the **only code anywhere** that reads an
@@ -493,7 +489,7 @@ rather than keeping.
   Depot cache of point 5, or a warm-tier snapshot fast path — wants it, and it is small.
 
 **Name the revival path so nobody rebuilds ganesha: JuiceFS plus its CSI driver** (point 5). What
-survives from [0062](0062-workspace-export-lazy-without-node-driver.md) is its **substrate facts**
+survives from [0062](0062-workspace-export-lazy-without-node-driver.md) is its **platform facts**
 (measured, still true, and the reason the revival path is a known quantity) and the **change-set
 tier**.
 
@@ -506,7 +502,7 @@ framing machinery survives *for artifacts only*. Deleting Export does not touch 
 Cancelling laziness raises a fair question: should we adopt BLAKE3 *now*, so that verified streaming
 (`bao`) is available if laziness ever returns, rather than re-addressing the whole store later? The
 answer is no, but the reasoning matters more than the verdict, because the instinct behind the
-question — do not paint yourself into a corner on an irreversible choice — is right.
+question (do not paint yourself into a corner on an irreversible choice) is right.
 
 **We use SHA-256** (`sha2`, declared in the pure-domain allow-block precisely because hashing is a
 pure function; see [0029](0029-workspace-cas.md) and [0031](0031-crate-boundaries.md)). BLAKE3 appears
@@ -516,7 +512,7 @@ Three reasons not to adopt it now:
 
 - **Verified streaming is not what laziness needs.** `bao` verifies a *byte range of one object*
   without fetching the whole object. Our laziness shape is per-**file**: a lazy read fetches a whole
-  blob, and any hash verifies a whole blob. Range verification earns its keep when you read 4 KB of a
+  blob, and any hash verifies a whole blob. Range verification pays off when you read 4 KB of a
   2 GB object; CI workspaces are millions of small files. Even under packing (point 7) you fetch a
   range of a pack, extract the blob, and verify it by its own address — SHA-256 does that.
 - **Adopting it collides with the next quarter of work.** Re-addressing every object breaks a frozen
@@ -540,7 +536,7 @@ speculative:
    BLAKE3 runs at roughly 5–10 GB/s against SHA-256's 1–2, and `feed_cost.rs` already notes that debug
    builds inflate the SHA-256 legs. It is not dominant in release for small files. If large artifacts
    become common, remeasure before assuming.
-2. **Packing adopts partial pack verification.** The one genuine `bao` use case that could arise here
+2. **Packing adopts partial pack verification.** The one real `bao` use case that could arise here
    is verifying a partial pack read without extracting. That belongs in the packing ADR's own
    evaluation (`a0c28aa`) — recorded there so whoever writes it *decides* rather than inheriting
    SHA-256 by default.
@@ -562,7 +558,7 @@ speculative:
   inverting `42d997c`.
 - **Relax `post_drain`'s closure validation so scattered blobs stop failing it.** The one-line fix for
   point 3. **Rejected outright**: the ledger check *is* `e58ce1f`'s cross-fence exfiltration fix.
-  Trading a security property for an availability one is never the trade it looks like.
+  We do not trade a security property for an availability one.
 - **A hash ring or a new `attempts` column for replica choice.** More principled-looking than reading
   the Pod spec. **Rejected as unnecessary**: the Pod spec is *already* the durable record that
   survives a control-plane restart, and `ANNOTATION_WS_OUTPUTS` is the precedent. A schema migration
@@ -575,10 +571,10 @@ speculative:
 - **Evict warm by TTL rather than by a size watermark.** Simpler to reason about per object.
   **Rejected**: the operator's actual constraint is **space**, a TTL bounds nothing when fill rate
   changes, and space is the bound already instrumented.
-- **Build the access index now** rather than deferring it. It is the honest LRU. **Deferred** rather
+- **Build the access index now** rather than deferring it. It is proper LRU. **Deferred** rather
   than rejected: reachability-first eviction may well suffice, and building an access-tracking write
   path for immutable content before knowing that is machinery bought on a guess.
-- **Fix the queueing-eats-the-timeout bug by simply raising default timeouts.** Zero code.
+- **Fix the queueing-eats-the-timeout bug by raising default timeouts.** Zero code.
   **Rejected**: it hides a misattribution rather than correcting it, and the failure still reports
   `Timeout` for a Step that never ran.
 
@@ -620,8 +616,8 @@ speculative:
 - [0047](0047-retry-classification-and-attempt-model.md) — failure classes; why `FailureClass::Config`
   ignoring `retry:` is the sharp edge in point 2, and where the provisioning-deadline class lands
 - [0050](0050-retention-and-gc.md) — the sweeper whose mark walk point 4 points at warm
-- [0051](0051-multi-replica-operation.md) — multi-replica for the **control plane**; the Depot's story
-  is this ADR
+- [0051](0051-multi-replica-operation.md) — multi-replica for the **control plane**; the Depot's multi-replica
+  design is this ADR
 - [0061](0061-workspace-data-path.md) — the cache invariant this restores; **amends** its part 4 LRU
   deferral
 - [0062](0062-workspace-export-lazy-without-node-driver.md) — the lazy Export; **cancelled** here on
@@ -634,11 +630,11 @@ speculative:
   rationale and supplies the warm space budget point 4 needs
 - git-bug `4ce7f2c` — the measurement that cancelled laziness
 - git-bug `e140121` — we are not resilient today; the prerequisite for HA
-- git-bug `20e8786` — measured ganesha semantics; why a continuously-dependent Pod has no block-and-retry story
+- git-bug `20e8786` — measured ganesha semantics; why a continuously-dependent Pod cannot block and retry
 - git-bug `42d997c` — the warm-only matrix; object storage as a soft, recommended requirement
 - git-bug `6cb4a27` — Depot HA; yesterday's shard-by-fence answer and why it simplified
 - git-bug `974440b` — logs swallow errors in every deployment, not just warm-only
 - git-bug `2e1a458` — fan-in is a sequential per-path union; why affinity hashes by Run
 - git-bug `1d4b3ce` — the drain's serial closure validation; what packing's free presence index subsumes
 - git-bug `0d3666a` — artifact harvest stays on its exec-tar leg; unaffected by the deletion
-- git-bug `16a7768` — the in-Pod drain's resource story
+- git-bug `16a7768` — the in-Pod drain's resource usage

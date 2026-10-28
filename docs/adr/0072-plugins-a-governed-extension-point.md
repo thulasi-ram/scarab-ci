@@ -35,7 +35,7 @@ The governing principle, from the owner, verbatim:
 > "We should not overfit scarab to argo, we should ensure the plugin system is powerful
 > enough to fit argo."
 
-Argo is the proving workload. Every capability below exists because the Argo plugin
+Argo is the case that proves the design. Every capability below exists because the Argo plugin
 needs it *and* a non-Argo plugin could use it the same way.
 
 Two earlier decisions constrain the design and **still stand**:
@@ -195,7 +195,7 @@ can sync but not override) is the first.
   re-approved on every digest. Everything the Plugin emits (labels, links, action
   results) is scrubbed by the secret redactor.
 
-**Honest limit:** behind a **shared ingress**, a delivered credential's tunnel may reach
+**Known limit:** behind a **shared ingress**, a delivered credential's tunnel may reach
 other sites on that ingress, because address and SNI pinning cannot tell them apart. The
 UI says so. `delivered` is meant for destinations with an address of their own
 (databases, SSH, dedicated endpoints).
@@ -256,7 +256,7 @@ defend against `trusted_dom` code, which can change what is being confirmed.
 - Each Plugin runs under a ServiceAccount with **no RBAC** and **no token automount**.
   It receives only a projected token for the broker (§11).
 - **NetworkPolicy is default-deny**, including Plugin to Plugin. Egress is allowed to the
-  CredentialBroker only — not to DNS: the cluster resolver forwards any name upstream, so
+  CredentialBroker only, not to DNS: the cluster resolver forwards any name upstream, so
   a DNS allowance is a two-way tunnel out. A Plugin is handed the broker by IP instead
   (core resolves the broker's address itself). Ingress is allowed from the control plane
   only.
@@ -281,8 +281,8 @@ defend against `trusted_dom` code, which can change what is being confirmed.
   (`delivered`, `trusted_dom`) need dual approval on every digest.
 - **Publisher trust.** A **PluginPublisher** is a signing identity (a Sigstore identity
   or key) an org trusts. **Unsigned images, or images from untrusted publishers, cannot be
-  installed.** Scarab's own release identity is trusted by default (first-party). "Which
-  plugins do we trust?" is answered as "which publishers?".
+  installed.** Scarab's own release identity is trusted by default (first-party). Trust is
+  decided per publisher, not per plugin.
 - **Operator ceiling.** Above org admins, the operator decides which publishers may be
   trusted at all and whether elevated tiers exist on this deployment.
 - **Kill switch.** An installation can be stopped at once, without an upgrade or an
@@ -324,7 +324,7 @@ defend against `trusted_dom` code, which can change what is being confirmed.
   that does not enforce it fail loudly rather than run unprotected.
 - Third-party installs stay **off** until StepUpConfirmation and publisher signatures
   exist. Until then only first-party plugins run.
-- New surface: a plugin runtime, a broker, a capability check, `plugin_action`, UI
+- New components: a plugin runtime, a broker, a capability check, `plugin_action`, UI
   extension points, step-up. This is the largest new subsystem since the engine.
 - Verifying projected tokens needs TokenReview RBAC (`system:auth-delegator`) for the
   control plane in the chart, or JWKS access.

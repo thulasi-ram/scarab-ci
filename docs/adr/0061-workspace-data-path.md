@@ -24,7 +24,7 @@
 
 [0004](0004-execution-topology.md) chose **pod-per-step** with the workspace passed as
 content-addressed snapshots in object storage, and promised a **control-plane / data-plane
-split**: the durable brain records intent, data moves on its own path.
+split**: the durable control plane records intent, and data moves on its own path.
 
 The implementation does not honour that promise. `build_pod` gives each Step Pod an
 `emptyDir` plus two `busybox` doorstop containers, and `drive_workspace` moves the workspace
@@ -38,10 +38,10 @@ are real, but they apply only between the server and object storage, i.e. *after
 part." **Measurement — s0, recorded under Open below — showed that sentence to be backwards.**
 The server↔object-storage leg *is* the expensive part, 81–88% of every Step boundary, and the
 dedup saves approximately nothing: the cost is one sequential round-trip **per file**, not the
-bytes. Every structural complaint below still holds. The money is simply not where this
+bytes. Every structural complaint below still holds. The time is not spent where this
 paragraph guessed it was.
 
-**This is unsound by inspection, independent of any benchmark.** A tar piped through an
+You can see this design is unsound without running a benchmark. A tar piped through an
 `exec` stream is: a single sequential connection (no parallel ranges, no saturating a NIC);
 unresumable (a break at 90% starts over); routed through the cluster's most contended
 component, competing with the control traffic that keeps the cluster alive; funnelled through
@@ -62,18 +62,18 @@ That rules out the topologies other CI engines use to make this problem disappea
 avoid it by choosing a coarser unit that owns a machine for its lifetime — GitHub Actions
 (the job), Woodpecker (the pipeline, one volume, node-pinned under RWO), Tekton (the Task,
 plus an affinity assistant that pins a whole run). Sharing is free inside the unit and
-painful across it. Argo Workflows makes our choice — step-grain pods, object-storage
-passing — and pays what we pay. Pod-per-step is not the mistake; **routing the data through
-the brain is**.
+painful across it. Argo Workflows makes our choice (step-grain pods, object-storage
+passing) and pays what we pay. Pod-per-step is not the mistake; **routing the data through
+the control plane is**.
 
 ## The governing principle
 
-> **Minimise the substrate idiosyncrasies an author must know.**
+> **Minimise the infrastructure quirks an author must know.**
 
 A Pipeline author should not have to learn that this engine is expensive at Step boundaries,
 that caches shouldn't live in the workspace, or that wide edges cost money. Rules of that
 shape are unenforceable, they date badly, and they push our operational problems into other
-people's YAML. Where the substrate is expensive, **the system pays, not the author.**
+people's YAML. Where the infrastructure is expensive, **the system pays, not the author.**
 
 This principle decides things that would otherwise look arguable, and it is why this ADR
 does *not* make `outputs:` a performance requirement (see Consequences).
@@ -86,21 +86,21 @@ does *not* make `outputs:` a performance requirement (see Consequences).
 A long-lived, Scarab-operated service holding a warm content-addressed store on a persistent
 volume, deployed once per failure domain (per AZ, where AZs exist). Generic **object
 storage** sits behind it as the cold archive under a retention TTL. *One* path in every
-deployment mode — dev, `kind`, colima, production — because two modes is two mental models
-and the taxonomy cost is worse than the component cost.
+deployment mode (dev, `kind`, colima, production), because two modes means two mental models,
+and that costs more than running one more component.
 
 The persistent volume attaches to **the service**, never to a Step Pod. Every problem PVCs
 have here — attach/detach latency at each boundary, stuck volumes when a spot node is
 reclaimed, per-node attachment quotas, provisioning delay — comes from binding volumes to
 short-lived pods. Bind them to the long-lived thing instead and all of it goes away.
 
-**One path is a direction-at-a-time claim, and both directions have now arrived.**
+**"One path" has to hold in each direction separately, and it now holds in both.**
 s3-feed converged the **read** path: every Step that inherits a workspace materialises it from
 the service, in every deployment mode, with no second route. **s3-drain converged the write
 path** (2026-08-01): the drain runs *inside the Pod* — the control plane execs `scarab-wsfetch
 drain` in the egress helper, the helper ingests `/workspace` to the Depot warm-first
 (`/have`-dedup), prunes to the authored `outputs:` and folds the content identity in-process,
-and posts a **drain record** to the Depot as the rendezvous. The control plane reads the record
+and posts a **drain record** to the Depot as the hand-off. The control plane reads the record
 back, awaits the archival `flush`, and patches root/identity/durability onto the Pod — hashes
 and a record, never bytes.
 
@@ -141,19 +141,19 @@ bytes. Helper containers become Scarab-owned images rather than `busybox` doorst
 >   busybox barrier ran as root, and a `0600` file left by a `run_as_root` step must not
 >   silently vanish from the snapshot).
 > - The control plane execs `scarab-wsfetch drain --workspace /workspace --outputs <glob>…` in
->   that container — argv in, exit code out; the globs are transport, the Pod annotation is the
->   truth. The helper ingests warm-first with `/have` dedup, prunes and folds the content
+>   that container — argv in, exit code out; the globs only carry the request, the Pod annotation
+>   is the source of truth. The helper ingests warm-first with `/have` dedup, prunes and folds the content
 >   identity in-process (no HTTP tree read-backs on the hot path), and POSTs its **DrainRecord**
 >   to the Depot LAST — so a record's existence implies the ingest completed. The Depot
 >   validates the record against the fence's write ledger and the closure's warm presence
 >   before accepting it.
-> - Classification is **record-first**: the record is the truth, the exec's exit code only a
+> - Classification is **record-first**: the record is authoritative, the exec's exit code only a
 >   hint when no record exists (a success record publishes; an `OutputContract` record fails
 >   Config with the helper's detail; exit 11 with no record fails Config; 126/127/"executable
 >   file not found" is a named image/control-plane **skew** failure, and so is **exit 0 with no
 >   record** — a stale wsfetch has no subcommands, ignores the `drain` argv, runs fetch and
 >   exits 0 having published nothing, while a current binary always POSTs its record before
->   exiting 0 — prompt and legible, never a wedge to the step budget; everything else re-drives
+>   exiting 0 — reported promptly and clearly, never a hang until the step budget runs out; everything else re-drives
 >   under the 5-minute escalation clock).
 > - `ws-timing` moved to **v2**: the control plane keeps `exec_drain_ms` / `cold_flush_ms` /
 >   `total_ms`; `files`, `tree_bytes`, `blobs_uploaded`, `bytes_uploaded`, `have_hits`,
@@ -187,7 +187,7 @@ this product may not do.
 > and disclosure removes it.
 >
 > The related prohibition three paragraphs into "the price of seeding the warm tier" — that writing
-> warm-first and letting the service tier onward makes warm load-bearing for durability — **still
+> warm-first and letting the service tier onward makes durability depend on warm — **still
 > stands**. 0064 writes warm-first for *one batched flush* that is synchronous with respect to
 > `Succeeded`; it does not tier onward asynchronously. Warm is the write path, cold remains the promise
 > wherever it exists.
@@ -236,7 +236,7 @@ Two tiers, two policies, so eviction can never break a promise:
 > "GC deletes from cold and leaves warm" bullet calls *"the only thing that will ever reclaim it"*).
 > **It is now the gating gap**, for two reasons this ADR could not see:
 >
-> - **Warm-only makes it load-bearing.** With no cold tier there is no second copy, so what warm
+> - **Warm-only makes it critical.** With no cold tier there is no second copy, so what warm
 >   evicts is what a rerun loses — a bounded *recent window* rather than a latency event. An
 >   unbounded, unswept warm tier in that mode is not a cache with a soft edge; it is a volume that
 >   fills and then fails writes.
@@ -256,7 +256,7 @@ Two tiers, two policies, so eviction can never break a promise:
 
 Plus a manual **pin** ("keep this Run's workspaces") for investigations, and **graceful
 degradation**: expired inputs widen a rerun's scope and say so, rather than failing. Rerun
-affordances must state which they are — "Rerun this step" vs "Inputs expired — this re-runs
+buttons must say which they are — "Rerun this step" vs "Inputs expired — this re-runs
 from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never means mysterious.
 
 ## Consequences
@@ -266,7 +266,7 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
   path beats a fast path plus a fallback path.
 - ~~**A privileged node driver becomes an install prerequisite**~~ — **withdrawn with part 2
   ([0062](0062-workspace-export-lazy-without-node-driver.md)).** It was booked here as an
-  honest cost and it is now a forbidden one. 0062 replaces it with a privileged **workspace
+  accepted cost and it is now a forbidden one. 0062 replaces it with a privileged **workspace
   service** Pod — one operator-installed StatefulSet on the node Scarab's server already runs
   on, not a component on every node — and makes even that *preferred rather than required*, since
   the Farm degrades to a `reflink` or plain local copy without the capability. The comparison to
@@ -275,10 +275,10 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
 - **The implicit inherit-everything default stays**, and `outputs:` ([0007](0007-data-passing-model.md))
   stays a *precision* tool — for cache keys, safe fan-out and restricting what flows — never
   a performance tax. Laziness plus content addressing is the automatic version of a narrow
-  edge: a Step that reads 5% of a tree moves 5% of it, having declared nothing. Directly
-  downstream of the governing principle.
+  edge: a Step that reads 5% of a tree moves 5% of it, having declared nothing. This follows
+  directly from the governing principle.
 - **"Don't put your cache in the workspace" is not a rule we will teach.** It is
-  unenforceable and it is substrate knowledge. [0007](0007-data-passing-model.md)'s Cache
+  unenforceable, and it asks authors to know how our infrastructure works. [0007](0007-data-passing-model.md)'s Cache
   concept remains the *better* tool; using it stays an optimisation, not a requirement.
 - **The Helm-dogfood failure class goes — and the warm tier is not what removes it.** This
   bullet used to credit the wrong component, which matters because the mis-attribution
@@ -311,10 +311,9 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
   > of record for workspaces in that deployment — disclosed per Attempt via
   > `attempts.output_durability`.
   >
-  > The payoff for holding the invariant is why it is worth the repair: **HA becomes "run more
+  > Holding the invariant is worth the repair because of what it buys: **HA becomes "run more
   > replicas"** (replicas hold nothing unique), **eviction is safe by construction**, and **spot
-  > preemption costs a cold cache**. The accepted cost, documented rather than apologised for: **HA
-  > requires object storage.**
+  > preemption costs a cold cache**. The accepted cost: **HA requires object storage.**
 - **Cross-AZ traffic is confined to the archive drain**, which can be throttled or scheduled.
   Step Pods talk only to their own zone's service. (In-region object storage is typically
   free per byte; EC2-to-EC2 across AZs is not. The cost was never "object storage" — it was
@@ -348,7 +347,7 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
   rather than test-only.
 - **OCI artifacts are an available internal representation** for the service, not a separate
   concept. Kubernetes already distributes immutable content to ephemeral nodes with per-node
-  caching and dedup; if the service chooses to ride that, nothing above it changes.
+  caching and dedup; if the service chooses to build on that, nothing above it changes.
 
 ## Alternatives considered
 
@@ -356,12 +355,12 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
   per Step, per-node attachment quotas, one volume to reap per Step, and no reuse between
   Steps, because isolation is the opposite of caching.
 - **One RWO PVC per Run** — a detach-then-attach cycle at every boundary (tens of seconds
-  each way on EBS-class storage), and on spot the reclaimed-node-holding-the-volume wedge is
-  routine rather than exceptional. Only pays off under co-location, which is excluded.
-- **RWX PVC per Run** — avoids the attach dance, but NFS-class storage is slowest at exactly
+  each way on EBS-class storage), and on spot a volume stuck on a reclaimed node is routine
+  rather than exceptional. Only pays off under co-location, which is excluded.
+- **RWX PVC per Run** — avoids the attach/detach cycle, but NFS-class storage is slowest at exactly
   our file shape (many small files: checkouts, `node_modules`), and it is a much heavier
   prerequisite than the driver.
-- **PVC clone / VolumeSnapshot per Step** — genuinely good on copy-on-write storage (Ceph,
+- **PVC clone / VolumeSnapshot per Step** — good on copy-on-write storage (Ceph,
   local LVM/btrfs); unusable at Step grain on EBS, where a clone means snapshot-then-restore
   with lazy block hydration. Also dedups only down a lineage, where content addressing dedups
   across unrelated Runs.
@@ -372,7 +371,7 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
   rebuild (today's `tar` legs do preserve both); and concurrent pods contend on the index
   lock. Worth revisiting only for delta compression of large binaries.
 - **Coarsening the unit (pod-per-pipeline or pod-per-stage)** — the GHA / Woodpecker / Tekton
-  answer, and it genuinely makes intra-unit sharing free. Rejected because it trades away
+  answer, and it does make sharing within the unit free. Rejected because it trades away
   per-Step restart, per-Step placement ([0055](0055-placement-profiles.md)) and per-Step
   right-sizing — which on spot is a direct cost lever — to solve a problem that a lazy mount
   solves without giving anything up.
@@ -390,8 +389,8 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
   the whole workspace to every fresh node, i.e. it rebuilds the same complaint over a shorter
   wire.
 - **Teaching authors to declare narrow `outputs:`** — the cheapest fix on paper and rejected
-  on principle: it is substrate knowledge in the authoring model, and it assumes an awareness
-  of our idiosyncrasies that we have decided to minimise.
+  on principle: it puts infrastructure knowledge into the authoring model, and it assumes
+  authors know the quirks the governing principle says we should minimise.
 - **Naming a specific object-storage product or zone topology** — an operator's cost decision,
   not an engine decision.
 
@@ -432,7 +431,7 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
      (8867 ms). `put_if_absent` pays a `head` round-trip per file either way, and the avoided
      `put` costs about the same as the `head`. Dedup saves storage, not wall-clock.
 
-  **Consequence for sequencing.** Part 2 (**lazy materialisation**) is the load-bearing part,
+  **Consequence for sequencing.** Part 2 (**lazy materialisation**) is the part that matters most,
   not part 3: it attacks file count, which finding 2 identifies as the actual cost driver.
   Whatever else the workspace service does, it must not reproduce a per-file sequential
   round-trip walk — concurrency and batching in the CAS legs are worth more today than the
@@ -518,7 +517,7 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
   limit still buys is peak memory. A *remote* object store, with a real network in the path,
   would move that knee to the right — hence a knob and not a constant.
 
-  **The counters relocated the bottleneck, and this is the finding that matters most.** With the
+  **The counters show the bottleneck has moved, and this is the most important finding.** With the
   round-trips overlapped, `store_ms` — a sum over concurrent requests, so it legitimately exceeds
   the leg's wall clock; the *ratio* is the reading — runs 15–90× the leg's duration. **The object
   store is now essentially hidden.** What is left is `fs_ms`: the local filesystem on the control
@@ -556,7 +555,7 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
   hidden either way). It is that 88% of the leg is reading every file off local disk in order to
   hash it, and dedup cannot avoid a read whose redundancy it has not yet discovered. The only
   thing that fixes it is not walking unchanged content at all — the **overlay diff for the drain**
-  below. Two independent measurements have now landed on that slice. (An in-process run *did*
+  below. Two independent measurements now point to that slice. (An in-process run *did*
   show a deduped ingest 4× faster; that harness re-ingests the same directory immediately, so it
   measures a hot page cache as much as dedup. The stack numbers are the ones to believe.)
 
@@ -565,12 +564,12 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
   a second invocation against the same bucket reported `objects_put=41 objects_present=2000` on
   what it called a *cold* ingest. Nothing outside the CAS could have seen that.
 
-  **Cost of the concurrency, stated plainly.** A blob is still buffered whole, so peak memory is
+  **Cost of the concurrency.** A blob is still buffered whole, so peak memory is
   now roughly `concurrency × largest blob` where it used to be `1 × largest blob`. At the default
   32 that is nothing for the KB–MB files a checkout is made of and fatal for a workspace holding
   a 500 MB artefact. Mitigated today only by documentation and by `SCARAB_CAS_CONCURRENCY` being
   lowerable; the real fix is a byte budget beside the count budget, or streaming blob bodies
-  instead of buffering them — the same primitive ADR-0029's deferred sub-file chunking needs.
+  instead of buffering them. ADR-0029's deferred sub-file chunking needs that streaming too.
 - ~~**mtime fidelity across the CAS.**~~ **Answered (s7) — it did not, and now it does.**
   Measured, not reasoned about: the CAS tree entry carried only `name` and `target`, so a
   round-trip silently dropped every mode (an executable came back `0644`) and every mtime
@@ -592,8 +591,8 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
   sentence excluded from consideration **exactly the case skip-if-unchanged exists for**: an
   ancestor that *did* re-run and produced the same output. The live kube tier then measured it
   (git-bug `945b1f4`): two Attempts writing byte-identical content produced roots differing in
-  `mtime_ms` alone. Recorded here because the reasoning error is reusable — a cost argument
-  that names the cases it does not pay for is not yet an argument.
+  `mtime_ms` alone. Recorded here because the mistake generalises: listing the cases a cost
+  argument does not pay for is not the same as checking them.
 - **Two digests, one address — s8. DONE, and it closes `945b1f4`.** A Workspace Snapshot now
   has two coordinates, and only one of them is an address:
 
@@ -603,7 +602,7 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
   | **content identity** | names, targets, modes | **no** | is this the same content? |
 
   The identity is the same merkle fold with every mtime dropped and each sub-tree named by
-  *its* identity. It is folded up for free during `ingest` (one extra SHA-256 per directory,
+  *its* identity. It is folded up during `ingest` at almost no cost (one extra SHA-256 per directory,
   **zero** round-trips — nothing is stored under it), recorded beside the root as Attempt
   evidence, and it is what [0027](0027-restart-semantics.md)'s input signature compares.
 
@@ -637,14 +636,14 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
 
   Also considered and rejected: **carrying mtimes forward from a baseline** — on ingest, reuse
   the previous snapshot's mtime for any path whose content is unchanged. This is the only
-  scheme that keeps *one* digest and stays safe, and it is genuinely elegant: it makes a root
+  scheme that keeps *one* digest and stays safe, and it is elegant: it makes a root
   reproducible *and* keeps every timestamp truthful about when content last changed. It loses
   on this ADR's own retention model. The baseline is a snapshot, snapshots expire (warm by
   space, cold by TTL), and when the baseline is gone the mtimes revert to wall clock and the
   root moves again. A determinism guarantee that decays with retention, silently, is the
   failure we are already fixing.
 
-  **Consequences, stated plainly:**
+  **Consequences:**
 
   - **The identity is never an address.** Nothing is stored under it, `materialize` never sees
     it, GC's mark walk still starts from roots, `prune_tree` is unchanged. It is a label on
@@ -667,11 +666,11 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
     > hashes it compared came from one statically-linked `canonical_tree_bytes` executing in
     > one process — `WorkspaceClient::put_tree` canonicalises client-side — so no pair of real
     > tiers could ever disagree, and the "version skew between deployed binaries" it claimed to
-    > guard was never in its comparison. The check now lives where the two binaries genuinely
+    > guard was never in its comparison. The check now lives where the two binaries actually
     > meet: the Depot's `PUT /v1/cas/trees` re-serialises the parsed body through **its own**
     > linked `canonical_tree_bytes` and answers a distinct `400` ("canonicalisation skew") on
     > a byte difference — the client's serialiser versus the Depot's, which is the comparison
-    > the old tripwire pretended to be. This makes the format's evolution rule load-bearing:
+    > the old tripwire claimed to be. This means the format's evolution rule must now be followed:
     > the tree format may only evolve by **additive `Option` fields** with
     > `#[serde(default, skip_serializing_if)]`, so parse → re-serialise stays byte-identical
     > across one version of skew. A non-additive change breaks mid-rollout PUTs **by design**
@@ -683,7 +682,7 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
 
   > **Amended 2026-08-01 by [0064](0064-durability-tiering-and-the-write-path.md) (the
   > control-plane section).** This bullet's prohibition — point 1's "writing warm-first and
-  > letting the service tier onward would make the warm tier load-bearing for durability,
+  > letting the service tier onward would make durability depend on the warm tier,
   > which part 4 forbids" — is **superseded for the control plane**, whose write leg is now
   > warm-first too: the Depot's PUT handlers are **warm-only**, and durability is one explicit
   > `POST /v1/cas/flush` the control plane **awaits before `Succeeded`**. That is not the
@@ -692,7 +691,7 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
   > protected (warm never silently licenses `Succeeded`) survives in the flush contract. The
   > original reasoning below is kept: it correctly priced the cold-first shape, and points 1–3
   > describe the shape this amendment retires (point 2's double cold write disappears with it;
-  > the flush's existence probe is the `exists` primitive point 2 filed). The Depot being on
+  > the flush's existence probe is the `exists` check point 2 filed). The Depot being on
   > the durability path means a Depot outage **may fail Attempts — promptly and with a named
   > cause, never as a timeout**; 0064's control-plane section records that as the architect's
   > accepted trade.
@@ -704,14 +703,14 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
      made concurrent inside a pure domain crate (no `futures` dependency), so it would be one
      sequential round-trip per file, which is precisely the pattern s0 identified as the
      dominant cost and this ADR forbids the new path from reproducing; and writing warm-first
-     and letting the service tier onward would make the warm tier load-bearing for durability,
+     and letting the service tier onward would make durability depend on the warm tier,
      which part 4 forbids. Removing the second walk needs a port change — a `Cas` that writes
      one walk to two backends, or an `ingest` that returns the tree it built so a tiered
      implementation could seed warm at merkle grain *with the adapter's concurrency*.
-  2. **Genuinely new content is written to cold twice** — once by the drain's own cold leg, once
+  2. **Content not already stored is written to cold twice** — once by the drain's own cold leg, once
      by the service's cold-first `PUT`. Dedup bounds it: `POST /v1/cas/have` answers from warm,
      so a re-drain of unchanged content uploads nothing at all, and only new blobs pay. Neither
-     `ObjectStore` nor the wire protocol has an **existence** primitive, so neither side can
+     `ObjectStore` nor the wire protocol has an **existence** check, so neither side can
      skip; adding `exists` to the port is the fix and is filed.
   3. **GC deletes from cold and leaves warm.** ADR-0050's sweep runs against the control plane's
      own object store, and the service exposes no delete verb, so a collected blob can survive

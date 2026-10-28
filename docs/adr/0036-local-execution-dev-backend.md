@@ -7,12 +7,12 @@
 ## Context
 
 [0005](0005-tenancy-and-k8s-only.md) states **Kubernetes is the ONLY execution
-substrate** (explicit non-goal: Docker-socket, local, SSH). Yet a
+backend** (explicit non-goal: Docker-socket, local, SSH). Yet a
 `scarab-executor-local` crate exists and the roadmap (CONTEXT §9.7, slice 7) lists
 "local exec." Read literally these conflict. The `Executor` **port**
 ([0004](0004-execution-topology.md), [0016](0016-code-architecture.md)) makes
-alternative backends *possible* — the durable brain (`scarab-engine` + the
-Postgres outbox + the API) never touches Kubernetes — so the question is one of
+alternative backends *possible*: the durable brain (`scarab-engine` + the
+Postgres outbox + the API) never touches Kubernetes. So the question is one of
 product stance, not feasibility.
 
 ## Decision
@@ -30,7 +30,7 @@ a supported deployment mode.** [0005]'s "Kubernetes-only" governs how Scarab is
 It is **never** offered as a hosted/self-hosted execution backend, and carries no
 multi-backend abstraction beyond the single `Executor` port that already exists.
 "Local dev against a cluster" remains **kind** (Kubernetes-in-Docker) on the k8s
-adapter — the real substrate.
+adapter, the real backend.
 
 Consequences for its semantics (a dev tool, so deliberately narrower than k8s):
 

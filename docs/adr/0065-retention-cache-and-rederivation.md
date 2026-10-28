@@ -30,7 +30,7 @@
 [0007](0007-data-passing-model.md) makes the Workspace **implicit-by-default**: a Step inherits the
 merged workspace of its `needs`, and `inputs:`/`outputs:` are precision tools. Its 2026-07-26
 amendment makes that permanent, on [0061](0061-workspace-data-path.md)'s governing principle —
-*"minimise the substrate idiosyncrasies an author must know… where the substrate is expensive, the
+*"minimise the infrastructure quirks an author must know… where the infrastructure is expensive, the
 system pays, not the author"* — and forbids `outputs:` ever becoming something an author declares
 **for speed**.
 
@@ -43,10 +43,10 @@ declared**. So under the implicit default, every Step retains its **entire** wor
 `node_modules`, `.git`, temp files — per Step, per Run, for the retention window. Content addressing
 dedupes identical files, but a build output churns by design, so dedup does not save it.
 
-**What the classes cost is ecosystem-dependent, and this is estimated rather than measured.** Recorded
-as an estimate on purpose: this ADR family has already paid for a probe read as answering a question
-it had not asked, and the mirror-image error is an assumption that later reads as a measurement. A
-deliberate decision was taken *not* to measure the dogfood repo, because a pre-release project
+**What the classes cost is ecosystem-dependent, and this is estimated rather than measured.** It is
+labelled an estimate on purpose. These ADRs have already been burned by a probe that was read as
+answering a question it never asked, and the opposite mistake is an assumption that later gets read
+as a measurement. We deliberately chose *not* to measure the dogfood repo, because a pre-release project
 measuring one Rust repository would over-fit the design to a sample of one, and because the mix
 differs per organisation — which is itself the argument for the knobs below.
 
@@ -99,7 +99,7 @@ it as keyed and author-declared.
 > cost. The `saved_at` refresh and the fetcher's hit/miss log lines built here are exactly that
 > instrumentation.
 >
-> **Honesty at replicaCount > 1: cache hits assume `replicaCount = 1`.** Warm is replica-local and a
+> **Caveat at replicaCount > 1: cache hits assume `replicaCount = 1`.** Warm is replica-local and a
 > restore's blob GETs scatter independently, so at N replicas the effective hit rate for a real
 > directory is **~zero** (every GET must land on the holder: ~(1/N)^files) — each such restore
 > degrades to the tolerated miss. Follow-up filed as git-bug `12e2f6b` (warmth-affinity restore
@@ -152,7 +152,7 @@ against**. Its own acceptance criteria named the hazard that kills it: *"`target
 the next Step rebuilds and an **output** when the next Step consumes a built binary"* — the split is
 behavioural, not nameable, and guessing "cache" on the second case breaks a pipeline silently.
 
-The honest cost of this choice, booked rather than discovered: **an opt-in knob saves nothing for
+The cost of this choice, stated up front rather than discovered later: **an opt-in knob saves nothing for
 authors who do not turn it on**, and the amendment says we will not teach "don't put your cache in the
 workspace" as a rule. Naive pipelines keep paying for retention. That is accepted.
 
@@ -161,7 +161,7 @@ workspace" as a rule. Naive pipelines keep paying for retention. That is accepte
 rather than failing"*, with affordances that must state which they are — *"Rerun this step"* versus
 *"Inputs expired — this re-runs from `clone`"*. Losing a snapshot to eviction or expiry is the same
 event with a different cause, so it needs **no new Attempt outcome**. A `Corrupted` state was proposed
-and is not needed: the Attempt genuinely succeeded, and what is unavailable is its *evidence*.
+and is not needed: the Attempt really did succeed, and what is unavailable is its *evidence*.
 
 **Because a human is in the loop, the engine needs no notion of a Step being pure.** An earlier
 draft of this reasoning required a purity property — safe-to-re-run versus effectful — to stop the
@@ -187,7 +187,7 @@ repository plus the deltas, and Runs on the same SHA share it entirely.
 | build output | **no** — churns per build, dedupes poorly | **no** — minutes of compute |
 
 So checkout is cheap on both axes and needs no special handling; build output is expensive on both and
-is the only genuinely hard class. Declining to archive clone output stays available as a knob, with a
+is the only hard class. Declining to archive clone output stays available as a knob, with a
 stated failure mode — a force-push or a deleted repository can remove the SHA, and then the Run can
 never be re-run — but it is not the default.
 
@@ -204,7 +204,7 @@ per-Run escape hatch for investigations.
 > **TTL-only** — name, `default`, and the four per-class TTLs (each falling back to the flat
 > `SCARAB_RETENTION_*` env knobs); the warm space budget, Cache-eligible directories and
 > drop-and-re-derive thresholds are deliberately **not parsed** until something consumes them (an
-> inert knob is a silent lie), so the bundle grows with its consumers rather than ahead of them. The
+> inert knob misleads whoever sets it), so the bundle grows with its consumers rather than ahead of them. The
 > committed-pack expiry pass this ADR's retention grain feeds now **exists**
 > (`crates/scarab-server/src/depot_expiry.rs`): it resolves the pipeline-named profile out of
 > `runs.ir` against the *current* operator registry at sweep time, and the pin wins across classes.
@@ -213,7 +213,7 @@ per-Run escape hatch for investigations.
 
 - **Flip the default: a fresh Workspace per Step, explicit outputs only, with a finite exclusion list
   for things like checkout.** The most legible model, saves the most storage, and it is what Concourse
-  and Tekton do. **Rejected**: it makes every author learn what the substrate finds expensive, which is
+  and Tekton do. **Rejected**: it makes every author learn what the infrastructure finds expensive, which is
   the exact tax [0007](0007-data-passing-model.md)'s amendment forbids and
   [0061](0061-workspace-data-path.md)'s governing principle exists to prevent; and it breaks every
   existing pipeline, including the live `.scarab/dogfood.yaml`. Recorded because it was the architect's
@@ -224,7 +224,7 @@ per-Run escape hatch for investigations.
 - **Author-tunable retention values in pipeline YAML.** Maximum flexibility and the performance tax the
   amendment forbids. Rejected.
 - **Operator-only retention with no author involvement at all.** Cleanest against the principle, and it
-  leaves an author who genuinely needs a snapshot kept with no recourse. Rejected in favour of
+  leaves an author who really needs a snapshot kept with no recourse. Rejected in favour of
   name-a-profile plus the existing manual pin.
 - **A system that decides per edge whether to retain or re-derive, autonomously.** Attractive, and it
   is what "the system pays" would suggest. Rejected for now because it requires the purity property
@@ -240,7 +240,7 @@ per-Run escape hatch for investigations.
   the pattern should be shared rather than duplicated from [0055](0055-placement-profiles.md).
 - **Retention becomes a thing an operator can get wrong** in a way that costs reruns rather than
   correctness. Graceful degradation is what makes that survivable, so the widened-rerun affordance is
-  load-bearing product surface, not a nicety.
+  a required part of the product, not a nicety.
 - **The implicit inherit-everything default survives**, so no authored pipeline changes and
   [0062](0062-workspace-export-lazy-without-node-driver.md) keeps its purpose. Had the default flipped,
   most of 0062 would have lost its reason to exist.

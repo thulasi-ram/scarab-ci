@@ -29,15 +29,15 @@ internally for dedup, but an artifact's identity is `(run, name)`.
 Following ADR-0008's filesystem convention: a step writes to **`/scarab/artifacts/`**
 and the executor **auto-collects** post-step (like results). An optional
 **`artifacts:` glob** names/selects what to publish (ADR-0007 "explicit-on-demand").
-No mandatory upload ceremony.
+No required upload step.
 
 ### API + retention
 
 - `GET /v1/runs/{id}/artifacts` (list) and `GET .../artifacts/{name}` (download,
   via a **presigned object-store URL**), **Project-scoped** (ADR-0049).
 - Independent per-class **TTL** (~90d or count-capped, ADR-0030/0050).
-- **Immutable** once written; provenance/signing (SLSA/cosign, ADR-0015) rides
-  later on top of the artifact record.
+- **Immutable** once written; provenance/signing (SLSA/cosign, ADR-0015) is
+  added later on top of the artifact record.
 
 ## Consequences
 
@@ -51,5 +51,5 @@ No mandatory upload ceremony.
 - **Reuse the workspace CAS:** free dedup, but two lifecycles in one store
   complicate GC and conflate "data on DAG edges" with "output of record".
   Rejected.
-- **Explicit-upload-only (GHA `upload-artifact`):** more ceremony; convention +
+- **Explicit-upload-only (GHA `upload-artifact`):** more boilerplate; convention +
   optional globs is lower-friction and matches ADR-0007. Rejected.

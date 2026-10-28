@@ -7,7 +7,7 @@
 
 ## Context
 
-The user-facing surface is partly a facade (2026-07-16 audit): the web UI is
+Parts of the user-facing product only look finished (2026-07-16 audit): the web UI is
 **not served in production** (no static serving, no CORS, the Dockerfile excludes
 `ui/`), there is **no run-cancel API** (and step Pods leak because
 `executor.cancel` is never called), `openapi.json` is hand-curated and can drift
@@ -21,11 +21,11 @@ with **no CI gate**, and 4 of 5 CLI subcommands are **stubs that exit 0** (a
 The compiled UI bundle is **embedded in the binary** (rust-embed/include_dir) and
 served via an SPA fallback route — **same-origin, no CORS**, one artifact. This
 reinforces CONTEXT §7 invariant 5 ("the UI eats the same API as everyone else")
-and the single-binary ethos (§5). The Dockerfile builds the UI and embeds it; the
+and the single-binary approach (§5). The Dockerfile builds the UI and embeds it; the
 UI versions with the server (acceptable, even desirable, for a self-hosted
 product).
 
-### Run cancellation is a first-class API
+### Run cancellation gets a proper API
 
 `POST /v1/runs/{id}/cancel` → transition to `Cancelled` **and tear down Pods**
 (wires the existing `cancel_run` plus the never-called `executor.cancel`,
@@ -55,6 +55,6 @@ Cancel control (currently disabled) is enabled.
 
 - **Serve the UI separately (static host/CDN):** independent caching/deploy, but
   needs CORS, a second artifact, and version coordination. Rejected for embedding
-  — simpler ops and same-origin honesty for a self-hosted product.
+  — simpler ops and same-origin serving for a self-hosted product.
 - **Leave CLI stubs exiting 0 until implemented:** silent-pass footgun in user
   CI. Rejected — non-zero until real.

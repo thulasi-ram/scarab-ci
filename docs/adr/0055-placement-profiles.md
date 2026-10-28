@@ -21,7 +21,7 @@ can write these fields today and get zero effect and zero error. The `scarab-exe
 Pod builder ends with `..Default::default()` — no `node_selector`, `tolerations`, `affinity`,
 or container `resources`.
 
-The forcing function is ACME (the intended dogfood cluster). Its CI nodes are tainted
+What forced this is ACME (the intended dogfood cluster). Its CI nodes are tainted
 (`workload-type=application-sub-critical:NoSchedule`) across **multiple pools** by
 architecture (amd64/arm64) and workload tier. Their Woodpecker setup needed the toleration
 on *every* step Pod or nothing schedules, and was fragile enough that they bolted on **two**
@@ -36,7 +36,7 @@ baseline can be stamped on at construction time.
 
 Two kinds of leak must both be avoided, not just one:
 
-- **k8s leak** — Kubernetes primitives (tolerations, nodeSelectors, taint keys) appearing in
+- **k8s leak** — Kubernetes concepts (tolerations, nodeSelectors, taint keys) appearing in
   a pipeline file.
 - **topology leak** — cluster-specific knowledge (pool names, node labels) in a pipeline
   file that won't survive moving to another cluster.
@@ -47,10 +47,10 @@ k8s has both. `size:` tiers ([0026]) are a third, separate mistake: they hide a 
 
 ## Decision
 
-A four-part surface. **Magnitudes are stated as specifics; identity/placement is a named,
+The design has four parts. **Magnitudes are stated as specifics; identity/placement is a named,
 admin-owned profile; the rare raw case is governed, fail-closed.**
 
-### A. Control-plane **baseline** (the pain-killer)
+### A. Control-plane **baseline** (the main fix)
 
 An operator sets a baseline once (Scarab server/executor config): default `tolerations`,
 `nodeSelector`, and default container `resources`. The **control plane stamps the baseline
@@ -67,14 +67,14 @@ pipeline involvement.
   - a **`k8s:`** block — the concrete, admin-owned mapping (`nodeSelector`, `tolerations`,
     `runtimeClass`, annotations…). This is an **opaque overlay**, not a fixed-field schema:
     an admin can bake *any* static k8s placement fact into a profile without a Scarab schema
-    change (this is what makes Case 1 below absorb almost everything — see Consequences).
+    change (this is why Case 1 below covers almost everything — see Consequences).
 - Architecture (`amd64`/`arm64`) is **not** a special axis; it is just part of a profile's
   `k8s.nodeSelector`. Because a job composes **many** profiles (C), profiles can stay
   **orthogonal** — an `arm64` profile, a `critical` profile, a `gpu` profile — and a job
   lists the ones it wants. This avoids an arch × tier *combinatorial* set of profiles;
   expect a small, factored set.
 
-### C. Job surface — name profile(s), state specifics
+### C. Job fields — name profile(s), state specifics
 
 - **`placement_profiles: [<name>, …]`** (plural, on a step) — names one *or more*
   `PlacementProfile`s, whose `k8s:` overlays are **merged in listed order** (later wins on a
@@ -90,8 +90,8 @@ pipeline involvement.
 ### D. `k8s_overlay` — the governed escape hatch (Case 2)
 
 - **`k8s_overlay: { … }`** (on a step) — a raw pod-spec fragment, strategic-merged onto the
-  generated Pod **last** (so it wins). The `k8s_` prefix is deliberate: it announces the
-  backend-coupling loudly (a pipeline using it will not run on the local/dev executor).
+  generated Pod **last** (so it wins). The `k8s_` prefix is deliberate: it makes the
+  dependency on the k8s backend obvious (a pipeline using it will not run on the local/dev executor).
 - It **carries no authority** — exactly like `add_capabilities`/`privileged` in [0039]. At
   admission the engine checks whether the run's target Environment permits raw overlays:
   - **permitted** → merged onto the Pod;
@@ -120,16 +120,16 @@ pipeline involvement.
 - **Pipelines contain no k8s.** The one bounded topology leak is the profile *names*
   (`placement_profiles: [critical]`), accepted as GHA does — portability across orgs was never
   a real CI property, and ACME is the one cluster that matters.
-- **Profiles absorb Case 1 with zero break-away.** Because `k8s:` is an opaque overlay (not a
+- **Profiles cover all of Case 1 without the escape hatch.** Because `k8s:` is an opaque overlay (not a
   fixed vocabulary), a new static placement fact — an exotic annotation, `runtimeClass`,
   topology spread — is an admin edit to a profile, not a Scarab change and not a pipeline
-  change. Break-away to `k8s_overlay` is needed only for genuinely *dynamic per-job* k8s,
+  change. Falling back to `k8s_overlay` is needed only for *dynamic per-job* k8s,
   which is rare.
 - Governance is **not new machinery** — `k8s_overlay` reuses [0039]'s "request carries no
-  authority / fail-closed" admission, applied to a new axis. Consistent mental model with the
+  authority / fail-closed" admission, applied to a new axis. It works the same way as the
   existing `security:` field.
 - `resources` states real numbers; no `size` abstraction hides magnitude.
-- New surface: a `placement_profiles` registry + resolver, baseline application, the
+- New pieces: a `placement_profiles` registry + resolver, baseline application, the
   `k8s_overlay` admission grant, and end-to-end plumbing of the three step fields. Replaces
   the stubbed, never-read `runs_on` labels.
 
@@ -153,7 +153,7 @@ pipeline involvement.
   steps. Placement is its own cluster-scoped concern.
 - **Fully resource-derived placement** (no placement field; pool chosen from cpu/mem) — elegant
   for magnitudes, but cannot express a qualitative business tier (`critical`), which is not a
-  number. Kept as a possible future routing convenience, not the primary surface.
+  number. Kept as a possible future routing convenience, not the primary interface.
 - **Naming: `pool` / `RunProfile` / `AllocationProfile` / `provision_config`.** `pool` leaks
   cloud/k8s topology-speak; `RunProfile` collides with the `Run` durable entity;
   `Allocation*` pulls toward resource-*quantity* (which `resources` owns); `provision*`

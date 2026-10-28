@@ -7,13 +7,13 @@
 ## Context
 
 The step boundary decides the size of the plugin ecosystem on day one. A typed SDK/ABI gives
-richer plugins but starts the catalog at zero; WASM steps are sandboxed but fight the reality
-that CI runs `docker build`, `cargo`, `gradle` — native toolchains, not WASM.
+richer plugins but starts the catalog at zero; WASM steps are sandboxed, but CI
+runs `docker build`, `cargo`, `gradle`: native toolchains, not WASM.
 
 ## Decision
 
-**A step is any OCI image + command, with a thin filesystem/env I/O convention** — so the
-entire container ecosystem is the plugin library on day one, zero SDK required:
+**A step is any OCI image + command, with a thin filesystem/env I/O convention**, so the
+entire container ecosystem is the plugin library on day one, with no SDK required:
 
 - Workspace at `/workspace`; params as `SCARAB_PARAM_*` + `params.json`; secrets as **tmpfs**
   files under `/scarab/secrets/`; results written to `/scarab/results/*.json`; artifacts to
@@ -21,10 +21,10 @@ entire container ecosystem is the plugin library on day one, zero SDK required:
 - An **optional** injected `scarab` CLI for structured emit (results/annotations/progress) —
   never required.
 
-Plus first-class **built-in step kinds**: `clone` (forge-aware checkout), `invoke` (call
-another Pipeline — the recursion primitive), and **`gate`** — a **durable suspend** point
-(human approval / timer / external event). Gate is where the wedge pays off: suspend for
-seconds or weeks at ~zero cost because state lives in Postgres.
+Plus **built-in step kinds**: `clone` (forge-aware checkout), `invoke` (call another
+Pipeline; this is how pipelines recurse), and **`gate`**, a **durable suspend** point
+(human approval / timer / external event). Gate is where durable execution pays off: a gate
+can suspend for seconds or weeks at ~zero cost because state lives in Postgres.
 
 > **Amended by [0058](0058-runtime-service-containers.md):** `service` was originally listed
 > here as a step kind too. It is **not** a `needs`-able DAG node — a service is infrastructure
@@ -33,8 +33,8 @@ seconds or weeks at ~zero cost because state lives in Postgres.
 
 ## Consequences
 
-- Massive ecosystem from day one; low barrier.
-- `gate` turns approvals/waits from a wart into a native primitive; underpins Environments
+- Large ecosystem from day one; low barrier to entry.
+- `gate` makes approvals/waits a built-in step kind instead of a workaround; underpins Environments
   ([0024](0024-environments.md)).
 - Fencing tokens are injected into the step env ([0021](0021-double-effect-fencing.md)).
 

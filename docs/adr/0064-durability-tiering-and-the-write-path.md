@@ -1,4 +1,4 @@
-# 0064. Durability tiering and the write path: warm-first, flush before `Succeeded`, and the promise is the backing
+# 0064. Durability tiering and the write path: warm-first, flush before `Succeeded`, and durability comes from the backing store
 
 - **Status:** Accepted
 - **Date:** 2026-07-28
@@ -50,15 +50,15 @@ the critical path.
 **"Durable" is a property of the backing, not of the tier's name.** `StoreConfig` is `S3 | LocalDir`,
 and `LocalDir` may point anywhere — including a directory on the warm volume itself, or the Helm
 chart's `scratch` **`emptyDir`**. In those configurations "written to cold" licenses nothing: cold is
-the same disk as warm, or worse, a volume that dies with the Pod. The word "cold" implies a promise
-that in those deployments nothing is making.
+the same disk as warm, or worse, a volume that dies with the Pod. The word "cold" implies a guarantee
+that nothing in those deployments provides.
 
 **And the deployments that matter do have a real cold tier**, which is worth recording because an
 earlier reading of this said otherwise. `deploy/local-helm/deploy.sh` defaults `S3_BUCKET` and
 stands up in-cluster MinIO on a PVC; `just up` runs MinIO under compose; a real chart install has the
 operator set `scarab.s3.bucket`. The degenerate case is the chart's **unset default**, labelled
 "dev only", which no shipped deployment path uses. So this is a misconfiguration hazard rather than
-the normal case — but it is silent, and silence is what this ADR family refuses.
+the normal case. But it fails silently, and these ADRs consistently reject silent downgrades.
 
 ## Decision
 
@@ -92,11 +92,11 @@ check (refuse or loudly label a cold path that resolves to an `emptyDir`), not a
 Follow-up: the chart-side check is not yet built.
 
 "Is it object storage?" was the obvious test and it is the wrong one: it would reject a second PVC,
-which is a perfectly good cold tier, and accept nothing else. **The backing is the promise** — and
-`st_dev` is one measurable half of it.
+which is a perfectly good cold tier, and accept nothing else. The guarantee comes from the backing,
+and `st_dev` measures one half of it.
 
 **4. Where there is no independent cold tier, the Depot degrades gracefully rather than refusing.**
-Warm gates `Succeeded`, and the deployment is *loudly* a warm-only-durability deployment: stated at
+Warm gates `Succeeded`, and the deployment says clearly that its durability is warm-only: at
 startup, and stamped on the record (below). Refusing to boot was considered and rejected — it
 re-imposes object storage as a prerequisite, which [0061](0061-workspace-data-path.md) declines to do
 even for the CAS ("an operator's cost decision, not an engine decision").
@@ -121,7 +121,7 @@ Part 4 as written is unconditional, and allowing `Succeeded` on warm alone contr
 retention table says warm "promises none". So this **amends part 4**, and the amendment is marked in
 0061 in place.
 
-**What the amendment preserves is the invariant; what it changes is the mechanism.** Read part 4's own
+The amendment keeps the invariant and changes the mechanism. Read part 4's own
 reasoning: *"Declaring success before durability puts a claim in the durable record that the record
 cannot back — the one thing this product may not do."* The invariant is **never make a claim the
 record cannot back.** Cold-before-`Succeeded` was one mechanism for it, and a good one where a cold
@@ -135,19 +135,19 @@ retreat.
 
 0061 also explicitly forbade a related thing, and that prohibition **stands**:
 
-> *"writing warm-first and letting the service tier onward would make the warm tier load-bearing for
-> durability, which part 4 forbids."*
+> *"writing warm-first and letting the service tier onward would make durability depend on the warm
+> tier, which part 4 forbids."*
 
 This ADR writes warm-first and **does not let the service tier onward asynchronously**. The flush is
-synchronous with respect to `Succeeded`. Warm is the write *path*; cold remains the *promise* wherever
+synchronous with respect to `Succeeded`. Writes go to warm first; the guarantee still rests on cold wherever
 it exists. Asynchronous archival was considered and rejected — see below.
 
 ### The control plane's write leg (added 2026-08-01)
 
 The decision above was built Depot-side first, and its "one walk, no network" phrasing is true of
 exactly one topology: the Depot's own drain, whose warm tier is its local disk. This section extends
-warm-first to the **control plane**, whose warm tier is the Depot *over HTTP*, and states what the
-words mean there — because the same slogan quietly overclaims on that leg.
+warm-first to the **control plane**, whose warm tier is the Depot *over HTTP*, and spells out what the
+words mean there, because the same phrase overclaims on that leg.
 
 **Warm-first on the control plane means one deduped HTTP walk plus one flush RPC — not "no
 network".** The per-Step drain uploads through the Depot's PUT verbs (`WorkspaceClient::ingest`: one
@@ -163,20 +163,20 @@ invariant rode on it. The invariant did not weaken; it **migrated into the flush
 Attempt is not `Succeeded` until its snapshot is durable" is now "the caller awaits the flush — the
 settle path's internal flush phase, or the `/v1/cas/flush` RPC — before reporting `Succeeded`". The
 flush's refusals split on the one axis a caller acts on: `422 retryable: false` for an addressing
-disagreement between the tiers (the only fatal class — no retry converges two binaries that
-canonicalise differently), `503 retryable: true` for everything else, **including a warm miss** — a
+disagreement between the tiers (the only fatal class: no retry reconciles two binaries that
+canonicalise differently), `503 retryable: true` for everything else, **including a warm miss**. A
 wiped Depot warm tier is recoverable, because the re-driven drain re-uploads via `/have` before the
-retried flush, so answering fatal there would strand a provably repairable state. The flush requires
-the control plane's own token scope (`browse`): unlike a content-addressed PUT it is not harmless
-under any valid token — it commands cold round trips for arbitrary roots.
+retried flush, so answering fatal there would strand a state that can provably be repaired. The flush
+requires the control plane's own token scope (`browse`): unlike a content-addressed PUT it is not
+harmless under any valid token, because it triggers cold round trips for arbitrary roots.
 
 **A Depot outage MAY fail Attempts — promptly and with a named cause, never as a timeout.** This is
 the availability question 0061 answered by forbidding warm-first on the control plane, decided the
 other way (architect's decision): the Depot is now on the write path *and* the durability path of
 every workspace Step, so when it is down, Steps whose evidence cannot be drained fail, saying so.
-What is bought with that coupling is the end of the double write and of the tar-tunnel-era shape;
-what is kept is legibility — the failure names the Depot and the leg (upload vs flush), and the
-`retryable` verdict tells the caller whether re-driving can ever help. 0061's prohibition is marked
+That coupling buys the end of the double write and of the tar-tunnel-era design. What it keeps is a
+clear failure: it names the Depot and the leg (upload vs flush), and the `retryable` verdict tells
+the caller whether re-driving can ever help. 0061's prohibition is marked
 superseded in place, with the reasoning preserved.
 
 **Reads keep the fall-through.** Nothing here touches the read side: the control plane's `TieredCas`
@@ -190,15 +190,15 @@ accepted; the read leg still refuses it.
   mechanism. Rejected on cost: a network round-trip per file on the critical path, plus a second full
   walk, is precisely the per-file cost 0061 and 0062 exist to eliminate.
 - **Warm-first with asynchronous archival, `Succeeded` on warm.** The fastest option, and the one
-  first proposed in the discussion that produced this ADR. Rejected: it makes warm load-bearing for
-  durability, which is what part 4 forbids and what 0061 named explicitly. It also requires the
-  machinery that falls out of that choice — an eviction pin for un-archived snapshots, and a state
+  first proposed in the discussion that produced this ADR. Rejected: it makes durability depend on warm,
+  which is what part 4 forbids and what 0061 named explicitly. It also requires the
+  machinery that follows from that choice — an eviction pin for un-archived snapshots, and a state
   for an Attempt whose evidence was lost after it went green, which would mean a `Succeeded` Attempt
   becoming un-green *after downstream Steps consumed it and the forge already showed a checkmark*.
   That is a large amount of vocabulary and cascade semantics bought for a latency win that the
   batched flush delivers anyway.
-- **Refuse to boot without an independent cold tier.** Honest and simple, and it makes object storage
-  a hard prerequisite. Rejected per (4).
+- **Refuse to boot without an independent cold tier.** Simple and never overclaims, and it makes
+  object storage a hard prerequisite. Rejected per (4).
 - **Test for cold-ness by asking "is it S3?"**. One line, and wrong in both directions: it rejects a
   second PVC and cannot detect a `LocalDir` sitting on the warm volume. Rejected in favour of
   `st_dev`.
@@ -215,12 +215,12 @@ accepted; the read leg still refuses it.
   `put_tree` is a different hazard and stays.
 - **A flush that fails fails the Attempt** where a cold tier exists. The Step exited 0 and its
   evidence did not reach the archive, so it is a retryable failure that must name the cause rather
-  than surfacing a mystery I/O error.
+  than showing up as an unexplained I/O error.
 - **One new column on `attempts`** for the durability tier that backed the snapshot —
   `attempts.output_durability`, holding `object` / `separate-volume` / `warm-only` (part 5).
 - **A warm-only deployment is a supported configuration** with a stated, weaker guarantee — not a
   misconfiguration to be rejected, and not a silent downgrade either.
-- **The batched flush is a new failure surface**: a partial flush must not report success, and the
+- **The batched flush is a new failure point**: a partial flush must not report success, and the
   batch must be idempotent, because the CAS is content-addressed and a retried flush will re-offer
   the same keys.
 

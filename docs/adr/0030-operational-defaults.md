@@ -23,7 +23,7 @@ decisions. Recorded together for traceability; each may be split into its own AD
 - **Notifications:** a `Notifier` **port** with adapters (Slack/email/generic webhook),
   distinct from forge status/checks (the `Forge` port). Fast-follow, not v1-core.
 - **Log masking:** best-effort redaction of known secret values from live + stored streams
-  (defense-in-depth atop fork-PR lockout, [0014](0014-secrets.md)).
+  (defense-in-depth on top of fork-PR lockout, [0014](0014-secrets.md)).
 - **Install/distribution:** canonical **Helm chart** first; optional install **Operator** later.
 - **Multi-cluster:** *designed-for, not built* — the `Executor` port + version-tagged work
   claiming accommodate a future remote agent; no agent in v1.

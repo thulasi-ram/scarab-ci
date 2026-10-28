@@ -6,11 +6,11 @@
 
 ## Context
 
-"Durable execution" engines (DBOS, Temporal) derive their power from **deterministic replay**
+"Durable execution" engines (DBOS, Temporal) are built on **deterministic replay**
 of workflow code, with side effects wrapped in idempotent, memoized activities. But a CI
 step is **arbitrary side-effecting user shell in a container** (`docker push`,
-`terraform apply`). You cannot transparently replay the *interior* of such a step. Believing
-otherwise ("resume a `docker build` from the middle") would poison the design.
+`terraform apply`). You cannot transparently replay the *interior* of such a step. Designing as
+if you could ("resume a `docker build` from the middle") would break the design.
 
 ## Decision
 
@@ -21,8 +21,8 @@ Draw the durability boundary explicitly:
 - **Not durable / not replayable:** the step interior. A step is an **opaque black box,
   re-executed wholesale** on restart.
 - **Execution contract: at-least-once** per step. Idempotency of *external effects* is a
-  **step-author contract** for which we provide tooling (see
-  [0021](0021-double-effect-fencing.md)), not a magic guarantee.
+  **step-author contract**. We provide tooling for it (see
+  [0021](0021-double-effect-fencing.md)), but the engine does not guarantee it.
 
 Therefore: **Resume** = re-drive the DAG from the last durably-recorded state (finished steps
 stay finished, zero user work). **Restart step** = re-run the black-box container.
@@ -32,8 +32,8 @@ output-commit protocol is reserved in the IR for later, not built now.
 
 ## Consequences
 
-- The engine is a *bounded* state machine, not a general workflow runtime — which is why we
-  can own it on Postgres ([0003](0003-durability-substrate-postgres.md)).
+- The engine is a *bounded* state machine, not a general workflow runtime. That is why we
+  can build it ourselves on Postgres ([0003](0003-durability-substrate-postgres.md)).
 - Restart/skip semantics ([0027](0027-restart-semantics.md)) hang off the recorded step
   outputs, not off replay.
 - Documentation must state the at-least-once contract prominently.
@@ -41,4 +41,4 @@ output-commit protocol is reserved in the IR for later, not built now.
 ## Alternatives considered
 
 - **Output-commit / resource protocol now** — more exactly-once power, +1 major concept; deferred.
-- **Full workflow-as-code replay (Temporal-style)** — wrong impedance for opaque shell steps.
+- **Full workflow-as-code replay (Temporal-style)** — a poor fit for opaque shell steps.

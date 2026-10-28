@@ -1,4 +1,4 @@
-# 0003. Durability substrate: own it — DBOS pattern on Postgres (Rust)
+# 0003. Durability layer: build our own, DBOS-style on Postgres (Rust)
 
 - **Status:** Accepted
 - **Date:** 2026-07-12
@@ -6,14 +6,15 @@
 
 ## Context
 
-We need a durable substrate for the orchestrator. Options: DBOS (Postgres-backed durable
-execution, but **no Rust SDK** as of 2026 — TS/Python/Go/Java/Kotlin only), Restate
+The orchestrator needs a durable backend. Options: DBOS (Postgres-backed durable
+execution, but **no Rust SDK** as of 2026; TS/Python/Go/Java/Kotlin only), Restate
 (Rust-native engine, but adds a *second* stateful system alongside the Postgres we still
-need, and imposes a workflow-as-code model), Temporal (heaviest ops footprint — a cluster —
-against our "shed baggage" value), or building on k8s CRDs/etcd (etcd is not a database:
-object-size limits, no history queries, status-write storms — a documented Argo scaling wall).
+need, and imposes a workflow-as-code model), Temporal (heaviest ops footprint: it needs its
+own cluster, which goes against our "shed baggage" value), or building on k8s CRDs/etcd (etcd is
+not a database: object-size limits, no history queries, status-write storms; Argo has hit and
+documented this scaling limit).
 
-Decisive insight: because [0002](0002-durability-model.md) rejects deterministic step replay,
+The deciding factor: because [0002](0002-durability-model.md) rejects deterministic step replay,
 a general durable-execution engine would be used for ~20% of its power at 100% of its
 operational and conceptual cost. The slice we actually need — a crash-safe DAG state machine
 with a reliable work queue and idempotent dispatch — is small and well-understood on Postgres.
@@ -24,7 +25,7 @@ with a reliable work queue and idempotent dispatch — is small and well-underst
 DBOS architecture (durable workflows in Postgres, embedded as a library, no separate cluster)
 reimplemented in Rust because DBOS has no Rust SDK. Mechanisms:
 
-- **Store:** Postgres — the *only* stateful dependency for control state (blobs go to an
+- **Store:** Postgres, the *only* stateful dependency for control state (blobs go to an
   object store, [0004](0004-execution-topology.md)).
 - **Queue:** `SELECT … FOR UPDATE SKIP LOCKED` work claiming.
 - **Safety:** transactional **outbox** + **idempotency keys** for exactly-once dispatch.
@@ -33,11 +34,11 @@ reimplemented in Rust because DBOS has no Rust SDK. Mechanisms:
 
 ## Consequences
 
-- Durability becomes *our* core competency and codebase, not a wrapped dependency — so it
-  must be proven (see [0017](0017-testing-strategy.md)).
-- Minimal operational footprint (Postgres + object store) — strong for self-hosting.
+- Durability becomes *our* code and our core skill rather than a wrapped dependency, so we
+  must prove it works (see [0017](0017-testing-strategy.md)).
+- Minimal operational footprint (Postgres + object store), which suits self-hosting.
 - `sqlx` in the adapter crate `scarab-db-postgres`; the domain core stays pure.
-- We own exactly-once correctness — the chief risk, mitigated by crash-interleaving tests.
+- We own exactly-once correctness. That is the main risk; crash-interleaving tests mitigate it.
 
 ## Alternatives considered
 

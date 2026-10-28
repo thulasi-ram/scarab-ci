@@ -1,4 +1,4 @@
-# 0006. Pipeline ontology: flat recursive DAG
+# 0006. Pipeline model: flat recursive DAG
 
 - **Status:** Accepted
 - **Date:** 2026-07-12
@@ -8,9 +8,9 @@
 
 Incumbents fix a tier count: GHA `Workflow→Job→Step`, Woodpecker `Pipeline→Workflow→Step`,
 Concourse `Pipeline→Job→Step`. That middle tier exists because "job = pod, steps =
-sequential-in-pod sharing a filesystem." We dissolved that rationale in
-[0004](0004-execution-topology.md): **Step is the Pod boundary**, and the workspace passes
-via content-addressing. So parallelism no longer needs a "job" tier (it is emergent from the
+sequential-in-pod sharing a filesystem." [0004](0004-execution-topology.md) removed that
+reason: **Step is the Pod boundary**, and the workspace passes
+via content-addressing. So parallelism no longer needs a "job" tier (it follows from the
 DAG), and reuse doesn't need two mechanisms.
 
 ## Decision
@@ -18,10 +18,11 @@ DAG), and reuse doesn't need two mechanisms.
 A **flat recursive DAG**:
 
 - **`Pipeline → Step`**, with dependencies expressed directly between steps (`needs:`).
-  Parallelism is emergent (non-dependent steps run concurrently, each its own Pod).
+  Parallelism follows from the graph (steps that don't depend on each other run concurrently,
+  each in its own Pod).
 - **Composition = recursion:** a Step can `invoke` another Pipeline. This single concept
   replaces "reusable workflows" *and* "composite actions" *and* Woodpecker's "workflow" tier.
-  A "job" is just a named subgraph — sugar, not structure.
+  A "job" is only a named subgraph: syntactic sugar, not a structural tier.
 - **Matrix is an orthogonal modifier** on any Step (fan-out), not a tier
   ([0023](0023-dag-shape.md)).
 
@@ -35,6 +36,6 @@ A **flat recursive DAG**:
 
 ## Alternatives considered
 
-- **Two-tier `Pipeline→Job(DAG of Steps)`** — GHA-familiar, but the tier is vestigial once
+- **Two-tier `Pipeline→Job(DAG of Steps)`** — GHA-familiar, but the tier has no purpose once
   step = pod, and reuse still needs a second mechanism.
 - **Three-tier `Pipeline→Workflow→Step`** — most redundant given our model.

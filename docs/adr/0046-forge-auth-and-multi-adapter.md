@@ -9,7 +9,7 @@
 
 The forge adapter is unbuilt: 8 outbound `GithubForge` methods are
 `unimplemented!()` and production wires `forge: None` (2026-07-16 audit). Before
-building it, a framing error surfaced: treating "use a GitHub App" as a
+building it, we spotted a framing error: treating "use a GitHub App" as a
 *Scarab-level auth decision* leaks a vendor concept into what CONTEXT.md and
 ADR-0010 require to be forge-agnostic ("Forge is the domain concept; vendors are
 adapters, never their own domain"). Forgejo/Codeberg have no App/installation
@@ -28,11 +28,11 @@ or a bot access token).
 
 ### Two adapters in v1 — GitHub **and** Forgejo
 
-Both ship in v1, so the port is validated by construction: Forgejo cannot be
+Both ship in v1, so the port is tested against two forges from the start: Forgejo cannot be
 satisfied by anything GitHub-shaped. This yields a shared **`ForgePort`
-contract-test suite both adapters must pass** — the mechanism that keeps future
-adapters (GitLab, Bitbucket) honest. It also plants a flag GitHub Actions
-structurally can't: forge-native CI that is not GitHub-locked.
+contract-test suite both adapters must pass** — the mechanism that holds future
+adapters (GitLab, Bitbucket) to the same contract. It also offers something GitHub Actions
+structurally can't: forge-native CI that is not tied to GitHub.
 
 Per-capability mapping:
 
@@ -57,7 +57,7 @@ to the Scarab run) is **required**, not the current hardcoded `None`
   render.
 - **Follow-up (GitHub-only, not v1 core):** wire Checks *action buttons* and
   `rerequested`/`requested_action` webhooks to Scarab's restart-a-step and
-  gate-approve primitives — surfacing the durable-restart wedge inside the PR.
+  gate-approve operations, which brings durable restart into the PR.
 
 ### `register_webhook` is a real capability, not a GitHub no-op
 
@@ -87,7 +87,7 @@ credentials* for a given repo.
   **1 Project : 1 RepoRef** in v1 (monorepo per-subdir governance deferred to an
   optional path scope). The old governed `Repo` struct is **absorbed into
   `Project`**; `Org → Project → Environment`. The `scarab-projects` crate is
-  renamed **`scarab-project`**; the vestigial `Project` struct becomes this
+  renamed **`scarab-project`**; the leftover `Project` struct becomes this
   aggregate.
 - **Webhook routing:** separate endpoints per forge (`/webhooks/github`,
   `/webhooks/forgejo`), each bound to its adapter and verification secret — no

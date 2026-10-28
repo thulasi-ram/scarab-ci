@@ -126,11 +126,11 @@ one ends. Its history stays where it was; nothing is moved, and the move is not 
 conflict.
 
 "Ends" is a **display, not a status**: the old Environment's board shows the target as
-**Moved** — naming where its reports go now ("now: prod"), or that no Environment lists
-the grouping ("unmapped") — instead of claiming what was last live there; no input is
+**Moved**, naming where its reports go now ("now: prod") or that no Environment lists
+the grouping ("unmapped"), instead of claiming what was last live there; no input is
 appended and no seventh status exists. Moved is derived on read from the current
 EnvironmentDeploymentSources, so an admin's edit shows at once. A request for the target on
-the old Environment waits and, honestly, stalls: its reports now land elsewhere. The new
+the old Environment waits and, correctly, stalls: its reports now land elsewhere. The new
 Environment never shows the old one's last status as its own; the target appears there
 when its reporter re-sends its current state (§11). Fan-out (one Environment
 across regions or clusters) is several DeploymentTargets, not a grouping concept.
@@ -155,7 +155,7 @@ new version as soon as Argo refreshes, before the sync. Like any per-target sche
 also avoids the gitops-commit problem: on a shared gitops repository an unrelated team's
 merge would change every Application's version (audit finding 1, a blocker).
 
-Its blind spots, stated plainly:
+Its blind spots:
 
 - **Tags, not digests.** The references are the strings written in the manifest, usually
   tags. A tag re-pushed to new bytes is the same DeploymentVersion.
@@ -202,7 +202,7 @@ allowed while the Deployment is still the newest on its target. Only `superseded
 final. *Superseded* means what it means for an Attempt (ADR-0056): a newer one took its
 place.
 
-**A status earns its place only if something branches on it**: a gate, a governance rule
+**A status exists only if something branches on it**: a gate, a governance rule
 or a view. "Was it ever live?" is a fact read from the reports, not a status. *Unexplained*
 (no requester) and *Unconfirmed* (requested on a target its source has not yet
 reported) are display terms, not statuses.
@@ -431,8 +431,8 @@ time.
 
 The cost of ordering by receipt: a stale `failed` that reaches core late counts as
 *after* the window and can fail a fresh gate. The DeploymentReporterContract's "source
-order, never replay older history" (§11) is what prevents that, and so it is
-load-bearing.
+order, never replay older history" (§11) is what prevents that, and so the
+design depends on it.
 
 The verdict is **journaled per Attempt** when it is first reached, as a `GateResolved`
 carrying the Deployment's id, and never re-derived from the log afterwards: a gate tick
@@ -535,8 +535,8 @@ behaviour is the same across CD tools:
   in every reader. (A reporter that sends a huge one freezes its own target: every later
   report is stale until an admin resets the cursor.)
 - **Re-send when asked.** Core never fabricates a report from what it last heard. When a
-  target routes to an Environment its last status never reached — a grouping an admin just
-  mapped, or moved — `GET /targets` flags it `resend`. Poll `GET /targets?resend=true` at
+  target routes to an Environment its last status never reached (a grouping an admin just
+  mapped, or moved), `GET /targets` flags it `resend`. Poll `GET /targets?resend=true` at
   least once a minute and re-send each flagged target's **current** state as a new report
   (next sequence, new idempotency key): the one exception to "transitions only". Skip a
   target you have no status for. Only a status report that lands clears the flag; an
@@ -637,7 +637,7 @@ cut** keeps ADR-0037's one Environment per Run. Promotion is chained Deploy Runs
   and runnable siblings now keeps running instead of suspending.
 - New failure classes (`deployment-request-incomplete`, and `gate` for every failed gate
   wait) and a new per-Step result declaration (`results:`) for the Pipeline check.
-- A provisional decision (the version scheme) is load-bearing for correlation. It is
+- Correlation depends on a provisional decision (the version scheme). The scheme is
   isolated in the reporter and the requester so that revising it does not touch the fold.
   Under the default scheme a DeploymentGate cannot see a config-only change (§4).
 - Every board read refolds the Environment's whole input log, and so does every tick
@@ -645,7 +645,7 @@ cut** keeps ADR-0037's one Environment per Run. Promotion is chained Deploy Runs
   tick. "Transitions only" (§11) bounds the log's growth; an incremental fold or a
   snapshot is a known follow-up (git-bug `1f2163f`).
 - Ordering by receipt time makes the reporter contract's "source order, never replay"
-  load-bearing (§8).
+  rule essential (§8).
 - Known gaps this ADR does not close: approvers are opt-in, so an Environment with
   approvers does not force a gate into a Pipeline that omits one (git-bug `cd43bf3`); and
   external gate release skips `admits()` (git-bug `220917f`). Both matter more once gates
@@ -716,7 +716,7 @@ cut** keeps ADR-0037's one Environment per Run. Promotion is chained Deploy Runs
   - the scheme check (§7, `5fc1860`) and the ownership rejection (`9c1173a`);
   - a target first claimed by two Environments at once (`9e66f2c`);
   - a failed results drain on Kubernetes reads as DeploymentRequest incomplete (`0cb5895`):
-    **decided** 2026-10-24 and built — same class, an honest reason (§7);
+    **decided** 2026-10-24 and built — same class, an accurate reason (§7);
   - a retried deploy Step's request reads as a claim (`2b5d9d9`): **decided** 2026-10-24
     and built — effective at the first Attempt of the current Take (§2, §7);
   - when the first gate Attempt's window should open (`fce05da`): **decided** 2026-10-24

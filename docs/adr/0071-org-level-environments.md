@@ -3,7 +3,7 @@
 - **Status:** Proposed
 - **Date:** 2026-10-22
 - **Deciders:** thulasi.ram (architect)
-- **Builds on:** [0024](0024-environments.md) (Environment is first-class),
+- **Builds on:** [0024](0024-environments.md) (Environments with protection rules),
   [0037](0037-environment-governance.md) (approval-as-gate, scoped secrets, admission at
   the point of use), [0070](0070-deployments-as-a-vendor-neutral-record.md) (the
   Deployment record an Environment owns)
@@ -44,9 +44,9 @@ An **Environment** is an org-level place that deployments land in (staging, prod
 owns its protection rules (approvers, wait timer, allowed refs, `require_reason`,
 concurrency, EnvironmentDeploymentDeadline), the DeploymentTargets in it, and the
 Deployments to them. It does not own an OIDC subject: the subject is still minted per
-repository from the Run's coordinates (§11). **Projects ask; the Environment
-decides.** A Pipeline's `environment: prod` is the *request*. The Environment's own
-records are the *authority*.
+repository from the Run's coordinates (§11). Projects ask and the Environment decides:
+a Pipeline's `environment: prod` is the *request*, and the Environment's own records are
+the *authority*.
 
 ### 2. EnvironmentProjectEligibility: which Projects may deploy here
 
@@ -59,8 +59,8 @@ from: *all projects*, or an explicit list in which project-name globs are allowe
   It is checked **again** wherever the Environment's authority is used later in the Run:
   a manual or external gate does not release (409) for a Project no longer eligible, or
   for an Environment that no longer exists, and **every** step of a Deploy Run is
-  re-checked at launch — whether or not it carries secrets, an OIDC token, governed
-  grants or a raw overlay — and fails cleanly (a configuration failure with the reason)
+  re-checked at launch, whether or not it carries secrets, an OIDC token, governed
+  grants or a raw overlay, and fails cleanly (a configuration failure with the reason)
   when the Project is no longer eligible. Timer gates are covered by that launch check.
   An admin withdrawing eligibility therefore stops a long Run at its next step, not only
   its next Run.
@@ -110,7 +110,7 @@ example a new service whose source object is created by the very change being de
 It is recorded *Unconfirmed*, and flagged if the source later reports owners that
 exclude the requester. A request is rejected only when **other** Projects own the target.
 That rejection and the flag are not built yet (git-bug `9c1173a`). **No PluginAction is offered on a DeploymentTarget with no owners.** The fix is for the
-source to report one, not a side door around Runs.
+source to report one, not a way to act outside a Run.
 
 **A request never explains a Deployment a report created.** If a request joins one, it is
 recorded as a separate claim beside it, and the Deployment stays Unexplained (ADR-0070
@@ -133,7 +133,7 @@ Environments that list it.
 
 **The consent unit is the installation.** The vendor grouping is asserted by the plugin,
 so listing *(installation, grouping)* trusts the installation to report groupings
-honestly; it does not stop that installation from reporting another grouping's target as
+truthfully; it does not stop that installation from reporting another grouping's target as
 this one. One installation per Environment makes the two the same, and is recommended.
 
 **A source moving a target re-homes it.** When a source reports a known DeploymentTarget
@@ -253,12 +253,12 @@ governed exactly as before:
    saying exactly what the admin must do; a webhook names each refused pipeline in its
    delivery body. An org Environment that already existed (created through
    the minimal org-level API before the migration) and that no Project defined is treated
-   like a referenced-only name — a pipeline naming it deployed with no rules from any
-   Project — and also gets eligibility **all projects**.
+   like a referenced-only name (a pipeline naming it deployed with no rules from any
+   Project), and also gets eligibility **all projects**.
 7. Old `deployments` rows stay readable as **legacy approval history** (ADR-0070 §1).
    They are not converted into Deployments, because they carry no target or version.
 8. A **split report** lists every name that merged across Projects, so an admin can
-   split places that are genuinely different (for example a `prod` that is really
+   split places that are actually different (for example a `prod` that is really
    `prod-eu` in one repository). It also lists names migrated with eligibility *all
    projects*, and a name one Project defined that another Project only ran into: that
    Project is eligible under the permissive baseline with no overlay, so the definer's
@@ -282,7 +282,7 @@ moving to org level changes nothing in it, so no cloud trust policy needs editin
 - Ownership depends on the source reporting it. A target whose source reports no owner
   can be requested (Unconfirmed) but never acted on through a PluginAction. Ownership is
   only as strong as write access to the gitops source (§4).
-- The API surface moves from `/v1/repos/{org}/{repo}/environments/...` to an org-level
+- The API moves from `/v1/repos/{org}/{repo}/environments/...` to an org-level
   Environment resource with per-Project overlays, grants and secret scopes beneath it.
 - The split report is the one place the migration asks an admin to think. Everything
   else is mechanical. The one behaviour change is a name referenced only by a Pipeline

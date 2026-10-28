@@ -10,7 +10,7 @@
 ## Context
 
 Slices 3–5 are being built by an unattended loop. To avoid mid-run guessing, this ADR fixes the
-load-bearing *implementation* choices those slices' ADRs left open. These are defaults consistent
+important *implementation* choices those slices' ADRs left open. These are defaults consistent
 with the accepted ADRs; two (GitHub auth, OIDC subject) were confirmed with the maintainer.
 
 ## Decision
@@ -45,7 +45,7 @@ with the accepted ADRs; two (GitHub auth, OIDC subject) were confirmed with the 
   max-in-flight (config, default effectively unbounded); excess waits durably in queue. Integer
   `priority` (higher first), default 0.
 - **Cancellation:** mark cancelled → outbox cancel intent → executor SIGTERM + grace → kill →
-  durable terminal (no half-cancelled limbo).
+  durable terminal (nothing is left half-cancelled).
 - **Gate step kind (built-in):** kinds `manual` (approval by an RBAC role / user list), `timer`
   (wait a duration), `external` (release via API/webhook with a token). Suspends the run
   (`RunStatus::Suspended`); resume via `POST /v1/runs/:id/gates/:step/approve` (authz'd). Survives
@@ -80,7 +80,7 @@ with the accepted ADRs; two (GitHub auth, OIDC subject) were confirmed with the 
 ## Consequences
 
 - The loop cites this ADR instead of re-deciding; env var names above are the config contract.
-- More untestable-here surface (GitHub App, BuildKit, cloud OIDC trust) — those paths are
+- More code that cannot be tested here (GitHub App, BuildKit, cloud OIDC trust); those paths are
   `#[ignore]`/env-gated and need an attended pass on a machine with the dev harness + creds.
 - If any choice proves wrong, supersede it with a focused ADR (0033+), don't edit this one.
 

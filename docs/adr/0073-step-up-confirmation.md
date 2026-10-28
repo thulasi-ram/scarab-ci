@@ -1,4 +1,4 @@
-# 0073. Step-up confirmation: a human, a passkey, the exact action
+# 0073. Step-up confirmation: a human confirms the exact action with a passkey
 
 - **Status:** Accepted. Built 2026-10-24 as one build on `feat/step-up`; where the build
   differs from the text, the text is amended in place or recorded in
@@ -90,7 +90,8 @@ is in §10.
 no step-up. A reject can only fail a Gate, never release one. Anyone who can reject can
 already cancel the whole Run, both are recorded, and a Retry undoes a reject.
 
-The guard covers the **whole** list from day one. A partial list is a list of holes.
+The guard covers the **whole** list from day one. Any operation left off it would be
+unguarded.
 
 ### 4. The window
 
@@ -103,7 +104,7 @@ cookie (and its CSRF token) inside the window inherits the window. That is inher
 any session-bound window, and it is why the operations below confirm every time.
 
 Three operations confirm **every time**, even inside a window, because each mints a new
-credential or outbound channel, and that is how minutes become permanent access:
+credential or outbound channel, which turns a 5-minute window into permanent access:
 - API token creation;
 - Plugin install/upgrade and a PluginConnection's destination;
 - adding, removing or resetting passkeys.
@@ -145,7 +146,7 @@ human. The link expires in 5 minutes and cannot be reused or widened. How "exact
   confirmation time.
 - A PluginPrincipal has no human and cannot raise one.
 
-This makes Scarab a human-in-the-loop gate for agents rather than a wall they hit.
+Agents can still reach these operations; a human confirms each one.
 
 ### 7. OrgSecurityEventLog
 
@@ -154,7 +155,7 @@ One append-only, Org-scoped log records:
 - every crown-jewel operation, with the confirmation or StepUpConfirmationRequest that
   authorised it;
 - every **refusal**, meaning which caller attempted which operation without step-up. A
-  burst from one token is an agent probing the edges;
+  burst from one token is an agent trying operations to see which ones get through;
 - every passkey enrollment, removal and reset, break-glass included.
 
 Org admins see the Org's log; each user sees their own events and passkeys. Core sends
@@ -176,7 +177,7 @@ checks:
   enforced refuses to boot. With no login configured there is no human to confirm, so
   nothing is enforced and the boot log warns.
 
-To make day one survivable:
+So that enforcing from day one does not lock people out:
 
 - `scarab security setup` checks for a passkey. If there is none, it opens the browser
   at enrollment (through a fresh login), waits until it completes, and is safe to
@@ -255,7 +256,7 @@ through a `subscribe_events` plugin.
 
 ## Implementation notes (2026-10-24)
 
-Recorded when the build landed, so the ADR stays honest about how it was built and what
+Recorded when the build landed, so the ADR stays accurate about how it was built and what
 is still open. None of these reverses a decision.
 
 - **The WebAuthn relying party is hand-rolled** (`crates/scarab-webauthn`, on `ring` +

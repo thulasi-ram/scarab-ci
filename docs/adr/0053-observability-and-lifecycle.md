@@ -7,7 +7,7 @@
 
 ## Context
 
-The server is operationally blind (2026-07-16 audit): no metrics (no
+Operators can't see what the server is doing (2026-07-16 audit): no metrics (no
 metrics/Prometheus dep anywhere), bare `tracing_subscriber::fmt::init()` with no
 `EnvFilter`/JSON/request-ids, `/healthz` is a static string that ignores DB
 health (readiness == liveness), and there is **no graceful shutdown** (the driver
@@ -35,8 +35,8 @@ health (readiness == liveness), and there is **no graceful shutdown** (the drive
 
 - A metrics crate + instrumentation; tracing config; `/readyz` checks; shutdown
   wiring; chart probe split + a ServiceMonitor.
-- The operational posture becomes legible (dashboards, alerts) and rollouts stop
-  cutting live connections.
+- Operators can see what the server is doing (dashboards, alerts), and rollouts
+  stop cutting live connections.
 
 ## Alternatives considered
 

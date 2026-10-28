@@ -7,8 +7,8 @@
 ## Context
 
 Secrets need storage, scoping, injection, and one thing everyone gets wrong: **fork-PR
-exposure** (untrusted PRs from forks must get no secrets unless a maintainer approves — a
-repeated real-world breach vector).
+exposure** (untrusted PRs from forks must get no secrets unless a maintainer approves; this has
+caused real breaches more than once).
 
 ## Decision
 

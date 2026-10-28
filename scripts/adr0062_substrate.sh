@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Re-assert the substrate facts ADR-0062 rests on.
+# Re-assert the platform facts ADR-0062 rests on.
 #
 # ADR-0062 ("Workspace export: lazy materialisation without a node driver")
 # does not choose its design from taste — it chooses it because a handful of

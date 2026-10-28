@@ -13,15 +13,15 @@ task and its rootless/cache footguns onto every user).
 
 ## Decision
 
-**Bless a first-class `build` capability backed by rootless BuildKit** — no `docker.sock`, no
+**Provide a built-in `build` capability backed by rootless BuildKit**: no `docker.sock`, no
 privileged pods (privilege via user namespaces). Layer cache to a registry / object store.
 Secure-by-default for the most common job.
 
 ## Consequences
 
-- Great, safe out-of-the-box build experience; strong DX.
+- A safe build experience out of the box; good DX.
 - BuildKit integration + cache plumbing to build/maintain.
-- Composes with keyless cosign signing ([0015](0015-supply-chain-oidc.md)).
+- Works with keyless cosign signing ([0015](0015-supply-chain-oidc.md)).
 
 ## Alternatives considered
 
@@ -41,7 +41,7 @@ At the time of writing, `build_pod_for_build` existed but was unwired, with
 - **Registry credentials are a generic scoped secret** (ADR-0037) — a
   `dockerconfigjson`-shaped secret in the Project/Environment scope, injected
   into BuildKit's auth path for both push and private-`FROM` pull. No new
-  first-class `registry:` concept (that would reinvent secret-scoping); reuses
+  dedicated `registry:` concept (that would reinvent secret-scoping); reuses
   scope inheritance, fork-PR lockout, and log redaction as-is.
 - **Zero-config convenience:** the forge adapter may *derive* a registry
   credential for pushing to the forge's **own** registry (GHCR via the GitHub

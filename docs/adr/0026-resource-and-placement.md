@@ -18,9 +18,9 @@ over-abstracting blocks power users (a specific taint, a GPU class).
 - Pipelines say `runs-on: linux/arm64`, `resources: { cpu, mem }`, optional `size: large`.
 - A **cluster-admin config** maps those labels to k8s specifics (nodeSelector / tolerations /
   runtimeClass / requests).
-- A **raw pod-spec overlay** is available for power users who truly need it.
+- A **raw pod-spec overlay** is available for power users who need it.
 
-Portable by default; no ceiling. Infra lives in admin config, not pipeline files.
+Portable by default, with no hard ceiling. Infra lives in admin config, not pipeline files.
 
 ## Consequences
 

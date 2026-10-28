@@ -7,7 +7,8 @@
 ## Context
 
 Because the DAG is durable, content-addressed, and records exactly what produced what, two
-modern security features are *nearly free* — a differentiator most CIs bolt on painfully.
+modern security features take *very little extra work*. Most CIs bolt them on painfully, so
+this sets us apart.
 
 ## Decision
 
@@ -16,7 +17,7 @@ modern security features are *nearly free* — a differentiator most CIs bolt on
 - **Scarab is an OIDC issuer** for **keyless cloud federation.** Mint short-lived per-run JWTs
   with claims (`repo`, `ref`, `environment`, `pipeline`) that cloud IAM trust policies key on,
   so pipelines authenticate to AWS/GCP/Azure/registries with **zero stored long-lived
-  secrets** (à la GHA OIDC). Composes with keyless signing.
+  secrets** (à la GHA OIDC). Works with keyless signing.
 - **Provenance-by-construction hooks:** we already record the full "source + steps + inputs →
   artifact" graph; capture it so SLSA attestation is mostly serialization of existing state.
 
@@ -27,9 +28,9 @@ issuer), SBOM attach.
 
 - Env-scoped OIDC subjects tie into Environments ([0024](0024-environments.md)).
 - Fewer stored secrets ([0014](0014-secrets.md)) → smaller blast radius.
-- High value/effort ratio; banks a differentiator early without over-scoping v1.
+- High value for the effort; gets a differentiator in early without over-scoping v1.
 
 ## Alternatives considered
 
-- **All-in v1 (OIDC + SLSA + cosign + SBOM)** — strongest story, notably more v1 surface.
-- **Defer all** — forfeits an almost-free differentiator; retrofitting OIDC trust is friction.
+- **All-in v1 (OIDC + SLSA + cosign + SBOM)** — strongest pitch, notably more v1 scope.
+- **Defer all** — gives up a differentiator that costs almost nothing; retrofitting OIDC trust is friction.

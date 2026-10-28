@@ -107,7 +107,7 @@ The id is readable rather than `usr_<uuid>` because it is what an admin types
 into an approver list or a grant. It is also what the activity log shows for
 "cancelled by", and what `when: event.actor == …` compares against on
 manual/api runs (the only triggers that expose `event.actor`). An opaque id
-would need a display-resolution layer across every one of those surfaces, and
+would need a display-resolution layer in every one of those places, and
 would make approver lists unwritable. The cost is cosmetic: after a rename,
 `github:alice` keeps reading "alice". `display_name` tracks the current name.
 
@@ -162,7 +162,7 @@ Boot **refuses**:
   trim connections apply);
 - a bare email in `SCARAB_OAUTH_OWNERS` when more than one provider is configured.
 
-**Disclosed residual:** under an `unqualified_ids` GitHub provider, the first
+**Remaining risk:** under an `unqualified_ids` GitHub provider, the first
 post-upgrade login with a given handle claims that handle's history. If the
 login was recycled before its original holder signs in again, the new holder
 gets it. Once pinned, this cannot recur. Operators who want no window move to a
@@ -196,7 +196,7 @@ connections store.
 1. **Resolve.** Find the repo's connection (as today) and the provider whose
    `forge_url` matches it. **If there is none, return a 409** naming
    `SCARAB_OAUTH_FORGE_URL` / `forge_url`. Without that provider, imported roles
-   could never be signed into. Making the gap loud closes (1).
+   could never be signed into. Failing loudly here closes (1).
 2. **List.** Call the new `ForgePort::list_collaborators(repo)`, which returns
    `{external_id, login, permissions}` and defaults to `Unsupported`.
    - **GitHub:** `affiliation=all`, which includes team and org access, paged
@@ -324,14 +324,14 @@ The end state this is a step toward. None of it is decided here:
   OIDC-only user's first login.
 - **Actor ↔ Principal display.** The UI shows "alice · signed in as
   okta:ada@example.com" when a webhook Actor's forge account is linked. Display
-  only, never load-bearing.
+  only; nothing relies on it.
 - **Admin merge** of two claimed Principals that the caller cannot prove alone.
 - **Re-checking global roles per request.** Today the global role snapshotted
   into the session survives an unlink for up to 24h.
 
 ## Alternatives considered
 
-- **Opaque `usr_<uuid>` ids.** Every admin-typed surface and every attribution
+- **Opaque `usr_<uuid>` ids.** Every field an admin types into and every attribution
   display would need a resolution layer, and `when: event.actor == …` would
   stop being writable. Rejected for §2.
 - **Identity-keyed bindings with a union lookup.** Here `rbac_bindings.subject`
@@ -342,7 +342,7 @@ The end state this is a step toward. None of it is decided here:
   property with the existing single-key authz.
 - **Claiming a typed string at first mint.** This was the first draft of this
   ADR. Whoever minted the id first claimed every grant, approver entry and owner
-  entry typed against it, which re-opens (4) for every pre-assigned surface. The
+  entry typed against it, which re-opens (4) for everything pre-assigned. The
   skeptical audit of this ADR caught it. Rejected for §3.
 - **Linking by verified email.** The usual convenience, and the usual takeover
   vector. Rejected (§6).

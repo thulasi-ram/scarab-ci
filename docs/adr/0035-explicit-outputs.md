@@ -8,8 +8,8 @@
 
 The workspace data-passing model ([0007](0007-data-passing-model.md)) is
 implicit-by-default, explicit-on-demand. The input half (`inputs:`) landed with
-restart skip-if-unchanged ([0027](0027-restart-semantics.md)). The output half —
-which paths a step *publishes* downstream — was still whole-workspace only, so a
+restart skip-if-unchanged ([0027](0027-restart-semantics.md)). The output half
+(which paths a step *publishes* downstream) was still whole-workspace only, so a
 step always exported everything (`target/`, `node_modules/`) and its output hash
 changed on any incidental file.
 

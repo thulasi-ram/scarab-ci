@@ -1,4 +1,4 @@
-# 0024. Environments: first-class with protection rules
+# 0024. Environments: a built-in entity with protection rules
 
 - **Status:** Accepted
 - **Date:** 2026-07-12
@@ -7,12 +7,12 @@
 ## Context
 
 An Environment (staging/prod) is the natural convergence point for deployment governance, and
-several primitives we built already meet there: `gate` (approval/timer), env-scoped secrets,
+several features we built already meet there: `gate` (approval/timer), env-scoped secrets,
 env OIDC subject, concurrency groups, RBAC approvers, and the forge deployments API.
 
 ## Decision
 
-**Environment is a first-class entity** (in `scarab-projects`) carrying **protection rules**:
+**Environment is its own entity** (in `scarab-projects`) carrying **protection rules**:
 
 - required **approvers** + **wait timer** → realized via `gate` ([0008](0008-step-contract.md))
 - **allowed refs/branches**
@@ -21,7 +21,8 @@ env OIDC subject, concurrency groups, RBAC approvers, and the forge deployments 
 - **OIDC subject template** → ([0015](0015-supply-chain-oidc.md))
 - **deployment history** + forge deployments link
 
-One coherent governance/security surface — a credible deploy system, not just a build runner.
+Governance and security live in one place, which makes Scarab a credible deploy system and
+not only a build runner.
 
 ## Consequences
 
@@ -33,4 +34,4 @@ One coherent governance/security surface — a credible deploy system, not just 
 
 - **Thin named scope** (secrets + OIDC + optional gate only) — fewer concepts, governance
   reinvented per team.
-- **No Environment concept** — maximal minimalism, no cohesive deploy-safety surface.
+- **No Environment concept** — as minimal as it gets, but no single place for deploy safety.

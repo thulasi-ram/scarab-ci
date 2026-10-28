@@ -21,7 +21,7 @@ fast authoring loop.
 
 ## Consequences
 
-- "Second execution path" collapses to a second adapter, kept in sync **by construction**
+- The "second execution path" becomes a second adapter, kept in sync **by construction**
   (the domain engine drives both).
 - Enables offline development and reproducible local runs.
 - The local executor is not a security boundary; it is a dev convenience.

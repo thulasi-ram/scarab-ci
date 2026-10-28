@@ -6,9 +6,9 @@
 
 ## Context
 
-A step may emit four genuinely different kinds of data with different lifecycles. The classic
-mistake (Argo's single "artifact"; Concourse's everything-is-a-"resource") collapses them and
-breeds confusion.
+A step may emit four different kinds of data with different lifecycles. The classic
+mistake (Argo's single "artifact"; Concourse's everything-is-a-"resource") lumps them together
+and confuses people.
 
 ## Decision
 
@@ -24,14 +24,14 @@ Keep **four distinct concepts**:
 **Workspace is implicit-by-default, explicit-on-demand:** by default a step inherits the
 merged content-addressed workspace of its `needs` (GHA ergonomics). It *may* declare explicit
 `inputs:`/`outputs:` to get precise cache keys, restrict what flows (safe fan-out), or remap
-(Concourse precision). Explicit I/O is exactly what powers skip-if-unchanged
+(Concourse precision). Explicit I/O is what skip-if-unchanged relies on
 ([0027](0027-restart-semantics.md)).
 
 ## Consequences
 
 - Clear retention/UI/caching semantics per concept; no reinvention by users.
 - Workspace mechanism is per-file merkle CAS ([0029](0029-workspace-cas.md)).
-- More concepts to learn than a 2-concept minimal model — deemed worth it.
+- More concepts to learn than a 2-concept minimal model; we think it is worth it.
 
 ## Amendment (2026-07-25) — explicit workspace I/O is fully built
 
@@ -50,12 +50,12 @@ Both halves of "explicit-on-demand" now ship:
 Note for anyone re-reading old notes: the `outputs:` half was deferred for months as "blocked on
 CAS sub-tree addressing". That was a mistaken premise. [0029](0029-workspace-cas.md)'s CAS is a
 per-file merkle store, so a tree *is* a hashed list of `name -> blob|tree` entries; restricting a
-snapshot to a path subset is a walk plus a bottom-up rebuild over primitives that already existed,
+snapshot to a path subset is a walk plus a bottom-up rebuild using CAS operations that already existed,
 sharing every blob with the full snapshot. No new storage capability was required.
 
 ## Amendment (2026-07-26) — `outputs:` is a precision tool, never a performance tax
 
-[0061](0061-workspace-data-path.md) makes wide edges cheap in the substrate (lazy
+[0061](0061-workspace-data-path.md) makes wide edges cheap in the storage layer (lazy
 materialisation + content addressing), and adopts the principle that **the system pays for
 its own idiosyncrasies, not the author**. So the implicit inherit-everything default stated
 above is permanent, and neither `inputs:` nor `outputs:` may become something an author has

@@ -23,9 +23,9 @@ regenerated per boot** → each replica publishes a different JWKS.
 > leader-gated sweeper) converges replicas **through Postgres**, which is what the Consequences mean by
 > *"converged replicas share work via Postgres; no service-to-service RPC"*. The **Data Depot** has
 > **no durable core** — it never connects to Postgres — so none of it applies there, and
-> `replicaCount: 2+` becoming honest for the server says nothing about the Depot.
+> `replicaCount: 2+` becoming safe for the server says nothing about the Depot.
 >
-> **The Depot's multi-replica story is [0066](0066-the-depot-is-a-cache.md)**, and it is a different
+> **The Depot's multi-replica design is [0066](0066-the-depot-is-a-cache.md)**, and it is a different
 > shape for a structural reason: the Depot is **definitionally a cache**, so replicas hold nothing
 > unique and HA is *"run more replicas"* rather than a coordination protocol. What it needs instead is
 > **fence affinity** — a headless Service, a replica chosen at launch and stamped into the Pod spec,
@@ -66,7 +66,7 @@ one sweeper cluster-wide.
 
 - A tail-lease table + reclaim loop; the SSE handler polls the durable index for
   live chunks; the OIDC key comes from SecretProvider/config.
-- `replicaCount: 2+` becomes **honest**; the chart can raise it with guidance
+- `replicaCount: 2+` becomes **safe**; the chart can raise it with guidance
   (converged replicas share work via Postgres; no service-to-service RPC).
 
 ## Alternatives considered
