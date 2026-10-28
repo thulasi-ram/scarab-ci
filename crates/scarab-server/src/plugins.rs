@@ -22,20 +22,21 @@ use std::sync::OnceLock;
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::Json;
+use axum::{Extension, Json};
 use scarab_engine::DbError;
 use scarab_identity::Action;
 use scarab_plugin::{
     admit_for_mmp, validate_installation_name, ConnectionSlot, InstallationState, PluginCapability,
     PluginConnection, PluginConnectionAuthScheme, PluginInstallation, PluginManifest,
-    PluginStoreError, RequestRule, RuntimeStatus, MAX_CONNECTION_BASE_URL_CHARS,
-    MAX_CONNECTION_CA_PEM_BYTES, MAX_CONNECTION_CREDENTIAL_BYTES,
+    PluginStorage, PluginStoreError, RequestRule, RuntimeStatus, MAX_CONNECTION_BASE_URL_CHARS,
+    MAX_CONNECTION_CA_PEM_BYTES, MAX_CONNECTION_CREDENTIAL_BYTES, PLUGIN_STORAGE_OWNER_ANNOTATION,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use utoipa::ToSchema;
 
 use super::{authorize_scoped, rbac_scope, ApiError, AppState};
+use crate::step_up::GuardCtx;
 
 /// The first-party Argo CD plugin's manifest, compiled in: what an admin
 /// approves for it is exactly this document plus a digest (ADR-0072 §1-2).
@@ -168,9 +169,9 @@ fn manifest_sha256(manifest: &PluginManifest) -> String {
 pub(crate) fn plugin_store_api_error(e: PluginStoreError) -> ApiError {
     match e {
         PluginStoreError::Invalid(m) => ApiError::BadRequest(m),
-        e @ (PluginStoreError::NameTaken(_) | PluginStoreError::NameRetired(_)) => {
-            ApiError::Conflict(e.to_string())
-        }
+        e @ (PluginStoreError::NameTaken(_)
+        | PluginStoreError::NameRetired(_)
+        | PluginStoreError::Changed(_)) => ApiError::Conflict(e.to_string()),
         PluginStoreError::NotFound => ApiError::NotFound,
         e @ PluginStoreError::Killed => ApiError::Denied(e.to_string()),
         // Busy reaches here only from the public API's own pool; the broker
@@ -353,6 +354,55 @@ pub struct PluginInstallationDto {
     pub killed_by: Option<String>,
     /// Unix-ms.
     pub killed_at: Option<i64>,
+    /// The PersistentVolumeClaim its Pod mounts (ADR-0074 §7); absent = none.
+    pub storage: Option<PluginStorageDto>,
+}
+
+/// An installation's storage (ADR-0074 §7): a PersistentVolumeClaim an
+/// operator created in the plugin namespace. Scarab mounts it read-write; it
+/// never creates, backs up or reads it.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PluginStorageDto {
+    /// The claim's name in the plugin namespace.
+    pub claim: String,
+    /// Where the Plugin's container sees it.
+    pub mount_path: String,
+    /// The annotation the claim must carry before the runtime mounts it…
+    pub owner_annotation: String,
+    /// …and its value, `<org>/<installation name>`. The plugin namespace is
+    /// shared by every org; this is how the operator says which
+    /// installation the claim is for.
+    pub owner_annotation_value: String,
+}
+
+fn storage_dto(i: &PluginInstallation) -> Option<PluginStorageDto> {
+    i.storage.as_ref().map(|s| PluginStorageDto {
+        claim: s.claim.clone(),
+        mount_path: s.mount_path.clone(),
+        owner_annotation: PLUGIN_STORAGE_OWNER_ANNOTATION.to_string(),
+        owner_annotation_value: i.storage_owner(),
+    })
+}
+
+/// `storage` on an install, and `PUT …/plugins/{name}/storage`.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PluginStorageRequest {
+    /// The PersistentVolumeClaim's name in the plugin namespace (a DNS-1123
+    /// subdomain). Scarab does not create it.
+    pub claim: String,
+    /// An absolute path in the Plugin's container; omitted = `/data`. Not
+    /// `/`, and clear of `/tmp`, `/var/run/secrets` and the other paths the
+    /// runtime or the kubelet mounts.
+    #[serde(default)]
+    pub mount_path: Option<String>,
+}
+
+impl PluginStorageRequest {
+    fn validated(&self) -> Result<PluginStorage, ApiError> {
+        PluginStorage::new(&self.claim, self.mount_path.as_deref())
+            .map_err(|e| ApiError::BadRequest(e.to_string()))
+    }
 }
 
 fn installation_dto(i: &PluginInstallation) -> PluginInstallationDto {
@@ -374,6 +424,7 @@ fn installation_dto(i: &PluginInstallation) -> PluginInstallationDto {
         approved_at: i.approved_at,
         killed_by: i.killed_by.clone(),
         killed_at: i.killed_at,
+        storage: storage_dto(i),
     }
 }
 
@@ -391,6 +442,9 @@ pub struct InstallPluginRequest {
     /// Values for the manifest's `config_keys`; omitted = none.
     #[serde(default)]
     pub config: BTreeMap<String, String>,
+    /// A PersistentVolumeClaim to mount (ADR-0074 §7); omitted = none.
+    #[serde(default)]
+    pub storage: Option<PluginStorageRequest>,
 }
 
 /// What an uninstall removed.
@@ -641,7 +695,7 @@ pub(crate) async fn list_plugins(
     summary = "Install a first-party plugin (ADR-0072)",
     responses(
         (status = 201, body = PluginInstallationDto),
-        (status = 400, description = "invalid name or config"),
+        (status = 400, description = "invalid name, config or storage"),
         (status = 403, description = "not an org admin, or not a first-party plugin pinned by digest"),
         (status = 404, description = "plugins not configured"),
         (status = 409, description = "the name is taken or retired, or plugins are off")
@@ -681,6 +735,11 @@ pub(crate) async fn install_plugin(
         .manifest
         .validate_config(&body.config)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let storage = body
+        .storage
+        .as_ref()
+        .map(PluginStorageRequest::validated)
+        .transpose()?;
     let now = st.clock.now().await.0;
     let mut installation = PluginInstallation {
         id: mint_installation_id(),
@@ -699,6 +758,7 @@ pub(crate) async fn install_plugin(
         approved_at: now,
         killed_by: None,
         killed_at: None,
+        storage,
     };
     // A 40-bit id collides about never; when it does, mint again rather
     // than fail an admin's install.
@@ -849,6 +909,130 @@ pub(crate) async fn enable_plugin(
     Path((org, name)): Path<(String, String)>,
 ) -> Result<Json<PluginInstallationDto>, ApiError> {
     set_state(&st, &headers, &org, &name, InstallationState::Enabled).await
+}
+
+fn describe_storage(s: &PluginStorage) -> String {
+    format!("claim `{}` at `{}`", s.claim, s.mount_path)
+}
+
+/// Set the installation's storage (ADR-0074 §7): the PersistentVolumeClaim,
+/// made by an operator in the plugin namespace and annotated for this
+/// installation, that the runtime mounts read-write into its Pod. Scarab does
+/// not create, back up or read it. Administer on the Org.
+///
+/// Adding storage to an installation that has none needs no step-up; moving
+/// it to another claim or path does (ADR-0073 §3, window), since that
+/// re-aims what the plugin reads and writes.
+#[utoipa::path(
+    put,
+    path = "/v1/orgs/{org}/plugins/{name}/storage",
+    params(
+        ("org" = String, Path, description = "org"),
+        ("name" = String, Path, description = "installation name")
+    ),
+    request_body = PluginStorageRequest,
+    summary = "Set a plugin installation's storage claim (ADR-0074)",
+    responses(
+        (status = 200, body = PluginInstallationDto),
+        (status = 400, description = "invalid claim or mount path"),
+        (status = 403, description = "not an org admin, or a step-up is required"),
+        (status = 404, description = "no such installation, or plugins not configured"),
+        (status = 409, description = "the storage changed meanwhile")
+    )
+)]
+pub(crate) async fn put_plugin_storage(
+    State(st): State<AppState>,
+    Extension(guard): Extension<GuardCtx>,
+    headers: HeaderMap,
+    Path((org, name)): Path<(String, String)>,
+    Json(body): Json<PluginStorageRequest>,
+) -> Result<Json<PluginInstallationDto>, ApiError> {
+    let by = org_admin(&st, &headers, &org).await?;
+    let storage = body.validated()?;
+    let store = store(&st)?;
+    let current = store
+        .installation(&org, &name)
+        .await
+        .map_err(plugin_store_api_error)?
+        .ok_or(ApiError::NotFound)?;
+    match &current.storage {
+        None => guard.exempt("adds storage to an installation that has none"),
+        Some(was) if *was == storage => guard.exempt("unchanged"),
+        Some(was) => {
+            guard
+                .require(
+                    &st,
+                    vec![format!(
+                        "storage moves from {} to {}",
+                        describe_storage(was),
+                        describe_storage(&storage)
+                    )],
+                )
+                .await?
+        }
+    }
+    let updated = store
+        .set_installation_storage(&org, &name, Some(&storage), current.storage.as_ref())
+        .await
+        .map_err(plugin_store_api_error)?
+        .ok_or(ApiError::NotFound)?;
+    tracing::info!(
+        org,
+        installation = name,
+        by,
+        claim = storage.claim,
+        mount_path = storage.mount_path,
+        "plugin installation storage set (ADR-0074 §7)"
+    );
+    Ok(Json(installation_dto(&updated)))
+}
+
+/// Remove the installation's storage: the runtime stops mounting the claim.
+/// The claim and its data stay in the cluster; Scarab never deletes them.
+/// Administer on the Org.
+#[utoipa::path(
+    delete,
+    path = "/v1/orgs/{org}/plugins/{name}/storage",
+    params(
+        ("org" = String, Path, description = "org"),
+        ("name" = String, Path, description = "installation name")
+    ),
+    summary = "Stop mounting a plugin installation's storage claim (ADR-0074)",
+    responses(
+        (status = 200, body = PluginInstallationDto),
+        (status = 403, description = "not an org admin"),
+        (status = 404, description = "no such installation, or plugins not configured"),
+        (status = 409, description = "the storage changed meanwhile")
+    )
+)]
+pub(crate) async fn delete_plugin_storage(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((org, name)): Path<(String, String)>,
+) -> Result<Json<PluginInstallationDto>, ApiError> {
+    let by = org_admin(&st, &headers, &org).await?;
+    let store = store(&st)?;
+    let current = store
+        .installation(&org, &name)
+        .await
+        .map_err(plugin_store_api_error)?
+        .ok_or(ApiError::NotFound)?;
+    let Some(was) = &current.storage else {
+        return Ok(Json(installation_dto(&current)));
+    };
+    let updated = store
+        .set_installation_storage(&org, &name, None, Some(was))
+        .await
+        .map_err(plugin_store_api_error)?
+        .ok_or(ApiError::NotFound)?;
+    tracing::info!(
+        org,
+        installation = name,
+        by,
+        claim = was.claim,
+        "plugin installation storage removed (ADR-0074 §7); the claim is left as it is"
+    );
+    Ok(Json(installation_dto(&updated)))
 }
 
 /// An installation in `org` and the manifest slot `slot` of it, or 404.

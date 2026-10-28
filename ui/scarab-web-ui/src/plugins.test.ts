@@ -11,7 +11,10 @@ import {
   runtimeBadge,
   shortDigest,
   stateBadge,
+  storageClaimError,
+  storageMountPathError,
   toInstallBody,
+  toStorageBody,
 } from "./plugins";
 
 const REPO = "ghcr.io/acme/scarab-plugin-argocd";
@@ -158,5 +161,40 @@ describe("connection binding", () => {
       tone: "ok",
     });
     expect(credentialBadge({ configured: true, credential_set: false }).tone).toBe("danger");
+  });
+});
+
+describe("storage (ADR-0074 §7)", () => {
+  it("takes a claim name the way Kubernetes names a PVC", () => {
+    expect(storageClaimError("argocd-state")).toBeNull();
+    expect(storageClaimError("state.v2")).toBeNull();
+    expect(storageClaimError("")).toMatch(/Enter/);
+    for (const bad of ["Data", "-data", "data-", "data..v2", "data_v2", "a/b"]) {
+      expect(storageClaimError(bad), bad).toMatch(/Not a claim name/);
+    }
+  });
+
+  it("refuses a mount path that is relative, the root, or over a runtime mount", () => {
+    expect(storageMountPathError("")).toBeNull();
+    expect(storageMountPathError("/data")).toBeNull();
+    expect(storageMountPathError("/var/lib/argocd/")).toBeNull();
+    expect(storageMountPathError("/tmpdata")).toBeNull();
+    expect(storageMountPathError("data")).toMatch(/absolute/);
+    expect(storageMountPathError("/")).toMatch(/cannot be \//);
+    expect(storageMountPathError("/data/../tmp")).toMatch(/parts/);
+    for (const bad of ["/tmp", "/tmp/x", "/var/run/secrets", "/var", "/etc", "/proc/self"]) {
+      expect(storageMountPathError(bad), bad).toMatch(/overlaps/);
+    }
+  });
+
+  it("omits a blank mount path so the server's default applies", () => {
+    expect(toStorageBody({ claim: " argocd-state ", mount_path: " " })).toEqual({
+      body: { claim: "argocd-state" },
+    });
+    expect(toStorageBody({ claim: "argocd-state", mount_path: "/srv" })).toEqual({
+      body: { claim: "argocd-state", mount_path: "/srv" },
+    });
+    expect(toStorageBody({ claim: "", mount_path: "/srv" }).error).toMatch(/Enter/);
+    expect(toStorageBody({ claim: "argocd-state", mount_path: "/tmp" }).error).toMatch(/overlaps/);
   });
 });

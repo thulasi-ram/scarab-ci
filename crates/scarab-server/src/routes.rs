@@ -397,6 +397,16 @@ pub(crate) fn governed_routes() -> Routes {
             &ops::PLUGIN_ENABLE,
             plugins::enable_plugin,
         )
+        .put(
+            "/v1/orgs/{org}/plugins/{name}/storage",
+            &ops::PLUGIN_STORAGE_PUT,
+            plugins::put_plugin_storage,
+        )
+        .delete(
+            "/v1/orgs/{org}/plugins/{name}/storage",
+            &ops::PLUGIN_STORAGE_DELETE,
+            plugins::delete_plugin_storage,
+        )
         .get(
             "/v1/orgs/{org}/plugins/{name}/connections",
             plugins::list_plugin_connections,

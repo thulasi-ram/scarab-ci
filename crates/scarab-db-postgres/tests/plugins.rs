@@ -16,7 +16,7 @@ use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_plugin::{
     ConnectionSlot, InstallationState, PluginCapability, PluginInstallation, PluginManifest,
-    PluginStore, PluginStoreError, RequestRule, RuntimeStatus,
+    PluginStorage, PluginStore, PluginStoreError, RequestRule, RuntimeStatus,
 };
 
 async fn migrated() -> Option<(common::TestDb, PostgresDb)> {
@@ -64,6 +64,7 @@ fn installation(org: &str, name: &str, id: &str) -> PluginInstallation {
         approved_at: 1_000,
         killed_by: None,
         killed_at: None,
+        storage: None,
     }
 }
 
@@ -293,5 +294,73 @@ async fn uninstall_retires_its_name() {
     db.install(&installation("initech", "argocd", "0000000004"))
         .await
         .unwrap();
+    tdb.cleanup().await;
+}
+
+/// ADR-0074 §7: the storage write is conditional on the storage the caller
+/// read, so a step-up judged against one claim never lands on another
+/// admin's newer one; and a half-written storage row cannot exist.
+#[tokio::test]
+async fn storage_writes_only_over_the_storage_the_caller_read() {
+    let Some((tdb, db)) = migrated().await else {
+        return;
+    };
+    db.install(&installation("acme", "argocd", "0000000001"))
+        .await
+        .unwrap();
+    let a = PluginStorage::new("state-a", None).unwrap();
+    let b = PluginStorage::new("state-b", Some("/srv/b")).unwrap();
+
+    let set = db
+        .set_installation_storage("acme", "argocd", Some(&a), None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(set.storage, Some(a.clone()));
+    assert_eq!(
+        db.installation_by_id("0000000001")
+            .await
+            .unwrap()
+            .unwrap()
+            .storage,
+        Some(a.clone())
+    );
+    // Judged against "no storage", but A is there now.
+    assert!(matches!(
+        db.set_installation_storage("acme", "argocd", Some(&b), None)
+            .await,
+        Err(PluginStoreError::Changed(_))
+    ));
+    let moved = db
+        .set_installation_storage("acme", "argocd", Some(&b), Some(&a))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(moved.storage, Some(b.clone()));
+    // A stale clear is refused too.
+    assert!(matches!(
+        db.set_installation_storage("acme", "argocd", None, Some(&a))
+            .await,
+        Err(PluginStoreError::Changed(_))
+    ));
+    let cleared = db
+        .set_installation_storage("acme", "argocd", None, Some(&b))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cleared.storage, None);
+    // No such installation.
+    assert_eq!(
+        db.set_installation_storage("acme", "nope", Some(&a), None)
+            .await
+            .unwrap(),
+        None
+    );
+    // A claim without a mount path cannot be stored.
+    let half =
+        sqlx::query("UPDATE plugin_installations SET storage_claim = 'x' WHERE id = '0000000001'")
+            .execute(&tdb.pool)
+            .await;
+    assert!(half.is_err(), "the CHECK keeps storage whole");
     tdb.cleanup().await;
 }

@@ -2602,7 +2602,7 @@
             }
           },
           "400": {
-            "description": "invalid name or config"
+            "description": "invalid name, config or storage"
           },
           "403": {
             "description": "not an org admin, or not a first-party plugin pinned by digest — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
@@ -3054,6 +3054,144 @@
           },
           "404": {
             "description": "no such installation, or plugins not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/plugins/{name}/storage": {
+      "put": {
+        "tags": [
+          "Plugins"
+        ],
+        "summary": "Set a plugin installation's storage claim (ADR-0074)",
+        "description": "Adding storage to an installation that has none needs no step-up; moving\nit to another claim or path does (ADR-0073 §3, window), since that\nre-aims what the plugin reads and writes.",
+        "operationId": "put_plugin_storage",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "installation name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PluginStorageRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginInstallationDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "invalid claim or mount path"
+          },
+          "403": {
+            "description": "not an org admin, or a step-up is required — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such installation, or plugins not configured"
+          },
+          "409": {
+            "description": "the storage changed meanwhile"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "Plugins"
+        ],
+        "summary": "Stop mounting a plugin installation's storage claim (ADR-0074)",
+        "operationId": "delete_plugin_storage",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "installation name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginInstallationDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "no such installation, or plugins not configured"
+          },
+          "409": {
+            "description": "the storage changed meanwhile"
           }
         },
         "security": [
@@ -7084,6 +7222,17 @@
           "plugin": {
             "type": "string",
             "description": "The catalog plugin (`argocd`)."
+          },
+          "storage": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PluginStorageRequest",
+                "description": "A PersistentVolumeClaim to mount (ADR-0074 §7); omitted = none."
+              }
+            ]
           }
         },
         "additionalProperties": false
@@ -7938,6 +8087,17 @@
           },
           "state": {
             "$ref": "#/components/schemas/InstallationStateDto"
+          },
+          "storage": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PluginStorageDto",
+                "description": "The PersistentVolumeClaim its Pod mounts (ADR-0074 §7); absent = none."
+              }
+            ]
           }
         }
       },
@@ -7973,6 +8133,55 @@
             "type": "string"
           }
         }
+      },
+      "PluginStorageDto": {
+        "type": "object",
+        "description": "An installation's storage (ADR-0074 §7): a PersistentVolumeClaim an\noperator created in the plugin namespace. Scarab mounts it read-write; it\nnever creates, backs up or reads it.",
+        "required": [
+          "claim",
+          "mount_path",
+          "owner_annotation",
+          "owner_annotation_value"
+        ],
+        "properties": {
+          "claim": {
+            "type": "string",
+            "description": "The claim's name in the plugin namespace."
+          },
+          "mount_path": {
+            "type": "string",
+            "description": "Where the Plugin's container sees it."
+          },
+          "owner_annotation": {
+            "type": "string",
+            "description": "The annotation the claim must carry before the runtime mounts it…"
+          },
+          "owner_annotation_value": {
+            "type": "string",
+            "description": "…and its value, `<org>/<installation name>`. The plugin namespace is\nshared by every org; this is how the operator says which\ninstallation the claim is for."
+          }
+        }
+      },
+      "PluginStorageRequest": {
+        "type": "object",
+        "description": "`storage` on an install, and `PUT …/plugins/{name}/storage`.",
+        "required": [
+          "claim"
+        ],
+        "properties": {
+          "claim": {
+            "type": "string",
+            "description": "The PersistentVolumeClaim's name in the plugin namespace (a DNS-1123\nsubdomain). Scarab does not create it."
+          },
+          "mount_path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An absolute path in the Plugin's container; omitted = `/data`. Not\n`/`, and clear of `/tmp`, `/var/run/secrets` and the other paths the\nruntime or the kubelet mounts."
+          }
+        },
+        "additionalProperties": false
       },
       "PrincipalDto": {
         "type": "object",

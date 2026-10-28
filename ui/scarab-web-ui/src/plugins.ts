@@ -250,3 +250,79 @@ export function credentialBadge(c: { configured: boolean; credential_set: boolea
         title: "The binding's credential is missing from the secret store: bind it again.",
       };
 }
+
+// ── Storage (ADR-0074 §7) ────────────────────────────────────────────────
+// A plugin may mount ONE PersistentVolumeClaim that an operator created in
+// the plugin namespace. Scarab mounts it; it never creates, backs up or reads
+// it. The server is the authority on these rules; the form mirrors them so a
+// typo is caught before the request.
+
+/** Where the claim is mounted when no path is given. */
+export const DEFAULT_STORAGE_MOUNT_PATH = "/data";
+
+/** What the panel says about storage, wherever it shows it. */
+export const STORAGE_NOTE =
+  "Scarab mounts this claim read-write into the plugin's Pod. It does not create, back up or read it, and the data is outside what Scarab keeps.";
+
+/** Paths the plugin runtime or the kubelet mounts: a storage mount path may
+ *  not be one of them, under one, or above one. */
+const RESERVED_MOUNT_PATHS = [
+  "/tmp",
+  "/var/run/secrets",
+  "/run/secrets",
+  "/etc/hosts",
+  "/etc/hostname",
+  "/etc/resolv.conf",
+  "/dev",
+  "/proc",
+  "/sys",
+];
+
+/** Why `claim` is not a PersistentVolumeClaim name, or `null`. */
+export function storageClaimError(claim: string): string | null {
+  const c = claim.trim();
+  if (c === "") return "Enter the PersistentVolumeClaim's name.";
+  const label = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/;
+  if (c.length > 253 || !c.split(".").every((l) => label.test(l))) {
+    return "Not a claim name: lowercase letters, digits, \"-\" and \".\", starting and ending with a letter or digit.";
+  }
+  return null;
+}
+
+/** Why `path` cannot be the mount path, or `null` (blank = the default). */
+export function storageMountPathError(path: string): string | null {
+  const p = path.trim().replace(/(.)\/+$/, "$1");
+  if (p === "") return null;
+  if (!p.startsWith("/")) return "The mount path must be absolute.";
+  if (p === "/") return "The mount path cannot be /.";
+  if (p.length > 256) return "The mount path is longer than 256 characters.";
+  const parts = p.slice(1).split("/");
+  if (parts.some((x) => x === "" || x === "." || x === "..")) {
+    return "No empty, \".\" or \"..\" parts in the mount path.";
+  }
+  if (!parts.every((x) => /^[A-Za-z0-9._-]+$/.test(x))) {
+    return "The mount path may hold only letters, digits, \".\", \"_\", \"-\" and \"/\".";
+  }
+  const within = (inner: string, outer: string) => inner === outer || inner.startsWith(`${outer}/`);
+  const hit = RESERVED_MOUNT_PATHS.find((r) => within(p, r) || within(r, p));
+  if (hit) return `The mount path overlaps ${hit}, which the plugin runtime or the kubelet mounts.`;
+  return null;
+}
+
+/** The storage form as the panel holds it. */
+export type StorageForm = { claim: string; mount_path: string };
+
+/** What `PUT …/plugins/{name}/storage` carries. */
+export type StorageBody = { claim: string; mount_path?: string };
+
+/** The body for `form`, or the first reason it cannot be sent. */
+export function toStorageBody(
+  form: StorageForm,
+): { body: StorageBody; error?: undefined } | { body?: undefined; error: string } {
+  const claimProblem = storageClaimError(form.claim);
+  if (claimProblem) return { error: claimProblem };
+  const pathProblem = storageMountPathError(form.mount_path);
+  if (pathProblem) return { error: pathProblem };
+  const mount_path = form.mount_path.trim();
+  return { body: { claim: form.claim.trim(), ...(mount_path ? { mount_path } : {}) } };
+}

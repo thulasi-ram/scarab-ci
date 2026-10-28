@@ -1025,3 +1025,125 @@ async fn exempt_operations_never_need_a_step_up() {
 
     assert!(h.events_of("step_up.refused").is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Plugin storage (ADR-0074 §7)
+// ---------------------------------------------------------------------------
+
+fn plugin_installation() -> scarab_plugin::PluginInstallation {
+    scarab_plugin::PluginInstallation {
+        id: "0000000001".into(),
+        org: "acme".into(),
+        name: "argocd".into(),
+        plugin: "argocd".into(),
+        image: format!("ghcr.io/acme/argocd@sha256:{}", "a".repeat(64)),
+        manifest: scarab_plugin::PluginManifest {
+            plugin: "argocd".into(),
+            capabilities: vec![scarab_plugin::PluginCapability::UseConnection],
+            connections: vec![scarab_plugin::ConnectionSlot {
+                name: "argocd".into(),
+                auth_schemes: vec!["bearer".into()],
+                read_rules: vec![scarab_plugin::RequestRule {
+                    method: "GET".into(),
+                    path: "/api/version".into(),
+                    query: vec![],
+                }],
+            }],
+            config_keys: vec![],
+        },
+        manifest_sha256: "0".repeat(64),
+        config: Default::default(),
+        state: scarab_plugin::InstallationState::Enabled,
+        runtime_status: scarab_plugin::RuntimeStatus::Pending,
+        runtime_message: String::new(),
+        probe_passed_at: None,
+        approved_by: "amy".into(),
+        approved_at: 0,
+        killed_by: None,
+        killed_at: None,
+        storage: None,
+    }
+}
+
+/// Adding storage to an installation that has none, and removing it, need
+/// no step-up; moving it to another claim or mount path does (window), and
+/// the human confirms the move. A refused move stores nothing.
+#[tokio::test]
+async fn moving_plugin_storage_needs_a_step_up_and_adding_or_removing_does_not() {
+    let Some(tdb) = fresh_db().await else { return };
+    let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
+    pg.migrate().await.unwrap();
+    use scarab_plugin::PluginStore;
+    pg.install(&plugin_installation()).await.unwrap();
+    let plugins = pg.clone();
+    let h = harness_with(move |st| {
+        st.with_plugins(
+            plugins,
+            scarab_server::plugins::PluginPolicy {
+                enabled: true,
+                namespace: "scarab-plugins".into(),
+                argocd_repo: "ghcr.io/acme/argocd".into(),
+                dev_allow_tag: false,
+            },
+        )
+    });
+    let (s, mut soft) = signed_in_admin(&h).await;
+    let uri = "/v1/orgs/acme/plugins/argocd/storage";
+    let stored = || async {
+        pg.installation("acme", "argocd")
+            .await
+            .unwrap()
+            .unwrap()
+            .storage
+            .map(|s| (s.claim, s.mount_path))
+    };
+    let claim = |c: &str| (c.to_string(), "/data".to_string());
+
+    // Added: 200, and the same body again is unchanged: 200.
+    for _ in 0..2 {
+        let (st, b) = h
+            .cookie("PUT", uri, Some(json!({ "claim": "state-a" })), &s)
+            .await;
+        assert_ok(st, &b);
+    }
+    assert_eq!(stored().await, Some(claim("state-a")));
+
+    // Moved to another claim, or another path: 403.
+    let (st, b) = h
+        .cookie("PUT", uri, Some(json!({ "claim": "state-b" })), &s)
+        .await;
+    assert_refused_for(
+        st,
+        &b,
+        "plugin.storage.put",
+        "storage moves from claim `state-a` at `/data` to claim `state-b` at `/data`",
+    );
+    let (st, b) = h
+        .cookie(
+            "PUT",
+            uri,
+            Some(json!({ "claim": "state-a", "mount_path": "/srv" })),
+            &s,
+        )
+        .await;
+    assert_refused_for(st, &b, "plugin.storage.put", "to claim `state-a` at `/srv`");
+    assert_eq!(stored().await, Some(claim("state-a")));
+
+    // Removed: 200 (exempt), and re-adding is exempt again.
+    let (st, b) = h.cookie("DELETE", uri, None, &s).await;
+    assert_ok(st, &b);
+    assert_eq!(stored().await, None);
+    let (st, b) = h
+        .cookie("PUT", uri, Some(json!({ "claim": "state-b" })), &s)
+        .await;
+    assert_ok(st, &b);
+
+    // With a window open, the move goes through.
+    h.open_window(&s, &mut soft).await;
+    let (st, b) = h
+        .cookie("PUT", uri, Some(json!({ "claim": "state-a" })), &s)
+        .await;
+    assert_ok(st, &b);
+    assert_eq!(stored().await, Some(claim("state-a")));
+    tdb.cleanup().await;
+}

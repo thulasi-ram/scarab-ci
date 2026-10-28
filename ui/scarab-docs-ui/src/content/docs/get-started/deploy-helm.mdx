@@ -104,7 +104,43 @@ CredentialBroker and the RBAC they need. No built plugin capability acts on Scar
 so you don't need it to run pipelines or deploys; leave it off unless you are working on a plugin.
 A plugin that needs storage brings its own: you create a PersistentVolumeClaim in the plugin
 namespace and the plugin runtime mounts it. Scarab doesn't provision, back up or read that
-volume.
+volume, and its data is outside what Scarab keeps.
+
+#### Plugin storage
+
+Create the claim in the plugin namespace (`plugins.namespace`, default `scarab-plugins`) and
+annotate it with the installation it is for, as `<org>/<installation name>`:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: argocd-state
+  namespace: scarab-plugins
+  annotations:
+    scarab.io/plugin-installation: acme/argocd-prod
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+```
+
+Then name it on the installation, under Settings › Plugins › storage, or with
+`PUT /v1/orgs/{org}/plugins/{name}/storage` and a body of
+`{"claim": "argocd-state", "mount_path": "/data"}`. `mount_path` defaults to `/data`; it
+can't be `/`, and it can't overlap `/tmp`, `/var/run/secrets` or the other paths the runtime
+or the kubelet mounts.
+
+The plugin namespace is shared by every org, so the runtime mounts a claim only when its
+annotation names that installation. Until it does, or while the claim is missing, the plugin is
+held at zero replicas and its status names the claim. A claim that hasn't bound yet shows as
+waiting. The plugin runs as uid and gid 65532 with `fsGroup: 65532`; a volume type that ignores
+`fsGroup` (hostPath, some local provisioners) needs to be writable by that uid.
+
+Adding storage to an installation that has none, or removing it, needs no step-up. Moving it
+to another claim or mount path asks for a passkey step-up. Removing it leaves the claim and its
+data in place.
 
 ## A minimal `values.yaml`
 

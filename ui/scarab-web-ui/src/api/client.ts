@@ -801,6 +801,36 @@ export async function uninstallPlugin(org: string, name: string): Promise<Uninst
   return data;
 }
 
+/** Mount an operator-made PersistentVolumeClaim into the installation's Pod
+ *  (`PUT …/plugins/{name}/storage`, ADR-0074 §7). Moving existing storage to
+ *  another claim or path asks for a step-up. */
+export async function putPluginStorage(
+  org: string,
+  name: string,
+  body: components["schemas"]["PluginStorageRequest"],
+): Promise<PluginInstallation> {
+  const { data, error, response } = await api.PUT("/v1/orgs/{org}/plugins/{name}/storage", {
+    params: { path: { org, name } },
+    body,
+  });
+  if (error || !data) {
+    throw new Error(errorText(error) || `could not set ${name}'s storage (${response.status})`);
+  }
+  return data;
+}
+
+/** Stop mounting the installation's claim (`DELETE …/plugins/{name}/storage`).
+ *  The claim and its data stay in the cluster. */
+export async function deletePluginStorage(org: string, name: string): Promise<PluginInstallation> {
+  const { data, error, response } = await api.DELETE("/v1/orgs/{org}/plugins/{name}/storage", {
+    params: { path: { org, name } },
+  });
+  if (error || !data) {
+    throw new Error(errorText(error) || `could not remove ${name}'s storage (${response.status})`);
+  }
+  return data;
+}
+
 /** One connection slot of an installation and what is bound to it — never
  *  the credential (ADR-0072 §5). */
 export type PluginConnection = components["schemas"]["PluginConnectionDto"];

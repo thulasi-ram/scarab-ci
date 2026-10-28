@@ -27,6 +27,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 mod connection;
+mod storage;
 mod store;
 
 pub use connection::{
@@ -34,6 +35,12 @@ pub use connection::{
     PluginConnectionAuthScheme, ReadRequestMatch, ReadRequestRefusal, BROKER_JOURNAL_RETENTION_MS,
     MAX_CONNECTION_BASE_URL_CHARS, MAX_CONNECTION_CA_PEM_BYTES, MAX_CONNECTION_CREDENTIAL_BYTES,
     MAX_PROXY_PATH_CHARS, MAX_PROXY_PATH_SEGMENTS, MAX_PROXY_QUERY_CHARS, MAX_PROXY_QUERY_PARAMS,
+};
+
+pub use storage::{
+    storage_owner, validate_storage_claim, validate_storage_mount_path, PluginStorage,
+    DEFAULT_PLUGIN_STORAGE_MOUNT_PATH, MAX_STORAGE_CLAIM_CHARS, MAX_STORAGE_MOUNT_PATH_CHARS,
+    PLUGIN_STORAGE_OWNER_ANNOTATION, RESERVED_PLUGIN_MOUNT_PATHS,
 };
 
 pub use store::{
@@ -532,6 +539,9 @@ pub struct PluginInstallation {
     pub approved_at: i64,
     pub killed_by: Option<String>,
     pub killed_at: Option<i64>,
+    /// The operator-made PersistentVolumeClaim its Pod mounts (ADR-0074 §7);
+    /// `None` = no storage beyond the scratch `/tmp`.
+    pub storage: Option<PluginStorage>,
 }
 
 impl PluginInstallation {
@@ -558,7 +568,17 @@ impl PluginInstallation {
                 self.plugin, self.manifest.plugin
             )));
         }
-        self.manifest.validate_config(&self.config)
+        self.manifest.validate_config(&self.config)?;
+        if let Some(storage) = &self.storage {
+            storage.validate()?;
+        }
+        Ok(())
+    }
+
+    /// What [`PLUGIN_STORAGE_OWNER_ANNOTATION`] must say on its storage
+    /// claim: `<org>/<name>`.
+    pub fn storage_owner(&self) -> String {
+        storage_owner(&self.org, &self.name)
     }
 }
 

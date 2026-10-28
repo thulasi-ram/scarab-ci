@@ -1,6 +1,7 @@
 //! [`PluginStore`] on Postgres (ADR-0072, migrations 0055 and 0056): the
 //! PluginInstallation registry with its kill switch, its PluginConnections
-//! and the broker journal.
+//! and the broker journal. Migration 0068 adds an installation's storage
+//! claim (ADR-0074 §7).
 //!
 //! **PluginConnections** (ADR-0072 §5, migration 0056): a bind takes the
 //! installation row `FOR UPDATE` before the connection row, and uninstall
@@ -16,8 +17,8 @@ use sqlx::Row;
 
 use scarab_plugin::{
     BrokerJournalEntry, BrokerJournalPhase, InstallationState, PluginConnection,
-    PluginConnectionAuthScheme, PluginInstallation, PluginManifest, PluginStore, PluginStoreError,
-    PluginUninstall, RuntimeStatus, PAGE_DEFAULT_LIMIT, PAGE_MAX_LIMIT,
+    PluginConnectionAuthScheme, PluginInstallation, PluginManifest, PluginStorage, PluginStore,
+    PluginStoreError, PluginUninstall, RuntimeStatus, PAGE_DEFAULT_LIMIT, PAGE_MAX_LIMIT,
 };
 
 use crate::PostgresDb;
@@ -58,7 +59,7 @@ fn saturating_i64(n: u64) -> i64 {
 
 const INSTALLATION_COLUMNS: &str = "id, org, name, plugin, image, manifest, manifest_sha256, \
      config, state, runtime_status, runtime_message, probe_passed_at, approved_by, approved_at, \
-     killed_by, killed_at";
+     killed_by, killed_at, storage_claim, storage_mount_path";
 
 /// One `plugin_installations` row back into the domain. A row whose manifest,
 /// config or state this binary cannot read is reported, never defaulted: a
@@ -80,6 +81,25 @@ fn installation_from_row(
     let runtime_status: String = r.get("runtime_status");
     let runtime_status = RuntimeStatus::parse(&runtime_status)
         .ok_or_else(|| unreadable("runtime status", format!("{runtime_status:?}")))?;
+    let storage = match (
+        r.get::<Option<String>, _>("storage_claim"),
+        r.get::<Option<String>, _>("storage_mount_path"),
+    ) {
+        (Some(claim), Some(mount_path)) => {
+            let storage = PluginStorage { claim, mount_path };
+            storage
+                .validate()
+                .map_err(|e| unreadable("storage", e.to_string()))?;
+            Some(storage)
+        }
+        (None, None) => None,
+        (claim, path) => {
+            return Err(unreadable(
+                "storage",
+                format!("claim {claim:?} without mount path {path:?} or the reverse"),
+            ))
+        }
+    };
     Ok(PluginInstallation {
         org: r.get("org"),
         name: r.get("name"),
@@ -96,6 +116,7 @@ fn installation_from_row(
         approved_at: r.get("approved_at"),
         killed_by: r.get("killed_by"),
         killed_at: r.get("killed_at"),
+        storage,
         id,
     })
 }
@@ -175,8 +196,9 @@ impl PluginStore for PostgresDb {
             "INSERT INTO plugin_installations
                  (org, name, id, plugin, image, manifest, manifest_sha256, config, state,
                   runtime_status, runtime_message, probe_passed_at, approved_by, approved_at,
-                  killed_by, killed_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
+                  killed_by, killed_at, storage_claim, storage_mount_path)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+                     $17, $18)",
         )
         .bind(&installation.org)
         .bind(&installation.name)
@@ -194,6 +216,8 @@ impl PluginStore for PostgresDb {
         .bind(installation.approved_at)
         .bind(&installation.killed_by)
         .bind(installation.killed_at)
+        .bind(installation.storage.as_ref().map(|s| s.claim.as_str()))
+        .bind(installation.storage.as_ref().map(|s| s.mount_path.as_str()))
         .execute(&mut *tx)
         .await
         .map_err(plugin_store_err)?;
@@ -258,6 +282,58 @@ impl PluginStore for PostgresDb {
             .iter()
             .map(installation_from_row)
             .collect()
+    }
+
+    async fn set_installation_storage(
+        &self,
+        org: &str,
+        name: &str,
+        storage: Option<&PluginStorage>,
+        expected: Option<&PluginStorage>,
+    ) -> Result<Option<PluginInstallation>, PluginStoreError> {
+        if let Some(storage) = storage {
+            storage
+                .validate()
+                .map_err(|e| PluginStoreError::Invalid(e.to_string()))?;
+        }
+        let claim = |s: Option<&PluginStorage>| s.map(|s| s.claim.clone());
+        let path = |s: Option<&PluginStorage>| s.map(|s| s.mount_path.clone());
+        // Conditional on the storage the caller judged the change against:
+        // whether it needed a step-up was decided from that (ADR-0073 §3).
+        let sql = format!(
+            "UPDATE plugin_installations
+                SET storage_claim = $3, storage_mount_path = $4
+              WHERE org = $1 AND name = $2
+                AND storage_claim IS NOT DISTINCT FROM $5
+                AND storage_mount_path IS NOT DISTINCT FROM $6
+             RETURNING {INSTALLATION_COLUMNS}"
+        );
+        let mut tx = self.pool().begin().await.map_err(plugin_store_err)?;
+        let updated = sqlx::query(&sql)
+            .bind(org)
+            .bind(name)
+            .bind(claim(storage))
+            .bind(path(storage))
+            .bind(claim(expected))
+            .bind(path(expected))
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(plugin_store_err)?;
+        if let Some(row) = updated {
+            tx.commit().await.map_err(plugin_store_err)?;
+            return installation_from_row(&row).map(Some);
+        }
+        let exists: Option<String> =
+            sqlx::query_scalar("SELECT id FROM plugin_installations WHERE org = $1 AND name = $2")
+                .bind(org)
+                .bind(name)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(plugin_store_err)?;
+        match exists {
+            Some(_) => Err(PluginStoreError::Changed(name.to_string())),
+            None => Ok(None),
+        }
     }
 
     async fn set_runtime_status(

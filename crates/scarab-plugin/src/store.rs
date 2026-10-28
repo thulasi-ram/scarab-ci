@@ -4,7 +4,8 @@
 use async_trait::async_trait;
 
 use crate::{
-    BrokerJournalEntry, InstallationState, PluginConnection, PluginInstallation, RuntimeStatus,
+    BrokerJournalEntry, InstallationState, PluginConnection, PluginInstallation, PluginStorage,
+    RuntimeStatus,
 };
 
 /// A list read's page size when none is asked for, and the most one page
@@ -47,6 +48,10 @@ pub enum PluginStoreError {
     /// The installation is killed; nothing it sends is accepted.
     #[error("plugin installation is killed")]
     Killed,
+    /// The row changed between the caller's read and its conditional write
+    /// (another admin's edit landed first). Nothing was written.
+    #[error("plugin installation `{0}` changed meanwhile; reload it and try again")]
+    Changed(String),
     /// The store is saturated: no connection was free in time, or a lock
     /// wait passed its timeout. Nothing was recorded; retry later.
     #[error("plugin store busy: {0}")]
@@ -101,6 +106,19 @@ pub trait PluginStore: Send + Sync {
         state: InstallationState,
         by: &str,
         at: i64,
+    ) -> Result<Option<PluginInstallation>, PluginStoreError>;
+
+    /// Set (`Some`) or clear (`None`) the installation's storage claim
+    /// (ADR-0074 §7) — **only if its storage is still `expected`**, what the
+    /// caller read and judged the change against
+    /// ([`PluginStoreError::Changed`] otherwise). `None` if there is no such
+    /// installation.
+    async fn set_installation_storage(
+        &self,
+        org: &str,
+        name: &str,
+        storage: Option<&PluginStorage>,
+        expected: Option<&PluginStorage>,
     ) -> Result<Option<PluginInstallation>, PluginStoreError>;
 
     /// Record what the plugin runtime observed of installation `id`'s
