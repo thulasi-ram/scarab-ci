@@ -5,13 +5,15 @@
 //! each `--param k=v` as a raw string and lets the server's
 //! `resolve_params`/`coerce` do the typing, so there is no second, client-side
 //! validator to drift. `lint` and `validate` are offline compile/semantic
-//! checks over a pipeline file; `logs` replays + tails a run's logs over SSE;
+//! checks over a pipeline file; `validate --server` also dry-runs the
+//! `run.create` Policies through the policy test API (ADR-0075 §2); `logs` replays + tails a run's logs over SSE;
 //! `rerun` reruns a step and its dependents — all wired, not stubs.
 //! `security setup|status` enroll and inspect passkeys (ADR-0073 §10); `api`
 //! calls any endpoint. Every command reports a `403 step_up_required` as the
 //! one-time browser link its human confirms the operation at.
 
 mod security;
+mod validate;
 
 use clap::{Args, Parser, Subcommand};
 
@@ -28,8 +30,10 @@ enum Command {
     Run(RunArgs),
     /// Lint a pipeline file (compile-time lints, e.g. missing-clone).
     Lint(FileArgs),
-    /// Validate a pipeline file offline (compile + semantic checks).
-    Validate(FileArgs),
+    /// Validate a pipeline file: compile + semantic checks offline, with the
+    /// libraries it invokes read from the repository. With `--server`, also
+    /// dry-run the `run.create` Policies for a trigger (ADR-0075 §2).
+    Validate(validate::ValidateArgs),
     /// Stream a run's logs (replay + live tail via SSE).
     Logs(LogsArgs),
     /// Rerun a step (and its dependents) of a run.
@@ -187,7 +191,7 @@ async fn main() {
     let code = match cli.command {
         Command::Run(args) => run(args).await,
         Command::Lint(args) => lint(&args),
-        Command::Validate(args) => validate(&args),
+        Command::Validate(args) => validate::run(args).await,
         Command::Logs(args) => logs(args).await,
         Command::Rerun(args) => rerun(args).await,
         Command::Security(cmd) => security::run(cmd).await,
@@ -197,40 +201,11 @@ async fn main() {
 }
 
 /// Compile a pipeline file offline (the same compiler the server runs —
-/// invariant #5, one validator). Errors print one diagnostic per line.
+/// invariant #5, one validator), with the libraries it invokes read from
+/// the repository. Errors print one diagnostic per line.
 fn compile_file(path: &str) -> Result<scarab_pipeline::PipelineIr, i32> {
-    let yaml = match std::fs::read_to_string(path) {
-        Ok(y) => y,
-        Err(e) => {
-            eprintln!("error: cannot read {path}: {e}");
-            return Err(2);
-        }
-    };
-    match scarab_pipeline::compile_yaml(&yaml) {
-        Ok(ir) => Ok(ir),
-        Err(scarab_pipeline::PipelineError::Validation(diags)) => {
-            for d in diags {
-                eprintln!("error: {d}");
-            }
-            Err(1)
-        }
-        Err(e) => {
-            eprintln!("error: {e}");
-            Err(1)
-        }
-    }
-}
-
-/// `scarab validate <file>`: compile + semantic checks, offline. Non-zero on
-/// any failure.
-fn validate(args: &FileArgs) -> i32 {
-    match compile_file(&args.file) {
-        Ok(ir) => {
-            println!("ok: {} step(s), ir v{}", ir.steps.len(), ir.ir_version);
-            0
-        }
-        Err(code) => code,
-    }
+    let sources = validate::read_sources(path)?;
+    validate::compile(&sources).map_err(|()| 1)
 }
 
 /// `scarab lint <file>`: the compile-time lints (e.g. a push/PR pipeline with

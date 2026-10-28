@@ -2703,6 +2703,7 @@ dependencies = [
  "scarab-forge",
  "scarab-identity",
  "scarab-pipeline",
+ "scarab-policy",
  "scarab-secrets-postgres",
  "scarab-server",
  "scarab-testkit",
