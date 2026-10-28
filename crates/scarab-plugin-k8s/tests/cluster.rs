@@ -417,6 +417,7 @@ fn installation(image: &str) -> PluginInstallation {
             capabilities: vec![PluginCapability::ReportDeployments],
             connections: vec![],
             config_keys: vec![],
+            actions: vec![],
         },
         manifest_sha256: "f".repeat(64),
         config: BTreeMap::new(),

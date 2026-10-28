@@ -33,8 +33,14 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 mod connection;
+mod invocation;
 mod report;
 mod store;
+
+pub use invocation::{
+    AnswerResponse, InvocationAnswer, InvocationFence, InvocationsPage, OfferedInvocation,
+    MAX_INVOCATIONS_PER_POLL, MAX_POLL_WAIT_SECS,
+};
 
 pub use connection::{
     match_read_request, rule_label, BrokerJournalEntry, BrokerJournalPhase, PluginConnection,
@@ -151,12 +157,45 @@ impl fmt::Display for PluginCapability {
 }
 
 /// The capabilities this release can run (ADR-0072, MMP horizon): reporting,
-/// and connections with **read** rules only. Everything else is refused at
+/// connections with **read** rules only, and polling PluginActions that a
+/// `plugin_action` Step invokes (ADR-0074 §5). Everything else is refused at
 /// install, by name, rather than accepted and ignored.
-pub const MMP_ADMITTED_CAPABILITIES: [PluginCapability; 2] = [
+pub const MMP_ADMITTED_CAPABILITIES: [PluginCapability; 3] = [
     PluginCapability::ReportDeployments,
     PluginCapability::UseConnection,
+    PluginCapability::OfferActions,
 ];
+
+/// The most actions a manifest may declare.
+pub const MAX_ACTIONS: usize = 32;
+/// The poll interval of an action that declares none, and the bounds on a
+/// declared one, in seconds (ADR-0074 §5).
+pub const DEFAULT_ACTION_POLL_INTERVAL_SECS: u32 = 10;
+pub const MIN_ACTION_POLL_INTERVAL_SECS: u32 = 1;
+pub const MAX_ACTION_POLL_INTERVAL_SECS: u32 = 3600;
+
+/// A PluginAction the Plugin offers (ADR-0072 §4) under `offer_actions`:
+/// a `plugin_action` Step names it, and core offers the Step's invocation
+/// to the Plugin again `poll_interval_secs` after each `pending` answer
+/// (ADR-0074 §5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActionDecl {
+    /// A DNS-1123 label, unique in the manifest (`wait-live`).
+    pub name: String,
+    /// Seconds between offers while the action answers `pending`; absent =
+    /// [`DEFAULT_ACTION_POLL_INTERVAL_SECS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_interval_secs: Option<u32>,
+}
+
+impl ActionDecl {
+    /// The declared poll interval, or the default.
+    pub fn poll_interval_secs(&self) -> u32 {
+        self.poll_interval_secs
+            .unwrap_or(DEFAULT_ACTION_POLL_INTERVAL_SECS)
+    }
+}
 
 /// An allowed request shape on a PluginConnection (ADR-0072 §5): a method,
 /// a path pattern (`*` matching exactly one segment) and the query keys the
@@ -208,12 +247,26 @@ pub struct PluginManifest {
     /// PluginConnections). Environment-variable shaped.
     #[serde(default)]
     pub config_keys: Vec<String>,
+    /// The PluginActions it offers (ADR-0072 §4), declared exactly when it
+    /// asks for `offer_actions`. Omitted from the serialized manifest when
+    /// empty, so a manifest without actions hashes as it did before they
+    /// existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<ActionDecl>,
 }
 
 impl PluginManifest {
     /// Does it ask for `capability`?
     pub fn has(&self, capability: PluginCapability) -> bool {
         self.capabilities.contains(&capability)
+    }
+
+    /// The action named `name`, when the manifest offers it.
+    pub fn action(&self, name: &str) -> Option<&ActionDecl> {
+        if !self.has(PluginCapability::OfferActions) {
+            return None;
+        }
+        self.actions.iter().find(|a| a.name == name)
     }
 
     /// Check every rule the types do not already guarantee: names, no
@@ -269,6 +322,40 @@ impl PluginManifest {
                 "at most {MAX_CONFIG_KEYS} config keys, got {}",
                 self.config_keys.len()
             ));
+        }
+        // Like connections: an action needs the capability that offers it,
+        // and the capability needs an action to offer.
+        match (
+            self.has(PluginCapability::OfferActions),
+            self.actions.is_empty(),
+        ) {
+            (true, true) => return invalid("`offer_actions` needs at least one action".into()),
+            (false, false) => return invalid("actions need the `offer_actions` capability".into()),
+            _ => {}
+        }
+        if self.actions.len() > MAX_ACTIONS {
+            return invalid(format!(
+                "at most {MAX_ACTIONS} actions, got {}",
+                self.actions.len()
+            ));
+        }
+        let mut names = std::collections::BTreeSet::new();
+        for action in &self.actions {
+            if !is_dns1123_label(&action.name) {
+                return invalid(format!("action `{}` must be a DNS-1123 label", action.name));
+            }
+            if !names.insert(action.name.as_str()) {
+                return invalid(format!("action `{}` is listed twice", action.name));
+            }
+            let interval = action.poll_interval_secs();
+            if !(MIN_ACTION_POLL_INTERVAL_SECS..=MAX_ACTION_POLL_INTERVAL_SECS).contains(&interval)
+            {
+                return invalid(format!(
+                    "action `{}`: `poll_interval_secs` must be between \
+                     {MIN_ACTION_POLL_INTERVAL_SECS} and {MAX_ACTION_POLL_INTERVAL_SECS}",
+                    action.name
+                ));
+            }
         }
         let mut keys = std::collections::BTreeSet::new();
         for key in &self.config_keys {
@@ -699,8 +786,8 @@ pub enum PluginError {
     /// The manifest asks for a capability this release cannot run (ADR-0072
     /// implementation horizon). Lists them, comma-separated.
     #[error(
-        "this Scarab release cannot run plugins that ask for: {0} (only report_deployments \
-         and read-only use_connection are available, ADR-0072)"
+        "this Scarab release cannot run plugins that ask for: {0} (only report_deployments, \
+         read-only use_connection and offer_actions are available, ADR-0072)"
     )]
     CapabilityNotAdmitted(String),
 }
@@ -733,6 +820,7 @@ mod tests {
                 ],
             }],
             config_keys: vec!["ARGOCD_UI_URL".into()],
+            actions: vec![],
         }
     }
 
@@ -759,7 +847,6 @@ mod tests {
     fn admission_refuses_every_capability_beyond_the_mmp_by_name() {
         for capability in [
             PluginCapability::SubscribeEvents,
-            PluginCapability::OfferActions,
             PluginCapability::ContributeUi,
             PluginCapability::ApproveGates,
         ] {
@@ -779,8 +866,46 @@ mod tests {
             capabilities: vec![PluginCapability::ReportDeployments],
             connections: vec![],
             config_keys: vec![],
+            actions: vec![],
         };
         assert_eq!(admit_for_mmp(&report_only), Ok(()));
+    }
+
+    #[test]
+    fn actions_are_declared_exactly_under_offer_actions() {
+        let action = |name: &str, poll: Option<u32>| ActionDecl {
+            name: name.into(),
+            poll_interval_secs: poll,
+        };
+        let mut m = argo_like();
+        m.capabilities.push(PluginCapability::OfferActions);
+        assert!(m.validate().is_err(), "the capability with no action");
+        m.actions = vec![action("wait-live", Some(15))];
+        assert_eq!(admit_for_mmp(&m), Ok(()));
+        assert_eq!(m.action("wait-live").unwrap().poll_interval_secs(), 15);
+        assert!(m.action("promote").is_none());
+
+        for bad in [
+            vec![action("Wait", None)],
+            vec![action("wait-live", None), action("wait-live", None)],
+            vec![action("wait-live", Some(0))],
+            vec![action("wait-live", Some(MAX_ACTION_POLL_INTERVAL_SECS + 1))],
+        ] {
+            let mut m = m.clone();
+            m.actions = bad;
+            assert!(m.validate().is_err(), "{:?}", m.actions);
+        }
+
+        let mut no_capability = argo_like();
+        no_capability.actions = vec![action("wait-live", None)];
+        assert!(no_capability.validate().is_err());
+        assert!(no_capability.action("wait-live").is_none());
+    }
+
+    #[test]
+    fn a_manifest_without_actions_serializes_as_before() {
+        let json = serde_json::to_value(argo_like()).unwrap();
+        assert!(json.get("actions").is_none());
     }
 
     #[test]

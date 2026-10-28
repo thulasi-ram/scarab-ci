@@ -495,6 +495,7 @@ mod tests {
                 capabilities: vec![PluginCapability::ReportDeployments],
                 connections: vec![],
                 config_keys: vec!["ARGOCD_UI_URL".into()],
+                actions: vec![],
             },
             manifest_sha256: "f".repeat(64),
             config: BTreeMap::from([(
