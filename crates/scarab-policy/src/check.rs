@@ -19,9 +19,12 @@
 //! `cap × (predicate + 1)`, where `cap` is the list's declared size cap (a
 //! literal list's length); `x in list` adds the list's cap. Nested macros
 //! multiply. The bound is the worst case: every macro iterating every element,
-//! short-circuits ignored. String functions cost 1 regardless of string length;
-//! that is sound only while checkpoint inputs bound their strings, which this
-//! spike does not enforce.
+//! short-circuits ignored. Costs saturate at `u64::MAX` rather than wrap. String
+//! functions cost 1 regardless of string length; that is sound only while
+//! checkpoint inputs bound their strings, which this spike does not enforce.
+//! `matches()` costs 2 because its pattern is compiled once per evaluation,
+//! not once per call (`eval::evaluate_when`); `cel`'s own `matches` compiles
+//! on every call and is never the one evaluated.
 //!
 //! **Stack.** Parsing, checking and evaluating run on a thread with a large
 //! stack ([`on_cel_stack`]), after a length and bracket-depth pre-check: a
@@ -252,6 +255,18 @@ pub(crate) fn parse(source: &str) -> Result<cel::Program, Vec<Diagnostic>> {
     }
 }
 
+/// The most memory a `matches()` pattern may compile to.
+pub const MAX_PATTERN_BYTES: usize = 1 << 20;
+
+/// Compiles a `matches()` pattern, under [`MAX_PATTERN_BYTES`]: at check
+/// time to validate it, and at evaluation once per pattern
+/// (`eval::evaluate_when`).
+pub(crate) fn pattern(p: &str) -> Result<regex::Regex, regex::Error> {
+    regex::RegexBuilder::new(p)
+        .size_limit(MAX_PATTERN_BYTES)
+        .build()
+}
+
 /// Which standard macro a comprehension was expanded from.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum MacroKind {
@@ -355,13 +370,13 @@ impl Checker<'_> {
                     return Err(self.unsupported(e, "an optional list element"));
                 }
                 let mut elem = Type::Dyn;
-                let mut cost = 1;
+                let mut cost: u64 = 1;
                 for item in &list.elements {
                     let (t, c) = self.expr(item)?;
                     elem = unify(&elem, &t).ok_or_else(|| {
                         self.unsupported(item, &format!("a list mixing {elem} and {t}"))
                     })?;
-                    cost += c;
+                    cost = cost.saturating_add(c);
                 }
                 let cap = list.elements.len() as u64;
                 Ok((
@@ -395,7 +410,7 @@ impl Checker<'_> {
                             &format!("a map mixing {value} and {v} values"),
                         )
                     })?;
-                    cost += kc + vc;
+                    cost = add(&[cost, kc, vc]);
                 }
                 let cap = map.entries.len() as u64;
                 Ok((
@@ -509,10 +524,10 @@ impl Checker<'_> {
                         self.warnings.push(w);
                     }
                 }
-                Ok((field.ty, cost + 1))
+                Ok((field.ty, add(&[cost, 1])))
             }
             Type::Map { key, value, .. } if matches!(**key, Type::String | Type::Dyn) => {
-                Ok(((**value).clone(), cost + 1))
+                Ok(((**value).clone(), add(&[cost, 1])))
             }
             other => Err(self.diag(e, format!("cannot select a field from {other}"))),
         }
@@ -536,10 +551,10 @@ impl Checker<'_> {
                         ),
                     ));
                 }
-                Ok((Type::Bool, cost + 1))
+                Ok((Type::Bool, add(&[cost, 1])))
             }
             Type::Map { key, .. } if matches!(**key, Type::String | Type::Dyn) => {
-                Ok((Type::Bool, cost + 1))
+                Ok((Type::Bool, add(&[cost, 1])))
             }
             other => Err(self.diag(e, format!("has() needs a struct or map field, not {other}"))),
         }
@@ -583,12 +598,12 @@ impl Checker<'_> {
                 };
                 let (tb, cb) = self.with_guards(facts, b)?;
                 self.expect(b, &tb, &Type::Bool)?;
-                Ok((Type::Bool, ca + cb + 1))
+                Ok((Type::Bool, add(&[ca, cb, 1])))
             }
             (operators::LOGICAL_NOT, None, [a]) => {
                 let (t, c) = self.expr(a)?;
                 self.expect(a, &t, &Type::Bool)?;
-                Ok((Type::Bool, c + 1))
+                Ok((Type::Bool, add(&[c, 1])))
             }
             (operators::CONDITIONAL, None, [cond, then, otherwise]) => {
                 let (tc, cc) = self.expr(cond)?;
@@ -601,13 +616,13 @@ impl Checker<'_> {
                         format!("both branches must have one type: {tt} and {te}"),
                     )
                 })?;
-                Ok((t, cc + ct.max(ce) + 1))
+                Ok((t, add(&[cc, ct.max(ce), 1])))
             }
             (operators::EQUALS, None, [a, b]) | (operators::NOT_EQUALS, None, [a, b]) => {
                 let (ta, ca) = self.equality_side(a)?;
                 let (tb, cb) = self.equality_side(b)?;
                 self.equatable(e, a, &ta, b, &tb)?;
-                Ok((Type::Bool, ca + cb + 1))
+                Ok((Type::Bool, add(&[ca, cb, 1])))
             }
             (
                 operators::LESS
@@ -637,7 +652,7 @@ impl Checker<'_> {
                 if !ordered(&ta) || !ordered(&tb) || !same {
                     return Err(self.diag(e, format!("cannot order {ta} against {tb}")));
                 }
-                Ok((Type::Bool, ca + cb + 1))
+                Ok((Type::Bool, add(&[ca, cb, 1])))
             }
             (operators::IN, None, [needle, haystack]) => {
                 let (tn, cn) = self.expr(needle)?;
@@ -659,7 +674,7 @@ impl Checker<'_> {
                         self.enum_literal(item, name)?;
                     }
                 }
-                Ok((Type::Bool, cn + ch + cap + 1))
+                Ok((Type::Bool, add(&[cn, ch, cap, 1])))
             }
             ("size", None, [x]) | ("size", Some(x), []) => {
                 let (t, c) = self.expr(x)?;
@@ -668,7 +683,7 @@ impl Checker<'_> {
                     | Type::Enum(_)
                     | Type::Bytes
                     | Type::List { .. }
-                    | Type::Map { .. } => Ok((Type::Int, c + 1)),
+                    | Type::Map { .. } => Ok((Type::Int, add(&[c, 1]))),
                     other => Err(self.diag(
                         e,
                         format!("size() needs a string, bytes, list or map, not {other}"),
@@ -684,7 +699,7 @@ impl Checker<'_> {
                         format!("{f}() is a string function: called on {tr} with {ta}"),
                     ));
                 }
-                Ok((Type::Bool, cr + ca + 1))
+                Ok((Type::Bool, add(&[cr, ca, 1])))
             }
             ("matches", Some(recv), [pattern]) => {
                 let (tr, cr) = self.expr(recv)?;
@@ -697,11 +712,9 @@ impl Checker<'_> {
                         "matches() takes a string literal pattern in policies".to_string(),
                     ));
                 };
-                regex::RegexBuilder::new(p.inner())
-                    .size_limit(1 << 20)
-                    .build()
+                self::pattern(p.inner())
                     .map_err(|err| self.diag(pattern, format!("invalid pattern: {err}")))?;
-                Ok((Type::Bool, cr + 2))
+                Ok((Type::Bool, add(&[cr, 2])))
             }
             (conv @ ("timestamp" | "duration"), None, [arg]) => {
                 let Expr::Literal(LiteralValue::String(s)) = &arg.expr else {
@@ -770,8 +783,7 @@ impl Checker<'_> {
         self.guards = saved;
         let (tp, cp) = r?;
         self.expect(predicate, &tp, &Type::Bool)?;
-        let cost = rc.saturating_add(cap.saturating_mul(cp.saturating_add(1)));
-        Ok((Type::Bool, cost))
+        Ok((Type::Bool, add(&[rc, cap.saturating_mul(add(&[cp, 1]))])))
     }
 
     fn expect(&self, e: &IdedExpr, actual: &Type, expected: &Type) -> Result<(), Diagnostic> {
@@ -842,6 +854,13 @@ impl Checker<'_> {
         }
         Ok(())
     }
+}
+
+/// The sum of cost parts, saturating at `u64::MAX`: a release build does not
+/// check overflow, and a wrapped sum would let an unbounded rule under
+/// [`MAX_COST`].
+fn add(parts: &[u64]) -> u64 {
+    parts.iter().fold(0, |sum, c| sum.saturating_add(*c))
 }
 
 fn literal_type(lit: &LiteralValue) -> Type {

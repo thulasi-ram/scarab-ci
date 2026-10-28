@@ -221,13 +221,15 @@ fn capped<T, const N: usize>(
     noun: &str,
 ) -> Result<Capped<T, N>, CapExceeded> {
     let len = items.len();
-    Capped::new(items).ok_or_else(|| {
-        CapExceeded(format!(
-            "{} has {len} {noun}, more than the {N} a run.create Policy can check, so the Run \
-             is refused",
-            owner()
-        ))
-    })
+    Capped::new(items).ok_or_else(|| cap_message(owner, len, noun, N))
+}
+
+fn cap_message(owner: &dyn Fn() -> String, len: usize, noun: &str, cap: usize) -> CapExceeded {
+    CapExceeded(format!(
+        "{} has {len} {noun}, more than the {cap} a run.create Policy can check, so the Run \
+         is refused",
+        owner()
+    ))
 }
 
 fn origin_of(
@@ -295,66 +297,110 @@ pub fn input_from_pipeline(
     ir: &scarab_pipeline::PipelineIr,
     facts: RunCreateFacts,
 ) -> Result<RunCreateInput, CapExceeded> {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::HashMap;
 
-    let by_id: BTreeMap<&str, &scarab_pipeline::StepSpec> =
-        ir.steps.iter().map(|s| (s.id.as_str(), s)).collect();
-    // Every Step's transitive upstream, memoised. The DAG is validated, so
-    // the walk terminates; `visiting` guards it all the same.
-    fn upstream<'a>(
-        id: &'a str,
-        by_id: &BTreeMap<&'a str, &'a scarab_pipeline::StepSpec>,
-        memo: &mut BTreeMap<&'a str, BTreeSet<&'a str>>,
-        visiting: &mut BTreeSet<&'a str>,
-    ) -> BTreeSet<&'a str> {
-        if let Some(done) = memo.get(id) {
-            return done.clone();
+    // The Run-level caps first, before any work that grows with the Run: a
+    // Pipeline that compiles to 100,000 Steps is refused here, in time
+    // linear in its size.
+    let run = || "the Run".to_string();
+    let gate_count = ir.steps.iter().filter(|s| s.is_gate()).count();
+    let step_count = ir.steps.len() - gate_count;
+    if step_count > MAX_STEPS {
+        return Err(cap_message(&run, step_count, "Steps", MAX_STEPS));
+    }
+    if gate_count > MAX_GATES {
+        return Err(cap_message(&run, gate_count, "gates", MAX_GATES));
+    }
+
+    // Each Step's transitive upstream gates, as a bit set over the gates
+    // (at most MAX_GATES, so one u64), in O(Steps × needs). Steps are
+    // visited in dependency order (Kahn's algorithm over `needs`); the DAG is
+    // validated, and a Step left on a cycle all the same gets no gates.
+    let index: HashMap<&str, usize> = ir
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.id.as_str(), i))
+        .collect();
+    let gate_bit: HashMap<usize, u64> = ir
+        .steps
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.is_gate())
+        .enumerate()
+        .map(|(bit, (i, _))| (i, 1u64 << bit))
+        .collect();
+    let needs: Vec<Vec<usize>> = ir
+        .steps
+        .iter()
+        .map(|s| {
+            s.needs
+                .0
+                .iter()
+                .filter_map(|n| index.get(n.as_str()).copied())
+                .collect()
+        })
+        .collect();
+    let mut waiting: Vec<usize> = needs.iter().map(Vec::len).collect();
+    let mut needed_by: Vec<Vec<usize>> = vec![Vec::new(); ir.steps.len()];
+    for (i, ns) in needs.iter().enumerate() {
+        for &n in ns {
+            needed_by[n].push(i);
         }
-        let mut out = BTreeSet::new();
-        if visiting.insert(id) {
-            if let Some(step) = by_id.get(id) {
-                for need in &step.needs.0 {
-                    if let Some((key, _)) = by_id.get_key_value(need.as_str()) {
-                        out.insert(*key);
-                        out.extend(upstream(key, by_id, memo, visiting));
-                    }
-                }
+    }
+    let mut upstream_gates_of = vec![0u64; ir.steps.len()];
+    let mut ready: Vec<usize> = (0..ir.steps.len()).filter(|&i| waiting[i] == 0).collect();
+    while let Some(i) = ready.pop() {
+        upstream_gates_of[i] = needs[i].iter().fold(0, |acc, &n| {
+            acc | upstream_gates_of[n] | gate_bit.get(&n).copied().unwrap_or(0)
+        });
+        for &d in &needed_by[i] {
+            waiting[d] -= 1;
+            if waiting[d] == 0 {
+                ready.push(d);
             }
-            visiting.remove(id);
         }
-        memo.insert(id, out.clone());
-        out
     }
-    let mut memo = BTreeMap::new();
-    let mut ups: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-    for s in &ir.steps {
-        let u = upstream(s.id.as_str(), &by_id, &mut memo, &mut BTreeSet::new());
-        ups.insert(s.id.as_str(), u);
+
+    // A gate's dependents, in Pipeline order: every non-gate Step with it
+    // upstream.
+    let mut dependents_of: HashMap<usize, Vec<String>> = HashMap::new();
+    for (i, s) in ir.steps.iter().enumerate() {
+        if s.is_gate() {
+            continue;
+        }
+        for (&g, &bit) in &gate_bit {
+            if upstream_gates_of[i] & bit != 0 {
+                dependents_of.entry(g).or_default().push(s.id.clone());
+            }
+        }
     }
+    // The gates in Pipeline order, for each Step's `upstream_gates`.
+    let mut gate_order: Vec<(usize, u64)> = gate_bit.iter().map(|(&i, &b)| (i, b)).collect();
+    gate_order.sort_unstable();
 
     let mut steps = Vec::new();
     let mut gates = Vec::new();
-    for s in &ir.steps {
+    for (i, s) in ir.steps.iter().enumerate() {
         let what = || format!("Step `{}`", s.id);
         let gate_what = || format!("gate `{}`", s.id);
         if s.is_gate() {
-            let dependents: Vec<String> = ir
-                .steps
-                .iter()
-                .filter(|d| !d.is_gate() && ups[d.id.as_str()].contains(s.id.as_str()))
-                .map(|d| d.id.clone())
-                .collect();
             gates.push(Gate {
                 id: s.id.clone(),
                 kind: gate_kind(s)?,
                 origin: origin_of(&s.origin, &gate_what)?,
-                dependents: capped(dependents, &gate_what, "dependent Steps")?,
+                dependents: capped(
+                    dependents_of.remove(&i).unwrap_or_default(),
+                    &gate_what,
+                    "dependent Steps",
+                )?,
             });
             continue;
         }
         let mut upstream_gates = Vec::new();
-        for g in &ir.steps {
-            if g.is_gate() && ups[s.id.as_str()].contains(g.id.as_str()) {
+        for &(g, bit) in &gate_order {
+            if upstream_gates_of[i] & bit != 0 {
+                let g = &ir.steps[g];
                 upstream_gates.push(UpstreamGate {
                     id: g.id.clone(),
                     kind: gate_kind(g)?,
@@ -405,8 +451,8 @@ pub fn input_from_pipeline(
             environment: facts.environment,
             deploy: ir.deploy,
         },
-        steps: capped(steps, &|| "the Run".to_string(), "Steps")?,
-        gates: capped(gates, &|| "the Run".to_string(), "gates")?,
+        steps: capped(steps, &run, "Steps")?,
+        gates: capped(gates, &run, "gates")?,
         principal: facts.principal,
         time: facts.time,
     })
