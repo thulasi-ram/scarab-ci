@@ -3,7 +3,7 @@
 //! CEL is the single expression language for `when:` guards, `${{ … }}` string
 //! interpolation, and matrix predicates (ADR-0009). It is **total** (always
 //! terminates), typed, and sandboxed — the deliberate antidote to GHA's
-//! `${{ }}` Turing-tarpit. The evaluator (`cel-interpreter`) is pure
+//! `${{ }}` Turing-tarpit. The evaluator (`cel`) is pure
 //! computation — no I/O, no clock, no RNG — so it lives directly in this pure
 //! crate, no port/adapter ceremony (ADR-0031).
 //!
@@ -12,18 +12,19 @@
 //! `matrix`). Bad expressions are caught at **submit time** by [`check`], never
 //! mid-run.
 
-use cel_interpreter::{Context, Program};
+use cel::{Context, Program};
 
 use crate::PipelineError;
 
-/// Compile a CEL expression, containing the panic hazard in the parser.
+/// Compile a CEL expression, containing any panic in the parser.
 ///
-/// `cel-parser` (antlr4rust 0.3.0-rc2) reaches an `unreachable!()` on some
-/// malformed inputs — e.g. a trailing binary operator (`1 +`) — instead of
-/// returning a `ParseError`. A malformed *user* pipeline must be a submit-time
-/// validation error, never a control-plane crash (the durability ethos), so we
-/// catch the unwind and turn it into [`PipelineError::Cel`]. (The parser's own
-/// stderr note on the caught panic is harmless.)
+/// `cel-parser` 0.10 (antlr4rust 0.3.0-rc2) reached an `unreachable!()` on some
+/// malformed inputs, e.g. a trailing binary operator (`1 +`), instead of
+/// returning a `ParseError`. `cel` 0.15 (antlr4rust 0.6) returns an error for
+/// every malformed input we have tried, `1 +` included, but the parser is still
+/// generated code over a third-party runtime. A malformed *user* pipeline must
+/// be a submit-time validation error, never a control-plane crash, and the
+/// guard costs nothing on the success path, so it stays.
 fn compile(expr: &str) -> Result<Program, PipelineError> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Program::compile(expr))) {
         Ok(Ok(program)) => Ok(program),

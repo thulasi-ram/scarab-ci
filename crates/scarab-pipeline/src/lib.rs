@@ -1,6 +1,6 @@
 //! # scarab-pipeline — pipeline authoring & compilation
 //!
-//! Pure domain crate (serde / serde_json / serde_yaml / cel-interpreter /
+//! Pure domain crate (serde / serde_json / serde_yaml / cel /
 //! thiserror only — all pure-computation deps per ADR-0031; no I/O, no clock,
 //! no RNG, no infra). Turns authored YAML
 //! into a validated, versioned [`PipelineIr`] — the *real* DSL (ADR-0009); YAML
