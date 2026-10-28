@@ -246,6 +246,21 @@ A `when:` CEL guard skips a step whose predicate is false; expressions read the 
   when: "event.branch == 'main'"
 ```
 
+### Expression limits
+
+Each CEL expression in a pipeline (a `when:` guard, a matrix `exclude` predicate, an input's
+`validate:` predicate, or the inside of one `${{ … }}`) can be at most **4096 bytes** long, with
+brackets (`(`, `[` and `{` together) nested at most **64** deep. Brackets inside string literals
+and `//` comments don't count. A pipeline over either limit is rejected at submit time, and the
+error names the step, the field and the limit (the expression is cut short here):
+
+```
+step `build`: when cel error: `1+1+1+…`: expression is 5000 bytes; the limit is 4096 bytes
+```
+
+The CEL parser recurses once per nesting level and once per operator in a chain such as
+`a + b + c`, so these limits bound how much stack one expression can use on the server.
+
 ## Reuse: `invoke`
 
 `invoke` inlines a **library** pipeline (under `.scarab/lib/` by convention) into the caller's DAG
