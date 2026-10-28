@@ -19,8 +19,8 @@
   - [0073](0073-step-up-confirmation.md)'s loosening rules for the deleted settings:
     adding a deployment source (E3), and an overlay's longer gate deadline (E1).
 - **Builds on:** [0037](0037-environment-governance.md) (approval is a gate, admission at
-  the point of use, scoped secrets), [0072](0072-plugins-a-governed-extension-point.md)
-  §4 (every PluginAction is a `plugin_action` Step in a Run) and §5 (CredentialBroker)
+  the point of use, scoped secrets), [0008](0008-step-contract.md) (a Step is any OCI
+  image)
 - **Relates:** [0008](0008-step-contract.md) (a Step is any OCI image),
   [0021](0021-double-effect-fencing.md) (fence as idempotency key),
   [0032](0032-slices-3-5-implementation-decisions.md) (concurrency groups),
@@ -178,111 +178,55 @@ holds only the Steps that depend on it, each gate has its own clock, and a verdi
 journaled per Attempt. An external gate can still be released with
 `{"passed": false, "reason": …}`.
 
-### 5. Waiting until the change is live is a PluginAction Step
+### 5. Waiting until the change is live is a blocking Step
 
-The Argo CD plugin offers a PluginAction, `wait-live`. A Run runs it as a
-`plugin_action` Step (ADR-0072 §4) after the Step that makes the change:
+A Step is any OCI image (ADR-0008), so waiting for the CD tool is an ordinary Step that
+blocks until the change is live or has failed. Scarab adds nothing for it. For Argo CD:
 
 ```yaml
-environment: production
+environment: production          # ARGOCD_AUTH_TOKEN is a production-scoped secret
 steps:
   - id: bump
-    # merges the image change into the gitops repository
-    results: [images]
+    deploy: true
+    results: [image]              # the image reference the change merged
+    # ...merges the image change into the gitops repository
   - id: live
     needs: [bump]
-    plugin_action:
-      plugin: argocd
-      action: wait-live
-      with:
-        application: payments/payments-api
-        images: ${{ outputs.bump.images }}
-    timeout: 1800   # seconds
+    image: quay.io/argoproj/argocd:v2.13.0
+    secrets: [ARGOCD_AUTH_TOKEN]
+    env:
+      - [ARGOCD_SERVER, argocd.example.com]
+      - [APP, payments-api]
+      - [IMAGE, "${{ outputs.bump.image }}"]
+    timeout: 1800
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        # 1. Wait until Argo has rendered our change. Right after the merge the app is
+        #    often still Synced and Healthy at the previous commit.
+        until argocd app manifests "$APP" --source git | grep -qF "$IMAGE"; do
+          argocd app get "$APP" --refresh >/dev/null; sleep 10
+        done
+        # 2. Wait for the sync to finish and the app to be healthy at that revision.
+        argocd app wait "$APP" --sync --health --operation --timeout 1700
 ```
 
-**What `wait-live` decides.** It reads the Application on each poll and decides from
-its current state, using the rules `assess.rs` and `version.rs` already implement:
+The Step's exit code is the outcome, its log holds Argo's messages, and its `timeout`
+bounds the wait. The documented recipe (docs site, "Deploying with Argo CD") covers the
+two points this example shows and where plain `argocd app wait` goes wrong: check that
+the target contains your image before trusting Synced and Healthy, because in a shared
+gitops repository Argo can be Synced and Healthy at an earlier commit; and let the wait
+fail when Argo's sync operation fails, rather than waiting out the timeout.
 
-- **Passes** when the images in the Application's target manifests (what Argo rendered
-  from git, `version.rs`) include every image in `images`, the Application is Synced,
-  and it is Healthy. It does not pass on Healthy alone, and not on a sync revision: in a
-  shared gitops repository the revision moves with unrelated commits.
-- **Fails** when the latest sync operation for the current target revision has failed
-  and Argo has stopped retrying, or a sync hook failed. The reason carries Argo's
-  message (for example "hook migrate: secret missing"). A failed operation for an older
-  revision does not fail it (`operation_is_current`, `assess.rs`). Because this test is
-  by revision, a failure that happened between the `bump` merge and the start of the wait
-  Step still fails it, and a Retry of the wait Step fails again while that failure is
-  current.
-- **Times out** otherwise. The reason names the last state the plugin reported.
+`helm upgrade --wait` and `kubectl rollout status` need no separate wait Step: the
+deploy Step itself blocks until the rollout finishes.
 
-It cannot tell, from current state, a newer change that replaced the requested images
-from one that has not been rendered yet. Both look like "the target does not contain
-`images`". That case ends in the timeout, and the reason shows the image set the target
-has.
-
-**Polling actions.** A PluginAction may answer an invocation with `pending` (and a
-label, such as "sync retry 2/5: hook migrate failed"), `succeeded` (with results) or
-`failed` (with a reason). On `pending`, core offers the same invocation again after the
-action's declared poll interval.
-
-- **Invocations come from durable rows.** An invocation is offered while its
-  `plugin_action` Step has a Running Attempt, so a control-plane restart loses none.
-- **Lease.** An invocation a plugin takes is leased for a fixed time. If no answer
-  arrives before the lease ends, core offers it again. Several replicas of one plugin
-  can therefore pull from the same queue.
-- **Fencing.** Every invocation carries its Attempt's fence (ADR-0021). Core drops an
-  answer whose fence is no longer current: after a cancel, a Retry or a superseded Take.
-- **Labels.** The latest label is stored on the Attempt and shown on the Step; it is
-  overwritten, not journaled. State changes (`succeeded`, `failed`) are journaled.
-- **Results.** `succeeded` results obey the size limits of a Step's results and are
-  read by `${{ outputs }}` like any other.
-- **The plugin keeps no state between answers.** It computes each one from the action's
-  inputs and the vendor's current state.
-
-**Delivery.** The plugin pulls invocations from the broker with a long poll, under the
-projected ServiceAccount token it uses for the broker today. Core maps the token to the
-PluginInstallation, so a plugin cannot answer for another installation, and no plugin
-has to be a server. This replaces the report push in ADR-0072 §11. The identity
-mechanism is unchanged.
-
-**Credentials.** The plugin reads Argo through the CredentialBroker under a credential
-issued for that invocation and carrying its fence (ADR-0072 §5 gives write actions such a
-credential; this extends it to reads made for an action). The broker chooses the
-PluginConnection from the invoking Run's Environment, not from a slot the plugin names,
-and applies the action's read rules. The Pipeline never holds the Argo token. This
-needs Environment-scoped PluginConnections, which ADR-0072 placed in its MLP and which
-are not built: today `plugin_connections` has no Environment column
-(`0056_plugin_connections.sql`), and the plugin picks a connection by slot
-(`crates/scarab-server/src/broker_proxy.rs`, `/connections/{slot}/…`). A Run with no
-Environment gets no connection, so a `plugin_action` that reads through the broker
-needs a Run that names an Environment, and the Pipeline check says so.
-
-**Who may read what.** Any Project eligible for the Environment can read any Application
-its Environment's connection can see. The Argo token's own RBAC is the bound; the
-connection for `production` should hold a token scoped to the production Argo project.
-
-**Timeouts and an absent plugin.** A `plugin_action` Step launches no Pod, so kubelet
-does not enforce its `timeout`. Core enforces it, at the deadline, for this Step kind.
-
-- Run creation refuses a `plugin_action` whose plugin is not installed or does not offer
-  the action.
-- When an installation is killed (ADR-0072 §10's kill switch) or uninstalled, its
-  pending invocations fail at once with the failure class `plugin-unavailable`.
-- A plugin that is installed but not answering leaves the Step pending until its
-  timeout. The reason says when the plugin last answered.
-
-**Budget and suspension.** A pending `plugin_action` holds no Pod. For the Run budget and
-the suspend rule it counts like a waiting gate: the wait is not billed, and a Run whose
-only unfinished work is pending actions and waiting gates suspends.
-
-**The verdict.** The plugin decides the Step's outcome, as a container decides its exit
-code. Core does not interpret it. The plugin is a digest the org admin approved at
-install, so the logic is pinned once for the org rather than per Pipeline.
-
-**A plain container Step remains possible.** A Step is any OCI image (ADR-0008), so a
-team can write its own wait Step, or use `helm upgrade --wait` or
-`kubectl rollout status`, where the deploy Step blocks until the rollout finishes.
+The cost of a Step: the Argo token is an Environment secret available to the Steps that
+name it, and the wait holds a Pod for its duration. A plugin-resolved gate, where the
+Argo plugin watches Argo and passes or fails a gate with Argo's reason, removes both and
+is the subject of a later ADR (§7).
 
 ### 6. Concurrency on a deploy is a Run-level concurrency group
 
@@ -312,8 +256,12 @@ group, is later work if a Pipeline needs it.
   there and shows it through `contribute_ui` once that tier is built.
 - `report_deployments` is removed from the PluginCapability vocabulary.
   `subscribe_events` covers Run events only.
-- `offer_actions`, `plugin_action` and Environment-scoped PluginConnections move from
-  ADR-0072's MLP into the next slice, because `wait-live` needs them.
+- **Plugins act as Principals, outside Runs.** The direction for the next ADR: a plugin
+  is a non-human member of the org that uses the public API under its own Principal and
+  RBAC. It reads state, resolves gates it is named on, and keeps its own storage. Core
+  never calls a plugin. Work done inside a Run stays a Step, reused through `invoke`.
+  Until that ADR, no built capability lets a plugin act; the plugin runtime, broker and
+  PluginConnections stay, unused.
 - **Write actions** (sync, promote, abort, rollback) are not offered until a new ADR says
   which Project may act on which vendor object. DeploymentTargetProjectOwnership answered
   that before, and it is deleted here.
@@ -330,16 +278,16 @@ group, is later work if a Pipeline needs it.
   a hotfix applied by hand, or Argo's selfHeal reverting a change. The CD tool's own UI
   and alerts cover those.
 - Without the record, a rollback is a Deploy Run like any other.
-- `wait-live` decides from Argo's state at each poll, not from an ordered log of
-  reports. A state that appears and clears between two polls is not seen, and a newer
-  change that replaces the requested images ends in a timeout rather than a named
-  failure (§5).
-- `plugin_action`, `offer_actions`, Environment-scoped PluginConnections and
-  per-invocation read credentials were on ADR-0072's roadmap. Polling answers are new.
+- Every team writes, or copies, its wait Step. Its correctness is the author's: a wait
+  that trusts Synced and Healthy alone can pass at an earlier commit (§5).
+- The Argo token for a Deploy Run is an Environment secret, and each wait holds a Pod.
+- After this ADR no built plugin capability does anything. The plugin system stays,
+  unused, until the plugin-as-Principal ADR (§7).
 - Two repositories deploying one service no longer serialise (§6).
 - Pipelines on v0.2.x that use `deployment_requests` or `gate: deployment` stop passing
   the Pipeline check, and the migration drops the deployment tables and their history.
-- The first-party Argo plugin changes from a reporter into an action provider.
+- The first-party Argo plugin loses its reporter. Its code for reading Argo and judging
+  an Application's state stays in `scarab-plugin-argocd` for the plugin-resolved gate.
 
 ## Alternatives considered
 
@@ -354,44 +302,40 @@ group, is later work if a Pipeline needs it.
 - **Move the record into the CD plugin.** Rejected: see Context. It needs plugin storage,
   event subscription and a plugin UI tier, and every CD plugin would rebuild the
   invariants.
-- **A first-party container image as the default wait Step.** Rejected as the default. The
-  Argo token would be an Environment secret in the Step's environment, each wait would
-  hold a Pod, and each Pipeline would pin its own image version. It remains possible
-  (§5).
-- **The plugin releases an external gate.** Rejected. It needs `subscribe_events` so the
-  plugin knows a gate is waiting, and it makes a plugin a gate approver outside the
-  two-key rule (ADR-0072 §3). A Step whose outcome the plugin reports fits ADR-0072 §4
-  as written.
+- **A polling `plugin_action` Step** (`wait-live` run by the Argo plugin: core offers the
+  invocation, the plugin answers pending, succeeded or failed, under leases, fences and
+  core-enforced timeouts, with Environment-scoped broker credentials). Rejected on
+  2026-10-28 after it was partly built: it adds dispatch, leasing and timeout machinery
+  to core to avoid one Pod and one secret, which works against the minimal-core goal. The
+  partial build is on branch `impl/adr-0074-plugin-action`, unmerged.
+- **The plugin releases an external gate.** Deferred to the plugin-as-Principal ADR
+  (§7), with the plugin named as the gate's releaser so the two-key rule (ADR-0072 §3)
+  holds.
 - **Core marks the deploy live when the deploy Step succeeds** (the GitLab model: one
   record per Deploy Run, version = commit SHA). Rejected: it keeps a record, and with
   GitOps the Step's success is the merge, not the rollout.
 
 ## Implementation horizon
 
-1. **Polling `plugin_action`:** `offer_actions`, the `plugin_action` Step kind with
-   polling answers, leases and core-enforced timeouts, the broker's invocation long
-   poll, Environment-scoped PluginConnections with per-invocation read credentials, and
-   the Argo plugin's `wait-live` built on `assess.rs` and `version.rs`. Verified live with
-   `just plugin-verify` against the fake Argo it uses today.
-2. **`deploy: true`** on Pipelines and Steps, stored on the Run, and the Runs list's
-   `deploy` and `environment` filters in the API and the Runs tab.
-3. **Delete** what §3 lists, as one change with one full gate run, with the Pipeline
+All in one PR (#41):
+
+1. **`deploy: true`** on Pipelines and Steps, stored on the Run, its exemption from
+   newest-wins cancel, and the Runs list's `deploy` and `environment` filters in the API
+   and the Runs tab.
+2. **Delete** what §3 lists, as one change with one full gate run, with the Pipeline
    check error for `deployment_requests` and `gate: deployment`. Grep found neither in
    `.scarab/dogfood.yaml` or the example Pipelines, so no Pipeline in the repository
    needs switching.
-4. **Plugin storage:** the PersistentVolumeClaim reference on a PluginInstallation and
+3. **Plugin storage:** the PersistentVolumeClaim reference on a PluginInstallation and
    its mount in the plugin runtime (`crates/scarab-plugin-k8s`).
-5. **Docs:** CONTEXT.md §3 (the non-goal), §4.1 and §4.6, and the docs site's
-   `environments.mdx`, `overview.mdx`, `deploy-helm.mdx` and `index.mdx`, which mention
-   the board and DeploymentGates.
+4. **Docs:** CONTEXT.md §3 (the non-goal), §4.1, §4.6 and §4.7; the docs site's
+   `environments.mdx`, `overview.mdx`, `deploy-helm.mdx` and `index.mdx`; and a
+   "Deploying with Argo CD" page with the wait Step from §5.
+
+Next, in its own ADR: plugins as Principals, starting with a gate the Argo plugin
+resolves (§7).
 
 Open:
 
-- Argo's `?refresh=` query asks Argo to refresh the Application before answering. A
-  normal refresh shortens the wait; a hard refresh regenerates manifests. The broker's
-  query allowlist is per key, not per value, so allowing `refresh` would allow both.
-  Decide whether `wait-live` refreshes, and if it does, whether the read rule needs a
-  value allowlist.
-- The default poll interval and lease length.
-- Whether the Pipeline check should warn when a GitOps Deploy Run has no wait Step. It
-  cannot tell a GitOps Step from another Step, so this would need a hint the author adds.
+- Whether the Pipeline check should warn when a Deploy Run has no Step after its Deploy
+  Step. It cannot tell a GitOps Step from another Step, so the warning would be a hint.
