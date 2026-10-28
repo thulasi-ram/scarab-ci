@@ -33,6 +33,7 @@
 //! would consult), against a supplied input, a recorded decision's input,
 //! or a Pipeline compiled here from the YAML and library sources the caller
 //! sends (no forge read). `scarab validate --server` calls the last form.
+//! Stored Policies need Read on the org; a draft needs Administer.
 
 use std::collections::BTreeMap;
 
@@ -233,7 +234,8 @@ pub struct PolicyDecisionsQuery {
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyTestRequest {
-    /// A draft Policy, compiled at the org level.
+    /// A draft Policy, compiled at the org level. Needs Administer on the
+    /// org; stored Policies need Read.
     #[serde(default)]
     #[schema(value_type = Option<Object>)]
     pub policy: Option<Value>,
@@ -1214,17 +1216,27 @@ fn test_event(
     })
 }
 
+/// The Pipeline form's input (an `Err` when it could not be built), what
+/// `match` sees, and the Pipeline's plugin gates.
+type PipelineInput = (
+    Result<Value, String>,
+    MatchContext,
+    Vec<run_create::PluginGate>,
+);
+
 /// The input of the Pipeline form: compiled here from the sent sources,
 /// then built through the code admission runs (`admission_before_policies`,
 /// `run_create_facts`, `run_create_input`), so the input evaluated is the
 /// one admission would record for the same event. A refusal admission makes
-/// before consulting Policies is a 400.
+/// before consulting Policies is a 400. An input that cannot be built (a
+/// Run over a list or string cap) is an `Err` evaluated as admission
+/// evaluates it, with the Pipeline's plugin gates.
 async fn pipeline_input(
     st: &AppState,
     org: &str,
     caller: &str,
     p: PolicyTestPipeline,
-) -> Result<(Value, MatchContext), ApiError> {
+) -> Result<PipelineInput, ApiError> {
     let repo = scarab_forge::RepoRef {
         owner: org.to_string(),
         name: p.project.clone(),
@@ -1262,11 +1274,26 @@ async fn pipeline_input(
     let path = p.path.unwrap_or_else(|| ".scarab/ci.yaml".to_string());
     let now = st.clock.now().await.0;
     let (facts, ctx) = crate::run_create_facts(&event, &path, &repo, &gov, now);
-    let facts = facts.map_err(ApiError::BadRequest)?;
-    let input = blocking(move || crate::run_create_input(&ir, facts))
-        .await?
-        .map_err(|e| ApiError::BadRequest(format!("the Run cannot be checked: {e}")))?;
-    Ok((input, ctx))
+    let plugin_gates = run_create::plugin_gates(&ir);
+    let input = match facts {
+        Ok(facts) => blocking(move || crate::run_create_input(&ir, facts)).await?,
+        Err(e) => Err(e),
+    };
+    Ok((input, ctx, plugin_gates))
+}
+
+/// A supplied or recorded input with a string over its cap is a 400: the
+/// evaluator would refuse to bind it, and no admission records one.
+fn check_input_strings(input: &Value, schema_version: u32) -> Result<(), ApiError> {
+    let Some(schema) = scarab_policy::ir::schema_for(Checkpoint::RunCreate, schema_version) else {
+        return Ok(());
+    };
+    scarab_policy::schema::check_string_lengths(&schema, input).map_err(|e| {
+        ApiError::BadRequest(format!(
+            "the input's `{}` is {} bytes; a run.create input string is at most {} bytes",
+            e.path, e.len, e.max
+        ))
+    })
 }
 
 /// What each rule of `policies` reads.
@@ -1303,16 +1330,21 @@ fn reads_of(policies: &[StoredPolicy]) -> Vec<PolicyReadsDto> {
 }
 
 /// Evaluate `run.create` Policies without enforcing and without recording
-/// (ADR-0075 §9). Read on the org: the answer names org Policies and can
-/// replay any recorded decision of the org, both of which org Read already
-/// shows.
+/// (ADR-0075 §9). Read on the org evaluates stored Policies: the answer
+/// names org Policies and can replay any recorded decision of the org, both
+/// of which org Read already shows. A draft `policy` needs Administer on the
+/// org, as saving it would: it runs rules the caller wrote, and only an org
+/// admin's rules run at admission.
 ///
 /// Policies: `policy` (a draft, compiled at the org level; a 400 when it
 /// does not compile), `policy_id` (a stored Policy of this org), or neither
 /// (the org's and the input's Project's effective Policies, as admission
 /// consults them). Input: `input`, `decision_id` (its recorded input and
 /// schema version), or `pipeline` (compiled here with `libs`; no forge
-/// read).
+/// read). A supplied or recorded input with a string over its cap is a 400.
+/// A Pipeline whose Run is over an input cap is answered as admission
+/// decides it: each matched Policy is an error, which denies when the Policy
+/// is enforced.
 #[utoipa::path(
     post,
     path = "/v1/orgs/{org}/policy-test",
@@ -1321,8 +1353,8 @@ fn reads_of(policies: &[StoredPolicy]) -> Vec<PolicyReadsDto> {
     summary = "Evaluate run.create Policies without enforcing or recording (ADR-0075 §9)",
     responses(
         (status = 200, body = PolicyTestResponse),
-        (status = 400, description = "not one input form, a draft that does not compile, a Pipeline that does not compile, a Run admission refuses before its Policies, or an input that cannot be matched"),
-        (status = 403, description = "no Read on the org"),
+        (status = 400, description = "not one input form, a draft that does not compile, a Pipeline that does not compile, a Run admission refuses before its Policies, an input that cannot be matched, or a supplied input with a string over its cap"),
+        (status = 403, description = "no Read on the org, or a draft `policy` without Administer on the org"),
         (status = 404, description = "no such Policy or decision in this org, or policies not configured")
     )
 )]
@@ -1332,8 +1364,13 @@ pub(crate) async fn policy_test(
     Path(org): Path<String>,
     Json(body): Json<PolicyTestRequest>,
 ) -> Result<Json<PolicyTestResponse>, ApiError> {
-    let principal =
-        authorize_scoped(&st, &headers, Action::Read, Some(&rbac_scope(&org, None))).await?;
+    // A draft runs rules the caller wrote: org Administer, as saving one.
+    let action = if body.policy.is_some() {
+        Action::Administer
+    } else {
+        Action::Read
+    };
+    let principal = authorize_scoped(&st, &headers, action, Some(&rbac_scope(&org, None))).await?;
     let store = store(&st)?;
     if body.policy.is_some() && body.policy_id.is_some() {
         return Err(ApiError::BadRequest(
@@ -1351,10 +1388,12 @@ pub(crate) async fn policy_test(
         ));
     }
 
-    // The input, its schema version, and what `match` sees.
-    let (input, schema_version, ctx) = if let Some(input) = body.input {
+    // The input (an `Err` when a Pipeline's could not be built), its schema
+    // version, what `match` sees, and the Pipeline's plugin gates.
+    let (input, schema_version, ctx, plugin_gates) = if let Some(input) = body.input {
+        check_input_strings(&input, run_create::SCHEMA_VERSION)?;
         let ctx = match_context_of(&input)?;
-        (input, run_create::SCHEMA_VERSION, ctx)
+        (Ok(input), run_create::SCHEMA_VERSION, ctx, None)
     } else if let Some(id) = body.decision_id {
         let record = store
             .decision(&id)
@@ -1373,12 +1412,14 @@ pub(crate) async fn policy_test(
                 "decision `{id}` recorded no input (its Run did not fit an input list cap)"
             )));
         }
+        check_input_strings(&record.decision.input, record.decision.schema_version)?;
         let ctx = match_context_of(&record.decision.input)?;
-        (record.decision.input, record.decision.schema_version, ctx)
+        let version = record.decision.schema_version;
+        (Ok(record.decision.input), version, ctx, None)
     } else {
         let pipeline = body.pipeline.expect("one form is present");
-        let (input, ctx) = pipeline_input(&st, &org, &principal.subject, pipeline).await?;
-        (input, run_create::SCHEMA_VERSION, ctx)
+        let (input, ctx, gates) = pipeline_input(&st, &org, &principal.subject, pipeline).await?;
+        (input, run_create::SCHEMA_VERSION, ctx, Some(gates))
     };
 
     // The Policies, as stored rows, so one evaluator serves all three.
@@ -1423,7 +1464,8 @@ pub(crate) async fn policy_test(
         evaluate_stored(
             Checkpoint::RunCreate,
             schema_version,
-            Ok(&input),
+            input.as_ref().map_err(String::as_str),
+            plugin_gates.as_deref(),
             &ctx,
             &policies,
         )

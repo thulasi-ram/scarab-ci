@@ -4732,7 +4732,10 @@ fn run_create_trigger(
     let (principal, reason) = match event {
         Event::Manual { actor, reason, .. } | Event::Api { actor, reason, .. } => (
             (!actor.is_empty()).then(|| actor.clone()),
-            reason.clone().filter(|r| !r.trim().is_empty()),
+            reason
+                .clone()
+                .filter(|r| !r.trim().is_empty())
+                .map(scarab_policy::schema::FreeText),
         ),
         _ => (None, None),
     };
@@ -4787,15 +4790,13 @@ fn run_create_facts(
 }
 
 /// The `run.create` input of `ir`, as a PolicyDecision records it; an `Err`
-/// names the list cap the Run does not fit. CPU work: call it off the async
-/// workers.
+/// names the list or string cap the Run does not fit. CPU work: call it off
+/// the async workers.
 fn run_create_input(
     ir: &scarab_pipeline::PipelineIr,
     facts: scarab_policy::run_create::RunCreateFacts,
 ) -> Result<serde_json::Value, String> {
-    let input =
-        scarab_policy::run_create::input_from_pipeline(ir, facts).map_err(|e| e.to_string())?;
-    serde_json::to_value(input).map_err(|e| e.to_string())
+    scarab_policy::run_create::input_value(ir, facts).map_err(|e| e.to_string())
 }
 
 /// Consults the `run.create` Policies of `repo`'s org and Project for a
@@ -4810,8 +4811,10 @@ fn run_create_input(
 ///   [`AdmissionRefusal::PolicyDenied`] whose messages name their Policy.
 /// - A stored Policy that no longer compiles denies when enforced and
 ///   matched ([`evaluate_stored`](scarab_policy::evaluate::evaluate_stored)).
-/// - A Run over an input list cap cannot be checked: it is refused, naming
-///   the cap, when an enforced Policy matches it, and admitted otherwise.
+/// - A Run over an input list or string cap cannot be checked: it is
+///   refused, naming the cap, when an enforced Policy matches it, and
+///   admitted otherwise. The plugin default reads the gates from `ir`, so it
+///   denies an unlisted plugin gate either way.
 /// - A store failure (loading or recording) is an error: no Run.
 #[allow(clippy::too_many_arguments)]
 async fn consult_run_create(
@@ -4847,12 +4850,14 @@ async fn consult_run_create(
             .map(|()| (ir.clone(), facts))
             .map_err(|e| e.to_string())
     });
+    let plugin_gates = run_create::plugin_gates(ir);
     let decision = tokio::task::spawn_blocking(move || {
         let input = job.and_then(|(ir, facts)| run_create_input(&ir, facts));
         evaluate_stored(
             Checkpoint::RunCreate,
             run_create::SCHEMA_VERSION,
             input.as_ref().map_err(String::as_str),
+            Some(&plugin_gates),
             &ctx,
             &stored,
         )
