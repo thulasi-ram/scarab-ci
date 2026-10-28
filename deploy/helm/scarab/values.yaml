@@ -459,7 +459,7 @@ workspace:
     annotations: {}
 
 # Plugins (ADR-0072): long-lived vendor workloads (e.g. the first-party Argo CD
-# reporter) that Scarab runs in ONE shared namespace and talks to only through
+# plugin) that Scarab runs in ONE shared namespace and talks to only through
 # the CredentialBroker — a second listener of scarab-server, exposed by a
 # ClusterIP Service and NEVER through the ingress.
 #
