@@ -182,3 +182,232 @@ policy_struct! {
 pub fn schema() -> Schema {
     Schema::for_root::<RunCreateInput>(CHECKPOINT, SCHEMA_VERSION)
 }
+
+impl Timestamp {
+    /// `ms` unix milliseconds; `None` outside chrono's range.
+    pub fn from_unix_millis(ms: i64) -> Option<Timestamp> {
+        chrono::DateTime::from_timestamp_millis(ms).map(Timestamp)
+    }
+}
+
+/// What a `run.create` consultation knows besides the compiled Pipeline.
+#[derive(Clone, Debug)]
+pub struct RunCreateFacts {
+    pub org: String,
+    pub project: String,
+    pub trigger: Trigger,
+    /// The Pipeline file, e.g. `.scarab/deploy.yaml`: the Pipeline's name
+    /// when it declares none.
+    pub pipeline_path: String,
+    /// The Environment the Run is governed by, when its Pipeline names one.
+    pub environment: Option<String>,
+    /// The human or token creating the Run; `None` for a webhook.
+    pub principal: Option<String>,
+    pub time: Timestamp,
+}
+
+/// A Run whose Steps or gates do not fit a list cap of the input schema. Its
+/// input cannot be checked, so the engine refuses the Run when a Policy
+/// applies (ADR-0075 §2); the message names the cap.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct CapExceeded(pub String);
+
+/// `items` as a capped list, or the refusal naming `owner`, the list's `noun`
+/// and the cap.
+fn capped<T, const N: usize>(
+    items: Vec<T>,
+    owner: &dyn Fn() -> String,
+    noun: &str,
+) -> Result<Capped<T, N>, CapExceeded> {
+    let len = items.len();
+    Capped::new(items).ok_or_else(|| {
+        CapExceeded(format!(
+            "{} has {len} {noun}, more than the {N} a run.create Policy can check, so the Run \
+             is refused",
+            owner()
+        ))
+    })
+}
+
+fn origin_of(
+    chain: &[scarab_pipeline::OriginEntry],
+    owner: &dyn Fn() -> String,
+) -> Result<Capped<Origin, MAX_ORIGIN>, CapExceeded> {
+    let links = chain
+        .iter()
+        .map(|o| Origin {
+            kind: match o.kind {
+                scarab_pipeline::OriginKind::File => OriginKind::File,
+                scarab_pipeline::OriginKind::Library => OriginKind::Library,
+                scarab_pipeline::OriginKind::Plugin => OriginKind::Plugin,
+            },
+            name: o.name.clone(),
+            source: o.source.clone(),
+            content_hash: o.content_hash.clone(),
+        })
+        .collect();
+    capped(links, owner, "links in its origin chain")
+}
+
+fn gate_kind(step: &scarab_pipeline::StepSpec) -> Result<GateKind, CapExceeded> {
+    match step.gate.as_deref() {
+        Some("manual") => Ok(GateKind::Manual),
+        Some("timer") => Ok(GateKind::Timer),
+        Some("external") => Ok(GateKind::External),
+        Some("plugin") => Ok(GateKind::Plugin),
+        other => Err(CapExceeded(format!(
+            "gate `{}` has kind {other:?}, which a run.create Policy cannot check, so the Run is refused",
+            step.id
+        ))),
+    }
+}
+
+/// Whether `step` uses the Environment's authority (ADR-0075 §5): it
+/// declares secrets, requests a governed grant or a raw overlay, or is a
+/// deploy Step (itself, or every non-gate Step of a `deploy: true`
+/// Pipeline). The Pipeline IR has no `forge_token` yet, so that item of the
+/// list cannot apply.
+pub fn uses_environment_authority(
+    ir: &scarab_pipeline::PipelineIr,
+    step: &scarab_pipeline::StepSpec,
+) -> bool {
+    if step.is_gate() {
+        return false;
+    }
+    let governed_grant = step
+        .security
+        .as_ref()
+        .is_some_and(|s| s.privileged || !s.add_capabilities.is_empty());
+    !step.secrets.is_empty()
+        || governed_grant
+        || step.k8s_overlay.is_some()
+        || step.deploy
+        || ir.deploy
+}
+
+/// Builds the `run.create` input of a compiled Pipeline (ADR-0075 §2). Every
+/// Step is listed, including ones a `when:` guard will skip: they are part
+/// of the Run. Gates are listed under `gates`, every other Step under
+/// `steps`. Upstream gates and a gate's dependents are transitive over
+/// `needs`.
+pub fn input_from_pipeline(
+    ir: &scarab_pipeline::PipelineIr,
+    facts: RunCreateFacts,
+) -> Result<RunCreateInput, CapExceeded> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let by_id: BTreeMap<&str, &scarab_pipeline::StepSpec> =
+        ir.steps.iter().map(|s| (s.id.as_str(), s)).collect();
+    // Every Step's transitive upstream, memoised. The DAG is validated, so
+    // the walk terminates; `visiting` guards it all the same.
+    fn upstream<'a>(
+        id: &'a str,
+        by_id: &BTreeMap<&'a str, &'a scarab_pipeline::StepSpec>,
+        memo: &mut BTreeMap<&'a str, BTreeSet<&'a str>>,
+        visiting: &mut BTreeSet<&'a str>,
+    ) -> BTreeSet<&'a str> {
+        if let Some(done) = memo.get(id) {
+            return done.clone();
+        }
+        let mut out = BTreeSet::new();
+        if visiting.insert(id) {
+            if let Some(step) = by_id.get(id) {
+                for need in &step.needs.0 {
+                    if let Some((key, _)) = by_id.get_key_value(need.as_str()) {
+                        out.insert(*key);
+                        out.extend(upstream(key, by_id, memo, visiting));
+                    }
+                }
+            }
+            visiting.remove(id);
+        }
+        memo.insert(id, out.clone());
+        out
+    }
+    let mut memo = BTreeMap::new();
+    let mut ups: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for s in &ir.steps {
+        let u = upstream(s.id.as_str(), &by_id, &mut memo, &mut BTreeSet::new());
+        ups.insert(s.id.as_str(), u);
+    }
+
+    let mut steps = Vec::new();
+    let mut gates = Vec::new();
+    for s in &ir.steps {
+        let what = || format!("Step `{}`", s.id);
+        let gate_what = || format!("gate `{}`", s.id);
+        if s.is_gate() {
+            let dependents: Vec<String> = ir
+                .steps
+                .iter()
+                .filter(|d| !d.is_gate() && ups[d.id.as_str()].contains(s.id.as_str()))
+                .map(|d| d.id.clone())
+                .collect();
+            gates.push(Gate {
+                id: s.id.clone(),
+                kind: gate_kind(s)?,
+                origin: origin_of(&s.origin, &gate_what)?,
+                dependents: capped(dependents, &gate_what, "dependent Steps")?,
+            });
+            continue;
+        }
+        let mut upstream_gates = Vec::new();
+        for g in &ir.steps {
+            if g.is_gate() && ups[s.id.as_str()].contains(g.id.as_str()) {
+                upstream_gates.push(UpstreamGate {
+                    id: g.id.clone(),
+                    kind: gate_kind(g)?,
+                });
+            }
+        }
+        let mut grants = Vec::new();
+        if let Some(sec) = &s.security {
+            if sec.run_as_root {
+                grants.push("run-as-root".to_string());
+            }
+            if sec.privileged {
+                grants.push("privileged".to_string());
+            }
+            grants.extend(
+                sec.add_capabilities
+                    .iter()
+                    .map(|c| format!("add-capabilities:{c}")),
+            );
+        }
+        steps.push(Step {
+            id: s.id.clone(),
+            image: s.image.clone(),
+            digest: s
+                .image
+                .split_once('@')
+                .map(|(_, d)| d.to_string())
+                .filter(|d| !d.is_empty()),
+            grants: capped(grants, &what, "grants")?,
+            k8s_overlay: s.k8s_overlay.is_some(),
+            secrets: capped(s.secrets.clone(), &what, "secrets")?,
+            placement_profiles: capped(s.placement_profiles.clone(), &what, "placement profiles")?,
+            deploy: s.deploy || ir.deploy,
+            forge_token: None,
+            uses_environment_authority: uses_environment_authority(ir, s),
+            origin: origin_of(&s.origin, &what)?,
+            upstream_gates: capped(upstream_gates, &what, "gates upstream of it")?,
+        });
+    }
+    Ok(RunCreateInput {
+        org: Org { name: facts.org },
+        project: Project {
+            name: facts.project,
+        },
+        trigger: facts.trigger,
+        pipeline: Pipeline {
+            name: ir.name.clone().unwrap_or(facts.pipeline_path),
+            environment: facts.environment,
+            deploy: ir.deploy,
+        },
+        steps: capped(steps, &|| "the Run".to_string(), "Steps")?,
+        gates: capped(gates, &|| "the Run".to_string(), "gates")?,
+        principal: facts.principal,
+        time: facts.time,
+    })
+}

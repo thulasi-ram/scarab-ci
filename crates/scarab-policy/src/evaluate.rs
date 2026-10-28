@@ -15,6 +15,7 @@ use crate::eval::{bind, evaluate_when};
 use crate::ir::{schema_for, Level, PolicyIr, Predicate, TypedPredicate};
 use crate::policy::{glob_matches, pattern_matches, sha256_hex, Checkpoint, Effect, Match, Mode};
 use crate::run_create::TriggerKind;
+use crate::store::StoredPolicy;
 
 /// The most messages one typed predicate reports; the rest are counted.
 pub const MAX_TYPED_MESSAGES: usize = 10;
@@ -146,8 +147,20 @@ pub fn evaluate(
                 })
                 .collect()
         });
+    PolicyDecision {
+        checkpoint,
+        schema_version,
+        input: input.clone(),
+        policy_set_digest: policy_set_digest(checkpoint, policies),
+        outcome: combine(&results),
+        results,
+    }
+}
+
+/// Any enforced deny or error denies, with every such message.
+fn combine(results: &[PolicyResult]) -> DecisionOutcome {
     let mut messages = Vec::new();
-    for r in &results {
+    for r in results {
         if r.mode != Mode::Enforce {
             continue;
         }
@@ -157,18 +170,118 @@ pub fn evaluate(
             _ => {}
         }
     }
-    let outcome = if messages.is_empty() {
+    if messages.is_empty() {
         DecisionOutcome::Allow
     } else {
         DecisionOutcome::Deny { messages }
-    };
+    }
+}
+
+/// Evaluates stored Policies at `checkpoint`, as admission does: each is
+/// compiled for its scope's level first.
+///
+/// - A Policy that no longer compiles (a newer checker refusing what an
+///   older one saved) is an error result, so when it is enforced
+///   and its `match` fits, the decision denies: fail closed.
+/// - `input` is `Err(reason)` when the input could not be built (a Run over
+///   a list cap, [`CapExceeded`](crate::run_create::CapExceeded)): every
+///   matched Policy is then an error with that reason, and the recorded
+///   input is `null`.
+///
+/// The PolicySetDigest covers every stored Policy at the checkpoint,
+/// compiled or not.
+pub fn evaluate_stored(
+    checkpoint: Checkpoint,
+    schema_version: u32,
+    input: Result<&Value, &str>,
+    ctx: &MatchContext,
+    stored: &[StoredPolicy],
+) -> PolicyDecision {
+    let compiled: Vec<(&StoredPolicy, Result<PolicyIr, String>)> = stored
+        .iter()
+        .filter(|p| p.body.checkpoint == checkpoint)
+        .map(|p| {
+            let ir = p.compile().map_err(|ds| {
+                let found: Vec<String> = ds.iter().map(|d| d.to_string()).collect();
+                format!(
+                    "version {} of this policy no longer compiles, so it denies: {}",
+                    p.version,
+                    found.join("; ")
+                )
+            });
+            (p, ir)
+        })
+        .collect();
+    let irs: Vec<PolicyIr> = compiled
+        .iter()
+        .filter_map(|(_, ir)| ir.as_ref().ok().cloned())
+        .collect();
+    let mut evaluated = match input {
+        Ok(v) => evaluate(checkpoint, schema_version, v, ctx, &irs).results,
+        Err(reason) => irs
+            .iter()
+            .map(|p| {
+                let outcome = if matches(&p.match_, ctx) {
+                    PolicyOutcome::Error {
+                        message: reason.to_string(),
+                    }
+                } else {
+                    PolicyOutcome::NotMatched
+                };
+                result_of(p, outcome)
+            })
+            .collect(),
+    }
+    .into_iter();
+
+    let mut digest_set = Vec::with_capacity(compiled.len());
+    let mut results = Vec::with_capacity(compiled.len());
+    for (p, ir) in compiled {
+        match ir {
+            Ok(ir) => {
+                results.push(evaluated.next().expect("one result per compiled policy"));
+                digest_set.push(ir);
+            }
+            Err(message) => {
+                // What the digest and the result need from a Policy that has
+                // no IR: its identity, `match` and mode, from the stored row.
+                let stub = PolicyIr {
+                    policy_id: p.id.clone(),
+                    version: p.version,
+                    content_hash: p.content_hash.clone(),
+                    name: p.name.clone(),
+                    level: p.scope.level(),
+                    checkpoint,
+                    match_: p.body.match_.clone(),
+                    mode: p.body.mode,
+                    rules: Vec::new(),
+                };
+                let outcome = if matches(&stub.match_, ctx) {
+                    PolicyOutcome::Error { message }
+                } else {
+                    PolicyOutcome::NotMatched
+                };
+                results.push(result_of(&stub, outcome));
+                digest_set.push(stub);
+            }
+        }
+    }
     PolicyDecision {
         checkpoint,
         schema_version,
-        input: input.clone(),
-        policy_set_digest: policy_set_digest(checkpoint, policies),
+        input: input.cloned().unwrap_or(Value::Null),
+        policy_set_digest: policy_set_digest(checkpoint, &digest_set),
+        outcome: combine(&results),
         results,
-        outcome,
+    }
+}
+
+impl PolicyDecision {
+    /// Whether any Policy's `match` selected this consultation.
+    pub fn any_matched(&self) -> bool {
+        self.results
+            .iter()
+            .any(|r| r.outcome != PolicyOutcome::NotMatched)
     }
 }
 
