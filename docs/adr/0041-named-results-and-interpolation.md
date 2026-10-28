@@ -191,5 +191,5 @@ continue with a wrong or empty value.
 - **Interpolate at compile time** — impossible: result values are only known at
   run time. Compile validates the *reference*; launch binds the *value*.
 - **Hidden data edges** (let a reference create the dependency implicitly) —
-  rejected: a reference must follow an explicit `needs` edge, keeping the DAG the
+  rejected: a reference must be backed by an explicit `needs` edge, keeping the DAG the
   single source of ordering truth and guaranteeing availability.

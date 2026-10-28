@@ -256,7 +256,7 @@ Two tiers, two policies, so eviction can never break a promise:
 
 Plus a manual **pin** ("keep this Run's workspaces") for investigations, and **graceful
 degradation**: expired inputs widen a rerun's scope and say so, rather than failing. Rerun
-buttons must say which they are — "Rerun this step" vs "Inputs expired — this re-runs
+controls must say which they are — "Rerun this step" vs "Inputs expired — this re-runs
 from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never means mysterious.
 
 ## Consequences
@@ -670,7 +670,7 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
     > meet: the Depot's `PUT /v1/cas/trees` re-serialises the parsed body through **its own**
     > linked `canonical_tree_bytes` and answers a distinct `400` ("canonicalisation skew") on
     > a byte difference — the client's serialiser versus the Depot's, which is the comparison
-    > the old tripwire claimed to be. This means the format's evolution rule must now be followed:
+    > the old tripwire claimed to be. This means the format's evolution rule is now enforced at runtime:
     > the tree format may only evolve by **additive `Option` fields** with
     > `#[serde(default, skip_serializing_if)]`, so parse → re-serialise stays byte-identical
     > across one version of skew. A non-additive change breaks mid-rollout PUTs **by design**

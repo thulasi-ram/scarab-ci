@@ -57,7 +57,7 @@ sharing every blob with the full snapshot. No new storage capability was require
 
 [0061](0061-workspace-data-path.md) makes wide edges cheap in the storage layer (lazy
 materialisation + content addressing), and adopts the principle that **the system pays for
-its own idiosyncrasies, not the author**. So the implicit inherit-everything default stated
+its own infrastructure quirks, not the author**. So the implicit inherit-everything default stated
 above is permanent, and neither `inputs:` nor `outputs:` may become something an author has
 to declare *for speed*. They remain what this ADR made them: tools for precise cache keys,
 safe fan-out, and restricting what flows.

@@ -49,7 +49,7 @@ operation without a passkey, the refusal points them to enrollment. The **first*
 passkey can be enrolled only right after a **fresh login** in that browser session
 (within the step-up window): a valid session alone is not enough, or a stolen session
 could enroll the attacker's own passkey and own step-up forever. Every enrollment is
-recorded and surfaced (see §7). Adding or removing a passkey **after** the first is
+recorded and shown (see §7). Adding or removing a passkey **after** the first is
 itself a crown-jewel operation. No second admin approves an enrollment.
 
 **Recovery.** An Org Owner may reset a member's passkeys, as a stepped-up operation.

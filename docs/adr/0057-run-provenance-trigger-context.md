@@ -94,7 +94,7 @@ extended with fixtures carrying a message/title/base. The server stamps
 `set_run_pipeline`) via a small `trigger_title(event) -> Option<String>`
 extractor.
 
-**Security boundary (important — do not undo):** these provenance fields are
+**Security boundary (the script-injection defence depends on it; do not undo):** these provenance fields are
 **deliberately excluded from `Event::context()`** — the flat JSON that feeds CEL
 trigger-matching and `${{ }}` interpolation. They flow *only* adapter → `Event`
 field → `trigger_title` / origin column → DTO → UI, never into the matching /
@@ -242,7 +242,7 @@ The seven open questions, as resolved in the `/grill-with-docs` session:
    requiredness **environment-configurable** via `ProtectionRules.require_reason`,
    enforced at the **admission gate**, scoped to `manual`/`api` with an empty
    reason.
-5. **Where the headline lives** → **Trigger-cell secondary line**, both surfaces;
+5. **Where the headline lives** → **Trigger-cell secondary line**, both screens;
    the Trigger cell is **one shared component** across the runs list and the
    run-detail top context bar; H1 promotion deferred.
 6. **Fork-PR title / interpolation** → provenance fields on `Event` but

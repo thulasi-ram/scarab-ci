@@ -91,7 +91,7 @@ pub struct PipelineIr {
     pub interface: Interface,
     /// Opt-in run budget in seconds (ADR-0047): the run fails once its
     /// **active** time (gate-suspended time excluded) exceeds this. No default
-    /// — a run suspended for weeks on a gate is the wedge, not a hang; forward
+    /// — a run suspended for weeks on a gate is the core feature, not a hang; forward
     /// progress rests on step timeouts and gate expiry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<u32>,

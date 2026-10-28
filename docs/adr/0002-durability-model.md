@@ -9,8 +9,8 @@
 "Durable execution" engines (DBOS, Temporal) are built on **deterministic replay**
 of workflow code, with side effects wrapped in idempotent, memoized activities. But a CI
 step is **arbitrary side-effecting user shell in a container** (`docker push`,
-`terraform apply`). You cannot transparently replay the *interior* of such a step. Designing as
-if you could ("resume a `docker build` from the middle") would break the design.
+`terraform apply`). You cannot transparently replay the *interior* of such a step. Assuming you
+could ("resume a `docker build` from the middle") would undermine the whole design.
 
 ## Decision
 

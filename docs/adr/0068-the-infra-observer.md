@@ -80,7 +80,7 @@ Polling and appending run on deliberately different cadences. One fence is
 polled every 30s; an event is written only when the condition **changes** —
 once at onset, once when it clears or the attempt ends.
 
-This is not just tidiness. The run's event log is walked in full on the
+This is a performance requirement, not tidiness. The run's event log is walked in full on the
 scheduler's hot path: `settle_failed_attempt` scans every event of the run to
 count `AttemptStarted` against the retry budget. A per-poll diagnostic would tax
 exactly the runs already in trouble, and would get *worse* the longer they

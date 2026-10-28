@@ -50,9 +50,9 @@
 Scarab node driver, shipped and installed as standard**, which would mount a Workspace Snapshot
 as a read-only lower layer with a pod-local writable upper layer, materialising **lazily** so a
 Step transfers what it reads rather than what it inherits. Part 2 is the part 0061's own
-measurement section identifies as the critical one:
+measurement section identifies as the part that matters most:
 
-> **Consequence for sequencing.** Part 2 (**lazy materialisation**) is the critical part,
+> **Consequence for sequencing.** Part 2 (**lazy materialisation**) is the part that matters most,
 > not part 3.
 
 A deployment constraint arrived after 0061 was accepted and it forbids the mechanism:
@@ -275,7 +275,7 @@ a tuning choice** (probed 2026-08-02 on this machine). A kind node — `kindest/
 `systemd` to *run* `rpc.statd`, so a mount that defaults to **v3** fails with *"rpc.statd is not
 running"*. `-o vers=4` and an unqualified mount that negotiates 4.2 both succeed. An unpinned PV
 therefore works or does not depending on what the client's default happens to be on that node —
-exactly the platform quirk the governing principle exists to keep away from authors. (`nolock`
+exactly the infrastructure quirk the governing principle exists to keep away from authors. (`nolock`
 is the alternative for a deployment that must stay on v3; the pin is the default.)
 
 > **Amended 2026-08-02 — delivery has three options, and NFS is only one of them.**

@@ -1,10 +1,10 @@
 ---
 title: Scarab
-description: A modern CI engine for Kubernetes that plugs into your forge. The control plane keeps each run as saved state rather than a running process, so a restart doesn't lose it. Written in Rust.
+description: A modern CI engine for Kubernetes that plugs into your forge. The control plane keeps each run as saved state rather than a running process, so a control-plane restart doesn't lose it. Written in Rust.
 template: splash
 hero:
   layout: split-left
-  tagline: A modern CI engine for Kubernetes that lives in your forge. Each run is saved as state, so it survives a control-plane restart.
+  tagline: A modern CI engine for Kubernetes that plugs into your forge. Each run is saved as state, so it survives a control-plane restart.
   image:
     # The brand emblem, square-cropped (1:1) — ink outline on light, gold on dark.
     light: ../../assets/brand/scarab-emblem-square.svg
@@ -27,7 +27,7 @@ hero:
 
 import AsciiScene from '../../components/AsciiScene.astro';
 
-Scarab gives you a CI that lives in your forge (pipelines in your repo, PR checks, secrets,
+Scarab gives you a CI that plugs into your forge (pipelines in your repo, PR checks, secrets,
 approvals, a UI) on a control plane that saves each run as durable **state**. If the control
 plane restarts partway through a run, the run carries on from its last completed step.
 
@@ -71,7 +71,7 @@ runners: if the control plane restarts mid-run, the run is orphaned or starts ov
     <dt class="sc-home-spec-key">cohesion</dt>
     <dd class="sc-home-spec-body">
       <p class="sc-home-spec-claim">Forge CI and engine, shipped together.</p>
-      <p class="sc-home-spec-support">A CI that lives in your forge (DSL, secrets, approvals, identity, UI) on a durable engine. You don't have to build a CI on top of a workflow engine, and you don't have to accept a job-runner CI with nothing durable underneath.</p>
+      <p class="sc-home-spec-support">A CI that plugs into your forge (DSL, secrets, approvals, identity, UI) on a durable engine. You don't have to build a CI on top of a workflow engine, and you don't have to accept a job-runner CI with nothing durable underneath.</p>
     </dd>
   </div>
   <div class="sc-home-spec-row">
@@ -85,13 +85,13 @@ runners: if the control plane restarts mid-run, the run is orphaned or starts ov
     <dt class="sc-home-spec-key">identity</dt>
     <dd class="sc-home-spec-body">
       <p class="sc-home-spec-claim">No long-lived cloud keys.</p>
-      <p class="sc-home-spec-support">Scarab acts as its own OIDC issuer, so a run can federate into your cloud with a token Scarab mints for it instead of a long-lived key. The identity isn't tied to one forge; adapters for GitHub and Forgejo are implemented today. See Status.</p>
+      <p class="sc-home-spec-support">Scarab acts as its own OIDC issuer, so a deploy step can federate into your cloud with a short-lived token Scarab mints for it instead of a long-lived key. The identity isn't tied to one forge; adapters for GitHub and Forgejo are implemented today. See Status.</p>
     </dd>
   </div>
   <div class="sc-home-spec-row">
     <dt class="sc-home-spec-key">the DSL</dt>
     <dd class="sc-home-spec-body">
-      <p class="sc-home-spec-claim">YAML that compiles to a typed language.</p>
+      <p class="sc-home-spec-claim">Typed pipelines, not templated YAML.</p>
       <p class="sc-home-spec-support">You write YAML with CEL expressions, and Scarab compiles it to a typed intermediate representation. Every pipeline becomes one flat recursive DAG: <code>invoke</code> handles reuse, and matrix is a modifier on a step.</p>
     </dd>
   </div>

@@ -30,7 +30,7 @@ limit of 5 (about 31 minutes of backoff), database migrations as Sync hooks at w
 and image bumps made by PR to a shared `devops-gitops` repository. A watcher
 (argo-watcher v0.10.7) waits 15 minutes and ignores `operationState`, so a sync that is
 still retrying, or has already given up, reads as success or as an unrelated timeout.
-QA's question is "what counts as a deployment?": failures surface late, there is no
+QA's question is "what counts as a deployment?": failures show up late, there is no
 single row per deploy, and two syncs of one change cannot be attributed.
 
 Three properties of today's gates also block any "wait until it is live" step:
@@ -130,7 +130,7 @@ conflict.
 the grouping ("unmapped"), instead of claiming what was last live there; no input is
 appended and no seventh status exists. Moved is derived on read from the current
 EnvironmentDeploymentSources, so an admin's edit shows at once. A request for the target on
-the old Environment waits and, correctly, stalls: its reports now land elsewhere. The new
+the old Environment waits, and stalls openly rather than pretending to progress: its reports now land elsewhere. The new
 Environment never shows the old one's last status as its own; the target appears there
 when its reporter re-sends its current state (§11). Fan-out (one Environment
 across regions or clusters) is several DeploymentTargets, not a grouping concept.
@@ -251,7 +251,7 @@ steps:
   Deployment input per request commit in **one transaction**. An exit 0 observed for an
   Attempt that is no longer the Step's latest (superseded, cancelled, or a successor
   runs) records nothing. A Step that changed the world and then failed records nothing;
-  the change surfaces as Unexplained.
+  the change shows up as Unexplained.
 - **On Kubernetes, results arrive through the results-egress sidecar**, not from the
   executor. The executor withholds the Step's success until the sidecar has terminated,
   and the sidecar exits only after the results were committed or its POST failed. A

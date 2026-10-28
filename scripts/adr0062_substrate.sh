@@ -286,7 +286,7 @@ spec:
         echo "NFSEXPORT_PLUS_METACOPY=refused"
       fi
       # (f) rename(2) of an inherited DIRECTORY without redirect_dir. Build tools
-      # do this constantly; EXDEV here is author-visible substrate knowledge.
+      # do this constantly; EXDEV here is an infrastructure quirk authors would have to know.
       echo "REDIRECT_DIR_PARAM=$(cat /sys/module/overlay/parameters/redirect_dir 2>/dev/null || echo absent)"
       mkdir -p /d/rfarm/ld/sub && echo x > /d/rfarm/ld/sub/f
       rm -rf /d/upper4 /d/work4; mkdir -p /d/upper4 /d/work4
@@ -347,7 +347,7 @@ fi
 # tools do this constantly. redirect_dir=on is therefore not optional.
 [ "$(get REDIRECTDIR_WITH_NFSEXPORT)" = "mounted" ] \
   && ok "redirect_dir=on coexists with nfs_export=on (unlike metacopy) -- the fix for inherited-directory renames is available" \
-  || bad "redirect_dir+nfs_export" "the combination to mount. Without it an inherited directory rename returns EXDEV inside an Export, which is author-visible substrate knowledge the governing principle forbids"
+  || bad "redirect_dir+nfs_export" "the combination to mount. Without it an inherited directory rename returns EXDEV inside an Export, which is an author-visible infrastructure quirk the governing principle forbids"
 DR=$(get DIRRENAME_NO_REDIRECT)
 if [ "$DR" = "failed" ]; then
   echo "  NOTE  renaming an inherited directory FAILS without redirect_dir (param $(get REDIRECT_DIR_PARAM)) -- expected, and why redirect_dir=on is required. Note \`mv\` may mask this by copying the subtree, which silently turns the change set into a full copy of an inherited tree."
@@ -365,4 +365,4 @@ if [ "$FAIL" -gt 0 ]; then
   printf 'change the DECISION, or record why the new behaviour does not matter.\n'
   exit 1
 fi
-printf '\n  Every substrate fact ADR-0062 cites still holds on this cluster.\n'
+printf '\n  Every platform fact ADR-0062 cites still holds on this cluster.\n'

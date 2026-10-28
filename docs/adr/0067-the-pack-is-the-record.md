@@ -14,12 +14,12 @@
 
 ## Context
 
-[0066](0066-the-depot-is-a-cache.md) defined the Data Depot as **definitionally a cache** — *"it
-holds nothing that cannot be recreated, which is what makes running more replicas a sufficient HA
-story, eviction safe by construction, and a lost replica a latency event. Anything that makes it a
-system of record is a defect."*
+[0066](0066-the-depot-is-a-cache.md) defined the Data Depot as **by definition a cache**: it
+holds nothing that cannot be recreated, so running more replicas is enough for HA, eviction is
+safe by construction, and losing a replica only costs latency. Anything that makes it a system of
+record is a defect.
 
-The code does not match that sentence, and not by accident. Four things live on a
+The code does not match that sentence, and the gap is structural, not a one-off. Four things live on a
 Depot replica's local disk and exist nowhere else:
 
 | what | where | consequence at `replicaCount > 1` |
@@ -310,7 +310,7 @@ MinIO and `kind.yml` runs the live tier on a local directory). Note also that **
   properties enter the `Directory` digest — the same coupling our `TreeEntry` already has. What
   actually rules the protocol out: the tree hash **is** the recorded snapshot identity, so changing
   the tree format changes every historical Run's root; and REAPI has no equivalent of the fence
-  ledger, the `durable`/`cache-only` label, or the commit-pack atomic boundary, the parts of this
+  ledger, the `durable`/`cache-only` label, or the commit-pack atomic boundary: the parts of this
   ADR that carry its guarantees. **The design lessons are adopted (batch shape, size available
   without a read); the protocol is not.**
 - **Encrypt content so authorisation leaves the data path.** Explored and rejected: with a

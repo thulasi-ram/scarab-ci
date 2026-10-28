@@ -367,7 +367,7 @@ describes. So packing's main downside — losing random access to an individual 
 longer pay for anything**. And it helps **both** legs, feed and drain, which nothing else on this list
 does.
 
-**The gap, and the reason this is gated rather than decided: the cold flush is unmeasured.**
+**The critical gap, and the reason this is gated rather than decided: the cold flush is unmeasured.**
 `flush_to_cold` (Depot → object storage) was **not** covered by `4ce7f2c`, which measured
 client → Depot **over loopback**. The flush **gates `Succeeded`**
 ([0064](0064-durability-tiering-and-the-write-path.md) part 2) and runs against **real S3**, not
@@ -418,7 +418,7 @@ key negotiation at all.
 dispatch**. So queueing delay already bills the Step's timeout.
 
 On a busy cluster, a Step that waits ten minutes for a slot starts with **ten minutes less** than its
-author asked for. When it overruns, it surfaces as `Timeout` with **no hint that waiting caused it** —
+author asked for. When it overruns, it shows up as `Timeout` with **no hint that waiting caused it** —
 the author reads it as their code being slow and raises a limit that was never the problem.
 
 **Principle: waiting for infrastructure must not bill the Step's execution budget.**
@@ -571,7 +571,7 @@ speculative:
 - **Evict warm by TTL rather than by a size watermark.** Simpler to reason about per object.
   **Rejected**: the operator's actual constraint is **space**, a TTL bounds nothing when fill rate
   changes, and space is the bound already instrumented.
-- **Build the access index now** rather than deferring it. It is proper LRU. **Deferred** rather
+- **Build the access index now** rather than deferring it. It is true LRU (by access). **Deferred** rather
   than rejected: reachability-first eviction may well suffice, and building an access-tracking write
   path for immutable content before knowing that is machinery bought on a guess.
 - **Fix the queueing-eats-the-timeout bug by raising default timeouts.** Zero code.

@@ -69,7 +69,7 @@ Reuse splits by trust boundary, and each side uses a mechanism we already have:
 
 - **No new subsystem, no marketplace, no SDK.** The OCI registry is the plugin ecosystem
   ([0008](0008-step-contract.md)); `.scarab/lib` is the module ecosystem (local); vendoring bridges
-  them. Maximally consistent with the core idea ("fewer concepts, strictly more power").
+  them. Maximally consistent with the design principle "fewer concepts, strictly more power".
 - **`invoke` must actually be built** (it does not exist): the step kind, compile-time inlining with
   the corollaries above, and an explicit `inputs:`/`outputs:` interface validated at compile
   (explicit over ambient — consistent with the secret-scope stance in [0037](0037-environment-governance.md)).

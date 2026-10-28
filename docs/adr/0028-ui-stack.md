@@ -22,7 +22,7 @@ mature viz ecosystem the DAG needs.
 ## Consequences
 
 - A TS toolchain alongside Rust (mitigated by codegen from the OpenAPI the server emits).
-- A much better DAG/timeline UX than crude CI UIs; this is what sets us apart.
+- A better DAG/timeline UX than typical CI UIs, which is our main UI differentiator.
 - Roadmap Slice 6.
 
 ## Alternatives considered

@@ -7,8 +7,8 @@
 ## Context
 
 Because the DAG is durable, content-addressed, and records exactly what produced what, two
-modern security features take *very little extra work*. Most CIs bolt them on painfully, so
-this sets us apart.
+modern security features take *very little extra work*, where most CIs bolt them on
+painfully.
 
 ## Decision
 

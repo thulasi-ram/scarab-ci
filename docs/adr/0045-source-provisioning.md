@@ -58,7 +58,7 @@ Pure git-clone for **all** runs in v1. No second checkout path.
 
 `clone` is authored explicitly (no implicit auto-prepended checkout), preserving
 ADR-0007's single rule ("a Step inherits the merged workspace of its `needs`")
-with no exception, and staying correct for repo-less triggers (`upstream` on
+with no exception, and never pretending there is source to check out for repo-less triggers (`upstream` on
 artifacts, `cron`/`manual`/`api` with no ref).
 
 - Because `clone` is a built-in *kind* (not a marketplace action), the author

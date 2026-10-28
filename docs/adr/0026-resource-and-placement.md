@@ -20,7 +20,7 @@ over-abstracting blocks power users (a specific taint, a GPU class).
   runtimeClass / requests).
 - A **raw pod-spec overlay** is available for power users who need it.
 
-Portable by default, with no hard ceiling. Infra lives in admin config, not pipeline files.
+Portable by default, with no ceiling for power users. Infra lives in admin config, not pipeline files.
 
 ## Consequences
 

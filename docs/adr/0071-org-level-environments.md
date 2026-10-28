@@ -3,7 +3,7 @@
 - **Status:** Proposed
 - **Date:** 2026-10-22
 - **Deciders:** thulasi.ram (architect)
-- **Builds on:** [0024](0024-environments.md) (Environments with protection rules),
+- **Builds on:** [0024](0024-environments.md) (Environment as a built-in entity),
   [0037](0037-environment-governance.md) (approval-as-gate, scoped secrets, admission at
   the point of use), [0070](0070-deployments-as-a-vendor-neutral-record.md) (the
   Deployment record an Environment owns)

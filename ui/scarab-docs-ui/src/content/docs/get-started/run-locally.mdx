@@ -67,7 +67,7 @@ streamed over SSE, is a follow-up.
 ## What just happened
 
 The server wrote every step transition to Postgres, where the run lives as a durable state
-machine. Try it: kill the control plane mid-run and bring it back. The run resumes from where it
+machine. Kill the control plane mid-run and bring it back. The run resumes from where it
 stopped instead of starting over. That is the main guarantee Scarab makes.
 
 ## References

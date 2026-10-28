@@ -35,7 +35,7 @@ The governing principle, from the owner, verbatim:
 > "We should not overfit scarab to argo, we should ensure the plugin system is powerful
 > enough to fit argo."
 
-Argo is the case that proves the design. Every capability below exists because the Argo plugin
+Argo is the workload we test the design against. Every capability below exists because the Argo plugin
 needs it *and* a non-Argo plugin could use it the same way.
 
 Two earlier decisions constrain the design and **still stand**:
@@ -124,7 +124,7 @@ audit, Environment governance, durability and fencing apply unchanged.
 - No PluginAction is offered on a DeploymentTarget with no owners (ADR-0071 §4).
 - What a PluginAction *means* is the Plugin's business. A mislabelled one is caught by
   install review, the broker's rules and the vendor's own RBAC; anything it makes live
-  without a request surfaces as an Unexplained Deployment.
+  without a request shows up as an Unexplained Deployment.
 
 ### 5. CredentialBroker, PluginConnection and request rules
 

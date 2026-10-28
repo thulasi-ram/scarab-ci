@@ -54,7 +54,7 @@ event log — deferred, no migration pain.
   acting principal (closes the who-restarted-this audit gap).
 - **`AttemptReadopted { step, attempt }`** — a control-plane crash re-adopting
   a live Pod (same attempt, same fence, per ADR-0047) is currently invisible.
-  This event exists only for visibility: it makes crash recovery visible
+  This event exists only so crash recovery shows up
   in the Activity feed. It is *not* a new attempt and must not render as one.
 
 ### Evidence moves to the attempt grain — the fence unit is the storage unit

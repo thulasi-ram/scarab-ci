@@ -136,7 +136,7 @@ VictoriaLogs or an object store may receive a copy for operators who want logs i
 stack. None of them becomes the thing Scarab reads back.
 [CONTEXT.md](../../CONTEXT.md) §4.3 states that *"each Attempt owns its evidence — logs, Results,
 Artifacts, workspace snapshot"*. Making an external system the system of record would make that
-sentence impossible to back up: a green Attempt from three weeks ago whose logs vanished at day 7 under
+sentence a claim Scarab cannot stand behind: a green Attempt from three weeks ago whose logs vanished at day 7 under
 someone else's retention policy, with Scarab's durable record pointing at data it neither governs
 nor can verify. That is the same defect as declaring success before durability, and it is refused
 for the same reason.

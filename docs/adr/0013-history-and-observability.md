@@ -33,7 +33,7 @@ Implementation defaults:
   > object store, the alternatives are a volume that dies with a Pod or nothing at all, and both lose
   > the one class whose loss is final.
   >
-  > **The exception is bounded on four axes, and each one matters:**
+  > **The exception is bounded on four axes, and all four are required; drop any one and the exception no longer holds:**
   >
   > - **Compressed** — chunks are gzipped before they reach the row, as they already are on the object
   >   store path.

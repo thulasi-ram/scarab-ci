@@ -7,7 +7,7 @@
 
 ## Context
 
-The scheduler tick (`Scheduler::tick_all`) is the durable loop that drives the whole fleet: each cycle it
+The scheduler tick (`Scheduler::tick_all`) is the durable loop behind the whole fleet: each cycle it
 walks every active Run and drives it forward (reconcile shared services → admit → advance), plus a
 few cross-run reconcile passes (`reconcile`, `reconcile_cancellations`, `reconcile_supersessions`).
 

@@ -61,7 +61,7 @@ claim to survive review, because by the time anyone checked the behaviour, the
 behaviour agreed with it.
 
 The original error is worth spelling out, because it is easy to
-repeat: it is true that `rerun_step` does not compare output hashes. It re-arms the
+repeat: `rerun_step` does not, in fact, compare output hashes. It re-arms the
 invalidation set to `Pending` and stops. The comparison lives in **admission**,
 which decides per step whether a `Pending` step runs. Reading the rerun entry
 point and finding no comparison is a correct reading of that function and a wrong
@@ -70,7 +70,7 @@ amendment asserting that something is not built must name where it looked** — 
 "not built" is a claim about a behaviour, so it needs a behavioural check, not a
 reading of one function.
 
-`force-skip` and `force-cascade` really are still unbuilt, and the "inputs
+`force-skip` and `force-cascade` are still unbuilt, and the "inputs
 unchanged" signal exists on the event log (`StepSkipped`) but not yet as a
 dedicated UI feature.
 

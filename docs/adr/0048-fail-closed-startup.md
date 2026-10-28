@@ -27,7 +27,7 @@ of what is enabled / disabled / degraded.
 
 ### Postgres is mandatory for every serving role — no API-only mode
 
-Postgres is the durable store and the coordination bus (CONTEXT §5); a DB-less server
+Postgres is what makes Scarab durable, and it is the coordination bus (CONTEXT §5); a DB-less server
 contradicts the durable-core design. **No `SCARAB_DATABASE_URL` → refuse to boot** (any serving
 role: converged/api/scheduler/executor/webhook). The unconnected-DB /
 `DbError::Unavailable` code path and the API-only mode are **deleted**, not

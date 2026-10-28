@@ -14,8 +14,8 @@ which Scarab runs as a single Kubernetes **Pod**. A **pipeline** is a group of s
 are triggered and wired together. Structurally a pipeline is a **flat recursive DAG**
 (`Pipeline → Step`).
 
-You write YAML, with **CEL** for expressions, and Scarab compiles it to a **typed IR**, which is
-the DSL proper.
+You write YAML, with **CEL** for expressions. Scarab compiles it to a **typed IR**, and the IR
+(not the YAML) defines what a valid pipeline is.
 `invoke` reuses a library pipeline by inlining it into the caller's DAG at compile time.
 `matrix` is a modifier that fans a step out over a set of inputs.
 

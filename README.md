@@ -53,8 +53,8 @@ restart: they stay stuck in `running` and leave containers behind
 [drone#2189](https://github.com/harness/drone/issues/2189)). A Scarab run picks up where it
 left off.
 
-We don't think durability on its own is a reason to pick a CI, but several useful features
-fall out of it: resuming a run, restarting a single step, approval gates that survive a
+Durability is how the engine is built, not the main reason to pick it. Several useful
+features come from it: resuming a run, restarting a single step, approval gates that survive a
 restart, and an event log you can inspect. It matters most as pipelines get longer and more
 autonomous (agents, multi-day workflows, long review gates),
 where "the job died, click re-run" is no longer good enough. Scarab holds a suspended
@@ -63,8 +63,8 @@ run at near-zero cost and resumes exactly where it paused.
 **Lineage.** Scarab's design owes a lot to [Woodpecker](https://woodpecker-ci.org/), a lean,
 forge-native CI without enterprise overhead. Woodpecker's limits shaped it just as much: the
 many backends it has to support, and the pace a volunteer project can keep up. Supporting
-only Kubernetes drops the extra backends on purpose, and a small team building with AI tools
-can now move faster than that.
+only Kubernetes drops the extra backends on purpose, and a small team building AI-first
+can now move faster than a volunteer project can.
 
 ## Status
 
@@ -136,7 +136,7 @@ Here a flaky step was retried automatically, then the run paused on a manual
 | **Forge CI and engine together** | A forge-native CI (DSL, secrets, approvals, identity, UI) on a durable engine. You don't have to build a CI on top of a workflow engine, or accept a job runner with nothing durable underneath. |
 | **Runs are state, not processes** | A DBOS-pattern durable state machine on Postgres. When the control plane restarts, the run resumes from its last completed step, and each step runs exactly once. |
 | **Keyless identity** | Forge-agnostic OIDC, with Scarab itself as an OIDC issuer for keyless federation to your cloud. *(GitHub + Forgejo adapters implemented; the live-forge loop is not yet hardened; see Status.)* |
-| **A real DSL** | You write YAML with CEL expressions; it compiles to a typed IR, which is the actual DSL. Every pipeline is a flat recursive DAG: `invoke` handles reuse and matrix is a modifier. |
+| **A real DSL** | You write YAML with CEL expressions. Scarab compiles it to a typed IR, and the IR (not the YAML) defines what a valid pipeline is. Every pipeline is a flat recursive DAG: `invoke` handles reuse and matrix is a modifier. |
 
 Every other design decision gets checked against the durable core. The reason to use
 Scarab, though, is that the CI and the engine come as one piece. See

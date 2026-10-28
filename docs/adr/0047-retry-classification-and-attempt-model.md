@@ -119,6 +119,6 @@ today's infinite redelivery of a permanently-failing message
 
 - **Uniform auto-retry any failure (ADR-0020 literal):** silently assumes all
   steps are retry-safe; re-runs doomed user code. Refined away.
-- **Opt-in retry for *all* classes incl. never-started:** correct but poor
+- **Opt-in retry for *all* classes incl. never-started:** safe (it never assumes a step is retry-safe) but poor
   ergonomics — a registry blip would fail every build until authors add `retry:`.
   Rejected; never-started is unconditionally safe to auto-heal.

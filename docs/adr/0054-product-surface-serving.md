@@ -25,7 +25,7 @@ and the single-binary approach (§5). The Dockerfile builds the UI and embeds it
 UI versions with the server (acceptable, even desirable, for a self-hosted
 product).
 
-### Run cancellation gets a proper API
+### Run cancellation gets its own API endpoint
 
 `POST /v1/runs/{id}/cancel` → transition to `Cancelled` **and tear down Pods**
 (wires the existing `cancel_run` plus the never-called `executor.cancel`,

@@ -21,7 +21,7 @@ can write these fields today and get zero effect and zero error. The `scarab-exe
 Pod builder ends with `..Default::default()` — no `node_selector`, `tolerations`, `affinity`,
 or container `resources`.
 
-What forced this is ACME (the intended dogfood cluster). Its CI nodes are tainted
+ACME (the intended dogfood cluster) forced this. Its CI nodes are tainted
 (`workload-type=application-sub-critical:NoSchedule`) across **multiple pools** by
 architecture (amd64/arm64) and workload tier. Their Woodpecker setup needed the toleration
 on *every* step Pod or nothing schedules, and was fragile enough that they bolted on **two**

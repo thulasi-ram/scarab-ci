@@ -8,7 +8,7 @@
 
 There are many CI systems (GitHub Actions, Woodpecker, Concourse, Tekton, Argo). A new
 entrant that is merely "a bit nicer" than an incumbent has no reason to exist. We must be
-far better at exactly one thing, and let that drive every other decision.
+far better at exactly one thing, and let that constrain every other decision.
 
 The candidate differentiators (forge-centric, k8s-native, better restart/resume UX, durable
 execution) are not equally strong. "k8s-native" is an implementation choice (Tekton/Argo own it);
@@ -18,7 +18,7 @@ restart/resume UX as a direct by-product of its structure is **durable execution
 
 ## Decision
 
-Scarab's core idea is **durable execution**: *a pipeline is a resumable, inspectable,
+Scarab's main differentiator is **durable execution**: *a pipeline is a resumable, inspectable,
 mutable-mid-flight workflow, not a fire-and-forget batch job.* Restart-step, resume,
 time-travel, and crash-safe scheduling are **derived** from this, not bolted on. Forge
 integration and Kubernetes are *means*, not the point.
@@ -34,6 +34,6 @@ integration and Kubernetes are *means*, not the point.
 
 ## Alternatives considered
 
-- **Developer-UX as the core idea** — UX is downstream of durability here; making it primary
+- **Developer-UX as the differentiator** — UX is downstream of durability here; making it primary
   would leave the hard part unproven.
-- **k8s purity / forge-centricity as the core idea** — already owned by incumbents; not defensible.
+- **k8s purity / forge-centricity as the differentiator** — already owned by incumbents; not defensible.

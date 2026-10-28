@@ -23,8 +23,8 @@ is a real durable suspend point but records **no approver identity**.
 The value of Environment is not any single rule. It is that **one reference —
 `environment: prod` — pulls in a governed bundle (approval + secrets + allowed-refs +
 OIDC subject), defined once by an admin and reused across pipelines.** That removes the
-per-pipeline wiring work. And because rules live in an admin-owned entity rather than the
-pipeline YAML, it gives separation of duties: a pipeline author *requests* a deploy; the
+per-pipeline wiring work. It also gives separation of duties, because rules live in an
+admin-owned entity rather than the pipeline YAML: a pipeline author *requests* a deploy; the
 environment *governs* it, regardless of what the YAML says (the GHA model).
 
 ## Decision

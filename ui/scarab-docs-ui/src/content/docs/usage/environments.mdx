@@ -12,8 +12,8 @@ import Doodle from '../../../components/Doodle.astro';
 An Environment (for example `staging` or `prod`) is a **deploy destination whose rules and
 scoped secrets an admin owns** (ADR-0037).
 The useful part is the bundle. One reference (`environment: prod` in a pipeline) pulls in
-approval, secrets, allowed refs and OIDC subject, which an admin defines **once** and every
-pipeline reuses. Because the rules live in the environment, which an admin owns, and not in the
+approval, secrets, allowed refs and OIDC subject, which an admin defines **once** and any
+pipeline can reuse. Because the rules live in the environment, which an admin owns, and not in the
 pipeline YAML, you get separation of duties: a pipeline author *requests* a deploy, and the
 environment *decides* whether it goes ahead, whatever the YAML says. Editing an environment needs
 the **Administer** capability on the repo.

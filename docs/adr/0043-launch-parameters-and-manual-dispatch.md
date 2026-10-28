@@ -186,11 +186,11 @@ constant, *not* `step_results`).
 - **A separate top-level `params:`/`dispatch:` block** (GHA keeps
   `workflow_dispatch.inputs` distinct from reusable-workflow inputs) — rejected:
   a parallel declaration, a second validator, a second env convention, for no v1
-  payoff. Unification is more consistent with the core idea.
+  payoff. Unification follows the same principle: fewer concepts, strictly more power.
 - **World A — inline-IR `POST /v1/runs` + client-side interface parsing** — the
   Woodpecker model. Rejected: no catalog (server doesn't know what exists at a
   ref), interface-parsing duplicated in JS (works around invariant #5), and,
-  worst of all, manual runs stay repo-less, so a *deploy* dispatched manually gets
+  fatally for this option, manual runs stay repo-less, so a *deploy* dispatched manually gets
   **no Environment/secrets/admission**. Manual dispatch's main use case is
   exactly a deploy.
 - **String-only parameters** — rejected: reduces the UI to naked text boxes (the
