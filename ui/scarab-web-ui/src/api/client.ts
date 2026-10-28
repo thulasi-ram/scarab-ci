@@ -149,14 +149,17 @@ export async function repoForgeUrl(org: string, repo: string): Promise<string | 
 }
 
 /** One repo's most recent runs (`GET /v1/repos/{org}/{repo}/runs`) — the source
- * for a repo card's pass/fail chart. Newest first. */
+ * for a repo card's pass/fail chart and the Runs tab. Newest first. With
+ * `environment`, only the deploy runs into it, filtered on the server before
+ * `limit` (ADR-0074 §2); pass `undefined`, never `""` (a 400), for all runs. */
 export async function listRepoRuns(
   org: string,
   repo: string,
   limit = 20,
+  environment?: string,
 ): Promise<RunSummary[]> {
   const { data, error } = await api.GET("/v1/repos/{org}/{repo}/runs", {
-    params: { path: { org, repo }, query: { limit } },
+    params: { path: { org, repo }, query: { limit, environment } },
   });
   if (error || !data) {
     throw new Error(`failed to list runs for ${org}/${repo}`);

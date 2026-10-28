@@ -1503,7 +1503,16 @@ function route(pathname: string, search: string, method: string): Response | nul
 
   // /v1/repos/{org}/{repo}/runs
   if ((m = p.match(/^\/v1\/repos\/[^/]+\/([^/]+)\/runs$/))) {
-    return json(repoRuns[m[1]] ?? strip("ooooooooooooo"));
+    const { runs } = repoRuns[m[1]] ?? strip("ooooooooooooo");
+    // `?environment=` filters before `limit`, as the server does; empty is a 400.
+    const q = new URLSearchParams(search);
+    const env = q.get("environment");
+    if (env === "") {
+      return new Response("`environment` must name an Environment", { status: 400 });
+    }
+    const matching = env == null ? runs : runs.filter((r) => r.environment === env);
+    const limit = Number(q.get("limit") ?? 50);
+    return json({ runs: matching.slice(0, limit) });
   }
   // /v1/repos/{org}/{repo}/environments
   if ((m = p.match(/^\/v1\/repos\/[^/]+\/([^/]+)\/environments$/))) {
