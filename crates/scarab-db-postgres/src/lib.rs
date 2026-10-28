@@ -37,6 +37,8 @@ mod org_environments;
 /// `PluginStore` (ADR-0072): PluginInstallations, the kill switch, their
 /// PluginConnections and the broker journal.
 mod plugins;
+/// `PolicyStore` (ADR-0075): Policies, their versions, and PolicyDecisions.
+mod policies;
 /// Step-up confirmation (ADR-0073): `PasskeyStore`, `ChallengeStore`,
 /// `StepUpStore` and the append-only `SecurityEventLog`.
 mod step_up;

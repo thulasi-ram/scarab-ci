@@ -78,6 +78,8 @@ scarab-plugin = { path = "crates/scarab-plugin" }
 # ADR-0072 §9/§11: the plugin runtime's Kubernetes adapter (namespace
 # baseline, workloads, isolation probe, TokenReview).
 scarab-plugin-k8s = { path = "crates/scarab-plugin-k8s" }
+# ADR-0075: the policy engine (Policy IR, evaluator, `PolicyStore` port).
+scarab-policy = { path = "crates/scarab-policy" }
 
 # --- test-only ---------------------------------------------------------------
 # Property testing for pure domain folds (invariant suites). Dev-dependency
