@@ -2915,11 +2915,15 @@ dependencies = [
 name = "scarab-policy"
 version = "0.2.2"
 dependencies = [
+ "async-trait",
  "cel",
  "chrono",
  "regex",
+ "scarab-pipeline",
  "serde",
  "serde_json",
+ "sha2",
+ "thiserror",
 ]
 
 [[package]]

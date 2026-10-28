@@ -22,7 +22,15 @@
 //! short-circuits ignored. String functions cost 1 regardless of string length;
 //! that is sound only while checkpoint inputs bound their strings, which this
 //! spike does not enforce.
+//!
+//! **Stack.** Parsing, checking and evaluating run on a thread with a large
+//! stack ([`on_cel_stack`]), after a length and bracket-depth pre-check: a
+//! stack overflow aborts the process and `catch_unwind` cannot stop it, and a
+//! Policy save runs this checker on user input inside the server. Nothing that
+//! holds a parsed AST leaves that thread, since dropping the tree recurses
+//! too: [`Checked`] keeps the source, and evaluation parses it again.
 
+use std::collections::BTreeSet;
 use std::fmt;
 
 use cel::common::ast::{
@@ -64,9 +72,14 @@ const TYPE_NAMES: &[&str] = &[
 ];
 
 /// A rule's checked expression, or a finding about it.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Diagnostic {
-    /// 1-based line and column of the node, when the parser recorded one.
+    /// Where in the Policy the finding is, e.g. `rules[0].when` or `match`.
+    /// Empty for a finding of [`check`] alone, which sees one rule.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub at: String,
+    /// 1-based line and column of the node, when the parser recorded one; 0
+    /// for a finding that is not about CEL.
     pub line: u32,
     pub column: u32,
     /// The sub-expression the finding is about, as the checker renders it.
@@ -74,8 +87,27 @@ pub struct Diagnostic {
     pub message: String,
 }
 
+impl Diagnostic {
+    /// A finding about the Policy's structure, not about a CEL expression.
+    pub fn at(at: impl Into<String>, message: impl Into<String>) -> Diagnostic {
+        Diagnostic {
+            at: at.into(),
+            line: 0,
+            column: 0,
+            expr: String::new(),
+            message: message.into(),
+        }
+    }
+}
+
 impl fmt::Display for Diagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if !self.at.is_empty() {
+            write!(f, "{}: ", self.at)?;
+        }
+        if self.line == 0 {
+            return f.write_str(&self.message);
+        }
         write!(
             f,
             "{}:{}: `{}`: {}",
@@ -84,18 +116,52 @@ impl fmt::Display for Diagnostic {
     }
 }
 
-/// A rule that type-checked.
-#[derive(Debug)]
+/// A rule that type-checked. It keeps the source, not the parsed program:
+/// evaluation parses it again on the large-stack thread (see the module
+/// documentation).
+#[derive(Clone, Debug, PartialEq)]
 pub struct Checked {
-    pub program: cel::Program,
+    pub source: String,
     pub result: Type,
     pub cost: u64,
     pub warnings: Vec<Diagnostic>,
+    /// The checkpoint fields the rule reads: each top-level variable, and
+    /// `variable.field` for a field selected from it directly (`trigger`,
+    /// `trigger.ref`). Fields read through an iteration variable count
+    /// towards the list variable (`steps`).
+    pub reads: BTreeSet<String>,
+}
+
+/// Runs `f` on a thread whose stack holds the deepest rule the limits allow
+/// (`scarab_pipeline::cel::CEL_STACK_BYTES`: 256 MiB reserved in a debug
+/// build, 64 MiB in release; only touched pages are committed). A panic on
+/// that thread, or failing to start it, is an `Err` with a short reason.
+pub fn on_cel_stack<T: Send>(f: impl FnOnce() -> T + Send) -> Result<T, String> {
+    std::thread::scope(|scope| {
+        let handle = std::thread::Builder::new()
+            .name("scarab-policy-cel".into())
+            .stack_size(scarab_pipeline::cel::CEL_STACK_BYTES)
+            .spawn_scoped(scope, f)
+            .map_err(|e| format!("cannot start the policy thread: {e}"))?;
+        handle
+            .join()
+            .map_err(|_| "the policy thread panicked".to_string())
+    })
 }
 
 /// Parses `source` and checks it against `schema`, expecting `expected` (bool
 /// for a `when`; [`Type::Dyn`] accepts any result type).
 pub fn check(schema: &Schema, source: &str, expected: &Type) -> Result<Checked, Vec<Diagnostic>> {
+    check_limits(source)?;
+    on_cel_stack(|| check_on_this_thread(schema, source, expected))
+        .unwrap_or_else(|e| Err(vec![at_start(source, format!("does not parse: {e}"))]))
+}
+
+fn check_on_this_thread(
+    schema: &Schema,
+    source: &str,
+    expected: &Type,
+) -> Result<Checked, Vec<Diagnostic>> {
     let program = parse(source)?;
     let mut checker = Checker {
         schema,
@@ -103,6 +169,7 @@ pub fn check(schema: &Schema, source: &str, expected: &Type) -> Result<Checked, 
         scopes: Vec::new(),
         guards: Vec::new(),
         warnings: Vec::new(),
+        reads: BTreeSet::new(),
         depth: 0,
     };
     let root = program.expression();
@@ -122,40 +189,66 @@ pub fn check(schema: &Schema, source: &str, expected: &Type) -> Result<Checked, 
             ),
         )]);
     }
-    let warnings = checker.warnings;
+    let Checker {
+        warnings, reads, ..
+    } = checker;
     Ok(Checked {
-        program,
+        source: source.to_string(),
         result,
         cost,
         warnings,
+        reads,
     })
 }
 
-/// Parses with the standard macros, containing a parser panic as a parse error.
-///
-/// A stack overflow is not a panic: it aborts the process. `cel` 0.15 stops
-/// nesting such as `((((…` at a depth of 96, but a left-recursive chain
-/// (`a.b.b.b…`, `x + x + x…`) of about 5,000 links overflows a 2 MiB thread
-/// in a release build, in the parser or in dropping the AST. The length cap
-/// keeps a rule well under that.
-pub(crate) fn parse(source: &str) -> Result<cel::Program, Vec<Diagnostic>> {
-    let at_start = |message: String| Diagnostic {
+fn at_start(source: &str, message: String) -> Diagnostic {
+    Diagnostic {
+        at: String::new(),
         line: 1,
         column: 1,
         expr: source.chars().take(60).collect(),
         message,
-    };
-    if source.len() > MAX_SOURCE_LEN {
-        return Err(vec![at_start(format!(
-            "a rule is at most {MAX_SOURCE_LEN} bytes; this one is {}",
-            source.len()
-        ))]);
     }
+}
+
+/// Refuses, before parsing, a rule the parser could not handle safely: longer
+/// than [`MAX_SOURCE_LEN`], or with brackets nested deeper than
+/// [`MAX_DEPTH`] (counted as `scarab-pipeline` counts them, outside string
+/// literals and comments).
+pub(crate) fn check_limits(source: &str) -> Result<(), Vec<Diagnostic>> {
+    if source.len() > MAX_SOURCE_LEN {
+        return Err(vec![at_start(
+            source,
+            format!(
+                "a rule is at most {MAX_SOURCE_LEN} bytes; this one is {}",
+                source.len()
+            ),
+        )]);
+    }
+    let depth = scarab_pipeline::cel::max_nesting(source);
+    if depth > MAX_DEPTH as usize {
+        return Err(vec![at_start(
+            source,
+            format!("brackets nest {depth} deep; the limit is {MAX_DEPTH}"),
+        )]);
+    }
+    Ok(())
+}
+
+/// Parses with the standard macros, containing a parser panic as a parse
+/// error. Call it only on the [`on_cel_stack`] thread, after
+/// [`check_limits`].
+///
+/// A stack overflow is not a panic: it aborts the process. In a debug build
+/// `cel` 0.15's parser overflows a 2 MiB thread at about 12 nested
+/// parentheses; in release a left-recursive chain (`a.b.b.b…`, `x + x + x…`)
+/// of about 5,000 links does, in the parser or in dropping the AST.
+pub(crate) fn parse(source: &str) -> Result<cel::Program, Vec<Diagnostic>> {
     let parsed = std::panic::catch_unwind(|| cel::Program::compile(source));
     match parsed {
         Ok(Ok(program)) => Ok(program),
-        Ok(Err(errors)) => Err(vec![at_start(format!("does not parse: {errors}"))]),
-        Err(_) => Err(vec![at_start("does not parse".to_string())]),
+        Ok(Err(errors)) => Err(vec![at_start(source, format!("does not parse: {errors}"))]),
+        Err(_) => Err(vec![at_start(source, "does not parse".to_string())]),
     }
 }
 
@@ -211,6 +304,8 @@ struct Checker<'a> {
     /// Paths known present here: `has(a.b)` or `a != null` held on the way in.
     guards: Vec<String>,
     warnings: Vec<Diagnostic>,
+    /// See [`Checked::reads`].
+    reads: BTreeSet<String>,
     depth: u32,
 }
 
@@ -224,6 +319,7 @@ impl Checker<'_> {
             .map(|(start, _)| line_col(&self.info.source, start as usize))
             .unwrap_or((1, 1));
         Diagnostic {
+            at: String::new(),
             line,
             column,
             expr: render(e),
@@ -337,12 +433,15 @@ impl Checker<'_> {
         self.ident_type(e, name)
     }
 
-    fn ident_type(&self, e: &IdedExpr, name: &str) -> Checked1 {
+    fn ident_type(&mut self, e: &IdedExpr, name: &str) -> Checked1 {
         if let Some((_, t)) = self.scopes.iter().rev().find(|(n, _)| n == name) {
             return Ok((t.clone(), 1));
         }
         match self.schema.variable(name) {
-            Some(var) => Ok((var.ty.clone(), 1)),
+            Some(var) => {
+                self.reads.insert(name.to_string());
+                Ok((var.ty.clone(), 1))
+            }
             None if TYPE_NAMES.contains(&name) => {
                 Err(self.unsupported(e, &format!("the type name `{name}`")))
             }
@@ -366,8 +465,19 @@ impl Checker<'_> {
         }
     }
 
+    /// Records `variable.field` when `sel` selects from a top-level variable.
+    fn read_field(&mut self, sel: &SelectExpr) {
+        if let Expr::Ident(name) = &sel.operand.expr {
+            let shadowed = self.scopes.iter().any(|(n, _)| n == name);
+            if !shadowed && self.schema.variable(name).is_some() {
+                self.reads.insert(format!("{name}.{}", sel.field));
+            }
+        }
+    }
+
     fn select(&mut self, e: &IdedExpr, sel: &SelectExpr) -> Checked1 {
         let (t, cost) = self.expr(&sel.operand)?;
+        self.read_field(sel);
         match &t {
             Type::Struct(name) => {
                 let decl = self.schema.struct_decl(name);
@@ -410,6 +520,7 @@ impl Checker<'_> {
 
     fn has(&mut self, e: &IdedExpr, sel: &SelectExpr) -> Checked1 {
         let (t, cost) = self.expr(&sel.operand)?;
+        self.read_field(sel);
         match &t {
             Type::Struct(name) => {
                 let decl = self.schema.struct_decl(name);

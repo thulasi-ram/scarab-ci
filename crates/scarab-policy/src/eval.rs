@@ -12,7 +12,7 @@ use std::sync::Arc;
 use cel::objects::{Key, Map};
 use cel::{Context, Value};
 
-use crate::check::{check, Checked, Diagnostic};
+use crate::check::{check, check_limits, on_cel_stack, parse, Checked, Diagnostic};
 use crate::schema::{Schema, Type};
 
 /// One rule of a Policy, checked. Its message is static (ADR-0075 §4): the
@@ -49,23 +49,39 @@ pub enum RuleOutcome {
 }
 
 /// Evaluates `rule` against `input`. Any error, in binding the input or in
-/// evaluating `when`, denies (ADR-0075 §6).
-pub fn evaluate_rule<I: serde::Serialize>(schema: &Schema, rule: &Rule, input: &I) -> RuleOutcome {
+/// evaluating `when`, denies (ADR-0075 §6). Runs on the large-stack thread
+/// ([`on_cel_stack`]).
+pub fn evaluate_rule<I: serde::Serialize + Sync>(
+    schema: &Schema,
+    rule: &Rule,
+    input: &I,
+) -> RuleOutcome {
     let denied = |error: String| RuleOutcome::DeniedOnError {
         message: rule.message.clone(),
         error,
     };
-    let context = match bind(schema, input) {
-        Ok(c) => c,
-        Err(e) => return denied(format!("input does not match the schema: {e}")),
-    };
-    match rule.when.program.execute(&context) {
-        Ok(Value::Bool(false)) => RuleOutcome::DoesNotApply,
-        Ok(Value::Bool(true)) => RuleOutcome::Applies {
+    let context = || bind(schema, input);
+    match on_cel_stack(|| {
+        let context = context().map_err(|e| format!("input does not match the schema: {e}"))?;
+        evaluate_when(&rule.when.source, &context)
+    }) {
+        Ok(Ok(true)) => RuleOutcome::Applies {
             message: rule.message.clone(),
         },
-        Ok(other) => denied(format!("`when` returned {other:?}, not a bool")),
-        Err(e) => denied(e.to_string()),
+        Ok(Ok(false)) => RuleOutcome::DoesNotApply,
+        Ok(Err(e)) | Err(e) => denied(e),
+    }
+}
+
+/// Parses a checked `when` again and evaluates it against `context`. Call it
+/// only on the [`on_cel_stack`] thread: the parsed program is dropped here.
+pub(crate) fn evaluate_when(source: &str, context: &Context<'_, '_>) -> Result<bool, String> {
+    check_limits(source).map_err(|d| d[0].message.clone())?;
+    let program = parse(source).map_err(|d| d[0].message.clone())?;
+    match program.execute(context) {
+        Ok(Value::Bool(b)) => Ok(b),
+        Ok(other) => Err(format!("`when` returned {other:?}, not a bool")),
+        Err(e) => Err(e.to_string()),
     }
 }
 

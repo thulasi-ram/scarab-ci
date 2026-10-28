@@ -215,8 +215,9 @@ macro_rules! policy_struct {
     };
 }
 
-/// Declares a closed set of strings: a Rust enum that serialises to the given
-/// names, and the [`Type::Enum`] the checker validates literals against.
+/// Declares a closed set of strings: a Rust enum that serialises to (and
+/// deserialises from) the given names, and the [`Type::Enum`] the checker
+/// validates literals against.
 #[macro_export]
 macro_rules! policy_enum {
     (
@@ -224,7 +225,9 @@ macro_rules! policy_enum {
         $vis:vis enum $name:ident { $( $variant:ident => $wire:literal ),* $(,)? }
     ) => {
         $(#[$meta])*
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+        #[derive(
+            Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+        )]
         $vis enum $name {
             $( #[serde(rename = $wire)] $variant ),*
         }
