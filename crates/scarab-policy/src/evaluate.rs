@@ -190,6 +190,9 @@ fn combine(results: &[PolicyResult]) -> DecisionOutcome {
 ///
 /// The PolicySetDigest covers every stored Policy at the checkpoint,
 /// compiled or not.
+///
+/// At `run.create` the built-in plugin default applies too
+/// ([`plugins_closed_default`]): its result follows the stored Policies'.
 pub fn evaluate_stored(
     checkpoint: Checkpoint,
     schema_version: u32,
@@ -264,6 +267,11 @@ pub fn evaluate_stored(
                 results.push(result_of(&stub, outcome));
                 digest_set.push(stub);
             }
+        }
+    }
+    if checkpoint == Checkpoint::RunCreate {
+        if let Ok(input) = input {
+            results.extend(plugins_closed_default(input, ctx, &digest_set));
         }
     }
     PolicyDecision {
@@ -378,6 +386,91 @@ fn cel_context<'c>(
     })
     .as_ref()
     .map_err(|e| e.clone())
+}
+
+/// The `policy_id` of the built-in plugin default's result.
+pub const PLUGINS_DEFAULT_ID: &str = "builtin:plugins_allowed";
+
+/// ADR-0075 §7's closed default for plugins: no plugin's gates run until an
+/// org admin lists the plugin. A gate whose origin includes a `plugin` link
+/// is denied unless an org-level, enforced `plugins_allowed` setting whose
+/// `match` fits lists that installation. A Project's setting, or one in
+/// audit mode, lists nothing here: it can only narrow what the org allows,
+/// which its own typed rule does.
+///
+/// `None` when the input has no plugin gate. The default is fixed in code,
+/// so it is not part of the PolicySetDigest.
+pub fn plugins_closed_default(
+    input: &Value,
+    ctx: &MatchContext,
+    policies: &[PolicyIr],
+) -> Option<PolicyResult> {
+    let listed: Vec<&str> = policies
+        .iter()
+        .filter(|p| p.level == Level::Org && p.mode == Mode::Enforce && matches(&p.match_, ctx))
+        .flat_map(|p| &p.rules)
+        .filter_map(|r| match &r.predicate {
+            Predicate::Typed(TypedPredicate::PluginsAllowed { installations }) => {
+                Some(installations)
+            }
+            _ => None,
+        })
+        .flatten()
+        .map(String::as_str)
+        .collect();
+    let outcome = match units(input) {
+        Err(e) => {
+            // An input that cannot be read is checked by nothing else
+            // either; fail closed only when it may hold a plugin gate.
+            let gates = input.get("gates").and_then(Value::as_array);
+            if gates.is_some_and(|g| g.is_empty()) {
+                return None;
+            }
+            PolicyOutcome::Error {
+                message: format!("the plugin default could not be evaluated, so it denies: {e}"),
+            }
+        }
+        Ok(units) => {
+            let gates: Vec<(&str, &str)> = units
+                .iter()
+                .filter(|u| u.what == "Gate")
+                .flat_map(|u| {
+                    u.origins
+                        .iter()
+                        .filter(|o| o.kind == "plugin")
+                        .map(|o| (u.id, o.name))
+                })
+                .collect();
+            if gates.is_empty() {
+                return None;
+            }
+            let mut messages: Vec<String> = gates
+                .iter()
+                .filter(|(_, plugin)| !listed.contains(plugin))
+                .map(|(id, plugin)| {
+                    format!(
+                        "Gate `{id}` comes from plugin `{plugin}`, which no org-level \
+                         plugins_allowed setting lists; no plugin's gates run until an org \
+                         admin lists the plugin."
+                    )
+                })
+                .collect();
+            messages.dedup();
+            if messages.is_empty() {
+                PolicyOutcome::Passed
+            } else {
+                PolicyOutcome::Denied { messages }
+            }
+        }
+    };
+    Some(PolicyResult {
+        policy_id: PLUGINS_DEFAULT_ID.to_string(),
+        version: 0,
+        name: "plugins-allowed-default".to_string(),
+        level: Level::Org,
+        mode: Mode::Enforce,
+        outcome,
+    })
 }
 
 /// One origin, read from the input's JSON.

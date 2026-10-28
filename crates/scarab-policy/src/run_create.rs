@@ -288,6 +288,18 @@ pub fn uses_environment_authority(
         || ir.deploy
 }
 
+/// Whether a gate of `ir` comes from a plugin: such a Run is consulted at
+/// `run.create` even when no Policy is stored, for the closed plugin
+/// default ([`plugins_closed_default`](crate::evaluate::plugins_closed_default)).
+pub fn has_plugin_gate(ir: &scarab_pipeline::PipelineIr) -> bool {
+    ir.steps.iter().any(|s| {
+        s.is_gate()
+            && s.origin
+                .iter()
+                .any(|o| o.kind == scarab_pipeline::OriginKind::Plugin)
+    })
+}
+
 /// Refuses a Run over [`MAX_STEPS`] Steps or [`MAX_GATES`] gates, in time
 /// linear in its size. [`input_from_pipeline`] checks this first, before any
 /// work that grows faster than the Run: a Pipeline that compiles to 100,000

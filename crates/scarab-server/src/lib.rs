@@ -4801,7 +4801,10 @@ fn run_create_input(
 /// Consults the `run.create` Policies of `repo`'s org and Project for a
 /// compiled Pipeline about to become Run `run` (ADR-0075 §2, §7, §9).
 ///
-/// - No Policy at `run.create`: nothing is evaluated or recorded.
+/// - No Policy at `run.create` and no plugin gate: nothing is evaluated or
+///   recorded. A plugin gate is denied by the closed plugin default
+///   ([`plugins_closed_default`](scarab_policy::evaluate::plugins_closed_default))
+///   unless an org-level, enforced `plugins_allowed` setting lists it.
 /// - Otherwise the decision is recorded: an allow with `run`, a deny with no
 ///   Run (the org's decision log). A deny is an
 ///   [`AdmissionRefusal::PolicyDenied`] whose messages name their Policy.
@@ -4829,7 +4832,9 @@ async fn consult_run_create(
         .effective(&repo.owner, Some(&repo.name), Checkpoint::RunCreate)
         .await
         .map_err(policy_store_err)?;
-    if stored.is_empty() {
+    // A plugin gate is consulted with no Policy stored: the closed plugin
+    // default denies it until an org lists the plugin (ADR-0075 §7).
+    if stored.is_empty() && !run_create::has_plugin_gate(ir) {
         return Ok(Ok(()));
     }
 

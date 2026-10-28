@@ -4,12 +4,14 @@
 
 use scarab_policy::check::check;
 use scarab_policy::evaluate::{
-    evaluate, policy_set_digest, DecisionOutcome, MatchContext, PolicyDecision, PolicyOutcome,
+    evaluate, evaluate_stored, policy_set_digest, DecisionOutcome, MatchContext, PolicyDecision,
+    PolicyOutcome, PLUGINS_DEFAULT_ID,
 };
 use scarab_policy::ir::{compile, Level, PolicyIr, Predicate};
 use scarab_policy::policy::{Checkpoint, Policy};
 use scarab_policy::run_create::{self, TriggerKind};
 use scarab_policy::schema::Type;
+use scarab_policy::store::{PolicyScope, StoredPolicy};
 use serde_json::{json, Value};
 
 fn policy(v: Value) -> Policy {
@@ -576,4 +578,79 @@ fn an_input_over_a_cap_fails_closed_for_typed_settings_too() {
         run(&[], &big, &ctx("x", None)).outcome,
         DecisionOutcome::Allow
     );
+}
+
+// --- the closed plugin default ---------------------------------------------
+
+fn stored(scope: PolicyScope, body: Value) -> StoredPolicy {
+    let body = policy(body);
+    StoredPolicy {
+        id: format!("pol-{}", body.name),
+        scope,
+        name: body.name.clone(),
+        version: 1,
+        content_hash: body.content_hash(),
+        body,
+        created_at: 0,
+        updated_at: 0,
+        deleted: false,
+    }
+}
+
+fn plugins(mode: &str, installations: &[&str]) -> Value {
+    json!({
+        "name": format!("plugins-{mode}"),
+        "checkpoint": "run.create",
+        "mode": mode,
+        "setting": { "plugins_allowed": { "installations": installations } }
+    })
+}
+
+/// ADR-0075 §7: no plugin's gates run until an org admin lists the plugin.
+/// Only an org-level, enforced `plugins_allowed` setting lists one.
+#[test]
+fn a_plugin_gate_is_denied_until_an_org_setting_lists_the_plugin() {
+    let org = || PolicyScope::Org { org: "acme".into() };
+    let project = || PolicyScope::Project {
+        org: "acme".into(),
+        project: "payments-api".into(),
+    };
+    let decide = |input: &Value, ps: &[StoredPolicy]| {
+        evaluate_stored(
+            Checkpoint::RunCreate,
+            run_create::SCHEMA_VERSION,
+            Ok(input),
+            &ctx("payments-api", Some("production")),
+            ps,
+        )
+    };
+    let denied = "Gate `sync` comes from plugin `argocd`, which no org-level plugins_allowed \
+                  setting lists; no plugin's gates run until an org admin lists the plugin.";
+
+    // No Policy at all.
+    let d = decide(&input(), &[]);
+    assert_eq!(d.messages(), [denied]);
+    assert_eq!(d.results.len(), 1);
+    assert_eq!(d.results[0].policy_id, PLUGINS_DEFAULT_ID);
+
+    // Listed by the org, enforced.
+    let d = decide(&input(), &[stored(org(), plugins("enforce", &["argocd"]))]);
+    assert_eq!(d.outcome, DecisionOutcome::Allow, "{:?}", d.results);
+    assert_eq!(d.results[1].outcome, PolicyOutcome::Passed);
+
+    // Listed only in audit mode, or only by the Project: still denied.
+    for listing in [
+        stored(org(), plugins("audit", &["argocd"])),
+        stored(project(), plugins("enforce", &["argocd"])),
+    ] {
+        let d = decide(&input(), &[listing]);
+        assert_eq!(d.messages(), [denied], "{:?}", d.results);
+    }
+
+    // A Run with no plugin gate gets no default result.
+    let mut plain = input();
+    plain["gates"] = json!([]);
+    let d = decide(&plain, &[]);
+    assert!(d.results.is_empty());
+    assert_eq!(d.outcome, DecisionOutcome::Allow);
 }
