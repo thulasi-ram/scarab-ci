@@ -91,7 +91,7 @@ pub struct PipelineIr {
     pub interface: Interface,
     /// Opt-in run budget in seconds (ADR-0047): the run fails once its
     /// **active** time (gate-suspended time excluded) exceeds this. No default
-    /// — a run suspended for weeks on a gate is the wedge, not a hang; forward
+    /// — a run suspended for weeks on a gate is the core feature, not a hang; forward
     /// progress rests on step timeouts and gate expiry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<u32>,
@@ -1100,7 +1100,7 @@ pub struct PlacementProfile {
 /// [`PlacementProfile`] pattern: it lives in Scarab operator config
 /// (`SCARAB_RETENTION_CONFIG_FILE`), **not** in a pipeline; a Pipeline may
 /// *name* one via the top-level `retention_profile:` key but never defines
-/// values — where the substrate is expensive, the system pays, not the author
+/// values — where the infrastructure is expensive, the system pays, not the author
 /// (ADR-0061's governing principle).
 ///
 /// **TTL-only** (2026-08-26 narrowing of ADR-0065's bundle): the warm space

@@ -1,6 +1,9 @@
 # 0072. Plugins: a second, governed extension point beside Steps
 
-- **Status:** Proposed
+- **Status:** Accepted. The MMP is built on main (`crates/scarab-plugin`,
+  `crates/scarab-plugin-argocd`, migrations `0055_plugins.sql` and
+  `0056_plugin_connections.sql`, the `/v1/orgs/{org}/plugins/*` routes). See
+  [Implementation horizon](#implementation-horizon) for what is still open.
 - **Date:** 2026-10-22
 - **Deciders:** thulasi.ram (architect)
 - **Builds on:** [0008](0008-step-contract.md) (a Step is any OCI image; the step
@@ -35,7 +38,7 @@ The governing principle, from the owner, verbatim:
 > "We should not overfit scarab to argo, we should ensure the plugin system is powerful
 > enough to fit argo."
 
-Argo is the proving workload. Every capability below exists because the Argo plugin
+Argo is the workload we test the design against. Every capability below exists because the Argo plugin
 needs it *and* a non-Argo plugin could use it the same way.
 
 Two earlier decisions constrain the design and **still stand**:
@@ -61,7 +64,7 @@ A **Plugin** is a digest-pinned OCI image plus a **PluginManifest**. It runs as 
 long-lived workload Scarab manages, outside any Run.
 
 - It depends **only on core, never on another Plugin.**
-- **First-party Plugins use exactly the contract third parties do.** If the first-party
+- **First-party Plugins use the same contract third parties do.** If the first-party
   Argo plugin needs more, core changes; it gets no private API.
 - A Plugin never holds a long-lived credential (§6), and never reads secrets, workspaces,
   artifacts or logs unless a future capability says so.
@@ -72,7 +75,7 @@ long-lived workload Scarab manages, outside any Run.
 ### 2. A closed PluginCapability vocabulary
 
 The PluginManifest declares every **PluginCapability** the Plugin wants, with scopes.
-What an org admin approves is exactly *(image digest, manifest)*. The vocabulary is
+What an org admin approves is *(image digest, manifest)*. The vocabulary is
 **closed** and grows only with a Scarab release.
 
 | Capability | Grants |
@@ -124,7 +127,7 @@ audit, Environment governance, durability and fencing apply unchanged.
 - No PluginAction is offered on a DeploymentTarget with no owners (ADR-0071 §4).
 - What a PluginAction *means* is the Plugin's business. A mislabelled one is caught by
   install review, the broker's rules and the vendor's own RBAC; anything it makes live
-  without a request surfaces as an Unexplained Deployment.
+  without a request shows up as an Unexplained Deployment.
 
 ### 5. CredentialBroker, PluginConnection and request rules
 
@@ -195,7 +198,7 @@ can sync but not override) is the first.
   re-approved on every digest. Everything the Plugin emits (labels, links, action
   results) is scrubbed by the secret redactor.
 
-**Honest limit:** behind a **shared ingress**, a delivered credential's tunnel may reach
+**Known limit:** behind a **shared ingress**, a delivered credential's tunnel may reach
 other sites on that ingress, because address and SNI pinning cannot tell them apart. The
 UI says so. `delivered` is meant for destinations with an address of their own
 (databases, SSH, dedicated endpoints).
@@ -256,12 +259,12 @@ defend against `trusted_dom` code, which can change what is being confirmed.
 - Each Plugin runs under a ServiceAccount with **no RBAC** and **no token automount**.
   It receives only a projected token for the broker (§11).
 - **NetworkPolicy is default-deny**, including Plugin to Plugin. Egress is allowed to the
-  CredentialBroker only — not to DNS: the cluster resolver forwards any name upstream, so
+  CredentialBroker only, not to DNS: the cluster resolver forwards any name upstream, so
   a DNS allowance is a two-way tunnel out. A Plugin is handed the broker by IP instead
   (core resolves the broker's address itself). Ingress is allowed from the control plane
   only.
 - **A fail-closed isolation probe.** At install and at every start, core runs a probe Pod
-  in the namespace and checks that the policy is actually enforced. A cluster whose CNI
+  in the namespace and checks that the policy is enforced. A cluster whose CNI
   ignores NetworkPolicy fails the probe, and the Plugin does not start.
 - **A self-check in every Plugin Pod.** The probe proves one node at one moment. So each
   Plugin Pod runs the probe's plugin-side checks itself, as an initContainer, before the
@@ -281,8 +284,8 @@ defend against `trusted_dom` code, which can change what is being confirmed.
   (`delivered`, `trusted_dom`) need dual approval on every digest.
 - **Publisher trust.** A **PluginPublisher** is a signing identity (a Sigstore identity
   or key) an org trusts. **Unsigned images, or images from untrusted publishers, cannot be
-  installed.** Scarab's own release identity is trusted by default (first-party). "Which
-  plugins do we trust?" is answered as "which publishers?".
+  installed.** Scarab's own release identity is trusted by default (first-party). Trust is
+  decided per publisher, not per plugin.
 - **Operator ceiling.** Above org admins, the operator decides which publishers may be
   trusted at all and whether elevated tiers exist on this deployment.
 - **Kill switch.** An installation can be stopped at once, without an upgrade or an
@@ -324,7 +327,7 @@ defend against `trusted_dom` code, which can change what is being confirmed.
   that does not enforce it fail loudly rather than run unprotected.
 - Third-party installs stay **off** until StepUpConfirmation and publisher signatures
   exist. Until then only first-party plugins run.
-- New surface: a plugin runtime, a broker, a capability check, `plugin_action`, UI
+- New components: a plugin runtime, a broker, a capability check, `plugin_action`, UI
   extension points, step-up. This is the largest new subsystem since the engine.
 - Verifying projected tokens needs TokenReview RBAC (`system:auth-delegator`) for the
   control plane in the chart, or JWKS access.
@@ -342,19 +345,19 @@ defend against `trusted_dom` code, which can change what is being confirmed.
   that, and WASM would mean rewriting every vendor client and running it inside the
   durable core.
 - **Per-verb broker adapters** (core implements "argo sync", "argo get"). Rejected. Core
-  would accumulate vendor knowledge one verb at a time, which is exactly what plugins
+  would accumulate vendor knowledge one verb at a time, which is what plugins
   exist to keep out. Request rules over the vendor's own API keep core vendor-neutral and
   let the Plugin keep its own client.
 - **Credential vending** (short-lived tokens handed to the Plugin). Rejected as the
   default. A vended token is still a credential in the Plugin's memory, usable against
-  anything it can reach for its lifetime. Brokering keeps it out entirely. Delivery
+  anything it can reach for its lifetime. With brokering, the Plugin never holds it. Delivery
   survives only as the governed escape hatch.
 - **Same-origin-only plugin UI.** Rejected. It makes every UI contribution equivalent to
   core code. `framed` gives most plugins a native-looking UI with no viewer authority;
   `trusted_dom` remains for the few publishers an operator names.
 - **A namespace per plugin, or gVisor.** Rejected for now. One namespace with a
   default-deny policy that includes plugin-to-plugin traffic gives the same network
-  isolation more simply. Container isolation matches what Steps already get.
+  isolation without the extra namespaces. Container isolation matches what Steps already get.
 - **Plugins invoking their own actions, or acting outside Runs.** Rejected. Every write
   must sit on a Run's Attempt so governance and fencing apply.
 - **Auto-applying new digests from a trusted publisher.** Rejected. A new digest is new

@@ -6,7 +6,7 @@
 
 ## Context
 
-ADR-0008 named `clone` (forge-aware checkout) as a first-class built-in step
+ADR-0008 named `clone` (forge-aware checkout) as a built-in step
 kind, with the workspace convention at `/workspace`. The *mechanism* was never
 designed and never built: `build_pod` mounts no source, the `ForgePort`
 exposes only per-file `read_file_at_ref`/`list_dir_at_ref` (no archive fetch),
@@ -46,10 +46,10 @@ Pure git-clone for **all** runs in v1. No second checkout path.
   itself uses for fork builds. Combined with the already-designed fork-PR secret
   lockout and restricted OIDC subject (ADR-0032/0015), the blast radius of a
   leaked token is "read the repo you already forked."
-- This is coherent with CONTEXT §3: Scarab is **not a hostile-tenant system in
+- This is consistent with CONTEXT §3: Scarab is **not a hostile-tenant system in
   v1** (gVisor/Kata deferred). Defending against untrusted fork code reading its
   own source with a scoped token is not a v1 threat.
-- **Deferred (rides with hostile-tenant isolation):** a tokenless
+- **Deferred (along with hostile-tenant isolation):** a tokenless
   control-plane fetch that seeds the CAS with no credential ever entering a
   Pod. Recorded as the hardening path if/when gVisor/Kata lands; not built now
   (it would be a second checkout mechanism yielding historyless trees).
@@ -58,10 +58,10 @@ Pure git-clone for **all** runs in v1. No second checkout path.
 
 `clone` is authored explicitly (no implicit auto-prepended checkout), preserving
 ADR-0007's single rule ("a Step inherits the merged workspace of its `needs`")
-with no exception, and staying honest for repo-less triggers (`upstream` on
+with no exception, and never pretending there is source to check out for repo-less triggers (`upstream` on
 artifacts, `cron`/`manual`/`api` with no ref).
 
-- Because `clone` is a first-class *kind* (not a marketplace action), the author
+- Because `clone` is a built-in *kind* (not a marketplace action), the author
   writes `clone: {}` and the engine fills repo/ref/SHA/token from the run's
   trigger context. Downstream steps `needs: [checkout]`.
 - **Guardrail is a lint, not a hard error:** a `push`/`pull_request` pipeline
@@ -71,15 +71,15 @@ artifacts, `cron`/`manual`/`api` with no ref).
 
 ### Workspace contents — working tree **and** `.git`
 
-The CAS snapshot includes `.git`, not just the working tree.
+The CAS snapshot includes `.git`, not only the working tree.
 
 - Stripping `.git` would silently break `git describe`/`rev-parse` versioning
   (a large fraction of real builds) and make the full-history forensic case
-  impossible. Retaining it is essential context.
+  impossible. Retaining it keeps both working.
 - Per-file merkle CAS over `.git` packfiles dedups *across runs* well (stable
   history → identical packfiles → only new objects transfer). It cannot dedup
-  *within* a repacked packfile — exactly the content-defined-chunking
-  optimization ADR-0029 already parks as "later," so v1 is coherent.
+  *within* a repacked packfile — the content-defined-chunking
+  optimization ADR-0029 already parks as "later," so v1 is consistent with it.
 - Skip-if-unchanged (ADR-0027) stays intact: the implicit whole-workspace hash
   changing on every commit is *correct* (new commit = re-run); a step wanting
   subtree precision declares explicit `inputs:` (ADR-0007).
@@ -115,9 +115,9 @@ arbitrary image can't guarantee.
   not cover another org's repo).
 - `lfs: true` → git-lfs fetch, served by the canonical image.
 - **Scope acknowledged:** Scarab now ships two first-party images — the
-  results-egress sidecar (ADR-0042, currently unbuilt/phantom `:latest`) and
-  `scarab-clone`. Both build + digest-pin in the same `image.yml` pipeline as
-  the server.
+  results-egress sidecar (ADR-0042; unbuilt when this was decided, now built from
+  `docker/sidecar/` as `scarab-results-sidecar`) and `scarab-clone`. Both build
+  + digest-pin in the same `image.yml` pipeline as the server.
 
 ### Fencing & determinism — pinned SHA always; vanished SHA fails fast
 
@@ -128,15 +128,15 @@ arbitrary image can't guarantee.
 - The run is pinned to the commit SHA resolved **once at trigger time**
   (ADR-0043/0044, stored on the self-describing run). `clone` always fetches
   *that SHA*, **never re-resolves the ref** on restart/resume. Re-cloning the
-  same SHA → same tree → same CAS root → deterministic resume. This is the wedge
-  paying off: a run resumed after a crash or a weeks-long gate rebuilds from the
+  same SHA → same tree → same CAS root → deterministic resume. This is where
+  durability pays off: a run resumed after a crash or a weeks-long gate rebuilds from the
   identical source.
 - A **vanished pinned SHA** (force-pushed away / ref deleted between attempts)
   is a **terminal, diagnostic failure** (`SourceUnavailable`), not a retry loop —
-  the SHA will not come back. Its message says so explicitly: the commit this
+  the SHA will not come back. Its message says so: the commit this
   run was pinned to no longer exists on the forge, which **signals an upstream
   integrity anomaly** (history rewritten / ref deleted), not routine churn.
-  Surfaced loudly; dead-letters with that reason once the ADR-0020 dead-letter
+  Reported loudly; dead-letters with that reason once the ADR-0020 dead-letter
   machinery exists.
 
 ### CAS boundary & GC — ephemeral run workspace, dedup across runs
@@ -144,28 +144,35 @@ arbitrary image can't guarantee.
 - The clone snapshot is the run's **ephemeral** workspace (ADR-0007); its CAS
   entries are reclaimable when the run is retired under retention (ADR-0030).
 - GC is refcount / mark-sweep over CAS roots: shared objects (stable `.git`
-  packfiles) survive as long as *any* live run references them — cross-run
-  dedup is the win. This is the "CAS store + GC" ADR-0029 already committed to;
+  packfiles) survive as long as *any* live run references them; cross-run
+  dedup is the benefit. This is the "CAS store + GC" ADR-0029 already committed to;
   no new mechanism.
 
 ## Consequences
 
 - `clone` becomes the run's workspace root; downstream steps inherit it via
   `needs` (ADR-0007) with no new inheritance rule.
-- **Implementation surface (all currently absent):**
+- **Work to build (all absent when this was decided; all done since):**
   - `clone` step kind in the IR + `scarab-pipeline` compiler (today: image +
-    `gate` only); the lint rule for the "no clone on push/PR" warning.
-  - CAS `materialize`/`ingest` wired into `build_pod` — the ADR-0029 substrate
+    `gate` only); the lint rule for the "no clone on push/PR" warning. (done as of 2026-10-28:
+    `CloneSpec` and the missing-clone lint in `crates/scarab-pipeline/src/lib.rs`)
+  - CAS `materialize`/`ingest` wired into `build_pod` — the ADR-0029 storage layer
     that exists in `scarab-storage-s3` but is never called on k8s. This is the
     *same* wiring the workspace-passing and `outputs:` gaps need, so `clone`
-    and inter-step workspace flow land together.
+    and inter-step workspace flow land together. (done as of 2026-10-28: the `scarab-wsfetch`
+    feed and drain containers in `crates/scarab-executor-k8s/src/lib.rs`,
+    ADR-0061/0067)
   - A clone URL on the normalized forge model (`Repo` carries only
-    `{owner, name}` today).
+    `{owner, name}` today). (done another way: `clone_url` in
+    `crates/scarab-server/src/clone_executor.rs` derives it per forge)
   - A scoped, short-TTL, read-only-for-forks token-minting path — **depends on
     the GitHub App adapter** (installation tokens), which is itself unbuilt
     (8× `unimplemented!()`). `clone` for private repos cannot ship before it.
-  - The `scarab-clone` image + its build in `image.yml`.
-- **Ordering:** `clone` is the keystone of "Scarab builds Scarab" — until it
+    (done as of 2026-10-28: `mint_checkout_credential` on `ForgePort`, implemented by the GitHub
+    and Forgejo adapters)
+  - The `scarab-clone` image + its build in `image.yml`. (done as of 2026-10-28: `docker/clone/`,
+    built in `.github/workflows/image.yml`)
+- **Ordering:** "Scarab builds Scarab" depends on `clone`: until it
   lands, no step sees source and the project cannot dogfood. It is gated on the
   GitHub App adapter (auth) and the CAS-into-`build_pod` wiring; those two are
   its prerequisites.

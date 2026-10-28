@@ -48,15 +48,15 @@ Scarab-native RBAC), not forge-coupled.
 
 When a `Project` is connected (ADR-0046 `ForgeConnection`), Scarab **may import**
 the forge's collaborators/teams as initial role bindings (via `get_permissions`)
-so it "just works" without hand-assigning everyone. But:
+so it works out of the box without hand-assigning everyone. But:
 
 - The import **seeds/refreshes** native bindings; the **native binding is
   authoritative** — a manual grant/revoke is never clobbered by a re-sync.
 - Authorization on the hot path reads **only native bindings** — never a live
-  forge API call. This keeps authz forge-agnostic and multi-forge-clean (an Org
-  spanning GitHub *and* Forgejo has one coherent role model).
+  forge API call. This keeps authz forge-agnostic: an Org
+  spanning GitHub *and* Forgejo has one role model.
 
-### Tenancy scoping (falls out of the above)
+### Tenancy scoping (follows from the above)
 
 Runs belong to a `Project` (ADR-0046); `Project` belongs to an `Org`. Every
 run/log/event query is scoped by the caller's authorized `Project`/`Org` — this
@@ -86,13 +86,13 @@ decision above; they close gaps that only show up against a *real* OIDC issuer.
   adapter, refetched when a `kid` is unknown, i.e. rotation), plus `iss`,
   `aud == client_id`, `exp`, and the login flow's `nonce` — and its claims are
   the Principal. A **present-but-invalid `id_token` fails the login**; falling
-  back to userinfo there would make the verification decorative. With no issuer
+  back to userinfo there would make the verification pointless. With no issuer
   configured (GitHub/Forgejo: plain OAuth2) no `id_token` is expected or
   trusted and userinfo remains the identity, unchanged.
 - **PKCE (RFC 7636, S256) on the browser flow.** The redirect carries
   `code_challenge` + `code_challenge_method=S256`; the verifier stays server-side
   in the same one-shot `HttpOnly` state cookie (now `state.verifier.nonce`) and
-  is replayed at the token endpoint. The adapter keeps the seam: the HTTP layer
+  is replayed at the token endpoint. The adapter keeps the split: the HTTP layer
   owns the cookie, the adapter owns the secrets and the exchange, so the
   API/CLI `POST /v1/auth/login` still works with no verifier — and may thread
   its own (`code_verifier`) if it ran its own authorize.
@@ -101,7 +101,7 @@ decision above; they close gaps that only show up against a *real* OIDC issuer.
   subject-only `SCARAB_OAUTH_OWNERS` means discovering and pasting UUIDs before
   anyone can administer anything. An owners entry now matches the subject **or**
   an `email` the issuer asserts as `email_verified`. `sub` remains the stored
-  Principal identity — email is only ever a matcher — and an unverified or
+  Principal identity (email is only ever a matcher), and an unverified or
   absent `email_verified` never grants `Owner`.
 
 ## Alternatives considered

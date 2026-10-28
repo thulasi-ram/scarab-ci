@@ -7,18 +7,17 @@ import Doodle from '../../../components/Doodle.astro';
 
 <Doodle icon="waypoints" size={210} rotate={-8} opacity={0.17} top="7rem" right="-2rem" />
 
-Scarab is a Kubernetes-native CI engine: every pipeline step runs as a Pod, so
-you always need a **Kubernetes cluster** to run against. That cluster can live on
-your laptop (kind / colima) or be a real, remote/production cluster. Scarab does
-not care which.
+This page covers what Scarab needs and the two ways to bring it up. Every
+pipeline step runs as a Pod, so either way you need a **Kubernetes cluster**:
+kind or colima on your laptop works, and so does a remote production cluster.
 
-There are two ways to bring Scarab up. They are both legitimate; pick the one
-that fits what you're doing, not a "real" one versus a "toy" one.
+Neither way is a cut-down version of the other; pick the one that fits what
+you're doing.
 
 If you only want to see what Scarab looks like, there is a third option that
 installs nothing: the [live demo](https://demo-scarab.ahiravan.dev/). Sign
 in with GitHub and you land as **Viewer**, which carries no Write, so you can
-read a run but not dispatch one. To actually run a pipeline, pick one of the two
+read a run but not dispatch one. To run a pipeline, pick one of the two
 paths below.
 
 ## Which path?
@@ -35,7 +34,7 @@ Both run the same engine against a real cluster; they differ in how
 
 The **same Helm chart** targets every environment: a local kind/colima cluster
 and a live production cluster use the identical `helm upgrade --install`. There is
-no separate "production build"; the proc-mode loop just swaps the packaged image
+no separate "production build"; the proc-mode loop only swaps the packaged image
 for a `scarab-server` you run straight from the tree, so you can rebuild and rerun
 in seconds.
 
@@ -43,16 +42,18 @@ in seconds.
 
 Whichever path you choose, `scarab-server` needs:
 
-- **Postgres**: the durable coordination substrate; without it the server
-  serves the API only.
+- **Postgres**: the durable store that all run state and coordination go
+  through. The server refuses to start without `SCARAB_DATABASE_URL`.
 - **An S3-compatible object store** (AWS S3 or in-cluster MinIO) for logs,
-  artifacts, and the content-addressed workspace snapshots reruns restore; a
-  fallback to a local directory exists for lightweight local runs.
+  artifacts, and the content-addressed workspace snapshots that reruns restore
+  from. The server refuses to start without one. For tests and dev loops you
+  can point it at a local directory with an explicit `--object-dir`: a single
+  directory with no replication.
 - **A Kubernetes namespace with RBAC** so it can launch one Pod per pipeline step.
 
-The [Installation](/scarab-ci/get-started/deploy-helm/) page wires all three up
-through the chart; the [Run locally](/scarab-ci/get-started/run-locally/) recipes
-stand them up for you on your machine.
+[Installation](/scarab-ci/get-started/deploy-helm/) sets all three up through
+the chart; the [Run locally](/scarab-ci/get-started/run-locally/) recipes start
+them for you on your machine.
 
 ## References
 

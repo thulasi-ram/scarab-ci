@@ -7,15 +7,15 @@ import Doodle from '../../../components/Doodle.astro';
 
 <Doodle icon="terminal" size={200} rotate={-10} opacity={0.18} top="7rem" right="-2rem" />
 
-The repo ships a one-command dev harness (a `Justfile` over `deploy/local-proc/`) that runs
-`scarab-server` straight from the tree, giving you a loop that rebuilds and reruns with no image to
-publish. It runs the durable core end-to-end on your machine. To deploy the packaged chart
+This page gets the whole stack running on your machine and pushes a pipeline through it. One
+command (a `Justfile` over `deploy/local-proc/`) runs `scarab-server` straight from the tree, so
+you can rebuild and rerun without publishing an image. To deploy the packaged chart
 instead (on kind/colima or a live cluster), see [Installation](/scarab-ci/get-started/deploy-helm/);
 the [Overview](/scarab-ci/get-started/overview/) compares the two paths.
 
 If you would rather look before you install, the [live demo](https://demo-scarab.ahiravan.dev/)
-is a running instance — read-only for visitors, so it shows you the UI but will not run your
-pipeline. Everything below runs the real thing on your machine.
+is a running instance. It is read-only for visitors, so it shows you the UI but will not run your
+pipeline. The steps below run Scarab on your machine.
 
 ## Prerequisites
 
@@ -39,8 +39,8 @@ just up      # Postgres + MinIO + kind + scarab-server (background)
 just demo    # submit a one-step pipeline and watch it run to completion
 ```
 
-This posts a pipeline to the running server and follows it to a terminal state, the walking
-skeleton that survives killing the control plane mid-run.
+This posts a pipeline to the running server and follows it until it finishes. It's the smallest
+end-to-end run, and it survives you killing the control plane partway through.
 
 ## Iterate
 
@@ -52,7 +52,7 @@ just down    # tear the whole stack down
 ```
 
 :::note[The other mode: Helm inside the cluster]
-`just up` runs the server as a host process (kind for step Pods). For the real path inside the cluster
+`just up` runs the server as a host process (kind for step Pods). To run everything inside the cluster
 (`scarab-server` deployed via the Helm chart on colima, with Postgres and MinIO inside the cluster), use
 `just local-helm` (`just local-helm local` builds from the tree; `just local-helm sha-<sha>` pins a
 published build). See [Installation](/scarab-ci/get-started/deploy-helm/).
@@ -60,15 +60,16 @@ published build). See [Installation](/scarab-ci/get-started/deploy-helm/).
 
 :::tip[See the UI]
 `just ui` starts the SolidJS web UI (Vite on <code>http://localhost:5173</code>), which proxies
-`/v1` to the running server. It's an early scaffold today. The rich UI, with a live DAG and logs
-streamed over SSE, is a follow-up.
+`/v1` to the running server. Open a run to see its step DAG and event timeline, which refresh
+while the run is going, and each step's logs, which stream live over SSE. To look around
+without a server, `just ui-mock` renders the same UI from built-in fixtures.
 :::
 
 ## What just happened
 
-The server persisted every step transition to Postgres as a durable state machine. Kill the
-control plane mid-run and bring it back: the run resumes from where it stopped rather than
-restarting. That durability contract is the whole point.
+The server wrote every step transition to Postgres, where the run lives as a durable state
+machine. Kill the control plane mid-run and bring it back. The run resumes from where it
+stopped instead of starting over. That is the main guarantee Scarab makes.
 
 ## References
 

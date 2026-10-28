@@ -6,16 +6,16 @@
 
 ## Context
 
-The wedge is durability correctness, and we want deterministic simulation testing
-([0017](0017-testing-strategy.md)). "Swappability" is not unique to hexagonal — the real
-distinctions are *which* edges are abstracted (time, executor, crash — not just the DB),
-*dependency direction*, and whether purity is enforced **by the compiler** vs by discipline.
+Durability correctness is the core of the product, and we want deterministic simulation
+testing ([0017](0017-testing-strategy.md)). "Swappability" is not unique to hexagonal. The real
+distinctions are *which* edges are abstracted (time, executor, crash, not just the DB),
+*dependency direction*, and whether purity is enforced **by the compiler** or by discipline.
 
 ## Decision
 
 - **Hexagonal with compiler-enforced purity via crate boundaries.** Pure **domain crates**
   (`scarab-engine`, `-pipeline`, `-forge`, `-identity`, `-secrets`, `-storage`, `-projects`)
-  list **no infra crates** in `Cargo.toml` — so `use sqlx::` in the domain is a *compile
+  list **no infra crates** in `Cargo.toml`, so `use sqlx::` in the domain is a *compile
   error*, not a review comment. Read that as *no infra*, **not** *no dependencies*: the boundary
   is narrowed by [0031](0031-pure-computation-deps.md), which admits an **I/O-free library**
   when the capability it provides belongs to the domain rather than to a backend. Three members
@@ -23,7 +23,7 @@ distinctions are *which* edges are abstracted (time, executor, crash — not jus
   `cel-interpreter` (0031's original case — evaluating a conditional is a domain rule); `sha2`
   ([0029](0029-workspace-cas.md) defines a snapshot **as** the SHA-256 merkle root of its
   canonical tree bytes, so the content address is a domain fact and the digest belongs where
-  that fact is defined); and `tracing` (a *facade* — see 0031's amendment). What actually writes
+  that fact is defined); and `tracing` (a *facade* — see 0031's amendment). What writes
   stays infra: `tracing-subscriber` is installed only by the composition root, and anything
   keyed by a deployment secret (`hmac`) belongs to a boundary. **Adapters are separate vendor
   crates**
@@ -40,8 +40,8 @@ distinctions are *which* edges are abstracted (time, executor, crash — not jus
 
 ## Consequences
 
-- DST is cheap: fakes are just alternate adapter crates ([0017](0017-testing-strategy.md)).
-- Single-binary simplicity + horizontal scale without a microservices tax.
+- DST is cheap: fakes are alternate adapter crates ([0017](0017-testing-strategy.md)).
+- Single-binary simplicity + horizontal scale without the overhead of microservices.
 - More crates and trait indirection than a flat monolith — accepted for the correctness payoff.
 
 ## Alternatives considered

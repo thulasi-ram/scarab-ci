@@ -33,7 +33,7 @@ The version unit had to be defined, not borrowed.
 A **Take** is the span of a run between two **human interventions**
 (restart-step presses). A restart closes the current Take and opens the next.
 Auto-retries, crash re-adoptions, and dead-letters are *contents* of a Take,
-never boundaries — they surface in the per-step attempt strip and Activity
+never boundaries — they show up in the per-step attempt strip and Activity
 feed, not as version entries (a `retry: max 5` flake must not mint five
 versions). "Attempt" stays reserved for the per-step unit (CONTEXT §4.3);
 "epoch" was rejected for the Unix-timestamp collision, "revision" for implying
@@ -54,7 +54,7 @@ event log — deferred, no migration pain.
   acting principal (closes the who-restarted-this audit gap).
 - **`AttemptReadopted { step, attempt }`** — a control-plane crash re-adopting
   a live Pod (same attempt, same fence, per ADR-0047) is currently invisible.
-  This event exists purely for visibility: the durability wedge, made legible
+  This event exists only so crash recovery shows up
   in the Activity feed. It is *not* a new attempt and must not render as one.
 
 ### Evidence moves to the attempt grain — the fence unit is the storage unit
@@ -69,9 +69,9 @@ it becomes the evidence unit. Logs (`log_chunks`) already comply.
   workspace inheritance), whose semantics are unchanged.
 - **`attempts.consumed JSONB`** — a map `upstream step → attempt id` stamped at
   attempt launch: which upstream attempt's outputs/workspace this attempt
-  actually consumed. Recorded, not inferred — after a mid-run restart, `test@2`
+  consumed. Recorded, not inferred — after a mid-run restart, `test@2`
   consumed `build@2` while a smart-skipped `deploy` still stands on `build@1`;
-  that mixed frontier is now a durable fact, not timestamp archaeology.
+  that mixed frontier is now recorded durably instead of reconstructed from timestamps.
 - **Artifacts become immutable per attempt**: key
   `(run_id, name, step_id, attempt_id)`. The ADR-0052 name-addressed
   of-record URL contract is unchanged; resolution gains one rule — it returns
@@ -86,7 +86,7 @@ it becomes the evidence unit. Logs (`log_chunks`) already comply.
 - **Snapshot-at-boundary**: a closed Take's view is the run frozen at the
   instant of the restart press. An attempt straddling the boundary (started in
   Take 1, finished in Take 2) shows as *running* in Take 1 — the state a
-  bystander actually observed — with a "finished in Take 2 →" affordance.
+  bystander observed — with a "finished in Take 2 →" affordance.
   Outcome-absorbing attribution was rejected: it reintroduces take
   bookkeeping and can render a state that never existed at any wall-clock
   moment.
@@ -98,7 +98,7 @@ it becomes the evidence unit. Logs (`log_chunks`) already comply.
   restart is only pressed from the latest Take. "Go back and try differently"
   is **Re-run** (a new run), which may later grow a from-this-Take prefill.
 
-### Read surface
+### Read endpoints
 
 `?attempt=` (already on logs) extends to the results / workspace / artifact
 read endpoints. There is **no `?take=` parameter** — the client derives
@@ -108,8 +108,8 @@ frontiers from the event log it already fetches.
 
 - Execution semantics untouched: viewing is pure read; the only engine-adjacent
   change is emitting two events. The UI (Take dropdown + merged step pane with
-  an attempt strip scoping logs/results/outputs/workspace) rides on top and is
-  freely revisable.
+  an attempt strip scoping logs/results/outputs/workspace) sits on top and can
+  change freely.
 - Migrations: three `attempts` columns; artifacts re-key + provenance backfill
   (existing rows get a synthetic attempt attribution or NULL-tolerant reads).
 - Storage growth is bounded by attempt budgets (ADR-0047 max-attempts) and
@@ -119,7 +119,7 @@ frontiers from the event log it already fetches.
 ## Alternatives considered
 
 - **GHA-style run-level attempt counter** — wrong unit for per-step restart;
-  forces whole-run re-execution semantics Scarab deliberately avoids (0027).
+  forces whole-run re-execution semantics Scarab avoids (0027).
 - **Stored `take_version` column** — derivable from the event log; storing it
   couples the engine to a read-model concept and invites drift.
 - **Latest-wins evidence + provenance tag only** — cheaper, but keeps
@@ -127,28 +127,28 @@ frontiers from the event log it already fetches.
   what it recovered from). Rejected as contrary to the durability thesis: the
   system never destroys evidence; the UI was the only thing hiding it.
 - **Auto-retries as Take boundaries** — noise; retries are the engine doing its
-  job within a chapter, already legible per step.
+  job within a Take, already visible per step.
 
 ## Amendment (2026-07-20): end-user language, retry vs rerun, superseded/shadowed
 
 The original decision defined the *internal* model (Take = derived lens; Attempt
-= evidence grain) but left the **end-user** framing open, and a grilling session
+= evidence grain) but left the **end-user** framing open, and a design review
 found the two history controls (a `Take` dropdown + a per-step attempt strip)
 were presented as confusing **peers**. This amendment fixes the user-facing model
 and sharpens the re-execution vocabulary. It changes **no execution semantics**;
 `superseded`, `shadowed`, and the `cascade` cause are all derived client-side
-from the existing event log, exactly as Takes are.
+from the existing event log, as Takes are.
 
 ### One mental model: the run is a timeline; the pipeline is its fixed shape
 
-The pipeline is *space* (what runs after what); the run is *time* (what actually
+The pipeline is *space* (what runs after what); the run is *time* (what
 happened). Every step **try** (Attempt) is kept, immutable, read-only, until the
-run's TTL. "Take"/"attempt" are **internal words** and are never surfaced
+run's TTL. "Take"/"attempt" are **internal words** and are never shown
 verbatim; the user sees a **row per rerun** and a per-step **tries** strip.
 
 ### Two "agains", split on step state — not on who pressed
 
-The discriminating axis is **what state the step was in**, not machine-vs-human:
+What decides it is **what state the step was in**, not machine-vs-human:
 
 - **auto-retry** — the *engine* re-executing a **not-yet-succeeded** step within
   its budget (ADR-0047). Same history row, **no fork**. The only "retry".
@@ -159,9 +159,9 @@ The discriminating axis is **what state the step was in**, not machine-vs-human:
 A separate **"manual retry"** concept was **rejected**: a human re-running a
 failed step is just a `rerun` of a terminal step (one human control on the
 screen, not two). This *confirms and generalizes* the original "every restart
-mints a Take": a rerun of a dead-lettered step is a genuine new version — the
+mints a Take": a rerun of a dead-lettered step is a real new version — the
 "before" is *the run that died*, the "after" is *the run revived and continued* —
-so `restart_step` correctly emits `RunRestartRequested` on **every** press,
+so `restart_step` emits `RunRestartRequested` on **every** press,
 regardless of the target's prior status. (Auto-retry emits no boundary.)
 
 ### Attempt causes gain `cascade`
@@ -177,7 +177,7 @@ followed". Full set: `initial · auto-retry · rerun · cascade` (plus
 An Attempt ends `running → succeeded | failed | superseded | cancelled`:
 
 - **superseded** — an Attempt **cut short while running** because a human reran an
-  ancestor (its input was being replaced, so it could not honestly finish; a
+  ancestor (its input was being replaced, so its result would no longer be valid; a
   fresh Attempt replaces it). Distinct from **cancelled** (a *deliberate* stop
   with **no** replacement, `cancel_run_request`) and **failed** (ran and errored).
   Derived client-side: `AttemptStarted` with no matching `AttemptFinished`, whose
@@ -193,14 +193,14 @@ The DAG, the selected step's evidence (logs/results/outputs/files), and a
 **version-aware Artifacts footer** merge into a single `PIPELINE` component:
 
 - **zoom out** = an **always-present version dropdown** on the component header
-  (rich rows: cause + time + result; single-version state reads "latest · live").
+  (each row: cause + time + result; single-version state reads "latest · live").
 - **zoom in** = the selected step's **tries** strip, chips labelled by cause
   (auto-retry / you reran / ⟵ cascade) and outcome (✗ / ⊘ superseded / shadowed).
 
 The two are **zoom levels, not peers**. Selecting a non-latest version turns the
 **whole component read-only** (tinted + a "👁 …" banner; `Rerun`/`Cancel`
 disabled, `New run`/`Debug pod` live). **Activity stays separate** — the
-unfiltered cross-version event log where reruns are witnessed and versions are
+unfiltered cross-version event log where reruns are recorded and versions are
 derived. User-facing verb is **Rerun** (not "Restart").
 
 ### Follow-up (the one real engine gap)
@@ -246,7 +246,7 @@ derived-lens principle, and `superseded`/`shadowed`/`cascade` are unchanged.
 
 A human Retry's target Attempt carries the `retry` cause (same strip treatment as
 an auto-retry — both are "another try in this version"); its human origin is
-witnessed by the `StepRetryRequested` event in Activity, not by a distinct chip.
+recorded by the `StepRetryRequested` event in Activity, not by a distinct chip.
 Dependent Attempts it drags along carry `cascade`, as with rerun.
 
 ### Rerun/retry validation — a FAILED prerequisite blocks (refines ADR-0027)
@@ -286,10 +286,10 @@ rerun" — rather than fabricating an attempt it never had.
 
 ## Amendment (2026-07-23): rerun voids in-flight work; superseded is intrinsic-terminal; naming; UI direction
 
-A design session crystallizing the re-execution model settled questions the prior
+A design session on the re-execution model settled questions the prior
 two amendments left open or had decided the other way — whether Rerun requires a
 terminal target, how a closed version paints an attempt still running when an
-ancestor was reran over it, the difference between a step **cut short** and one that
+ancestor was rerun over it, the difference between a step **cut short** and one that
 **never started**, and the canonical names — and records the (not-yet-built) UI
 working spec so it is not lost. The **only** execution-semantics change is a Pod
 **teardown** (it adopts the orphan-Pod follow-up from the 2026-07-20 amendment);
@@ -307,7 +307,7 @@ The Rerun re-arms its **invalidation set** (target + transitive dependents,
 ADR-0027). Any member holding a **live Pod is voided (superseded)**: the Pod is torn
 down (SIGTERM + grace) and its Attempt is marked `Superseded`. In-flight steps
 **outside** the invalidation set — unrelated siblings — are **untouched**. This
-targeted void is strictly better than the GitHub Actions posture, which forces you to
+targeted void is strictly better than GitHub Actions, which forces you to
 **cancel the whole run** just to rerun one step. It is safe under the monotonic fence
 (ADR-0021): a late verdict from a torn-down Pod is rejected. The at-least-once caveat
 for non-cooperating sinks (ADR-0047) is **unchanged** — and blocking Rerun would not
@@ -333,11 +333,11 @@ transient the Attempt merely passed through: technically true, operationally use
 The original anti-**absorption** concern is **not** relaxed: a re-execution's success
 — a *later* Attempt — must never be painted onto the earlier version. That would be
 showing a *different* Attempt's outcome, which the principle forbids. Superseded is
-not absorption; it is the Attempt's own honest terminal state.
+not absorption; it is the Attempt's own actual terminal state.
 
 Consequence: the `finishedInTake` straddling affordance is **retired for voided
 Attempts** — a voided Attempt never finishes. "Running-at-boundary → finished later"
-survives **only** for genuinely **carried-forward** (non-invalidated) Attempts: an
+survives **only** for **carried-forward** (non-invalidated) Attempts: an
 unrelated sibling that was mid-flight at the press and completes on its own, outside
 the fork.
 
@@ -378,11 +378,14 @@ New event **`AttemptSuperseded { step, attempt, by }`**. New per-Attempt outcome
 **additively** as `outcome` on `AttemptDto` (`shadowed` stays a *flag* on a succeeded
 Attempt, not an outcome — see the 2026-07-20 amendment).
 
-### UI direction (working spec — not yet built)
+### UI direction (working spec)
 
-Recorded so the design is not lost; nothing here is implemented. One coherent surface
-that is really a **3-axis selector — version × step × try** — feeding five evidence
-surfaces (Logs / Results / Outputs / Workspace, plus run-level Artifacts). Each
+Recorded so the design is not lost. (Done as of 2026-10-28: built in the web-UI "redesign stages
+1–4", commits `f761f72`…`fc60556`. Two controls changed shape later: the version
+rail became `VersionDropdown.tsx` and the filmstrip became `AttemptsDropdown.tsx`,
+both under `ui/scarab-web-ui/src/components/`.) One screen
+that is a **3-axis selector (version × step × try)** feeding five evidence
+views (Logs / Results / Outputs / Workspace, plus run-level Artifacts). Each
 control is chosen by the **cardinality** of its axis:
 
 - **version** grows unbounded → a persistent left **rail** (a list, not a dropdown).

@@ -27,7 +27,7 @@ export default defineConfig({
   integrations: [
     starlight({
       title: 'Scarab',
-      tagline: 'A modern CI engine for Kubernetes — forge-native, on a durable core.',
+      tagline: 'A CI engine for Kubernetes — forge-native, on a durable core.',
       // The brand emblem (ui/brand): ink-outline variant on light, gold-outline
       // on dark — same mark as the favicon.
       logo: {
@@ -85,7 +85,7 @@ export default defineConfig({
             },
           ],
           footerText:
-            'Scarab — a modern CI engine for Kubernetes: forge-native, on a durable core. Themed with [Lucode Starlight](https://github.com/lucas-labs/lucode-starlight-theme).',
+            'Scarab — a CI engine for Kubernetes: forge-native, on a durable core. Themed with [Lucode Starlight](https://github.com/lucas-labs/lucode-starlight-theme).',
         }),
         // API reference generated from the canonical spec, in place.
         starlightOpenAPI([

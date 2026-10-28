@@ -4,6 +4,10 @@
 - **Date:** 2026-07-13
 - **Deciders:** thulasi.ram (architect)
 
+> **Status note (2026-10-28):** Environments are org-level now.
+> [0071](0071-org-level-environments.md) revises this ADR's per-repo scoping (§A, §C and
+> the §E paths); the other decisions here stand.
+
 Refines [0024](0024-environments.md) (which modeled the concept) and wires it to
 [0008](0008-step-contract.md) gates, [0014](0014-secrets.md) secret scopes, and
 [0034](0034-external-gate-token.md) gate release. Closes the stored-but-not-enforced
@@ -11,33 +15,33 @@ gaps left after Slice 4.
 
 ## Context
 
-[0024] made Environment a first-class entity carrying protection rules, but the
+[0024] made Environment its own entity carrying protection rules, but the
 implementation left real gaps: `ProtectionRules.approvers`/`wait_timer`/`secret_scope`/
 `oidc_subject` are **stored and never read** at runtime; deploy admission trusts a
 **caller-supplied** `approvals` list (`DeployRequest.approvals`) rather than any
 authenticated state; secret lookup is **exact-scope only** (no `org→repo→env`
 inheritance despite [0014]); and env-scoped secret **resolution is never wired into
 the live run path** (`resolve_step_secrets` is test-only). A `manual` gate, meanwhile,
-is a genuine durable suspend point but records **no approver identity**.
+is a real durable suspend point but records **no approver identity**.
 
 The value of Environment is not any single rule. It is that **one reference —
 `environment: prod` — pulls in a governed bundle (approval + secrets + allowed-refs +
 OIDC subject), defined once by an admin and reused across pipelines.** That removes the
-per-pipeline wiring taxation, and — because rules live in an admin-owned entity, not the
-pipeline YAML — it gives separation of duties: a pipeline author *requests* a deploy; the
+per-pipeline wiring work. It also gives separation of duties, because rules live in an
+admin-owned entity rather than the pipeline YAML: a pipeline author *requests* a deploy; the
 environment *governs* it, regardless of what the YAML says (the GHA model).
 
 ## Decision
 
 ### A. Environment is the governed bundle; protection is optional
 
-- Environment stays a first-class entity in `scarab-projects`, edited only with
+- Environment stays its own entity in `scarab-projects`, edited only with
   `Administer` RBAC. A pipeline **references** it by name (`PipelineIr.environment`,
   pipeline-level: **one run targets one environment** — step-level multi-env deferred).
 - **Protection rules are optional per environment.** An environment with no rules
-  (typical `staging`) is a frictionless label: secrets are scoped to it, but no
+  (typical `staging`) is a plain label: secrets are scoped to it, but no
   approval, no ref restriction. An environment with reviewers (`prod`) is gated. Same
-  entity, opt-in governance — low-stakes targets pay nothing.
+  entity, opt-in governance; low-stakes targets pay nothing.
 
 ### B. Approval is a gate; admission runs at the point of use
 
@@ -59,7 +63,7 @@ environment *governs* it, regardless of what the YAML says (the GHA model).
 
 - Lookup walks the scope chain **`env → repo → org`, most-specific wins** (implements
   [0014]'s inheritance; today's store is exact-match only). A value shared across
-  environments lives **once** at repo/org scope; only values that genuinely differ are
+  environments lives **once** at repo/org scope; only values that differ are
   stored per-environment.
 - Pipelines reference secrets **by key, environment-agnostically** (`${{ secrets.X }}`).
   Resolution picks the value by the run's target environment — no `_staging`/`_prod`
@@ -84,13 +88,19 @@ environment *governs* it, regardless of what the YAML says (the GHA model).
 ### E. Management API surface (`Administer` for writes)
 
 ```
-PUT    /v1/environments/{project}/{name}            upsert env + protection rules
-GET    /v1/environments/{project}                   list environments
-GET    /v1/environments/{project}/{name}            get one (rules + effective secret status)
-DELETE /v1/environments/{project}/{name}            remove
-GET    /v1/environments/{project}/{name}/deployments deployment history (was the deploy handler)
-GET    /v1/projects/{project}/secrets/matrix        keys × envs effective-status read model (UI)
+PUT    /v1/orgs/{org}/environments/{env}                       upsert env
+PUT    /v1/orgs/{org}/environments/{env}/protection            protection rules
+GET    /v1/repos/{org}/{repo}/environments                     list environments
+GET    /v1/repos/{org}/{repo}/environments/{name}              get one (rules + effective secret status)
+DELETE /v1/orgs/{org}/environments/{env}                       remove
+GET    /v1/repos/{org}/{repo}/environments/{name}/deployments  deployment history (was the deploy handler)
+GET    /v1/repos/{org}/{repo}/secrets/matrix                   keys × envs effective-status read model (UI)
 ```
+
+(As decided, these were `/v1/environments/{project}/...` and
+`/v1/projects/{project}/secrets/matrix`. They moved under `/v1/repos/{org}/{repo}/`, and
+[0071](0071-org-level-environments.md) then moved environment writes to the org.
+`openapi.json` has the current list.)
 
 Secret CRUD stays the existing scoped endpoints ([0014]). Gate approval stays
 `POST /v1/runs/{id}/gates/{step}/approve` (RBAC `Write` **and** membership in the
@@ -101,7 +111,7 @@ environment's `approvers`); `external` release stays token-authed ([0034]).
 - Deploy approval becomes durable, auditable, and unforgeable: it is authenticated gate
   state on the event log, not a caller assertion. Restart-safe by construction.
 - Prod credentials exist **only** under the gated environment and cannot be relocated by
-  editing pipeline YAML — the separation-of-duties boundary is real.
+  editing pipeline YAML, so the separation of duties holds.
 - Pipelines become portable across environments; the target, not the pipeline, selects
   secret values.
 - New surface: `GateApproved` event + gate accumulation; a scope-chain resolver; the

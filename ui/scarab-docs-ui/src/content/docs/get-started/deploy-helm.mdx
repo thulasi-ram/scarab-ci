@@ -7,21 +7,21 @@ import Doodle from '../../../components/Doodle.astro';
 
 <Doodle icon="package" size={210} rotate={11} opacity={0.17} top="7rem" right="-2rem" />
 
-Scarab is Kubernetes-only by design, so Helm is the install path for a cluster. The chart deploys
-`scarab-server` (one binary,
-selectable roles) with the RBAC it needs to launch one Pod per step in its namespace.
+You install Scarab on a cluster with its Helm chart; Scarab is Kubernetes-only by design. The
+chart deploys `scarab-server` (one binary, selectable roles) with the RBAC it needs to launch one
+Pod per step in its namespace.
 
 The **same chart** targets any Kubernetes: a local kind/colima cluster or a real, live cluster.
-`just local-helm` (below) is just a convenience loop that installs this chart on colima; a live
+`just local-helm` (below) is a convenience recipe that installs this chart on colima; a live
 cluster uses the same `helm upgrade --install` with your own Postgres, object store, and
-credentials. The chart is young and gains production hardening as it earns mileage, but nothing
-about it works only locally.
+credentials. The chart is new and will get more production hardening as people use it, but
+nothing in it is local-only.
 
 ## The chart
 
 The chart lives at `deploy/helm/scarab/` (`Chart.yaml`, `values.yaml`, `templates/`). It expects:
 
-- **Postgres**: the durable coordination substrate; without it the server serves the API only.
+- **Postgres**: the durable store that all run state and coordination go through; without it the server serves the API only.
 - **An S3-compatible object store** (AWS S3 or in-cluster MinIO) for logs, artifacts, and the
   content-addressed workspace snapshots reruns restore; a fallback to a local directory exists for development.
 - **The published image** `ghcr.io/thulasi-ram/scarab-server`, built by
@@ -42,9 +42,10 @@ helm upgrade --install scarab deploy/helm/scarab \
 For production, keep credentials out of `--set`: create a Secret whose keys are the `SCARAB_*`
 environment-variable names and reference it with `secrets.existingSecret`.
 
-The GitHub App private key is the one credential with a bootstrap ordering problem — storing it
-through the API needs a server that is already running, and it dies with the database. So the chart
-can mount it from a Secret you manage out-of-band instead, and the server reads it at boot:
+The GitHub App private key is the one credential with a bootstrap problem: storing it through the
+API needs a server that is already running, and a stored key is lost if the database is recreated.
+So the chart can instead mount it from a Secret you manage out-of-band, and the server reads it at
+boot:
 
 ```sh
 kubectl -n scarab create secret generic scarab-github-app \
@@ -62,10 +63,10 @@ A correct webhook URL and secret are not enough. Both of these produce a loop th
 and has no error anywhere:
 
 - **Subscribe to events** (App → *Permissions & events → Subscribe to events*): check **Push** and
-  **Pull request**. With the list empty, `push`/`pull_request` are never delivered so nothing ever
-  runs — yet `installation` and `installation_repositories` still arrive (App-management events are
+  **Pull request**. With the list empty, `push`/`pull_request` are never delivered, so nothing ever
+  runs. But `installation` and `installation_repositories` still arrive (App-management events are
   independent of the subscription list), so the connection registers and `GET /v1/repos` looks
-  fine. The symptom reads as *"the repo is registered but no run ever starts."*
+  fine. The symptom: *"the repo is registered but no run ever starts."*
 - **Commit statuses: read & write** (App → *Permissions → Repository*): without `statuses:write`
   every status post is rejected `403 Resource not accessible by integration`. The run itself still
   succeeds, so the only visible effect is a pull request that never shows a Scarab status. Add
@@ -73,14 +74,14 @@ and has no error anywhere:
 
 You do not have to verify these by eye: **Settings → Connections** runs a preflight against the
 App and names whatever is missing (`GET /v1/connections/{id}/preflight`), so a misconfigured App
-reads as *unhealthy* rather than as silence. Note that a permission change is not live until an
-installation owner **approves the new access** (GitHub emails them) — until they do, the preflight
+shows as *unhealthy* instead of failing silently. A permission change is not live until an
+installation owner **approves the new access** (GitHub emails them). Until they do, the preflight
 keeps reporting the gap.
 :::
 
 ## Key values
 
-Only keys that exist in `values.yaml`:
+Every key in this table exists in `values.yaml`:
 
 | Key | Default | Notes |
 |-----|---------|-------|
@@ -94,11 +95,11 @@ Only keys that exist in `values.yaml`:
 | `rbac.create` | `true` | Role/RoleBinding for Pod execution |
 | `ingress.enabled` | `false` | expose the HTTP API |
 
-See `deploy/helm/scarab/README.md` and `values.yaml` for the full surface.
+See `deploy/helm/scarab/README.md` and `values.yaml` for every value.
 
 ## A minimal `values.yaml`
 
-A representative override for a real cluster, where Postgres and S3 credentials come from a Secret you
+An example override for a real cluster, where Postgres and S3 credentials come from a Secret you
 manage out-of-band (`secrets.existingSecret`), not inline:
 
 ```yaml
@@ -151,8 +152,9 @@ The kube context must be `colima` (the deploy script refuses otherwise). Configu
 `deploy/local-helm/.env`; see `deploy/local-helm/README.md` for the steps to configure the App and
 the caveats about the object store.
 
-For a workflow that stays on your laptop with no cluster at all, [Run locally](/scarab-ci/get-started/run-locally/)
-is the lightest way to exercise the system.
+To skip the chart, [Run locally](/scarab-ci/get-started/run-locally/) runs `scarab-server` as a
+host process on your laptop, with Postgres and MinIO in docker compose and step Pods on a local
+kind cluster.
 
 ## References
 

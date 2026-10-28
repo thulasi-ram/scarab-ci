@@ -11,7 +11,7 @@ and triggering *separate* pipelines (possibly cross-repo, cross-team) on complet
 
 ## Decision
 
-**Two clean primitives:**
+**Two separate mechanisms:**
 
 - **`invoke` = nest** — a sub-pipeline **in the same Run** (shared lineage, one durable
   lifecycle, one permission scope). Composition/reuse ([0006](0006-pipeline-ontology.md)).
@@ -26,7 +26,7 @@ Mental model: **nest = one run; trigger = new run.**
 
 ## Consequences
 
-- Tidy model that composes with everything; lineage is first-class.
+- A tidy model that works with everything else; lineage is built in.
 - Cross-repo triggering is an RBAC-gated event, not a special subsystem.
 
 ## Alternatives considered

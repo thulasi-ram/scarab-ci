@@ -30,7 +30,7 @@ rules, deployment history, and humans reason about).
 
 ## Decision
 
-Split the two ref meanings explicitly.
+Split the two ref meanings.
 
 - **Read/pin ref** — `config_ref(event)`, the immutable commit. Unchanged; used
   to fetch `.scarab/**` and pin the self-describing Run ([0022](0022-upgrades-and-versioning.md)).
@@ -39,8 +39,8 @@ Split the two ref meanings explicitly.
   creation-time check and the gate-approval re-check, via `DeployContext.git_ref`):
   - `Push` → its `refs/heads/…` ref;
   - `Tag`/`Release` → `refs/tags/<tag>`;
-  - `PullRequest` → `refs/pull/<n>/head` — deliberately **not** a branch ref, so
-    a PR is denied a branch-scoped Environment unless the env explicitly opts PRs
+  - `PullRequest` → `refs/pull/<n>/head` — **not** a branch ref, so
+    a PR is denied a branch-scoped Environment unless the env opts PRs
     in via `refs/pull/*` (the intended fail-safe);
   - `Manual`/`Api` → the symbolic dispatch ref (see below);
   - `Comment`/`Cron`/`Upstream` → `None`.
@@ -51,12 +51,12 @@ Split the two ref meanings explicitly.
   resolves the user ref → SHA for reading/pinning, and **canonicalizes** the
   user ref for protection: a `refs/…` ref or a 40-char lowercase-hex SHA is kept
   verbatim (a raw SHA stays opaque so it can never match a branch glob — a bare
-  commit is correctly denied a branch-scoped env), and any other bare name is
+  commit is denied a branch-scoped env), and any other bare name is
   treated as a branch (`main` → `refs/heads/main`).
 
 ## Consequences
 
-- **`allowed_refs` finally gates by branch** — the headline fix — on the push,
+- **`allowed_refs` finally gates by branch** (the main fix) on the push,
   dispatch, and PR paths, at both enforcement points. Regression tests assert a
   `feature`-branch run is denied a `refs/heads/main`-scoped env and a `main` run
   is admitted while still pinning the resolved SHA; these tests fail against the
@@ -75,6 +75,6 @@ Split the two ref meanings explicitly.
 - **Normalize inside `ref_allowed`** (strip to a SHA, or fuzzy-match) — pushes
   ref semantics into the pure `scarab-projects` matcher and guesses; the ref
   meaning belongs to the event, which is where `protection_ref` lives.
-- **A single canonical ref on every event** — collapses the two genuinely
+- **A single canonical ref on every event** — collapses the two
   different needs (immutable read point vs symbolic branch) that this ADR exists
   to separate.

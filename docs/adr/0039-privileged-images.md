@@ -20,15 +20,15 @@ Two facts force the shape of the decision:
 - **There is no floor today.** A normal step Pod is built with **no `SecurityContext` at all**
   (`scarab-executor-k8s`: only the rootless BuildKit pod is hardened). You cannot whitelist
   "privileged" as an *exception* until "unprivileged" is a defined, enforced baseline.
-- **Privilege on a shared node is a cross-tenant weapon.** `privileged: true` in a per-run
+- **Privilege on a shared node lets one tenant attack another.** `privileged: true` in a per-run
   namespace still shares the node kernel; `hostNetwork` reaches the node metadata endpoint and
   its IAM credentials. The whitelist is the only thing between "reusable deploy image" and "one
   repo owns the cluster/cloud account" — so it must be admin-owned, digest-pinned, fail-closed.
 
 ## Decision
 
-1. **Hardened baseline (the floor).** Every step Pod runs a **Kubernetes "restricted"-equivalent
-   posture** by default: `runAsNonRoot: true`, drop **ALL** capabilities,
+1. **Hardened baseline (the floor).** Every step Pod runs with **the equivalent of the Kubernetes
+   "restricted" profile** by default: `runAsNonRoot: true`, drop **ALL** capabilities,
    `seccompProfile: RuntimeDefault`, `allowPrivilegeEscalation: false`, no host namespaces, no
    hostPath. This is what "unprivileged plugin" means; every escalation below is an explicit,
    named exception to it. Fail-closed.
@@ -42,13 +42,13 @@ Two facts force the shape of the decision:
    - **`privileged`** — full privileged container. The blunt "node-level power" escape hatch of
      last resort; loud and rare.
 
-   **Explicitly out / deferred, and *never folded into* `privileged`** (they are orthogonal axes,
-   not rungs of one ladder — `privileged` does **not** include the host namespaces):
+   **Out / deferred, and *never folded into* `privileged`** (they are independent grants,
+   not levels of one scale — `privileged` does **not** include the host namespaces):
    - `cluster-access` (in-cluster k8s API) — **out**. Deploys reach a target cluster via
      **kubeconfig-as-a-secret** ([0037](0037-environment-governance.md)); Scarab's own cluster API
      is off-limits to step pods.
    - `host-path` — deferred (rootless BuildKit already removed the docker-socket reason;
-     `privileged` reaches it if truly needed).
+     `privileged` reaches it if needed).
    - `host-network` / `host-pid` / `host-ipc` — **provisionally a hard no**: `hostNetwork` →
      node metadata endpoint → node IAM credential theft → cloud-account compromise. If ever
      added, behind a louder opt-in than the others and/or hard-tenant isolation.
@@ -63,18 +63,18 @@ Two facts force the shape of the decision:
 4. **Self-service vs governed, split by whether the grant escapes the container.**
    - **`run-as-root` is self-service** — author requests it, no admin, no whitelist. Root inside a
      caps-dropped, unprivileged, seccomp-confined container does not escape the sandbox; it's the
-     weakest (defense-in-depth) leg of "restricted". Governing it buys friction, not safety — and a
+     weakest (defense-in-depth) leg of "restricted". Governing it adds friction without adding safety, and a
      restricted baseline that made *every* root-needing image an admin ticket would be unusable.
    - **`add-capabilities` and `privileged` are governed** — Environment whitelist, digest-pinned,
      Administer-only. These cross the isolation boundary.
 
    The floor keeps every **hard** boundary (no privileged, caps dropped, no priv-esc, seccomp, no
-   host namespaces); authors may self-opt-out only of the **soft** non-root leg. Net posture is
+   host namespaces); authors may self-opt-out only of the **soft** non-root leg. Overall this is
    stricter than GHA/GitLab (which run as root freely) yet usable without tickets.
 
 5. **Keying tiered to blast radius.**
    - **`privileged` → digest (`@sha256:…`) only, forever.** No signature shortcut for the
-     node-escape hammer; the friction (an admin re-approves exact bytes on every image bump) *is*
+     grant that can escape to the node; the friction (an admin re-approves exact bytes on every image bump) *is*
      the separation-of-duties control.
    - **`run-as-root` / `add-capabilities` → digest now; a signature/provenance rule allowed *later*,
      once [0015](0015-supply-chain-oidc.md) ships.**
@@ -82,11 +82,11 @@ Two facts force the shape of the decision:
      on unbuilt provenance machinery. Recommended operational pattern for third-party privileged
      images: **mirror into your own registry and self-sign on ingest.**
 
-6. **Enforcement.** **Admission** (in the engine — [0037](0037-environment-governance.md) moved it
+6. **Enforcement.** **Admission** (in the engine; [0037](0037-environment-governance.md) moved it
    there) computes the **admitted grant-set** as a pure function of `{the run's Environment whitelist,
    the step's request, the fork-lockout flag}`. The admitted set flows to the **executor**, which
-   applies **exactly** it to the Pod `SecurityContext` and **fail-closes** — it never applies an
-   escalation admission did not bless.
+   applies that set and nothing more to the Pod `SecurityContext` and **fail-closes** — it never applies an
+   escalation admission did not approve.
 
 ## Consequences
 

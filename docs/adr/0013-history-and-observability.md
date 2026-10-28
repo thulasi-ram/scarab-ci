@@ -7,7 +7,7 @@
 ## Context
 
 The durable core needs an append-only record serving four consumers: crash recovery,
-time-travel UX (the visible wedge payoff), immutable audit, and real-time SSE. The question is
+time-travel UX (the visible payoff of durability), immutable audit, and real-time SSE. The question is
 how much event-sourcing to adopt, given we already committed to a transactional outbox
 ([0003](0003-durability-substrate-postgres.md)).
 
@@ -15,8 +15,8 @@ how much event-sourcing to adopt, given we already committed to a transactional 
 
 **State tables are the source of truth (queryable current state); every transition is also
 appended as an immutable, versioned event via the outbox.** That one event stream drives SSE,
-the timeline, audit, and enough time-travel — without full event-sourcing (projections,
-event-schema replay-to-read complexity).
+the timeline, audit, and enough time-travel, without the complexity of full event-sourcing (projections,
+event-schema replay-to-read).
 
 Implementation defaults:
 
@@ -33,7 +33,7 @@ Implementation defaults:
   > object store, the alternatives are a volume that dies with a Pod or nothing at all, and both lose
   > the one class whose loss is final.
   >
-  > **The exception is bounded on four axes, and each one is load-bearing:**
+  > **The exception is bounded on four axes, and all four are required; drop any one and the exception no longer holds:**
   >
   > - **Compressed** — chunks are gzipped before they reach the row, as they already are on the object
   >   store path.
@@ -55,12 +55,12 @@ Implementation defaults:
 
 ## Consequences
 
-- Time-travel and audit for free from the event stream; SSE is a tail of it.
+- Time-travel and audit come from the event stream at no extra cost; SSE is a tail of it.
 - Bounded Postgres growth (no log bloat).
-- Not full ES — replay-to-rebuild-state is out of scope; state tables remain authoritative.
+- Not full ES: replay-to-rebuild-state is out of scope; state tables remain authoritative.
 
 ## Alternatives considered
 
 - **Pure event sourcing** — maximal replay, but projection lag + schema-evolution machinery;
   over-built for a bounded state machine.
-- **State + minimal audit log only** — weak time-travel; wedge stays invisible.
+- **State + minimal audit log only** — weak time-travel; users never see the benefit of durability.

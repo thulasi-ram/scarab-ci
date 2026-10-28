@@ -7,14 +7,14 @@
 ## Context
 
 Underneath "matrix" is an **invariant** decision: is a run's DAG fully known at submit time,
-or can it grow at runtime? A static DAG is a powerful simplifying invariant (bounded state for
-the engine + DST, fully drawable UI, complete validation). Dynamic fan-out (a step emits N
-children at runtime — monorepo per-package builds, dynamic sharding) is powerful but mutates
+or can it grow at runtime? A static DAG is a simplifying invariant (bounded state for
+the engine + DST, a UI that can draw the whole DAG up front, complete validation). Dynamic fan-out (a step emits N
+children at runtime — monorepo per-package builds, dynamic sharding) covers cases a static DAG cannot, but mutates
 the DAG mid-run and expands the state space.
 
 ## Decision
 
-- **Static matrix in v1:** cartesian product computed at **submit** → fixed node set, fully
+- **Static matrix in v1:** cartesian product computed at **submit** → fixed node set,
   validatable and visualizable, bounded state.
 - **Reserve runtime growth:** shape the IR + engine state model to allow a future runtime
   **`expand`** event, so **dynamic `for_each` fan-out** (`invoke … for_each: <CEL over a prior
@@ -24,8 +24,8 @@ the DAG mid-run and expands the state space.
 
 ## Consequences
 
-- v1 engine, DST, and UI stay simple (bounded DAG) without cornering dynamic later.
-- Dynamic fan-out reuses the `invoke` recursion primitive ([0006](0006-pipeline-ontology.md)).
+- v1 engine, DST, and UI stay simple (bounded DAG) without ruling out dynamic fan-out later.
+- Dynamic fan-out reuses `invoke` recursion ([0006](0006-pipeline-ontology.md)).
 
 ## Alternatives considered
 

@@ -1,4 +1,4 @@
-# 0073. Step-up confirmation: a human, a passkey, the exact action
+# 0073. Step-up confirmation: a human confirms the exact action with a passkey
 
 - **Status:** Accepted. Built 2026-10-24 as one build on `feat/step-up`; where the build
   differs from the text, the text is amended in place or recorded in
@@ -49,7 +49,7 @@ operation without a passkey, the refusal points them to enrollment. The **first*
 passkey can be enrolled only right after a **fresh login** in that browser session
 (within the step-up window): a valid session alone is not enough, or a stolen session
 could enroll the attacker's own passkey and own step-up forever. Every enrollment is
-recorded and surfaced (see §7). Adding or removing a passkey **after** the first is
+recorded and shown (see §7). Adding or removing a passkey **after** the first is
 itself a crown-jewel operation. No second admin approves an enrollment.
 
 **Recovery.** An Org Owner may reset a member's passkeys, as a stepped-up operation.
@@ -90,7 +90,8 @@ is in §10.
 no step-up. A reject can only fail a Gate, never release one. Anyone who can reject can
 already cancel the whole Run, both are recorded, and a Retry undoes a reject.
 
-The guard covers the **whole** list from day one. A partial list is a list of holes.
+The guard covers the **whole** list from day one. Any operation left off it would be
+unguarded.
 
 ### 4. The window
 
@@ -103,13 +104,13 @@ cookie (and its CSRF token) inside the window inherits the window. That is inher
 any session-bound window, and it is why the operations below confirm every time.
 
 Three operations confirm **every time**, even inside a window, because each mints a new
-credential or outbound channel, and that is how minutes become permanent access:
+credential or outbound channel, which turns a 5-minute window into permanent access:
 - API token creation;
 - Plugin install/upgrade and a PluginConnection's destination;
 - adding, removing or resetting passkeys.
 
 They are rare, so the friction is small, and a per-action WebAuthn challenge can show
-exactly what is being confirmed. As built, **every** PluginConnection write is
+what is being confirmed. As built, **every** PluginConnection write is
 always-ask, not only a destination change: the one write route sets the destination
 together with the rest.
 
@@ -145,7 +146,7 @@ human. The link expires in 5 minutes and cannot be reused or widened. How "exact
   confirmation time.
 - A PluginPrincipal has no human and cannot raise one.
 
-This makes Scarab a human-in-the-loop gate for agents rather than a wall they hit.
+Agents can still reach these operations; a human confirms each one.
 
 ### 7. OrgSecurityEventLog
 
@@ -154,7 +155,7 @@ One append-only, Org-scoped log records:
 - every crown-jewel operation, with the confirmation or StepUpConfirmationRequest that
   authorised it;
 - every **refusal**, meaning which caller attempted which operation without step-up. A
-  burst from one token is an agent probing the edges;
+  burst from one token is an agent trying operations to see which ones get through;
 - every passkey enrollment, removal and reset, break-glass included.
 
 Org admins see the Org's log; each user sees their own events and passkeys. Core sends
@@ -167,7 +168,7 @@ prunes it; who sees which rows is in Implementation notes.
 `SCARAB_STEP_UP` is `enforce` in production, with **no `off` or `log` mode**: the
 protection cannot be quietly disabled. Unset or blank means `enforce`; any other value
 refuses boot. `SCARAB_DEV_INSECURE` (local dev, every caller an Owner) implies off
-unless `SCARAB_STEP_UP=enforce` is set explicitly (for testing passkeys locally), so the
+unless `SCARAB_STEP_UP=enforce` is set (for testing passkeys locally), so the
 dev stack, `just plugin-verify` and the test suite keep working. As built, two more boot
 checks:
 - enforced step-up needs an `https` `SCARAB_PUBLIC_URL` (plain `http` only on
@@ -176,7 +177,7 @@ checks:
   enforced refuses to boot. With no login configured there is no human to confirm, so
   nothing is enforced and the boot log warns.
 
-To make day one survivable:
+So that enforcing from day one does not lock people out:
 
 - `scarab security setup` checks for a passkey. If there is none, it opens the browser
   at enrollment (through a fresh login), waits until it completes, and is safe to
@@ -255,7 +256,7 @@ through a `subscribe_events` plugin.
 
 ## Implementation notes (2026-10-24)
 
-Recorded when the build landed, so the ADR stays honest about how it was built and what
+Recorded when the build landed, so the ADR stays accurate about how it was built and what
 is still open. None of these reverses a decision.
 
 - **The WebAuthn relying party is hand-rolled** (`crates/scarab-webauthn`, on `ring` +

@@ -20,7 +20,7 @@ Scarab has no such machine. [0004](0004-execution-topology.md)/[0005](0005-tenan
 make each **Step its own Pod**, network-isolated by policy ([0042](0042-trusted-egress-sidecar.md)),
 and the glossary is explicit that a "job" is a named subgraph — *sugar, not structure*. There is
 no shared network for a set of steps to hang a service off. So "a service shared across steps" is
-not a feature we forgot; it is a capability we **traded away** for the durability wedge (each Step
+not a feature we forgot; it is a capability we **traded away** for durability (each Step
 is the individually re-executable unit). Offering it at all means either a standalone service Pod
 with cluster DNS (cross-Pod networking) or co-scheduling a subgraph into one Pod (surrendering
 per-step restart).
@@ -29,13 +29,13 @@ Two further tensions shape the design:
 
 - **A service is not a DAG node.** A `gate`/`clone`/`invoke` step has an id, an exit code, and an
   Attempt other steps `need`. A backing container has none of these — it is *infrastructure for a
-  Step, not a Step*. Forcing it to masquerade as a node gives it no coherent rerun or status
+  Step, not a Step*. Forcing it to pose as a node gives it no coherent rerun or status
   semantics. So the [0008](0008-step-contract.md) "service is a step kind" framing is wrong and is
   amended here.
 - **A shared, mutable, long-lived DB is unfenced external state.** [0021](0021-double-effect-fencing.md)
   neutralises the double-effect hazard for durable step I/O via fencing tokens and per-Attempt
   evidence isolation. A DB that one step seeds and another reads has *no fence* and is *not durable
-  state* in the [0007](0007-data-passing-model.md) sense — exactly the hazard the model contains.
+  state* in the [0007](0007-data-passing-model.md) sense — the hazard the model contains.
 
 ## Decision
 
@@ -65,7 +65,7 @@ steps:
   Steps that each declare Postgres each get their own. This is the common case (one test Step + a
   throwaway DB), and it carries **none** of the durability/fencing cost below.
 - The optional `ready:` probe drives the sidecar's startup probe so the **main container does not
-  start until the service is ready** — replacing the `sleep 30s` folklore of Woodpecker.
+  start until the service is ready** — replacing Woodpecker's `sleep 30s` workaround.
 
 ### 2. Shared service — the opt-in
 
@@ -93,13 +93,14 @@ steps:
 
 - **Explicit `uses:` opt-in, not ambient reachability.** Woodpecker/GHA make every step reach the
   service because their steps already share a network; Scarab's Pods are network-isolated, so
-  ambient would mean a hole for *every* Pod. `uses:` scopes the network-policy hole to exactly the
+  ambient would mean a hole for *every* Pod. `uses:` scopes the network-policy hole to only the
   opt-in Pods (least-privilege), tells the scheduler which steps to readiness-gate, and documents
   the dependency. Hostname = the declared `name` (`db:5432`), matching the label-as-hostname
-  familiarity of GHA/Woodpecker.
+  convention of GHA/Woodpecker.
 - **Eager birth, Run-scoped teardown.** The service starts at **Run start** (services are run
-  setup; the small idle cost is accepted for a clean mental model over lazy birth). It is torn down
-  when the Run — that Take — reaches terminal, riding namespace-per-run teardown
+  setup; the small idle cost is accepted because "the service lives for the whole
+  Run" is easier to reason about than lazy birth). It is torn down
+  when the Run — that Take — reaches terminal, via namespace-per-run teardown
   ([0050](0050-retention-and-gc.md)), **not a refcount**. The readiness *gate* still applies only to
   opt-in steps: a step without `uses: [db]` never waits on `db`.
 - **A fresh instance per Take.** The instance is keyed `{run, take}`. A **Rerun**
@@ -108,7 +109,7 @@ steps:
   violate the isolation Takes guarantee.
 - **Unfenced external mutable state.** A Shared service is *not* durable state and is *not* fenced.
   Intra-Take idempotency across auto-retries and parallel writers is a **step-author contract**
-  ([0021](0021-double-effect-fencing.md)) — exactly the rule for any other external effect
+  ([0021](0021-double-effect-fencing.md)) — the same rule as for any other external effect
   (`terraform apply`, `docker push`). Scarab provisions the container; it does **not** promise
   exactly-once semantics against it.
 
@@ -121,8 +122,8 @@ escalations (`run-as-root`, `add-capabilities`, `privileged`) are governed grant
 as root to fix perms) nonetheless run **non-root here without any grant**: the executor pins the
 image's built-in service uid and sets `fsGroup` so the ephemeral `emptyDir` is group-writable — the
 standard k8s non-root pattern, keeping the service inside the restricted baseline. `run-as-root`
-survives only as a **self-service escape hatch** (sandbox-bound) for the rare image that genuinely
-cannot run non-root — deliberately *not* the default path, because root-in-container is exactly what
+survives only as a **self-service escape hatch** (sandbox-bound) for the rare image that
+cannot run non-root — *not* the default path, because root-in-container is what
 the restricted baseline (and k8s PSS `restricted`, OpenShift's random-uid, rootless runtimes) is
 moving away from. No "services are magically trusted" exemption.
 
@@ -130,7 +131,7 @@ moving away from. No "services are magically trusted" exemption.
 
 - **Readiness is scheduler-gated.** The author supplies a `ready:` probe (TCP-connect on the first
   port by default; exec/http also allowed). For a Shared service the scheduler holds opt-in steps
-  until the probe passes — a natural durable suspend, no `sleep`. Fail-closed: a ready-timeout fails
+  until the probe passes — an ordinary durable suspend, no `sleep`. Fail-closed: a ready-timeout fails
   the opt-in steps with an unbound-dependency diagnostic.
 - **Startup flake → bounded auto-retry.** If a Shared service fails to become ready the *first*
   time, the service Pod is auto-retried within a bounded budget — nothing has been written, so
@@ -138,15 +139,15 @@ moving away from. No "services are magically trusted" exemption.
 - **Mid-run death → fail-closed, no auto-rerun.** If a healthy Shared service dies mid-run, the
   opt-in steps fail and their descendants cascade ([0027](0027-restart-semantics.md)); non-opt-in
   steps proceed. The engine does **not** auto-recover, because the property that makes auto-retry
-  sound elsewhere — durable, fenced inputs — is exactly what a Shared service lacks: a fresh
-  (empty) instance would give a green retry over corrupt state. Honest recovery means re-running
+  sound elsewhere — durable, fenced inputs — is what a Shared service lacks: a fresh
+  (empty) instance would give a green retry over corrupt state. Correct recovery means re-running
   every writer from the first, against a fresh instance — which *is* a new Take, i.e. a **human
   Rerun** (the per-Take model already provisions a fresh instance and re-runs from the chosen
   point). Auto-forking a Take would blur the machine-vs-human Take boundary
   ([0056](0056-run-takes-and-attempt-grain-evidence.md)) and risk the forward-progress invariant
   (a crash-looping service would auto-rerun forever).
 
-### Evidence / ontology
+### Evidence / where services appear
 
 Neither form is a DAG node (amends [0008](0008-step-contract.md)).
 
@@ -154,15 +155,15 @@ Neither form is a DAG node (amends [0008](0008-step-contract.md)).
   its lifecycle is the Step's.
 - **Shared service** is a **Run-scoped, non-DAG resource** keyed `{run, take, service}` with its own
   lifecycle status (`starting → ready → running → torn-down | failed`) and a best-effort log stream
-  ([0013](0013-history-and-observability.md)), surfaced in a **"Services" panel beside the DAG** —
+  ([0013](0013-history-and-observability.md)), shown in a **"Services" panel beside the DAG** —
   never as a node inside it. This gives operators the "why won't my DB come up" logs without
   polluting the graph.
 
 ## Consequences
 
 - The 95% case (one test Step + a throwaway DB) gets the **light, fenced, zero-networking** Sidecar
-  shape. The rare shared-live-DB case gets an honest, explicitly-unfenced tool.
-- **New surface:** pipeline-level `services:` and per-Step `services:`/`uses:` IR fields; a
+  shape. The rare shared-live-DB case gets a tool that is explicitly unfenced.
+- **New pieces:** pipeline-level `services:` and per-Step `services:`/`uses:` IR fields; a
   readiness-probe schema; scheduler readiness-gating on a **non-Step** resource; a Run-scoped
   service resource with status + best-effort logs + a UI Services panel; per-Take service
   instancing and teardown; network-policy scoping for opt-in Pods; governed-grant keying on service
@@ -174,8 +175,8 @@ Neither form is a DAG node (amends [0008](0008-step-contract.md)).
   Pod container; Shared = a Pod + Service.
 - **Matrix:** a matrixed Step's Sidecars multiply per instance (each instance's Pod gets its own);
   Shared services are pipeline-level and are **not** multiplied by a Step's matrix.
-- The durable data plane ([0007](0007-data-passing-model.md)) remains the sanctioned way to pass
-  state between steps; a Shared DB is explicitly *scaffolding*, not a state channel.
+- The durable data plane ([0007](0007-data-passing-model.md)) remains the supported way to pass
+  state between steps; a Shared DB is *scaffolding*, not a state channel.
 
 ## Alternatives considered
 
@@ -183,7 +184,7 @@ Neither form is a DAG node (amends [0008](0008-step-contract.md)).
   DNS, a Run-scoped durable resource, and the loss of fenced isolation for what a co-located sidecar
   does lighter and safer.
 - **Co-schedule a subgraph into one Pod (GHA "job = machine")** — rejected: the subgraph becomes one
-  unit of re-execution, surrendering per-Step restart — the durability wedge.
+  unit of re-execution, giving up per-Step restart, the core of Scarab's durability model.
 - **Ambient run-wide reachability (Woodpecker/GHA)** — rejected: with per-Pod network isolation,
   ambient means a network hole for every Pod; explicit `uses:` scopes it to opt-in Pods.
 - **Bounded auto-restart of a dead Shared service** — rejected: on an `emptyDir` the restart is
@@ -195,4 +196,4 @@ Neither form is a DAG node (amends [0008](0008-step-contract.md)).
 - **Keep `service` a formal step kind for uniformity** — rejected: false uniformity. A non-node
   forced into a DAG node has no coherent rerun action or status pill.
 - **Readiness left to the step author (`sleep`)** — rejected: with a durable scheduler, "wait until
-  healthy" is a native suspend; punting reproduces Woodpecker's `sleep 30s` folklore.
+  healthy" is a native suspend; leaving it to authors brings back Woodpecker's `sleep 30s` workaround.

@@ -1,9 +1,11 @@
 # 0071. Org-level Environments: a place that decides who may deploy into it
 
-- **Status:** Proposed
+- **Status:** Accepted. The MMP is built on main (migrations `0054_org_environments.sql`
+  and `0057_org_environment_governance.sql`, the `/v1/orgs/{org}/environments/*` routes).
+  See [Implementation horizon](#implementation-horizon) for what is still open.
 - **Date:** 2026-10-22
 - **Deciders:** thulasi.ram (architect)
-- **Builds on:** [0024](0024-environments.md) (Environment is first-class),
+- **Builds on:** [0024](0024-environments.md) (Environment as a built-in entity),
   [0037](0037-environment-governance.md) (approval-as-gate, scoped secrets, admission at
   the point of use), [0070](0070-deployments-as-a-vendor-neutral-record.md) (the
   Deployment record an Environment owns)
@@ -44,9 +46,9 @@ An **Environment** is an org-level place that deployments land in (staging, prod
 owns its protection rules (approvers, wait timer, allowed refs, `require_reason`,
 concurrency, EnvironmentDeploymentDeadline), the DeploymentTargets in it, and the
 Deployments to them. It does not own an OIDC subject: the subject is still minted per
-repository from the Run's coordinates (§11). **Projects ask; the Environment
-decides.** A Pipeline's `environment: prod` is the *request*. The Environment's own
-records are the *authority*.
+repository from the Run's coordinates (§11). Projects ask and the Environment decides:
+a Pipeline's `environment: prod` is the *request*, and the Environment's own records are
+the *authority*.
 
 ### 2. EnvironmentProjectEligibility: which Projects may deploy here
 
@@ -59,8 +61,8 @@ from: *all projects*, or an explicit list in which project-name globs are allowe
   It is checked **again** wherever the Environment's authority is used later in the Run:
   a manual or external gate does not release (409) for a Project no longer eligible, or
   for an Environment that no longer exists, and **every** step of a Deploy Run is
-  re-checked at launch — whether or not it carries secrets, an OIDC token, governed
-  grants or a raw overlay — and fails cleanly (a configuration failure with the reason)
+  re-checked at launch, whether or not it carries secrets, an OIDC token, governed
+  grants or a raw overlay, and fails cleanly (a configuration failure with the reason)
   when the Project is no longer eligible. Timer gates are covered by that launch check.
   An admin withdrawing eligibility therefore stops a long Run at its next step, not only
   its next Run.
@@ -93,7 +95,7 @@ on, and invoke actions against, a DeploymentTarget. It is **reported by the sour
 is configured to read) and never assigned in Scarab. Scarab mirrors the source's
 authority and does not invent a parallel one. It may name several Projects.
 
-**Where that authority really sits.** Mirroring the source means ownership is, in effect,
+**Where that authority sits.** Mirroring the source means ownership is, in effect,
 **write access to the gitops source** the metadata lives in. In a shared gitops
 repository that is whoever can merge there, and a deploy Step that writes to the
 repository can write an owner annotation into its own commit. Scarab does not make that
@@ -106,11 +108,11 @@ authority stronger than it is; it only refuses to invent a weaker parallel one.
 | Invoke a PluginAction | eligibility + ownership (never on an unowned target) |
 
 **Unowned targets.** A request may name a DeploymentTarget **no one owns yet**, for
-example a new service whose source object is created by the very change being deployed.
+example a new service whose source object is created by the change being deployed.
 It is recorded *Unconfirmed*, and flagged if the source later reports owners that
 exclude the requester. A request is rejected only when **other** Projects own the target.
 That rejection and the flag are not built yet (git-bug `9c1173a`). **No PluginAction is offered on a DeploymentTarget with no owners.** The fix is for the
-source to report one, not a side door around Runs.
+source to report one, not a way to act outside a Run.
 
 **A request never explains a Deployment a report created.** If a request joins one, it is
 recorded as a separate claim beside it, and the Deployment stays Unexplained (ADR-0070
@@ -132,8 +134,8 @@ reporting: a plugin with `report_deployments` (ADR-0072) can report only into th
 Environments that list it.
 
 **The consent unit is the installation.** The vendor grouping is asserted by the plugin,
-so listing *(installation, grouping)* trusts the installation to report groupings
-honestly; it does not stop that installation from reporting another grouping's target as
+so listing *(installation, grouping)* trusts what the installation reports about groupings;
+it does not stop that installation from reporting another grouping's target as
 this one. One installation per Environment makes the two the same, and is recommended.
 
 **A source moving a target re-homes it.** When a source reports a known DeploymentTarget
@@ -218,7 +220,7 @@ read at all.
 ### 10. Migration that keeps what every Run does today
 
 Existing installations migrate so that every Run the migration can see is admitted and
-governed exactly as before:
+governed as before:
 
 1. Create **one org Environment per distinct name** (all Projects' `prod` become one
    `prod`), with an **empty, permissive baseline**: no approvers, all refs, no timer, no
@@ -250,15 +252,15 @@ governed exactly as before:
 
    This is the behaviour change, and it is fail-closed on purpose: a scan is impossible
    without a pipeline store, and a grace mode would fail open. A dispatch answers 403
-   saying exactly what the admin must do; a webhook names each refused pipeline in its
+   saying what the admin must do; a webhook names each refused pipeline in its
    delivery body. An org Environment that already existed (created through
    the minimal org-level API before the migration) and that no Project defined is treated
-   like a referenced-only name — a pipeline naming it deployed with no rules from any
-   Project — and also gets eligibility **all projects**.
+   like a referenced-only name (a pipeline naming it deployed with no rules from any
+   Project), and also gets eligibility **all projects**.
 7. Old `deployments` rows stay readable as **legacy approval history** (ADR-0070 §1).
    They are not converted into Deployments, because they carry no target or version.
 8. A **split report** lists every name that merged across Projects, so an admin can
-   split places that are genuinely different (for example a `prod` that is really
+   split places that are different (for example a `prod` that means
    `prod-eu` in one repository). It also lists names migrated with eligibility *all
    projects*, and a name one Project defined that another Project only ran into: that
    Project is eligible under the permissive baseline with no overlay, so the definer's
@@ -282,7 +284,7 @@ moving to org level changes nothing in it, so no cloud trust policy needs editin
 - Ownership depends on the source reporting it. A target whose source reports no owner
   can be requested (Unconfirmed) but never acted on through a PluginAction. Ownership is
   only as strong as write access to the gitops source (§4).
-- The API surface moves from `/v1/repos/{org}/{repo}/environments/...` to an org-level
+- The API moves from `/v1/repos/{org}/{repo}/environments/...` to an org-level
   Environment resource with per-Project overlays, grants and secret scopes beneath it.
 - The split report is the one place the migration asks an admin to think. Everything
   else is mechanical. The one behaviour change is a name referenced only by a Pipeline
@@ -305,7 +307,7 @@ moving to org level changes nothing in it, so no cloud trust policy needs editin
 - **First-claim ownership** (the first Project to request a target owns it). Rejected. A
   race decides authority, and an attacker who names a target first takes it.
 - **Reject requests on unowned targets.** Rejected. A new service's source object is
-  created by the very change that deploys it, so it could never be deployed through
+  created by the change that deploys it, so it could never be deployed through
   Scarab the first time.
 - **Plugin-chosen source names.** Rejected. A plugin could impersonate another source.
 - **Privilege grants on the Environment as a whole.** Rejected. The merge would widen
@@ -314,7 +316,7 @@ moving to org level changes nothing in it, so no cloud trust policy needs editin
   serialises unrelated services and is not what any team asked for.
 - **Migrate with a strict merged baseline** (union of approvers, intersection of refs).
   Rejected. It changes behaviour for every Project at once. A permissive baseline plus
-  per-Project overlays reproduces today exactly.
+  per-Project overlays reproduces today's behaviour.
 - **Migrate concurrency as stored.** Rejected. The stored 1 was a UI default nobody chose
   and nothing read; enforcing it would throttle every target at once.
 - **A source moving a target is a standing conflict.** Rejected. Moving an Application

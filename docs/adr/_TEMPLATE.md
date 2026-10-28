@@ -7,7 +7,7 @@
 ## Context
 
 What forces are at play? What problem or tension are we resolving? Keep it to the facts and
-constraints that actually drive the decision.
+constraints that drive the decision.
 
 ## Decision
 

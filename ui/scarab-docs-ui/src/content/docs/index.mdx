@@ -1,10 +1,10 @@
 ---
 title: Scarab
-description: A modern CI engine for Kubernetes. It gives you the cohesion of a CI that lives in your forge, built on a control plane that treats a run as state rather than a process. Written in Rust.
+description: A CI engine for Kubernetes that plugs into your forge. The control plane keeps each run as saved state rather than a running process, so a control-plane restart doesn't lose it. Written in Rust.
 template: splash
 hero:
   layout: split-left
-  tagline: A modern CI engine for Kubernetes that lives in your forge. It treats your run as state, not a process you hope stays alive.
+  tagline: A CI engine for Kubernetes that plugs into your forge. Each run is saved as state, so it survives a control-plane restart.
   image:
     # The brand emblem, square-cropped (1:1) — ink outline on light, gold on dark.
     light: ../../assets/brand/scarab-emblem-square.svg
@@ -27,14 +27,15 @@ hero:
 
 import AsciiScene from '../../components/AsciiScene.astro';
 
-CI tools tend to fall into two camps. **Workflow engines** (Argo, Tekton, Temporal) have a
-durable core that survives a crash, but they aren't really CI: forge integration, in-repo config,
-PR checks, identity, secrets, the DSL, and the UI are all yours to build. **CIs that live in your
-forge** (GitHub Actions, GitLab, Woodpecker, Drone) hand you all of that, but underneath, the
-orchestrator is just a job runner. If the control plane restarts partway through a run, the run is
-orphaned or starts over. Scarab is built to be **both at once**: the batteries-included feel of a
-forge CI, sitting on a control plane that treats a run as durable **state** rather than a process
-it forgets the moment it restarts.
+Scarab gives you a CI that plugs into your forge (pipelines in your repo, PR checks, secrets,
+approvals, a UI) on a control plane that saves each run as durable **state**. If the control
+plane restarts partway through a run, the run carries on from its last completed step.
+
+Most CI tools give you one half of that. **Workflow engines** (Argo, Tekton, Temporal) have a
+durable core that survives a crash, but forge integration, in-repo config, PR checks, identity,
+secrets, the DSL and the UI are all yours to build. **CIs that live in your forge** (GitHub
+Actions, GitLab, Woodpecker, Drone) hand you all of that, but underneath they are plain job
+runners: if the control plane restarts mid-run, the run is orphaned or starts over.
 
 ![The Scarab dashboard: an action inbox of runs paused on a gate, recently visited repos shown as pass/fail status cards, and the repo list sorted by what you touched last](../../assets/dashboard.jpg)
 
@@ -69,29 +70,29 @@ it forgets the moment it restarts.
   <div class="sc-home-spec-row">
     <dt class="sc-home-spec-key">cohesion</dt>
     <dd class="sc-home-spec-body">
-      <p class="sc-home-spec-claim">One product, not a kit.</p>
-      <p class="sc-home-spec-support">A CI that lives in your forge (DSL, secrets, approvals, identity, UI) on a durable engine. Not a workflow engine you have to build a CI on top of, and not a job-runner CI with nothing durable underneath.</p>
+      <p class="sc-home-spec-claim">Forge CI and engine, shipped together.</p>
+      <p class="sc-home-spec-support">A CI that plugs into your forge (DSL, secrets, approvals, identity, UI) on a durable engine. You don't have to build a CI on top of a workflow engine, and you don't have to accept a job-runner CI with nothing durable underneath.</p>
     </dd>
   </div>
   <div class="sc-home-spec-row">
     <dt class="sc-home-spec-key">durability</dt>
     <dd class="sc-home-spec-body">
-      <p class="sc-home-spec-claim">Runs are state, not processes.</p>
-      <p class="sc-home-spec-support">A durable state machine on Postgres, in the spirit of DBOS. When the control plane restarts, a run resumes from its last completed step, and each step runs exactly once. That's the architecture doing its job, not a boast.</p>
+      <p class="sc-home-spec-claim">Runs survive control-plane restarts.</p>
+      <p class="sc-home-spec-support">A durable state machine on Postgres, modelled on DBOS. When the control plane restarts, a run resumes from its last completed step, and each step runs exactly once.</p>
     </dd>
   </div>
   <div class="sc-home-spec-row">
     <dt class="sc-home-spec-key">identity</dt>
     <dd class="sc-home-spec-body">
-      <p class="sc-home-spec-claim">Keyless by design.</p>
-      <p class="sc-home-spec-support">OIDC that doesn't care which forge you use, with Scarab acting as its own OIDC issuer so runs can federate into your cloud without long-lived keys. Adapters for GitHub and Forgejo are implemented today. See Status.</p>
+      <p class="sc-home-spec-claim">No long-lived cloud keys.</p>
+      <p class="sc-home-spec-support">Scarab acts as its own OIDC issuer, so a deploy step can federate into your cloud with a short-lived token Scarab mints for it instead of a long-lived key. The identity isn't tied to one forge; adapters for GitHub and Forgejo are implemented today. See Status.</p>
     </dd>
   </div>
   <div class="sc-home-spec-row">
     <dt class="sc-home-spec-key">the DSL</dt>
     <dd class="sc-home-spec-body">
-      <p class="sc-home-spec-claim">A real language, not templated YAML.</p>
-      <p class="sc-home-spec-support">A typed intermediate representation with a YAML frontend and CEL expressions. Under it all is one flat recursive DAG, where <code>invoke</code> is reuse and matrix is just a modifier.</p>
+      <p class="sc-home-spec-claim">Typed pipelines, not templated YAML.</p>
+      <p class="sc-home-spec-support">You write YAML with CEL expressions, and Scarab compiles it to a typed intermediate representation. Every pipeline becomes one flat recursive DAG: <code>invoke</code> handles reuse, and matrix is a modifier on a step.</p>
     </dd>
   </div>
 </dl>
@@ -102,21 +103,20 @@ it forgets the moment it restarts.
 
 As pipelines get longer and more autonomous (agents, review gates that sit open for hours,
 workflows that span days), "the job died, click re-run" stops being good enough. Scarab can hold
-a paused run almost for free and pick up exactly where it left off, and it keeps an event log that
-only ever grows, so you can see everything that happened. That's where a durable core earns its
-keep. It's also the kind of foundation that agent-driven development actually wants, rather than
-just a nicer YAML dialect. And Scarab is *built* that way too: ambitious systems software from a
-small team, at a pace that used to take a room full of people.
+a paused run at almost no cost and pick up where it left off, and it keeps an event log that
+only ever grows, so you can see everything that happened.
+We also build Scarab with AI tools: a small team writing systems software at a pace that used to
+need many more people.
 
 ![A Scarab run: the step DAG, live logs, and an event timeline showing a retried step and the run paused on a manual deploy gate](../../assets/run-detail.jpg)
 
 ## Lineage
 
 Scarab owes its shape to [Woodpecker](https://woodpecker-ci.org/): lean CI that lives in your
-forge, with none of the enterprise ceremony. It's shaped just as much by Woodpecker's *limits*:
-the many backends it has to support, and the pace a volunteer project can sustain. Sticking to
-Kubernetes alone is us shedding that backend baggage on purpose, and the pace is what a small team
-leaning on AI can now hold.
+forge, without enterprise overhead. It's shaped just as much by Woodpecker's *limits*: the many
+backends it has to support, and the pace a volunteer project can sustain. Supporting only
+Kubernetes drops that backend burden on purpose, and a small team using AI can now keep up a
+faster pace.
 
 ## Where to go next
 
@@ -131,22 +131,27 @@ leaning on AI can now hold.
   <a class="sc-home-next-el" href="/scarab-ci/tech/context/">
     <span class="sc-home-next-main">
       <span class="sc-home-next-label">Read the design</span>
-      <span class="sc-home-next-desc">the thesis, the durability contract, and the ubiquitous language: 40+ ADRs on the why</span>
+      <span class="sc-home-next-desc">the core idea, the durability contract (what is and isn't guaranteed), the domain vocabulary, and 40+ ADRs explaining the decisions</span>
     </span>
     <span class="sc-home-next-arrow" aria-hidden="true">&rarr;</span>
   </a>
 </div>
 
-:::note[Status: honest]
-A proven core, with real forge and Kubernetes I/O wired in around it. **Proven against real
-Postgres:** the durable engine, crash and resume, exactly-once execution, restarting a single
-step, gates, the content-addressed workspace, `invoke`, secrets, and the OIDC issuer (the
-workspace suite passes locally). **Implemented:** the GitHub adapter (it ingests webhooks and
-posts commit statuses) and a Forgejo adapter, so more than one forge is supported; Pod execution
-on a live Kubernetes cluster (`scarab-executor-k8s`, with cluster tests); the results-egress
-sidecar image (`docker/sidecar/`); and CI that runs the Rust suite on every push
-(`.github/workflows/ci.yml`). None of it is yet hardened at scale. Read this as a proven state
-machine with its edges freshly wired up: implemented, but not yet battle-tested in production.
+:::note[Status]
+Scarab is not a shipped product yet. **Tested against real Postgres, in CI:** the durable
+engine, crash and resume, exactly-once execution, restarting a single step, gates, the
+content-addressed workspace, `invoke`, secrets, and the OIDC issuer. `ci.yml` runs the
+workspace suite on every push to main and on every PR that touches Rust code. **Tested against
+a fake forge:** webhook → in-repo config → run → commit statuses posted back. **Implemented, and
+run against real forges by hand:** the GitHub and Forgejo adapters (webhook ingest and commit
+statuses); `just forgejo-verify` drives a real Forgejo from hook to Run, and the live demo takes
+its webhooks from a GitHub App. **Implemented, and tested on a kind cluster:** Pod execution and
+re-attach (`scarab-executor-k8s`) and the results-egress sidecar (`docker/sidecar/`).
+`kind.yml` runs those tests for changes to the execution path, not on every PR (as of
+2026-10-28 the job fails at image load, before the tests run; last green on main 2026-10-20). **Not proven
+yet:** control-plane crash and resume with a real Pod in flight (the weekly e2e test for it
+doesn't pass yet) and production-scale load. **Missing:** `on: cron` and `on: upstream`
+triggers parse, but nothing produces those events yet.
 :::
 
 ## References

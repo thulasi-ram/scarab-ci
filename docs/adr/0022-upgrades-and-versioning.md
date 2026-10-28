@@ -10,7 +10,7 @@ If upgrading the control plane breaks in-flight runs, "durable" is a lie. And `g
 ([0008](0008-step-contract.md)) is a durable suspend that can wait **weeks** — so a gated run
 is *guaranteed* to outlive many deploys. Resume-across-upgrades is therefore the **normal
 case**, not an edge case, which rules out drain-then-upgrade. Version tolerance is cheap now
-and brutal to retrofit (you cannot version history you did not version).
+and painful to retrofit (you cannot version history you did not version).
 
 ## Decision
 
@@ -31,10 +31,10 @@ and brutal to retrofit (you cannot version history you did not version).
 ## Consequences
 
 - Rolling, drain-free deploys; gated runs survive arbitrary upgrades.
-- Slightly more schema/event ceremony from the start — deemed mandatory.
-- Underpins the "survives its own deploys" credibility of the wedge.
+- Slightly more schema/event ceremony from the start; we consider it mandatory.
+- Backs up the core claim that a pipeline "survives its own deploys".
 
 ## Alternatives considered
 
 - **Basic migrations now, versioning later** — gate-outlives-deploy bites early; painful retrofit.
-- **Drain-based deploys** — impossible with weeks-long gates; contradicts the wedge.
+- **Drain-based deploys** — impossible with weeks-long gates; contradicts durable execution.

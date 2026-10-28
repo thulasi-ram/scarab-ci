@@ -15,25 +15,25 @@ files off disk after it exits. The **k8s** backend's `Executor::results` is stil
 and closing it is not a small wiring detail, because Scarab is **agentless**: the control
 plane drives Pods through the k8s API and there is no process co-located with the workload
 (unlike Woodpecker/Drone/Actions, whose runner *agent* brokers all step I/O out). So the
-control plane can only observe a Pod through the API surface — status and logs — and:
+control plane can only observe a Pod through the k8s API (status and logs), and:
 
 - **The step Pod is untrusted and credential-less.** Third-party code arrives as an
   isolated OCI image ([0038](0038-invoke-and-local-reuse.md)); it must never hold Postgres,
   object-store, or k8s-API credentials, nor a network path to the control plane. So the step
   cannot write its own results anywhere durable.
-- **Every credential-free API-surface channel is lossy.** k8s container logs are best-effort
+- **Every credential-free channel through the k8s API is lossy.** k8s container logs are best-effort
   observability: the kubelet **rotates and evicts** them (a chatty step pushes a marker out
   of the retained window), a `--follow` stream **drops** on API-server/kubelet restart, and
   logs vanish on **Pod deletion / node death**. k8s **Events** and the **termination message**
   are the same class — GC'd, deduplicated, capped, diagnostic-only. And parsing results out
-  of shared stdout is an *injection* surface (the class of bug that forced GitHub Actions off
-  `::set-output::` — CVE-2020-15228 — onto files).
+  of shared stdout is open to *injection* (the class of bug, CVE-2020-15228, that forced GitHub
+  Actions off `::set-output::` onto files).
 
 Results are **data, not observability**: losing one silently fails a dependent. They need a
-channel with **acknowledged delivery** and a **non-shared** surface — which no API-surface
-path provides. That forces a trusted egress helper co-located with the Pod. The question is
+**non-shared** channel with **acknowledged delivery**, and no k8s API
+path provides one. That forces a trusted egress helper co-located with the Pod. The question is
 the *smallest* such helper that preserves the agentless control plane and the untrusted-Pod
-trust posture.
+trust model.
 
 ## Decision
 
@@ -46,7 +46,7 @@ A **trusted per-Pod egress sidecar** carries results out with acknowledged deliv
 
 1. **Files in, over a shared volume.** The step container and a sidecar share an `emptyDir`
    mounted at `/scarab/results`. The step writes `<name>.json` files there (the *same*
-   authoring surface as the local backend, and the file-not-stdout lesson from
+   authoring interface as the local backend, and the file-not-stdout lesson from
    [0008](0008-step-contract.md) and GitHub's migration). The step needs no credentials and
    no network.
 
@@ -60,7 +60,7 @@ A **trusted per-Pod egress sidecar** carries results out with acknowledged deliv
 3. **Credential isolation is the whole point.** Only the **sidecar** holds a short-lived,
    fence-scoped token; the untrusted step holds nothing and has no egress to the control
    plane (enforced by network policy). Untrusted code therefore cannot call the results API,
-   cannot forge another step's results, and gains no ambient authority — the trust posture of
+   cannot forge another step's results, and gains no ambient authority, so the trust model of
    [0038](0038-invoke-and-local-reuse.md) is preserved. The results API authenticates the
    token, checks it matches the `{run, step, attempt}` it carries, and bounds the payload size.
 
@@ -73,7 +73,7 @@ A **trusted per-Pod egress sidecar** carries results out with acknowledged deliv
 5. **A general egress mechanism, results-first.** The sidecar + shared-volume + fence-scoped-API
    pattern is not results-specific: the same channel can later carry progress, structured
    annotations, and artifact manifests. **v1 scope is results only**; the shape is chosen so
-   those ride it without a new mechanism.
+   those can use it without a new mechanism.
 
 **Lifecycle.** The k8s executor's Pod spec gains the sidecar and the shared volume. The sidecar
 must **outlive** the step container (to drain results after it exits) and then **exit 0** so the
@@ -85,27 +85,27 @@ egress). Teardown deletes the Pod only after the results row is durable.
 
 ## Consequences
 
-- **Scarab's first co-located trusted helper** — deliberately the *smallest* one: per-Pod,
-  ephemeral, credential-isolated, and adopted **only** because every agentless API-surface path
-  is lossy for data. It is a thin sliver of the runner-agent pattern, not a standing per-node
-  agent, so the control plane stays agentless and k8s stays a replaceable substrate.
+- **Scarab's first co-located trusted helper** — the *smallest* one: per-Pod,
+  ephemeral, credential-isolated, and adopted **only** because every agentless path through the k8s API
+  is lossy for data. It is a small piece of the runner-agent pattern, not a standing per-node
+  agent, so the control plane stays agentless and k8s stays a replaceable backend.
 - **New surface:** a fence-scoped results-ingest endpoint on the control plane + per-step token
   minting; a sidecar image; Pod-spec changes (sidecar container + `emptyDir`); executor
   poll/teardown coordination with the sidecar.
 - **Per-Pod overhead:** one extra lightweight container and a small `emptyDir` per step. Accepted
   for guaranteed result delivery.
 - **The local backend is unchanged** — it reads results files directly; the `Executor` port hides
-  the difference. Backends converge on the *authoring* surface (`/scarab/results/*.json`), diverge
+  the difference. Backends share the *authoring* interface (`/scarab/results/*.json`) and differ
   on egress.
-- **Logs and results are now explicitly different channels** by reliability class: logs ride the
-  best-effort k8s API tail ([0013](0013-history-and-observability.md)); results ride the acked
+- **Logs and results are now different channels** by reliability class: logs use the
+  best-effort k8s API tail ([0013](0013-history-and-observability.md)); results use the acked
   sidecar path. Neither contaminates the other.
 
 ## Alternatives considered
 
 - **Markers on the step's stdout log stream** — rejected twice over: k8s logs are best-effort
   (rotation/stream-drop/deletion lose bytes), so a result could vanish; and parsing commands from
-  untrusted shared stdout is an injection surface (GitHub's CVE-2020-15228 → move to files). Fine
+  untrusted shared stdout is open to injection (GitHub's CVE-2020-15228 → move to files). Fine
   for logs, unacceptable for data.
 - **k8s Events / container termination message** — rejected: best-effort diagnostic channels,
   GC'd, deduplicated, size-capped. Same lossiness that rules out logs.
@@ -118,7 +118,7 @@ egress). Teardown deletes the Pod only after the results row is durable.
   logs-at-scale, wrong tool for result correctness.
 - **Full runner-agent (Woodpecker/Drone model)** — rejected for now: a long-lived per-node broker
   that owns all step I/O is a far larger architectural shift. The per-Pod sidecar buys acked result
-  egress with a fraction of the surface and keeps the control plane agentless. Revisit only if many
+  egress with a fraction of the footprint and keeps the control plane agentless. Revisit only if many
   more egress needs (live logs, interactive) accumulate.
 - **Object-store staging (sidecar → object store → control plane → Postgres)** — viable and reuses
   the workspace-CAS credential path, but adds a hop and a copy, and the sidecar would need
@@ -127,4 +127,4 @@ egress). Teardown deletes the Pod only after the results row is durable.
   [0041](0041-named-results-and-interpolation.md)).
 - **The step calls the results API directly (no sidecar)** — rejected: that hands the untrusted
   container a control-plane credential and an egress path, breaking [0038](0038-invoke-and-local-reuse.md)'s
-  isolation. The sidecar exists precisely to hold the credential outside the untrusted container.
+  isolation. The sidecar exists to hold the credential outside the untrusted container.

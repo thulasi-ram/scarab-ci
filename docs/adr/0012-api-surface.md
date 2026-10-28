@@ -4,13 +4,17 @@
 - **Date:** 2026-07-12
 - **Deciders:** thulasi.ram (architect)
 
+> **Status note (2026-10-28):** the internal gRPC half was never built. Roles coordinate through
+> the Postgres outbox, and the Data Depot and plugin broker speak HTTP.
+
 ## Context
 
-"API-first, UI dogfoods the API" only counts if the UI eats the **same** API third parties
-(CLI, automation, webhooks, bots) eat. So we must pick **one** primary API that serves both a
-rich nested UI and casual third-party automation. GraphQL suits the UI but is a poor lingua
-franca for CLIs/curl/webhooks; gRPC-first needs grpc-web proxying and is hostile to casual
-consumers. REST is the universal lingua franca and good enough for the UI with `expand`/`include`.
+"API-first, UI dogfoods the API" only counts if the UI uses the **same** API that third parties
+(CLI, automation, webhooks, bots) use. So we must pick **one** primary API that serves both a
+UI that reads nested data and casual third-party automation. GraphQL suits the UI but is a poor common
+format for CLIs/curl/webhooks; gRPC-first needs grpc-web proxying and is awkward for casual
+consumers. REST is what every client already speaks, and good enough for the UI with
+`expand`/`include`.
 
 ## Decision
 
@@ -26,9 +30,9 @@ consumers. REST is the universal lingua franca and good enough for the UI with `
 
 ## Consequences
 
-- True dogfooding: UI + integrators share REST; codegen kills client drift.
+- The UI dogfoods the API: UI + integrators share REST; codegen prevents client drift.
 - One type system from IR → API → generated clients.
-- Real-time is covered without dragging integrators into GraphQL.
+- Real-time is covered without forcing integrators onto GraphQL.
 
 ## Alternatives considered
 

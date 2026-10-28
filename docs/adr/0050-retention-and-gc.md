@@ -12,7 +12,7 @@ ADR-0030 committed the *what* (per-org TTLs, a durable sweeper, object-store
 lifecycle) but not the *how*, and the audit found **nothing built** — runs,
 events, log chunks, workspace CAS objects, and artifacts grow forever. The hard
 part is the workspace CAS: it is content-addressed and **shared across runs**
-(the dedup win, ADR-0029), so an object cannot be deleted while any live run
+(that is the point of dedup, ADR-0029), so an object cannot be deleted while any live run
 references it. Note the CAS holds the **Workspace** (correctness-critical
 intra-run data on DAG edges), *not* the separate evictable **Cache** concept
 (ADR-0007) — so CAS GC is a correctness concern, not best-effort eviction.
@@ -24,7 +24,7 @@ intra-run data on DAG edges), *not* the separate evictable **Cache** concept
 Periodically walk the workspace roots of all *reachable* runs, mark reachable
 objects, sweep the rest — the git/Nix/BuildKit model.
 
-- **Robust over precise:** a missed mark only *delays* collection; refcounting a
+- **Fault-tolerant over precise:** a missed mark only *delays* collection; refcounting a
   distributed CAS risks a missed increment *deleting live data* (corruption).
 - **Grace window:** never sweep objects younger than a grace period, so an
   in-flight run whose root is not yet recorded is not collected.
@@ -32,8 +32,8 @@ objects, sweep the rest — the git/Nix/BuildKit model.
 ### Eligibility is keyed on run *lifecycle*, not wall-clock alone
 
 - The mark set = **all non-terminal runs + terminal runs still within TTL**. A
-  **non-terminal run — including one suspended on a gate for weeks — is never
-  GC-eligible**, regardless of age. This protects the durable-gate wedge: a
+  **non-terminal run, including one suspended on a gate for weeks, is never
+  GC-eligible**, regardless of age. This protects durable gates: a
   resumed run always finds its workspace intact.
 - A terminal run's workspace CAS becomes collectable once the run is terminal
   **and** past its TTL.
@@ -63,6 +63,6 @@ never the primary (S3 cannot see run references).
 ## Alternatives considered
 
 - **Refcount CAS GC:** precise/incremental, but distributed refcount bugs delete
-  live data. Rejected for mark-sweep's self-healing robustness.
+  live data. Rejected in favour of mark-sweep, which self-heals.
 - **Wall-clock-only eligibility:** simple, but would collect a suspended run's
   workspace and break resume. Rejected — eligibility must read run lifecycle.

@@ -20,21 +20,21 @@ step `build`: Infra { never_started: true } — retries exhausted without a verd
 empty box. Kubernetes knew the answer the whole time (`0/3 nodes are available:
 3 Insufficient cpu`) and Scarab discarded it at four separate points.
 
-It is tempting to read that as four bugs. It is one: **there is no channel for
-infra narration.**
+That looks like four bugs, but it is one: there is no channel for infra
+narration.
 
-The two channels that exist are both structurally incapable of carrying it.
+Neither of the two existing channels can carry it, because of how each is built.
 
 **Logs are the Pod's stdout.** `Executor::log_stream` is the k8s log endpoint and
 nothing else. A Pod that never started never printed, so the log stream is empty
-*precisely because of* the condition an operator is trying to diagnose. The
+*because of* the condition an operator is trying to diagnose. The
 correlation is perfect and backwards: the worse the failure, the less the log
 pane says. `log_tail.rs` already detects this (`NOT_READY_GRACE`,
 `STUCK_WARN_INTERVAL`) and sends it to `tracing::warn!` — the server's own log,
 which no user of the product can see.
 
 **`failure_detail` is terminal and singular.** One string, written once, when a
-verdict exists. It cannot describe an attempt that is *currently* wedged, and
+verdict exists. It cannot describe an attempt that is *currently* stuck, and
 the k8s adapter was not populating it for the pod-never-started classes anyway:
 `terminal_waiting_class` and `is_unschedulable` both read `.reason` and dropped
 `.message`, which is where the entire diagnosis lives.
@@ -53,7 +53,7 @@ Add a third channel: an **infra observer** that sits outside the step Pod, reads
 the backend's account of a launched unit while it is in flight, and appends to
 the run's **activity log**.
 
-Outside is forced, not chosen: a Pod that never started cannot report on itself.
+It has to be outside: a Pod that never started cannot report on itself.
 
 ### 1. `Executor::infra_condition` — a new evidence port
 
@@ -67,8 +67,8 @@ executor it wraps, and nothing fails. Both production decorators forward
 explicitly, and a test pins that they do.
 
 On Kubernetes the reading is a pure function of the Pod (`pod_infra_condition`),
-so it stays fixture-testable and — more importantly — **structurally incapable
-of changing a verdict.** When the Pod's own status carries no message, one
+so it stays fixture-testable and, more importantly, **has no way to change a
+verdict.** When the Pod's own status carries no message, one
 best-effort `Event` list fills it in: `FailedScheduling`, `FailedMount`,
 `FailedCreatePodSandBox` exist nowhere else. That read needs `list` on `events`
 in the Role, and a missing grant degrades the diagnosis rather than failing the
@@ -76,15 +76,15 @@ run.
 
 ### 2. Emission is not observation
 
-Polling and appending run on deliberately different cadences. One fence is
+Polling and appending run on different cadences. One fence is
 polled every 30s; an event is written only when the condition **changes** —
 once at onset, once when it clears or the attempt ends.
 
-This is load-bearing, not tidiness. The run's event log is walked in full on the
+This is a performance requirement, not tidiness. The run's event log is walked in full on the
 scheduler's hot path: `settle_failed_attempt` scans every event of the run to
 count `AttemptStarted` against the retry budget. A per-poll diagnostic would tax
-exactly the runs already in trouble, and would get *worse* the longer they
-stayed in trouble. A Pod wedged for the full hour costs two rows.
+the runs already in trouble, and would get *worse* the longer they
+stayed in trouble. A Pod stuck for the full hour costs two rows.
 
 The closing event carries `held_ms` and `observations`, and the UI leads with
 duration. The count is an artifact of the kubelet's backoff schedule; "stuck in
@@ -92,13 +92,13 @@ duration. The count is an artifact of the kubelet's backoff schedule; "stuck in
 
 Change is keyed on `(reason, message)`, not `reason` alone: the same
 `FailedScheduling` label carrying first insufficient CPU and later an untolerated
-taint is a genuinely different problem, and it is exactly the transition worth
+taint is a different problem, and it is the transition worth
 seeing.
 
 ### 3. Narrative, never authoritative
 
 Nothing in the engine folds `StepInfraCondition`. Admission, the retry budget and
-completion all ignore it and must keep ignoring it. The verdict stays entirely
+completion all ignore it and must keep ignoring it. The verdict stays
 with `Executor::poll` and the scheduler; the observer only describes.
 
 ### 4. The terminal stamp stays
@@ -129,7 +129,7 @@ The Logs tab still shows nothing for these steps, and that is correct: it shows
 the Pod's stdout, and there wasn't any. Its empty state now names the cause and
 points at it rather than shrugging.
 
-**Not addressed here:** the hour-long silent hang itself. A wedged
+**Not addressed here:** the hour-long silent hang itself. A stuck
 `ContainerCreating` is now *visible* within 30 seconds, but it still burns the
 full step timeout before failing. The observer is what makes a terminal
 classifier for "benign wait that has gone on too long" possible; deciding that
@@ -137,5 +137,5 @@ bound is separate work.
 
 **Cost:** one `infra_condition` call per in-flight step per 30s, plus one
 `Event` list only when a condition has no message. The observer holds per-fence
-state in memory, bounded by the number of currently-wedged steps and retired
+state in memory, bounded by the number of currently stuck steps and retired
 when a fence leaves the in-flight set.

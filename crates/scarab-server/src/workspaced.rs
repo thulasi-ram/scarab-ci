@@ -102,7 +102,7 @@
 //! ADR-0067 part 4 makes the durable write **one pass, no second one**: a
 //! drain's durable bytes stream into packs as they arrive, commit pack last,
 //! then one index transaction with the drain record. Nothing here archives
-//! asynchronously — that would make warm load-bearing for durability — and
+//! asynchronously — that would make durability depend on warm — and
 //! there is no deferred flush and no warm-only deployment mode: a Depot whose
 //! object store cannot take the bytes fails the drain rather than succeeding
 //! with a smaller promise (ADR-0067 part 1).

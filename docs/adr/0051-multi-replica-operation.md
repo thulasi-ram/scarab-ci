@@ -7,6 +7,12 @@
   [0013](0013-history-and-observability.md) (log pipeline),
   [0048](0048-fail-closed-startup.md) / [0015](0015-supply-chain-oidc.md) (OIDC key)
 
+> **Status note (2026-10-28):** Two Depot facts in the 2026-08-03 amendment below have changed.
+> git-bug `e140121` is fixed: `scarab-wsfetch` now retries a Depot outage inside a window sized from
+> the step timeout (`crates/scarab-workspace-client/tests/fetch_retry.rs`). And
+> [0067](0067-the-pack-is-the-record.md) dropped fence affinity as a correctness requirement:
+> Depot state lives in Postgres and the bucket, so any replica can serve a drain (git-bug `afb13c2`).
+
 ## Context
 
 The chart pins `replicaCount: 1`. Most of the control plane is already
@@ -23,9 +29,9 @@ regenerated per boot** → each replica publishes a different JWKS.
 > leader-gated sweeper) converges replicas **through Postgres**, which is what the Consequences mean by
 > *"converged replicas share work via Postgres; no service-to-service RPC"*. The **Data Depot** has
 > **no durable core** — it never connects to Postgres — so none of it applies there, and
-> `replicaCount: 2+` becoming honest for the server says nothing about the Depot.
+> `replicaCount: 2+` becoming safe for the server says nothing about the Depot.
 >
-> **The Depot's multi-replica story is [0066](0066-the-depot-is-a-cache.md)**, and it is a different
+> **The Depot's multi-replica design is [0066](0066-the-depot-is-a-cache.md)**, and it is a different
 > shape for a structural reason: the Depot is **definitionally a cache**, so replicas hold nothing
 > unique and HA is *"run more replicas"* rather than a coordination protocol. What it needs instead is
 > **fence affinity** — a headless Service, a replica chosen at launch and stamped into the Pod spec,
@@ -66,7 +72,7 @@ one sweeper cluster-wide.
 
 - A tail-lease table + reclaim loop; the SSE handler polls the durable index for
   live chunks; the OIDC key comes from SecretProvider/config.
-- `replicaCount: 2+` becomes **honest**; the chart can raise it with guidance
+- `replicaCount: 2+` becomes **safe**; the chart can raise it with guidance
   (converged replicas share work via Postgres; no service-to-service RPC).
 
 ## Alternatives considered

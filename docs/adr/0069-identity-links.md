@@ -1,6 +1,7 @@
 # 0069. Identity links: one Principal, many provider identities, pinned by immutable id
 
-- **Status:** Proposed
+- **Status:** Accepted. Built on main (PR #10; migration `0052_identity_links.sql`, the
+  `/v1/me/identities/*` routes).
 - **Date:** 2026-10-16
 - **Deciders:** thulasi.ram (architect)
 - **Builds on:** [0049](0049-identity-and-access.md) (authn → `Principal`, native
@@ -62,7 +63,7 @@ Two new tables:
 
 - `principals(id PK, display_name, created_at, claimed_at, merged_into)`
   - `id` **is** the `Principal.subject` every existing consumer already stores.
-  - `claimed_at` is `NULL` until someone has actually signed in as the Principal
+  - `claimed_at` is `NULL` until someone has signed in as the Principal
     (see §4).
   - `merged_into` is set when the Principal has been folded into another (§5).
   - **Rows are never deleted.** An id, once minted, is never minted again.
@@ -107,7 +108,7 @@ The id is readable rather than `usr_<uuid>` because it is what an admin types
 into an approver list or a grant. It is also what the activity log shows for
 "cancelled by", and what `when: event.actor == …` compares against on
 manual/api runs (the only triggers that expose `event.actor`). An opaque id
-would need a display-resolution layer across every one of those surfaces, and
+would need a display-resolution layer in every one of those places, and
 would make approver lists unwritable. The cost is cosmetic: after a rename,
 `github:alice` keeps reading "alice". `display_name` tracks the current name.
 
@@ -162,7 +163,7 @@ Boot **refuses**:
   trim connections apply);
 - a bare email in `SCARAB_OAUTH_OWNERS` when more than one provider is configured.
 
-**Disclosed residual:** under an `unqualified_ids` GitHub provider, the first
+**Remaining risk:** under an `unqualified_ids` GitHub provider, the first
 post-upgrade login with a given handle claims that handle's history. If the
 login was recycled before its original holder signs in again, the new holder
 gets it. Once pinned, this cannot recur. Operators who want no window move to a
@@ -179,7 +180,7 @@ asserts `email_verified` could mint a global Owner.
 
 **Login.** Login takes a provider id: `?provider=` on `GET /v1/auth/login`, or
 `provider` on `POST /v1/auth/login`. If omitted, the only provider or the
-`unqualified_ids` one is used. The id rides in the existing one-shot state
+`unqualified_ids` one is used. The id is carried in the existing one-shot state
 cookie, so there is still **one** callback URL and registered OAuth apps keep
 working. `GET /v1/auth/providers` (unauthenticated) lists ids and names for the
 login page.
@@ -196,7 +197,7 @@ connections store.
 1. **Resolve.** Find the repo's connection (as today) and the provider whose
    `forge_url` matches it. **If there is none, return a 409** naming
    `SCARAB_OAUTH_FORGE_URL` / `forge_url`. Without that provider, imported roles
-   could never be signed into. Making the gap loud closes (1).
+   could never be signed into. Failing loudly here closes (1).
 2. **List.** Call the new `ForgePort::list_collaborators(repo)`, which returns
    `{external_id, login, permissions}` and defaults to `Unsupported`.
    - **GitHub:** `affiliation=all`, which includes team and org access, paged
@@ -220,7 +221,7 @@ connections store.
    - An empty listing never prunes.
 
 Because the identity is pinned at import by `external_id`, whoever signs in with
-that forge account claims exactly those roles, and nobody else does. Claiming is
+that forge account claims those roles, and nobody else does. Claiming is
 atomic: `UPDATE principals SET claimed_at = now() WHERE id = $1 AND claimed_at
 IS NULL`. The team does not have to sign in before an admin can import them.
 
@@ -277,7 +278,7 @@ owners matcher, scoped per provider and gated on `email_verified`.
 
 `GET /v1/me` gains `identities: [{provider, handle}]`.
 
-### 7. What deliberately stays a string
+### 7. What stays a string
 
 - **Actor** (CONTEXT): for webhook runs it is the forge `sender.login`. It stays
   a forge fact, is never a Principal, and is never compared to one.
@@ -324,14 +325,14 @@ The end state this is a step toward. None of it is decided here:
   OIDC-only user's first login.
 - **Actor ↔ Principal display.** The UI shows "alice · signed in as
   okta:ada@example.com" when a webhook Actor's forge account is linked. Display
-  only, never load-bearing.
+  only; nothing relies on it.
 - **Admin merge** of two claimed Principals that the caller cannot prove alone.
 - **Re-checking global roles per request.** Today the global role snapshotted
   into the session survives an unlink for up to 24h.
 
 ## Alternatives considered
 
-- **Opaque `usr_<uuid>` ids.** Every admin-typed surface and every attribution
+- **Opaque `usr_<uuid>` ids.** Every field an admin types into and every attribution
   display would need a resolution layer, and `when: event.actor == …` would
   stop being writable. Rejected for §2.
 - **Identity-keyed bindings with a union lookup.** Here `rbac_bindings.subject`
@@ -342,7 +343,7 @@ The end state this is a step toward. None of it is decided here:
   property with the existing single-key authz.
 - **Claiming a typed string at first mint.** This was the first draft of this
   ADR. Whoever minted the id first claimed every grant, approver entry and owner
-  entry typed against it, which re-opens (4) for every pre-assigned surface. The
+  entry typed against it, which re-opens (4) for everything pre-assigned. The
   skeptical audit of this ADR caught it. Rejected for §3.
 - **Linking by verified email.** The usual convenience, and the usual takeover
   vector. Rejected (§6).
