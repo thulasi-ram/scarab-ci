@@ -171,7 +171,7 @@ through identity links (ADR-0069) when one exists, so an org writes the rule its
 ```yaml
 checkpoint: gate.resolve
 rules:
-  - when: has(principal) && has(run.trigger.principal) && principal == run.trigger.principal
+  - when: principal != null && has(run.trigger.principal) && principal == run.trigger.principal
     effect: deny
     message: "You started this Run, so someone else must approve it."
 ```
@@ -185,22 +185,38 @@ and evaluation, and adds a **type-checking pass** over the 0.15 AST:
 
 - Each checkpoint's schema is declared into the CEL `Env` as typed variables and struct
   types.
-- The subset: field access, `has()`, literals, comparisons, `&&`, `||`, `!`, `?:`, `in` on
-  lists and maps, string functions (`startsWith`, `endsWith`, `contains`, `matches`),
-  `size`, timestamp and duration comparison, and the `exists`, `all` and `exists_one`
-  macros over typed lists. Anything else is rejected with "not supported in policies".
+- The subset: field access, `has()` on a field (`has(run.trigger.ref)`; an optional
+  top-level variable is tested with `!= null`), literals, comparisons, `&&`, `||`, `!`,
+  `?:`, `in` on lists and maps, string functions (`startsWith`, `endsWith`, `contains`,
+  `matches`) and string `+`, `size`, timestamp and duration comparison, and the `exists`,
+  `all` and `exists_one` macros over typed lists. Anything else is rejected with "not
+  supported in policies". Arithmetic, indexing, conversions, map iteration and
+  time-of-day functions (`getHours()`) are outside the subset, so a time-window rule
+  compares absolute timestamps; daily windows need a later addition.
 - `matches` takes a literal pattern only; it is compiled when the Policy is saved.
 - The checker computes a **static cost bound** from macro nesting and the list-size caps
   each schema declares, and rejects a rule above the limit. `cel` 0.15 has parse limits
   but no runtime cost tracking.
-- A rule that type-checks cannot raise a type error. It can still fail at evaluation on
-  integer overflow, an index out of range or a missing optional field read without
-  `has()`. Any evaluation error denies, with the error in the decision (fail-closed). The
+- A rule that type-checks cannot raise a type error. With arithmetic and indexing outside
+  the subset, the evaluation error left is reading an optional field that is absent,
+  without `has()`. Any evaluation error denies, with the error in the decision (fail-closed). The
   editor warns on optional fields read without `has()`, since a deny rule on `trigger.ref`
   would otherwise deny every Run that has no ref.
 
 Pipelines' `when:` and `${{ }}` move to `cel` 0.15 too, and stay unchecked until the
-checker covers their contexts.
+checker covers their contexts. The spike found 11 behaviour changes in 90 expressions run
+through both versions: `list[5]` and `map['missing']` raise an error where 0.10 returned
+null; `size()` on a string counts code points; `max()` is gone; `string(bool)`, `type()`
+and `dyn()` exist; and an error on one side of `||` is absorbed when the other side is
+true, as the spec says. The upgrade release notes list them.
+
+**Parser depth.** A deeply nested or very long left-recursive expression overflows the
+stack inside the CEL parser, which aborts the process; `catch_unwind` cannot catch it.
+With 0.10 about 1,000 nested parentheses abort a release build; 0.15 stops nesting at
+depth 96 with a parse error, but a left-recursive chain of about 5,000 links (about
+10 KB) still aborts. Policy rules are capped at 4 KiB and 64 levels. Pipelines' `when:`
+and `${{ }}` get the same length cap, and all CEL parsing runs on a thread with a large
+stack.
 
 The checker is offered upstream to cel-rust, whose conformance suite has `check_only`
 cases waiting for one. If upstream ships its own, Scarab switches to it.
@@ -330,10 +346,17 @@ instead of running their own code. Each move must make the same decisions:
 
 ## Implementation horizon
 
-1. **Spike:** `cel` 0.15 upgrade (Pipelines' `when:` and interpolation still pass), the
-   subset checker with `has()`, literal regexes and the static cost bound, against
-   `invoke.resolve`'s schema; a dozen policies; the cel-spec `check_only` cases inside the
-   subset. Decide on the checker from the result.
+1. **Spike: done 2026-10-28** (branch `spike/cel-type-checker`, crate `scarab-policy`).
+   The checker is about 1,000 lines over the `cel` 0.15 AST; schemas are generated from
+   Rust types by two `macro_rules` macros, with optional fields and list caps in the
+   types. 31 policy tests pass; of the 2,507 cel-spec cases in cel-rust's conformance
+   data, 469 fall inside the subset and pass, and none fail. The upgrade keeps the suite
+   green (2,005 passed). A static cost bound of 10,000 rejects three nested `exists` over
+   32-element lists. Release binary +3.6%. Remaining for production, about 1,500 to 2,000
+   lines: map and nested-struct schemas, string-length caps in the cost bound, several
+   errors per check, parsing on a large-stack thread, editor-shaped diagnostics. Upstream
+   would want full CEL typing, so the checker stays in Scarab for now; its type core and
+   tests could seed an upstream checker.
 2. **Engine:** Policy IR, evaluator, PolicyDecision records, `audit` mode, the policy test
    API, org and Project layers, `invoke.resolve` and `run.create`. First users: library and
    plugin allow and block lists.
