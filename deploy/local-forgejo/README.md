@@ -6,14 +6,14 @@ real Forgejo can answer.
 
 ## Why it exists (git-bug 3863d5e)
 
-Everything in the Forgejo path was asserted against unit tests of the
-request/response shapes we *believed* Forgejo uses. That is thin evidence, and it
-already produced a bug that was exactly a wrong guess: `register_webhook` sent no
+The Forgejo path had only been tested with unit tests against the
+request/response shapes we *believed* Forgejo uses. That is weak evidence, and it
+had already let through a bug caused by a wrong guess: `register_webhook` sent no
 `config.secret`, so every delivery from a Scarab-registered hook would have been
-rejected 401 by our own endpoint — registration reporting success while nothing
+rejected 401 by our own endpoint. Registration reported success while nothing
 ever ran.
 
-Three guesses of the same class stayed unverified:
+Three similar guesses were still unverified:
 
 | Guess | Answered by |
 |---|---|
@@ -32,7 +32,7 @@ Prerequisites:
 
 - **docker** running, and able to pull from `codeberg.org` (the Forgejo image).
 - **kind** + **kubectl** — the recipe brings up the whole proc-mode stack,
-  because the second half of the claim is "…and a Run appears".
+  because the test also checks that a Run appears.
 - Free ports: **3300** (Forgejo) and **8080** (scarab-server). Change them in
   `deploy/local-forgejo/.env` / `deploy/local-proc/.env`.
 - `cargo-nextest`.
@@ -53,16 +53,16 @@ volume. Never point this at a Forgejo you care about.
   against `127.0.0.1` is a hook the Forgejo *container* can never deliver to. It
   also sets `SCARAB_FORGEJO_WEBHOOK_SECRET` to the same secret the hook carries.
 
-Two Forgejo settings are load-bearing and set in `compose.yaml`:
+Two Forgejo settings in `compose.yaml` are required:
 
 - `webhook.ALLOWED_HOST_LIST=*` — Forgejo refuses to deliver to private/loopback
-  addresses by default. Without this the tier would go green by never exercising
-  the ingest path at all.
+  addresses by default. Without it the tier would pass without ever exercising
+  the ingest path.
 - `security.INSTALL_LOCK=true` — no install wizard to click through.
 
 ## What runs
 
-| Test | What it pins |
+| Test | What it checks |
 |---|---|
 | `crates/scarab-forge-forgejo/tests/live.rs::list_accessible_repos_walks_past_the_first_page` | the pick-list is complete across pages, with no duplicates |
 | `crates/scarab-forge-forgejo/tests/live.rs::a_registered_hook_delivers_a_signed_push_we_can_normalize` | registration is idempotent against the real hook-list shape; the delivery is signed with the registered secret; the real push payload normalizes |
@@ -70,12 +70,12 @@ Two Forgejo settings are load-bearing and set in `compose.yaml`:
 
 A green run leaves the real payloads in **`target/forgejo-capture/`**
 (`push-payload.json`, `push-headers.txt`, `hooks.json`, `user-repos.json`).
-Promote one into a committed fixture if you want to pin a shape without a
-Forgejo — but only ever from a captured file, never hand-written.
+To test a shape without a running Forgejo, turn one of these into a committed
+fixture. Only ever use a captured file; never write one by hand.
 
-## Gating — CI does not need any of this
+## Gating: CI does not need any of this
 
-Both tiers skip loudly unless their env var is set, mirroring the
+Both tiers skip with a visible message unless their env var is set, mirroring the
 `SCARAB_TEST_KUBE` cluster tier:
 
 - `SCARAB_TEST_FORGEJO=1` — the adapter tests (`crates/scarab-forge-forgejo/tests/live.rs`).
@@ -90,8 +90,8 @@ thing that sets the gate.
 
 `crates/scarab-forge-forgejo/tests/contract_live.rs` (the shared `ForgePort`
 contract, `#[ignore]`d) reads the same `SCARAB_TEST_FORGEJO_*` env. It is **not**
-part of `just forgejo-verify` — it asserts capabilities beyond the three shapes
-this tier is about, so a failure there would not mean what this tier claims. With
+part of `just forgejo-verify`: it checks capabilities beyond the three shapes
+this tier covers, so a failure there would not mean one of these three shapes is wrong. With
 the stacks up (`just forgejo-verify keep`) it can be run against the same
 instance:
 

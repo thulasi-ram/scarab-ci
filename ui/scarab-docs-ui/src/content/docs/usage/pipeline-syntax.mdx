@@ -9,30 +9,30 @@ import Doodle from '../../../components/Doodle.astro';
 
 ## The model, in brief
 
-A **step** is the fundamental unit of work: an OCI **image** plus a **command** (a contract)
+A **step** is the basic unit of work: an OCI **image** plus a **command** (a contract)
 that Scarab runs as a single Kubernetes **Pod**. A **pipeline** is a group of steps, plus how they
 are triggered and wired together. Structurally a pipeline is a **flat recursive DAG**
 (`Pipeline → Step`).
 
-The real DSL is a **typed IR**; YAML is a frontend and **CEL** provides expressions.
-`invoke` is reuse: inlining a library pipeline into the caller's DAG at compile time.
+The DSL itself is a **typed IR**; YAML is a frontend and **CEL** provides expressions.
+`invoke` reuses a library pipeline by inlining it into the caller's DAG at compile time.
 `matrix` is a modifier that fans a step out over a set of inputs.
 
 Compilation is **static**: the whole DAG (every matrix combination, every inlined library step) is
 materialised and validated at submit time, so a cycle, a dangling `needs`, or an empty matrix
 dimension is rejected up front, never discovered mid-run.
 
-Keys are **strict** at every level of that schema. A key Scarab does not know — a misspelling,
-a field borrowed from another CI system, a knob from a newer version — is a compile error naming
-the key and the ones that were expected, not a line that is quietly ignored:
+Keys are **strict** at every level of that schema. A key Scarab does not know (a misspelling,
+a field borrowed from another CI system, a knob from a newer version) is a compile error that names
+the key and the ones that were expected. It is never silently ignored:
 
 ```
 unknown field `cpu_milis`, expected `cpu_millis` or `memory_mib`
 ```
 
-The alternative is worse than it looks: `resources: { cpu_milis: 500 }` would parse clean, report
-`ok`, and then run the step with no CPU request at all. A setting that is silently dropped is
-indistinguishable from one that was never written.
+Ignoring unknown keys would be worse: `resources: { cpu_milis: 500 }` would parse cleanly, report
+`ok`, and then run the step with no CPU request at all, with nothing to show the setting was
+dropped.
 
 A repo's CI lives in `.scarab/`. A triggered pipeline is a YAML file such as `.scarab/ci.yaml`;
 its file name is the default display name (`ci.yaml` reads as `ci`, overridable with a top-level
@@ -42,10 +42,10 @@ its file name is the default display name (`ci.yaml` reads as `ci`, overridable 
 
 :::caution[Commit `.scarab/`, and never blanket-ignore it]
 `.scarab/` is **tracked source**: it is read from the triggering commit, so an ignored pipeline file
-is a pipeline that does not exist. The trap is that a local `scarab-server` also writes its
-development object store *inside* that directory — `SCARAB_OBJECT_DIR` defaults to
-`./.scarab/objects` — which tempts a blanket `/.scarab` ignore rule that then silently swallows
-`git add .scarab/ci.yaml`. Ignore the runtime path specifically instead:
+is a pipeline that does not exist. The catch is that a local `scarab-server` also writes its
+development object store *inside* that directory (`SCARAB_OBJECT_DIR` defaults to
+`./.scarab/objects`). That tempts a blanket `/.scarab` ignore rule, which then silently swallows
+`git add .scarab/ci.yaml`. Ignore only the runtime path instead:
 
 ```gitignore
 # runtime state only — the pipeline configs beside it are tracked source
@@ -70,7 +70,7 @@ steps:
     command: ["cargo", "check"]
 ```
 
-The rest of this page documents each vocabulary term in turn, from triggers and interface, through
+The rest of this page covers each part in turn, from triggers and interface, through
 the step shape, wiring, and reuse, to deploys and operational concerns.
 
 ## Triggers: `on:`
@@ -129,9 +129,9 @@ steps:
 - `type` is one of `string` (default), `boolean`, `number`, `choice`. A `choice` needs a non-empty
   `options` list.
 - `required` defaults to `true`. An optional parameter (`required: false`) **must** carry a
-  `default`, keeping the resolved parameter set total.
-- An optional `validate:` CEL predicate over the resolved value (bound as `value`) rejects a bad
-  launch, failing closed.
+  `default`, so every parameter always has a resolved value.
+- An optional `validate:` CEL predicate over the resolved value (bound as `value`) rejects a launch
+  with a bad value (fail-closed).
 
 Resolved parameters are read in steps as `${{ inputs.<name> }}` and are also injected into the
 step environment as `SCARAB_PARAM_<NAME>`. A **reusable library** pipeline additionally declares the
@@ -183,7 +183,7 @@ Some steps are **kinds** with no image that the engine runs on your behalf (you 
 
 ### The `clone` step
 
-Source is provisioned by a first-class **`clone` step**. It needs no configuration by design: the repo,
+Source is fetched by a built-in **`clone` step**. It needs no configuration by design: the repo,
 ref, resolved SHA, and token all come from the run's trigger context, so `clone: {}` is the common
 case. Downstream steps inherit the cloned workspace through ordinary `needs`.
 
@@ -248,7 +248,7 @@ A `when:` CEL guard skips a step whose predicate is false; expressions read the 
 
 `invoke` inlines a **library** pipeline (under `.scarab/lib/` by convention) into the caller's DAG
 at compile time, not a runtime call.
-It is local only, forever: repo-relative paths, read at the caller's ref; no `../` escape and no
+It is local only, and will stay that way: repo-relative paths, read at the caller's ref; no `../` escape and no
 cross-repo references (cross-repo causation is `on: upstream`). The invoked steps are namespaced
 by the invoke step's id (`deploy/plan`, `deploy/url`), and `matrix` on an invoke step fans out the
 whole subgraph.
@@ -279,7 +279,7 @@ steps:
     command: ["echo", "${{ outputs.deploy.url }}"]
 ```
 
-The interface is validated at compile: every required input present, no unknown extras, and every
+The interface is validated at compile time: every required input present, no unknown extras, and every
 referenced output declared. Supplied inputs reach each inlined step as `SCARAB_PARAM_<NAME>`.
 
 ## Results & interpolation
@@ -295,9 +295,9 @@ step's command or environment; an [artifact](#steps-the-step-shape) is a file pu
 
 ### Publishing a result
 
-A step publishes result `<name>` by writing the file **`/scarab/results/<name>.json`** — the
+A step publishes result `<name>` by writing the file **`/scarab/results/<name>.json`**. The
 result's name is the filename minus `.json`, and the file must hold **valid JSON**: `"abc123"`
-(quotes included) for a string, `42` for a number — never bare text.
+(quotes included) for a string, `42` for a number, never bare text.
 
 ```yaml
 - id: version
@@ -317,21 +317,21 @@ result's name is the filename minus `.json`, and the file must hold **valid JSON
   command: ["echo", "release ${{ outputs.version.tag }}"]
 ```
 
-Capture is otherwise transparent: on Kubernetes a trusted per-Pod egress sidecar drains the
-step's results back to the control plane — nothing to wire up in the pipeline. A `build:` step
+Otherwise, capture needs no setup in the pipeline: on Kubernetes a trusted per-Pod egress sidecar
+drains the step's results back to the control plane. A `build:` step
 emits an `image` result natively (BuildKit writes `--metadata-file /scarab/results/image.json`);
 its author writes nothing.
 
 ### The trap: a bare filename publishes nothing, and the step still goes green
 
-The sidecar drains **`*.json` files only**. Writing a bare `/scarab/results/tag` — the obvious
-guess — publishes **nothing**: the glob matches no file, the sidecar logs only
+The sidecar drains **`*.json` files only**. Writing a bare `/scarab/results/tag`, the obvious
+guess, publishes **nothing**: the glob matches no file, the sidecar logs only
 `no results to drain`, and the step still **exits 0**. The run goes green while
 `${{ outputs.version.tag }}` silently resolves to empty downstream. Nothing tells the author
 they produced no result.
 
-So make the consumer assert that its interpolation resolved — that is what turns the silent
-no-op into a failure at the point of use:
+So make the consumer check that its interpolation resolved. That turns the silent no-op into a
+failure where the value is used:
 
 ```yaml
 - id: notify
@@ -395,8 +395,8 @@ with `resources`:
 ```
 
 For a rare dynamic per-job Kubernetes need there is a governed `k8s_overlay` escape hatch: a raw
-pod-spec fragment merged last onto the Pod. It carries no authority: it is admitted only if the run's
-target environment permits raw overlays, else the run is rejected fail-closed. Prefer a named
+pod-spec fragment merged last onto the Pod. Writing one grants nothing by itself: it is admitted only
+if the run's target environment permits raw overlays; otherwise the run is rejected (fail-closed). Prefer a named
 profile for anything static.
 
 ```yaml
@@ -410,8 +410,8 @@ profile for anything static.
 ## Retries, timeouts & reruns
 
 A step may set a `timeout:` (seconds) and an opt-in `retry:` policy. Retry is
-**at-least-once**: declaring it is your assertion that the step is idempotent or fenced; a
-side effect that does not cooperate will fire twice.
+**at-least-once**: by declaring it, you assert that the step is idempotent or fenced; a
+side effect that is neither will fire twice.
 
 ```yaml
 - id: flaky
@@ -422,7 +422,7 @@ side effect that does not cooperate will fire twice.
 
 Re-execution that a human initiates is modelled as **Takes**: a *rerun* re-executes a run from
 the top, a *retry* resumes from a failed step, and an earlier attempt becomes *superseded* or
-*shadowed* by the newer one. These are concepts from a run's history surfaced in the UI. There is nothing to
+*shadowed* by the newer one. The UI shows these in a run's history. There is nothing to
 author for them.
 
 ## References

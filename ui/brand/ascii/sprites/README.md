@@ -7,8 +7,8 @@ reds. Everything downstream reads the pixel GRID, never the pixels themselves.
 not the supplied file itself. What arrived was a restoration: the same artwork
 upscaled and speckled, 1.0 MB of which was noise. Every cell was read at the
 native pitch and painted back flat — same dimensions, same positions, same four
-inks — which is 6.8 KB and, being on-grid, is also now legible as pixel art
-rather than as a photograph of some. The swap was gated on a round-trip:
+inks. The result is 6.8 KB and, because it sits on the grid, now reads as pixel
+art rather than as a photograph of pixel art. The swap was gated on a round-trip:
 `trace()` over the transcription returns byte-identical poses to `trace()` over
 the original. The original restoration is not in the repo.
 
@@ -28,7 +28,7 @@ so the art shows up in diffs:
   97% of cells are unanimous at this pitch and phase.
 - **Four inks**, from k-means over per-cell median RGB. Dark to light:
   outline `#850603`, shadow `#c40805`, body `#d61b13`, highlight `#fe8782`.
-- The sprites are **~25 × 20 native px**. That is the whole design.
+- The sprites are **~25 × 20 native px**; the whole design fits in that.
 
 ## Two rules the scenes inherit
 
@@ -36,8 +36,8 @@ so the art shows up in diffs:
   the front of the beetle turns into a mammoth's head. The scenes place one
   source pixel per baked cell. Rotation is fine (see `scenes.mjs`) — scaling
   is not.
-- **Colour by anatomy, not by shade.** The brand layers are semantic — shell
-  emerald, head/pronotum/horn gold, limbs gray — so the mapping runs off the
+- **Colour by anatomy, not by shade.** The brand layers are semantic (shell
+  emerald, head/pronotum/horn gold, limbs gray), so the mapping runs off the
   `parts` annotation (`seam`, `legRow`), not off which of the four reds a cell
   happens to be. `rear` is unannotated because no scene uses it; it renders
   flat in the review sheet.

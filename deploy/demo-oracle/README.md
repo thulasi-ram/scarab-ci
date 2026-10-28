@@ -16,7 +16,7 @@ control plane, workspace service, Postgres, the tunnel, **and** every step Pod.
 > 1. **R2 under real load.** The credential path is proven (list/put/get/delete
 >    from inside the cluster, plus the backup CronJob), but the Depot's
 >    multipart pack write path against R2 has not been exercised by an actual
->    drain — that needs a run with a workspace.
+>    drain, which needs a run with a workspace.
 > 2. **The two-core budget.** `cargo check` in a step Pod on two shared Ampere
 >    cores is still a guess, not a measurement. Nothing has run yet.
 > 3. **Step Pods in their own namespace** (`scarab.namespace: scarab-steps`).
@@ -48,13 +48,13 @@ Four things must exist first. Each fails differently and none of them fail in a
 way `deploy.sh` can diagnose for you.
 
 1. **The instance.** Oracle Cloud → Always Free → Ampere A1, 2 OCPU / 12 GB,
-   Ubuntu 24.04, 200 GB boot volume. The OCI security list needs **SSH only** —
-   the tunnel is egress-only, so nothing else is opened, ever.
+   Ubuntu 24.04, 200 GB boot volume. The OCI security list needs **SSH only**.
+   The tunnel is egress-only, so nothing else is ever opened.
 2. **A Cloudflare tunnel.** Zero Trust → Networks → Tunnels → create a
    *remotely-managed* tunnel. Copy its token into `CLOUDFLARE_TUNNEL_TOKEN`.
    On the tunnel's **Public Hostname** tab add
    `demo-scarab.<domain>` → `http://scarab.scarab.svc.cluster.local:80`.
-   The routing lives there and cannot live in `cloudflared.yaml` — token mode
+   The routing lives there and cannot live in `cloudflared.yaml`: token mode
    has no config file.
 3. **An R2 bucket** plus an API token scoped to it (Object Read & Write).
    Endpoint is `https://<account_id>.r2.cloudflarestorage.com` — account id, not
@@ -63,15 +63,15 @@ way `deploy.sh` can diagnose for you.
    *Abort multipart uploads* → 1 day). This is not optional: the Depot streams
    drain bytes as multipart pack uploads and aborts its own on error and on
    graceful shutdown, but a *crashed* replica cannot, and an S3-compatible store
-   gives a server no way to list uploads it does not know about — so the leaked
-   parts bill forever (git-bug ad79c90). MinIO did this natively; R2 does not.
-4. **GitHub credentials** — two separate things:
+   gives a server no way to list uploads it does not know about, so the leaked
+   parts are billed forever (git-bug ad79c90). MinIO did this natively; R2 does not.
+4. **GitHub credentials**, which are two separate things:
    * a **GitHub App** (clones, commit statuses). Webhook URL
      `https://demo-scarab.<domain>/webhooks/github`, secret =
      `SCARAB_GITHUB_WEBHOOK_SECRET`. It must **subscribe to Push and Pull
      request** events and be granted **Contents: read**, **Metadata: read**,
-     **Commit statuses: read & write** — the two failure modes here are silent
-     and are documented at length in `deploy/local-helm/README.md`;
+     **Commit statuses: read & write**. Both failure modes here are silent
+     and are documented in `deploy/local-helm/README.md`;
    * a **GitHub OAuth app** (visitor login). Authorization callback URL
      `https://demo-scarab.<domain>/v1/auth/callback`.
 
@@ -94,7 +94,7 @@ cores will not compile this workspace in a time anyone will wait for, and doing
 it on the demo box would starve the running demo of both cores while it
 happened. `image.yml` builds every image on native amd64 **and arm64** runners
 and stitches the digests into one multi-arch manifest per tag, so `edge` and
-`sha-*` already carry an arm64 manifest — pull, never build.
+`sha-*` already carry an arm64 manifest. Pull them; never build.
 
 ### Fresh install: registering the App installation
 
@@ -114,20 +114,20 @@ this mode specifically.
 
 **`kubectl` did not work as `ubuntu`.** `/usr/local/bin/kubectl` is a symlink to
 the k3s binary, and that wrapper prefers `/etc/rancher/k3s/k3s.yaml` over
-`$HOME/.kube/config` and does **not** fall back when it cannot read it — so a
-root-only kubeconfig broke kubectl for the very user `deploy.sh` runs as, even
-with a perfectly good copy in their home directory. `bootstrap.sh` now passes
-`--write-kubeconfig-group`. Rejected the one-character alternative
-(`--write-kubeconfig-mode 0644`): world-readable cluster-admin credentials on a
-public box.
+`$HOME/.kube/config` and does **not** fall back when it cannot read it. So a
+root-only kubeconfig broke kubectl for the user `deploy.sh` runs as, even with a
+valid copy in their home directory. `bootstrap.sh` now passes
+`--write-kubeconfig-group`. We rejected the one-character alternative
+(`--write-kubeconfig-mode 0644`) because it makes cluster-admin credentials
+world-readable on a public box.
 
 **Re-running `bootstrap.sh` poisoned `/etc/iptables/rules.v4`.**
 `netfilter-persistent save` snapshots the *live* ruleset, so running it once k3s
 was up baked 79 lines of kube-proxy / kube-router / flannel runtime chains into
-the file — including stale `kube-dns … has no endpoints -j REJECT` rules, which
+the file, including stale `kube-dns … has no endpoints -j REJECT` rules, which
 `netfilter-persistent` then restores **at boot, before k3s starts**. kube-proxy
-full-syncs and heals it, but a persisted DNS reject is precisely the failure
-class that section exists to prevent. The save is now skipped when k3s is
+full-syncs and heals it, but a persisted DNS reject is exactly the kind of
+failure that section is meant to prevent. The save is now skipped when k3s is
 already installed.
 
 **The chart did not give the workspace StatefulSet the OAuth client secret.**
@@ -135,7 +135,7 @@ Fixed in the chart, not here (`deploy/helm/scarab/templates/statefulset-workspac
 The Pod saw four of five `SCARAB_OAUTH_*` values and refused to boot, since
 ADR-0049 makes a provider all-five-or-none and ADR-0048 validates config before
 the role is dispatched. Unreachable from `deploy/local-helm`, which runs
-`SCARAB_DEV_INSECURE=true`; this mode is the first with authentication actually
+`SCARAB_DEV_INSECURE=true`; this is the first mode with authentication turned
 on. Fixing it exposed a second problem now guarded in `deploy.sh`: a
 StatefulSet's RollingUpdate will not replace a Pod that never became Ready, so
 the corrected template changed nothing until the Pod was deleted by hand.
@@ -144,24 +144,24 @@ the corrected template changed nothing until the Pod was deleted by hand.
 
 Every fix above is in `bootstrap.sh`, so a **fresh** box gets them from the
 script. The box that already exists was repaired **in place**, because bootstrap
-had already run on it. The two states are equivalent; they were reached by
-different routes, and that is worth knowing before you debug the live host.
+had already run on it. The two states are equivalent but were reached
+differently. Keep that in mind when you debug the live host.
 
 | What | On a fresh box | On the box that exists |
 |---|---|---|
 | kubeconfig group | `--write-kubeconfig-group` at install time | `--write-kubeconfig-group ubuntu` added to `ExecStart` in `/etc/systemd/system/k3s.service`, `daemon-reload`, `systemctl restart k3s` |
-| `rules.v4` | never saved after k3s is up | rewritten once: every `KUBE-*`/`FLANNEL-*`/`CNI-*`/`cali*` chain declaration, every rule in those chains, and every builtin rule jumping to one were stripped; validated with `iptables-restore --test` before install. What remains is the base ruleset — Oracle's 17-line `InstanceServices` chain, the SSH accept, both trailing REJECTs, and the eight pod/service ACCEPTs |
+| `rules.v4` | never saved after k3s is up | rewritten once: every `KUBE-*`/`FLANNEL-*`/`CNI-*`/`cali*` chain declaration, every rule in those chains, and every builtin rule jumping to one were stripped; validated with `iptables-restore --test` before install. What remains is the base ruleset: Oracle's 17-line `InstanceServices` chain, the SSH accept, both trailing REJECTs, and the eight pod/service ACCEPTs |
 | UDP buffers for QUIC | `/etc/sysctl.d/99-scarab-udp-buffers.conf` | same file, written by hand |
 
 Consequences to keep in mind:
 
 * `--write-kubeconfig-group` is an **install-time** flag baked into the systemd
-  unit. If you ever re-run `get.k3s.io` on this host, re-check `ExecStart` —
+  unit. If you ever re-run `get.k3s.io` on this host, re-check `ExecStart`:
   a reinstall can rewrite the unit and silently take the group back off.
 * Do **not** replay these by hand on a rebuilt box. Run `bootstrap.sh`; it does
   all three, in the right order, before k3s exists.
 
-## The operational facts that matter
+## Operational notes
 
 ### Two cores is the constraint, not the RAM
 
@@ -178,17 +178,17 @@ Rough budget of the 12 GB:
 
 `steps.yaml` caps a step at 2 GiB by default and 4 GiB by request, and gives
 every container a 250m CPU **request** so the scheduler queues step Pods rather
-than packing two cores past what fits. Deliberately **no CPU limit** — see the
-comments in that file; a CPU limit throttles the wsfetch drain's hashing, and
+than packing two cores past what fits. There is deliberately **no CPU limit** (see the
+comments in that file): a CPU limit throttles the wsfetch drain's hashing, and
 the step's own wall-clock deadline (`stepTimeoutSecs: 1800`) is the real bound.
 
 `bootstrap.sh` adds a 4 GiB swap file. It is a safety net for two specific
-spikes — an in-Pod `cargo check`, and the drain hashing and uploading
-`/workspace` — where without it the kernel OOM-kills a step, the Attempt
+spikes: an in-Pod `cargo check`, and the drain hashing and uploading
+`/workspace`. Without it the kernel OOM-kills a step, the Attempt
 classifies **Transient**, and the retry burns both cores again on a run that
 dies the same way.
 
-### Retention is aggressive, on purpose
+### Retention is deliberately short
 
 Set through `scarab.extraEnv` (the chart has no stanza for these; the names are
 `SCARAB_RETENTION_*` from `crates/scarab-server/src/config.rs`):
@@ -200,42 +200,42 @@ Set through `scarab.extraEnv` (the chart has no stanza for these; the names are
 | workspace CAS | 3d | 14d |
 | Depot packs | 3d | = workspace TTL |
 
-Run **metadata** is kept regardless — old runs stay in the UI, their content
+Run **metadata** is kept regardless: old runs stay in the UI, but their content
 does not. Packs must be ≥ the workspace TTL (they back Workspace Snapshots) or
 the server refuses to boot; 3/3 is the tightest legal pair.
 
 `casConcurrency` is raised to **96** from the default 32, because R2 is a remote
 bucket and the CAS legs are latency-bound — the chart's own comment calls 32 a
-*floor* for remote object storage. The counter-pressure is memory: peak is
+*floor* for remote object storage. The cost is memory: peak is
 roughly `casConcurrency × largest blob`. Raise it further only alongside the
 server's memory limit.
 
 ### Oracle will reclaim an idle instance
 
-The published rule is a **conjunction** over a 7-day window at the 95th
+The published rule requires **all three** over a 7-day window at the 95th
 percentile: CPU under 20% **and** network under 20% **and** memory under 20%. An
-idle k3s box fails CPU and network comfortably; 12 GB means memory is the only
-one that might save it alone, and "probably fine" is not a plan for the box the
-demo lives on.
+idle k3s box is well under the CPU and network thresholds. With 12 GB, memory is
+the only metric that might keep it above the line on its own, and "probably
+fine" is not good enough for the box the demo runs on.
 
 `.github/workflows/demo-keepalive.yml` runs every 4 hours and pushes an empty
 commit to a `demo-keepalive` branch, which the GitHub App delivers as a real
 `push` → a real Run. Six real runs a day move all three metrics.
 
-It has to be an outside poke, because **nothing in the engine schedules `cron:`
+It has to be triggered from outside, because **nothing in the engine schedules `cron:`
 triggers**. The DSL parses `on: { cron: … }` and `scarab_forge::Event::Cron`
 exists as a type, but outside `scarab-forge`'s own unit tests `Event::Cron`
 appears only in `match` arms — nothing constructs one. A pipeline declaring a
-cron trigger simply never runs.
+cron trigger never runs.
 
 ### There is no machine credential for `POST …/dispatch`
 
-The keepalive would rather dispatch than push, and today it structurally cannot:
+The keepalive would rather dispatch than push, but today it cannot:
 
 * requests authenticate with `Authorization: Bearer <session-id>` (or the
-  `scarab_session` cookie) — a **session id** is the only bearer credential the
+  `scarab_session` cookie), and a **session id** is the only bearer credential the
   server knows (`session_id()` in `crates/scarab-server/src/lib.rs`);
-* sessions are minted in exactly one place, `POST /v1/auth/login`, which takes an
+* sessions are created in exactly one place, `POST /v1/auth/login`, which takes an
   OAuth **authorization code** and exchanges it at the provider
   (`OAuthAuthenticator::exchange`). Authorization codes are single-use and only
   a browser redirect produces one;
@@ -244,17 +244,17 @@ The keepalive would rather dispatch than push, and today it structurally cannot:
   client-credentials grant. `openapi.json` declares no `securitySchemes` at all.
 
 So a scheduled runner has nothing to present, and a hand-pasted session would
-expire five times between two runs of a 4-hourly cron. Closing this is a **server
-feature** — issued API tokens with a verb and an expiry, minted by an Owner — not
-a deploy trick, and the workflow says so in a marked TODO rather than inventing
-one. What it does instead is not a workaround: a real push through the real
-webhook is a *better* demo, and nothing is forged.
+expire five times between two runs of a 4-hourly cron. Fixing this needs a **server
+feature** (issued API tokens with a verb and an expiry, created by an Owner), not
+a deploy trick. The workflow says so in a marked TODO rather than inventing one.
+Pushing instead is not a workaround: a real push through the real webhook makes
+a *better* demo, and nothing is faked.
 
-### Backups, and what surviving instance loss actually means
+### Backups, and what survives losing the instance
 
 `postgres.yaml` carries a CronJob at 03:17 UTC: `pg_dump -Fc` into an emptyDir,
 then `aws s3 cp` to R2 at `pg/scarab-<ISO-day-of-week>.dump`. **Seven rotating
-slots** — the eighth night overwrites the first — so the retention policy needs
+slots** (the eighth night overwrites the first), so the retention policy needs
 no bucket lifecycle rule and no prune job that could delete the wrong thing.
 
 Restore:
@@ -269,11 +269,11 @@ kubectl exec -n scarab <postgres-pod> -- \
 
 So, if Oracle reclaims the instance:
 
-* **survives** — logs, artifacts, Depot packs, workspace snapshots (all in R2),
+* **survives**: logs, artifacts, Depot packs, workspace snapshots (all in R2),
   and up to 24h-old run history (the nightly dump);
-* **lost** — up to a day of run history, every in-flight run, and the warm CAS
+* **lost**: up to a day of run history, every in-flight run, and the warm CAS
   (a cache: it re-fills from R2, at the cost of cache misses);
-* **must be replayed** — `bootstrap.sh`, `.env` (keep it somewhere else!), and
+* **must be replayed**: `bootstrap.sh`, `.env` (keep it somewhere else!), and
   the App installation registration.
 
 **Verified working (2026-08-27):** the CronJob ran on its own and left
@@ -289,14 +289,14 @@ and every stored secret becomes undecryptable) and, if you keep the DB,
 > `AWS_RESPONSE_CHECKSUM_VALIDATION=when_required`. Recent aws-cli v2 sends a
 > CRC32 full-object checksum on every upload that R2 rejects
 > (`Header 'x-amz-checksum-crc32' … not implemented`); without these two the
-> backup fails every night with an error that reads like a credential problem
-> and is not.
+> backup fails every night with an error that looks like a credential problem
+> but is not.
 
-### Security posture
+### Security
 
 `DEV_INSECURE` is **refused** by `deploy.sh` before anything is applied, and the
 chart refuses to render it alongside `scarab.oauth` anyway. On a box with a real
-hostname it would make every caller — including every anonymous one — a
+hostname it would make every caller, including anonymous ones, a
 synthetic Owner able to dispatch runs and read stored secrets.
 
 Everyone who signs in lands as **Viewer**: read-only, cannot dispatch.
@@ -305,7 +305,7 @@ Leave it empty and nobody can administer the install, including you.
 
 This rests on **two assumptions**: the demo repo is *public*, and the demo is
 *login-gated*. Together they are why admitting any GitHub user as a Viewer is
-safe — a Viewer reads every run's logs and artifacts, which are the repo's source
+safe: a Viewer can read every run's logs and artifacts, which are the repo's source
 and build output. `DEMO_ASSUME_PUBLIC_REPO=false` in `.env` makes `deploy.sh`
 refuse, because `scarab-server` has **no sign-in allowlist**: `SCARAB_OAUTH_OWNERS`
 elevates a login to Owner, it does not restrict who may log in. There is no
@@ -317,7 +317,7 @@ subject allowlist at `authenticate()`).
 Neon's free tier cannot back this: 100 compute-hours/month against a server that
 holds a connection pool open permanently is about four days of uptime, and then
 the demo is down. So Postgres lives on local-path and the **bucket** is the
-durable copy (above). This is a demo posture, not a production one — production
+durable copy (above). This is a demo setup; production
 uses managed Postgres.
 
 ### Why step Pods get their own namespace
@@ -325,16 +325,16 @@ uses managed Postgres.
 A LimitRange applies to every Pod in its namespace; there is no way to scope one
 to "just the step Pods". In the release namespace it would also hit the workspace
 StatefulSet, and the default it injects is exactly what the chart warns against
-there — a CPU limit throttles the drain's hashing, and the drain clock is already
-the liveness bound. Two namespaces is what lets step Pods be capped without
-capping the data plane with them.
+there: a CPU limit throttles the drain's hashing, and the drain clock is already
+the liveness bound. Two namespaces let step Pods be capped without capping
+the data plane too.
 
-The proper home for this is ADR-0055's `default_resources`, and it is not
+This belongs in ADR-0055's `default_resources`, but that is not
 reachable: `SCARAB_PLACEMENT_CONFIG_FILE` is file-only (no inline env form) and
 the chart has no value that mounts an arbitrary file. Wiring it would be a chart
-change. If the chart grows one, move the caps there and delete `steps.yaml` —
-`default_resources` is per-step and legible in the server's own config, where a
-LimitRange is invisible to Scarab entirely.
+change. If the chart grows one, move the caps there and delete `steps.yaml`:
+`default_resources` is per-step and visible in the server's own config, while
+Scarab cannot see a LimitRange at all.
 
 ## Clean slate
 
@@ -348,7 +348,7 @@ kubectl delete pvc -n scarab -l app.kubernetes.io/component=workspace
 ```
 
 Wiping the DB means re-registering the App installation (reinstall it on the
-repo). The App PEM is unaffected — it is mounted from a Secret, not stored in
+repo). The App PEM is unaffected: it is mounted from a Secret, not stored in
 Postgres. Keep `SCARAB_MASTER_KEY` stable regardless, or any *other* previously
 stored secret becomes undecryptable. The R2 bucket is untouched by all of this;
 emptying it drops every log, artifact, pack and workspace snapshot, and old runs

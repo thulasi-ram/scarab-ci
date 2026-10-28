@@ -6,7 +6,7 @@ with the RBAC it needs to launch one Pod per step in its namespace.
 ## Prerequisites
 
 - Kubernetes 1.25+
-- A Postgres database (the durable outbox / coordination bus) — without it the
+- A Postgres database (the durable outbox / coordination bus). Without it the
   server runs API-only.
 - An S3-compatible object store for logs/artifacts (AWS S3 or in-cluster MinIO)
   for production; a local dir fallback exists for dev.
@@ -24,7 +24,7 @@ helm upgrade --install scarab oci://ghcr.io/thulasi-ram/charts/scarab \
   --version 0.2.2 --namespace scarab --create-namespace -f values.yaml
 ```
 
-From a checkout, point at the directory instead (and pin `image.tag` — the
+From a checkout, point at the directory instead (and pin `image.tag`, because the
 in-tree `appVersion` may be ahead of the last release):
 
 ```sh
@@ -65,12 +65,11 @@ under neither ServiceAccount, so they do not inherit the role.
 Scarab authenticates operators against a **forge-agnostic OAuth/OIDC provider**:
 the endpoints are explicit values, so GitHub, Forgejo and any OIDC issuer are the
 same code path. Without one the server has no authenticator and **refuses to
-start** (ADR-0048); the only other bootable shape is `scarab.devInsecure`, where
+start** (ADR-0048). The only other way to start it is `scarab.devInsecure`, where
 every caller is a synthetic Owner.
 
-The four endpoints/ids are chart values; the **client secret never is** — it comes
-by reference from a Secret you manage out-of-band, exactly like the App PEM
-below:
+The four endpoints and ids are chart values. The **client secret never is**: it
+comes by reference from a Secret you manage out-of-band, like the App PEM below:
 
 ```sh
 kubectl -n scarab create secret generic scarab-oauth \
@@ -93,17 +92,17 @@ For a Forgejo host the same four point at `/login/oauth/authorize`,
 `/login/oauth/access_token` and `/api/v1/user` on your instance.
 
 `scarab.oauth.owners` are the provider subjects granted **Owner** at login
-(bootstrap until scoped RBAC, ADR-0049 C2); everyone else authenticates as
-**Viewer**. An empty list means nobody can administer the install — the chart says
-so on install. An entry matches the subject **or** a verified email claim.
+(a bootstrap measure until scoped RBAC, ADR-0049 C2); everyone else authenticates
+as **Viewer**. An empty list means nobody can administer the install, and the
+chart warns about this on install. An entry matches the subject **or** a verified email claim.
 
 ### Plain OAuth2 vs OIDC (`scarab.oauth.issuer`)
 
 Leaving `scarab.oauth.issuer` empty is **plain OAuth2**: the provider returns no
-`id_token` and the Principal comes from `userinfoUrl`. That is the GitHub and
-Forgejo shape, and it is the default.
+`id_token` and the Principal comes from `userinfoUrl`. This is how GitHub and
+Forgejo work, and it is the default.
 
-Setting it turns on **OIDC mode** — the `id_token` is verified against that
+Setting it turns on **OIDC mode**: the `id_token` is verified against that
 issuer's discovery document and JWKS (`iss`, `aud`, `exp`, `nonce`, RS256) and
 its claims become authoritative, with userinfo as fallback only when no
 `id_token` comes back. Use it for Dex, Keycloak, or Google:
@@ -114,7 +113,7 @@ its claims become authoritative, with userinfo as fallback only when no
 ```
 
 With an OIDC issuer, `sub` is typically an opaque per-client id, so prefer the
-**verified email** in `owners` — an unverified email never grants Owner. Setting
+**verified email** in `owners`. An unverified email never grants Owner. Setting
 `issuer` *without* the four endpoints is a render error, same as any other
 partial provider.
 
@@ -122,13 +121,13 @@ partial provider.
 
 Each sign-in is pinned to a Scarab Principal by the provider's **immutable** user
 id (OIDC `sub`, or GitHub/Forgejo's numeric `id`), never by the login, so a
-recycled login cannot inherit someone's roles. The provider above keeps minting
-the bare ids it always has (`alice`), so upgrading changes no existing binding.
+recycled login cannot inherit someone's roles. The provider above keeps issuing
+the same bare ids as before (`alice`), so upgrading changes no existing binding.
 Set `scarab.oauth.forgeUrl` to the forge it signs into (`https://api.github.com`
 for GitHub, the web host for Forgejo) so a forge-permission import resolves
 through it.
 
-Further providers mint ids in their own namespace (`okta:ada@example.com`,
+Additional providers issue ids in their own namespace (`okta:ada@example.com`,
 `forgejo:alice`) and share the one callback URL:
 
 ```yaml
@@ -149,19 +148,19 @@ scarab:
 
 With more than one provider an owners email must be qualified as
 `<provider>:<email>`. It is honoured only when that provider asserts the address
-verified, so the weakest IdP cannot mint an Owner. A bare email refuses boot.
+verified, so the weakest configured IdP cannot create an Owner. A bare email refuses boot.
 
-**All five or none.** The server refuses to boot on a partially configured
+**A provider needs all five values or none.** The server refuses to boot on a partially configured
 provider, so the chart refuses to render one: a missing endpoint, or a login
 config with no reachable client secret, **fails `helm upgrade`** with the exact
 value to set. If you already use `secrets.existingSecret`, you may supply
 `SCARAB_OAUTH_CLIENT_SECRET` as a key of it and leave
 `secrets.oauthClientSecret.name` empty.
 
-**`devInsecure` is not a fallback.** Setting `scarab.devInsecure=true` *and*
-`scarab.oauth.*` is a hard render error, not a precedence rule — dev-insecure
-would silently turn every caller back into an Owner and neuter the login you just
-configured. Pick one.
+**`devInsecure` cannot be combined with `scarab.oauth`.** Setting
+`scarab.devInsecure=true` *and* `scarab.oauth.*` fails the render; neither
+setting overrides the other. Dev-insecure mode would silently make every caller
+an Owner again and disable the login you just configured. Pick one.
 
 ## The GitHub App credential (bootstrap-free)
 
@@ -169,7 +168,7 @@ In App mode (`scarab.githubAppId`) the credential a GitHub connection
 authenticates with is the App's private-key PEM. It can be stored in Postgres at
 the reserved `_forge` scope via `POST /v1/secrets` (ADR-0046), but that has a
 bootstrap ordering problem for a cluster: the server must already be up to
-accept the credential it needs, and the credential dies with the database. So the
+accept the credential it needs, and the credential is lost with the database. So the
 chart can also hand the PEM to the server **at boot**, which survives a database
 recreate and needs no API call:
 
@@ -190,23 +189,23 @@ never a silent downgrade. A boot-supplied PEM **overrides** the DB-stored
 `_forge` credential for GitHub App-mode connections, so an absent one is expected
 and not reported as degraded.
 
-Two other shapes reach the same place — `secrets.githubAppPem` (inline value,
+There are two other ways to supply it: `secrets.githubAppPem` (inline value,
 rendered into the chart Secret as `SCARAB_GITHUB_APP_PEM`) and a
 `SCARAB_GITHUB_APP_PEM` key in your own `secrets.existingSecret`. Inline wins
 over the mounted file. Prefer the mounted file: no key material passes through
 Helm values.
 
-**This is the credential only.** Which installations and repos exist is separate
-durable state, registered by the App's `installation` /
+**This covers the credential only.** Which installations and repos exist is
+separate durable state, registered by the App's `installation` /
 `installation_repositories` webhook deliveries (or `deploy/local-helm/reseed.sh`
-for a local loop) — a fresh database still needs one delivery.
+for a local loop). A fresh database still needs one delivery.
 
 ## Declarative connections (`scarab.connections`, ADR-0060 part D)
 
 A forge connection can be **declared in config** instead of created through the
 UI. Config-declared connections are provisioned at boot, are **authoritative**,
 and are read-only in the UI ("managed by configuration"). This is the only way to
-onboard a Forgejo host — and its repos as Projects — without any API call.
+onboard a Forgejo host, and its repos as Projects, without any API call.
 
 ```sh
 kubectl -n scarab create secret generic scarab-forgejo \
@@ -219,15 +218,16 @@ helm upgrade --install scarab deploy/helm/scarab -n scarab \
 
 The block is rendered verbatim into a mounted ConfigMap and
 `SCARAB_CONNECTIONS_FILE` points at it, so the keys are the **server's** schema
-(`base_url`, `secret_ref` — snake_case, not the chart's camelCase). An unknown key
-fails the boot loudly rather than being ignored (ADR-0048).
+(`base_url`, `secret_ref`: snake_case, not the chart's camelCase). An unknown key
+fails the boot with an error instead of being ignored (ADR-0048).
 
-**One owner, never two.** A connection is owned by the config *or* by the
-database — declaring an id the database already owns (e.g. one a GitHub
-`installation` delivery created) **refuses the boot** and says so, rather than
-letting the two drift apart with no authority to break the tie. Removing an entry
-*releases* ownership back to the UI; it never deletes the connection, because
-Projects — and their Environments, secrets and RBAC — hang off its repo bindings.
+**Each connection has exactly one owner.** A connection is owned by the config
+*or* by the database. Declaring an id the database already owns (e.g. one a
+GitHub `installation` delivery created) **refuses the boot** with an error,
+rather than letting the two copies drift apart with nothing to decide between
+them. Removing an entry hands ownership back to the UI. It never deletes the
+connection, because Projects (and their Environments, secrets and RBAC) depend on
+its repo bindings.
 
 **Credentials resolve by one path: env override, then Scarab's secret store.**
 `credential: {env: VAR}` / `{file: PATH}` supply the material from the deployment
@@ -240,7 +240,7 @@ mechanism, applied kind-wide to GitHub App-mode connections.
 
 Step Pods are created by the server at run time, so the chart's `tolerations` /
 `nodeSelector` (which place the **server**) never reach them. On a cluster whose
-every node pool is tainted, step Pods — clone steps included — stay `Pending`
+every node pool is tainted, step Pods (clone steps included) stay `Pending`
 until you give them tolerations here:
 
 ```yaml
@@ -259,14 +259,14 @@ scarab:
             nodeSelector: { pool: ci-large }
 ```
 
-**`baseline` and `k8s` are Pod fragments, not pod-spec fragments** — they are
+**`baseline` and `k8s` are Pod fragments, not pod-spec fragments.** They are
 RFC-7386 merge-patched onto the whole Pod, so tolerations live under `spec:`.
 
 The block is rendered verbatim into a mounted ConfigMap and
 `SCARAB_PLACEMENT_CONFIG_FILE` points at it, so the keys are the **server's**
-schema (`baseline`, `default_resources`, `profiles`). Two mistakes are silent on
-the server — an unknown top-level key, and a fragment key other than
-`metadata`/`spec` (dropped when the merged Pod is decoded) — and either leaves
+schema (`baseline`, `default_resources`, `profiles`). The server silently accepts
+two mistakes: an unknown top-level key, and a fragment key other than
+`metadata`/`spec` (dropped when the merged Pod is decoded). Either one leaves
 every step Pod `Pending` with no error. The chart **fails the render** on both
 instead. A change rolls the server (it is read once at boot).
 
@@ -275,8 +275,8 @@ instead. A change rolls the server (it is read once at boot).
 A second workload in the same release: a **StatefulSet** running the **same
 image** with `SCARAB_ROLE=workspace`, holding a warm content-addressed store of
 **Workspace Snapshots** on a PVC, with your object store behind it as the cold
-archive. It is meant to be in the standard path, not an optional accelerator — a
-fast path plus a fallback path is two mental models.
+archive. It is part of the standard path, not an optional speed-up, because a
+fast path plus a fallback path means two code paths to reason about.
 
 ```sh
 helm upgrade --install scarab deploy/helm/scarab -n scarab \
@@ -284,15 +284,15 @@ helm upgrade --install scarab deploy/helm/scarab -n scarab \
   --set workspace.persistence.size=50Gi
 ```
 
-Why it is shaped the way it is:
+Why it is built this way:
 
-- **Same image, one release.** That is what makes server↔service version skew
-  structurally impossible. It is why this is a *role* on the converged binary
-  and not a fourth published artifact.
+- **Same image, one release.** That makes version skew between server and
+  service impossible. It is also why this is a *role* on the converged binary
+  rather than a fourth published artifact.
 - **`SCARAB_ROLE=workspace` is set as an explicit `env` entry**, which wins over
-  the ConfigMap arriving via `envFrom`. That single line is load-bearing: get the
-  precedence wrong and this StatefulSet quietly runs a second converged control
-  plane, complete with a driver loop. Confirm it after any edit:
+  the ConfigMap arriving via `envFrom`. That one line matters: if the precedence
+  is wrong, this StatefulSet silently runs a second converged control plane,
+  driver loop included. Confirm it after any edit:
   ```sh
   helm template scarab deploy/helm/scarab -n scarab \
     --set scarab.devInsecure=true --set secrets.databaseUrl=x \
@@ -300,16 +300,16 @@ Why it is shaped the way it is:
     | yq 'select(.kind=="StatefulSet").spec.template.spec.containers[0].env'
   ```
 - **The volume attaches to the SERVICE, never to a step Pod.** Every problem PVCs
-  have at step grain — attach/detach latency at each boundary, stuck volumes when
-  a spot node is reclaimed, per-node attachment quotas — comes from binding
-  volumes to short-lived pods.
-- **No RBAC.** It gets its own ServiceAccount with **no RoleBinding**. That looks
-  like an omission and is deliberate: a workspace replica creates no Pods, reads
+  have per step (attach/detach latency at each boundary, stuck volumes when a
+  spot node is reclaimed, per-node attachment quotas) comes from binding volumes
+  to short-lived pods.
+- **No RBAC.** It gets its own ServiceAccount with **no RoleBinding**. This is
+  deliberate: a workspace replica creates no Pods, reads
   no Secrets through the API and execs into nothing.
 - **`secrets.workspaceTokenSecret` must be different from
   `secrets.resultsTokenSecret`.** The results token carries no verb and never
   expires, so reusing it would turn a results-write credential into a content
-  read+write credential — and would let the workspace service forge step results
+  read+write credential, and would let the workspace service forge step results
   for any `{run, step, attempt}`.
 - **Nothing renders without that secret.** A workspace service with no token
   secret would serve every step's inputs to anything that can reach the port, so
@@ -318,16 +318,16 @@ Why it is shaped the way it is:
 Operating it: `/readyz` is *warm writable + cold reachable*, deliberately not the
 control plane's database check. The warm tier is bounded by **space** and **LRU
 eviction is not implemented yet**, so `scarab_workspace_warm_used_bytes` on
-`/metrics` is the whole budget — alert on it against
+`/metrics` is the whole budget. Alert on it against
 `workspace.persistence.size`. `scarab_workspace_warm_write_failed_total`
 climbing means snapshots are still durable (cold succeeded) but the cache is
 not being filled.
 
-**`workspace.persistence.storageClass` backs the warm CAS** — the Depot's
+**`workspace.persistence.storageClass` backs the warm CAS**, the Depot's
 local cache tier in front of the cold object store (ADR-0066: the Depot is a
-cache). Its whole point is local-syscall reads and writes, so prefer local
-disk: an NFS-backed class puts a network round trip back under every blob,
-which is exactly the cost the warm tier exists to remove.
+cache). The warm tier exists so that reads and writes are local syscalls, so
+prefer local disk. An NFS-backed class adds a network round trip to every blob,
+which is the cost the warm tier is there to remove.
 
 > **Unverified in this chart version:** more than one replica, per-availability-
 > zone placement, and reachability from a step Pod. `workspace.replicaCount > 1`
@@ -349,8 +349,8 @@ helm upgrade scarab oci://ghcr.io/thulasi-ram/charts/scarab --version 0.2.2 ...
 ```
 
 The recreated StatefulSet re-adopts the existing PVC by name (`cas-<sts>-0`);
-the old PVC simply keeps its old labels. Expect
-one restart of the workspace Pod. Later upgrades apply in place — the chart's CI
+the old PVC keeps its old labels. Expect
+one restart of the workspace Pod. Later upgrades apply in place; the chart's CI
 renders two versions and fails if any immutable StatefulSet field differs.
 
 ## Plugins (`plugins`, ADR-0072)
@@ -358,7 +358,7 @@ renders two versions and fails if any immutable StatefulSet field differs.
 Off by default. `plugins.enabled=true` runs the plugin runtime: Scarab manages
 one Deployment per installed plugin (e.g. the first-party Argo CD reporter) in
 the shared `plugins.namespace`, and plugins talk to Scarab only through the
-**CredentialBroker** — a second listener on `plugins.brokerPort`, exposed by
+**CredentialBroker**: a second listener on `plugins.brokerPort`, exposed by
 the ClusterIP Service `<fullname>-broker` and never through the ingress.
 
 It renders the namespace (labelled Pod Security `restricted`; set
@@ -367,11 +367,11 @@ there, `get` on that one namespace, and a binding to `system:auth-delegator`
 (TokenReview, which is how the broker verifies a plugin's projected token).
 
 **The cluster must enforce NetworkPolicy.** The runtime writes a default-deny
-policy plus one egress allowance — the broker, nothing else. Not even DNS: the
-cluster resolver forwards any name upstream, so a DNS allowance would be a
+policy plus one egress allowance, to the broker and nothing else. That excludes
+DNS: the cluster resolver forwards any name upstream, so a DNS allowance would be a
 tunnel out. Plugins are handed the broker by IP instead (the runtime resolves
-the broker Service to its ClusterIP every pass). Before any plugin starts — and
-every 6 h — the runtime runs an isolation probe in the namespace. On a cluster
+the broker Service to its ClusterIP every pass). Before any plugin starts, and
+every 6 h, the runtime runs an isolation probe in the namespace. On a cluster
 whose CNI ignores NetworkPolicy the probe fails and the plugin stays down, its
 installation showing `probe_failed` and why. Each plugin Pod then re-checks its
 own network in an `isolation-self-check` initContainer (the probe image) before
@@ -411,11 +411,11 @@ DNS, which must be the usual `kube-system` Pods labelled `k8s-app=kube-dns`.
 | `plugins.probeImage` | `""` = `busybox:1.36.1@sha256:73aa…` | the isolation probe's and the per-Pod self-check's image; digest-pin an override |
 | `ingress.enabled` | `false` | expose the HTTP API |
 
-See `values.yaml` for the full surface. Every value maps to a `SCARAB_*` env var
+See `values.yaml` for every value. Every value maps to a `SCARAB_*` env var
 read by `crates/scarab-server/src/config.rs`. Webhook verification binds a secret
 per forge endpoint: `SCARAB_GITHUB_WEBHOOK_SECRET` for `/webhooks/github`
 and `SCARAB_FORGEJO_WEBHOOK_SECRET` for `/webhooks/forgejo`. Both render from
-first-class values (`secrets.githubWebhookSecret` / `secrets.forgejoWebhookSecret`),
+dedicated values (`secrets.githubWebhookSecret` / `secrets.forgejoWebhookSecret`),
 or supply them as keys of your own `secrets.existingSecret`.
 
 ## References

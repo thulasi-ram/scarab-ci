@@ -1,6 +1,6 @@
 # Scarab brand assets
 
-Scarab mark traced pixel-to-pixel from the source artwork (gold linework only —
+Scarab mark traced pixel-to-pixel from the source artwork (gold linework only,
 no photographic background). Curves are shared across every variant; only the
 fills / outline colors differ.
 
@@ -16,7 +16,7 @@ fills / outline colors differ.
 ## Primary emblem
 
 The chosen mark: **emerald wings, gold body, transparent inside the circle**
-(no disc fill), so it drops onto any surface.
+(no disc fill), so it works on any background.
 
 - **Light variant** — `scarab-emblem` — **ink outline**, gold body. For white /
   cream / navy / mid backgrounds.
