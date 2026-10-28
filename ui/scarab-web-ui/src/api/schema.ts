@@ -2487,7 +2487,7 @@ export interface components {
              *     typed `setting` (§7).
              */
             policy: Record<string, never>;
-            /** @description Why, recorded on the PolicyVersion. */
+            /** @description Why, recorded on the PolicyVersion. At most 2,000 bytes. */
             reason?: string | null;
         };
         /**
@@ -3375,11 +3375,25 @@ export interface components {
         };
         PolicyTestTrigger: {
             /**
+             * @description The forge account that caused the event. Default: the caller for
+             *     `manual` and `api` (as a dispatch is), none otherwise.
+             */
+            actor?: string | null;
+            /** @description A pull request from a fork; `pull_request` only. Default false. */
+            fork?: boolean;
+            /**
              * @description `push`, `pull_request`, `tag`, `release`, `comment`, `cron`,
              *     `manual`, `api` or `upstream`.
              */
             kind: string;
-            /** @description The symbolic ref (`refs/heads/main`). */
+            /** @description The dispatch reason; `manual` and `api` only. Default none. */
+            reason?: string | null;
+            /**
+             * @description The symbolic ref, as admission sees it: `refs/heads/main` for a push
+             *     or a dispatch, `refs/pull/<n>/head` for a pull request,
+             *     `refs/tags/<tag>` for a tag or release. Required for those kinds;
+             *     `comment`, `cron` and `upstream` have none.
+             */
             ref?: string | null;
             sha?: string | null;
         };
@@ -6936,7 +6950,7 @@ export interface operations {
                     "application/json": components["schemas"]["PolicyDto"];
                 };
             };
-            /** @description not a Policy, or it does not compile (its checkpoint is not yet consulted, a CEL error, an effect the checkpoint does not allow) */
+            /** @description not a Policy, or it does not compile (its checkpoint is not yet consulted, a CEL error, an effect the checkpoint does not allow), or `reason` is over 2,000 bytes */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -6957,7 +6971,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description a live Policy here has that name */
+            /** @description a live Policy here has that name, or the scope holds its 256 Policies */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -7030,7 +7044,7 @@ export interface operations {
                     "application/json": components["schemas"]["PolicyDto"];
                 };
             };
-            /** @description not a Policy, or it does not compile */
+            /** @description not a Policy, or it does not compile, or `reason` is over 2,000 bytes */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -7097,6 +7111,13 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["PolicyDto"];
                 };
+            };
+            /** @description `reason` is over 2,000 bytes */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
@@ -7356,7 +7377,7 @@ export interface operations {
                     "application/json": components["schemas"]["PolicyDto"];
                 };
             };
-            /** @description not a typed setting (ADR-0075 §7), or it does not compile */
+            /** @description not a typed setting (ADR-0075 §7), or it does not compile, or `reason` is over 2,000 bytes */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -7377,7 +7398,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description a live Policy here has that name */
+            /** @description a live Policy here has that name, or the scope holds its 256 Policies */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -7454,7 +7475,7 @@ export interface operations {
                     "application/json": components["schemas"]["PolicyDto"];
                 };
             };
-            /** @description not a typed setting (ADR-0075 §7), or it does not compile */
+            /** @description not a typed setting (ADR-0075 §7), or it does not compile, or `reason` is over 2,000 bytes */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -7523,6 +7544,13 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["PolicyDto"];
                 };
+            };
+            /** @description `reason` is over 2,000 bytes */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description not a Project admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
             403: {
