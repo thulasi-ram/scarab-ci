@@ -380,7 +380,7 @@ Attempt, not an outcome — see the 2026-07-20 amendment).
 
 ### UI direction (working spec)
 
-Recorded so the design is not lost. (Done: built in the web-UI "redesign stages
+Recorded so the design is not lost. (Done as of 2026-10-28: built in the web-UI "redesign stages
 1–4", commits `f761f72`…`fc60556`. Two controls changed shape later: the version
 rail became `VersionDropdown.tsx` and the filmstrip became `AttemptsDropdown.tsx`,
 both under `ui/scarab-web-ui/src/components/`.) One screen

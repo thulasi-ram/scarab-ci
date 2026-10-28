@@ -320,7 +320,8 @@ control plane's database check. The warm tier is bounded by **space**: an LRU
 sweep runs every 60 seconds and, once `scarab_workspace_warm_used_bytes` passes
 `scarab_workspace_warm_budget_bytes` (`workspace.warmBudgetBytes`, default 90%
 of the volume), evicts down to 80% of the budget. It evicts content that is
-already durable in the packs first, then cache-only content. Both gauges are on
+already durable in the packs first, then everything else (cache-only content, and
+content whose drain hasn't committed yet). Both gauges are on
 `/metrics`. `scarab_workspace_warm_evicted_bytes_total{class="cache_only"}`
 climbing means the volume is too small for the working set and future reads
 will miss. The sweep never evicts a file whose mtime is under an hour old (a

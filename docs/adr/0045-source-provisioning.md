@@ -154,12 +154,12 @@ arbitrary image can't guarantee.
   `needs` (ADR-0007) with no new inheritance rule.
 - **Work to build (all absent when this was decided; all done since):**
   - `clone` step kind in the IR + `scarab-pipeline` compiler (today: image +
-    `gate` only); the lint rule for the "no clone on push/PR" warning. (done:
+    `gate` only); the lint rule for the "no clone on push/PR" warning. (done as of 2026-10-28:
     `CloneSpec` and the missing-clone lint in `crates/scarab-pipeline/src/lib.rs`)
   - CAS `materialize`/`ingest` wired into `build_pod` — the ADR-0029 storage layer
     that exists in `scarab-storage-s3` but is never called on k8s. This is the
     *same* wiring the workspace-passing and `outputs:` gaps need, so `clone`
-    and inter-step workspace flow land together. (done: the `scarab-wsfetch`
+    and inter-step workspace flow land together. (done as of 2026-10-28: the `scarab-wsfetch`
     feed and drain containers in `crates/scarab-executor-k8s/src/lib.rs`,
     ADR-0061/0067)
   - A clone URL on the normalized forge model (`Repo` carries only
@@ -168,9 +168,9 @@ arbitrary image can't guarantee.
   - A scoped, short-TTL, read-only-for-forks token-minting path — **depends on
     the GitHub App adapter** (installation tokens), which is itself unbuilt
     (8× `unimplemented!()`). `clone` for private repos cannot ship before it.
-    (done: `mint_checkout_credential` on `ForgePort`, implemented by the GitHub
+    (done as of 2026-10-28: `mint_checkout_credential` on `ForgePort`, implemented by the GitHub
     and Forgejo adapters)
-  - The `scarab-clone` image + its build in `image.yml`. (done: `docker/clone/`,
+  - The `scarab-clone` image + its build in `image.yml`. (done as of 2026-10-28: `docker/clone/`,
     built in `.github/workflows/image.yml`)
 - **Ordering:** "Scarab builds Scarab" depends on `clone`: until it
   lands, no step sees source and the project cannot dogfood. It is gated on the

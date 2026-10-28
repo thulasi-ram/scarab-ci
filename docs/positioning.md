@@ -137,7 +137,8 @@ Show respect and say where we differ; never take a swipe.
 ## Claims we don't make (the code or the market won't back them)
 
 1. ❌ "Works with GitHub" with no qualifier, or "production-ready on GitHub". The
-   adapter is implemented: every `ForgePort` method makes real GitHub API calls
+   adapter is implemented: every outbound `ForgePort` method GitHub needs makes real GitHub API calls (webhook
+   registration is a no-op, because the App's subscription is the hook)
    (`crates/scarab-forge-github/src/lib.rs`), and the live demo takes its webhooks
    from a GitHub App. But its live contract test (`tests/contract_live.rs`) runs only
    by hand, and no CI job talks to real GitHub. Say "GitHub and Forgejo adapters

@@ -255,9 +255,10 @@ and the control plane reads the drain's record from the Depot to decide the Atte
   (`scarab-server --role converged|api|scheduler|executor|webhook|workspace`).
   Postgres (outbox) is the coordination bus; no service-to-service RPC required internally.
   `workspace` is the one **data-plane** role: it connects to Postgres only for derived,
-  rebuildable rows (drain records, write ledgers) and never runs a migration (ADR-0067). Its
-  pool connects lazily and content reads never touch Postgres, so it keeps serving a Step its
-  inputs through a database outage.
+  rebuildable rows (the pack index, drain records, write ledgers) and never runs a migration
+  (ADR-0067). Its pool connects lazily, and reads served from the warm tier never touch
+  Postgres, so through a database outage it keeps serving inputs that are on warm. A warm miss
+  needs the pack index and fails until Postgres is back (the fetcher retries).
 - **Control-plane / data-plane split:** the durable *brain* records intent ("Step S should
   run"); the *executor* observes it, creates the Pod, watches it, writes back terminal state.
   The intent is that bulk **data** does not cross the brain — the control plane exchanges root

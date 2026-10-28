@@ -4,6 +4,9 @@
 - **Date:** 2026-07-12
 - **Deciders:** thulasi.ram (architect)
 
+> **Status note (2026-10-28):** the internal gRPC half was never built. Roles coordinate through
+> the Postgres outbox, and the Data Depot and plugin broker speak HTTP.
+
 ## Context
 
 "API-first, UI dogfoods the API" only counts if the UI uses the **same** API that third parties

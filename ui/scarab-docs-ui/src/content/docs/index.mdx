@@ -147,7 +147,8 @@ run against real forges by hand:** the GitHub and Forgejo adapters (webhook inge
 statuses); `just forgejo-verify` drives a real Forgejo from hook to Run, and the live demo takes
 its webhooks from a GitHub App. **Implemented, and tested on a kind cluster:** Pod execution and
 re-attach (`scarab-executor-k8s`) and the results-egress sidecar (`docker/sidecar/`).
-`kind.yml` runs those tests for changes to the execution path, not on every PR. **Not proven
+`kind.yml` runs those tests for changes to the execution path, not on every PR (as of
+2026-10-28 the job fails at image load, before the tests run; last green on main 2026-10-20). **Not proven
 yet:** control-plane crash and resume with a real Pod in flight (the weekly e2e test for it
 doesn't pass yet) and production-scale load. **Missing:** `on: cron` and `on: upstream`
 triggers parse, but nothing produces those events yet.

@@ -98,7 +98,8 @@ steps:
   the dependency. Hostname = the declared `name` (`db:5432`), matching the label-as-hostname
   convention of GHA/Woodpecker.
 - **Eager birth, Run-scoped teardown.** The service starts at **Run start** (services are run
-  setup; the small idle cost is accepted because "the service lives for the whole Run" is easier to reason about than lazy birth). It is torn down
+  setup; the small idle cost is accepted because "the service lives for the whole
+  Run" is easier to reason about than lazy birth). It is torn down
   when the Run — that Take — reaches terminal, via namespace-per-run teardown
   ([0050](0050-retention-and-gc.md)), **not a refcount**. The readiness *gate* still applies only to
   opt-in steps: a step without `uses: [db]` never waits on `db`.

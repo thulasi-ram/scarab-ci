@@ -41,7 +41,7 @@ Both halves of "explicit-on-demand" now ship:
   rerun invalidation signature (`workspace_inputs` / `input_signature`).
 - **`outputs:`** (2026-07-25) — the workspace-relative paths a step publishes downstream.
   Authored paths are written to the step Pod as an annotation (`scarab.io/workspace-outputs`), and the egress leg prunes the
-  post-step snapshot to only those paths via `scarab_storage::prune_tree`. **Fail-closed:** a
+  post-step snapshot to those paths and nothing else via `scarab_storage::prune_tree`. **Fail-closed:** a
   declared path the step did not produce fails the step with a permanent, author-fixable verdict
   (`FailureClass::Config`) — never a quietly narrower publish.
 

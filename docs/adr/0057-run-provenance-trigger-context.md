@@ -147,7 +147,7 @@ a global switch and not a dispatch-endpoint check:
   the runs-list row (`RepoView`) *and* the run-detail top context bar
   (`RunDetail`) — not two render sites sharing helpers. When this was decided,
   Thread A shared `trigger.ts` helpers but duplicated the JSX; this ADR unifies
-  them into one component so the list and header can never drift. (Done:
+  them into one component so the list and header can never drift. (Done as of 2026-10-28:
   `ui/scarab-web-ui/src/components/TriggerCell.tsx`, used by both screens.)
 - The component renders the headline as the **secondary line of the Trigger
   cell** (kind on top, title beneath), truncated with a full-text tooltip. PR

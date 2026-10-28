@@ -87,7 +87,7 @@ enter the database.
 
 **4. Live tail is untouched.** `log_tail.rs` in the control plane tails Pod stdout and calls
 `LogService::append`, which broadcasts in-process for SSE. Only the **durable** write redirects to
-the Depot; replay reads from it. The split is cheap because the tailing process and the storing
+the Depot; replay reads from it. The split is a small change because the tailing process and the storing
 process were already separate concerns in one binary.
 
 **5. Logs are space-bounded and evictable, and absence is loud.** They sit on a bounded volume and

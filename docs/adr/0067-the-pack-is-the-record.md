@@ -42,7 +42,7 @@ mechanism it needs (grouping many small objects into one) is something the cold 
 
 [0066](0066-the-depot-is-a-cache.md)'s own numbers: the drain is **2.68 ms/file cold** and the cost
 is **per-request, not per-byte**: 8.19 MB in 5360 ms is absurd as bandwidth and what
-~2000 round trips at 2.68 ms cost. Object storage has **no batch PUT**, which is why
+~2000 round trips cost at 2.68 ms each. Object storage has **no batch PUT**, which is why
 [0066](0066-the-depot-is-a-cache.md) point 7 named packing *"the only lever"* on the per-object bill
 and deferred it to a later ADR.
 
@@ -270,7 +270,7 @@ independent of every part above: `scarab-wsfetch` uses a bare `reqwest::Client::
 timeout and **no backoff**, so a 20–30 s outage burns an Attempt's whole budget in seconds and the
 Run dead-letters. That is [0066](0066-the-depot-is-a-cache.md) point 2's other half and it is still
 the single cheapest availability fix in the tree. **`replicaCount > 1` is worth nothing without it.**
-(Done: `scarab-wsfetch` now retries transient failures with a 1 s→10 s backoff inside a
+(Done as of 2026-10-28: `scarab-wsfetch` now retries transient failures with a 1 s→10 s backoff inside a
 window sized from the step timeout; see `retry_window` in
 `crates/scarab-workspace-client/src/bin/scarab-wsfetch.rs`.)
 
@@ -289,7 +289,7 @@ window sized from the step timeout; see `retry_window` in
 config defaults, `values.yaml`'s empty `bucket`, ~28 test sites that boot a local directory,
 `crash_resume.rs` (which clears every `SCARAB_S3_*` variable), and CI (`ci.yml` has no
 MinIO and `kind.yml` runs the live tier on a local directory). Note also that **no workflow runs
-`helm lint` or `helm template`**, so chart changes have no CI coverage at all today. (Done:
+`helm lint` or `helm template`**, so chart changes have no CI coverage at all today. (Done as of 2026-10-28:
 `ci.yml` and `kind.yml` both start MinIO, and the `chart` job in `.github/workflows/image.yml`
 runs `helm lint`, `helm template` and `scripts/chart_statefulset_immutable.sh` on every PR that
 touches the chart.)
@@ -305,7 +305,7 @@ touches the chart.)
 - **Move the drain record and ledger to Postgres, leave the write path alone.** Fixes two of the four
   states and leaves the other two — the pre-flush blob window and `/have`'s per-replica answer. The
   second is the expensive one: an 8× drain regression on the leg already measured as the bottleneck.
-- **Adopt the Bazel remote-execution CAS protocol.** Most of its shape maps onto ours:
+- **Adopt the Bazel remote-execution CAS protocol.** Its shape maps onto ours nearly one to one:
   `FindMissingBlobs` is `/have`, `GetTree` is `/flat`, batch read/write is the wire work the
   transfer handoff was going to invent, and its digest carries a size, which is part 9's problem
   solved at the format level. One rejection ground originally claimed here was **wrong** and is

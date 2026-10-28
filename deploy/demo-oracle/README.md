@@ -244,7 +244,9 @@ scheduled job had nothing to present to `POST …/dispatch`. It has one now:
   `on: api`);
 * tokens are wired whenever OAuth login is (`with_api_tokens` in
   `crates/scarab-server/src/main.rs`), which it is on this box;
-* a token cannot mint tokens, so a human re-mints it before it expires.
+* a token cannot mint tokens, so a human re-mints it before it expires. Minting
+  is a step-up operation (ADR-0073): with step-up enforced, the admin confirms it
+  with a passkey.
 
 So the keepalive could dispatch with a token kept as an Actions secret. It
 doesn't: `.github/workflows/demo-keepalive.yml` still pushes an empty commit,

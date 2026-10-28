@@ -81,7 +81,7 @@ pipeline involvement.
   key conflict — profiles are expected to be orthogonal, so conflicts are rare). Omitted /
   empty → the `default: true` profile. The job **names profiles**; it does not declare raw
   k8s. This is the GitHub-Actions `runs-on: [labels]` model, extended to compose. The field
-  name is deliberately identical to the admin registry key — same word, two contexts (a list
+  name is the same as the admin registry key — same word, two contexts (a list
   of *names* in a pipeline; a list of *definitions* in operator config).
 - **`resources: { cpu, memory }`** — exact specifics, applied to the container's
   requests/limits. **No `size:` tiers** ([0026]'s `size` is dropped).

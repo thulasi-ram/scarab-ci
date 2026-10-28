@@ -24,9 +24,9 @@ workspace it publishes. Absent = the whole workspace (the implicit default).
   travels in the run's stored IR (self-describing, [0022](0022-run-versioning.md)).
 - **Enforced on the live-workspace path.** The restriction happens at the
   post-step CAS snapshot ([0029](0029-workspace-cas.md)): the executor ingests
-  only the declared paths, so the output tree hash reflects only them. That
-  ingest is part of the live k8s post-step workspace path, so enforcement lands
-  with it; the executor reads `outputs:` from the run IR. (done: built 2026-07-25;
+  only the declared paths, so the output tree hash reflects the declared paths and nothing else.
+  That ingest is part of the live k8s post-step workspace path (not yet built), so enforcement lands
+  with it; the executor reads `outputs:` from the run IR. (done as of 2026-10-28: built 2026-07-25;
   the k8s executor reads the paths from the `scarab.io/workspace-outputs` Pod
   annotation and prunes the snapshot with `scarab_storage::prune_tree`; see the
   [0007](0007-data-passing-model.md) amendment.)
@@ -38,7 +38,7 @@ workspace it publishes. Absent = the whole workspace (the implicit default).
 
 - Precise cache/output hashes and safe fan-out become expressible; a change
   outside a step's declared outputs won't churn its downstream once the live path
-  enforces it (done: enforced since 2026-07-25).
+  enforces it (done as of 2026-10-28: enforced since 2026-07-25).
 - Submit-time validation rejects unsafe paths (absolute, escaping) early rather
   than at run time.
 - The field is authored and stored ahead of its enforcing consumer — a deliberate
@@ -47,7 +47,7 @@ workspace it publishes. Absent = the whole workspace (the implicit default).
 
 ## Alternatives considered
 
-- **Defer entirely** until the live-workspace path — but authoring + validation
+- **Defer the whole feature** until the live-workspace path — but authoring + validation
   have standalone value (early rejection, the IR carries intent), and this keeps
   the `inputs:`/`outputs:` pair coherent in the DSL.
 - **Thread `outputs` onto the engine launch `StepSpec` now** — needless churn

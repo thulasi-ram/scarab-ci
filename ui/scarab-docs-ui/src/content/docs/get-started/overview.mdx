@@ -47,8 +47,8 @@ Whichever path you choose, `scarab-server` needs:
 - **An S3-compatible object store** (AWS S3 or in-cluster MinIO) for logs,
   artifacts, and the content-addressed workspace snapshots that reruns restore
   from. The server refuses to start without one. For tests and dev loops you
-  can point it at a local directory with an explicit `--object-dir`, whose
-  contents are not durable.
+  can point it at a local directory with an explicit `--object-dir`: a single
+  directory with no replication.
 - **A Kubernetes namespace with RBAC** so it can launch one Pod per pipeline step.
 
 [Installation](/scarab-ci/get-started/deploy-helm/) sets all three up through

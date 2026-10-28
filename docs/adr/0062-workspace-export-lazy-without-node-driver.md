@@ -994,7 +994,7 @@ folded away: they are all properties of a network protocol, and `LocalPath` has 
 - **The exact path has never executed, and every green test exercises the approximate one.** This
   caveat is easy to miss, because the code is written,
   reviewed and tested. Part 3's argument — that the rungs "do not differ in correctness" because the
-  upper layer is the kernel's own record — rests entirely on the **overlay** rung. Reaching it needs
+  upper layer is the kernel's own record — depends only on the **overlay** rung. Reaching it needs
   a privileged Linux host with a Rust toolchain, which nothing in this repo's loop has: the dogfood
   node has no Rust, GitHub Actions is quota-blocked, and darwin cannot mount `overlayfs` at all. So
   the mount, the resulting upper layer, and `read_change_set` against a real one are all unexecuted,

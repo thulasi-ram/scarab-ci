@@ -93,7 +93,8 @@ but none of them has carried production load.
   sidecar image (`docker/sidecar/`). `.github/workflows/kind.yml` runs these live-cluster
   tests on a throwaway kind cluster for PRs and pushes to main that change the execution path
   (the executor, engine, server, storage and workspace-client crates, or `docker/`), not on
-  every PR.
+  every PR. As of 2026-10-28 the kind job fails at image load, before the tests run; it was
+  last green on main on 2026-10-20.
 - **Not proven yet.** Control-plane crash and resume with a real Pod in flight. The
   `crash_resume` test in `crates/scarab-e2e` does this on a kind cluster; it runs weekly
   (`.github/workflows/e2e.yml`) and doesn't pass yet. Nothing has run at production scale.

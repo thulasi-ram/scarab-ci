@@ -26,7 +26,7 @@ happens downstream? This is where content-addressing ([0004](0004-execution-topo
 ## Consequences
 
 - "Restart the flaky lint step" costs nothing downstream; "restart the build with a fix"
-  cascades only to what changed. This is where users see durable execution pay off.
+  cascades to what changed and nothing more. This is where users see durable execution pay off.
 - Requires reliable per-step input/output hashing (merkle CAS).
 
 ## Alternatives considered

@@ -41,9 +41,9 @@ Consequences for its semantics (a dev tool, so narrower than k8s):
   `Lost` and the orchestrator relaunches ([0020](0020-retry-and-failure.md)).
 - **No content-addressed workspace / `output`** in v1 — returns `None`; workspace
   CAS is the k8s post-step path. So restart skip-if-unchanged ([0027]) and
-  `outputs:` ([0035]) don't engage under local exec (safe cascade). The k8s
-  adapter's post-step snapshot has shipped since (`K8sExecutor::output`), so this
-  gap is local-only.
+  `outputs:` ([0035]) don't engage under local exec (safe cascade), same as the
+  k8s adapter until its post-step snapshot lands. (Status as of 2026-10-28: the k8s
+  snapshot has shipped (`K8sExecutor::output`), so this gap is local-only.)
 - Steps must carry a `command` (there is no image to default to).
 
 ## Consequences
