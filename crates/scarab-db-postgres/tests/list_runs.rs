@@ -83,7 +83,10 @@ async fn run_number_is_allocated_per_repo_over_real_postgres() {
     );
 
     assert_eq!(db.run_number(&RunId("r2".into())).await.unwrap(), Some(2));
-    let summ = db.list_runs_for_tenant("acme", "app", None, 10).await.unwrap();
+    let summ = db
+        .list_runs_for_tenant("acme", "app", &Default::default(), 10)
+        .await
+        .unwrap();
     assert_eq!(
         summ.iter().find(|s| s.run.0 == "r2").unwrap().run_number,
         Some(2),

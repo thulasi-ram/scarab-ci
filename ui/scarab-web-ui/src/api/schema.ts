@@ -3744,6 +3744,11 @@ export interface components {
             /** Format: int64 */
             created_at: number;
             /**
+             * @description Whether this is a **deploy Run** (ADR-0074 §2): its pipeline, or one of
+             *     its Steps, is marked `deploy: true`. Independent of `environment`.
+             */
+            deploy: boolean;
+            /**
              * Format: int64
              * @description Run duration in millis: `updated_at - created_at`. For a terminal run
              *     this is its total wall time; for an in-flight run, elapsed-to-last-update.
@@ -4108,6 +4113,11 @@ export interface components {
              */
             attempt_list?: components["schemas"]["AttemptDto"][];
             attempts: number;
+            /**
+             * @description This Step is marked `deploy: true` (ADR-0074 §2) — the Step of a deploy
+             *     Run that deploys. Omitted when false.
+             */
+            deploy?: boolean;
             deployment_gate?: null | components["schemas"]["DeploymentGateDto"];
             /**
              * @description `manual`/`timer`/`external`/`deployment` if this step is a gate
@@ -7627,8 +7637,10 @@ export interface operations {
             query?: {
                 /** @description max runs (default 50, capped 200) */
                 limit?: number;
-                /** @description only deploy runs into this Environment (ADR-0074); applied before `limit`; must not be empty */
+                /** @description only runs governed by this Environment (ADR-0074); applied before `limit`; must not be empty */
                 environment?: string;
+                /** @description true: only deploy Runs (pipeline or a Step marked `deploy: true`); false: only the rest; applied before `limit` */
+                deploy?: boolean;
             };
             header?: never;
             path: {
@@ -7649,7 +7661,7 @@ export interface operations {
                     "application/json": components["schemas"]["RunListResponse"];
                 };
             };
-            /** @description `environment` present but empty */
+            /** @description `environment` present but empty, or `deploy` not a boolean */
             400: {
                 headers: {
                     [name: string]: unknown;

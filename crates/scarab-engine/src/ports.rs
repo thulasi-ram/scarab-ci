@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     Attempt, AttemptId, ConcurrencyPolicy, DbError, EventKind, ExecError, FailureKind,
-    LogChunkMeta, OutboxId, OutboxMessage, RunId, RunService, RunStatus, RunSummary, ServiceStatus,
-    StepId, StepRun, StepSpec, StepStatus, Timestamp,
+    LogChunkMeta, OutboxId, OutboxMessage, RunId, RunListFilter, RunService, RunStatus, RunSummary,
+    ServiceStatus, StepId, StepRun, StepSpec, StepStatus, Timestamp,
 };
 
 /// A time-bounded lease over a work item, used to guarantee single-owner
@@ -385,6 +385,15 @@ pub trait Db: Send + Sync {
         &self,
         run: &RunId,
     ) -> Result<Option<crate::DeployContext>, DbError>;
+
+    /// Mark a run a **deploy Run** (ADR-0074 §2) — set once at creation when
+    /// its pipeline or a Step is marked `deploy: true`. `steps` are the marked
+    /// Steps (empty when only the pipeline is marked). A display/filter marker:
+    /// nothing schedules on it.
+    async fn mark_deploy_run(&self, run: &RunId, steps: &[StepId]) -> Result<(), DbError>;
+
+    /// The Steps of a run marked `deploy: true`; empty for an unmarked run.
+    async fn deploy_steps_of_run(&self, run: &RunId) -> Result<Vec<StepId>, DbError>;
 
     /// Record the output workspace snapshot (CAS merkle-root hash) a step
     /// produced, so a dependent can materialize it as input (workspace flows
@@ -813,15 +822,14 @@ pub trait Db: Send + Sync {
 
     /// The most recent runs for one tenant `(org, project)`, newest first, capped
     /// at `limit` — the source for a repo's `GET /v1/repos/{org}/{repo}/runs`
-    /// history and the dashboard's per-repo pass/fail chart. With
-    /// `environment`, only the deploy runs into that Environment (ADR-0074 §2:
-    /// a Project's deploys are its Runs filtered by Environment) — filtered
+    /// history and the dashboard's per-repo pass/fail chart. `filter` narrows
+    /// it by Environment and by the deploy marker (ADR-0074 §2), applied
     /// before the `limit`, so a page holds the newest *matching* runs.
     async fn list_runs_for_tenant(
         &self,
         org: &str,
         project: &str,
-        environment: Option<&str>,
+        filter: &RunListFilter,
         limit: u32,
     ) -> Result<Vec<RunSummary>, DbError>;
 

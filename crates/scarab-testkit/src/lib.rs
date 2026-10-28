@@ -152,6 +152,7 @@ fn fake_run_summary(st: &InMemoryState, run: &RunId, status: RunStatus) -> RunSu
         pipeline: st.run_pipeline.get(run).cloned(),
         trigger_title: st.run_trigger_title.get(run).cloned(),
         environment: st.run_deploy.get(run).map(|d| d.environment.clone()),
+        deploy: st.deploy_runs.contains_key(run),
     }
 }
 
@@ -169,6 +170,8 @@ struct InMemoryState {
     run_params: HashMap<RunId, std::collections::BTreeMap<String, serde_json::Value>>,
     /// Per-run deploy context (ADR-0037); set only for deploy runs.
     run_deploy: HashMap<RunId, scarab_engine::DeployContext>,
+    /// Deploy Runs (ADR-0074 §2) → their Steps marked `deploy: true`.
+    deploy_runs: HashMap<RunId, Vec<StepId>>,
     /// Per-(run, step) rows: status, spec, attempts.
     steps: HashMap<(RunId, StepId), StepRec>,
     /// The transactional outbox.
@@ -1536,6 +1539,20 @@ impl Db for InMemoryDb {
         Ok(self.state.lock().unwrap().run_deploy.get(run).cloned())
     }
 
+    async fn mark_deploy_run(&self, run: &RunId, steps: &[StepId]) -> Result<(), DbError> {
+        self.state
+            .lock()
+            .unwrap()
+            .deploy_runs
+            .insert(run.clone(), steps.to_vec());
+        Ok(())
+    }
+
+    async fn deploy_steps_of_run(&self, run: &RunId) -> Result<Vec<StepId>, DbError> {
+        let st = self.state.lock().unwrap();
+        Ok(st.deploy_runs.get(run).cloned().unwrap_or_default())
+    }
+
     async fn run_status(&self, run: &RunId) -> Result<Option<RunStatus>, DbError> {
         Ok(self.state.lock().unwrap().runs.get(run).copied())
     }
@@ -1582,7 +1599,7 @@ impl Db for InMemoryDb {
         &self,
         org: &str,
         project: &str,
-        environment: Option<&str>,
+        filter: &scarab_engine::RunListFilter,
         limit: u32,
     ) -> Result<Vec<RunSummary>, DbError> {
         let want = (org.to_string(), project.to_string());
@@ -1592,7 +1609,13 @@ impl Db for InMemoryDb {
             .iter()
             .filter(|(run, _)| st.run_tenant.get(*run) == Some(&want))
             .map(|(run, status)| fake_run_summary(&st, run, *status))
-            .filter(|s| environment.is_none_or(|e| s.environment.as_deref() == Some(e)))
+            .filter(|s| {
+                filter
+                    .environment
+                    .as_ref()
+                    .is_none_or(|e| s.environment.as_ref() == Some(e))
+                    && filter.deploy.is_none_or(|d| s.deploy == d)
+            })
             .collect();
         out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.run.0.cmp(&a.run.0)));
         out.truncate(limit as usize);
