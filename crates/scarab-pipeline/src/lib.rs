@@ -68,11 +68,11 @@ pub struct PipelineIr {
     /// run is unconstrained. The engine wiring is `Db::set_run_concurrency`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<Concurrency>,
-    /// The deployment environment this pipeline targets, if any (ADR-0024, 0032).
-    /// A pipeline with an `environment:` is a **deploy**: its runs are enforced
-    /// against the environment's protection rules at admission, and they opt out
-    /// of newest-wins auto-cancel (a superseded deploy must not be silently
-    /// cancelled). Absent for ordinary CI pipelines.
+    /// The Environment that governs this pipeline's runs, if any (ADR-0024,
+    /// 0032, 0074 §2): its runs are checked against the Environment's protection
+    /// rules at admission, get its scoped secrets, and opt out of newest-wins
+    /// auto-cancel. Naming an Environment does not mark a run as a deploy; see
+    /// [`PipelineIr::deploy`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<String>,
     /// `deploy: true` marks this pipeline's runs as **deploy Runs** (ADR-0074
@@ -80,7 +80,9 @@ pub struct PipelineIr {
     /// `environment:`: an Environment-governed run may be a smoke test or a
     /// backup, and only the author knows which runs deploy. A Step can carry
     /// the mark instead ([`StepSpec::deploy`]); see [`PipelineIr::is_deploy`].
-    /// A marker only — it changes no scheduling, concurrency or admission.
+    /// Besides the filter, it changes one thing: a deploy run opts out of
+    /// newest-wins auto-cancel, as an Environment-governed run does, so a newer
+    /// push never cancels a deploy half-way. No admission or secrets.
     #[serde(default, skip_serializing_if = "is_false")]
     pub deploy: bool,
     /// The operator [`RetentionProfile`] this pipeline's runs age under
@@ -410,7 +412,7 @@ pub struct StepSpec {
     pub artifacts: Vec<String>,
     /// `deploy: true` marks this Step as the one that deploys (ADR-0074 §2):
     /// its Run is a deploy Run, and the Run page marks the Step. Not allowed
-    /// on a gate step, which runs nothing. A marker only, like
+    /// on a gate step, which runs nothing. Same effect as
     /// [`PipelineIr::deploy`].
     #[serde(default, skip_serializing_if = "is_false")]
     pub deploy: bool,
