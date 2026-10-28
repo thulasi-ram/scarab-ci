@@ -140,6 +140,20 @@ const resolved = (passed: boolean, over: Record<string, unknown> = {}) => ({
 });
 
 describe("gateStatus", () => {
+  it("shows a pending plugin action's latest label, and nothing once it settles", () => {
+    const action = (status: string, label?: string) => ({
+      status,
+      plugin_action: { plugin: "argocd", action: "wait-live", label },
+    });
+    expect(gateStatus(action("running", "sync retry 2/5"))).toEqual({
+      tone: "waiting",
+      text: "waiting on argocd/wait-live: sync retry 2/5",
+    });
+    expect(gateStatusText(action("running"))).toBe("waiting on argocd/wait-live (no answer yet)");
+    expect(gateStatus(action("succeeded", "Synced"))).toBeNull();
+    expect(gateStatus(action("failed", "sync retry 2/5"))).toBeNull();
+  });
+
   it("says what a waiting DeploymentGate waits on: target, status, label", () => {
     expect(gateStatus(waitingDeploy())).toEqual({
       tone: "waiting",

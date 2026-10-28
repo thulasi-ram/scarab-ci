@@ -290,6 +290,9 @@ export default function RunDetail() {
         reused,
         needs: s.needs ?? [],
         gate: s.gate,
+        pluginAction: s.plugin_action
+          ? `${s.plugin_action.plugin}/${s.plugin_action.action}`
+          : null,
         // The gate verdict / DeploymentGate wait / concurrency hold line. It
         // describes the run NOW, so it is dropped while viewing an older
         // version (the statuses there are a replay; this is not).

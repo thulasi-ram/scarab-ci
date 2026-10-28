@@ -24,6 +24,9 @@ export type DagStep = {
   reused?: boolean;
   needs: string[];
   gate?: string | null;
+  /** `plugin/action` when this is a `plugin_action` step (ADR-0074 §5): it
+   * runs no Pod; the plugin's answer decides it. */
+  pluginAction?: string | null;
   /** A gate's verdict, a waiting DeploymentGate's target + Deployment, or a
    * deploy step's concurrency hold — the line `gateStatus` (gates.ts) derives.
    * Shown as the node's meta line in place of the generic one. */
@@ -364,6 +367,8 @@ export default function Dag(props: {
   // A short status meta line under the node id.
   const meta = (s: DagStep): string => {
     if (s.status === "running") {
+      // A pending plugin action: what the plugin last said says more.
+      if (s.pluginAction && s.note) return s.note.text;
       return s.runningSince ? `running · ${elapsed(s.runningSince, now())}` : "running";
     }
     // A gate's verdict / wait, or a concurrency hold, says more than the
@@ -522,6 +527,11 @@ export default function Dag(props: {
                       </Show>
                       <Show when={s.gate}>
                         <Icon icon="timer" size={12} class="dnode-gate" />
+                      </Show>
+                      <Show when={s.pluginAction}>
+                        <span class="dnode-gate" title={`plugin action ${s.pluginAction}`}>
+                          <Icon icon="waypoints" size={12} />
+                        </span>
                       </Show>
                       <Show when={s.status === "running"}>
                         <span class="dnode-prog" />

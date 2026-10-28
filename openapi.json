@@ -6466,7 +6466,7 @@
               "string",
               "null"
             ],
-            "description": "Coarse failure kind when `failed`: `infra` | `step` | `timeout` | `lost`\n| `config` | `missing-inputs` (an input snapshot gone from every tier —\nRerun/Retry regenerates it; ticket e140121) | `gate` (a gate's wait\nresolved failed — e.g. not released within `gate_expires_after`; the\nreason is in `failure_detail`) | `deployment-request-incomplete` (the\nstep exited 0 but its results could not complete a DeploymentRequest\nit declares; never auto-retried; what is missing is in\n`failure_detail`)."
+            "description": "Coarse failure kind when `failed`: `infra` | `step` | `timeout` | `lost`\n| `config` | `missing-inputs` (an input snapshot gone from every tier —\nRerun/Retry regenerates it; ticket e140121) | `gate` (a gate's wait\nresolved failed — e.g. not released within `gate_expires_after`; the\nreason is in `failure_detail`) | `deployment-request-incomplete` (the\nstep exited 0 but its results could not complete a DeploymentRequest\nit declares; never auto-retried; what is missing is in\n`failure_detail`) | `plugin-unavailable` (a `plugin_action` step's\nplugin installation was killed or uninstalled while it waited; never\nauto-retried)."
           },
           "failure_detail": {
             "type": [
@@ -8575,6 +8575,57 @@
           }
         }
       },
+      "PluginActionDeclDto": {
+        "type": "object",
+        "description": "A PluginAction a plugin offers (ADR-0074 §5).",
+        "required": [
+          "name",
+          "poll_interval_secs"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "poll_interval_secs": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Seconds between offers while the action answers `pending`.",
+            "minimum": 0
+          }
+        }
+      },
+      "PluginActionStepDto": {
+        "type": "object",
+        "description": "A `plugin_action` step as the Run page shows it (ADR-0074 §5).",
+        "required": [
+          "plugin",
+          "action"
+        ],
+        "properties": {
+          "action": {
+            "type": "string"
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The latest `pending` label the plugin gave for the latest Attempt\n(\"sync retry 2/5\"). Overwritten by each answer, not journaled."
+          },
+          "last_answer_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix-ms the plugin last answered the latest Attempt's invocation.\nAbsent: it has not answered yet."
+          },
+          "plugin": {
+            "type": "string",
+            "description": "The plugin installation's name."
+          }
+        }
+      },
       "PluginCapabilityDto": {
         "type": "string",
         "description": "One entry of the closed PluginCapability vocabulary (ADR-0072 §2).",
@@ -8813,9 +8864,17 @@
           "plugin",
           "capabilities",
           "connections",
-          "config_keys"
+          "config_keys",
+          "actions"
         ],
         "properties": {
+          "actions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PluginActionDeclDto"
+            },
+            "description": "The PluginActions it offers under `offer_actions` (ADR-0072 §4): what\na `plugin_action` step may name."
+          },
           "capabilities": {
             "type": "array",
             "items": {
@@ -10091,6 +10150,17 @@
               "type": "string"
             },
             "description": "Upstream step ids this step depends on — the DAG in-edges (ADR-0006). The\nUI folds these into the run's graph view."
+          },
+          "plugin_action": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PluginActionStepDto",
+                "description": "For a `plugin_action` step (ADR-0074 §5): the plugin, the action and,\nfor its latest Attempt, the plugin's latest `pending` label. Absent\nfor every other step kind."
+              }
+            ]
           },
           "services": {
             "type": "array",

@@ -108,6 +108,17 @@ export type GateStatusLike = GateLike & {
   gate_resolution?: GateResolutionLike | null;
   deployment_gate?: DeploymentGateLike | null;
   held?: string | null;
+  /** Set on a `plugin_action` step (ADR-0074 §5): the plugin, the action and
+   * the plugin's latest `pending` label for the latest attempt. */
+  plugin_action?: PluginActionLike | null;
+};
+
+/** A `plugin_action` step's view: which plugin action it waits on and what
+ * the plugin last said. */
+export type PluginActionLike = {
+  plugin: string;
+  action: string;
+  label?: string | null;
 };
 
 /** The tone a status line renders with, and its text. */
@@ -160,6 +171,16 @@ export function gateStatus(
   fmtTime: (ms: number) => string = absTime,
 ): GateStatus | null {
   if (s.held) return { tone: "held", text: `held: ${holdReason(s.held)}` };
+  // A running plugin_action step waits on its plugin's answer, holding no Pod.
+  const p = s.plugin_action;
+  if (p && s.status === "running") {
+    const what = `${p.plugin}/${p.action}`;
+    const label = p.label?.trim();
+    return {
+      tone: "waiting",
+      text: label ? `waiting on ${what}: ${label}` : `waiting on ${what} (no answer yet)`,
+    };
+  }
   if (!s.gate) return null;
   const r = currentResolution(s);
   if (r) {

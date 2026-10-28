@@ -2091,7 +2091,9 @@ export interface components {
              *     reason is in `failure_detail`) | `deployment-request-incomplete` (the
              *     step exited 0 but its results could not complete a DeploymentRequest
              *     it declares; never auto-retried; what is missing is in
-             *     `failure_detail`).
+             *     `failure_detail`) | `plugin-unavailable` (a `plugin_action` step's
+             *     plugin installation was killed or uninstalled while it waited; never
+             *     auto-retried).
              */
             failure?: string | null;
             /**
@@ -3270,6 +3272,32 @@ export interface components {
             /** @description The step that re-runs (a gate re-arms and pauses instead of running). */
             step: string;
         };
+        /** @description A PluginAction a plugin offers (ADR-0074 §5). */
+        PluginActionDeclDto: {
+            name: string;
+            /**
+             * Format: int32
+             * @description Seconds between offers while the action answers `pending`.
+             */
+            poll_interval_secs: number;
+        };
+        /** @description A `plugin_action` step as the Run page shows it (ADR-0074 §5). */
+        PluginActionStepDto: {
+            action: string;
+            /**
+             * @description The latest `pending` label the plugin gave for the latest Attempt
+             *     ("sync retry 2/5"). Overwritten by each answer, not journaled.
+             */
+            label?: string | null;
+            /**
+             * Format: int64
+             * @description Unix-ms the plugin last answered the latest Attempt's invocation.
+             *     Absent: it has not answered yet.
+             */
+            last_answer_at?: number | null;
+            /** @description The plugin installation's name. */
+            plugin: string;
+        };
         /**
          * @description One entry of the closed PluginCapability vocabulary (ADR-0072 §2).
          * @enum {string}
@@ -3379,6 +3407,11 @@ export interface components {
          *     digest (ADR-0072 §1-2).
          */
         PluginManifestDto: {
+            /**
+             * @description The PluginActions it offers under `offer_actions` (ADR-0072 §4): what
+             *     a `plugin_action` step may name.
+             */
+            actions: components["schemas"]["PluginActionDeclDto"][];
             capabilities: components["schemas"]["PluginCapabilityDto"][];
             config_keys: string[];
             connections: components["schemas"]["ConnectionSlotDto"][];
@@ -4129,6 +4162,7 @@ export interface components {
              *     UI folds these into the run's graph view.
              */
             needs?: string[];
+            plugin_action?: null | components["schemas"]["PluginActionStepDto"];
             /**
              * @description Co-located sidecar services (ADR-0058) this step declares — rendered as
              *     sidecar nodes attached to the step, each with its own log stream (fetched

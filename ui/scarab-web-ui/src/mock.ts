@@ -1027,6 +1027,7 @@ const argocdManifest: PluginCatalogEntryDto["manifest"] = {
     },
   ],
   config_keys: ["ARGOCD_UI_URL", "OWNER_ANNOTATION"],
+  actions: [],
 };
 const pluginCatalog: PluginCatalogEntryDto[] = [
   {
