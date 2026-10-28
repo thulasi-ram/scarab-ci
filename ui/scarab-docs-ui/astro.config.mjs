@@ -112,6 +112,7 @@ export default defineConfig({
             { label: 'Pipeline Syntax', slug: 'usage/pipeline-syntax' },
             { label: 'Secrets', slug: 'usage/secrets' },
             { label: 'Environments', slug: 'usage/environments' },
+            { label: 'Deploying with Argo CD', slug: 'usage/deploying-with-argo-cd' },
             { label: 'Environment Variables', slug: 'usage/environment-variables' },
           ],
         },

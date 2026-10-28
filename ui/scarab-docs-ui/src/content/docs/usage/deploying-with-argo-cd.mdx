@@ -1,0 +1,169 @@
+---
+title: Deploying with Argo CD
+description: Keep a deploy run open until Argo CD has rolled out your change, and fail it when Argo gives up, with one ordinary step after the deploy step.
+---
+
+import Doodle from '../../../components/Doodle.astro';
+
+<Doodle icon="rocket" size={200} rotate={-8} opacity={0.18} top="7rem" right="-2rem" />
+
+With GitOps, the step that deploys usually commits an image change to a gitops repository and
+exits. Argo CD applies the change later, and the rollout can still fail: an image that can't be
+pulled, a migration hook that fails, Pods that never become ready, or a sync that Argo stops
+retrying. If the run ends when the commit lands, it is green before anyone knows whether the
+change is live.
+
+Scarab doesn't track deploys after a run ends (that is Argo's job), so the way to close the gap is
+to keep the run open: add a step after the deploy step that waits for Argo. Its exit code is the
+outcome, its log holds Argo's messages, and its `timeout` bounds the wait. Scarab adds nothing for
+it; it is a step like any other.
+
+## The pipeline
+
+```yaml
+environment: production          # ARGOCD_AUTH_TOKEN is a production-scoped secret
+steps:
+  - id: bump
+    deploy: true
+    image: registry.example.com/ci/gitops-bump:1.0
+    results: [image]              # the image reference the change merged
+    # ...commits the image change to the gitops repository and writes
+    #    /scarab/results/image.json, e.g. "registry.example.com/payments-api:3f9c2e1"
+
+  - id: live
+    needs: [bump]
+    image: registry.example.com/ci/argocd-jq:v2.13.0   # see "The image" below
+    secrets: [ARGOCD_AUTH_TOKEN]
+    env:
+      - [ARGOCD_SERVER, argocd.example.com]
+      - [APP, payments-api]
+      - [IMAGE, "${{ outputs.bump.image }}"]
+    timeout: 1800
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        # 1. Wait until Argo has rendered our change. Right after the merge the
+        #    app is often still Synced and Healthy at the previous commit.
+        until argocd app manifests "$APP" --source git | grep -qF "$IMAGE"; do
+          argocd app get "$APP" --refresh >/dev/null
+          sleep 10
+        done
+        # 2. Wait until the app is Synced and Healthy at that target. Fail as
+        #    soon as Argo's sync of the current target fails, or the rollout
+        #    goes Degraded.
+        while :; do
+          set -- $(argocd app get "$APP" -o json | jq -r '[
+              .status.sync.status,
+              (.status.health.status // "Unknown"),
+              (if .operation != null then "Pending"
+               else (.status.operationState.phase // "None") end),
+              (.status.operationState.syncResult.revision == .status.sync.revision
+               | tostring)
+            ] | @tsv')
+          sync=$1 health=$2 op=$3 current=$4
+          echo "sync=$sync health=$health operation=$op"
+          case "$sync/$health/$op/$current" in
+            */*/Failed/true|*/*/Error/true)
+              argocd app get "$APP" --show-operation; exit 1 ;;
+            */*/Pending/*|*/*/Running/*|*/*/Terminating/*) ;;
+            Synced/Healthy/*) exit 0 ;;
+            Synced/Degraded/*)
+              argocd app get "$APP"; exit 1 ;;
+          esac
+          sleep 10
+        done
+```
+
+`deploy: true` on `bump` makes this a deploy run: it shows in the Runs tab's **deploys** filter,
+and a newer push never cancels it half-way. See
+[Deploys: `deploy: true`](/scarab-ci/usage/pipeline-syntax/#deploys-deploy-true).
+
+## The two traps
+
+A plain `argocd app wait "$APP" --sync --health` looks like it does the same job. It goes wrong in
+two ways, and the script above handles both.
+
+**Synced and Healthy at an earlier commit.** Argo polls the gitops repository every few minutes
+unless a webhook tells it sooner. Right after the merge, the app still reports Synced and Healthy,
+at the commit before yours, and a wait that trusts those two words passes at once. In a shared
+gitops repository the app can also be Synced at a later commit that doesn't contain your change
+yet. So step 1 asks Argo for the app's target manifests (`argocd app manifests --source git`, what
+Argo would apply now) and waits until they contain your image. Only then do Synced and Healthy
+describe your change.
+
+Use an image reference that only your change produces, such as a tag built from the commit SHA or
+a digest. `grep -F` matches substrings, so `payments-api:1.2` also matches `payments-api:1.20`.
+
+**A sync that fails never becomes Synced.** When Argo's sync operation fails (a hook fails, a
+manifest is rejected, the retries run out), the app stays OutOfSync, and `argocd app wait --sync`
+keeps waiting until its timeout. Adding `--operation` doesn't change that: it waits for the
+operation to finish, not for it to succeed. Step 2 reads the operation's phase instead, and fails
+as soon as the operation for the current target revision ends `Failed` or `Error`. It ignores a
+failed operation from an older revision, which Argo leaves in place until the next sync. It also
+fails when the app is Synced but Degraded, which is how a rollout that never becomes ready (an
+image that can't be pulled, for example) shows up once the Deployment's progress deadline passes.
+
+With automated sync and a `retry` policy, Argo keeps the operation `Running` while it retries, so
+the step waits through the retries and fails only when Argo gives up.
+
+## The image
+
+The `quay.io/argoproj/argocd` image has the CLI but no `jq`. Build a small image with both:
+
+```dockerfile
+FROM quay.io/argoproj/argocd:v2.13.0
+COPY --from=ghcr.io/jqlang/jq:1.7.1 /jq /usr/local/bin/jq
+```
+
+You can build and push it with a Scarab [`build:` step](/scarab-ci/usage/pipeline-syntax/#steps-the-step-shape).
+Pin the CLI to a version close to your Argo CD server's.
+
+The CLI reads `ARGOCD_SERVER` and `ARGOCD_AUTH_TOKEN` from the environment. If your Argo CD
+server sits behind an ingress that doesn't pass gRPC, add `- [ARGOCD_OPTS, --grpc-web]` to `env`.
+
+## The token
+
+The step needs a token that can read the application and nothing more, for example a project role
+with this policy:
+
+```
+p, proj:payments:ci-wait, applications, get, payments/*, allow
+```
+
+Store the token as an [Environment secret](/scarab-ci/usage/environments/#scoped-secrets) of
+`production`, so only runs governed by that Environment can read it, and name it in the step's
+`secrets:` list.
+
+## When you don't need a wait step
+
+If the deploy step applies the change itself, it can block until the rollout finishes, and no
+separate step is needed:
+
+- `helm upgrade --install ... --wait --timeout 15m` waits until the release's Pods are ready, and
+  fails the step if they aren't by the timeout.
+- `kubectl apply -f ...` followed by `kubectl rollout status deployment/payments-api --timeout=15m`
+  does the same for a plain manifest.
+
+Mark that step `deploy: true`.
+
+## What this doesn't cover
+
+- **The wait costs a Pod and a secret.** The wait step holds a Pod for as long as it waits, and
+  the Argo token is an Environment secret that the steps naming it can read.
+- **Nothing after the run ends.** A rollout that fails an hour later, a hotfix applied by hand, or
+  Argo's self-heal reverting a change are not seen by Scarab. Argo CD's UI and notifications cover
+  those.
+- **Manual sync.** The recipe assumes the Application syncs automatically. With manual sync,
+  nothing applies the change, and the step waits until its timeout.
+- **Multi-source applications.** They report `.status.sync.revisions` (a list) in place of
+  `.status.sync.revision`, so step 2's revision check needs adjusting for them.
+- **Correctness is yours.** Scarab runs the step and reports its exit code; it doesn't check what
+  the step checks.
+
+## References
+
+- [ADR-0074: Deployments leave core](/scarab-ci/tech/adr/0074-deployments-leave-core/)
+- [ADR-0008: Step contract: OCI image + convention + built-in kinds](/scarab-ci/tech/adr/0008-step-contract/)
+- [ADR-0041: Named step results + launch-time interpolation](/scarab-ci/tech/adr/0041-named-results-and-interpolation/)
