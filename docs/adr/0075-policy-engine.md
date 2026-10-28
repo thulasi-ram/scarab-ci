@@ -10,7 +10,8 @@
 - **Relates:** [0039](0039-privileged-images.md) (grants), [0055](0055-placement-profiles.md)
   (`k8s_overlay`, placement), [0038](0038-invoke-and-local-reuse.md) (`invoke`),
   [0074](0074-deployments-leave-core.md) (`deploy: true`), [0049](0049-identity-and-access.md)
-  (RBAC), [0056](0056-run-takes-and-attempt-grain-evidence.md) (Takes, Attempts)
+  (RBAC), [0056](0056-run-takes-and-attempt-grain-evidence.md) (Takes, Attempts),
+  [0069](0069-identity-links.md) (forge actor to Principal)
 
 ## Context
 
@@ -81,7 +82,7 @@ schema version.
 
 | PolicyCheckpoint | When | Input (abridged) |
 |---|---|---|
-| `run.create` | Run creation, before any Step row | `org`, `project`, `trigger` (kind, optional symbolic `ref`, `sha`, `fork`, actor), `pipeline` (name, `environment`, `deploy`), `steps` (every Step's static `step.admit` input), `principal`, `time` |
+| `run.create` | Run creation, before any Step row | `org`, `project`, `trigger` (kind, optional symbolic `ref`, `sha`, `fork`, forge actor, optional `principal` linked to that actor), `pipeline` (name, `environment`, `deploy`), `steps` (every Step's static `step.admit` input), `principal`, `time` |
 | `invoke.resolve` | compile, once per `invoke` | `invoke.target` (kind: local, library or plugin; name; content hash), `project`, `environment`, `time` |
 | `step.admit` | every launch of an Attempt (§3) | `step` (image, digest, grants, `k8s_overlay`, secrets, placement, `deploy`, `origin`: the invoke kind, name and content hash it was inlined from), `run`, `environment`, `time` |
 | `gate.resolve` | approve, reject, release | `gate`, optional `principal` (an external release has none), `approvals` in the current wait, `run`, `time` |
@@ -135,8 +136,9 @@ rules:
 - A rule is `when` (a CEL boolean over the checkpoint's input), an effect, a static
   `message` and an optional `message_expr` (CEL, checked to return a string). There is no
   separate templating syntax.
-- A Policy names one checkpoint. A rule that reads a field its checkpoint does not have
-  is rejected when the Policy is saved (§6).
+- A Policy names exactly one checkpoint. A rule that reads a field its checkpoint does not
+  have is rejected when the Policy is saved (§6). Policies that span checkpoints may come
+  later; one checkpoint per Policy is where this starts.
 
 ### 5. PolicyEffects: deny and require
 
@@ -159,7 +161,21 @@ Where a `require_approval` takes effect depends on the checkpoint:
 | `step.admit` | a **PolicyApprovalHold** on that Step: the Step does not launch until the named Principals approve. It has its own clock and the Policy's expiry, counts approvals per hold, appears as a badge on the Step's node, and is decided per Attempt. No node is added mid-Run. |
 | `gate.resolve` | an addition to that gate's **release quorum**. No gate is added. |
 
-One approval counts toward every requirement that names its Principal. Groups and roles
+One approval counts toward every requirement that names its Principal.
+
+**Separation of duties is a Policy, not a Scarab rule.** Scarab adds no built-in rule
+such as "the person who triggered a Run may not approve it". The `gate.resolve` input
+carries the approving `principal` and the Run's trigger actor, resolved to a Principal
+through identity links (ADR-0069) when one exists, so an org writes the rule itself:
+
+```yaml
+checkpoint: gate.resolve
+rules:
+  - when: has(principal) && has(run.trigger.principal) && principal == run.trigger.principal
+    effect: deny
+    message: "You started this Run, so someone else must approve it."
+```
+ Groups and roles
 as approvers wait for a group concept in identity (ADR-0049 has none today).
 
 ### 6. CEL is type-checked, over a subset
@@ -197,8 +213,12 @@ Policies attach at three levels:
 |---|---|---|
 | Org | org admin | any Project, Environment |
 | Environment | that Environment's admins | Runs it governs |
-| Project | that Project's admins | its own Runs |
+| Project | that Project's admins, **typed settings only** | its own Runs |
 
+- **Project admins write typed settings, not CEL.** Where a typed setting exists for a
+  rule, it is the only way to write that rule at the Project level. CEL at the Project
+  level is added one use case at a time, by a later decision. Org and Environment admins
+  write both.
 - **Combination.** Every Policy whose checkpoint and `match` fit is evaluated. Any `deny`
   wins, and every deny message is reported. Requirements add up. No layer can remove
   what another adds, so a lower layer can only tighten, as Environment overlays do today
@@ -248,7 +268,17 @@ Saving a Policy is a `settings.change`:
   decided in general, so the check fails closed, as ADR-0073 does.
 - A plugin's kill switch tightens and never needs a step-up.
 
-### 11. Typed settings compile into the same IR
+### 11. Policies are stored in the database, versioned and diffable
+
+Policies, and the typed settings that compile into Policy IR, live in Scarab's database,
+not as files in a repository. Every save creates a new **PolicyVersion** with its author,
+time, reason and the step-up that approved it (when one was needed). Scarab shows the
+history of each Policy and a diff between any two versions, and a PolicyDecision's
+PolicySetDigest names the exact versions it evaluated. Restoring an earlier version is a
+`settings.change` like any other save. Syncing policies from files in a governance
+repository is not planned.
+
+### 12. Typed settings compile into the same IR
 
 The existing settings keep their forms and their API, and compile to Policy IR predicates
 instead of running their own code. Each move must make the same decisions:
@@ -273,7 +303,7 @@ instead of running their own code. Each move must make the same decisions:
 - Scarab owns a CEL type checker for a subset until upstream has one.
 - Moving every existing rule into the engine is a large migration. Each rule moves with a
   test showing the same decisions, and runs in `audit` beside the old code before the old
-  code is deleted.
+  code is deleted (§12).
 - A Run admitted under one policy set can have a later Step denied under another. The
   decision record shows which, with its PolicySetDigest.
 - Decisions store their inputs, which grows the Run's record.
@@ -310,18 +340,17 @@ instead of running their own code. Each move must make the same decisions:
 3. **Requirements:** gate nodes from `run.create` and `invoke.resolve`, PolicyApprovalHold,
    `require_reason`, `require_step_up`; `step.admit` in the claiming commit, `gate.resolve`,
    `settings.change`; the Environment layer.
-4. **Migration** of §11's settings, one at a time, each in `audit` beside the old code
+4. **Migration** of §12's settings, one at a time, each in `audit` beside the old code
    first.
-5. **UI and docs:** policy editor with the checker's errors, the decision view on the Run
+5. **UI and docs:** policy editor with the checker's errors, version history and diffs, the decision view on the Run
    page, a "would deny" view for `audit` policies; CONTEXT.md terms (Policy,
    PolicyCheckpoint, PolicyEffect, PolicyDecision, PolicyInvariant, PolicySetDigest,
-   PolicyApprovalHold).
+   PolicyApprovalHold, PolicyVersion).
 
-Open:
+Decided by the owner on 2026-10-28, from this ADR's first draft:
 
-- Whether Project admins may write CEL rules, or only typed ones.
-- Whether a Policy may span checkpoints, or stays one checkpoint per Policy.
-- Whether policies can also live as files in a governance repository and sync in, with
-  the UI read-only for them.
-- Whether `require_approval` should support separation of duties (the Run's actor may not
-  approve).
+- Project admins write typed settings only; CEL at the Project level is decided per use
+  case (§7).
+- One checkpoint per Policy (§4).
+- Policies live in the database, versioned and diffable; no file sync (§11).
+- Separation of duties is written as a Policy (§5).
