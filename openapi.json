@@ -3291,7 +3291,7 @@
             }
           },
           "400": {
-            "description": "not a Policy, or it does not compile (its checkpoint is not yet consulted, a CEL error, an effect the checkpoint does not allow)"
+            "description": "not a Policy, or it does not compile (its checkpoint is not yet consulted, a CEL error, an effect the checkpoint does not allow), or `reason` is over 2,000 bytes"
           },
           "403": {
             "description": "not an org admin"
@@ -3300,7 +3300,7 @@
             "description": "policies not configured"
           },
           "409": {
-            "description": "a live Policy here has that name"
+            "description": "a live Policy here has that name, or the scope holds its 256 Policies"
           }
         },
         "security": [
@@ -3415,7 +3415,7 @@
             }
           },
           "400": {
-            "description": "not a Policy, or it does not compile"
+            "description": "not a Policy, or it does not compile, or `reason` is over 2,000 bytes"
           },
           "403": {
             "description": "not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
@@ -3501,6 +3501,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "`reason` is over 2,000 bytes"
           },
           "403": {
             "description": "not an org admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
@@ -3869,7 +3872,7 @@
             }
           },
           "400": {
-            "description": "not a typed setting (ADR-0075 §7), or it does not compile"
+            "description": "not a typed setting (ADR-0075 §7), or it does not compile, or `reason` is over 2,000 bytes"
           },
           "403": {
             "description": "not a Project admin"
@@ -3878,7 +3881,7 @@
             "description": "policies not configured"
           },
           "409": {
-            "description": "a live Policy here has that name"
+            "description": "a live Policy here has that name, or the scope holds its 256 Policies"
           }
         },
         "security": [
@@ -4011,7 +4014,7 @@
             }
           },
           "400": {
-            "description": "not a typed setting (ADR-0075 §7), or it does not compile"
+            "description": "not a typed setting (ADR-0075 §7), or it does not compile, or `reason` is over 2,000 bytes"
           },
           "403": {
             "description": "not a Project admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
@@ -4106,6 +4109,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "`reason` is over 2,000 bytes"
           },
           "403": {
             "description": "not a Project admin — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
@@ -7703,7 +7709,7 @@
               "string",
               "null"
             ],
-            "description": "Why, recorded on the PolicyVersion."
+            "description": "Why, recorded on the PolicyVersion. At most 2,000 bytes."
           }
         },
         "additionalProperties": false
@@ -9488,16 +9494,34 @@
           "kind"
         ],
         "properties": {
+          "actor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The forge account that caused the event. Default: the caller for\n`manual` and `api` (as a dispatch is), none otherwise."
+          },
+          "fork": {
+            "type": "boolean",
+            "description": "A pull request from a fork; `pull_request` only. Default false."
+          },
           "kind": {
             "type": "string",
             "description": "`push`, `pull_request`, `tag`, `release`, `comment`, `cron`,\n`manual`, `api` or `upstream`."
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The dispatch reason; `manual` and `api` only. Default none."
           },
           "ref": {
             "type": [
               "string",
               "null"
             ],
-            "description": "The symbolic ref (`refs/heads/main`)."
+            "description": "The symbolic ref, as admission sees it: `refs/heads/main` for a push\nor a dispatch, `refs/pull/<n>/head` for a pull request,\n`refs/tags/<tag>` for a tag or release. Required for those kinds;\n`comment`, `cron` and `upstream` have none."
           },
           "sha": {
             "type": [
