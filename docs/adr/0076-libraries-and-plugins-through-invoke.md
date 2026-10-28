@@ -37,9 +37,10 @@ What exists today:
 
 - `invoke` takes a repo-relative path (`resolve_lib_path`,
   `crates/scarab-pipeline/src/lib.rs:1278-1316`) and inlines that Pipeline at compile
-  time. `with:` is validated against the library's `interface.inputs` and delivered only
-  as `SCARAB_PARAM_*` environment variables; after inlining, `${{ inputs.* }}` means the
-  calling Run's launch parameters, not the library's inputs (`lib.rs:1695-1745`). Inlining
+  time. `with:` is validated against the library's `interface.inputs` (`lib.rs:1695-1745`)
+  and delivered only as `SCARAB_PARAM_*` environment variables; after inlining,
+  `${{ inputs.* }}` means the calling Run's launch parameters, not the library's
+  inputs. Inlining
   copies each library Step and changes only its id, `deploy`, `needs`, inputs, matrix
   values and `SCARAB_PARAM_*` variables (`lib.rs:1502-1570`); the invoke Step's own
   `when`, `timeout`, `resources` and `placement_profiles` are not carried over, and no
@@ -61,7 +62,7 @@ What exists today:
   container, whose image and command the server sets.
 - A plugin authenticates to the broker with a projected ServiceAccount token (audience
   `scarab-broker`) checked by TokenReview, rotated by the kubelet, with the kill switch
-  checked on every request (`crates/scarab-plugin/src/lib.rs:80`, `87-98`, `668-690`). It
+  checked on every request (`crates/scarab-plugin/src/lib.rs:80-87`, `668-690`). It
   cannot call the public API. A PluginPrincipal is refused every operation that needs a
   step-up (`crates/scarab-server/src/step_up/mod.rs:877-884`). An external gate is released
   only with an HMAC token (`release_gate_external`, `crates/scarab-server/src/lib.rs:7733`).
@@ -95,8 +96,8 @@ calling Run's launch parameters. `SCARAB_PARAM_*` variables are still set.
 
 **What the invoke Step carries.** The invoke Step's `timeout`, `resources` and
 `placement_profiles` apply to each non-gate Step it inlines, only where the library Step
-leaves that field unset; the library's own value wins. Its `when` is ANDed with each
-library Step's own. `env` never carries, and `placement_profiles` never carries onto a
+leaves that field unset; the library's own value wins. Its `when` is ANDed with the
+`when` of every Step and gate it inlines. `env` never carries, and `placement_profiles` never carries onto a
 Step with `forge_token` (§9): a placement profile is an arbitrary Pod patch, so a caller
 could otherwise place a trusted Step next to its own. Any other Step field on an invoke
 Step is a compile error, where today it is dropped without a word.
@@ -115,7 +116,8 @@ source, since the name is chosen at install.
 
 **Policy.** Library and plugin rules are `run.create` Policies over `origin`
 (ADR-0075 §2). The typed settings "libraries allowed here" and "plugins whose gates may
-run here" write them, at the org, Environment and Project levels. `scarab validate
+run here" write them, at the org, Environment and Project levels; a list left unset adds no rule, and an
+installed library is usable until a list narrows it (ADR-0075 §7). `scarab validate
 --server` reports a refusal before the push.
 
 ### 2. A library is a YAML file with `kind: library`
@@ -141,8 +143,7 @@ steps:
 - An input that reaches a Step with `forge_token` must be a `boolean`, a `number`, a
   `choice`, or a `string` with a `validate:` rule. A free string would let the caller
   write into that Step's environment or command.
-- A library's outputs are read as `${{ outputs.<invoke-id>.<name> }}`, as today
-  (`lib.rs:1785-1796`).
+- A library's outputs are read as `${{ outputs.<invoke-id>.<name> }}`, as today.
 
 ### 3. Vendoring is copying a file
 
@@ -165,8 +166,9 @@ An org admin installs a library from a git source pinned to a commit:
   default (`github.com/acme/…` gives `acme`), so an org can install another
   publisher's library under that publisher's name. The admin may change the publisher at
   install. Within an org, each publisher and name pair names one installation. No name
-  is reserved. A name proves nothing about where a library came from; trust and
-  first-party status come from the source and the content hash (§5, §9).
+  is reserved. A name proves nothing about where a library came from: first-party
+  status comes from the content hash (§5), and trust with forge credentials from the
+  source (§9).
 - An installation is usable by every Project in the org. A Policy narrows it to some
   Projects (§1).
 - Pipelines name it: `invoke: lib:acme/deploy-helm`. Compilation resolves the name to the
@@ -183,7 +185,9 @@ An org admin installs a library from a git source pinned to a commit:
 
 First-party libraries live as YAML in the Scarab repository under `libs/`, for example
 `libs/clone.yaml`. Each release publishes them as a release asset with a manifest that
-lists each library's name, publisher, source and content hash.
+lists each library's name, publisher, source and content hash. A LibraryVersion whose
+hash is in a Scarab release manifest is first-party, whether it was fetched from the
+release, a mirror or an uploaded copy.
 
 - The publisher is the owner of Scarab's repository, as for any other library:
   `lib:thulasi-ram/clone` today. If the repository moves, say to a `scarab-ci` org, new
@@ -333,7 +337,8 @@ The `clone` Step kind is replaced by `lib:thulasi-ram/clone`:
 kind: library
 interface:
   inputs:
-    - { name: depth,      type: string,  required: false, default: "1" }   # validate: "full" or a number
+    - { name: depth,      type: string,  required: false, default: "1",
+        validate: 'value == "full" || value.matches("^[0-9]+$")' }
     - { name: submodules, type: boolean, required: false, default: false }
     - { name: lfs,        type: boolean, required: false, default: false }
 steps:
@@ -366,10 +371,10 @@ PolicyInvariants (ADR-0075 §7) bound it:
 - **Which Steps may receive it.** A Step receives a forge credential only when the forge
   mints a short-lived token scoped to the Run's repository (GitHub App mode), or when the
   Step's `origin` is an installation the org trusts with long-lived credentials.
-  Otherwise `run.create` refuses the Run. Trust is keyed by source, not by name or hash:
-  it carries across upgrades from the same source, each confirmed with its diff (§4).
-  By default the org trusts the first-party clone library installed from Scarab's
-  release. On Forgejo and GitHub PAT connections, which hand out a long-lived token, only
+  Otherwise `run.create` refuses the Run. Trust is keyed by the installation's source, not by
+  its name: it carries across upgrades from the same source, each confirmed with its
+  diff (§4). By default the org trusts its installation of the first-party clone library
+  (§5), wherever that copy was fetched from. On Forgejo and GitHub PAT connections, which hand out a long-lived token, only
   the trusted library's Step receives it, and its image and command come from the
   library, not from the repository. This keeps today's guarantee that a repository's own
   code never reads that token.
@@ -382,7 +387,8 @@ narrow as the token the admin configured: Scarab returns the same token either w
 Only GitHub App mode mints a narrower token.
 
 `write` needs the forge to mint a write token: GitHub App mode gains a `contents: write`
-mint. A default denies `forge_token: write` unless the Run is Environment-governed and the
+mint. Forgejo and GitHub PAT connections have no mint, so `run.create` refuses
+`forge_token: write` there. A default denies `forge_token: write` unless the Run is Environment-governed and the
 Environment restricts refs (non-empty effective allowed refs); the forge port has no
 protected-ref concept. A Step with `forge_token: write` uses the Environment's authority
 (ADR-0075 §5), so it needs an approved gate where the Environment has approvers.
@@ -430,7 +436,7 @@ stored with the Run (today it is computed at launch,
 | a trigger with no SHA is refused (`lib.rs:5191`) | reading `event.sha` on such a trigger refuses the Run |
 | fork pull request credential fixed read-only (`lib.rs:5222`) | the `forge_token` invariant |
 | `ref:` (parsed, never used) | dropped |
-| missing-clone lint (`is_clone`) | checks for a Step whose `origin` source is the first-party clone library |
+| missing-clone lint (`is_clone`) | checks for a Step whose `origin` is the first-party clone library (§5) |
 | local executor refuses clone | it refuses `forge_token` |
 | Step id `checkout` | `checkout/git`; `needs: [checkout]` still works across the seam |
 

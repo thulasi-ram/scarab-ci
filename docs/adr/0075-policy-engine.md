@@ -22,15 +22,15 @@ Scarab's governance rules are written as code, one feature at a time:
   (`admit_and_create_run`, `crates/scarab-server/src/lib.rs`; `EffectiveProtection`,
   `crates/scarab-project/src/environment_governance.rs`).
 - Step privileges: grants against a per-Project digest whitelist and the `k8s_overlay`
-  permission, checked for every Step at Run creation (`admit_step_grants`,
-  `admit_k8s_overlay`, `lib.rs:5545-5578`).
+  permission, checked for every Step at Run creation (`admit_step_grants` and `admit_k8s_overlay`,
+  `lib.rs:4919`, `4967`).
 - Re-admission at each launch: the Run's Environment rules are checked again before a
   Step's Pod starts (`ensure_still_admitted`, `crates/scarab-server/src/secret_executor.rs:88-118`).
-- Gates: who may approve, release or reject; allowed refs re-checked when a gate releases
-  (`lib.rs:7801`); a step-up to approve where the Environment names approvers
-  (`lib.rs:7711-7735`); `gate_release_governance`.
+- Gates: who may approve, release or reject; allowed refs re-checked when a manual gate releases
+  (`admits()` in `approve_gate`, `lib.rs:7481`); a step-up to approve where the
+  Environment names approvers (`lib.rs:7384-7423`); `gate_release_governance`.
 - Fork pull requests: no secrets, OIDC subject `env=none` (`fork_policy`), no build push
-  (`lib.rs:5604`), a read-only clone token (`lib.rs:5537`).
+  (`lib.rs:5283`), a read-only clone token (`lib.rs:5222`).
 - Settings changes that loosen governance need a step-up (`crates/scarab-server/src/step_up/`).
 
 Each rule has its own data model, its own UI and its own error text. None can be tried
@@ -113,7 +113,7 @@ that way. A check on the forge pull request is not planned.
 `step.admit` replaces `ensure_still_admitted`, which today runs only for
 Environment-governed Runs (`secret_executor.rs:88-118`); `step.admit` runs for every
 launch. It is decided once per Attempt, including automatic retries, which go from Running
-to Ready without passing promotion (`rearm_step`, `crates/scarab-engine/src/scheduler.rs:4759`).
+to Ready without passing promotion (`rearm_step`, `crates/scarab-engine/src/scheduler.rs:4318`).
 
 The executor makes the decision before it uses any credential or creates the Pod, and
 records it with insert-if-absent, keyed by *(run, step, attempt)*. The first write wins.
@@ -123,30 +123,39 @@ claim commit does not change and does not read the policy store. If the policy s
 cannot be read, the launch fails for that tick and is retried; a Step is never admitted
 without a decision.
 
-**An approval is checked again at launch.** In a Run whose Environment has approvers, a
-Step that uses the Environment's authority (§5) is refused at `step.admit` when:
+**An approval is checked again at launch.** An Environment *has approvers* when its
+effective approvers setting (the baseline and the Project's overlay) is not empty at the
+time of the check; an org Policy with `require_approval` does not count. In such an
+Environment, a Step that uses the Environment's authority (§5) is refused at
+`step.admit` when:
 
+- it has no manual gate upstream, which happens to a Run created before the approvers
+  were added;
 - the Run's symbolic ref no longer matches the Environment's allowed refs;
-- the approver set or the PolicySetDigest has changed since its upstream gate was
-  released;
-- that release is older than the Environment's maximum approval age (24 hours by default;
-  an Environment can raise it, lower it or set none).
+- for any manual gate upstream of it, the approver set, or the digest of the enforced
+  `gate.resolve` Policies that matched that gate, differs from what was recorded when the
+  gate released;
+- any of those releases is older than the Environment's maximum approval age (24 hours by
+  default; an Environment can raise it, lower it or set none). This applies to every
+  launch, including a first launch that waited a day in the queue.
 
-The refusal says "rerun the gate". This is what makes a Rerun safe: rerunning a Step
+The refusal says "rerun the gate", or "start a new Run" when there is no gate. This is what makes a Rerun safe: rerunning a Step
 downstream of a released gate does not ask again, as today, so without these checks a
 member could rerun the deploy Step of a six-month-old Run on its original approval
 (`step.rerun` needs no step-up, `step_up/ops.rs:586`). Rerunning the gate asks again.
 
-**The OIDC subject follows the gate.** Every Step of an Environment-governed Run gets an
-OIDC token, as today. In an Environment with approvers, a Step with no released manual
+**The OIDC subject follows the gate.** When the OIDC issuer is configured, every Step of
+an Environment-governed Run gets an OIDC token, as today. In an Environment with approvers, a Step with no released manual
 gate upstream gets the subject fork pull requests get, `env=none`, which no trust policy
 for a real Environment matches (`secret_executor.rs:154-161`). Steps after the gate get
-the Environment's subject. Authors write nothing for this, and existing trust policies
-keep working. The Step's log says why its subject is `env=none`.
+the subject with the Environment in it. Authors write nothing for this, and existing
+trust policies keep working. The Step's log says why its subject is `env=none`. This is a
+PolicyInvariant (§7) and has no `audit` period; the release notes list it as a breaking
+change.
 
 `run.create` also evaluates every Step's static `step.admit` input as a preflight. A grant
 or `k8s_overlay` that would be denied refuses the whole Run before any row exists, as
-today (`lib.rs:5545-5578`). The launch-time check still runs, so a policy tightened after
+today (`lib.rs:5230-5311`). The launch-time check still runs, so a policy tightened after
 Run creation applies to Steps not yet launched.
 
 ### 4. A Policy
@@ -194,7 +203,7 @@ Policy (§7). Policies never change a Pipeline or a Step: there is no mutating e
 no Policy adds a gate or holds a Step.
 
 A missing reason is a `deny` over the `reason` field, which is what the code does today
-(`TriggerError::ReasonRequired`, `lib.rs:4555`). A `require_reason` effect can be added
+(`TriggerError::ReasonRequired`, `lib.rs:4552`). A `require_reason` effect can be added
 later if the UI should ask for a reason instead of refusing; Policies written as a deny
 keep working.
 
@@ -232,7 +241,8 @@ Environment governs the Run:
 - it is marked `deploy: true`, or its Pipeline is, which marks every non-gate Step for
   this rule.
 
-Steps that use none of these, such as build and test, run before the gate. The OIDC
+Steps that use none of these, such as build and test, run before the gate, unless the
+Pipeline itself is marked `deploy: true`, which puts every Step behind it. The OIDC
 token is not on the list; its subject follows the gate instead (§3). The rule relies on
 today's join, where a Step runs only when every one of its `needs` succeeded and a
 skipped gate skips its dependents (`scheduler.rs:2295-2300`). A richer join rule would
@@ -339,11 +349,15 @@ Policies attach at three levels:
   - a yanked LibraryVersion and the forge-credential rules (ADR-0076 §6 and §9);
   - the `env=none` OIDC subject for Steps with no released manual gate upstream, in an
     Environment with approvers (§3).
-- **Defaults are typed-setting defaults.** Scarab ships no Policies of its own. A typed
-  setting's default fails closed: an empty allow list allows nothing. For example, no
-  plugin's gates may run until an admin lists the plugin (ADR-0076 §7), and
-  `forge_token: write` is denied unless the Run is Environment-governed (ADR-0076 §9). A
-  default changes only with a Scarab release.
+- **Defaults are typed-setting defaults.** Scarab ships no Policies of its own. Each
+  typed setting states its default, and no default allows more than Scarab does today:
+  no plugin's gates may run until an org admin lists the plugin (ADR-0076 §7); every
+  installed library may be used until a list narrows it, because installing it was the
+  approval (ADR-0076 §4); `forge_token: write` is denied unless the Run is
+  Environment-governed and the Environment restricts refs (ADR-0076 §9). A list left
+  unset at a lower layer adds no rule, so an Environment or Project that never sets
+  "plugins whose gates may run here" does not deny a plugin the org listed. A default
+  changes only with a Scarab release.
 
 ### 8. RBAC stays separate
 
@@ -432,8 +446,10 @@ gates may run here", compile to `run.create` denies over `origin`.
 - In an Environment with approvers, Steps before the gate get the `env=none` OIDC
   subject. A Pipeline whose build Step assumed a production cloud role before any gate
   stops working, and the Step's log says why.
-- An approval expires for reruns after 24 hours by default, and when the approvers or the
-  Policies change.
+- An approval expires after 24 hours by default, for every launch it covers, and when the
+  approvers or the gate's Policies change.
+- The `env=none` subject before the gate applies on the release day, with no `audit`
+  period.
 - A Run admitted under one policy set can have a later Step denied under another. The
   decision record shows which, with its PolicySetDigest.
 - Decisions store their inputs, which grows the Run's record.
