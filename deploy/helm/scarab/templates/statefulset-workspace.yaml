@@ -200,11 +200,14 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+  # Immutable after creation, so version-free labels only (not workspaceLabels);
+  # guarded by scripts/chart_statefulset_immutable.sh.
   volumeClaimTemplates:
     - metadata:
         name: cas
         labels:
-          {{- include "scarab.workspaceLabels" . | nindent 10 }}
+          {{- include "scarab.workspaceSelectorLabels" . | nindent 10 }}
+          app.kubernetes.io/component: workspace
       spec:
         accessModes: ["ReadWriteOnce"]
         {{- if .Values.workspace.persistence.storageClass }}

@@ -405,6 +405,9 @@ jobs:
           grep -q 'SCARAB_SIDECAR_IMAGE: "ghcr.io/x/sidecar:pinned"' <<<"$out"
           grep -q 'SCARAB_RESULTS_API_URL: "http://t-scarab.ci.svc"' <<<"$out"
 
+      - name: StatefulSet upgrades apply in place
+        run: scripts/chart_statefulset_immutable.sh "$CHART_DIR"
+
       - name: Package + push to ghcr
         if: startsWith(github.ref, 'refs/tags/v')
         env:
