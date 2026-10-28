@@ -138,9 +138,9 @@ held at zero replicas and its status names the claim. A claim that hasn't bound 
 waiting. The plugin runs as uid and gid 65532 with `fsGroup: 65532`; a volume type that ignores
 `fsGroup` (hostPath, some local provisioners) needs to be writable by that uid.
 
-Adding storage to an installation that has none, or removing it, takes effect at once. Moving
-it to another claim or mount path asks for a passkey step-up. Removing it leaves the claim and
-its data in place.
+Adding storage to an installation that has none, or removing it, needs no step-up. Moving it
+to another claim or mount path asks for a passkey step-up. Removing it leaves the claim and its
+data in place.
 
 ## A minimal `values.yaml`
 
