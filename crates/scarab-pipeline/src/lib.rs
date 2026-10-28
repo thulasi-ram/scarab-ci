@@ -544,6 +544,52 @@ pub struct StepSpec {
     /// and an IR stored before then still decodes. Nothing reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deployment_requests: Option<serde_json::Value>,
+    /// The invoke chain this Step (or gate) was inlined through, outermost
+    /// first (ADR-0075 §2, ADR-0076 §1). Empty for a Step written in the
+    /// Pipeline file itself. Written only by the compiler
+    /// ([`compile_yaml_with_libs`]): an authored `origin` is a compile error,
+    /// so a Pipeline cannot claim to come from somewhere it does not. The
+    /// `run.create` PolicyCheckpoint reads it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub origin: Vec<OriginEntry>,
+}
+
+/// The kind of one link in an invoke chain (ADR-0076). Today the compiler
+/// writes only [`File`](OriginKind::File): `invoke:` is repo-local.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OriginKind {
+    /// A library file in the same repository (`.scarab/lib/…`).
+    File,
+    /// An installed library (ADR-0076).
+    Library,
+    /// A plugin's gate (ADR-0076).
+    Plugin,
+}
+
+/// One link of a compiled Step's [`origin`](StepSpec::origin).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OriginEntry {
+    pub kind: OriginKind,
+    /// For a `file` link, the repo-relative library path.
+    pub name: String,
+    /// Where an installed library comes from; `None` for a `file` link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// SHA-256 of the library source, lowercase hex.
+    pub content_hash: String,
+}
+
+/// SHA-256 of `bytes`, lowercase hex.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+    let mut out = String::with_capacity(64);
+    for b in Sha256::digest(bytes) {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 impl StepSpec {
@@ -1360,6 +1406,20 @@ fn inline_level(
     let mut output_aliases: Vec<(String, Vec<String>)> = Vec::new();
 
     for step in steps {
+        // `origin` is the compiler's record of where a Step came from
+        // (ADR-0075 §2); an authored one would let a Pipeline pass a
+        // library Policy by claiming another source.
+        if !step.origin.is_empty() {
+            let place = match stack.last() {
+                Some(lib) => format!(" in library `{lib}`"),
+                None => String::new(),
+            };
+            diagnostics.push(format!(
+                "step `{}`{place}: `origin` is written by the compiler and cannot be set in a \
+                 pipeline file",
+                step.id
+            ));
+        }
         let Some(raw_path) = &step.invoke else {
             // `with:` supplies inputs to a library — meaningless off an invoke step.
             if !step.with.is_empty() {
@@ -1468,6 +1528,14 @@ fn inline_level(
         stack.push(key.clone());
         let resolved = inline_level(&lib.steps, libs, stack, diagnostics);
         stack.pop();
+        // This library is the outermost link so far of every Step it
+        // inlines: the nested levels already recorded theirs.
+        let link = OriginEntry {
+            kind: OriginKind::File,
+            name: key.clone(),
+            source: None,
+            content_hash: sha256_hex(src.as_bytes()),
+        };
 
         // `matrix` × `invoke` (ADR-0038): a matrix on the invoke step fans out N
         // copies of the whole subgraph, once per coordinate. `expand_step` gives
@@ -1502,6 +1570,7 @@ fn inline_level(
             for ls in &resolved {
                 let mut inst = ls.clone();
                 inst.id = ns(&ls.id);
+                inst.origin.insert(0, link.clone());
                 // `deploy: true` on the invoke step, or on the library
                 // pipeline, marks every Step it inlines that runs something
                 // (ADR-0074 §2); a gate can never carry the mark.
@@ -3605,6 +3674,85 @@ mod tests {
         // The result is a single valid flat DAG that round-trips.
         let back: PipelineIr = serde_json::from_str(&serde_json::to_string(&ir).unwrap()).unwrap();
         assert_eq!(ir, back);
+    }
+
+    #[test]
+    fn inlined_steps_and_gates_carry_their_origin_chain_outermost_first() {
+        let outer = r#"
+            steps:
+              - { id: approve, gate: manual }
+              - { id: db, invoke: .scarab/lib/db.yaml, needs: [approve] }
+        "#;
+        let inner = "steps: [{ id: migrate, image: busybox }]";
+        let ir = compile_with(
+            r#"
+            steps:
+              - { id: checkout, image: busybox }
+              - { id: deploy, invoke: ./.scarab/lib/deploy.yaml, needs: [checkout] }
+            "#,
+            &libs(&[
+                (".scarab/lib/deploy.yaml", outer),
+                (".scarab/lib/db.yaml", inner),
+            ]),
+        );
+        let step = |id: &str| ir.steps.iter().find(|s| s.id == id).unwrap();
+        let file = |name: &str, src: &str| OriginEntry {
+            kind: OriginKind::File,
+            name: name.to_string(),
+            source: None,
+            content_hash: sha256_hex(src.as_bytes()),
+        };
+
+        assert!(
+            step("checkout").origin.is_empty(),
+            "written in the file itself"
+        );
+        // A gate inlined from a library carries the library too.
+        assert_eq!(
+            step("deploy/approve").origin,
+            vec![file(".scarab/lib/deploy.yaml", outer)]
+        );
+        assert_eq!(
+            step("deploy/db/migrate").origin,
+            vec![
+                file(".scarab/lib/deploy.yaml", outer),
+                file(".scarab/lib/db.yaml", inner)
+            ]
+        );
+        // SHA-256 of the source text, as `sha256sum` prints it.
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        // Stored IR keeps it.
+        let back: PipelineIr = serde_json::from_str(&serde_json::to_string(&ir).unwrap()).unwrap();
+        assert_eq!(ir, back);
+    }
+
+    #[test]
+    fn an_authored_origin_is_a_compile_error_in_the_file_or_a_library() {
+        let spoof =
+            "origin: [{ kind: library, name: x, source: github.com/acme/ok, content_hash: '00' }]";
+        let top = format!("steps: [{{ id: a, image: busybox, {spoof} }}]");
+        let errs = errors_with(&top, &BTreeMap::new());
+        assert!(
+            errs.iter().any(
+                |e| e.contains("step `a`") && e.contains("`origin` is written by the compiler")
+            ),
+            "{errs:?}"
+        );
+
+        let lib = format!("steps: [{{ id: b, image: busybox, {spoof} }}]");
+        let errs = errors_with(
+            "steps: [{ id: ci, invoke: .scarab/lib/ci.yaml }]",
+            &libs(&[(".scarab/lib/ci.yaml", &lib)]),
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("step `b` in library `.scarab/lib/ci.yaml`")
+                    && e.contains("`origin` is written by the compiler")),
+            "{errs:?}"
+        );
     }
 
     #[test]

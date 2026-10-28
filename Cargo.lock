@@ -2858,6 +2858,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "thiserror",
 ]
 
@@ -2995,6 +2996,7 @@ dependencies = [
  "scarab-pipeline",
  "scarab-plugin",
  "scarab-plugin-k8s",
+ "scarab-policy",
  "scarab-project",
  "scarab-secrets",
  "scarab-secrets-postgres",
