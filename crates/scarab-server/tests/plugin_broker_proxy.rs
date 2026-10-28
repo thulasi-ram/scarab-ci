@@ -182,7 +182,6 @@ async fn harness_with(adjust: impl FnOnce(AppState) -> AppState) -> Option<Harne
         db.clone(),
     ));
     let st = AppState::new(db, Arc::new(FakeClock::new(CLOCK_START_MS)), logs)
-        .with_deployments(pg.clone())
         .with_org_environments(pg.clone())
         .with_plugins(
             pg.clone(),

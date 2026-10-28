@@ -234,7 +234,7 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "PUT",
         "/v1/orgs/{org}/environments/{env}",
         "environment.put",
-        "COND-W",
+        "NG",
     ),
     ("GET", "/v1/orgs/{org}/environments/{env}", "read", "READ"),
     (
@@ -321,12 +321,6 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "environment.migration_report_ack",
         "NG",
     ),
-    (
-        "GET",
-        "/v1/orgs/{org}/environments/{env}/deployment-targets",
-        "read",
-        "READ",
-    ),
     ("GET", "/v1/orgs/{org}/plugin-catalog", "read", "READ"),
     ("GET", "/v1/orgs/{org}/plugins", "read", "READ"),
     ("POST", "/v1/orgs/{org}/plugins", "plugin.install", "CJ-A"),
@@ -351,12 +345,6 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "GET",
-        "/v1/orgs/{org}/plugins/{name}/unmapped-groupings",
-        "read",
-        "READ",
-    ),
-    (
-        "GET",
         "/v1/orgs/{org}/plugins/{name}/connections",
         "read",
         "READ",
@@ -372,19 +360,6 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "/v1/orgs/{org}/plugins/{name}/connections/{slot}",
         "plugin_connection.delete",
         "EX",
-    ),
-    ("GET", "/v1/orgs/{org}/board", "read", "READ"),
-    (
-        "GET",
-        "/v1/orgs/{org}/environments/{env}/deployments",
-        "read",
-        "READ",
-    ),
-    (
-        "GET",
-        "/v1/orgs/{org}/environments/{env}/deployments/{id}",
-        "read",
-        "READ",
     ),
     ("GET", "/v1/connections", "read", "READ"),
     ("POST", "/v1/connections", "connection.create", "CJ-W"),
@@ -877,7 +852,7 @@ async fn exempt_and_ungoverned_routes_never_ask_for_a_step_up() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 26, "the EX + NG mutating routes");
+    assert_eq!(checked, 27, "the EX + NG mutating routes");
     assert!(h.events_of("step_up.refused").is_empty());
 }
 

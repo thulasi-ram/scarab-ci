@@ -28,8 +28,7 @@ use scarab_engine::{Clock, Db, RunId, RunStatus, Scheduler, StepId, StepStatus};
 use scarab_forge::RepoRef;
 use scarab_identity::{ApiToken, ApiTokenStore, Role, Scope};
 use scarab_project::{
-    DeployGovernance, DeploymentTargetHome, EnvironmentDeploymentDeadline,
-    EnvironmentDeploymentSource, EnvironmentGovernanceStore, EnvironmentMigrationReport,
+    DeployGovernance, EnvironmentGovernanceStore, EnvironmentMigrationReport,
     EnvironmentProjectEligibility, EnvironmentProjectOverlay, EnvironmentProjectPrivilegeGrant,
     EnvironmentProjectRecord, EnvironmentProtectionRules, ImageGrant, OrgEnvironment,
     OrgEnvironmentError, OrgEnvironmentStore,
@@ -117,9 +116,7 @@ async fn governed_with(
     let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
     pg.migrate().await.unwrap();
     install_named(&tdb.pool).await;
-    pg.put_org_environment(&environment("prod", &[]))
-        .await
-        .unwrap();
+    pg.put_org_environment(&environment("prod")).await.unwrap();
     pg.put_environment_eligibility(
         "acme",
         "prod",
@@ -142,22 +139,11 @@ async fn governed() -> Option<Governed> {
     governed_with(|pg| pg).await
 }
 
-fn environment(name: &str, sources: &[(&str, &str)]) -> OrgEnvironment {
+fn environment(name: &str) -> OrgEnvironment {
     OrgEnvironment {
         org: "acme".into(),
         name: name.into(),
         description: String::new(),
-        deployment_deadline: EnvironmentDeploymentDeadline::new(
-            scarab_deployment::DEFAULT_DEPLOYMENT_DEADLINE_MS,
-        )
-        .unwrap(),
-        deployment_sources: sources
-            .iter()
-            .map(|(i, g)| EnvironmentDeploymentSource {
-                installation: (*i).into(),
-                vendor_grouping: (*g).into(),
-            })
-            .collect(),
         protection: Default::default(),
         eligibility: Default::default(),
         created_at: 0,
@@ -318,95 +304,38 @@ async fn eligibility_widening_needs_a_step_up() {
     g.tdb.cleanup().await;
 }
 
-/// E3: adding an EnvironmentDeploymentSource (a new outside party whose
-/// reports the Environment accepts) loosens — on create too; removing one
-/// does not.
+/// The whole-Environment PUT writes a name and a description: no longer
+/// governed (its E3 rule went with deployment sources, ADR-0074), and a body
+/// naming a field ADR-0074 removed is a 400, not a silent no-op.
 #[tokio::test]
-async fn adding_a_deployment_source_needs_a_step_up_and_removing_one_does_not() {
+async fn an_environment_put_needs_no_step_up_and_refuses_removed_fields() {
     let Some(g) = governed().await else { return };
     let (h, pg) = (&g.h, &g.pg);
-    let (s, mut soft) = signed_in_admin(h).await;
-    let argocd = json!({ "installation": "argocd", "vendor_grouping": "prod" });
-    let sources = || async move {
+    let (s, _soft) = signed_in_admin(h).await;
+    let (st, b) = h
+        .cookie(
+            "PUT",
+            PROD,
+            Some(json!({ "description": "production" })),
+            &s,
+        )
+        .await;
+    assert_ok(st, &b);
+    assert_eq!(
         pg.get_org_environment("acme", "prod")
             .await
             .unwrap()
             .unwrap()
-            .deployment_sources
-    };
-
-    // Add → 403, nothing written.
-    let (st, b) = h
-        .cookie(
-            "PUT",
-            PROD,
-            Some(json!({ "deployment_sources": [argocd] })),
-            &s,
-        )
-        .await;
-    assert_refused_for(
-        st,
-        &b,
-        "environment.put",
-        "adds deployment source `argocd` / `prod`",
+            .description,
+        "production"
     );
-    assert!(sources().await.is_empty());
-
-    // A create with a source is an addition over "no sources".
-    let stage = "/v1/orgs/acme/environments/stage";
-    let eu = json!({ "installation": "argocd-eu", "vendor_grouping": "stage" });
-    let (st, b) = h
-        .cookie(
-            "PUT",
-            stage,
-            Some(json!({ "deployment_sources": [eu] })),
-            &s,
-        )
-        .await;
-    assert_refused_for(st, &b, "environment.put", "adds deployment source");
-    assert!(pg
-        .get_org_environment("acme", "stage")
-        .await
-        .unwrap()
-        .is_none());
-    // A create without one, or a description change, adds nothing: 200.
-    let (st, b) = h
-        .cookie("PUT", stage, Some(json!({ "deployment_sources": [] })), &s)
-        .await;
-    assert_ok(st, &b);
-    let (st, b) = h
-        .cookie(
-            "PUT",
-            PROD,
-            Some(json!({ "description": "production", "deployment_sources": [] })),
-            &s,
-        )
-        .await;
-    assert_ok(st, &b);
-
-    // Remove → 200.
-    pg.put_org_environment(&environment("prod", &[("argocd", "prod")]))
-        .await
-        .unwrap();
-    let (st, b) = h
-        .cookie("PUT", PROD, Some(json!({ "deployment_sources": [] })), &s)
-        .await;
-    assert_ok(st, &b);
-    assert!(sources().await.is_empty());
-
-    // With a window open, the addition goes through.
-    h.open_window(&s, &mut soft).await;
-    let (st, b) = h
-        .cookie(
-            "PUT",
-            PROD,
-            Some(json!({ "deployment_sources": [argocd] })),
-            &s,
-        )
-        .await;
-    assert_ok(st, &b);
-    assert_eq!(sources().await.len(), 1);
-
+    for removed in [
+        json!({ "deployment_sources": [] }),
+        json!({ "deployment_deadline_ms": 60_000 }),
+    ] {
+        let (st, b) = h.cookie("PUT", PROD, Some(removed.clone()), &s).await;
+        assert!(st.is_client_error(), "{removed}: {st} {b}");
+    }
     g.tdb.cleanup().await;
 }
 
@@ -506,7 +435,6 @@ async fn overlay_loosening_and_delete_need_a_step_up() {
             environment: "prod".into(),
             project: "web".into(),
             rules: rules(&["amy", "bob"], &[]),
-            deployment_gate_deadline: Some(EnvironmentDeploymentDeadline::new(3_600_000).unwrap()),
         },
         "seed",
         0,
@@ -528,29 +456,9 @@ async fn overlay_loosening_and_delete_need_a_step_up() {
 
     // Remove an overlay approver → 403.
     let (st, b) = h
-        .cookie(
-            "PUT",
-            &uri,
-            Some(json!({ "approvers": ["amy"], "deployment_gate_deadline_ms": 3_600_000 })),
-            &s,
-        )
+        .cookie("PUT", &uri, Some(json!({ "approvers": ["amy"] })), &s)
         .await;
     assert_refused_for(st, &b, "environment.overlay.put", "removes approver `bob`");
-    // Remove the gate deadline → 403.
-    let (st, b) = h
-        .cookie(
-            "PUT",
-            &uri,
-            Some(json!({ "approvers": ["amy", "bob"] })),
-            &s,
-        )
-        .await;
-    assert_refused_for(
-        st,
-        &b,
-        "environment.overlay.put",
-        "removes the deployment gate deadline",
-    );
     assert!(overlay()
         .await
         .is_some_and(|o| o.rules.approvers.len() == 2));
@@ -560,10 +468,7 @@ async fn overlay_loosening_and_delete_need_a_step_up() {
         .cookie(
             "PUT",
             &uri,
-            Some(json!({
-                "approvers": ["amy", "bob", "carol"],
-                "deployment_gate_deadline_ms": 3_600_000
-            })),
+            Some(json!({ "approvers": ["amy", "bob", "carol"] })),
             &s,
         )
         .await;
@@ -573,12 +478,7 @@ async fn overlay_loosening_and_delete_need_a_step_up() {
     // With a window open, the loosening and the delete go through.
     h.open_window(&s, &mut soft).await;
     let (st, b) = h
-        .cookie(
-            "PUT",
-            &uri,
-            Some(json!({ "approvers": ["amy"], "deployment_gate_deadline_ms": 3_600_000 })),
-            &s,
-        )
+        .cookie("PUT", &uri, Some(json!({ "approvers": ["amy"] })), &s)
         .await;
     assert_ok(st, &b);
     let (st, b) = h.cookie("DELETE", &uri, None, &s).await;
@@ -748,13 +648,6 @@ impl EnvironmentGovernanceStore for RacingGovernance {
         org: &str,
     ) -> Result<Vec<EnvironmentMigrationReport>, OrgEnvironmentError> {
         self.inner.environment_migration_report(org).await
-    }
-    async fn deployment_target_homes(
-        &self,
-        org: &str,
-        targets: &[(String, String)],
-    ) -> Result<Vec<DeploymentTargetHome>, OrgEnvironmentError> {
-        self.inner.deployment_target_homes(org, targets).await
     }
     async fn acknowledge_environment_migration_report(
         &self,

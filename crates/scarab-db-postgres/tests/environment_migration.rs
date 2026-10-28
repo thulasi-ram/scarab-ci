@@ -11,7 +11,7 @@
 //!   `migrate_legacy_environment` of its legacy row (the function whose
 //!   decisions the c1 proptests prove identical to the old rules);
 //! - every created Environment has the permissive baseline; a pre-existing
-//!   c-min Environment keeps its deadline and description;
+//!   c-min Environment keeps its description;
 //! - eligibility is definers ∪ run-referencers, and "all projects" for a name
 //!   no Project defined (referenced-only, or c-min only);
 //! - the split report lists merged, all-projects, and single-definer-plus-
@@ -324,9 +324,6 @@ async fn backfill_reproduces_the_pure_migration_and_is_a_no_op_the_second_time()
             EnvironmentProtectionRules::default(),
             "{org}/{name} baseline is permissive"
         );
-        // Concurrency is never carried (ADR-0071 §10 step 3), even where the
-        // legacy row said 3.
-        assert_eq!(g.effective_protection().deployment_concurrency, None);
     }
 
     // The two old-JSON shapes the pure function never saw as JSON: absent
@@ -414,9 +411,9 @@ async fn backfill_reproduces_the_pure_migration_and_is_a_no_op_the_second_time()
         .unwrap()
         .is_some_and(|g| !g.eligible));
 
-    // Deadlines: a c-min Environment keeps its own; a created one gets the
-    // one-hour default it already folded by.
-    let deadline = |name: &'static str| {
+    // A c-min Environment keeps its own fields; a created one is the
+    // migration's.
+    let environment = |name: &'static str| {
         let db = &db;
         async move {
             db.deploy_governance("acme", "x", name)
@@ -426,14 +423,12 @@ async fn backfill_reproduces_the_pure_migration_and_is_a_no_op_the_second_time()
                 .environment
         }
     };
-    let prod = deadline("prod").await;
-    assert_eq!(prod.deployment_deadline.millis(), 600_000);
+    let prod = environment("prod").await;
     assert_eq!(prod.description, "the c-min prod");
     assert_eq!(
-        deadline("staging").await.deployment_deadline.millis(),
-        3_600_000
+        environment("preview").await.updated_by,
+        "migration:adr-0071"
     );
-    assert_eq!(deadline("preview").await.updated_by, "migration:adr-0071");
 
     // The split report: merged names, all-projects names, and a single
     // definer with a run-referencer — nothing else (`release`, `globex/prod`:

@@ -414,7 +414,7 @@ fn installation(image: &str) -> PluginInstallation {
         image: image.into(),
         manifest: PluginManifest {
             plugin: "argocd".into(),
-            capabilities: vec![PluginCapability::ReportDeployments],
+            capabilities: vec![PluginCapability::UseConnection],
             connections: vec![],
             config_keys: vec![],
         },

@@ -542,7 +542,7 @@ mod tests {
             image: format!("ghcr.io/acme/argocd@sha256:{}", "a".repeat(64)),
             manifest: PluginManifest {
                 plugin: "argocd".into(),
-                capabilities: vec![PluginCapability::ReportDeployments],
+                capabilities: vec![PluginCapability::UseConnection],
                 connections: vec![],
                 config_keys: vec![],
             },
