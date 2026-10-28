@@ -371,3 +371,67 @@ async fn the_local_backend_reports_no_workspace_provisioning() {
     let bogus = scarab_engine::ports::ExecHandle("local://nope/nope/0".into());
     assert_eq!(exec.workspace_provisioning(&bogus).await.unwrap(), None);
 }
+
+/// Results are handed over in-process (`results` reads the step's own dir):
+/// there is no delivery leg that could lose them apart from the step, so an
+/// exit-0 step that wrote a result reports no delivery failure.
+#[tokio::test]
+async fn the_local_backend_reports_no_results_delivery_failure() {
+    let exec = LocalExecutor::new();
+    let s = step("r1", "delivered");
+    let handle = exec
+        .launch(
+            &s,
+            &spec(&["sh", "-c", "echo 1 > \"$SCARAB_RESULTS/n.json\""]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(drive(&exec, &handle).await, ExecState::Succeeded);
+
+    assert_eq!(
+        exec.results_delivery_failure(&handle).await.unwrap(),
+        None,
+        "the local backend has no delivery leg to fail"
+    );
+    let bogus = scarab_engine::ports::ExecHandle("local://nope/nope/0".into());
+    assert_eq!(exec.results_delivery_failure(&bogus).await.unwrap(), None);
+}
+
+/// git-bug 333d389: when a launch's handle was never recorded, the engine
+/// tears down `unit_handle(step)` instead — so it must name the unit `launch`
+/// created, or the cancel misses it and the child runs on.
+#[tokio::test]
+async fn unit_handle_names_the_unit_launch_created() {
+    let exec = LocalExecutor::new();
+    let s = step("r1", "orphan");
+    let launched = exec
+        .launch(&s, &spec(&["sh", "-c", "sleep 30"]))
+        .await
+        .unwrap();
+
+    let unit = exec.unit_handle(&s).expect("the local unit is derivable");
+    assert_eq!(unit, launched);
+    exec.cancel(&unit).await.unwrap();
+    assert!(matches!(
+        exec.poll(&launched).await.unwrap(),
+        ExecState::Failed { .. }
+    ));
+}
+
+/// git-bug f22056d: `cancel` SIGKILLs with no termination grace, so a
+/// cancelled unit is torn down as soon as `cancel` returns; a fence this
+/// executor never launched has nothing running either.
+#[tokio::test]
+async fn a_cancelled_unit_is_torn_down() {
+    let exec = LocalExecutor::new();
+    let s = step("r1", "teardown");
+    let handle = exec
+        .launch(&s, &spec(&["sh", "-c", "sleep 30"]))
+        .await
+        .unwrap();
+    exec.cancel(&handle).await.unwrap();
+
+    assert!(exec.torn_down(&handle).await.unwrap());
+    let bogus = scarab_engine::ports::ExecHandle("local://nope/nope/0".into());
+    assert!(exec.torn_down(&bogus).await.unwrap());
+}
