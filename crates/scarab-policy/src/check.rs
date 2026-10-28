@@ -9,7 +9,10 @@
 //! list's element type.
 //!
 //! The subset: field access, `has()`, literals (scalars, lists, maps),
-//! `==` `!=` `<` `<=` `>` `>=`, `&&` `||` `!` `?:`, `in` on lists and maps,
+//! `==` `!=` `<` `<=` `>` `>=` on scalars, enums, timestamps and durations
+//! (comparing lists, maps or structs is refused: one comparison would walk
+//! the whole value), `&&` `||` `!` `?:`, `in` on lists and maps with a
+//! scalar on the left,
 //! `startsWith` `endsWith` `contains` `matches` (literal pattern, compiled
 //! here), `size`, `timestamp('<literal>')` and `duration('<literal>')`, and
 //! `exists` `all` `exists_one` over lists. Anything else, `+` on strings
@@ -20,11 +23,15 @@
 //! literal list's length); `x in list` adds the list's cap. Nested macros
 //! multiply. The bound is the worst case: every macro iterating every element,
 //! short-circuits ignored. Costs saturate at `u64::MAX` rather than wrap. String
-//! functions cost 1 regardless of string length; that is sound only while
-//! checkpoint inputs bound their strings, which this spike does not enforce.
-//! `matches()` costs 2 because its pattern is compiled once per evaluation,
-//! not once per call (`eval::evaluate_when`); `cel`'s own `matches` compiles
-//! on every call and is never the one evaluated.
+//! functions cost 1: every string of a checkpoint input is capped (at most
+//! [`MAX_STRING_LEN`](crate::schema::MAX_STRING_LEN) or
+//! [`MAX_FREE_TEXT_LEN`](crate::schema::MAX_FREE_TEXT_LEN) bytes, refused
+//! when an input is bound), and a literal is at most the rule's length, so one
+//! call scans a bounded string. `matches()` costs 2 because its pattern is
+//! compiled once per evaluation, not once per call (`eval::evaluate_when`);
+//! `cel`'s own `matches` compiles on every call and is never the one
+//! evaluated. A rule uses at most [`MAX_PATTERNS`] distinct patterns, each
+//! compiled under [`MAX_PATTERN_BYTES`], so compiling them is bounded too.
 //!
 //! **Stack.** Parsing, checking and evaluating run on a thread with a large
 //! stack ([`on_cel_stack`]), after a length and bracket-depth pre-check: a
@@ -133,6 +140,8 @@ pub struct Checked {
     /// `trigger.ref`). Fields read through an iteration variable count
     /// towards the list variable (`steps`).
     pub reads: BTreeSet<String>,
+    /// The distinct `matches()` patterns the rule uses.
+    pub patterns: BTreeSet<String>,
 }
 
 /// Runs `f` on a thread whose stack holds the deepest rule the limits allow
@@ -173,6 +182,7 @@ fn check_on_this_thread(
         guards: Vec::new(),
         warnings: Vec::new(),
         reads: BTreeSet::new(),
+        patterns: BTreeSet::new(),
         depth: 0,
     };
     let root = program.expression();
@@ -193,7 +203,10 @@ fn check_on_this_thread(
         )]);
     }
     let Checker {
-        warnings, reads, ..
+        warnings,
+        reads,
+        patterns,
+        ..
     } = checker;
     Ok(Checked {
         source: source.to_string(),
@@ -201,6 +214,7 @@ fn check_on_this_thread(
         cost,
         warnings,
         reads,
+        patterns,
     })
 }
 
@@ -257,6 +271,11 @@ pub(crate) fn parse(source: &str) -> Result<cel::Program, Vec<Diagnostic>> {
 
 /// The most memory a `matches()` pattern may compile to.
 pub const MAX_PATTERN_BYTES: usize = 1 << 20;
+
+/// The most distinct `matches()` patterns one rule may use. Each is compiled
+/// when the rule is checked and again once per evaluation, and a pattern
+/// under [`MAX_PATTERN_BYTES`] can take milliseconds to compile.
+pub const MAX_PATTERNS: usize = 8;
 
 /// Compiles a `matches()` pattern, under [`MAX_PATTERN_BYTES`]: at check
 /// time to validate it, and at evaluation once per pattern
@@ -321,6 +340,8 @@ struct Checker<'a> {
     warnings: Vec<Diagnostic>,
     /// See [`Checked::reads`].
     reads: BTreeSet<String>,
+    /// See [`Checked::patterns`].
+    patterns: BTreeSet<String>,
     depth: u32,
 }
 
@@ -666,6 +687,9 @@ impl Checker<'_> {
                         )
                     }
                 };
+                if let Some(what) = composite(&tn) {
+                    return Err(self.unsupported(e, &format!("comparing {what} (with `in`)")));
+                }
                 if !equatable(&tn, &elem) {
                     return Err(self.diag(e, format!("cannot look for {tn} in {th}")));
                 }
@@ -712,8 +736,23 @@ impl Checker<'_> {
                         "matches() takes a string literal pattern in policies".to_string(),
                     ));
                 };
-                self::pattern(p.inner())
-                    .map_err(|err| self.diag(pattern, format!("invalid pattern: {err}")))?;
+                let p: &str = p.inner();
+                if !self.patterns.contains(p) {
+                    // Counted before compiling, so a rule over the cap
+                    // compiles no more than the cap.
+                    if self.patterns.len() >= MAX_PATTERNS {
+                        return Err(self.diag(
+                            pattern,
+                            format!(
+                                "a rule uses at most {MAX_PATTERNS} distinct matches() \
+                                 patterns"
+                            ),
+                        ));
+                    }
+                    self::pattern(p)
+                        .map_err(|err| self.diag(pattern, format!("invalid pattern: {err}")))?;
+                    self.patterns.insert(p.to_string());
+                }
                 Ok((Type::Bool, add(&[cr, 2])))
             }
             (conv @ ("timestamp" | "duration"), None, [arg]) => {
@@ -823,6 +862,11 @@ impl Checker<'_> {
                 return Ok(());
             }
         }
+        // One comparison of two lists, maps or structs walks both values to
+        // their leaves, while the cost bound counts it as one node.
+        if let Some(what) = composite(ta).or_else(|| composite(tb)) {
+            return Err(self.unsupported(e, &format!("comparing {what}")));
+        }
         if !equatable(ta, tb) {
             return Err(self.diag(e, format!("cannot compare {ta} with {tb}")));
         }
@@ -872,6 +916,16 @@ fn literal_type(lit: &LiteralValue) -> Type {
         LiteralValue::Null => Type::Null,
         LiteralValue::String(_) => Type::String,
         LiteralValue::UInt(_) => Type::Uint,
+    }
+}
+
+/// What `==`, `!=` and `in` refuse to compare, named for the message.
+fn composite(t: &Type) -> Option<&'static str> {
+    match t {
+        Type::List { .. } => Some("lists"),
+        Type::Map { .. } => Some("maps"),
+        Type::Struct(_) => Some("structs"),
+        _ => None,
     }
 }
 

@@ -136,17 +136,33 @@ pub fn bind<I: serde::Serialize>(
             None | Some(serde_json::Value::Null) => {
                 return Err(format!("`{}` is required", var.name));
             }
-            Some(v) => to_value(schema, &var.ty, v).map_err(|e| format!("{}{e}", var.name))?,
+            Some(v) => {
+                to_value(schema, &var.ty, var.max_len, v).map_err(|e| format!("{}{e}", var.name))?
+            }
         };
         context.add_variable_from_value(var.name.clone(), value);
     }
     Ok(context)
 }
 
-/// Converts `json` to a CEL value of type `ty`. Errors carry the path below
-/// the value, e.g. `.target.kind: ...`.
-fn to_value(schema: &Schema, ty: &Type, json: &serde_json::Value) -> Result<Value, String> {
+/// Converts `json` to a CEL value of type `ty`, refusing a string longer
+/// than `max_len` bytes (the field's [`max_len`](crate::schema::Field::max_len)).
+/// Errors carry the path below the value, e.g. `.target.kind: ...`.
+fn to_value(
+    schema: &Schema,
+    ty: &Type,
+    max_len: usize,
+    json: &serde_json::Value,
+) -> Result<Value, String> {
     use serde_json::Value as J;
+    if let J::String(s) = json {
+        if s.len() > max_len {
+            return Err(format!(
+                ": {} bytes, more than the {max_len} a Policy input string may hold",
+                s.len()
+            ));
+        }
+    }
     Ok(match (ty, json) {
         (Type::Bool, J::Bool(b)) => Value::Bool(*b),
         (Type::String, J::String(s)) => Value::String(Arc::new(s.clone())),
@@ -169,7 +185,7 @@ fn to_value(schema: &Schema, ty: &Type, json: &serde_json::Value) -> Result<Valu
             let items = items
                 .iter()
                 .enumerate()
-                .map(|(i, v)| to_value(schema, elem, v).map_err(|e| format!("[{i}]{e}")))
+                .map(|(i, v)| to_value(schema, elem, max_len, v).map_err(|e| format!("[{i}]{e}")))
                 .collect::<Result<Vec<_>, _>>()?;
             Value::List(Arc::new(items))
         }
@@ -181,7 +197,7 @@ fn to_value(schema: &Schema, ty: &Type, json: &serde_json::Value) -> Result<Valu
                     None | Some(J::Null) if field.optional => {}
                     None | Some(J::Null) => return Err(format!(".{}: required", field.name)),
                     Some(v) => {
-                        let v = to_value(schema, &field.ty, v)
+                        let v = to_value(schema, &field.ty, field.max_len, v)
                             .map_err(|e| format!(".{}{e}", field.name))?;
                         map.insert(Key::String(Arc::new(field.name.clone())), v);
                     }

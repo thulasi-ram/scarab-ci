@@ -13,8 +13,14 @@
 //! 85,505 with [`MAX_UPSTREAM_GATES`] at 32; at 64 it would be 167,425. A Run
 //! whose input does not fit the caps cannot be checked, so the engine must
 //! refuse it.
+//!
+//! **String caps.** Every string is at most
+//! [`MAX_STRING_LEN`](crate::schema::MAX_STRING_LEN) bytes, the dispatch
+//! reason (a [`FreeText`]) at most
+//! [`MAX_FREE_TEXT_LEN`](crate::schema::MAX_FREE_TEXT_LEN); [`input_value`]
+//! refuses a Run with a longer one, as it refuses one over a list cap.
 
-use crate::schema::{Capped, Schema, Timestamp};
+use crate::schema::{check_string_lengths, Capped, FreeText, Schema, Timestamp};
 use crate::{policy_enum, policy_struct};
 
 pub const CHECKPOINT: &str = "run.create";
@@ -103,7 +109,7 @@ policy_struct! {
         /// The Principal linked to `actor` (ADR-0069), when there is one.
         pub principal: Option<String>,
         /// The reason given for a manual or API dispatch.
-        pub reason: Option<String>,
+        pub reason: Option<FreeText>,
     }
 }
 
@@ -286,6 +292,34 @@ pub fn uses_environment_authority(
         || step.k8s_overlay.is_some()
         || step.deploy
         || ir.deploy
+}
+
+/// A gate of a Run whose origin includes a plugin link: what the closed
+/// plugin default ([`plugins_closed_default`](crate::evaluate::plugins_closed_default))
+/// checks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PluginGate {
+    pub gate: String,
+    pub plugin: String,
+}
+
+/// Each (gate, plugin) pair of `ir`, in Pipeline order, read from the
+/// compiled Pipeline itself: the plugin default holds whether or not the
+/// Run's input could be built.
+pub fn plugin_gates(ir: &scarab_pipeline::PipelineIr) -> Vec<PluginGate> {
+    ir.steps
+        .iter()
+        .filter(|s| s.is_gate())
+        .flat_map(|s| {
+            s.origin
+                .iter()
+                .filter(|o| o.kind == scarab_pipeline::OriginKind::Plugin)
+                .map(|o| PluginGate {
+                    gate: s.id.clone(),
+                    plugin: o.name.clone(),
+                })
+        })
+        .collect()
 }
 
 /// Whether a gate of `ir` comes from a plugin: such a Run is consulted at
@@ -475,4 +509,24 @@ pub fn input_from_pipeline(
         principal: facts.principal,
         time: facts.time,
     })
+}
+
+/// The `run.create` input of `ir` as a PolicyDecision records it: built by
+/// [`input_from_pipeline`], then checked against the string caps (see the
+/// module documentation). An `Err` names the list or the string that does
+/// not fit.
+pub fn input_value(
+    ir: &scarab_pipeline::PipelineIr,
+    facts: RunCreateFacts,
+) -> Result<serde_json::Value, CapExceeded> {
+    let input = input_from_pipeline(ir, facts)?;
+    let value = serde_json::to_value(input).map_err(|e| CapExceeded(e.to_string()))?;
+    check_string_lengths(&schema(), &value).map_err(|e| {
+        CapExceeded(format!(
+            "`{}` is {} bytes, more than the {} a run.create Policy can check, so the Run \
+             is refused",
+            e.path, e.len, e.max
+        ))
+    })?;
+    Ok(value)
 }

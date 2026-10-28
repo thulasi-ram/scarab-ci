@@ -507,7 +507,7 @@ fn manual_dispatch_needs_a_reason() {
     let mut manual = base();
     manual.trigger.kind = TriggerKind::Manual;
     assert!(applies(&s, when, &manual));
-    manual.trigger.reason = Some("hotfix".to_string());
+    manual.trigger.reason = Some("hotfix".into());
     assert!(!applies(&s, when, &manual));
 }
 

@@ -14,7 +14,7 @@ use crate::check::on_cel_stack;
 use crate::eval::{bind, evaluate_when};
 use crate::ir::{schema_for, Level, PolicyIr, Predicate, TypedPredicate};
 use crate::policy::{glob_matches, pattern_matches, sha256_hex, Checkpoint, Effect, Match, Mode};
-use crate::run_create::TriggerKind;
+use crate::run_create::{PluginGate, TriggerKind};
 use crate::store::StoredPolicy;
 
 /// The most messages one typed predicate reports; the rest are counted.
@@ -193,10 +193,16 @@ fn combine(results: &[PolicyResult]) -> DecisionOutcome {
 ///
 /// At `run.create` the built-in plugin default applies too
 /// ([`plugins_closed_default`]): its result follows the stored Policies'.
+/// `plugin_gates` are the Run's plugin gates, read from its compiled
+/// Pipeline ([`plugin_gates`](crate::run_create::plugin_gates)); pass them
+/// whenever the Pipeline is at hand, so the default holds when the input
+/// could not be built. `None` reads them from `input` (a supplied or
+/// recorded input, which has no Pipeline).
 pub fn evaluate_stored(
     checkpoint: Checkpoint,
     schema_version: u32,
     input: Result<&Value, &str>,
+    plugin_gates: Option<&[PluginGate]>,
     ctx: &MatchContext,
     stored: &[StoredPolicy],
 ) -> PolicyDecision {
@@ -270,9 +276,13 @@ pub fn evaluate_stored(
         }
     }
     if checkpoint == Checkpoint::RunCreate {
-        if let Ok(input) = input {
-            results.extend(plugins_closed_default(input, ctx, &digest_set));
-        }
+        let default = match (plugin_gates, input) {
+            (Some(gates), _) => plugin_default(Ok(gates), input.err(), ctx, &digest_set),
+            (None, Ok(input)) => plugins_closed_default(input, ctx, &digest_set),
+            // No Pipeline and no input: nothing names a gate.
+            (None, Err(_)) => None,
+        };
+        results.extend(default);
     }
     PolicyDecision {
         checkpoint,
@@ -398,10 +408,52 @@ pub const PLUGINS_DEFAULT_ID: &str = "builtin:plugins_allowed";
 /// audit mode, lists nothing here: it can only narrow what the org allows,
 /// which its own typed rule does.
 ///
+/// This form reads the gates from `input`; admission reads them from the
+/// compiled Pipeline instead (see [`evaluate_stored`]).
+///
 /// `None` when the input has no plugin gate. The default is fixed in code,
 /// so it is not part of the PolicySetDigest.
 pub fn plugins_closed_default(
     input: &Value,
+    ctx: &MatchContext,
+    policies: &[PolicyIr],
+) -> Option<PolicyResult> {
+    let gates = match units(input) {
+        Err(e) => {
+            // An input that cannot be read is checked by nothing else
+            // either; fail closed only when it may hold a plugin gate.
+            let gates = input.get("gates").and_then(Value::as_array);
+            if gates.is_some_and(|g| g.is_empty()) {
+                return None;
+            }
+            Err(e)
+        }
+        Ok(units) => Ok(units
+            .iter()
+            .filter(|u| u.what == "Gate")
+            .flat_map(|u| {
+                u.origins
+                    .iter()
+                    .filter(|o| o.kind == "plugin")
+                    .map(|o| PluginGate {
+                        gate: u.id.to_string(),
+                        plugin: o.name.to_string(),
+                    })
+            })
+            .collect::<Vec<_>>()),
+    };
+    match gates {
+        Ok(g) => plugin_default(Ok(&g), None, ctx, policies),
+        Err(e) => plugin_default(Err(e), None, ctx, policies),
+    }
+}
+
+/// The plugin default over `gates`. `unbuilt` is why the Run's input could
+/// not be built, when it could not: a gate the org has not listed is denied
+/// all the same, and the message names that reason too.
+fn plugin_default(
+    gates: Result<&[PluginGate], String>,
+    unbuilt: Option<&str>,
     ctx: &MatchContext,
     policies: &[PolicyIr],
 ) -> Option<PolicyResult> {
@@ -418,40 +470,21 @@ pub fn plugins_closed_default(
         .flatten()
         .map(String::as_str)
         .collect();
-    let outcome = match units(input) {
-        Err(e) => {
-            // An input that cannot be read is checked by nothing else
-            // either; fail closed only when it may hold a plugin gate.
-            let gates = input.get("gates").and_then(Value::as_array);
-            if gates.is_some_and(|g| g.is_empty()) {
-                return None;
-            }
-            PolicyOutcome::Error {
-                message: format!("the plugin default could not be evaluated, so it denies: {e}"),
-            }
-        }
-        Ok(units) => {
-            let gates: Vec<(&str, &str)> = units
-                .iter()
-                .filter(|u| u.what == "Gate")
-                .flat_map(|u| {
-                    u.origins
-                        .iter()
-                        .filter(|o| o.kind == "plugin")
-                        .map(|o| (u.id, o.name))
-                })
-                .collect();
-            if gates.is_empty() {
-                return None;
-            }
+    let outcome = match gates {
+        Err(e) => PolicyOutcome::Error {
+            message: format!("the plugin default could not be evaluated, so it denies: {e}"),
+        },
+        Ok([]) => return None,
+        Ok(gates) => {
             let mut messages: Vec<String> = gates
                 .iter()
-                .filter(|(_, plugin)| !listed.contains(plugin))
-                .map(|(id, plugin)| {
+                .filter(|g| !listed.contains(&g.plugin.as_str()))
+                .map(|g| {
                     format!(
-                        "Gate `{id}` comes from plugin `{plugin}`, which no org-level \
+                        "Gate `{}` comes from plugin `{}`, which no org-level \
                          plugins_allowed setting lists; no plugin's gates run until an org \
-                         admin lists the plugin."
+                         admin lists the plugin.",
+                        g.gate, g.plugin
                     )
                 })
                 .collect();
@@ -459,6 +492,12 @@ pub fn plugins_closed_default(
             if messages.is_empty() {
                 PolicyOutcome::Passed
             } else {
+                if let Some(reason) = unbuilt {
+                    messages.push(format!(
+                        "The Run's input could not be built either, so no Policy checked it: \
+                         {reason}"
+                    ));
+                }
                 PolicyOutcome::Denied { messages }
             }
         }

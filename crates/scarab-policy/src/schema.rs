@@ -6,6 +6,12 @@
 //! so the schema the checker reads and the value the evaluator is given cannot
 //! drift apart. Optional fields come from `Option<T>`, list caps from
 //! [`Capped<T, N>`], and closed string sets from [`policy_enum!`].
+//!
+//! **String caps.** Every string in an input has a length cap: a field's
+//! [`Field::max_len`], [`MAX_STRING_LEN`] for names, ids, refs and image
+//! references, and [`MAX_FREE_TEXT_LEN`] for a [`FreeText`] field. The
+//! checker costs a string function as one node; the caps are what make that
+//! sound. [`check_string_lengths`] and binding refuse a longer string.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -69,7 +75,17 @@ pub struct Field {
     /// The field may be absent. Reading it without `has()` (or, for a
     /// top-level variable, without `!= null`) draws a warning.
     pub optional: bool,
+    /// The longest string, in bytes, the field holds: its own value, or each
+    /// element of a list of strings. A struct's strings use their own
+    /// fields' caps.
+    pub max_len: usize,
 }
+
+/// The longest string, in bytes, in a checkpoint input: names, ids, refs,
+/// image references and hashes.
+pub const MAX_STRING_LEN: usize = 1024;
+/// The longest [`FreeText`] string, in bytes: a dispatch reason.
+pub const MAX_FREE_TEXT_LEN: usize = 4096;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct StructDecl {
@@ -133,6 +149,8 @@ impl Registry {
 pub trait PolicyType {
     /// `Option<T>`: the field may be absent.
     const OPTIONAL: bool = false;
+    /// The longest string a field of this type holds; see [`Field::max_len`].
+    const MAX_LEN: usize = MAX_STRING_LEN;
     fn policy_type(reg: &mut Registry) -> Type;
 }
 
@@ -147,6 +165,7 @@ primitive!(String => Type::String, bool => Type::Bool, i64 => Type::Int, u64 => 
 
 impl<T: PolicyType> PolicyType for Option<T> {
     const OPTIONAL: bool = true;
+    const MAX_LEN: usize = T::MAX_LEN;
     fn policy_type(reg: &mut Registry) -> Type {
         T::policy_type(reg)
     }
@@ -166,11 +185,37 @@ impl<T, const N: usize> Capped<T, N> {
 }
 
 impl<T: PolicyType, const N: usize> PolicyType for Capped<T, N> {
+    const MAX_LEN: usize = T::MAX_LEN;
     fn policy_type(reg: &mut Registry) -> Type {
         Type::List {
             elem: Box::new(T::policy_type(reg)),
             cap: N as u64,
         }
+    }
+}
+
+/// A free-form string, such as a dispatch reason: a CEL `string` of at most
+/// [`MAX_FREE_TEXT_LEN`] bytes, where other strings hold [`MAX_STRING_LEN`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(transparent)]
+pub struct FreeText(pub String);
+
+impl From<String> for FreeText {
+    fn from(s: String) -> Self {
+        FreeText(s)
+    }
+}
+
+impl From<&str> for FreeText {
+    fn from(s: &str) -> Self {
+        FreeText(s.to_string())
+    }
+}
+
+impl PolicyType for FreeText {
+    const MAX_LEN: usize = MAX_FREE_TEXT_LEN;
+    fn policy_type(_: &mut Registry) -> Type {
+        Type::String
     }
 }
 
@@ -208,6 +253,7 @@ macro_rules! policy_struct {
                         name: stringify!($field).trim_start_matches("r#").to_string(),
                         ty: <$ty as $crate::schema::PolicyType>::policy_type(reg),
                         optional: <$ty as $crate::schema::PolicyType>::OPTIONAL,
+                        max_len: <$ty as $crate::schema::PolicyType>::MAX_LEN,
                     } ),*
                 ])
             }
@@ -283,5 +329,70 @@ impl Schema {
 
     pub fn enum_decl(&self, name: &str) -> &EnumDecl {
         &self.enums[name]
+    }
+}
+
+/// A string of an input longer than its field's [`Field::max_len`].
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("`{path}` is {len} bytes, more than the {max} a Policy input string may hold")]
+pub struct StringTooLong {
+    /// Where the string is, e.g. `pipeline.name` or `steps[3].image`.
+    pub path: String,
+    pub len: usize,
+    pub max: usize,
+}
+
+/// The first string of `input` longer than its field allows, walking the
+/// input as `schema` declares it. A value of the wrong type is left to
+/// binding to report; only lengths are checked here, in time linear in the
+/// input.
+pub fn check_string_lengths(
+    schema: &Schema,
+    input: &serde_json::Value,
+) -> Result<(), StringTooLong> {
+    for var in &schema.variables {
+        if let Some(v) = input.get(&var.name) {
+            walk_strings(schema, &var.ty, var.max_len, v, &mut var.name.clone())?;
+        }
+    }
+    Ok(())
+}
+
+fn walk_strings(
+    schema: &Schema,
+    ty: &Type,
+    max_len: usize,
+    v: &serde_json::Value,
+    path: &mut String,
+) -> Result<(), StringTooLong> {
+    use serde_json::Value as J;
+    match (ty, v) {
+        (_, J::String(s)) if s.len() > max_len => Err(StringTooLong {
+            path: path.clone(),
+            len: s.len(),
+            max: max_len,
+        }),
+        (Type::List { elem, .. }, J::Array(items)) => {
+            for (i, item) in items.iter().enumerate() {
+                let at = path.len();
+                path.push_str(&format!("[{i}]"));
+                walk_strings(schema, elem, max_len, item, path)?;
+                path.truncate(at);
+            }
+            Ok(())
+        }
+        (Type::Struct(name), J::Object(obj)) => {
+            for field in &schema.struct_decl(name).fields {
+                if let Some(fv) = obj.get(&field.name) {
+                    let at = path.len();
+                    path.push('.');
+                    path.push_str(&field.name);
+                    walk_strings(schema, &field.ty, field.max_len, fv, path)?;
+                    path.truncate(at);
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
     }
 }

@@ -620,6 +620,7 @@ fn a_plugin_gate_is_denied_until_an_org_setting_lists_the_plugin() {
             Checkpoint::RunCreate,
             run_create::SCHEMA_VERSION,
             Ok(input),
+            None,
             &ctx("payments-api", Some("production")),
             ps,
         )
