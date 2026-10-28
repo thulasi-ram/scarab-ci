@@ -94,6 +94,26 @@ pub fn interpolate(template: &str, ctx: &serde_json::Value) -> Result<String, Pi
     Ok(out)
 }
 
+/// Like [`interpolate`], but a `template` that is exactly one `${{ expr }}`
+/// (surrounding whitespace aside) resolves to the JSON value of `expr`
+/// itself rather than its text, so an array or a number keeps its type.
+/// Anything else interpolates to a string.
+pub fn interpolate_value(
+    template: &str,
+    ctx: &serde_json::Value,
+) -> Result<serde_json::Value, PipelineError> {
+    let trimmed = template.trim();
+    if let Some(inner) = trimmed
+        .strip_prefix("${{")
+        .and_then(|t| t.strip_suffix("}}"))
+    {
+        if !inner.contains("${{") && !inner.contains("}}") {
+            return eval(inner.trim(), ctx);
+        }
+    }
+    interpolate(template, ctx).map(serde_json::Value::String)
+}
+
 /// Extract the (trimmed) expressions inside each `${{ … }}` in `template`,
 /// erroring if any is unterminated.
 pub(crate) fn interpolations(template: &str) -> Result<Vec<&str>, PipelineError> {

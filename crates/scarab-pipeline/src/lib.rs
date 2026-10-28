@@ -344,6 +344,13 @@ pub struct StepSpec {
     /// `gate`/`clone`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<BuildSpec>,
+    /// If set, this is a **plugin_action** step (ADR-0072 §4, ADR-0074 §5):
+    /// core offers an invocation of a PluginAction to the named plugin
+    /// installation and the plugin's answer is the Step's verdict. It
+    /// launches no Pod, so core enforces its `timeout` itself. Image-less
+    /// like `gate`/`clone`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_action: Option<PluginActionSpec>,
     /// If set, this is an **invoke** step (ADR-0038): a repo-relative path to a
     /// Library pipeline (under `.scarab/lib/` by convention) that is *inlined at
     /// compile time*, not a runtime object. The step launches nothing itself;
@@ -695,6 +702,11 @@ impl StepSpec {
         self.build.is_some()
     }
 
+    /// Is this a plugin_action step (ADR-0072 §4)? It launches no Pod.
+    pub fn is_plugin_action(&self) -> bool {
+        self.plugin_action.is_some()
+    }
+
     /// Is this an image-less invoke step (a compile-time library inline point)?
     /// True only in authored YAML — [`compile_yaml_with_libs`] resolves every
     /// invoke step away, so a compiled IR never contains one.
@@ -914,6 +926,95 @@ pub struct CloneSpec {
     /// its resolved SHA (ADR-0043/0044) — restarts always re-clone that SHA.
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "ref")]
     pub r#ref: Option<String>,
+}
+
+/// A `plugin_action` step (ADR-0072 §4, ADR-0074 §5): which installed
+/// plugin, which of the actions its manifest declares, and the action's
+/// inputs.
+///
+/// `plugin` is the PluginInstallation's name in the Run's Org. Run creation
+/// refuses the Run when no installation has that name or its manifest does
+/// not declare `action`. A string anywhere in `with` may carry
+/// `${{ outputs.<step>.<name> }}`, `${{ inputs.<name> }}` or
+/// `${{ matrix.<dim> }}`, resolved when the Step starts; a string that is
+/// exactly one `${{ … }}` keeps the JSON type of what it resolves to (an
+/// array of images stays an array).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginActionSpec {
+    #[serde(default)]
+    pub plugin: String,
+    #[serde(default)]
+    pub action: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub with: BTreeMap<String, serde_json::Value>,
+}
+
+impl PluginActionSpec {
+    /// Every string inside `with`, depth first: what interpolation reads.
+    pub fn strings(&self) -> Vec<&str> {
+        fn walk<'a>(v: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+            match v {
+                serde_json::Value::String(s) => out.push(s),
+                serde_json::Value::Array(items) => items.iter().for_each(|i| walk(i, out)),
+                serde_json::Value::Object(map) => map.values().for_each(|i| walk(i, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        self.with.values().for_each(|v| walk(v, &mut out));
+        out
+    }
+
+    /// [`strings`](Self::strings), mutably: what an invoke's output-reference
+    /// rewrite edits.
+    pub fn strings_mut(&mut self) -> Vec<&mut String> {
+        fn walk<'a>(v: &'a mut serde_json::Value, out: &mut Vec<&'a mut String>) {
+            match v {
+                serde_json::Value::String(s) => out.push(s),
+                serde_json::Value::Array(items) => items.iter_mut().for_each(|i| walk(i, out)),
+                serde_json::Value::Object(map) => map.values_mut().for_each(|i| walk(i, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        self.with.values_mut().for_each(|v| walk(v, &mut out));
+        out
+    }
+}
+
+/// Resolve the `${{ … }}` interpolations in a plugin action's `with`
+/// against `ctx` (ADR-0041 context: `outputs`, `inputs`, `matrix`). A string
+/// that is exactly one `${{ expr }}` becomes the JSON value `expr` resolves
+/// to; any other string is interpolated as text. Fail-fast like
+/// [`interpolate_spec`].
+pub fn interpolate_with(
+    with: &BTreeMap<String, serde_json::Value>,
+    ctx: &serde_json::Value,
+) -> Result<BTreeMap<String, serde_json::Value>, PipelineError> {
+    fn resolve(
+        v: &serde_json::Value,
+        ctx: &serde_json::Value,
+    ) -> Result<serde_json::Value, PipelineError> {
+        Ok(match v {
+            serde_json::Value::String(s) => cel::interpolate_value(s, ctx)?,
+            serde_json::Value::Array(items) => serde_json::Value::Array(
+                items
+                    .iter()
+                    .map(|i| resolve(i, ctx))
+                    .collect::<Result<_, _>>()?,
+            ),
+            serde_json::Value::Object(map) => serde_json::Value::Object(
+                map.iter()
+                    .map(|(k, i)| resolve(i, ctx).map(|i| (k.clone(), i)))
+                    .collect::<Result<_, _>>()?,
+            ),
+            other => other.clone(),
+        })
+    }
+    with.iter()
+        .map(|(k, v)| resolve(v, ctx).map(|v| (k.clone(), v)))
+        .collect()
 }
 
 /// A step's keyed directory Cache declaration (ADR-0065 s1):
@@ -1776,6 +1877,11 @@ fn inline_level(
             for (_, v) in &mut step.env {
                 *v = rewrite_output_refs(v, invoke_id, exposed);
             }
+            if let Some(action) = &mut step.plugin_action {
+                for v in action.strings_mut() {
+                    *v = rewrite_output_refs(v, invoke_id, exposed);
+                }
+            }
         }
     }
 
@@ -1965,6 +2071,9 @@ fn interpolatable_strings(step: &StepSpec) -> Vec<&str> {
     let mut out: Vec<&str> = vec![step.image.as_str()];
     out.extend(step.command.iter().map(String::as_str));
     out.extend(step.env.iter().map(|(_, v)| v.as_str()));
+    if let Some(action) = &step.plugin_action {
+        out.extend(action.strings());
+    }
     out
 }
 
@@ -2371,6 +2480,53 @@ fn validate_deployment_requests(ir: &PipelineIr, step: &StepSpec, diagnostics: &
     }
 }
 
+/// The rules of a `plugin_action` step (ADR-0072 §4, ADR-0074 §5) that do
+/// not need the Org's installations: those (is the plugin installed, does it
+/// declare the action) are checked at Run creation.
+fn validate_plugin_action(
+    step: &StepSpec,
+    action: &PluginActionSpec,
+    diagnostics: &mut Vec<String>,
+) {
+    let mut refuse = |m: &str| diagnostics.push(format!("step `{}`: {m}", step.id));
+    if action.plugin.trim().is_empty() {
+        refuse("`plugin_action.plugin` must name a plugin installation");
+    }
+    if action.action.trim().is_empty() {
+        refuse("`plugin_action.action` must name an action the plugin declares");
+    }
+    // The plugin decides the outcome; there is no container to configure.
+    if !step.image.is_empty() || !step.command.is_empty() {
+        refuse("a plugin_action step runs no container — it must not set an image or command");
+    }
+    if !step.env.is_empty() || !step.secrets.is_empty() {
+        refuse("a plugin_action step runs no container — it must not set `env` or `secrets`");
+    }
+    if step.security.as_ref().is_some_and(|s| !s.is_baseline()) {
+        refuse("a plugin_action step runs no container — it must not set `security`");
+    }
+    if !step.services.is_empty() || !step.uses.is_empty() {
+        refuse("a plugin_action step runs no Pod — it must not set `services` or `uses`");
+    }
+    if step.cache.is_some() || step.outputs.is_some() || !step.artifacts.is_empty() {
+        refuse(
+            "a plugin_action step has no workspace — it must not set `cache`, `outputs` or \
+             `artifacts`",
+        );
+    }
+    if !step.placement_profiles.is_empty() || step.k8s_overlay.is_some() {
+        refuse("a plugin_action step runs no Pod — it must not set placement");
+    }
+    if !step.deployment_requests.is_empty() {
+        refuse("a plugin_action step must not set `deployment_requests`");
+    }
+    // One invocation per Step: a matrix would offer the same action once per
+    // leg, and no leg could be told apart by the plugin.
+    if !step.matrix_values.is_empty() {
+        refuse("`plugin_action` is not supported on a matrixed step");
+    }
+}
+
 pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
     let mut diagnostics = Vec::new();
 
@@ -2414,6 +2570,7 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
             step.gate.is_some(),
             step.clone.is_some(),
             step.build.is_some(),
+            step.plugin_action.is_some(),
         ]
         .iter()
         .filter(|k| **k)
@@ -2421,9 +2578,13 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
             > 1
         {
             diagnostics.push(format!(
-                "step `{}`: `gate`, `clone`, and `build` are mutually exclusive step kinds",
+                "step `{}`: `gate`, `clone`, `build` and `plugin_action` are mutually exclusive \
+                 step kinds",
                 step.id
             ));
+        }
+        if let Some(action) = &step.plugin_action {
+            validate_plugin_action(step, action, &mut diagnostics);
         }
         // Placement (ADR-0055): profile names must be non-empty, and a raw
         // `k8s_overlay`, if present, must be a JSON object (a pod-spec fragment) —
@@ -2589,7 +2750,11 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                 }
             }
             None => {
-                if step.image.is_empty() && !step.is_clone() && !step.is_build() {
+                if step.image.is_empty()
+                    && !step.is_clone()
+                    && !step.is_build()
+                    && !step.is_plugin_action()
+                {
                     diagnostics.push(format!("step `{}`: missing image", step.id));
                 }
                 if step.gate_after.is_some() {
@@ -2707,10 +2872,7 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                 diagnostics.push(format!("step `{}`: when {e}", step.id));
             }
         }
-        let mut templates = vec![&step.image];
-        templates.extend(&step.command);
-        templates.extend(step.env.iter().map(|(_, v)| v));
-        for t in templates {
+        for t in interpolatable_strings(step) {
             if let Err(e) = cel::check_interpolation(t) {
                 diagnostics.push(format!("step `{}`: {e}", step.id));
             }
@@ -4288,6 +4450,128 @@ mod tests {
             errs.iter()
                 .any(|e| e.contains("exposes output `ghost` but has no step `ghost`")),
             "got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn plugin_action_step_compiles_without_an_image() {
+        let ir = compile(
+            r#"
+environment: production
+interface: { inputs: [{ name: app, type: string, required: false, default: web }] }
+steps:
+  - { id: bump, image: busybox, results: [images] }
+  - id: live
+    needs: [bump]
+    timeout: 1800
+    results: [synced]
+    plugin_action:
+      plugin: argocd
+      action: wait-live
+      with:
+        application: "payments/${{ inputs.app }}"
+        images: ${{ outputs.bump.images }}
+        strict: true
+"#,
+        );
+        let live = &ir.steps[1];
+        assert!(live.is_plugin_action());
+        let action = live.plugin_action.as_ref().unwrap();
+        assert_eq!(
+            (action.plugin.as_str(), action.action.as_str()),
+            ("argocd", "wait-live")
+        );
+        assert_eq!(action.with["strict"], json!(true));
+        // Round-trips through the stored IR.
+        let back: PipelineIr = serde_json::from_value(serde_json::to_value(&ir).unwrap()).unwrap();
+        assert_eq!(back, ir);
+    }
+
+    #[test]
+    fn plugin_action_with_resolves_whole_references_to_their_json_type() {
+        let with = BTreeMap::from([
+            ("images".to_string(), json!("${{ outputs.bump.images }}")),
+            (
+                "application".to_string(),
+                json!("payments/${{ inputs.app }}"),
+            ),
+            (
+                "nested".to_string(),
+                json!({ "list": ["${{ inputs.app }}", 3] }),
+            ),
+        ]);
+        let ctx = json!({
+            "outputs": { "bump": { "images": ["ghcr.io/a@sha256:1"] } },
+            "inputs": { "app": "web" },
+        });
+        let out = interpolate_with(&with, &ctx).unwrap();
+        assert_eq!(out["images"], json!(["ghcr.io/a@sha256:1"]));
+        assert_eq!(out["application"], json!("payments/web"));
+        assert_eq!(out["nested"], json!({ "list": ["web", 3] }));
+        // Fail-fast on a reference that does not resolve (ADR-0041 §5).
+        let bad = BTreeMap::from([("x".to_string(), json!("${{ outputs.nope.x }}"))]);
+        assert!(interpolate_with(&bad, &ctx).is_err());
+    }
+
+    #[test]
+    fn plugin_action_rejects_a_container_or_another_kind() {
+        for (step, wanted) in [
+            (
+                "{ id: s, image: busybox, plugin_action: { plugin: p, action: a } }",
+                "must not set an image or command",
+            ),
+            (
+                "{ id: s, command: [true], plugin_action: { plugin: p, action: a } }",
+                "must not set an image or command",
+            ),
+            (
+                "{ id: s, gate: manual, plugin_action: { plugin: p, action: a } }",
+                "mutually exclusive",
+            ),
+            (
+                "{ id: s, clone: {}, plugin_action: { plugin: p, action: a } }",
+                "mutually exclusive",
+            ),
+            (
+                "{ id: s, plugin_action: { plugin: '', action: a } }",
+                "must name a plugin",
+            ),
+            (
+                "{ id: s, plugin_action: { plugin: p, action: '' } }",
+                "must name an action",
+            ),
+            (
+                "{ id: s, plugin_action: { plugin: p, action: a }, timeout: 0 }",
+                "greater than zero",
+            ),
+            (
+                "{ id: s, plugin_action: { plugin: p, action: a }, timeout: 999999 }",
+                "at most",
+            ),
+            (
+                "{ id: s, plugin_action: { plugin: p, action: a, with: { x: '${{ y ' } } }",
+                "unterminated",
+            ),
+        ] {
+            let errs = errors(&format!("steps: [{step}]"));
+            assert!(errs.iter().any(|e| e.contains(wanted)), "{step}: {errs:?}");
+        }
+        assert!(
+            parse_error("steps: [{ id: s, plugin_action: { plugin: p, action: a, x: 1 } }]")
+                .contains("unknown field")
+        );
+    }
+
+    #[test]
+    fn plugin_action_is_refused_on_a_matrixed_step() {
+        let errs = errors(
+            "steps: [{ id: s, matrix: { dimensions: { region: [eu, us] } }, \
+             plugin_action: { plugin: p, action: a } }]",
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("not supported on a matrixed step")),
+            "{errs:?}"
         );
     }
 
