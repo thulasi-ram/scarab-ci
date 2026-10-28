@@ -798,6 +798,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // every Deploy Run. ALWAYS wired here — an unwired store would admit
         // deploys with no rules, which only a hand-built test state may do.
         .with_environment_governance(pg.clone())
+        // Stored Policies (ADR-0075), consulted at Run creation.
+        .with_policies(pg.clone())
         // Org-level Environments (ADR-0071): their admin API.
         .with_org_environments(pg.clone())
         // The PluginInstallation registry (ADR-0072). Wired whatever

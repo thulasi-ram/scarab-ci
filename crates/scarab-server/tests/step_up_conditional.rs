@@ -829,7 +829,7 @@ async fn at_gate(h: &Harness, governance: &InMemoryEnvironmentGovernance, pipeli
         &forge(),
         h.db.as_ref(),
         h.clock.as_ref(),
-        Some(governance),
+        scarab_server::AdmissionPorts::governance(Some(governance)),
         "bob".into(),
         RepoRef {
             owner: "acme".into(),

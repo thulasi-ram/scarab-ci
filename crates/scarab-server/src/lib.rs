@@ -162,6 +162,10 @@ pub struct AppState {
     /// environment was before ADR-0071, and the per-repo environment reads
     /// answer 404.
     pub environment_governance: Option<Arc<dyn scarab_project::EnvironmentGovernanceStore>>,
+    /// Stored Policies and their decisions (ADR-0075). Admission consults
+    /// the `run.create` Policies through it. `main.rs` always wires it; `None`
+    /// (a hand-built state) consults no Policies, as before ADR-0075.
+    pub policies: Option<Arc<dyn scarab_policy::store::PolicyStore>>,
     /// Org-level Environments (ADR-0071, MMP step 1). `None` disables
     /// `/v1/orgs/{org}/environments[/{env}]` (404).
     pub org_environments: Option<Arc<dyn scarab_project::OrgEnvironmentStore>>,
@@ -290,6 +294,7 @@ impl AppState {
             api_tokens: None,
             environments: None,
             environment_governance: None,
+            policies: None,
             org_environments: None,
             plugins: None,
             broker_plugins: None,
@@ -386,6 +391,20 @@ impl AppState {
     ) -> Self {
         self.environment_governance = Some(governance);
         self
+    }
+
+    /// Consult stored Policies at Run creation (ADR-0075).
+    pub fn with_policies(mut self, policies: Arc<dyn scarab_policy::store::PolicyStore>) -> Self {
+        self.policies = Some(policies);
+        self
+    }
+
+    /// The stores Run admission reads ([`AdmissionPorts`]).
+    pub fn admission_ports(&self) -> AdmissionPorts<'_> {
+        AdmissionPorts {
+            governance: self.environment_governance.as_deref(),
+            policies: self.policies.as_deref(),
+        }
     }
 
     /// Enable the org-level Environment endpoints (ADR-0071).
@@ -1515,7 +1534,8 @@ impl From<DispatchError> for ApiError {
             // does not let this Project deploy — a policy refusal (403) with
             // the actionable text, not a malformed request.
             refused @ (DispatchError::UnknownEnvironment { .. }
-            | DispatchError::NotEligible { .. }) => ApiError::Denied(refused.to_string()),
+            | DispatchError::NotEligible { .. }
+            | DispatchError::PolicyDenied { .. }) => ApiError::Denied(refused.to_string()),
             other => ApiError::BadRequest(other.to_string()),
         }
     }
@@ -1590,6 +1610,7 @@ async fn create_run(
     Json(req): Json<CreateRunRequest>,
 ) -> Result<(StatusCode, Json<CreateRunResponse>), ApiError> {
     authorize(&st, &headers, Action::Write).await?;
+    // No `run.create` Policy is consulted (ADR-0075): an inline Run names no org or Project.
 
     // Resolve launch parameters against the declared interface BEFORE creating
     // the run (ADR-0043): coerce to declared types, apply defaults, validate
@@ -1766,7 +1787,7 @@ async fn create_run(
     request_body = DispatchRequest,
     responses(
         (status = 201, description = "Run created", body = CreateRunResponse),
-        (status = 403, description = "the caller may not dispatch, or the pipeline's Environment does not exist in the org or does not admit this project (ADR-0071); the body says what an org admin must do. No run is created")
+        (status = 403, description = "the caller may not dispatch, the pipeline's Environment does not exist in the org or does not admit this project (ADR-0071), or a run.create Policy denied the Run (ADR-0075); the body says why. No run is created")
     )
 )]
 async fn dispatch(
@@ -1791,7 +1812,7 @@ async fn dispatch(
         forge.as_ref(),
         st.db.as_ref(),
         st.clock.as_ref(),
-        st.environment_governance.as_deref(),
+        st.admission_ports(),
         principal.subject,
         scarab_forge::RepoRef {
             owner: org,
@@ -4123,37 +4144,77 @@ fn origin_pr_base(event: &scarab_forge::Event) -> Option<String> {
 /// Project — ADR-0037, ADR-0071) is skipped on its own and never aborts the
 /// delivery: the other pipelines still run.
 ///
-/// `governance` is the org-level Environment governance store (ADR-0071);
-/// `None` only in a hand-built state, where a deploy is admitted as an
-/// undefined environment was before ADR-0071 ([`GovernedRules::Unwired`]).
+/// `ports` are the stores admission reads ([`AdmissionPorts`]).
 ///
-/// The run ids only; [`trigger_runs_from_event`] also reports the deploy
-/// pipelines the Environment refused.
+/// The run ids only; [`trigger_runs_from_event`] also reports the
+/// pipelines the Environment or a Policy refused.
 pub async fn trigger_run_from_event(
     forge: &dyn scarab_forge::ForgePort,
     db: &dyn Db,
     clock: &dyn Clock,
-    governance: Option<&dyn scarab_project::EnvironmentGovernanceStore>,
+    ports: AdmissionPorts<'_>,
     event: &scarab_forge::Event,
 ) -> Result<Vec<RunId>, TriggerError> {
-    Ok(trigger_runs_from_event(forge, db, clock, governance, event)
+    Ok(trigger_runs_from_event(forge, db, clock, ports, event)
         .await?
         .runs)
 }
 
-/// A deploy pipeline a delivery did not run because its Environment does not
-/// exist in the Org or does not admit the Project (ADR-0071 §2, §10). Reported
-/// in the webhook delivery body: for a pipeline whose name the ADR-0071
-/// migration could never see (it had never run), this is the only place the
-/// refusal surfaces besides the server log.
+/// The stores Run admission reads, beside the run store itself. Each `None`
+/// is a hand-built state (a test, or the inline dev stack); `main.rs` wires
+/// both.
+#[derive(Clone, Copy, Default)]
+pub struct AdmissionPorts<'a> {
+    /// Org-level Environment governance (ADR-0071). `None`: a deploy is
+    /// admitted as an undefined environment was before ADR-0071
+    /// ([`GovernedRules::Unwired`]).
+    pub governance: Option<&'a dyn scarab_project::EnvironmentGovernanceStore>,
+    /// Stored Policies (ADR-0075), consulted at `run.create`. `None`: no
+    /// Policy is consulted and no decision recorded.
+    pub policies: Option<&'a dyn scarab_policy::store::PolicyStore>,
+}
+
+impl<'a> AdmissionPorts<'a> {
+    /// Environment governance only; no Policies.
+    pub fn governance(
+        governance: Option<&'a dyn scarab_project::EnvironmentGovernanceStore>,
+    ) -> Self {
+        AdmissionPorts {
+            governance,
+            policies: None,
+        }
+    }
+
+    /// The same ports, consulting `policies` at `run.create`.
+    pub fn with_policies(mut self, policies: &'a dyn scarab_policy::store::PolicyStore) -> Self {
+        self.policies = Some(policies);
+        self
+    }
+}
+
+/// A pipeline a delivery did not run because its Environment does not exist
+/// in the Org or does not admit this Project (ADR-0071 §2, §10), or because a
+/// `run.create` Policy denied it (ADR-0075). Reported in the webhook delivery
+/// body: for a pipeline whose name the ADR-0071 migration could never see (it
+/// had never run), this is the only place the refusal surfaces besides the
+/// server log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RefusedPipeline {
     /// The pipeline file, e.g. `.scarab/deploy.yaml`.
     pub pipeline: String,
-    /// The Environment it named.
-    pub environment: String,
-    /// What is missing and who can fix it.
+    /// The Environment it named; absent for a Policy refusal of a Pipeline
+    /// that names none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
+    /// What is missing and who can fix it, or what the Policies denied.
     pub reason: String,
+    /// The recorded PolicyDecision, in the org's decision log, for a Policy
+    /// refusal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision_id: Option<String>,
+    /// Each Policy deny message, naming its Policy, for a Policy refusal.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<String>,
 }
 
 /// What one delivery did: the Runs it created and the deploy pipelines the
@@ -4165,13 +4226,13 @@ pub struct TriggerOutcome {
     pub refused: Vec<RefusedPipeline>,
 }
 
-/// [`trigger_run_from_event`], also reporting every deploy pipeline refused
-/// as `UnknownEnvironment` / `NotEligible`.
+/// [`trigger_run_from_event`], also reporting every pipeline refused as
+/// `UnknownEnvironment` / `NotEligible` or by a Policy.
 pub async fn trigger_runs_from_event(
     forge: &dyn scarab_forge::ForgePort,
     db: &dyn Db,
     clock: &dyn Clock,
-    governance: Option<&dyn scarab_project::EnvironmentGovernanceStore>,
+    ports: AdmissionPorts<'_>,
     event: &scarab_forge::Event,
 ) -> Result<TriggerOutcome, TriggerError> {
     // Repo-less events (cron/manual/api) don't carry in-repo config here.
@@ -4232,8 +4293,7 @@ pub async fn trigger_runs_from_event(
         // skips this pipeline only (the dispatch path turns the same refusal
         // into a fail-closed error). Webhook-triggered runs supply no launch
         // parameters.
-        match admit_and_create_run(db, clock, governance, event, &ir, path, &excluded, None).await?
-        {
+        match admit_and_create_run(db, clock, ports, event, &ir, path, &excluded, None).await? {
             Admission::Created(run) => outcome.runs.push(run),
             // A branch-scoped Environment ignoring every other branch is the
             // rule working, not news: silent, as it always was.
@@ -4257,8 +4317,36 @@ pub async fn trigger_runs_from_event(
                 );
                 outcome.refused.push(RefusedPipeline {
                     pipeline: path.clone(),
-                    environment: environment.clone(),
+                    environment: Some(environment.clone()),
                     reason,
+                    decision_id: None,
+                    messages: Vec::new(),
+                });
+            }
+            // ADR-0075 §9: a `run.create` Policy denied this Run. Its
+            // decision is in the org's decision log; the body names it and
+            // carries every message.
+            Admission::Refused(
+                ref refusal @ AdmissionRefusal::PolicyDenied {
+                    ref decision_id,
+                    ref messages,
+                },
+            ) => {
+                let reason = admission_refusal_message(refusal, &repo.owner, &repo.name);
+                tracing::warn!(
+                    org = %repo.owner,
+                    project = %repo.name,
+                    pipeline = %path,
+                    trigger = event.trigger_kind().as_str(),
+                    decision = %decision_id,
+                    "pipeline not run: {reason}"
+                );
+                outcome.refused.push(RefusedPipeline {
+                    pipeline: path.clone(),
+                    environment: ir.environment.clone(),
+                    reason,
+                    decision_id: Some(decision_id.clone()),
+                    messages: messages.clone(),
                 });
             }
         }
@@ -4326,6 +4414,12 @@ enum AdmissionRefusal {
     /// The Environment exists but its EnvironmentProjectEligibility does not
     /// admit this Project (ADR-0071 §2).
     NotEligible { environment: String },
+    /// A `run.create` Policy denied the Run (ADR-0075). `decision_id` is the
+    /// recorded PolicyDecision; `messages` name the Policy each came from.
+    PolicyDenied {
+        decision_id: String,
+        messages: Vec<String>,
+    },
 }
 
 /// The outcome of admitting one compiled pipeline (ADR-0037, ADR-0071 §2):
@@ -4503,7 +4597,7 @@ async fn resolve_governance(
 async fn admit_and_create_run(
     db: &dyn Db,
     clock: &dyn Clock,
-    governance: Option<&dyn scarab_project::EnvironmentGovernanceStore>,
+    ports: AdmissionPorts<'_>,
     event: &scarab_forge::Event,
     ir: &scarab_pipeline::PipelineIr,
     path: &str,
@@ -4521,7 +4615,7 @@ async fn admit_and_create_run(
     // an unknown Environment or an ineligible Project outright. Then reject a
     // disallowed ref at creation (enforced even without an approver gate) and
     // admit per-step privilege grants against the Project's grant.
-    let gov = match resolve_governance(governance, event, ir, repo).await? {
+    let gov = match resolve_governance(ports.governance, event, ir, repo).await? {
         Ok(gov) => gov,
         Err(refusal) => return Ok(Admission::Refused(refusal)),
     };
@@ -4555,6 +4649,17 @@ async fn admit_and_create_run(
 
     let now = clock.now().await;
     let run = new_run_id();
+    // ADR-0075: the `run.create` Policies, after the Environment's ref and
+    // reason checks and before anything is persisted (`persist_run_from_ir`
+    // is not atomic, so a deny after it would leave a partial Run). The run
+    // id is minted first so an allow decision names the Run it admitted.
+    if let Some(policies) = ports.policies {
+        if let Err(refusal) =
+            consult_run_create(policies, event, ir, path, repo, &gov, &run, now).await?
+        {
+            return Ok(Admission::Refused(refusal));
+        }
+    }
     persist_run_from_ir(db, &run, ir, event, path, &gov, excluded, params, now).await?;
     // Freeze the resolved launch parameters on the run so every step's
     // interpolation (`${{ inputs.… }}`) and `SCARAB_PARAM_*` env re-derive
@@ -4563,6 +4668,180 @@ async fn admit_and_create_run(
         db.set_run_params(&run, params).await?;
     }
     Ok(Admission::Created(run))
+}
+
+/// A PolicyStore failure: refuse the Run (fail closed) rather than admit it
+/// unchecked. A 500 on the webhook and dispatch paths, like a governance
+/// store failure.
+fn policy_store_err(e: scarab_policy::store::PolicyStoreError) -> TriggerError {
+    TriggerError::Db(DbError::Other(format!(
+        "policy store: {e}; the Run was not created because its Policies could not be checked"
+    )))
+}
+
+/// The `run.create` trigger of `event` (ADR-0075 §2). For a manual or API
+/// dispatch the actor is the authenticated Principal (the dispatch handler
+/// passes `principal.subject`), so it is both `trigger.principal` and the
+/// input's `principal`. A webhook actor is a forge login; resolving it to a
+/// Principal through identity links (ADR-0069) is not done here, so a
+/// webhook Run has no `principal`.
+fn run_create_trigger(
+    event: &scarab_forge::Event,
+) -> (scarab_policy::run_create::Trigger, Option<String>) {
+    use scarab_forge::{Event, TriggerKind as F};
+    use scarab_policy::run_create::TriggerKind as P;
+    let kind = match event.trigger_kind() {
+        F::Push => P::Push,
+        F::PullRequest => P::PullRequest,
+        F::Tag => P::Tag,
+        F::Release => P::Release,
+        F::Comment => P::Comment,
+        F::Cron => P::Cron,
+        F::Manual => P::Manual,
+        F::Api => P::Api,
+        F::Upstream => P::Upstream,
+    };
+    let sha = match event {
+        Event::Push { after, .. } => Some(after.clone()),
+        Event::PullRequest { head, .. } => Some(head.clone()),
+        Event::Manual { sha, .. } | Event::Api { sha, .. } => Some(sha.clone()),
+        _ => None,
+    }
+    .filter(|s| !s.is_empty());
+    let (principal, reason) = match event {
+        Event::Manual { actor, reason, .. } | Event::Api { actor, reason, .. } => (
+            (!actor.is_empty()).then(|| actor.clone()),
+            reason.clone().filter(|r| !r.trim().is_empty()),
+        ),
+        _ => (None, None),
+    };
+    let trigger = scarab_policy::run_create::Trigger {
+        kind,
+        r#ref: event.protection_ref(),
+        sha,
+        fork: event.is_fork_pr(),
+        actor: event.actor().map(str::to_string),
+        principal: principal.clone(),
+        reason,
+    };
+    (trigger, principal)
+}
+
+/// Consults the `run.create` Policies of `repo`'s org and Project for a
+/// compiled Pipeline about to become Run `run` (ADR-0075 §2, §7, §9).
+///
+/// - No Policy at `run.create`: nothing is evaluated or recorded.
+/// - Otherwise the decision is recorded: an allow with `run`, a deny with no
+///   Run (the org's decision log). A deny is an
+///   [`AdmissionRefusal::PolicyDenied`] whose messages name their Policy.
+/// - A stored Policy that no longer compiles denies when enforced and
+///   matched ([`evaluate_stored`](scarab_policy::evaluate::evaluate_stored)).
+/// - A Run over an input list cap cannot be checked: it is refused, naming
+///   the cap, when an enforced Policy matches it, and admitted otherwise.
+/// - A store failure (loading or recording) is an error: no Run.
+#[allow(clippy::too_many_arguments)]
+async fn consult_run_create(
+    policies: &dyn scarab_policy::store::PolicyStore,
+    event: &scarab_forge::Event,
+    ir: &scarab_pipeline::PipelineIr,
+    path: &str,
+    repo: &scarab_forge::RepoRef,
+    gov: &RunGovernance,
+    run: &RunId,
+    now: scarab_engine::Timestamp,
+) -> Result<Result<(), AdmissionRefusal>, TriggerError> {
+    use scarab_policy::evaluate::{evaluate_stored, MatchContext, PolicyOutcome};
+    use scarab_policy::policy::{Checkpoint, Mode};
+    use scarab_policy::run_create;
+
+    let stored = policies
+        .effective(&repo.owner, Some(&repo.name), Checkpoint::RunCreate)
+        .await
+        .map_err(policy_store_err)?;
+    if stored.is_empty() {
+        return Ok(Ok(()));
+    }
+
+    let environment = match gov {
+        RunGovernance::Governed { environment, .. } => Some(environment.clone()),
+        RunGovernance::Ungoverned => None,
+    };
+    let (trigger, principal) = run_create_trigger(event);
+    let ctx = MatchContext {
+        project: repo.name.clone(),
+        environment: environment.clone(),
+        trigger_kind: trigger.kind,
+    };
+    let input = scarab_policy::schema::Timestamp::from_unix_millis(now.0)
+        .ok_or_else(|| format!("the time {} is out of range", now.0))
+        .and_then(|time| {
+            let facts = run_create::RunCreateFacts {
+                org: repo.owner.clone(),
+                project: repo.name.clone(),
+                trigger,
+                pipeline_path: path.to_string(),
+                environment,
+                principal,
+                time,
+            };
+            run_create::input_from_pipeline(ir, facts).map_err(|e| e.to_string())
+        })
+        .and_then(|i| serde_json::to_value(i).map_err(|e| e.to_string()));
+
+    // CEL runs on the engine's own large-stack thread; keep that join off
+    // the async workers.
+    let decision = tokio::task::spawn_blocking(move || {
+        evaluate_stored(
+            Checkpoint::RunCreate,
+            run_create::SCHEMA_VERSION,
+            input.as_ref().map_err(String::as_str),
+            &ctx,
+            &stored,
+        )
+    })
+    .await
+    .map_err(|e| policy_store_err(scarab_policy::store::PolicyStoreError::Store(e.to_string())))?;
+
+    let denied = decision.is_denied();
+    // Each message with the Policy it came from, for the refusal.
+    let mut messages = Vec::new();
+    if denied {
+        for r in &decision.results {
+            if r.mode != Mode::Enforce {
+                continue;
+            }
+            match &r.outcome {
+                PolicyOutcome::Denied { messages: m } => {
+                    messages.extend(m.iter().map(|m| format!("policy `{}`: {m}", r.name)))
+                }
+                PolicyOutcome::Error { message } => {
+                    messages.push(format!("policy `{}`: {message}", r.name))
+                }
+                _ => {}
+            }
+        }
+    }
+    let record = scarab_policy::store::DecisionRecord {
+        id: Uuid::now_v7().to_string(),
+        org: repo.owner.clone(),
+        project: Some(repo.name.clone()),
+        run_id: (!denied).then(|| run.0.clone()),
+        step_id: None,
+        attempt: None,
+        decision,
+        at: now.0,
+    };
+    let decision_id = policies
+        .record_decision(&record)
+        .await
+        .map_err(policy_store_err)?;
+    if denied {
+        return Ok(Err(AdmissionRefusal::PolicyDenied {
+            decision_id,
+            messages,
+        }));
+    }
+    Ok(Ok(()))
 }
 
 /// Which trigger a dispatch opts into: a human [`Manual`](DispatchKind::Manual)
@@ -4667,6 +4946,13 @@ pub enum DispatchError {
         project: String,
         environment: String,
     },
+    /// A `run.create` Policy denied the Run (ADR-0075) — fail-closed; the
+    /// message carries every deny and the recorded decision's id.
+    #[error("{}", policy_denied_message(.decision_id, .messages))]
+    PolicyDenied {
+        decision_id: String,
+        messages: Vec<String>,
+    },
     #[error(transparent)]
     Db(DbError),
 }
@@ -4685,7 +4971,18 @@ fn admission_refusal_message(refusal: &AdmissionRefusal, org: &str, project: &st
         AdmissionRefusal::RefNotAllowed => {
             "the ref is not allowed to deploy to this environment".to_string()
         }
+        AdmissionRefusal::PolicyDenied {
+            decision_id,
+            messages,
+        } => policy_denied_message(decision_id, messages),
     }
+}
+
+fn policy_denied_message(decision_id: &str, messages: &[String]) -> String {
+    format!(
+        "a run.create Policy refused this Run (decision {decision_id}): {}",
+        messages.join("; ")
+    )
 }
 
 fn unknown_environment_message(org: &str, project: &str, environment: &str) -> String {
@@ -4799,7 +5096,7 @@ pub async fn dispatch_run(
     forge: &dyn scarab_forge::ForgePort,
     db: &dyn Db,
     clock: &dyn Clock,
-    governance: Option<&dyn scarab_project::EnvironmentGovernanceStore>,
+    ports: AdmissionPorts<'_>,
     actor: String,
     repo: scarab_forge::RepoRef,
     r#ref: String,
@@ -4868,7 +5165,7 @@ pub async fn dispatch_run(
     let refusal = match admit_and_create_run(
         db,
         clock,
-        governance,
+        ports,
         &event,
         &ir,
         &path,
@@ -4898,6 +5195,13 @@ pub async fn dispatch_run(
             org: repo.owner.clone(),
             project: repo.name.clone(),
             environment,
+        },
+        AdmissionRefusal::PolicyDenied {
+            decision_id,
+            messages,
+        } => DispatchError::PolicyDenied {
+            decision_id,
+            messages,
         },
     })
 }
@@ -5571,7 +5875,7 @@ async fn ingest_event(
         forge.as_ref(),
         st.db.as_ref(),
         st.clock.as_ref(),
-        st.environment_governance.as_deref(),
+        st.admission_ports(),
         &event,
     )
     .await
