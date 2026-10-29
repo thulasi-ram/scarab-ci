@@ -32,6 +32,9 @@ pub use environment_governance::InMemoryEnvironmentGovernance;
 /// versioning, name and concurrency rules.
 mod policies;
 pub use policies::InMemoryPolicies;
+// The in-memory `LibraryStore` (ADR-0076).
+mod libraries;
+pub use libraries::InMemoryLibraries;
 
 /// In-memory step-up stores (ADR-0073) and a real-AEAD test `Sealer`, with
 /// the Postgres adapter's single-use, expiry and compare-and-swap semantics.

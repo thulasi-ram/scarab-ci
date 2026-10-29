@@ -32,6 +32,9 @@ use scarab_project::{Deployment, Environment, EnvironmentStore, ProjectError};
 /// `EnvironmentGovernanceStore` (ADR-0071 §2, §3, §8): baseline, eligibility,
 /// overlays and grants, and the one-snapshot read admission makes.
 mod environment_governance;
+/// `LibraryStore` (ADR-0076): installed libraries, their versions, yanks
+/// and each org's first-party defaults.
+mod libraries;
 /// `OrgEnvironmentStore` (ADR-0071): the org-level Environment.
 mod org_environments;
 /// `PluginStore` (ADR-0072): PluginInstallations, the kill switch, their
