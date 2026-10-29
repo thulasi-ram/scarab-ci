@@ -6630,6 +6630,9 @@
           },
           "404": {
             "description": "no such run/step, no step spec, or debug-pod disabled"
+          },
+          "409": {
+            "description": "the step was inlined from a library version yanked in the run's org"
           }
         },
         "security": [

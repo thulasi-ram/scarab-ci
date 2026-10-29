@@ -9492,6 +9492,13 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description the step was inlined from a library version yanked in the run's org */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     get_step_logs: {
