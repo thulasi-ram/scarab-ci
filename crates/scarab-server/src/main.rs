@@ -554,11 +554,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         scarab_server::connections_config::CredentialOverrides::from_specs(&config.connections)
             .with_github_app_pem(github_app_pem.clone(), config.github_app_id.is_some()),
     );
+    // The orgs config bound repos into: offered their first-party libraries
+    // once the API state exists (ADR-0076 §5).
+    let mut provisioned_orgs = std::collections::BTreeSet::new();
     {
         let provisioned =
             scarab_server::connections_config::provision(pg.as_ref(), &config.connections)
                 .await
                 .map_err(|e| format!("refusing to start: {e}"))?;
+        provisioned_orgs.extend(
+            provisioned
+                .bound
+                .iter()
+                .filter_map(|r| r.split_once('/').map(|(org, _)| org.to_string())),
+        );
         if !provisioned.owned.is_empty() {
             tracing::info!(
                 connections = ?provisioned.owned,
@@ -848,6 +857,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match scarab_server::library_fetch::HttpsFetcher::new() {
         Ok(f) => state = state.with_library_fetcher(Arc::new(f)),
         Err(e) => tracing::warn!(error = %e, "anonymous library fetches are off"),
+    }
+    // A new org bound by config gets the first-party libraries (ADR-0076 §5);
+    // claimed here, installed in the background.
+    for org in &provisioned_orgs {
+        scarab_server::libraries::offer_defaults_on_bind(&state, org).await;
     }
     // The rerun-widening oracle's strict handle (git-bug 4afaa3e amendment F1):
     // only exists when a Depot is configured — without one, `workspace_cas` IS

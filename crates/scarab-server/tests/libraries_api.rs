@@ -615,3 +615,44 @@ async fn an_older_first_party_version_shows_an_update_marked_as_a_security_fix()
     assert_eq!(i["update"]["security_fix"], true);
     assert_eq!(list["first_party"][0]["installed"], true);
 }
+
+/// Through the real bind route: the first repo of an org binds whether or
+/// not the release source can be reached, and the org records what is
+/// missing.
+#[tokio::test]
+async fn a_bind_succeeds_when_the_defaults_cannot_be_fetched() {
+    let h = harness_with(
+        ManifestSource::Fixed(release_manifest()),
+        FakeForge::new(),
+        InMemoryLibraries::new(),
+    );
+    github_connection(&h.db).await;
+    // Nothing is served: every fetch fails.
+    let (st, b) = call(
+        &h.app,
+        "POST",
+        "/v1/connections/gh/repos",
+        Some(json!({ "owner": "acme", "name": "web" })),
+    )
+    .await;
+    assert!(st.is_success(), "{st} {b}");
+    let mut d = None;
+    for _ in 0..200 {
+        d = h.store.defaults("acme").await.unwrap();
+        if d.as_ref()
+            .is_some_and(|d| d.state != DefaultsState::Pending)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let d = d.expect("the bind claimed the org");
+    assert_eq!(d.state, DefaultsState::Missing);
+    assert_eq!(d.missing[0].name, "clone");
+    let (_, list) = call(&h.app, "GET", "/v1/orgs/acme/libraries", None).await;
+    assert_eq!(list["defaults"]["state"], "missing");
+    assert!(h
+        .http
+        .asked()
+        .contains(&raw("thulasi-ram", "scarab-ci", C2, "libs/clone.yaml")));
+}

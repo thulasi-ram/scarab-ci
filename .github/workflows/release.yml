@@ -1,0 +1,66 @@
+# The GitHub Release for a `v*` tag, with the first-party library manifest
+# (ADR-0076 §5) and the library files as assets.
+#
+# A Scarab server reads `libs-manifest.json` from its own version's release
+# (`SCARAB_LIBS_MANIFEST` overrides it) to know which library versions are
+# first-party, and installs those libraries into each new org from the
+# commit-pinned sources the manifest lists. The manifest carries every
+# released version of each library, so the previous release's manifest is
+# read first and extended (scripts/libs_manifest.py).
+#
+# Tags only: no pull request runs this. One small job, standard-library
+# Python, no build.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  libraries:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write # create the Release and upload its assets
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test the manifest generator
+        run: python3 -I scripts/test_libs_manifest.py
+      - name: Read the previous release's manifest
+        run: |
+          set -euo pipefail
+          prev=$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts \
+                   --json tagName,isPrerelease -q '[.[] | select(.tagName != env.TAG)][0].tagName // ""')
+          echo "previous release: ${prev:-none}"
+          if [ -n "$prev" ]; then
+            # A release from before ADR-0076 has no manifest: start a new one.
+            gh release download "$prev" --repo "$GITHUB_REPOSITORY" \
+              --pattern libs-manifest.json --dir prev || true
+          fi
+      - name: Write the manifest
+        run: |
+          set -euo pipefail
+          python3 -I scripts/libs_manifest.py \
+            --libs libs \
+            --repository "github.com/$GITHUB_REPOSITORY" \
+            --commit "$GITHUB_SHA" \
+            --release "$TAG" \
+            --previous prev/libs-manifest.json \
+            > libs-manifest.json
+          cat libs-manifest.json
+      - name: Create the Release and upload the assets
+        run: |
+          set -euo pipefail
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+          fi
+          shopt -s nullglob
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            libs-manifest.json libs/*.yaml

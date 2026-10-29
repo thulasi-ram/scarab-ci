@@ -6326,6 +6326,10 @@ async fn github_webhook(
             )
             .await
             .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;
+            // A new org gets the first-party libraries (ADR-0076 §5).
+            if !sync.added.is_empty() {
+                libraries::offer_defaults_on_bind(&st, &sync.account).await;
+            }
             return Ok((
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -9717,6 +9721,8 @@ async fn resync_connection(
             .bind_repo(&id, &repo, &repo.owner, &repo.name)
             .await
             .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        // A new org gets the first-party libraries (ADR-0076 §5).
+        libraries::offer_defaults_on_bind(&st, &repo.owner).await;
         bound.push(format!("{}/{}", repo.owner, repo.name));
     }
     Ok(Json(ResyncResultDto { bound, confirmed }))
@@ -10124,6 +10130,9 @@ async fn bind_repo(
         .bind_repo(&id, &repo, &repo.owner, &repo.name)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    // A new org gets the first-party libraries (ADR-0076 §5): claimed now,
+    // installed in the background, so the bind never waits on a forge.
+    libraries::offer_defaults_on_bind(&st, &repo.owner).await;
 
     let (webhook_registered, webhook_error) = if req.register_webhook {
         match try_register_webhook(&st, &conn, &repo).await {

@@ -1,0 +1,4 @@
+kind: library
+steps:
+  - id: git
+    image: ghcr.io/thulasi-ram/scarab-clone:0.3.0@sha256:0000000000000000000000000000000000000000000000000000000000000000

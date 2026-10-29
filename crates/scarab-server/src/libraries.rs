@@ -1433,6 +1433,19 @@ mod tests {
         assert!(update_notice(&m, &"d".repeat(64)).is_none());
     }
 
+    /// The manifest `scripts/libs_manifest.py` writes for its fixture (its
+    /// own test checks it writes exactly this), read as the server reads a
+    /// release asset.
+    #[test]
+    fn the_generators_manifest_parses() {
+        let bytes = include_bytes!("../../../scripts/testdata/libs_manifest/expected.json");
+        let m = LibraryManifest::parse(bytes).unwrap();
+        assert_eq!(m.libraries[0].qualified_name(), "thulasi-ram/clone");
+        let v = m.libraries[0].latest().unwrap();
+        assert!(!v.security_fix);
+        assert!(LibrarySource::parse(&v.source).is_ok());
+    }
+
     #[test]
     fn a_manifest_with_a_bad_source_is_refused() {
         let mut m = manifest(&[("a", false)]);
