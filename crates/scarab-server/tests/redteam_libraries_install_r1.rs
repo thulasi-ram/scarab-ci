@@ -889,7 +889,6 @@ async fn yank_holds_a_timer_gate_from_a_yanked_version() {
 /// The debug-Pod endpoint reproduces a finished Step in a fresh Pod with
 /// the Step's image. For a Step inlined from a yanked version, no Pod is
 /// launched.
-#[ignore = "red: s2 r1"]
 #[tokio::test]
 async fn yank_refuses_a_debug_pod_of_a_yanked_library_step() {
     #[derive(Default)]
@@ -980,6 +979,11 @@ async fn yank_refuses_a_debug_pod_of_a_yanked_library_step() {
         launched.is_empty(),
         "a debug Pod of a yanked library Step launched: {launched:?} (response: {})",
         head.lines().next().unwrap_or_default()
+    );
+    // Refused as the gate routes refuse a yanked gate: 409, before the upgrade.
+    assert!(
+        head.starts_with("HTTP/1.1 409") && head.contains("yanked"),
+        "{head}"
     );
 }
 

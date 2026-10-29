@@ -4035,7 +4035,8 @@ async fn bridge_attach(socket: WebSocket, io: scarab_executor_k8s::AttachIo) {
     ),
     responses(
         (status = 101, description = "WebSocket upgrade — interactive TTY into a fresh reproduction Pod"),
-        (status = 404, description = "no such run/step, no step spec, or debug-pod disabled")
+        (status = 404, description = "no such run/step, no step spec, or debug-pod disabled"),
+        (status = 409, description = "the step was inlined from a library version yanked in the run's org")
     )
 )]
 async fn debug_pod_step(
@@ -4052,7 +4053,11 @@ async fn debug_pod_step(
         .as_ref()
         .ok_or(ApiError::NotFound)?
         .clone();
-    let (sr, image, snapshot) = debug_pod_plan(st.db.as_ref(), &run, &StepId(step)).await?;
+    let step = StepId(step);
+    let (sr, image, snapshot) = debug_pod_plan(st.db.as_ref(), &run, &step).await?;
+    // ADR-0076 §6: a debug Pod runs the Step's image, so a Step inlined from
+    // a yanked library version gets none, as a launch would not.
+    refuse_yanked_step(&st, &run, &step, "no debug Pod starts").await?;
     Ok(ws.on_upgrade(move |mut socket| async move {
         let _ = socket
             .send(Message::Text(
@@ -8127,7 +8132,7 @@ async fn approve_gate(
     // ADR-0076 §6: a gate inlined from a yanked library version neither
     // takes an approval nor releases. Where `gate.resolve` (ADR-0075 §2)
     // will be consulted.
-    refuse_yanked_gate(&st, &run, &step).await?;
+    refuse_yanked_step(&st, &run, &step, "the gate cannot release").await?;
 
     // 1. Record this principal's approval — append-only, no resume, idempotent
     //    per (step, subject).
@@ -8497,7 +8502,7 @@ async fn release_gate_external(
     let ctx = st.db.run_deploy_context(&run).await?;
     gate_release_governance(&st, ctx.as_ref(), "the gate cannot release").await?;
     // ADR-0076 §6: nor does one inlined from a yanked library version.
-    refuse_yanked_gate(&st, &run, &step).await?;
+    refuse_yanked_step(&st, &run, &step, "the gate cannot release").await?;
 
     match scarab_engine::release_gate(st.db.as_ref(), st.clock.as_ref(), &run, &step).await {
         Ok(()) => Ok(StatusCode::ACCEPTED),
@@ -8514,16 +8519,20 @@ async fn release_gate_external(
     }
 }
 
-/// 409 when gate `step` of `run` was inlined from a library version yanked
-/// in the run's org (ADR-0076 §6), naming the version and the reason.
-async fn refuse_yanked_gate(st: &AppState, run: &RunId, step: &StepId) -> Result<(), ApiError> {
+/// 409 when `step` of `run` was inlined from a library version yanked in
+/// the run's org (ADR-0076 §6), naming the version and the reason after
+/// `refused` (what does not happen: "the gate cannot release").
+async fn refuse_yanked_step(
+    st: &AppState,
+    run: &RunId,
+    step: &StepId,
+    refused: &str,
+) -> Result<(), ApiError> {
     match libraries::stored_step_yank_refusal(st.db.as_ref(), st.libraries.as_deref(), run, &step.0)
         .await
     {
         Ok(None) => Ok(()),
-        Ok(Some(refusal)) => Err(ApiError::Conflict(format!(
-            "the gate cannot release: {refusal}"
-        ))),
+        Ok(Some(refusal)) => Err(ApiError::Conflict(format!("{refused}: {refusal}"))),
         Err(e) => Err(ApiError::Db(DbError::Other(e))),
     }
 }
