@@ -1815,7 +1815,49 @@ async fn commit_run_transition(
     notify: bool,
     intents: &[OutboxMessage],
 ) -> Result<(), DbError> {
-    let events = [event(run, EventPayload::RunTransitioned { from, to }, now)];
+    commit_run_transition_after(db, run, from, to, now, notify, intents, Vec::new()).await
+}
+
+/// End a run whose creation failed after [`Db::begin_run_creation`]:
+/// `Pending → Failed`, journalled with [`EventPayload::RunCreationFailed`]
+/// carrying `reason`, and the status post any failed run owes its forge — one
+/// commit. Its creation never finished, so the run never enters
+/// [`Db::active_runs`] and nothing schedules it.
+pub async fn fail_run_creation(
+    db: &dyn Db,
+    run: &RunId,
+    reason: String,
+    now: Timestamp,
+) -> Result<(), DbError> {
+    let journal = vec![event(run, EventPayload::RunCreationFailed { reason }, now)];
+    commit_run_transition_after(
+        db,
+        run,
+        RunStatus::Pending,
+        RunStatus::Failed,
+        now,
+        true,
+        &[],
+        journal,
+    )
+    .await
+}
+
+/// [`commit_run_transition`], with `journal` committed ahead of its
+/// `RunTransitioned`.
+#[allow(clippy::too_many_arguments)] // commit_run_transition's arguments plus the journal
+async fn commit_run_transition_after(
+    db: &dyn Db,
+    run: &RunId,
+    from: RunStatus,
+    to: RunStatus,
+    now: Timestamp,
+    notify: bool,
+    intents: &[OutboxMessage],
+    mut journal: Vec<EventKind>,
+) -> Result<(), DbError> {
+    journal.push(event(run, EventPayload::RunTransitioned { from, to }, now));
+    let events = journal;
     let mut outbox: Vec<OutboxMessage> = intents.to_vec();
     // The commit is guarded on this read (red team R2-E3 at run grain): a
     // run cancelled, rerun and back in `from` in between conflicts, so the

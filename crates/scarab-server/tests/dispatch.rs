@@ -1287,3 +1287,69 @@ async fn a_tick_during_creation_never_starts_a_run_past_its_concurrency_slot() {
         "only the holder launched"
     );
 }
+
+// `build` is persisted before `escalate`, whose privilege request an inline
+// (no-Environment) run can never be granted.
+const REFUSED_SECOND_STEP_YAML: &str = r#"
+on:
+  manual: {}
+steps:
+  - { id: build, image: busybox, command: ["build"] }
+  - { id: escalate, image: busybox, command: ["x"], security: { privileged: true } }
+"#;
+
+/// A creation that fails after some steps exist ends the Run Failed, with the
+/// creation error on its event log — never Pending, and never schedulable.
+#[tokio::test]
+async fn a_creation_that_fails_partway_ends_the_run_failed_and_launches_nothing() {
+    let forge = scarab_testkit::FakeForge::new()
+        .with_file(".scarab/ci.yaml", REFUSED_SECOND_STEP_YAML)
+        .with_commit("refs/heads/main", "sha-1");
+    let db = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+
+    let err = dispatch_run(
+        &forge,
+        db.as_ref(),
+        clock.as_ref(),
+        None,
+        "alice".into(),
+        repo(),
+        "refs/heads/main".into(),
+        "ci".into(),
+        std::collections::BTreeMap::new(),
+        DispatchKind::Manual,
+        None,
+    )
+    .await
+    .expect_err("the privileged step is refused");
+    assert!(err.to_string().contains("privilege request rejected"), "{err}");
+
+    let runs = db.list_runs(10).await.unwrap();
+    assert_eq!(runs.len(), 1, "the run row existed before the refusal");
+    let run = runs[0].run.clone();
+    assert!(
+        db.steps_of_run(&run).await.unwrap().iter().any(|s| s.step.0 == "build"),
+        "the refusal came after a step was written"
+    );
+    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Failed));
+    let reason = db
+        .events(&run)
+        .await
+        .unwrap()
+        .into_iter()
+        .find_map(|e| match e.kind {
+            EventPayload::RunCreationFailed { reason } => Some(reason),
+            _ => None,
+        })
+        .expect("the creation error is on the event log");
+    assert!(reason.contains("privilege request rejected"), "{reason}");
+
+    let exec = Arc::new(RecordingExec::default());
+    let sched = Scheduler::new(&*db as &dyn Db, &*clock as &dyn Clock, &*exec, "sched");
+    assert!(db.active_runs().await.unwrap().is_empty());
+    sched.tick_all().await.unwrap();
+    sched.tick(&run).await.unwrap();
+    assert!(exec.launches.lock().unwrap().is_empty(), "nothing launched");
+    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Failed));
+}
