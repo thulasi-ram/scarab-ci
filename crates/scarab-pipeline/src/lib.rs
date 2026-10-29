@@ -1290,6 +1290,10 @@ fn compile_libs(yaml: &str, libs: LibsRef<'_>) -> Result<PipelineIr, PipelineErr
                 // resulting duplicate concrete ids are caught by validate().
                 instances.insert(step.id.clone(), ids);
                 expanded.extend(concrete);
+                if expanded.len() > MAX_COMPILED_STEPS {
+                    diagnostics.push(too_many_steps(&format!("step `{}`", step.id)));
+                    break;
+                }
             }
             Err(msg) => diagnostics.push(msg),
         }
@@ -1569,6 +1573,23 @@ fn resolve_lib_path(raw: &str) -> Result<String, String> {
 /// `scarab_policy::run_create::MAX_ORIGIN` is this constant.
 pub const MAX_INVOKE_DEPTH: usize = 8;
 
+/// The most Steps and gates one Pipeline may compile to, after `invoke:`
+/// inlining and matrix expansion. Twice `scarab_policy`'s per-Run caps (512
+/// Steps and 32 gates), so every Run a `run.create` Policy can check compiles,
+/// with room for Projects that store no Policy, where those caps are not
+/// applied. The compile runs on the server for each webhook, and a few small
+/// libraries that each invoke the next several times multiply: the compiler
+/// stops as soon as a count passes this, instead of building the whole list.
+pub const MAX_COMPILED_STEPS: usize = 1024;
+
+/// The diagnostic for a Pipeline over [`MAX_COMPILED_STEPS`].
+fn too_many_steps(at: &str) -> String {
+    format!(
+        "{at}: the pipeline compiles to more than {MAX_COMPILED_STEPS} Steps and gates after \
+         inlining `invoke:` steps and expanding matrices; the limit is {MAX_COMPILED_STEPS}"
+    )
+}
+
 /// Inline every `invoke:` step (ADR-0038, ADR-0076) into a flat step list
 /// with no invoke steps left. **Recursive**: a library that itself invokes is
 /// expanded to full depth, ids namespacing correctly at each level
@@ -1580,7 +1601,8 @@ pub const MAX_INVOKE_DEPTH: usize = 8;
 fn inline_invokes(steps: &[StepSpec], libs: LibsRef<'_>) -> Result<Vec<StepSpec>, Vec<String>> {
     let mut diagnostics = Vec::new();
     let mut stack: Vec<Frame> = Vec::new();
-    let out = inline_level(steps, libs, &mut stack, &mut diagnostics);
+    let mut over_cap = false;
+    let out = inline_level(steps, libs, &mut stack, &mut over_cap, &mut diagnostics);
     if diagnostics.is_empty() {
         Ok(out)
     } else {
@@ -1635,11 +1657,15 @@ fn invoke_step_extra_fields(step: &StepSpec) -> Vec<&'static str> {
 /// level (an outer caller applies its own prefix). `stack` holds the libraries
 /// currently being expanded on this DFS path — used for cycle detection (a
 /// target already on the stack), the depth cap (its length) and the closed
-/// rule for installed libraries (its last frame).
+/// rule for installed libraries (its last frame). `over_cap` is set, with one
+/// diagnostic, once a level's list passes [`MAX_COMPILED_STEPS`]; every level
+/// then returns at once. A level's list is part of the final list at least
+/// once, so the check never refuses a Pipeline under the cap.
 fn inline_level(
     steps: &[StepSpec],
     libs: LibsRef<'_>,
     stack: &mut Vec<Frame>,
+    over_cap: &mut bool,
     diagnostics: &mut Vec<String>,
 ) -> Vec<StepSpec> {
     let mut out: Vec<StepSpec> = Vec::new();
@@ -1649,7 +1675,19 @@ fn inline_level(
     // rewrite (ADR-0041): `outputs.<id>.<name>` -> `outputs["<id>/<name>"].<name>`.
     let mut output_aliases: Vec<(String, Vec<String>)> = Vec::new();
 
+    // Stop when the list passes the cap: set `over_cap` and report once.
+    let capped = |len: usize, at: &str, over_cap: &mut bool, diagnostics: &mut Vec<String>| {
+        if len > MAX_COMPILED_STEPS && !*over_cap {
+            *over_cap = true;
+            diagnostics.push(too_many_steps(at));
+        }
+        *over_cap
+    };
+
     for step in steps {
+        if *over_cap {
+            return out;
+        }
         // `origin` is the compiler's record of where a Step came from
         // (ADR-0075 §2); an authored one would let a Pipeline pass a
         // library Policy by claiming another source.
@@ -1673,6 +1711,14 @@ fn inline_level(
                 ));
             }
             out.push(step.clone());
+            if capped(
+                out.len(),
+                &format!("step `{}`", step.id),
+                over_cap,
+                diagnostics,
+            ) {
+                return out;
+            }
             continue;
         };
 
@@ -1867,8 +1913,11 @@ fn inline_level(
             label: label.clone(),
             installed: kind == OriginKind::Library,
         });
-        let resolved = inline_level(&lib_steps, libs, stack, diagnostics);
+        let resolved = inline_level(&lib_steps, libs, stack, over_cap, diagnostics);
         stack.pop();
+        if *over_cap {
+            return out;
+        }
         // This library is the outermost link so far of every Step it
         // inlines: the nested levels already recorded theirs.
         let link = OriginEntry {
@@ -1967,6 +2016,14 @@ fn inline_level(
                     inst.env = env;
                 }
                 out.push(inst);
+                if capped(
+                    out.len(),
+                    &format!("step `{}`", step.id),
+                    over_cap,
+                    diagnostics,
+                ) {
+                    return out;
+                }
             }
         }
         seam.insert(step.id.clone(), all_leaves);
@@ -2632,6 +2689,14 @@ fn expand_step(step: &StepSpec) -> Result<Vec<StepSpec>, String> {
                 step.id
             ));
         }
+    }
+    // Refuse a product over the cap before building it.
+    let combinations = matrix
+        .dimensions
+        .values()
+        .try_fold(1usize, |n, v| n.checked_mul(v.len()));
+    if combinations.is_none_or(|n| n > MAX_COMPILED_STEPS) {
+        return Err(too_many_steps(&format!("step `{}`", step.id)));
     }
 
     // Cartesian product over the (sorted) dimensions.
