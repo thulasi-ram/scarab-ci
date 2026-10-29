@@ -119,8 +119,9 @@ fn the_deepest_invoke_chain_fits_the_origin_cap() {
 
 /// A Step's `image` and `digest` are the image as Run creation knows it,
 /// rendered by the launch's own renderer (ADR-0076): a library input bound to
-/// a literal is known, an input bound to the caller's template is not, and a
-/// `${{` left in an image pins nothing.
+/// a literal is known, so is one bound to a caller's template that reads only
+/// launch parameters, one whose template reads an output is not, and a `${{`
+/// left in an image pins nothing.
 #[test]
 fn a_steps_image_is_previewed_and_a_template_pins_nothing() {
     let lib = "kind: library\ninterface: { inputs: [{ name: d, type: string }] }\nsteps: [{ id: s, image: \"app@${{ inputs.d }}\" }]\n";
@@ -130,6 +131,8 @@ interface: { inputs: [{ name: tag, type: string }] }
 steps:
   - { id: lit, invoke: file:l.yaml, with: { d: "sha256:abc" } }
   - { id: tpl, invoke: file:l.yaml, with: { d: "${{ inputs.tag }}" } }
+  - { id: b, image: busybox, results: [d] }
+  - { id: out, invoke: file:l.yaml, needs: [b], with: { d: "${{ outputs.b.d }}" } }
   - { id: own, image: "app@${{ inputs.tag }}" }
 "#,
         &scarab_pipeline::Libraries {
@@ -152,10 +155,14 @@ steps:
     };
     assert_eq!(by_id("lit/s")["image"], "app@sha256:abc");
     assert_eq!(by_id("lit/s")["digest"], "sha256:abc");
-    // The caller's template renders when the Step launches; until then the
-    // image holds it and has no digest.
-    assert_eq!(by_id("tpl/s")["image"], "app@${{ inputs.d }}");
-    assert_eq!(by_id("tpl/s")["digest"], serde_json::Value::Null);
+    // The caller's template reads a launch parameter: known now, as at
+    // launch.
+    assert_eq!(by_id("tpl/s")["image"], "app@sha256:run");
+    assert_eq!(by_id("tpl/s")["digest"], "sha256:run");
+    // One that reads an output renders when the Step launches; until then
+    // the image holds the template and has no digest.
+    assert_eq!(by_id("out/s")["image"], "app@${{ inputs.d }}");
+    assert_eq!(by_id("out/s")["digest"], serde_json::Value::Null);
     // A Step in the Pipeline file reads the Run's launch parameters.
     assert_eq!(by_id("own")["image"], "app@sha256:run");
     assert_eq!(by_id("own")["digest"], "sha256:run");
