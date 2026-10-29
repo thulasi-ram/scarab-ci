@@ -3579,32 +3579,34 @@ impl<'a> Scheduler<'a> {
         // Launch parameters (ADR-0043) are frozen on the run at creation. Every
         // launched step receives them as `SCARAB_PARAM_<NAME>` env (stringified),
         // even one it never references — unreferenced params still reach the step
-        // (ADR-0008 param convention). Injected values are concrete (no `${{`), so
-        // they are unaffected by the interpolation pass below.
+        // (ADR-0008 param convention). They are added after the interpolation
+        // pass, never before: a param value is data, and one holding `${{ … }}`
+        // must reach the step as that text, not be evaluated.
         let params = self.db.run_params(run).await?;
-        let mut spec = spec;
-        if !params.is_empty() {
-            // Prepend so a step's own explicit env of the same name still wins.
-            let mut env: Vec<(String, String)> = params
-                .iter()
-                .map(|(k, v)| {
-                    (
-                        format!("SCARAB_PARAM_{}", k.to_uppercase()),
-                        scarab_pipeline::params::stringify(v),
-                    )
-                })
-                .collect();
-            env.append(&mut spec.env);
-            spec.env = env;
-        }
+        let with_params = |mut spec: StepSpec| {
+            if !params.is_empty() {
+                // Prepend so a step's own explicit env of the same name still wins.
+                let mut env: Vec<(String, String)> = params
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            format!("SCARAB_PARAM_{}", k.to_uppercase()),
+                            scarab_pipeline::params::stringify(v),
+                        )
+                    })
+                    .collect();
+                env.append(&mut spec.env);
+                spec.env = env;
+            }
+            spec
+        };
 
-        // Fast path: no interpolation → launch verbatim (the common case). Params
-        // env has already been injected above.
+        // Fast path: no interpolation → launch verbatim (the common case).
         let has_interp = spec.image.contains("${{")
             || spec.command.iter().any(|c| c.contains("${{"))
             || spec.env.iter().any(|(_, v)| v.contains("${{"));
         if !has_interp {
-            return Ok(Ok(spec));
+            return Ok(Ok(with_params(spec)));
         }
 
         // Build the `outputs` context from this step's upstream results, keyed by
@@ -3630,7 +3632,7 @@ impl<'a> Scheduler<'a> {
         }
         // `inputs` exposes the resolved launch params (typed), so `${{ inputs.x }}`
         // resolves and a numeric guard like `inputs.n > 80` compares numerically.
-        let inputs = serde_json::Value::Object(params.into_iter().collect());
+        let inputs = serde_json::Value::Object(params.clone().into_iter().collect());
         // `matrix` exposes this instance's concrete coordinate (ADR-0023). A matrix
         // leg is expanded with `${{ matrix.<dim> }}` left in its image/command/env
         // and its coordinate carried on `spec.matrix_values`; without binding it a
@@ -3657,7 +3659,7 @@ impl<'a> Scheduler<'a> {
             }
             Ok::<(), String>(())
         })() {
-            Ok(()) => Ok(Ok(out)),
+            Ok(()) => Ok(Ok(with_params(out))),
             Err(reason) => Ok(Err(reason)),
         }
     }

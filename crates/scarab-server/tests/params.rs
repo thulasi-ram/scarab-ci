@@ -198,6 +198,46 @@ async fn params_interpolate_inputs_and_rerun_re_derives_identically() {
     assert_eq!(launches[0], launches[1], "re-launch is byte-identical");
 }
 
+/// A launch parameter is data. One whose value holds `${{ … }}` reaches the
+/// step as that text in `SCARAB_PARAM_*` and in `inputs`; it is never
+/// evaluated. Before the fix the param env was added before the interpolation
+/// pass, so `${{ inputs.region }}` in a param value was rendered.
+#[tokio::test]
+async fn a_param_holding_an_expression_reaches_the_step_as_text() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    let clock: Arc<FakeClock> = Arc::new(FakeClock::new(1_000));
+    let run = RunId("r1".into());
+    let step = StepId("deploy".into());
+
+    db.create_run(&run, 2, 1, Timestamp(1_000)).await.unwrap();
+    let params = std::collections::BTreeMap::from([
+        ("region".to_string(), json!("us-east-1")),
+        ("n".to_string(), json!(90)),
+        ("note".to_string(), json!("${{ inputs.region }}")),
+    ]);
+    db.set_run_params(&run, &params).await.unwrap();
+    // The step interpolates (so the slow path runs) and also reads `note`.
+    let mut spec = interp_spec();
+    spec.command.push("${{ inputs.note }}".into());
+    db.create_step_run(&run, &step, Some(&spec), &[], Timestamp(1_000))
+        .await
+        .unwrap();
+
+    let exec = Arc::new(RecordingExec::default());
+    Scheduler::new(&*db as &dyn Db, &*clock as &dyn Clock, &*exec, "sched-1")
+        .tick(&run)
+        .await
+        .unwrap();
+
+    let launches = exec.launches.lock().unwrap().clone();
+    let (cmd, env) = &launches[0];
+    assert_eq!(cmd.last().unwrap(), "${{ inputs.region }}", "{cmd:?}");
+    assert!(
+        env.contains(&("SCARAB_PARAM_NOTE".into(), "${{ inputs.region }}".into())),
+        "{env:?}"
+    );
+}
+
 // --- supply path (POST /v1/runs) ---------------------------------------------
 
 fn app(db: Arc<InMemoryDb>, clock: Arc<FakeClock>) -> axum::Router {
