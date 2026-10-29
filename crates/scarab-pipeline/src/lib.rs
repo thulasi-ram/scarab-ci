@@ -1448,11 +1448,27 @@ impl InvokeTarget {
 /// `invoke` stays refused, ADR-0038).
 fn parse_invoke_target(raw: &str) -> Result<InvokeTarget, String> {
     let text = raw.trim();
-    // A prefix is the lowercase word before the first `:`. Anything else
-    // (`./x.yaml`, `.scarab/lib/x.yaml`) is a bare path.
+    // A prefix is the word before the first `:`. Anything else (`./x.yaml`,
+    // `.scarab/lib/x.yaml`) is a bare path.
     let prefixed = text
         .split_once(':')
-        .filter(|(p, _)| !p.is_empty() && p.bytes().all(|b| b.is_ascii_lowercase()));
+        .filter(|(p, _)| !p.is_empty() && p.bytes().all(|b| b.is_ascii_alphabetic()));
+    if let Some((prefix, rest)) = prefixed {
+        // Prefixes are lowercase: `LIB:` and `File:` are unknown, not paths.
+        if prefix.bytes().any(|b| b.is_ascii_uppercase()) {
+            return Err(format!(
+                "`invoke: {text}` has an unknown prefix `{prefix}:`; use `file:`, `lib:` or \
+                 `plugin:` (prefixes are lowercase)"
+            ));
+        }
+        // No space between the prefix and the target, for every prefix.
+        if rest.starts_with(char::is_whitespace) {
+            return Err(format!(
+                "`invoke: {text}` has a space after `{prefix}:`; write the target right after \
+                 the prefix"
+            ));
+        }
+    }
     let Some((prefix, rest)) = prefixed else {
         return Err(if resolve_lib_path(text).is_ok() {
             format!("`invoke: {text}` needs a prefix: write `invoke: file:{text}`")
