@@ -312,7 +312,6 @@ async fn call(
 /// `git.example.com/acme-tools/libs`; `github.com/acme-tools/libs` is a
 /// different repository, owned by whoever owns `acme-tools` on GitHub, and
 /// the GitHub connection's credential may reach it.
-#[ignore = "red: s2 r1"]
 #[tokio::test]
 async fn org_rule_a_binding_on_another_forge_does_not_open_a_github_repo() {
     let db = Arc::new(InMemoryDb::new());

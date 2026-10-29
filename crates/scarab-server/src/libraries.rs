@@ -648,12 +648,15 @@ pub(crate) async fn read_source(
                 )));
             }
             // The org rule: the org's own repositories, or ones bound to it.
+            // A binding names a repository on one connection's forge; the
+            // same `<owner>/<name>` on another forge is another repository,
+            // so the binding counts only when it is through this connection.
             let bound_here = match connections
                 .resolve(&src.repo_ref())
                 .await
                 .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?
             {
-                Some(r) => r.org == org,
+                Some(r) => r.org == org && r.connection.id == conn.id,
                 None => false,
             };
             if src.owner != org && !bound_here {
