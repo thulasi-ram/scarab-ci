@@ -1845,6 +1845,23 @@ fn inline_level(
                 step.id
             ));
         }
+        // A library is only Steps and their interface. A Pipeline-level field
+        // would be dropped when it is inlined, so it is refused instead.
+        for (field, set) in [
+            ("environment", lib.environment.is_some()),
+            ("concurrency", lib.concurrency.is_some()),
+            ("services", !lib.services.is_empty()),
+            ("budget", lib.budget.is_some()),
+            ("retention_profile", lib.retention_profile.is_some()),
+        ] {
+            if set {
+                diagnostics.push(format!(
+                    "step `{}`: library `{label}` sets `{field}`, which only a Pipeline can \
+                     set; set it on the Pipeline that invokes the library",
+                    step.id
+                ));
+            }
+        }
         if lib.steps.is_empty() {
             diagnostics.push(format!(
                 "step `{}`: library `{label}` has no steps",
@@ -1918,6 +1935,26 @@ fn inline_level(
         if *over_cap {
             return out;
         }
+        // The fields an invoke step carries apply only to non-gate Steps; with
+        // none to receive them they would be dropped, so they are refused.
+        if resolved.iter().all(StepSpec::is_gate) {
+            for (field, set) in [
+                ("timeout", step.timeout.is_some()),
+                (
+                    "resources",
+                    step.resources.cpu_millis.is_some() || step.resources.memory_mib.is_some(),
+                ),
+                ("placement_profiles", !step.placement_profiles.is_empty()),
+            ] {
+                if set {
+                    diagnostics.push(format!(
+                        "step `{}`: `{field}` applies to the Steps an invoke inlines, and \
+                         library `{label}` inlines only gates",
+                        step.id
+                    ));
+                }
+            }
+        }
         // This library is the outermost link so far of every Step it
         // inlines: the nested levels already recorded theirs.
         let link = OriginEntry {
@@ -1952,6 +1989,43 @@ fn inline_level(
                 continue;
             }
         };
+
+        // A `with:` value that reads `outputs.<X>` of a Step at this level
+        // reaches every Step the library inlines, as bound text and as
+        // `SCARAB_PARAM_*`. The engine gives a Step the outputs of its direct
+        // needs only, so `<X>` must be a need of the invoke step, and it
+        // becomes a need of every inlined Step. A root already needs it, and
+        // every other Step runs after a root, so the schedule is unchanged. An
+        // `<X>` that is not a Step here came from an outer level's `with:`,
+        // which adds it there. An invoke Step `<X>` is checked by
+        // `validate_interface`.
+        let mut with_needs: Vec<String> = Vec::new();
+        for value in step.with.values() {
+            for expr in cel::interpolations(value).unwrap_or_default() {
+                for read in output_step_refs(expr) {
+                    // A matrix instance (`build[os=l]`) is read through its
+                    // authored Step, which fans onto every instance.
+                    let Some(sibling) = steps.iter().find(|s| {
+                        read == s.id
+                            || read
+                                .strip_prefix(s.id.as_str())
+                                .is_some_and(|r| r.starts_with('['))
+                    }) else {
+                        continue;
+                    };
+                    let x = sibling.id.clone();
+                    if !step.needs.0.contains(&x) && sibling.invoke.is_none() {
+                        diagnostics.push(format!(
+                            "step `{}`: `with:` reads `outputs.{x}` but does not `needs: [{x}]`",
+                            step.id
+                        ));
+                    }
+                    if !with_needs.contains(&x) {
+                        with_needs.push(x);
+                    }
+                }
+            }
+        }
 
         let internal: BTreeSet<&str> = resolved.iter().map(|s| s.id.as_str()).collect();
         let needed_inside: BTreeSet<&str> = resolved
@@ -2010,6 +2084,11 @@ fn inline_level(
                         .entry(k.clone())
                         .or_insert_with(|| v.clone());
                 }
+                for n in &with_needs {
+                    if !inst.needs.0.contains(n) {
+                        inst.needs.0.push(n.clone());
+                    }
+                }
                 if !param_env.is_empty() {
                     let mut env = param_env.clone();
                     env.append(&mut inst.env);
@@ -2041,14 +2120,28 @@ fn inline_level(
     // to the concrete inlined backing step so the launch context stays generic
     // (just `outputs[<step-id>] = <that step's results>`). The backing step of a
     // non-matrixed invoke's exposed output `<name>` is `<invoke-id>/<name>`.
+    // The engine gives a Step the outputs of its direct needs only, and
+    // `needs: [<invoke-id>]` reaches the library's leaves, so a Step that
+    // reads the output also needs its backing step, which need not be a leaf.
     for (invoke_id, exposed) in &output_aliases {
         for step in &mut out {
-            step.image = rewrite_output_refs(&step.image, invoke_id, exposed);
-            for c in &mut step.command {
-                *c = rewrite_output_refs(c, invoke_id, exposed);
-            }
-            for (_, v) in &mut step.env {
-                *v = rewrite_output_refs(v, invoke_id, exposed);
+            for name in exposed {
+                let name = std::slice::from_ref(name);
+                let mut read = false;
+                let mut rewrite = |text: &mut String| {
+                    let rewritten = rewrite_output_refs(text, invoke_id, name);
+                    if rewritten != *text {
+                        read = true;
+                        *text = rewritten;
+                    }
+                };
+                rewrite(&mut step.image);
+                step.command.iter_mut().for_each(&mut rewrite);
+                step.env.iter_mut().for_each(|(_, v)| rewrite(v));
+                let backing = format!("{invoke_id}/{}", name[0]);
+                if read && !step.needs.0.contains(&backing) {
+                    step.needs.0.push(backing);
+                }
             }
         }
     }
@@ -2079,7 +2172,9 @@ fn carry_invoke_fields(invoke: &StepSpec, inst: &mut StepSpec) {
     }
     if let Some(When(outer)) = &invoke.when {
         inst.when = Some(When(match &inst.when {
-            Some(When(inner)) => format!("({outer}) && ({inner})"),
+            // On their own lines, so a `//` comment ending either side does
+            // not swallow the `)` after it.
+            Some(When(inner)) => format!("(\n{outer}\n) && (\n{inner}\n)"),
             None => outer.clone(),
         }));
     }
@@ -2241,6 +2336,23 @@ fn unbound_input_reads(step: &StepSpec) -> Vec<String> {
     }
     if let Some(When(expr)) = &step.when {
         check(expr, "when", &mut out);
+    }
+    out
+}
+
+/// The Step ids an expression reads outputs of: `outputs.<id>` and
+/// `outputs["<id>"]`.
+fn output_step_refs(expr: &str) -> Vec<String> {
+    let mut out = field_accesses(expr, "outputs");
+    let mut rest = expr;
+    while let Some(at) = rest.find("outputs[") {
+        rest = &rest[at + "outputs[".len()..];
+        let key = rest.trim_start();
+        if let Some(q) = key.chars().next().filter(|c| matches!(c, '"' | '\'')) {
+            if let Some(end) = key[1..].find(q) {
+                out.push(key[1..1 + end].to_string());
+            }
+        }
     }
     out
 }
@@ -5320,7 +5432,7 @@ mod tests {
             }
         );
         assert_eq!(y.placement_profiles, vec!["gpu"]);
-        assert_eq!(y.when, Some(When(format!("({guard}) && (true)"))));
+        assert_eq!(y.when, Some(When(format!("(\n{guard}\n) && (\ntrue\n)"))));
 
         // A gate gets only the `when`.
         let g = step("d/g");
