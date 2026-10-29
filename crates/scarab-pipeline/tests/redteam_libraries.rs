@@ -813,7 +813,7 @@ fn a_reader_of_an_exposed_output_needs_its_backing_step() {
     let ir = ok(yaml, &files(&[("l.yaml", lib), ("u.yaml", user)]));
     let rd = step(&ir, "r");
     assert_eq!(rd.needs.0, vec!["c/post".to_string(), "c/img".into()]);
-    assert_eq!(rd.command[0], "${{ outputs[\"c/img\"].img }}");
+    assert_eq!(rd.command[0], "${{ outputs.c.img }}");
     for id in ["u/a", "u/b"] {
         let s = step(&ir, id);
         assert!(

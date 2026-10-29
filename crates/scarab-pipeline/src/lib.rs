@@ -1356,6 +1356,18 @@ fn compile_libs(yaml: &str, libs: LibsRef<'_>) -> Result<PipelineIr, PipelineErr
     };
     for step in &mut expanded {
         step.needs.0 = fan_in(&step.needs.0);
+        // A Pipeline Step given a scope for an invoke's outputs reads every
+        // other need by its id, as a Step with no scope does.
+        if let Some(scope) = &mut step.scope {
+            if scope.inputs == ScopeInputs::Run {
+                for n in &step.needs.0 {
+                    scope
+                        .outputs
+                        .entry(n.clone())
+                        .or_insert_with(|| OutputSource::Step(n.clone()));
+                }
+            }
+        }
         // Explicit `inputs:` fan in the same way, so a subset of a matrixed need
         // resolves to that need's instances.
         if let Some(inputs) = &step.inputs {
@@ -1781,10 +1793,6 @@ fn inline_level(
     let mut out: Vec<StepSpec> = Vec::new();
     // invoke-step id -> the namespaced leaf ids that a `needs: [that id]` maps to.
     let mut seam: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    // Non-matrixed invoke id -> its exposed output names, for the output-reference
-    // rewrite of the Pipeline file's own Steps (ADR-0041):
-    // `outputs.<id>.<name>` -> `outputs["<id>/<name>"].<name>`.
-    let mut output_aliases: Vec<(String, Vec<String>)> = Vec::new();
     // What each invoke Step at this level exposes, so a sibling read before
     // the invoke is inlined resolves too.
     let exposed = exposed_outputs(steps, libs);
@@ -1850,8 +1858,11 @@ fn inline_level(
                 ));
             }
             let mut step = step.clone();
-            if let Some((label, _)) = level.library {
-                library_step_scope(&mut step, level, label, steps, &exposed, diagnostics);
+            match level.library {
+                Some((label, _)) => {
+                    library_step_scope(&mut step, level, label, steps, &exposed, diagnostics)
+                }
+                None => invoke_output_scope(&mut step, &exposed),
             }
             out.push(step);
             if capped(
@@ -2032,12 +2043,6 @@ fn inline_level(
         // library's declared/exposed outputs at compile — explicit over ambient.
         let before_interface = diagnostics.len();
         validate_interface(step, &label, &lib, steps, diagnostics);
-        // Record exposed outputs for the reference rewrite of the Pipeline
-        // file's own Steps (ADR-0041). A matrixed invoke's outputs are
-        // unaddressable (validate_interface errors on any reference).
-        if level.library.is_none() && step.matrix.is_none() && !lib.interface.outputs.is_empty() {
-            output_aliases.push((step.id.clone(), lib.interface.outputs.clone()));
-        }
 
         // Bind the library's inputs (ADR-0076): a literal `with:` value or a
         // default, converted to the declared type now; a caller's template,
@@ -2326,34 +2331,6 @@ fn inline_level(
         step.needs = Needs(rewrite_through_seam(&step.needs.0, &seam));
         if let Some(inputs) = &step.inputs {
             step.inputs = Some(rewrite_through_seam(inputs, &seam));
-        }
-    }
-
-    // Output-reference rewrite (ADR-0041) of the Pipeline file's own Steps:
-    // resolve `outputs.<invoke-id>.<name>` to the concrete inlined backing
-    // step `<invoke-id>/<name>`. A library Step reads an invoke's outputs
-    // through its scope's view instead, and is never rewritten. The engine
-    // gives a Step the outputs of its direct needs only, and `needs:
-    // [<invoke-id>]` reaches the library's leaves, so a Step that reads the
-    // output also needs its backing step, which need not be a leaf.
-    for (invoke_id, exposed) in &output_aliases {
-        for step in out.iter_mut().filter(|s| s.scope.is_none()) {
-            for name in exposed {
-                let name = std::slice::from_ref(name);
-                let mut read = false;
-                let mut rewrite = |text: &mut String| {
-                    if rewrite_output_refs(text, invoke_id, name) {
-                        read = true;
-                    }
-                };
-                rewrite(&mut step.image);
-                step.command.iter_mut().for_each(&mut rewrite);
-                step.env.iter_mut().for_each(|(_, v)| rewrite(v));
-                let backing = format!("{invoke_id}/{}", name[0]);
-                if read && !step.needs.0.contains(&backing) {
-                    step.needs.0.push(backing);
-                }
-            }
         }
     }
 
@@ -2749,6 +2726,59 @@ fn namespace_view(scope: &mut Scope, ns: &impl Fn(&str) -> String) {
     }
 }
 
+/// Give a Step written in the Pipeline file a scope when it reads an
+/// invoke's exposed output (ADR-0041 §2, ADR-0076): `outputs.<invoke>` is
+/// a view of the invoke's backing Steps, `<invoke>/<output>`. Its `inputs`
+/// stay the Run's launch parameters, and every other Step it reads is named
+/// by its own id, as for a Step with no scope ([`compile_libs`] adds those
+/// once its `needs` are final). The engine gives a Step the results of its
+/// direct needs only, and `needs: [<invoke>]` reaches the library's leaves,
+/// so the Step also needs each backing Step it reads, which need not be a
+/// leaf. A read of an output the invoke does not expose, or without `needs:
+/// [<invoke>]`, is reported by `validate_interface`.
+fn invoke_output_scope(step: &mut StepSpec, exposed: &BTreeMap<String, Option<Vec<String>>>) {
+    let mut view = BTreeMap::new();
+    let mut backing = Vec::new();
+    for text in interpolatable_strings(step) {
+        for i in cel::scan_interpolations(text).0 {
+            let Ok(reads) = cel::reads(text[i.inner].trim()) else {
+                continue;
+            };
+            for r in reads.into_iter().filter(|r| r.var == "outputs") {
+                let Some(name) = r.first else { continue };
+                let Some(Some(outs)) = exposed.get(&name) else {
+                    continue;
+                };
+                for out in outs {
+                    if r.second.as_ref().is_none_or(|f| f == out) {
+                        backing.push(format!("{name}/{out}"));
+                    }
+                }
+                view.insert(
+                    name.clone(),
+                    OutputSource::Invoke(
+                        outs.iter()
+                            .map(|o| (o.clone(), format!("{name}/{o}")))
+                            .collect(),
+                    ),
+                );
+            }
+        }
+    }
+    if view.is_empty() {
+        return;
+    }
+    for b in backing {
+        if !step.needs.0.contains(&b) {
+            step.needs.0.push(b);
+        }
+    }
+    step.scope = Some(Scope {
+        outputs: view,
+        ..Scope::run()
+    });
+}
+
 /// What an invoke step carries onto each Step and gate it inlines
 /// (ADR-0076 §1). Its `timeout`, `resources` and `placement_profiles` apply to
 /// a Step that is not a gate, only where the library Step leaves the field
@@ -2770,36 +2800,6 @@ fn carry_invoke_fields(invoke: &StepSpec, inst: &mut StepSpec) {
             inst.placement_profiles = invoke.placement_profiles.clone();
         }
     }
-}
-
-/// Rewrite `outputs.<invoke_id>.<name>` reads (for each exposed `<name>`), in
-/// any form [`cel::output_reads`] finds (`outputs["<invoke_id>"]["<name>"]`,
-/// spaces around `.`), to `outputs["<invoke_id>/<name>"].<name>`, pointing at
-/// the concrete inlined backing step (ADR-0041). Returns whether any changed.
-fn rewrite_output_refs(text: &mut String, invoke_id: &str, exposed: &[String]) -> bool {
-    let mut edits = Vec::new();
-    for i in cel::scan_interpolations(text).0 {
-        for read in cel::output_reads(&text[i.inner.clone()]) {
-            let (Some(id), Some(name)) = (read.step.as_deref(), read.field.as_deref()) else {
-                continue;
-            };
-            if id == invoke_id && exposed.iter().any(|n| n == name) {
-                // A JSON string is a CEL string literal.
-                let backing = serde_json::Value::String(format!("{id}/{name}")).to_string();
-                let at = i.inner.start;
-                edits.push((
-                    at + read.start..at + read.end,
-                    format!("outputs[{backing}]"),
-                ));
-            }
-        }
-    }
-    let changed = !edits.is_empty();
-    // From the end, so earlier byte ranges stay valid.
-    for (range, new) in edits.into_iter().rev() {
-        text.replace_range(range, &new);
-    }
-    changed
 }
 
 /// Namespace one `needs`/`inputs` reference of a library step: prefix it if it
@@ -6140,7 +6140,7 @@ mod tests {
     "#;
 
     #[test]
-    fn a_satisfied_interface_compiles_injects_params_and_rewrites_output_refs() {
+    fn a_satisfied_interface_compiles_injects_params_and_reads_output_refs() {
         let ir = compile_with(
             r#"
             steps:
@@ -6161,10 +6161,18 @@ mod tests {
         // The invoke step is gone; the exposed-output reference compiled fine.
         assert!(ir.steps.iter().all(|s| !s.is_invoke()));
         assert!(ir.steps.iter().any(|s| s.id == "deploy/url"));
-        // The output reference is rewritten to the concrete backing step (ADR-0041),
-        // so the launch context stays generic (keyed by step id).
+        // The output reference is kept as written (ADR-0076): the reading
+        // Step's scope names the backing Step, which it needs.
         let notify = ir.steps.iter().find(|s| s.id == "notify").unwrap();
-        assert_eq!(notify.command[1], "${{ outputs[\"deploy/url\"].url }}");
+        assert_eq!(notify.command[1], "${{ outputs.deploy.url }}");
+        assert!(notify.needs.0.contains(&"deploy/url".to_string()));
+        let r = launch(
+            notify,
+            json!({}),
+            json!({ "deploy/url": { "url": "https://svc" }, "deploy/plan": { "url": "no" } }),
+        )
+        .unwrap();
+        assert_eq!(r.command, ["echo", "https://svc"]);
     }
 
     #[test]
@@ -7561,8 +7569,8 @@ mod tests {
     }
 
     /// A library step's declared results check reads of it through the
-    /// namespaced `outputs["<id>"]` spelling the invoke rewrite produces: an
-    /// exposed output `images` is library step `images`'s result `images`.
+    /// reader's view of the invoke: an exposed output `images` is library
+    /// step `images`'s result `images`.
     #[test]
     fn a_read_through_an_invoke_seam_is_checked_against_declared_results() {
         let lib = |declared: &str| {
@@ -7581,7 +7589,7 @@ mod tests {
         );
         assert!(
             ds.iter().any(|d| d.contains("`wait`")
-                && d.contains("outputs.deploy/images.images")
+                && d.contains("reads `outputs.deploy.images`, which step `deploy/images`")
                 && d.contains("does not declare")),
             "got: {ds:?}"
         );

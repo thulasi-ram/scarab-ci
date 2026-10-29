@@ -299,3 +299,28 @@ async fn a_library_when_reads_its_own_inputs_when_the_run_is_created() {
     assert!(d.launched("c/prod").is_some());
     assert_eq!(d.outcome("c/any").await.0, StepStatus::Skipped);
 }
+
+/// A Step in the Pipeline file reads an invoke's exposed output as
+/// `outputs.<invoke>.<name>` (ADR-0041 §2) through its scope's view of the
+/// backing Step; the text is kept as written. Its other needs read as
+/// before, and its `inputs` stay the Run's launch parameters.
+#[tokio::test]
+async fn a_pipeline_step_reads_an_invoke_output_through_its_view() {
+    let pipeline = format!(
+        "{ON_MANUAL}interface: {{ inputs: [{{ name: p, type: string }}] }}\nsteps:\n  - {{ id: other, image: busybox, results: [o] }}\n  - {{ id: d, invoke: file:.scarab/lib/l.yaml }}\n  - {{ id: notify, image: busybox, needs: [d, other], command: [\"${{{{ outputs.d.url }}}}\", \"${{{{ outputs.other.o }}}}\", \"${{{{ inputs.p }}}}\"] }}\n"
+    );
+    let l = "kind: library\ninterface: { outputs: [url] }\nsteps:\n  - { id: url, image: busybox, results: [url] }\n  - { id: post, image: busybox, needs: [url] }\n";
+    let d = drive(
+        &pipeline,
+        &[(".scarab/lib/l.yaml", l)],
+        json!({ "p": "P" }),
+        &[
+            ("d/url", json!({ "url": "https://svc" })),
+            ("other", json!({ "o": "O" })),
+        ],
+    )
+    .await;
+    let n = d.launched("notify").expect("launched");
+    assert_eq!(n.command, ["https://svc", "O", "P"]);
+    assert_eq!(n.env, [("SCARAB_PARAM_P".to_string(), "P".to_string())]);
+}
