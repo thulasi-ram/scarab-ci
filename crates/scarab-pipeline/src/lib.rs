@@ -3207,19 +3207,22 @@ pub fn lint(ir: &PipelineIr) -> Vec<String> {
     warnings
 }
 
-/// Where a value that a template reads comes from, for the script check.
+/// Where a value that a template reads comes from (ADR-0076), for the checks
+/// that treat a value from outside differently from the Pipeline's own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ValueSource {
-    /// Written in the repository: a Step's results, a matrix coordinate, a
-    /// library's inputs.
+    /// Written in the Pipeline or a library file: a literal, a `matrix`
+    /// coordinate, a literal `with:` value or an input's default.
     Pipeline,
-    /// From outside the repository: a trigger event's fields, or a Run's
-    /// launch parameters, which whoever dispatches the Run supplies.
+    /// From outside those files: a Run's launch parameters, which whoever
+    /// dispatches the Run supplies, a Step's results, a trigger event's
+    /// fields, and a library input whose caller's `with:` template reads any
+    /// of these, however many callers out.
     Outside,
 }
 
 /// How the Pipeline check reports a finding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
     /// A lint warning; the Pipeline still compiles.
     Warning,
@@ -3227,100 +3230,301 @@ pub enum Severity {
     Error,
 }
 
-/// What the Pipeline check does about a `${{ … }}` in a shell script, by
-/// where the value comes from. Both warn for now; a later step makes a
-/// value from outside the repository an error.
+/// What the Pipeline check does about a `${{ … }}` in a script, by where the
+/// value comes from: the Pipeline's own value is a warning, a value from
+/// outside is an error.
 pub fn script_template_severity(source: ValueSource) -> Severity {
     match source {
-        ValueSource::Pipeline | ValueSource::Outside => Severity::Warning,
+        ValueSource::Pipeline => Severity::Warning,
+        ValueSource::Outside => Severity::Error,
     }
 }
 
-/// The shells whose `-c` argument is a script.
-const SHELLS: [&str; 9] = [
-    "sh",
-    "bash",
-    "zsh",
-    "ash",
-    "dash",
-    "ksh",
-    "mksh",
-    "yash",
-    "busybox-sh",
-];
+/// The last path segment of a program: `sh` for `/bin/sh`.
+fn basename(program: &str) -> &str {
+    program.rsplit('/').next().unwrap_or(program)
+}
 
-/// The index of the script in a shell command: the argument after `-c`, or
-/// after a group of short flags that holds `c` (`sh -ec`, `bash -xc`), when
-/// `command[0]` is a shell (by name or path, `/bin/sh`). `-o name` takes an
-/// argument; anything else that is not a flag ends the options (a script
-/// file).
-fn shell_script_arg(command: &[String]) -> Option<usize> {
-    let shell = command.first()?.rsplit('/').next()?;
-    if !SHELLS.contains(&shell) {
-        return None;
-    }
-    let mut i = 1;
-    while i < command.len() {
-        let arg = command[i].as_str();
-        match arg {
-            "-o" | "+o" => i += 2,
-            "--" | "-" => return None,
-            _ if arg.starts_with("--") || arg.starts_with('+') => i += 1,
-            _ => match arg.strip_prefix('-') {
-                Some(flags) if flags.contains('c') => {
-                    return (i + 1 < command.len()).then_some(i + 1)
-                }
-                Some(_) => i += 1,
-                None => return None,
-            },
+/// The index of the program a command runs once the wrappers in front of it
+/// are skipped: `env` (with its options and `NAME=value` arguments),
+/// `busybox`, `timeout` (with its duration), `nice`, `nohup`, `stdbuf`,
+/// `setsid`, `sudo` and `exec`, each with its options and their arguments.
+fn skip_wrappers(command: &[String]) -> usize {
+    let mut i = 0;
+    while let Some(program) = command.get(i) {
+        // The options that take the next argument, whether `NAME=value`
+        // arguments may follow, and how many operands come before the
+        // program the wrapper runs.
+        let (takes_arg, assigns, operands): (&[&str], bool, usize) = match basename(program) {
+            "env" => (
+                &["-u", "-C", "-S", "--unset", "--chdir", "--split-string"],
+                true,
+                0,
+            ),
+            "sudo" => (
+                &[
+                    "-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-U", "-T", "-R", "--user",
+                    "--group", "--host", "--prompt", "--close-from", "--chdir", "--role",
+                    "--type", "--other-user", "--command-timeout", "--chroot",
+                ],
+                true,
+                0,
+            ),
+            "timeout" => (&["-s", "-k", "--signal", "--kill-after"], false, 1),
+            "nice" => (&["-n", "--adjustment"], false, 0),
+            "stdbuf" => (
+                &["-i", "-o", "-e", "--input", "--output", "--error"],
+                false,
+                0,
+            ),
+            "exec" => (&["-a"], false, 0),
+            "busybox" | "nohup" | "setsid" => (&[], false, 0),
+            _ => return i,
+        };
+        i += 1;
+        while let Some(arg) = command.get(i) {
+            let arg = arg.as_str();
+            if arg == "--" {
+                i += 1;
+                break;
+            }
+            if arg.starts_with('-') {
+                i += if takes_arg.contains(&arg) { 2 } else { 1 };
+            } else if assigns && arg.contains('=') {
+                i += 1;
+            } else {
+                break;
+            }
         }
+        while assigns
+            && command
+                .get(i)
+                .is_some_and(|a| a.contains('=') && !a.starts_with('-'))
+        {
+            i += 1;
+        }
+        i += operands;
+    }
+    i
+}
+
+/// The index of the script in a shell command (`sh`, `bash`, `dash`, ...):
+/// the first argument after the options when one of them holds `c` (`-c`,
+/// `-ec`, `-c -e`). `-o`, `-O`, `--rcfile` and `--init-file` take an
+/// argument; an argument that is not an option, without `-c`, is a script
+/// file.
+fn shell_script(command: &[String], start: usize) -> Option<usize> {
+    let mut has_c = false;
+    let mut i = start;
+    while let Some(arg) = command.get(i) {
+        let arg = arg.as_str();
+        match arg {
+            "--" | "-" => {
+                i += 1;
+                break;
+            }
+            "--rcfile" | "--init-file" => i += 2,
+            _ if arg.starts_with("--") => i += 1,
+            _ if arg.len() > 1 && (arg.starts_with('-') || arg.starts_with('+')) => {
+                let flags = &arg[1..];
+                has_c |= flags.contains('c');
+                // Each `o` or `O` in a group takes the next argument.
+                i += 1 + flags.chars().filter(|c| matches!(c, 'o' | 'O')).count();
+            }
+            _ => break,
+        }
+    }
+    (has_c && i < command.len()).then_some(i)
+}
+
+/// How an interpreter that is not a shell takes a script on its command
+/// line (`python -c`, `node -e`, `perl -e`, `ruby -e`).
+struct ScriptFlags {
+    /// The short options whose argument is the script.
+    script: &'static [char],
+    /// Long options whose argument is the script (`--eval`), next or after
+    /// `=`.
+    long_script: &'static [&'static str],
+    /// Short options that take an argument: the rest of their group, or the
+    /// next argument when the group ends with them.
+    takes_arg: &'static [char],
+    /// Long options that take the next argument.
+    long_takes_arg: &'static [&'static str],
+    /// Short options after which no script follows (`python -m`).
+    stop: &'static [char],
+}
+
+const PYTHON: ScriptFlags = ScriptFlags {
+    script: &['c'],
+    long_script: &[],
+    takes_arg: &['W', 'X'],
+    long_takes_arg: &[],
+    stop: &['m'],
+};
+const NODE: ScriptFlags = ScriptFlags {
+    script: &['e', 'p'],
+    long_script: &["--eval", "--print"],
+    takes_arg: &['r', 'C'],
+    long_takes_arg: &[
+        "--require",
+        "--conditions",
+        "--import",
+        "--loader",
+        "--experimental-loader",
+    ],
+    stop: &[],
+};
+const PERL: ScriptFlags = ScriptFlags {
+    script: &['e', 'E'],
+    long_script: &[],
+    takes_arg: &['I', 'M', 'm', 'i', 'x', 'd', 'D'],
+    long_takes_arg: &[],
+    stop: &[],
+};
+const RUBY: ScriptFlags = ScriptFlags {
+    script: &['e'],
+    long_script: &[],
+    takes_arg: &['I', 'r', 'C', 'E', 'F', 'x', 'K', 'W', 'T', '0'],
+    long_takes_arg: &[],
+    stop: &[],
+};
+
+/// The index of the script in an interpreter's command (see
+/// [`ScriptFlags`]). A script written in the same argument as its option
+/// (`python -c'…'`, `node --eval=…`) is that argument. An argument that is
+/// not an option is a script file.
+fn flag_script(command: &[String], start: usize, flags: &ScriptFlags) -> Option<usize> {
+    let next = |i: usize| (i + 1 < command.len()).then_some(i + 1);
+    let mut i = start;
+    while let Some(arg) = command.get(i) {
+        let arg = arg.as_str();
+        if arg == "-" || arg == "--" || !arg.starts_with('-') {
+            return None;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            let name = long.split('=').next().unwrap_or(long);
+            let name = &arg[..2 + name.len()];
+            if flags.long_script.contains(&name) {
+                return if long.contains('=') { Some(i) } else { next(i) };
+            }
+            i += if !long.contains('=') && flags.long_takes_arg.contains(&name) {
+                2
+            } else {
+                1
+            };
+            continue;
+        }
+        let group = &arg[1..];
+        let mut skip = 1;
+        for (at, c) in group.char_indices() {
+            let rest = &group[at + c.len_utf8()..];
+            if flags.stop.contains(&c) {
+                return None;
+            }
+            if flags.script.contains(&c) {
+                return if rest.is_empty() { next(i) } else { Some(i) };
+            }
+            if flags.takes_arg.contains(&c) {
+                if rest.is_empty() {
+                    skip = 2;
+                }
+                break;
+            }
+        }
+        i += skip;
     }
     None
 }
 
-/// Each `${{ … }}` in a shell script of a Step (ADR-0076), with its
-/// severity: the rendered value is pasted into the script, so a value that
-/// holds `"; curl …` runs. One finding per script, at the severity of the
-/// value from furthest outside it reads.
+/// The index of the script in a Step's command, after any wrappers: what a
+/// shell reads with `-c`, `python -c`, `node -e`/`-p`, `perl -e`/`-E` and
+/// `ruby -e` run. The interpreter is named by name or path (`/bin/sh`,
+/// `python3.12`).
+fn script_arg(command: &[String]) -> Option<(usize, &str)> {
+    let at = skip_wrappers(command);
+    let program = basename(command.get(at)?);
+    let start = at + 1;
+    let found = match program {
+        "sh" | "bash" | "dash" | "zsh" | "ash" | "ksh" | "mksh" | "yash" | "busybox-sh" => {
+            shell_script(command, start)
+        }
+        "node" | "nodejs" => flag_script(command, start, &NODE),
+        "perl" => flag_script(command, start, &PERL),
+        "ruby" => flag_script(command, start, &RUBY),
+        _ if program
+            .strip_prefix("python")
+            .is_some_and(|v| v.chars().all(|c| c.is_ascii_digit() || c == '.')) =>
+        {
+            flag_script(command, start, &PYTHON)
+        }
+        _ => None,
+    }?;
+    Some((found, program))
+}
+
+/// Each `${{ … }}` in a script a Step runs (ADR-0076), with its severity: the
+/// rendered value is pasted into the script, so a value that holds `"; curl
+/// …` runs. One finding per script text, at the severity of the value from
+/// furthest outside that any Step running it reads.
 fn script_templates(ir: &PipelineIr) -> Vec<(Severity, String)> {
-    let mut out = Vec::new();
-    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    // Script text -> the finding, so a library Step inlined twice reports
+    // once, at the severity of its worse caller.
+    let mut found: Vec<(Severity, String)> = Vec::new();
+    let mut index: BTreeMap<&str, usize> = BTreeMap::new();
     for step in &ir.steps {
-        let Some(at) = shell_script_arg(&step.command) else {
+        let Some((at, program)) = script_arg(&step.command) else {
             continue;
         };
         let script = step.command[at].as_str();
-        let (found, _) = cel::scan_interpolations(script);
-        if found.is_empty() || !seen.insert(script) {
+        let (spans, _) = cel::scan_interpolations(script);
+        if spans.is_empty() {
             continue;
         }
-        // At the Pipeline level, `inputs` are the Run's launch parameters.
-        let run_inputs = step
-            .scope
-            .as_ref()
-            .is_none_or(|s| s.inputs == ScopeInputs::Run);
-        let source = found
+        let sources = scope::InputSources::of(step.scope.as_ref());
+        let each: Vec<(ValueSource, &str)> = spans
             .iter()
-            .flat_map(|i| cel::reads(script[i.inner.clone()].trim()).unwrap_or_default())
-            .map(|r| match r.var.as_str() {
-                "event" => ValueSource::Outside,
-                "inputs" if run_inputs => ValueSource::Outside,
-                _ => ValueSource::Pipeline,
+            .map(|i| {
+                (
+                    sources.of_expr(script[i.inner.clone()].trim()),
+                    &script[i.outer.clone()],
+                )
             })
+            .collect();
+        let source = each
+            .iter()
+            .map(|(s, _)| *s)
             .max()
             .unwrap_or(ValueSource::Pipeline);
-        let first = &script[found[0].outer.clone()];
-        out.push((
-            script_template_severity(source),
-            format!(
-                "step `{}`: `command[{at}]` is a shell script with `{first}` in it, so the value \
-                 becomes part of the script; pass it in `env:` (`env: [[VALUE, \"{first}\"]]`) \
-                 and read it in the script as \"$VALUE\"",
-                step.id
-            ),
-        ));
+        let severity = script_template_severity(source);
+        // The template named is the first one from as far outside.
+        let shown = each
+            .iter()
+            .find(|(s, _)| *s == source)
+            .map(|(_, t)| *t)
+            .unwrap_or_default();
+        let why = match source {
+            ValueSource::Pipeline => "so the value becomes part of the script".to_string(),
+            ValueSource::Outside => "which reads a value from outside the Pipeline (a Run \
+                                     parameter, a Step's results or an event field), so that \
+                                     value would run as part of the script"
+                .to_string(),
+        };
+        let finding = format!(
+            "step `{}`: `command[{at}]` is a script that `{program}` runs, with `{shown}` in it, \
+             {why}; pass it in `env:` (`env: [[VALUE, \"{shown}\"]]`) and read it from the \
+             environment (\"$VALUE\" in a shell script)",
+            step.id
+        );
+        match index.get(script) {
+            Some(&k) if found[k].0 >= severity => {}
+            Some(&k) => found[k] = (severity, finding),
+            None => {
+                index.insert(script, found.len());
+                found.push((severity, finding));
+            }
+        }
     }
-    out
+    found
 }
 
 /// Validate one step's [`CacheSpec`] (ADR-0065 s1). All diagnostics are
@@ -5935,49 +6139,118 @@ mod tests {
     }
 
     #[test]
-    fn a_template_in_a_shell_script_is_a_lint_warning() {
-        let lint_of = |command: &str| {
-            lint(&compile(&format!(
+    fn a_template_in_a_script_warns_for_the_pipelines_own_value_and_refuses_an_outside_one() {
+        let yaml = |command: &str| {
+            format!(
                 "interface: {{ inputs: [{{ name: p, type: string }}] }}\n\
-                 steps: [{{ id: a, image: busybox, command: {command} }}]"
-            )))
+                 steps:\n  - {{ id: b, image: busybox, results: [v] }}\n  \
+                 - {{ id: a, image: busybox, needs: [b], command: {command}, \
+                 matrix: {{ dimensions: {{ x: [one] }} }} }}"
+            )
         };
+        // The Pipeline's own value (a matrix coordinate, a literal): a
+        // warning, in every form of script.
         for command in [
-            r#"[sh, -c, "echo ${{ inputs.p }}"]"#,
-            r#"[/bin/bash, -ec, "echo ${{ inputs.p }}"]"#,
+            r#"[sh, -c, "echo ${{ matrix.x }}"]"#,
+            r#"[/bin/bash, -ec, "echo ${{ matrix.x }}"]"#,
             r#"[bash, -o, pipefail, -xc, "echo ${{ matrix.x }}"]"#,
-            r#"[dash, --norc, +e, -c, "echo ${{ outputs.b.v }}"]"#,
+            r#"[dash, --norc, +e, -c, "echo ${{ 'lit' }}"]"#,
+            r#"[bash, -c, -e, "echo ${{ matrix.x }}"]"#,
+            r#"[env, -i, A=b, --, sh, -c, "echo ${{ matrix.x }}"]"#,
+            r#"[sudo, -u, root, A=b, bash, -c, "echo ${{ matrix.x }}"]"#,
+            r#"[nice, -n, "5", stdbuf, -oL, setsid, nohup, sh, -c, "echo ${{ matrix.x }}"]"#,
+            r#"[timeout, -s, KILL, 60s, exec, -a, x, sh, -c, "echo ${{ matrix.x }}"]"#,
+            r#"[python3.12, -B, -W, ignore, -c, "print('${{ matrix.x }}')"]"#,
+            r#"[python, "-uc", "print('${{ matrix.x }}')"]"#,
+            r#"[python, "-c print('${{ matrix.x }}')"]"#,
+            r#"[node, -r, m, -e, "console.log('${{ matrix.x }}')"]"#,
+            r#"[node, "--eval=console.log('${{ matrix.x }}')"]"#,
+            r#"[nodejs, --print, "'${{ matrix.x }}'"]"#,
+            r#"[perl, -Ilib, -ne, "print '${{ matrix.x }}'"]"#,
+            r#"[ruby, -r, json, -e, "puts '${{ matrix.x }}'"]"#,
         ] {
-            let w = lint_of(command);
+            let ir = compile(&yaml(command));
+            let w = lint(&ir);
             assert!(
                 w.iter().any(|w| w.contains("`command[")
-                    && w.contains("is a shell script with `${{")
+                    && w.contains("is a script that `")
                     && w.contains("pass it in `env:`")
                     && w.contains("\"$VALUE\"")),
                 "{command}: {w:?}"
             );
         }
+        // A value from outside: a Run parameter or a Step's results.
+        for command in [
+            r#"[sh, -c, "echo ${{ inputs.p }}"]"#,
+            r#"[sh, -c, "echo ${{ matrix.x }} ${{ outputs.b.v }}"]"#,
+            r#"[python3, -c, "${{ size(inputs) }}"]"#,
+        ] {
+            let errs = errors(&yaml(command));
+            assert!(
+                errs.iter().any(|e| e.contains("from outside the Pipeline")
+                    && e.contains("pass it in `env:`")),
+                "{command}: {errs:?}"
+            );
+        }
+        // Not a script, a script file, a script with no template, a module.
         for command in [
             r#"[echo, "${{ inputs.p }}"]"#,
             r#"[sh, script.sh, "${{ inputs.p }}"]"#,
-            r#"[sh, -c, "echo \"$VALUE\""]"#,
+            r#"[sh, -c, "echo \"$VALUE\"", sh, "${{ inputs.p }}"]"#,
             r#"[sh, -e]"#,
-            r#"[python, -c, "${{ inputs.p }}"]"#,
+            r#"[sh, -c]"#,
+            r#"[python, -m, "${{ inputs.p }}"]"#,
+            r#"[python, script.py, -c, "${{ inputs.p }}"]"#,
+            r#"[node, --, "${{ inputs.p }}"]"#,
+            r#"[perl, -pi, "${{ inputs.p }}"]"#,
+            r#"[env, "${{ inputs.p }}"]"#,
         ] {
+            let ir = compile(&yaml(command));
             assert!(
-                !lint_of(command).iter().any(|w| w.contains("shell script")),
+                !lint(&ir).iter().any(|w| w.contains("is a script")),
                 "{command}"
             );
         }
-        // The value's source is classified; both kinds warn for now.
+        // A script given in `env:` is not run from the command line.
+        compile(&yaml(r#"[sh, -c, "$S"], env: [[S, "${{ inputs.p }}"]]"#));
         assert_eq!(
             script_template_severity(ValueSource::Outside),
-            Severity::Warning
+            Severity::Error
         );
         assert_eq!(
             script_template_severity(ValueSource::Pipeline),
             Severity::Warning
         );
+    }
+
+    /// A library script's value is from outside when its caller's `with:`
+    /// reads a Run parameter, however many callers out; a literal `with:`
+    /// value or a default is the Pipeline's own. One script inlined from two
+    /// callers is reported at the worse caller's severity.
+    #[test]
+    fn a_library_scripts_value_is_classified_through_its_callers() {
+        let inner = "kind: library\ninterface: { inputs: [{ name: v, type: string }, { name: d, type: string, required: false, default: x }] }\nsteps: [{ id: s, image: busybox, command: [sh, -c, \"echo ${{ inputs.v }}\"] }, { id: t, image: busybox, command: [sh, -c, \"echo ${{ inputs.d }}\"] }]\n";
+        let outer = "kind: library\ninterface: { inputs: [{ name: w, type: string }] }\nsteps: [{ id: n, invoke: file:inner.yaml, with: { v: \"${{ inputs.w }}-x\" } }]\n";
+        let files = libs(&[("inner.yaml", inner), ("outer.yaml", outer)]);
+        let pipeline = |w: &str| {
+            format!(
+                "interface: {{ inputs: [{{ name: p, type: string }}] }}\nsteps:\n  - {{ id: lit, invoke: file:outer.yaml, with: {{ w: lit }} }}\n  - {{ id: run, invoke: file:outer.yaml, with: {{ w: \"{w}\" }} }}\n"
+            )
+        };
+        // Both callers literal: warnings only.
+        let ir = compile_with(&pipeline("also-lit"), &files);
+        let w = lint(&ir);
+        assert!(w.iter().any(|w| w.contains("lit/n/s")), "{w:?}");
+        assert!(w.iter().any(|w| w.contains("lit/n/t")), "{w:?}");
+        // One caller passes a Run parameter two levels down: an error, while
+        // the default read by the other script stays a warning.
+        let errs = errors_with(&pipeline("${{ inputs.p }}"), &files);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("run/n/s") && e.contains("from outside the Pipeline")),
+            "{errs:?}"
+        );
+        assert!(!errs.iter().any(|e| e.contains("/n/t")), "{errs:?}");
     }
 
     #[test]

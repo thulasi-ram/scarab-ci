@@ -376,10 +376,14 @@ fn script_findings(command: &str) -> (Vec<String>, Result<(), Vec<String>>) {
     let yaml = format!(
         "interface: {{ inputs: [{{ name: p, type: string }}] }}\nsteps: [{{ id: s, image: busybox, command: {command} }}]\n"
     );
-    let ir = ok(&yaml, &Libraries::default());
+    // A finding that is an error fails the compile, which runs `validate`.
+    let ir = match compile(&yaml, &Libraries::default()) {
+        Ok(ir) => ir,
+        Err(e) => return (Vec::new(), Err(e)),
+    };
     let warns: Vec<String> = lint(&ir)
         .into_iter()
-        .filter(|w| w.contains("shell script"))
+        .filter(|w| w.contains("is a script"))
         .collect();
     (warns, validate(&ir))
 }
@@ -387,7 +391,6 @@ fn script_findings(command: &str) -> (Vec<String>, Result<(), Vec<String>>) {
 /// Shell invocations whose script holds `${{ inputs.p }}`. Each must be
 /// reported (warning or error).
 #[test]
-#[ignore = "red: render r1"]
 fn script_lint_sees_every_shell_invocation_form() {
     let mut missed = Vec::new();
     for cmd in [
@@ -416,7 +419,6 @@ fn script_lint_sees_every_shell_invocation_form() {
 /// Pipeline's own values and an error for outside values. A Run parameter
 /// is outside.
 #[test]
-#[ignore = "red: render r1"]
 fn an_outside_value_in_a_shell_script_is_an_error() {
     let (_, errs) = script_findings(r#"[sh, -c, "echo ${{ inputs.p }}"]"#);
     assert!(errs.is_err(), "a Run parameter in `sh -c` compiled");
@@ -426,19 +428,19 @@ fn an_outside_value_in_a_shell_script_is_an_error() {
 /// parameter carries an outside value. The check names its source as the
 /// library (Pipeline), so once outside values are errors this one is not.
 #[test]
-#[ignore = "red: render r1"]
 fn a_library_script_reading_a_run_parameter_through_with_is_outside() {
     let lib = "kind: library\ninterface: { inputs: [{ name: v, type: string }] }\nsteps: [{ id: s, image: busybox, command: [sh, -c, \"echo ${{ inputs.v }}\"] }]\n";
     let yaml = "interface: { inputs: [{ name: p, type: string }] }\nsteps: [{ id: c, invoke: file:l.yaml, with: { v: \"${{ inputs.p }}\" } }]\n";
-    let ir = ok(yaml, &files(&[("l.yaml", lib)]));
+    // An error fails the compile, which runs `validate`.
+    let refused = compile(yaml, &files(&[("l.yaml", lib)])).is_err();
     // Same severity as the Pipeline-level form.
     let direct = script_findings(r#"[sh, -c, "echo ${{ inputs.p }}"]"#).1.is_err();
     assert_eq!(
-        validate(&ir).is_err(),
+        refused,
         direct,
         "a Run parameter reaches a library script at a different severity than in the Pipeline"
     );
-    assert!(validate(&ir).is_err(), "outside value through `with:` in `sh -c` compiled");
+    assert!(refused, "outside value through `with:` in `sh -c` compiled");
 }
 
 // ========================================================= 7. stored IR

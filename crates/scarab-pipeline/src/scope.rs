@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ParamSpec;
+use crate::{cel, ParamSpec, ValueSource};
 
 /// The names a Step's templates read, and where each value comes from.
 ///
@@ -143,5 +143,94 @@ impl Scope {
             cur = cur.and_then(|s| s.caller.as_deref_mut());
         }
         cur
+    }
+}
+
+/// Where each value a scope's templates read through `inputs` comes from
+/// ([`ValueSource`]), for the checks that treat an outside value differently
+/// from the Pipeline's own: the script check at compile and the leading-`-`
+/// check when an argument renders.
+#[derive(Debug, Clone)]
+pub(crate) enum InputSources {
+    /// `inputs` are the Run's launch parameters: every one is from outside.
+    Run,
+    /// A library invocation's inputs, each by name. A literal `with:` value
+    /// or a default is the Pipeline's own; a caller's template is from
+    /// outside when what it reads, in its caller's scope, is.
+    Bound(BTreeMap<String, ValueSource>),
+}
+
+impl InputSources {
+    /// The sources of `scope`'s inputs (`None`: a Step written in the
+    /// Pipeline file). Built from the outermost caller in, once per scope, so
+    /// the work is the size of the chain's bindings, however the templates
+    /// read each other.
+    pub(crate) fn of(scope: Option<&Scope>) -> Self {
+        let Some(scope) = scope else {
+            return InputSources::Run;
+        };
+        let chain: Vec<&Scope> = scope.chain().collect();
+        let mut caller: Option<InputSources> = None;
+        for s in chain.into_iter().rev() {
+            let here = match &s.inputs {
+                ScopeInputs::Run => InputSources::Run,
+                ScopeInputs::Bound(bindings) => InputSources::Bound(
+                    bindings
+                        .iter()
+                        .map(|(name, b)| {
+                            let source = match &b.value {
+                                BoundValue::Literal(_) => ValueSource::Pipeline,
+                                // A template with no caller scope fails at
+                                // launch; until then it is from outside.
+                                BoundValue::Template(t) => match &caller {
+                                    Some(c) => c.of_template(t),
+                                    None => ValueSource::Outside,
+                                },
+                            };
+                            (name.clone(), source)
+                        })
+                        .collect(),
+                ),
+            };
+            caller = Some(here);
+        }
+        caller.unwrap_or(InputSources::Run)
+    }
+
+    /// Where the value of the expression `expr` comes from: from outside
+    /// when any read is. `matrix` is the Pipeline's own; `outputs` (a Step's
+    /// results), `event` and any name not known here are from outside, and
+    /// so is an expression that does not parse.
+    pub(crate) fn of_expr(&self, expr: &str) -> ValueSource {
+        let Ok(reads) = cel::reads(expr) else {
+            return ValueSource::Outside;
+        };
+        reads
+            .iter()
+            .map(|r| match (r.var.as_str(), self) {
+                ("matrix", _) => ValueSource::Pipeline,
+                ("inputs", InputSources::Run) => ValueSource::Outside,
+                ("inputs", InputSources::Bound(m)) => match &r.first {
+                    Some(name) => m.get(name).copied().unwrap_or(ValueSource::Outside),
+                    None => m.values().copied().max().unwrap_or(ValueSource::Pipeline),
+                },
+                _ => ValueSource::Outside,
+            })
+            .max()
+            .unwrap_or(ValueSource::Pipeline)
+    }
+
+    /// Where the text a template renders to comes from: from outside when
+    /// any of its `${{ … }}` is. An unterminated `${{` is from outside.
+    pub(crate) fn of_template(&self, template: &str) -> ValueSource {
+        let (found, unterminated) = cel::scan_interpolations(template);
+        if unterminated.is_some() {
+            return ValueSource::Outside;
+        }
+        found
+            .iter()
+            .map(|i| self.of_expr(template[i.inner.clone()].trim()))
+            .max()
+            .unwrap_or(ValueSource::Pipeline)
     }
 }
