@@ -585,6 +585,20 @@ pr-gate n:
 chart-immutable:
     scripts/chart_statefulset_immutable.sh deploy/helm/scarab
 
+# The CEL policy checker (ADR-0075) against the cel-spec conformance cases inside
+# its subset. cel-rust's conformance/tests/gen embeds cel-spec's cases, so this
+# needs a cel-rust checkout and no network:
+#   git clone https://github.com/cel-rust/cel-rust && just policy-conformance cel-rust
+policy-conformance cel_rust:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out="${CARGO_TARGET_DIR:-target}/cel-conformance-cases.jsonl"
+    # cargo runs the test from the crate directory: pass an absolute path.
+    case "$out" in /*) ;; *) out="$PWD/$out" ;; esac
+    mkdir -p "$(dirname "$out")"
+    python3 -I crates/scarab-policy/tests/conformance/extract.py "{{cel_rust}}/conformance/tests/gen" > "$out"
+    SCARAB_CEL_CONFORMANCE_CASES="$out" cargo test -p scarab-policy --test conformance -- --ignored --nocapture
+
 # Compile-check everything.
 check:
     cargo check --workspace

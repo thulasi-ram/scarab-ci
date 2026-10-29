@@ -3,7 +3,7 @@
 //! CEL is the single expression language for `when:` guards, `${{ … }}` string
 //! interpolation, and matrix predicates (ADR-0009). It is **total** (always
 //! terminates), typed, and sandboxed — the deliberate antidote to GHA's
-//! `${{ }}` Turing-tarpit. The evaluator (`cel-interpreter`) is pure
+//! `${{ }}` Turing-tarpit. The evaluator (`cel`) is pure
 //! computation — no I/O, no clock, no RNG — so it lives directly in this pure
 //! crate, no port/adapter ceremony (ADR-0031).
 //!
@@ -12,7 +12,7 @@
 //! `matrix`). Bad expressions are caught at **submit time** by [`check`], never
 //! mid-run.
 
-use cel_interpreter::{Context, Program};
+use cel::{Context, Program};
 
 use crate::PipelineError;
 
@@ -27,7 +27,7 @@ pub const MAX_EXPRESSION_NESTING: usize = 64;
 
 /// Stack size of the thread that parses and evaluates CEL.
 ///
-/// The parser (`cel-parser`, antlr4rust) and the evaluator recurse once per
+/// The parser (antlr4rust) and the evaluator recurse once per
 /// nesting level *and* once per link of a left-recursive chain (`1+1+1…`,
 /// `a.b.b…`, `l[0][0]…`). A stack overflow aborts the whole process, and
 /// `catch_unwind` cannot stop it, so an expression a repository author wrote
@@ -42,6 +42,8 @@ pub const MAX_EXPRESSION_NESTING: usize = 64;
 /// committed. Measured cost of the extra thread: about 57 µs per call in
 /// release on an M-series Mac (69 µs against 12 µs inline for a two-clause
 /// guard), which is small next to the Postgres writes around each caller.
+/// These figures were measured on `cel-interpreter` 0.10; the limit tests
+/// below run every worst-case shape on `cel` 0.15 under this stack.
 const CEL_STACK_BYTES: usize = if cfg!(debug_assertions) {
     256 << 20
 } else {
@@ -145,12 +147,14 @@ fn skip_string(b: &[u8], open: usize, q: u8) -> usize {
 /// the deepest expression the limits allow (see [`CEL_STACK_BYTES`]). The
 /// program is also dropped there: dropping its tree recurses too.
 ///
-/// It also contains the panic hazard in the parser: `cel-parser` (antlr4rust
-/// 0.3.0-rc2) reaches an `unreachable!()` on some malformed inputs — e.g. a
-/// trailing binary operator (`1 +`) — instead of returning a `ParseError`. A
-/// malformed *user* pipeline must be a submit-time validation error, never a
-/// control-plane crash, so a panic on the CEL thread becomes
-/// [`PipelineError::Cel`]. (The parser's own stderr note on it is harmless.)
+/// It also contains any panic in the parser. `cel-parser` 0.10 (antlr4rust
+/// 0.3.0-rc2) reached an `unreachable!()` on some malformed inputs, e.g. a
+/// trailing binary operator (`1 +`), instead of returning a `ParseError`.
+/// `cel` 0.15 (antlr4rust 0.6) returns an error for every malformed input we
+/// have tried, `1 +` included, but the parser is still generated code over a
+/// third-party runtime. A malformed *user* pipeline must be a submit-time
+/// validation error, never a control-plane crash, so a panic on the CEL thread
+/// becomes [`PipelineError::Cel`].
 fn with_program<T: Send>(
     expr: &str,
     f: impl FnOnce(&Program) -> Result<T, PipelineError> + Send,
@@ -411,7 +415,14 @@ mod tests {
                 check(&deep).unwrap();
                 assert!(eval(&deep, &ctx).is_err());
             }
+            // A ternary chain nests to the right. `cel` 0.15's parser stops at
+            // a recursion depth of 96 and returns an error, so the longest
+            // chain is a submit-time error, not an abort; a chain within that
+            // depth evaluates.
             let ternary = format!("{}1", "t?1:".repeat((max - 1) / 4));
+            let err = check(&ternary).unwrap_err().to_string();
+            assert!(err.contains("Recursion limit"), "{}", shown(&err));
+            let ternary = format!("{}1", "t?1:".repeat(64));
             assert_eq!(eval(&ternary, &ctx).unwrap(), json!(1));
             // A long flat list literal.
             let list = format!("size({}])", chain("[1", ",1", max - 7));
