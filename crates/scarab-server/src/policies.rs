@@ -294,6 +294,11 @@ pub struct PolicyTestTrigger {
     /// `manual` and `api` (as a dispatch is), none otherwise.
     #[serde(default)]
     pub actor: Option<String>,
+    /// The forge's immutable id of that account (a webhook's `sender.id`),
+    /// which admission resolves to the linked Principal (ADR-0069); webhook
+    /// kinds only. Default none: the Run has no `principal`.
+    #[serde(default)]
+    pub actor_id: Option<String>,
     /// A pull request from a fork; `pull_request` only. Default false.
     #[serde(default)]
     pub fork: bool,
@@ -1122,6 +1127,13 @@ fn test_event(
     if t.reason.is_some() && !dispatched {
         return Err(bad("only a manual or api trigger carries a reason".into()));
     }
+    if t.actor_id.is_some() && dispatched {
+        return Err(bad(
+            "a manual or api trigger's actor is a Principal; `actor_id` is for webhook kinds"
+                .into(),
+        ));
+    }
+    let actor_id = t.actor_id.clone().unwrap_or_default();
     let needs_ref = || {
         t.r#ref
             .clone()
@@ -1148,6 +1160,7 @@ fn test_event(
     Ok(match kind {
         TriggerKind::Push => Event::Push {
             actor,
+            actor_id: actor_id.clone(),
             repo,
             r#ref: needs_ref()?,
             after: sha,
@@ -1167,6 +1180,7 @@ fn test_event(
                 })?;
             Event::PullRequest {
                 actor,
+                actor_id: actor_id.clone(),
                 repo,
                 number,
                 head: sha,
@@ -1177,11 +1191,13 @@ fn test_event(
         }
         TriggerKind::Tag => Event::Tag {
             actor,
+            actor_id: actor_id.clone(),
             repo,
             tag: tag_of()?,
         },
         TriggerKind::Release => Event::Release {
             actor,
+            actor_id: actor_id.clone(),
             repo,
             tag: tag_of()?,
         },
@@ -1204,6 +1220,7 @@ fn test_event(
         }
         TriggerKind::Comment => Event::Comment {
             actor,
+            actor_id: actor_id.clone(),
             repo,
             issue: 0,
             body: String::new(),
@@ -1275,7 +1292,13 @@ async fn pipeline_input(
 
     let path = p.path.unwrap_or_else(|| ".scarab/ci.yaml".to_string());
     let now = st.clock.now().await.0;
-    let (facts, ctx) = crate::run_create_facts(&event, &path, &repo, &gov, now);
+    // The actor's linked Principal, as admission resolves it.
+    let linked = st
+        .actor_links()
+        .principal_of(&event, &repo)
+        .await
+        .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;
+    let (facts, ctx) = crate::run_create_facts(&event, linked, &path, &repo, &gov, now);
     let plugin_gates = run_create::plugin_gates(&ir);
     let input = match facts {
         Ok(facts) => blocking(move || crate::run_create_input(&ir, facts)).await?,

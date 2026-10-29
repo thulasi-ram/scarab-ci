@@ -535,6 +535,7 @@ fn pipeline_form() -> Value {
 fn push() -> Event {
     Event::Push {
         actor: "octocat".into(),
+        actor_id: String::new(),
         repo: RepoRef {
             owner: "acme".into(),
             name: "web".into(),
@@ -705,6 +706,7 @@ async fn policy_test_evaluates_the_input_admission_records() {
     };
     let fork_pr = Event::PullRequest {
         actor: "mallory".into(),
+        actor_id: String::new(),
         repo,
         number: 7,
         head: SHA.into(),

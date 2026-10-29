@@ -3393,6 +3393,12 @@ export interface components {
              *     `manual` and `api` (as a dispatch is), none otherwise.
              */
             actor?: string | null;
+            /**
+             * @description The forge's immutable id of that account (a webhook's `sender.id`),
+             *     which admission resolves to the linked Principal (ADR-0069); webhook
+             *     kinds only. Default none: the Run has no `principal`.
+             */
+            actor_id?: string | null;
             /** @description A pull request from a fork; `pull_request` only. Default false. */
             fork?: boolean;
             /**

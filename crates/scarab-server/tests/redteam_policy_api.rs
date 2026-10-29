@@ -81,6 +81,7 @@ async fn create(h: &Harness, s: &Sess, uri: &str, policy: Value) -> Value {
 fn push() -> Event {
     Event::Push {
         actor: "octocat".into(),
+        actor_id: String::new(),
         repo: RepoRef {
             owner: "acme".into(),
             name: "web".into(),
@@ -408,6 +409,148 @@ async fn redteam_api_the_same_push_twice_records_one_decision_per_run() {
         let d = policies.decisions_for_run(&r.0).await.unwrap();
         assert_eq!(d.len(), 1, "{r:?}");
     }
+}
+
+/// A webhook actor is the Run's `principal` when its immutable account id is
+/// pinned to one through identity links (ADR-0069, ADR-0075 §2): a Policy on
+/// `trigger.principal` denies the linked account's push, and admits the same
+/// login under an id nobody linked. The forge serving the repo picks the
+/// login provider, as forge import does.
+#[tokio::test]
+async fn a_linked_webhook_actor_is_the_run_create_principal() {
+    use scarab_forge::{ForgeConnection, ForgeConnectionStore, ForgeKind};
+    use scarab_identity::{IdentityStore, ProviderIdentity};
+    use scarab_server::config::OAuthConfig;
+    use scarab_server::oauth::OAuthAuthenticator;
+    use scarab_server::ActorLinks;
+
+    let db = InMemoryDb::new();
+    db.put_connection(&ForgeConnection {
+        id: "gh".into(),
+        kind: ForgeKind::GitHub,
+        base_url: "https://api.github.com/".into(),
+        credential_ref: "github-app".into(),
+    })
+    .await
+    .unwrap();
+    let repo = RepoRef {
+        owner: "acme".into(),
+        name: "web".into(),
+    };
+    db.bind_repo("gh", &repo, "acme", "web").await.unwrap();
+    let identities = scarab_testkit::InMemoryIdentities::new();
+    let pinned = identities
+        .pin(
+            &ProviderIdentity {
+                provider: "github".into(),
+                external_id: "583231".into(),
+                handle: "octocat".into(),
+                email: None,
+                email_verified: false,
+                display_name: None,
+            },
+            "github:octocat",
+            1,
+        )
+        .await
+        .unwrap();
+    let providers = [Arc::new(OAuthAuthenticator::new(OAuthConfig {
+        client_id: "cid".into(),
+        client_secret: "s".into(),
+        authorize_url: "https://github.com/login/oauth/authorize".into(),
+        token_url: "https://github.com/login/oauth/access_token".into(),
+        userinfo_url: "https://api.github.com/user".into(),
+        oidc_issuer: None,
+        scopes: String::new(),
+        owners: vec![],
+        provider_id: "github".into(),
+        unqualified_ids: false,
+        name: "GitHub".into(),
+        forge_url: Some("https://api.github.com".into()),
+    }))];
+
+    let policies = InMemoryPolicies::new();
+    policies
+        .create(&NewPolicy {
+            id: "p".into(),
+            scope: PolicyScope::Org { org: "acme".into() },
+            body: Policy::from_json(json!({
+                "name": "no-octocat", "checkpoint": "run.create", "mode": "enforce",
+                "rules": [{
+                    "when": format!("has(trigger.principal) && trigger.principal == \"{pinned}\""),
+                    "effect": "deny", "message": "not this Principal"
+                }]
+            }))
+            .unwrap(),
+            author: "a".into(),
+            reason: "r".into(),
+            at: 1,
+        })
+        .await
+        .unwrap();
+    let ports = AdmissionPorts {
+        links: ActorLinks {
+            connections: Some(&db),
+            identities: Some(&identities),
+            providers: &providers,
+        },
+        ..AdmissionPorts::default().with_policies(&policies)
+    };
+    let push_by = |actor_id: &str| match push() {
+        Event::Push {
+            actor,
+            repo,
+            r#ref,
+            after,
+            message,
+            ..
+        } => Event::Push {
+            actor,
+            actor_id: actor_id.into(),
+            repo,
+            r#ref,
+            after,
+            message,
+        },
+        _ => unreachable!(),
+    };
+
+    let linked = trigger_runs_from_event(
+        &forge_with(CI_YAML),
+        &db,
+        &FakeClock::new(1_000),
+        ports,
+        &push_by("583231"),
+    )
+    .await
+    .unwrap();
+    assert!(linked.runs.is_empty(), "the linked account is denied");
+    assert_eq!(linked.refused.len(), 1);
+    let denied = policies.org_decisions("acme", 0, None).await.unwrap();
+    assert_eq!(denied.len(), 1);
+    assert_eq!(
+        denied[0].decision.input["trigger"]["principal"],
+        json!(pinned)
+    );
+    assert_eq!(denied[0].decision.input["principal"], json!(pinned));
+
+    // The same login under an id nobody linked has no `principal`.
+    let unlinked = trigger_runs_from_event(
+        &forge_with(CI_YAML),
+        &db,
+        &FakeClock::new(1_000),
+        ports,
+        &push_by("1"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(unlinked.runs.len(), 1);
+    let d = policies
+        .decisions_for_run(&unlinked.runs[0].0)
+        .await
+        .unwrap();
+    assert_eq!(d[0].decision.input["trigger"]["actor"], json!("octocat"));
+    assert_eq!(d[0].decision.input["trigger"]["principal"], json!(null));
 }
 
 /// Saving an enforced Policy unchanged needs no step-up; saving an earlier

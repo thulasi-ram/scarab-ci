@@ -166,6 +166,11 @@ pub enum Event {
         /// login. Stamped onto the Run as its [`Actor`](Event::actor) and shown in
         /// the UI. Empty only if the payload carried no sender (malformed).
         actor: String,
+        /// The forge's immutable id of that account (the webhook `sender.id`):
+        /// the key identity links resolve it by (ADR-0069), since a login can
+        /// be renamed and reused. Empty when the payload carried none.
+        #[serde(default)]
+        actor_id: String,
         repo: RepoRef,
         r#ref: String,
         after: String,
@@ -179,6 +184,11 @@ pub enum Event {
     PullRequest {
         /// The forge principal who triggered the PR event (the webhook `sender`).
         actor: String,
+        /// The forge's immutable id of that account (the webhook `sender.id`):
+        /// the key identity links resolve it by (ADR-0069), since a login can
+        /// be renamed and reused. Empty when the payload carried none.
+        #[serde(default)]
+        actor_id: String,
         repo: RepoRef,
         number: u64,
         head: String,
@@ -201,18 +211,33 @@ pub enum Event {
     Tag {
         /// The forge principal who cut the tag (the webhook `sender`).
         actor: String,
+        /// The forge's immutable id of that account (the webhook `sender.id`):
+        /// the key identity links resolve it by (ADR-0069), since a login can
+        /// be renamed and reused. Empty when the payload carried none.
+        #[serde(default)]
+        actor_id: String,
         repo: RepoRef,
         tag: String,
     },
     Release {
         /// The forge principal who published the release (the webhook `sender`).
         actor: String,
+        /// The forge's immutable id of that account (the webhook `sender.id`):
+        /// the key identity links resolve it by (ADR-0069), since a login can
+        /// be renamed and reused. Empty when the payload carried none.
+        #[serde(default)]
+        actor_id: String,
         repo: RepoRef,
         tag: String,
     },
     Comment {
         /// The forge principal who wrote the comment (the webhook `sender`).
         actor: String,
+        /// The forge's immutable id of that account (the webhook `sender.id`):
+        /// the key identity links resolve it by (ADR-0069), since a login can
+        /// be renamed and reused. Empty when the payload carried none.
+        #[serde(default)]
+        actor_id: String,
         repo: RepoRef,
         issue: u64,
         body: String,
@@ -355,6 +380,21 @@ impl Event {
             | Event::Manual { actor, .. }
             | Event::Api { actor, .. } => actor.as_str(),
             Event::Cron { .. } | Event::Upstream { .. } => "",
+        };
+        (!a.is_empty()).then_some(a)
+    }
+
+    /// The forge's immutable id of the [`actor`](Event::actor) of a webhook
+    /// event, when the payload carried one. `None` for a dispatch, whose actor
+    /// is already a Principal, and for `cron` and `upstream`.
+    pub fn actor_id(&self) -> Option<&str> {
+        let a = match self {
+            Event::Push { actor_id, .. }
+            | Event::PullRequest { actor_id, .. }
+            | Event::Tag { actor_id, .. }
+            | Event::Release { actor_id, .. }
+            | Event::Comment { actor_id, .. } => actor_id.as_str(),
+            _ => "",
         };
         (!a.is_empty()).then_some(a)
     }
@@ -1052,6 +1092,7 @@ mod tests {
             (
                 Event::Push {
                     actor: "octocat".into(),
+                    actor_id: String::new(),
                     repo: repo(),
                     r#ref: "refs/heads/main".into(),
                     after: "deadbeef".into(),
@@ -1062,6 +1103,7 @@ mod tests {
             (
                 Event::PullRequest {
                     actor: "octocat".into(),
+                    actor_id: String::new(),
                     repo: repo(),
                     number: 7,
                     head: "cafe".into(),
@@ -1074,6 +1116,7 @@ mod tests {
             (
                 Event::Tag {
                     actor: "octocat".into(),
+                    actor_id: String::new(),
                     repo: repo(),
                     tag: "v1".into(),
                 },
@@ -1082,6 +1125,7 @@ mod tests {
             (
                 Event::Release {
                     actor: "octocat".into(),
+                    actor_id: String::new(),
                     repo: repo(),
                     tag: "v1".into(),
                 },
@@ -1090,6 +1134,7 @@ mod tests {
             (
                 Event::Comment {
                     actor: "octocat".into(),
+                    actor_id: String::new(),
                     repo: repo(),
                     issue: 1,
                     body: "/deploy".into(),
@@ -1141,6 +1186,7 @@ mod tests {
         assert_eq!(
             Event::Push {
                 actor: "octocat".into(),
+                actor_id: String::new(),
                 repo: repo(),
                 r#ref: "refs/heads/main".into(),
                 after: "abc".into(),
@@ -1173,6 +1219,7 @@ mod tests {
         assert_eq!(
             Event::Push {
                 actor: String::new(),
+                actor_id: String::new(),
                 repo: repo(),
                 r#ref: "refs/heads/main".into(),
                 after: "abc".into(),
@@ -1187,6 +1234,7 @@ mod tests {
     fn fork_pr_is_detected() {
         let fork = Event::PullRequest {
             actor: "octocat".into(),
+            actor_id: String::new(),
             repo: repo(),
             number: 1,
             head: "x".into(),
@@ -1196,6 +1244,7 @@ mod tests {
         };
         let internal = Event::PullRequest {
             actor: "octocat".into(),
+            actor_id: String::new(),
             repo: repo(),
             number: 2,
             head: "y".into(),
@@ -1209,6 +1258,7 @@ mod tests {
         // Non-PR events are never fork PRs.
         assert!(!Event::Push {
             actor: "octocat".into(),
+            actor_id: String::new(),
             repo: repo(),
             r#ref: "main".into(),
             after: "z".into(),
@@ -1254,6 +1304,7 @@ mod tests {
         assert_eq!(
             Event::Push {
                 actor: "octocat".into(),
+                actor_id: String::new(),
                 repo: repo(),
                 r#ref: "main".into(),
                 after: "x".into(),
@@ -1271,6 +1322,7 @@ mod tests {
         assert_eq!(
             Event::Push {
                 actor: "octocat".into(),
+                actor_id: String::new(),
                 repo: repo(),
                 r#ref: "refs/heads/main".into(),
                 after: "deadbeef".into(),
@@ -1308,6 +1360,7 @@ mod tests {
         assert_eq!(
             Event::Tag {
                 actor: "octocat".into(),
+                actor_id: String::new(),
                 repo: repo(),
                 tag: "v1".into()
             }
@@ -1318,6 +1371,7 @@ mod tests {
         assert_eq!(
             Event::Release {
                 actor: "octocat".into(),
+                actor_id: String::new(),
                 repo: repo(),
                 tag: "v2".into()
             }
@@ -1330,6 +1384,7 @@ mod tests {
         assert_eq!(
             Event::PullRequest {
                 actor: "octocat".into(),
+                actor_id: String::new(),
                 repo: repo(),
                 number: 7,
                 head: "cafe".into(),
@@ -1352,6 +1407,7 @@ mod tests {
         assert_eq!(
             Event::Comment {
                 actor: "octocat".into(),
+                actor_id: String::new(),
                 repo: repo(),
                 issue: 1,
                 body: "/deploy".into()
@@ -1386,6 +1442,7 @@ mod tests {
     fn push_context_exposes_branch_and_sha_for_cel() {
         let ctx = Event::Push {
             actor: "octocat".into(),
+            actor_id: String::new(),
             repo: repo(),
             r#ref: "refs/heads/main".into(),
             after: "deadbeef".into(),
@@ -1406,6 +1463,7 @@ mod tests {
         // map, or `${{ event.message }}` becomes a shell script-injection sink.
         let ctx = Event::Push {
             actor: "octocat".into(),
+            actor_id: String::new(),
             repo: repo(),
             r#ref: "refs/heads/main".into(),
             after: "deadbeef".into(),
@@ -1431,6 +1489,7 @@ mod tests {
         // byte-for-byte as lean as before the enrichment.
         let ctx = Event::PullRequest {
             actor: "octocat".into(),
+            actor_id: String::new(),
             repo: repo(),
             number: 7,
             head: "cafe".into(),
@@ -1461,6 +1520,7 @@ mod tests {
         // A PR's headline is its title verbatim; the base branch is NOT part of it.
         let title = Event::PullRequest {
             actor: "octocat".into(),
+            actor_id: String::new(),
             repo: repo(),
             number: 7,
             head: "cafe".into(),
@@ -1475,6 +1535,7 @@ mod tests {
         assert_eq!(
             Event::PullRequest {
                 actor: "octocat".into(),
+                actor_id: String::new(),
                 repo: repo(),
                 number: 7,
                 head: "cafe".into(),
@@ -1571,6 +1632,7 @@ mod tests {
         // The subject is the first line; the body (blank line + prose) is dropped.
         let title = Event::Push {
             actor: "octocat".into(),
+            actor_id: String::new(),
             repo: repo(),
             r#ref: "refs/heads/main".into(),
             after: "deadbeef".into(),
@@ -1583,6 +1645,7 @@ mod tests {
         assert_eq!(
             Event::Push {
                 actor: "octocat".into(),
+                actor_id: String::new(),
                 repo: repo(),
                 r#ref: "refs/heads/main".into(),
                 after: "deadbeef".into(),
@@ -1613,6 +1676,7 @@ mod tests {
         let subject = "é".repeat(TRIGGER_TITLE_MAX + 50);
         let title = Event::Push {
             actor: "octocat".into(),
+            actor_id: String::new(),
             repo: repo(),
             r#ref: "refs/heads/main".into(),
             after: "deadbeef".into(),

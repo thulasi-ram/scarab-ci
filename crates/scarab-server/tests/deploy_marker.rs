@@ -30,6 +30,7 @@ use scarab_testkit::{FakeClock, FakeForge, InMemoryObjectStore};
 fn push() -> Event {
     Event::Push {
         actor: "octocat".into(),
+        actor_id: String::new(),
         repo: RepoRef {
             owner: "acme".into(),
             name: "web".into(),

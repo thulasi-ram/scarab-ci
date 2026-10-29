@@ -200,6 +200,7 @@ fn webhook_events(project: &str) -> Vec<(&'static str, Event)> {
             "push main",
             Event::Push {
                 actor: "octocat".into(),
+                actor_id: String::new(),
                 repo: repo.clone(),
                 r#ref: "refs/heads/main".into(),
                 after: SHA.into(),
@@ -210,6 +211,7 @@ fn webhook_events(project: &str) -> Vec<(&'static str, Event)> {
             "push feature",
             Event::Push {
                 actor: "octocat".into(),
+                actor_id: String::new(),
                 repo: repo.clone(),
                 r#ref: "refs/heads/feature".into(),
                 after: SHA.into(),
@@ -220,6 +222,7 @@ fn webhook_events(project: &str) -> Vec<(&'static str, Event)> {
             "pull request",
             Event::PullRequest {
                 actor: "octocat".into(),
+                actor_id: String::new(),
                 repo: repo.clone(),
                 number: 7,
                 head: SHA.into(),
@@ -232,6 +235,7 @@ fn webhook_events(project: &str) -> Vec<(&'static str, Event)> {
             "tag",
             Event::Tag {
                 actor: "octocat".into(),
+                actor_id: String::new(),
                 repo: repo.clone(),
                 tag: "v1".into(),
             },
@@ -240,6 +244,7 @@ fn webhook_events(project: &str) -> Vec<(&'static str, Event)> {
             "comment (no symbolic ref)",
             Event::Comment {
                 actor: "octocat".into(),
+                actor_id: String::new(),
                 repo,
                 issue: 7,
                 body: "deploy".into(),

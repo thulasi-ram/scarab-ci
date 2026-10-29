@@ -407,6 +407,16 @@ impl AppState {
         AdmissionPorts {
             governance: self.environment_governance.as_deref(),
             policies: self.policies.as_deref(),
+            links: self.actor_links(),
+        }
+    }
+
+    /// The stores that link a webhook actor to a Principal ([`ActorLinks`]).
+    pub(crate) fn actor_links(&self) -> ActorLinks<'_> {
+        ActorLinks {
+            connections: self.connections.as_deref(),
+            identities: self.identities.as_deref(),
+            providers: &self.oauth_providers,
         }
     }
 
@@ -4175,6 +4185,69 @@ pub struct AdmissionPorts<'a> {
     /// Stored Policies (ADR-0075), consulted at `run.create`. `None`: no
     /// Policy is consulted and no decision recorded.
     pub policies: Option<&'a dyn scarab_policy::store::PolicyStore>,
+    /// What links a webhook actor to a Principal (ADR-0069) for the
+    /// `run.create` input. Unset: a webhook Run has no `principal`.
+    pub links: ActorLinks<'a>,
+}
+
+/// The stores that resolve a webhook actor to a Principal (ADR-0069): the
+/// forge connection serving the repo, the login provider whose accounts are
+/// that forge's, and the identity pinned by the actor's immutable id.
+#[derive(Clone, Copy, Default)]
+pub struct ActorLinks<'a> {
+    pub connections: Option<&'a dyn scarab_forge::ForgeConnectionStore>,
+    pub identities: Option<&'a dyn scarab_identity::IdentityStore>,
+    pub providers: &'a [Arc<oauth::OAuthAuthenticator>],
+}
+
+impl ActorLinks<'_> {
+    /// The Principal linked to `event`'s actor: `None` for a dispatch (its
+    /// actor is already a Principal, ADR-0075 §2), for an actor with no
+    /// immutable id, and when the repo has no forge connection, the forge no
+    /// login provider, or the account no Principal. A store failure is an
+    /// error, so a Policy that names Principals is never evaluated as if the
+    /// actor had none.
+    async fn principal_of(
+        &self,
+        event: &scarab_forge::Event,
+        repo: &scarab_forge::RepoRef,
+    ) -> Result<Option<String>, TriggerError> {
+        let (Some(actor_id), Some(connections), Some(identities)) =
+            (event.actor_id(), self.connections, self.identities)
+        else {
+            return Ok(None);
+        };
+        let store_err = |what: &str, e: String| {
+            TriggerError::Db(DbError::Other(format!(
+                "{what}: {e}; the Run was not created because its actor could not be resolved"
+            )))
+        };
+        let Some(resolved) = connections
+            .resolve(repo)
+            .await
+            .map_err(|e| store_err("forge connections", e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let base_url = resolved.connection.base_url.trim_end_matches('/');
+        let Some(provider) = self
+            .providers
+            .iter()
+            .find(|p| p.forge_url() == Some(base_url))
+        else {
+            return Ok(None);
+        };
+        let Some(pinned) = identities
+            .pinned(provider.provider_id(), actor_id)
+            .await
+            .map_err(|e| store_err("identities", e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        scarab_identity::resolve_principal(identities, &pinned)
+            .await
+            .map_err(|e| store_err("identities", e.to_string()))
+    }
 }
 
 impl<'a> AdmissionPorts<'a> {
@@ -4185,6 +4258,7 @@ impl<'a> AdmissionPorts<'a> {
         AdmissionPorts {
             governance,
             policies: None,
+            links: ActorLinks::default(),
         }
     }
 
@@ -4625,8 +4699,18 @@ async fn admit_and_create_run(
     // is not atomic, so a deny after it would leave a partial Run). The run
     // id is minted first so an allow decision names the Run it admitted.
     if let Some(policies) = ports.policies {
-        if let Err(refusal) =
-            consult_run_create(policies, event, ir, path, repo, &gov, &run, now).await?
+        if let Err(refusal) = consult_run_create(
+            policies,
+            &ports.links,
+            event,
+            ir,
+            path,
+            repo,
+            &gov,
+            &run,
+            now,
+        )
+        .await?
         {
             return Ok(Admission::Refused(refusal));
         }
@@ -4703,11 +4787,12 @@ fn policy_store_err(e: scarab_policy::store::PolicyStoreError) -> TriggerError {
 /// The `run.create` trigger of `event` (ADR-0075 §2). For a manual or API
 /// dispatch the actor is the authenticated Principal (the dispatch handler
 /// passes `principal.subject`), so it is both `trigger.principal` and the
-/// input's `principal`. A webhook actor is a forge login; resolving it to a
-/// Principal through identity links (ADR-0069) is not done here, so a
-/// webhook Run has no `principal`.
+/// input's `principal`. A webhook actor is a forge login: its `principal`
+/// is `linked`, the Principal its immutable account id is pinned to through
+/// identity links (ADR-0069, [`ActorLinks::principal_of`]), or none.
 fn run_create_trigger(
     event: &scarab_forge::Event,
+    linked: Option<String>,
 ) -> (scarab_policy::run_create::Trigger, Option<String>) {
     use scarab_forge::{Event, TriggerKind as F};
     use scarab_policy::run_create::TriggerKind as P;
@@ -4737,7 +4822,7 @@ fn run_create_trigger(
                 .filter(|r| !r.trim().is_empty())
                 .map(scarab_policy::schema::FreeText),
         ),
-        _ => (None, None),
+        _ => (linked, None),
     };
     let trigger = scarab_policy::run_create::Trigger {
         kind,
@@ -4757,6 +4842,7 @@ fn run_create_trigger(
 /// and the policy test API.
 fn run_create_facts(
     event: &scarab_forge::Event,
+    linked: Option<String>,
     path: &str,
     repo: &scarab_forge::RepoRef,
     gov: &RunGovernance,
@@ -4769,7 +4855,7 @@ fn run_create_facts(
         RunGovernance::Governed { environment, .. } => Some(environment.clone()),
         RunGovernance::Ungoverned => None,
     };
-    let (trigger, principal) = run_create_trigger(event);
+    let (trigger, principal) = run_create_trigger(event, linked);
     let ctx = scarab_policy::evaluate::MatchContext {
         project: repo.name.clone(),
         environment: environment.clone(),
@@ -4819,6 +4905,7 @@ fn run_create_input(
 #[allow(clippy::too_many_arguments)]
 async fn consult_run_create(
     policies: &dyn scarab_policy::store::PolicyStore,
+    links: &ActorLinks<'_>,
     event: &scarab_forge::Event,
     ir: &scarab_pipeline::PipelineIr,
     path: &str,
@@ -4841,7 +4928,8 @@ async fn consult_run_create(
         return Ok(Ok(()));
     }
 
-    let (facts, ctx) = run_create_facts(event, path, repo, gov, now.0);
+    let linked = links.principal_of(event, repo).await?;
+    let (facts, ctx) = run_create_facts(event, linked, path, repo, gov, now.0);
     // Building the input and evaluating it are CPU work; both run off the
     // async workers. The Run-level caps are checked here first, so a Run
     // that cannot be checked is not copied to get there.

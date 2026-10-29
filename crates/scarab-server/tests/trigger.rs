@@ -29,6 +29,7 @@ fn repo() -> RepoRef {
 fn push(branch: &str) -> Event {
     Event::Push {
         actor: "octocat".into(),
+        actor_id: String::new(),
         repo: repo(),
         r#ref: format!("refs/heads/{branch}"),
         after: "sha123".into(),
@@ -121,6 +122,7 @@ async fn run_number_is_per_repo_sequential() {
     // global — no cross-tenant volume leak).
     let other = Event::Push {
         actor: "octocat".into(),
+        actor_id: String::new(),
         repo: RepoRef {
             owner: "acme".into(),
             name: "other".into(),
@@ -170,6 +172,7 @@ steps:
 fn pr() -> Event {
     Event::PullRequest {
         actor: "octocat".into(),
+        actor_id: String::new(),
         repo: repo(),
         number: 42,
         head: "prsha456".into(),

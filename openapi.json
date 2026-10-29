@@ -9501,6 +9501,13 @@
             ],
             "description": "The forge account that caused the event. Default: the caller for\n`manual` and `api` (as a dispatch is), none otherwise."
           },
+          "actor_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The forge's immutable id of that account (a webhook's `sender.id`),\nwhich admission resolves to the linked Principal (ADR-0069); webhook\nkinds only. Default none: the Run has no `principal`."
+          },
           "fork": {
             "type": "boolean",
             "description": "A pull request from a fork; `pull_request` only. Default false."

@@ -21,6 +21,7 @@ steps:
 fn push() -> Event {
     Event::Push {
         actor: "octocat".into(),
+        actor_id: String::new(),
         repo: RepoRef {
             owner: "acme".into(),
             name: "app".into(),

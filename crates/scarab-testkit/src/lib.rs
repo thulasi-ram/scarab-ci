@@ -3681,6 +3681,18 @@ impl InMemoryIdentities {
 
 #[async_trait]
 impl scarab_identity::IdentityStore for InMemoryIdentities {
+    async fn pinned(
+        &self,
+        provider: &str,
+        external_id: &str,
+    ) -> Result<Option<String>, IdentityError> {
+        let st = self.inner.lock().unwrap();
+        Ok(st
+            .identities
+            .get(&(provider.to_string(), external_id.to_string()))
+            .map(|(id, _)| id.clone()))
+    }
+
     async fn sign_in(
         &self,
         identity: &scarab_identity::ProviderIdentity,

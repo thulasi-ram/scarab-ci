@@ -4005,6 +4005,22 @@ impl PostgresDb {
 
 #[async_trait]
 impl scarab_identity::IdentityStore for PostgresDb {
+    async fn pinned(
+        &self,
+        provider: &str,
+        external_id: &str,
+    ) -> Result<Option<String>, scarab_identity::IdentityError> {
+        sqlx::query_scalar(
+            "SELECT principal_id FROM principal_identities
+             WHERE provider = $1 AND external_id = $2",
+        )
+        .bind(provider)
+        .bind(external_id)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(identity_err)
+    }
+
     async fn sign_in(
         &self,
         identity: &scarab_identity::ProviderIdentity,

@@ -76,6 +76,7 @@ fn forge() -> FakeForge {
 fn push() -> Event {
     Event::Push {
         actor: "octocat".into(),
+        actor_id: String::new(),
         repo: repo(),
         r#ref: "refs/heads/main".into(),
         after: "1234567890abcdef1234567890abcdef12345678".into(),

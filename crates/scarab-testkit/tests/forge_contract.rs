@@ -27,6 +27,7 @@ async fn fake_forge_passes_the_port_contract() {
         signature: None,
         payload: serde_json::to_value(Event::Push {
             actor: "octocat".into(),
+            actor_id: String::new(),
             repo: repo.clone(),
             r#ref: "refs/heads/main".into(),
             after: "cafe1234".into(),
