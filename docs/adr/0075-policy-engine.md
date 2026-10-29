@@ -125,8 +125,13 @@ without a decision.
 
 **An approval is checked again at launch.** An Environment *has approvers* when its
 effective approvers setting (the baseline and the Project's overlay) is not empty at the
-time of the check; an org Policy with `require_approval` does not count. In such an
-Environment, a Step that uses the Environment's authority (§5) is refused at
+time of the check; an org Policy with `require_approval` does not count. Org admins who
+want approval for an Environment set approvers on its baseline. Saving a `require_approval`
+Policy whose `match` names an Environment with no approvers returns a warning. A Run in an
+Environment with no approvers that an enforced `require_approval` Policy matches (by its
+`match`, not its `when`) fails at `run.create` and names the Environment: without
+approvers, its Steps would get the Environment's subject and run unasked, so the Run
+does not proceed. In an Environment with approvers, a Step that uses the Environment's authority (§5) is refused at
 `step.admit` when:
 
 - it has no manual gate upstream, which happens to a Run created before the approvers
@@ -139,7 +144,9 @@ Environment, a Step that uses the Environment's authority (§5) is refused at
   default; an Environment can raise it, lower it or set none). This applies to every
   launch, including a first launch that waited a day in the queue.
 
-The refusal says "rerun the gate", or "start a new Run" when there is no gate. This is what makes a Rerun safe: rerunning a Step
+The refusal says "rerun the gate", or "start a new Run" when there is no gate. A refusal
+for age says how old the release is and the Environment's maximum ("released 26 hours
+ago; the maximum is 24"), since a Step held by a concurrency group is the usual case. This is what makes a Rerun safe: rerunning a Step
 downstream of a released gate does not ask again, as today, so without these checks a
 member could rerun the deploy Step of a six-month-old Run on its original approval
 (`step.rerun` needs no step-up, `step_up/ops.rs:586`). Rerunning the gate asks again.
@@ -389,7 +396,9 @@ and never grants what the role does not.
 - `audit` mode evaluates and records "would deny" or "would require" without enforcing.
 - A policy test API evaluates a Policy against a stored PolicyDecision's input or a
   supplied one, without enforcing and without recording. `scarab validate --server` uses
-  it (§2). Evaluating stored Policies needs read access to the org; evaluating a draft
+  it (§2). Evaluating a Project's effective Policies, or replaying one of its decisions,
+  needs read access to that Project: the answer is what a refused Run of the Project
+  shows. Evaluating an org Policy by id needs read access to the org. Evaluating a draft
   Policy body needs the org admin role, since it runs CEL the caller wrote.
 
 ### 10. Changing a policy is governed by the route table
@@ -460,6 +469,8 @@ gates may run here", compile to `run.create` denies over `origin`.
   approvers or the gate's Policies change.
 - The `env=none` subject before the gate applies on the release day, with no `audit`
   period.
+- An Environment with no approvers that an enforced org `require_approval` Policy matches
+  refuses its Runs until an admin sets approvers on it.
 - A Run admitted under one policy set can have a later Step denied under another. The
   decision record shows which, with its PolicySetDigest.
 - Decisions store their inputs, which grows the Run's record.
@@ -534,7 +545,9 @@ gates may run here", compile to `run.create` denies over `origin`.
    library and plugin allow and block lists.
 3. **Requirements:** `step.admit` at launch with the approval checks, `gate.resolve`,
    `require_approval` on authored manual gates, `require_step_up`, actor kinds in
-   `match`, the gate-scoped OIDC subject; the Environment layer.
+   `match`, the gate-scoped OIDC subject; the Environment layer; the save warning and
+   `run.create` refusal for a `require_approval` Policy on an Environment with no
+   approvers.
 4. **Migration** of §12's settings, one at a time, each in `audit` beside the old code
    first.
 5. **UI and docs:** policy editor with the checker's errors, version history and diffs,

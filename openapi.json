@@ -3667,7 +3667,7 @@
           "Policies"
         ],
         "summary": "Evaluate run.create Policies without enforcing or recording (ADR-0075 §9)",
-        "description": "Policies: `policy` (a draft, compiled at the org level; a 400 when it\ndoes not compile), `policy_id` (a stored Policy of this org), or neither\n(the org's and the input's Project's effective Policies, as admission\nconsults them). Input: `input`, `decision_id` (its recorded input and\nschema version), or `pipeline` (compiled here with `libs`; no forge\nread). A supplied or recorded input with a string or a list over its cap\nis a 400.\nA Pipeline whose Run is over an input cap is answered as admission\ndecides it: each matched Policy is an error, which denies when the Policy\nis enforced.\n\nPermissions: Read on the org for stored Policies (`policy_id`, or\nneither, which is what `scarab validate --server` sends); Administer on\nthe org for a draft `policy`, as saving it would need.",
+        "description": "Policies: `policy` (a draft, compiled at the org level; a 400 when it\ndoes not compile), `policy_id` (a stored Policy of this org), or neither\n(the org's and the input's Project's effective Policies, as admission\nconsults them). Input: `input`, `decision_id` (its recorded input and\nschema version), or `pipeline` (compiled here with `libs`; no forge\nread). A supplied or recorded input with a string or a list over its cap\nis a 400.\nA Pipeline whose Run is over an input cap is answered as admission\ndecides it: each matched Policy is an error, which denies when the Policy\nis enforced.\n\nPermissions: Read on the input's Project for its effective Policies\n(neither `policy` nor `policy_id`, which is what `scarab validate\n--server` sends) or its own typed setting by id; Read on the org for an\norg Policy by id; Administer on the org for a draft `policy`, as saving it\nwould need. Org Read covers every Project.",
         "operationId": "policy_test",
         "parameters": [
           {
@@ -3705,7 +3705,7 @@
             "description": "not one input form, a draft that does not compile, a Pipeline that does not compile, a Run admission refuses before its Policies, an input that cannot be matched, or a supplied input with a string or a list over its cap"
           },
           "403": {
-            "description": "no Read on the org, or a draft `policy` without Administer on the org"
+            "description": "no Read on the input's Project or the org, an org Policy by id without Read on the org, or a draft `policy` without Administer on the org"
           },
           "404": {
             "description": "no such Policy or decision in this org, or policies not configured"
@@ -9455,7 +9455,7 @@
               "object",
               "null"
             ],
-            "description": "A draft Policy, compiled at the org level. Needs Administer on the\norg; stored Policies need Read."
+            "description": "A draft Policy, compiled at the org level. Needs Administer on the\norg; stored Policies need Read on the input's Project (an org Policy\nby id, Read on the org)."
           },
           "policy_id": {
             "type": [

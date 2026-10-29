@@ -33,7 +33,8 @@
 //! would consult), against a supplied input, a recorded decision's input,
 //! or a Pipeline compiled here from the YAML and library sources the caller
 //! sends (no forge read). `scarab validate --server` calls the last form.
-//! Stored Policies need Read on the org; a draft needs Administer.
+//! The effective Policies need Read on the input's Project, an org Policy by
+//! id needs Read on the org, and a draft needs Administer on the org.
 
 use std::collections::BTreeMap;
 
@@ -235,7 +236,8 @@ pub struct PolicyDecisionsQuery {
 #[serde(deny_unknown_fields)]
 pub struct PolicyTestRequest {
     /// A draft Policy, compiled at the org level. Needs Administer on the
-    /// org; stored Policies need Read.
+    /// org; stored Policies need Read on the input's Project (an org Policy
+    /// by id, Read on the org).
     #[serde(default)]
     #[schema(value_type = Option<Object>)]
     pub policy: Option<Value>,
@@ -1341,7 +1343,9 @@ fn reads_of(policies: &[StoredPolicy]) -> Vec<PolicyReadsDto> {
 /// Evaluate `run.create` Policies without enforcing and without recording
 /// (ADR-0075 §9). Read on the org evaluates stored Policies: the answer
 /// names org Policies and can replay any recorded decision of the org, both
-/// of which org Read already shows. A draft `policy` needs Administer on the
+/// of which org Read already shows. Read on a Project evaluates that
+/// Project's effective Policies and replays its decisions, which is what a
+/// refused Run of the Project shows. A draft `policy` needs Administer on the
 /// org, as saving it would: it runs rules the caller wrote, and only an org
 /// admin's rules run at admission.
 ///
@@ -1356,9 +1360,11 @@ fn reads_of(policies: &[StoredPolicy]) -> Vec<PolicyReadsDto> {
 /// decides it: each matched Policy is an error, which denies when the Policy
 /// is enforced.
 ///
-/// Permissions: Read on the org for stored Policies (`policy_id`, or
-/// neither, which is what `scarab validate --server` sends); Administer on
-/// the org for a draft `policy`, as saving it would need.
+/// Permissions: Read on the input's Project for its effective Policies
+/// (neither `policy` nor `policy_id`, which is what `scarab validate
+/// --server` sends) or its own typed setting by id; Read on the org for an
+/// org Policy by id; Administer on the org for a draft `policy`, as saving it
+/// would need. Org Read covers every Project.
 #[utoipa::path(
     post,
     path = "/v1/orgs/{org}/policy-test",
@@ -1368,7 +1374,7 @@ fn reads_of(policies: &[StoredPolicy]) -> Vec<PolicyReadsDto> {
     responses(
         (status = 200, body = PolicyTestResponse),
         (status = 400, description = "not one input form, a draft that does not compile, a Pipeline that does not compile, a Run admission refuses before its Policies, an input that cannot be matched, or a supplied input with a string or a list over its cap"),
-        (status = 403, description = "no Read on the org, or a draft `policy` without Administer on the org"),
+        (status = 403, description = "no Read on the input's Project or the org, an org Policy by id without Read on the org, or a draft `policy` without Administer on the org"),
         (status = 404, description = "no such Policy or decision in this org, or policies not configured")
     )
 )]
@@ -1384,7 +1390,26 @@ pub(crate) async fn policy_test(
     } else {
         Action::Read
     };
-    let principal = authorize_scoped(&st, &headers, action, Some(&rbac_scope(&org, None))).await?;
+    let caller = super::authenticate(&st, &headers, action).await?;
+    let org_allowed =
+        caller.may_globally(action) || caller.may(&st, action, &rbac_scope(&org, None)).await?;
+    if body.policy.is_some() && !org_allowed {
+        return Err(ApiError::Forbidden);
+    }
+    // Without org Read, Read on the input's Project evaluates that
+    // Project's Policies: the decision a refused Run of the Project shows.
+    // Checked before the input is compiled or evaluated.
+    let project_allowed = |project: String| {
+        let (st, caller, org) = (&st, &caller, &org);
+        async move {
+            let scope = rbac_scope(org, Some(&project));
+            if org_allowed || caller.may(st, Action::Read, &scope).await? {
+                Ok(())
+            } else {
+                Err(ApiError::Forbidden)
+            }
+        }
+    };
     let store = store(&st)?;
     if body.policy.is_some() && body.policy_id.is_some() {
         return Err(ApiError::BadRequest(
@@ -1405,8 +1430,9 @@ pub(crate) async fn policy_test(
     // The input (an `Err` when a Pipeline's could not be built), its schema
     // version, what `match` sees, and the Pipeline's plugin gates.
     let (input, schema_version, ctx, plugin_gates) = if let Some(input) = body.input {
-        check_input_caps(&input, run_create::SCHEMA_VERSION)?;
         let ctx = match_context_of(&input)?;
+        project_allowed(ctx.project.clone()).await?;
+        check_input_caps(&input, run_create::SCHEMA_VERSION)?;
         (Ok(input), run_create::SCHEMA_VERSION, ctx, None)
     } else if let Some(id) = body.decision_id {
         let record = store
@@ -1415,6 +1441,11 @@ pub(crate) async fn policy_test(
             .map_err(store_api_error)?
             .filter(|d| d.org == org)
             .ok_or(ApiError::NotFound)?;
+        match record.project.clone() {
+            Some(project) => project_allowed(project).await?,
+            None if org_allowed => {}
+            None => return Err(ApiError::Forbidden),
+        }
         if record.decision.checkpoint != Checkpoint::RunCreate {
             return Err(ApiError::BadRequest(format!(
                 "decision `{id}` is at `{}`; only `run.create` is evaluated",
@@ -1432,7 +1463,9 @@ pub(crate) async fn policy_test(
         (Ok(record.decision.input), version, ctx, None)
     } else {
         let pipeline = body.pipeline.expect("one form is present");
-        let (input, ctx, gates) = pipeline_input(&st, &org, &principal.subject, pipeline).await?;
+        project_allowed(pipeline.project.clone()).await?;
+        let (input, ctx, gates) =
+            pipeline_input(&st, &org, &caller.principal.subject, pipeline).await?;
         (input, run_create::SCHEMA_VERSION, ctx, Some(gates))
     };
 
@@ -1457,6 +1490,10 @@ pub(crate) async fn policy_test(
             .map_err(store_api_error)?
             .filter(|p| p.scope.org() == org && !p.deleted)
             .ok_or(ApiError::NotFound)?;
+        // An org Policy is read with org Read, as listing it is.
+        if p.scope.project().is_none() && !org_allowed {
+            return Err(ApiError::Forbidden);
+        }
         // A Project typed setting applies to its own Project's Runs only.
         if let Some(project) = p.scope.project().filter(|p| *p != ctx.project) {
             return Err(ApiError::BadRequest(format!(

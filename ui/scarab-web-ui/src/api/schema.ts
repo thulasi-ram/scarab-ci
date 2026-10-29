@@ -1029,9 +1029,11 @@ export interface paths {
          *     decides it: each matched Policy is an error, which denies when the Policy
          *     is enforced.
          *
-         *     Permissions: Read on the org for stored Policies (`policy_id`, or
-         *     neither, which is what `scarab validate --server` sends); Administer on
-         *     the org for a draft `policy`, as saving it would need.
+         *     Permissions: Read on the input's Project for its effective Policies
+         *     (neither `policy` nor `policy_id`, which is what `scarab validate
+         *     --server` sends) or its own typed setting by id; Read on the org for an
+         *     org Policy by id; Administer on the org for a draft `policy`, as saving it
+         *     would need. Org Read covers every Project.
          */
         post: operations["policy_test"];
         delete?: never;
@@ -3367,7 +3369,8 @@ export interface components {
             pipeline?: null | components["schemas"]["PolicyTestPipeline"];
             /**
              * @description A draft Policy, compiled at the org level. Needs Administer on the
-             *     org; stored Policies need Read.
+             *     org; stored Policies need Read on the input's Project (an org Policy
+             *     by id, Read on the org).
              */
             policy?: Record<string, never> | null;
             /** @description A stored Policy of this org (either level). */
@@ -7279,7 +7282,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description no Read on the org, or a draft `policy` without Administer on the org */
+            /** @description no Read on the input's Project or the org, an org Policy by id without Read on the org, or a draft `policy` without Administer on the org */
             403: {
                 headers: {
                     [name: string]: unknown;

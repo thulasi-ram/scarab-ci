@@ -606,6 +606,48 @@ async fn redteam_api_cross_org_ids_and_role_boundaries() {
         StatusCode::FORBIDDEN,
         "project admin on org policy-test: {b}"
     );
+    // Read on a Project evaluates that Project's effective Policies, as a
+    // refused Run of the Project would show them, and nothing else: not
+    // another Project's, not an org Policy by id. Another org's Owner has
+    // neither.
+    h.grant(
+        "rita",
+        Scope::Project {
+            org: "acme".into(),
+            name: "web".into(),
+        },
+        Role::Viewer,
+    )
+    .await;
+    let rita = h.browser_session(scoped("rita")).await;
+    let (st, b) = test(json!({ "input": draft_input() }), rita.clone()).await;
+    assert_eq!(st, StatusCode::OK, "a Project Viewer, its Project: {b}");
+    let validate = |project: &str| {
+        json!({ "pipeline": {
+            "yaml": CI_YAML, "project": project,
+            "trigger": { "kind": "push", "ref": "refs/heads/main" }
+        }})
+    };
+    let (st, b) = test(validate("web"), rita.clone()).await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "a Project Viewer, validate --server: {b}"
+    );
+    let (st, _) = test(validate("api"), rita.clone()).await;
+    assert_eq!(
+        st,
+        StatusCode::FORBIDDEN,
+        "a Project Viewer, another Project"
+    );
+    let (st, _) = test(
+        json!({ "policy_id": acme_id, "input": draft_input() }),
+        rita.clone(),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "a Project Viewer, an org Policy");
+    let (st, _) = test(json!({ "input": draft_input() }), olga.clone()).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "another org's Owner");
     // A Viewer cannot write.
     let (st, _) = h
         .cookie(
