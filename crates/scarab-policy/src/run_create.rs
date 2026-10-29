@@ -214,6 +214,9 @@ pub struct RunCreateFacts {
     /// of the input: each Step's `image` is previewed with them, the image
     /// as Run creation knows it (ADR-0076).
     pub params: std::collections::BTreeMap<String, serde_json::Value>,
+    /// The Run's checked `event` values (ADR-0076 §9). Not part of the
+    /// input either: an image is previewed with them, as with `params`.
+    pub event: serde_json::Map<String, serde_json::Value>,
 }
 
 /// A Run whose Steps or gates do not fit a list cap of the input schema. Its
@@ -278,8 +281,7 @@ fn gate_kind(step: &scarab_pipeline::StepSpec) -> Result<GateKind, CapExceeded> 
 /// Whether `step` uses the Environment's authority (ADR-0075 §5): it
 /// declares secrets, requests a governed grant or a raw overlay, or is a
 /// deploy Step (itself, or every non-gate Step of a `deploy: true`
-/// Pipeline). The Pipeline IR has no `forge_token` yet, so that item of the
-/// list cannot apply.
+/// Pipeline), or asks for `forge_token: write` (ADR-0076 §9).
 pub fn uses_environment_authority(
     ir: &scarab_pipeline::PipelineIr,
     step: &scarab_pipeline::StepSpec,
@@ -296,6 +298,7 @@ pub fn uses_environment_authority(
         || step.k8s_overlay.is_some()
         || step.deploy
         || ir.deploy
+        || step.forge_token == Some(scarab_pipeline::ForgeToken::Write)
 }
 
 /// A gate of a Run whose origin includes a plugin link: what the closed
@@ -487,6 +490,7 @@ pub fn input_from_pipeline(
             s.scope.as_ref(),
             &s.matrix_values,
             &facts.params,
+            &facts.event,
         );
         let digest = (!image.contains("${{"))
             .then(|| image.rsplit_once('@').map(|(_, d)| d.to_string()))
@@ -501,7 +505,10 @@ pub fn input_from_pipeline(
             secrets: capped(s.secrets.clone(), &what, "secrets")?,
             placement_profiles: capped(s.placement_profiles.clone(), &what, "placement profiles")?,
             deploy: s.deploy || ir.deploy,
-            forge_token: None,
+            forge_token: s.forge_token.map(|t| match t {
+                scarab_pipeline::ForgeToken::Read => ForgeToken::Read,
+                scarab_pipeline::ForgeToken::Write => ForgeToken::Write,
+            }),
             uses_environment_authority: uses_environment_authority(ir, s),
             origin: origin_of(&s.origin, &what)?,
             upstream_gates: capped(upstream_gates, &what, "gates upstream of it")?,

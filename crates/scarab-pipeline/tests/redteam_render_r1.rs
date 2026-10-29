@@ -74,6 +74,7 @@ fn launch(
         Facts::Launch {
             params: &params,
             results: &results,
+            event: &serde_json::Map::new(),
         },
     )
     .map(|mut r| {
@@ -265,7 +266,7 @@ fn survived_a_templated_name_cannot_change_a_literal_digest() {
     );
     let ir = ok(&yaml, &Libraries::default());
     let s = step(&ir, "s");
-    let pre = preview_image(&s.image, s.scope.as_ref(), &s.matrix_values, &BTreeMap::new());
+    let pre = preview_image(&s.image, s.scope.as_ref(), &s.matrix_values, &BTreeMap::new(), &serde_json::Map::new());
     assert!(pre.contains("${{"), "{pre}");
     for n in [
         "evil.io/x",
@@ -331,7 +332,7 @@ fn survived_preview_and_launch_agree_on_known_values() {
     let ir = ok(yaml, &files(&[("l.yaml", lib)]));
     let params = map(json!({ "d": "sha256:fff" }));
     for s in &ir.steps {
-        let pre = preview_image(&s.image, s.scope.as_ref(), &s.matrix_values, &params);
+        let pre = preview_image(&s.image, s.scope.as_ref(), &s.matrix_values, &params, &serde_json::Map::new());
         let at = launch(s, json!({ "d": "sha256:fff" }), json!({}))
             .map(|r| r.image)
             .unwrap_or_else(|e| e);

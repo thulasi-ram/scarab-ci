@@ -117,9 +117,11 @@ services:
       exec: [pg_isready, -U, postgres]
 
 steps:
-  # --- clone step (ADR-0045): zero-config source provisioning ---------------
+  # --- checkout (ADR-0076 §9): the first-party clone library ----------------
+  # The org installs `lib:thulasi-ram/clone`; its Step is `checkout/git`, and
+  # `needs: [checkout]` reaches it across the invoke.
   - id: checkout
-    clone: {}
+    invoke: lib:thulasi-ram/clone
 
   # --- ordinary step + run_as_root grant (ADR-0039) + timeout (ADR-0047) ----
   # The stock rust image is USER root, so opt into the self-service run-as-root

@@ -66,6 +66,7 @@ fn launch(
         Facts::Launch {
             params: &params,
             results: &results,
+            event: &serde_json::Map::new(),
         },
     )
 }
@@ -81,7 +82,10 @@ fn preview(spec: &StepSpec, params: Value) -> Result<scarab_pipeline::Rendered, 
         },
         spec.scope.as_ref(),
         &spec.matrix_values,
-        Facts::Preview { params: &params },
+        Facts::Preview {
+                params: &params,
+                event: &serde_json::Map::new(),
+            },
     )
 }
 

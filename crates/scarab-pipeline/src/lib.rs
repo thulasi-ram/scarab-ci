@@ -21,6 +21,7 @@
 
 mod argv;
 pub mod cel;
+pub mod event;
 pub mod oci;
 pub mod params;
 pub mod render;
@@ -341,6 +342,12 @@ const CONCURRENCY_POLICIES: [&str; 2] = ["queue", "cancel-in-progress"];
 /// with [`RETIRED_DEPLOYMENTS`].
 const GATE_KINDS: [&str; 3] = ["manual", "timer", "external"];
 
+/// The Pipeline check's answer to a `clone:` Step, removed by ADR-0076 §9:
+/// it names the library that replaces it.
+pub const RETIRED_CLONE: &str = "the `clone` Step kind was removed (ADR-0076 §9); check out \
+    the repository with `invoke: lib:thulasi-ram/clone`, and set `depth`, `submodules` and \
+    `lfs` under `with:`";
+
 /// The Pipeline check's answer to `deployment_requests` and `gate: deployment`,
 /// both removed by ADR-0074: it names what replaces them.
 pub const RETIRED_DEPLOYMENTS: &str = "deployments are no longer recorded by Scarab \
@@ -395,19 +402,21 @@ pub struct StepSpec {
     /// still decodes. Nothing reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deployment: Option<serde_json::Value>,
-    /// If set, this is a **clone** step (ADR-0045): first-class source
-    /// provisioning. Zero-config by design — repo/ref/SHA/token are implicit
-    /// from the run's trigger context; the engine runs the canonical
-    /// `scarab-clone` image (never the author's). Downstream steps inherit
-    /// the cloned workspace via plain `needs` (ADR-0007 — no new inheritance
-    /// rule). Image-less like `gate`.
+    /// Removed by ADR-0076 §9: the `clone` Step kind, replaced by `invoke:
+    /// lib:thulasi-ram/clone`. Kept as raw data only so the Pipeline check
+    /// can refuse it with [`RETIRED_CLONE`] instead of an unknown-field
+    /// error. Nothing reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub clone: Option<CloneSpec>,
+    pub clone: Option<serde_json::Value>,
+    /// The forge credential this Step asks for (ADR-0076 §9). Run creation
+    /// refuses the Run when the Step may not have it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forge_token: Option<ForgeToken>,
     /// If set, this is a **build** step (ADR-0018): a first-class rootless
     /// BuildKit image build. The engine runs the blessed BuildKit image
     /// (never the author's); the context/dockerfile are workspace-relative,
-    /// so a build step normally `needs` the clone step. Image-less like
-    /// `gate`/`clone`.
+    /// so a build step normally `needs` the checkout. Image-less like
+    /// `gate`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<BuildSpec>,
     /// If set, this is an **invoke** step (ADR-0038, ADR-0076 §1): the library
@@ -652,11 +661,6 @@ impl StepSpec {
         self.gate.is_some()
     }
 
-    /// Is this a clone step (ADR-0045 source provisioning)?
-    pub fn is_clone(&self) -> bool {
-        self.clone.is_some()
-    }
-
     /// Is this a build step (ADR-0018 rootless image build)?
     pub fn is_build(&self) -> bool {
         self.build.is_some()
@@ -859,28 +863,28 @@ impl<'de> Deserialize<'de> for SharedServiceSpec {
     }
 }
 
-/// Configuration of a `clone` step (ADR-0045). Everything is optional —
-/// `clone: {}` is the common case; repo/ref/SHA/token come from the run's
-/// trigger context, never from the author.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CloneSpec {
-    /// `1` (default — shallow, small CAS snapshots) or `full` (complete
-    /// history + all refs, for history-dependent workloads). Any other value
-    /// is a compile error.
-    #[serde(default)]
-    pub depth: CloneDepth,
-    /// Recursive submodule fetch with the run's token. Cross-installation
-    /// private submodules are a documented limitation (ADR-0045).
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub submodules: bool,
-    /// git-lfs fetch (served by the canonical `scarab-clone` image).
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub lfs: bool,
-    /// Override the ref to clone. Default = the run's trigger ref, pinned to
-    /// its resolved SHA (ADR-0043/0044) — restarts always re-clone that SHA.
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "ref")]
-    pub r#ref: Option<String>,
+/// The forge credential a Step asks for (ADR-0076 §9): `forge_token: read`
+/// or `forge_token: write`. Core mints it when each Attempt launches and
+/// mounts it as two files, `/scarab/secrets/forge-token` and
+/// `/scarab/secrets/forge-username`, never as an environment variable.
+/// Run creation decides whether the Step may have it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForgeToken {
+    /// Read the Run's repository. A fork pull request always gets this.
+    Read,
+    /// Push to the Run's repository. Only a forge that mints short-lived
+    /// tokens (GitHub App mode) can give it.
+    Write,
+}
+
+impl ForgeToken {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ForgeToken::Read => "read",
+            ForgeToken::Write => "write",
+        }
+    }
 }
 
 /// A step's keyed directory Cache declaration (ADR-0065 s1):
@@ -927,61 +931,6 @@ pub struct BuildSpec {
     /// Push the built image (default false — build-only validation).
     #[serde(default, skip_serializing_if = "is_false")]
     pub push: bool,
-}
-
-/// The `depth:` of a [`CloneSpec`]: shallow (`1`, the default) or `full`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum CloneDepth {
-    /// `depth: 1` — the working tree at the pinned SHA, minimal history.
-    #[default]
-    Shallow,
-    /// `depth: full` — complete history and all refs.
-    Full,
-}
-
-impl Serialize for CloneDepth {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        match self {
-            CloneDepth::Shallow => s.serialize_u64(1),
-            CloneDepth::Full => s.serialize_str("full"),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for CloneDepth {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        struct V;
-        impl serde::de::Visitor<'_> for V {
-            type Value = CloneDepth;
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("`1` (shallow) or `full`")
-            }
-            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<CloneDepth, E> {
-                if v == 1 {
-                    Ok(CloneDepth::Shallow)
-                } else {
-                    Err(E::custom(format!(
-                        "invalid clone depth {v}: only `1` (shallow) or `full` are supported"
-                    )))
-                }
-            }
-            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<CloneDepth, E> {
-                u64::try_from(v)
-                    .map_err(|_| E::custom("invalid clone depth"))
-                    .and_then(|v| self.visit_u64(v))
-            }
-            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<CloneDepth, E> {
-                match v {
-                    "1" => Ok(CloneDepth::Shallow),
-                    "full" => Ok(CloneDepth::Full),
-                    other => Err(E::custom(format!(
-                        "invalid clone depth `{other}`: only `1` (shallow) or `full` are supported"
-                    ))),
-                }
-            }
-        }
-        d.deserialize_any(V)
-    }
 }
 
 /// A step's opt-in retry policy (ADR-0020 syntax, ADR-0047 semantics).
@@ -2080,6 +2029,7 @@ fn invoke_step_extra_fields(step: &StepSpec) -> Vec<&'static str> {
         ("gate", step.gate.is_some()),
         ("gate_after", step.gate_after.is_some()),
         ("clone", step.clone.is_some()),
+        ("forge_token", step.forge_token.is_some()),
         ("build", step.build.is_some()),
         ("artifacts", !step.artifacts.is_empty()),
         ("inputs", step.inputs.is_some()),
@@ -3118,7 +3068,10 @@ fn invoke_output_scope(step: &mut StepSpec, exposed: &BTreeMap<String, Option<Ve
 /// a Step that is not a gate, only where the library Step leaves the field
 /// unset: the library's own value wins (`resources` per field, `cpu_millis`
 /// and `memory_mib`). Its `when` becomes a [`Guard`] of each, read in the
-/// invoke Step's own scope. `env` never carries.
+/// invoke Step's own scope. `env` never carries, and `placement_profiles`
+/// never carries onto a Step with `forge_token` (ADR-0076 §1): a placement
+/// profile is an arbitrary Pod patch, so a caller could otherwise place a
+/// trusted Step next to its own.
 fn carry_invoke_fields(invoke: &StepSpec, inst: &mut StepSpec) {
     if !inst.is_gate() {
         if inst.timeout.is_none() {
@@ -3130,7 +3083,7 @@ fn carry_invoke_fields(invoke: &StepSpec, inst: &mut StepSpec) {
         if inst.resources.memory_mib.is_none() {
             inst.resources.memory_mib = invoke.resources.memory_mib;
         }
-        if inst.placement_profiles.is_empty() {
+        if inst.placement_profiles.is_empty() && inst.forge_token.is_none() {
             inst.placement_profiles = invoke.placement_profiles.clone();
         }
     }
@@ -3199,6 +3152,22 @@ fn validate_interface(
                 "library `{key}`: input `{}` has a default holding `${{{{ … }}}}`; a default \
                  is a plain value, and only the caller's `with:` may hold an expression",
                 p.name
+            ));
+        }
+    }
+
+    // An input that reaches a Step with `forge_token` must be a value the
+    // library can check (ADR-0076 §2): a free string would let the caller
+    // write into a Step that holds a forge credential.
+    for (name, lib_step) in forge_token_input_reads(lib) {
+        let Some(p) = iface.inputs.iter().find(|p| p.name == name) else {
+            continue; // an undeclared input is reported where it is read
+        };
+        if p.r#type == ParamType::String && p.validate.is_none() {
+            diagnostics.push(format!(
+                "library `{key}`: input `{name}` reaches step `{lib_step}`, which has \
+                 `forge_token`; declare it as a `boolean`, a `number`, a `choice`, or a \
+                 `string` with a `validate:` rule"
             ));
         }
     }
@@ -3298,6 +3267,38 @@ fn validate_interface(
             }
         }
     }
+}
+
+/// Each `(input, step)` where a library Step with `forge_token` reads
+/// `inputs.<input>` in its image, command or env, once per pair. A read of
+/// `inputs` whole counts as a read of every input.
+fn forge_token_input_reads(lib: &PipelineIr) -> BTreeSet<(String, String)> {
+    let mut out = BTreeSet::new();
+    for step in lib.steps.iter().filter(|s| s.forge_token.is_some()) {
+        let mut texts: Vec<&str> = vec![step.image.as_str()];
+        texts.extend(step.command.iter().map(String::as_str));
+        texts.extend(step.env.iter().map(|(_, v)| v.as_str()));
+        for text in texts {
+            for i in cel::scan_interpolations(text).0 {
+                let Ok(reads) = cel::reads(text[i.inner].trim()) else {
+                    continue;
+                };
+                for r in reads.into_iter().filter(|r| r.var == "inputs") {
+                    match r.first {
+                        Some(name) => {
+                            out.insert((name, step.id.clone()));
+                        }
+                        None => {
+                            for p in &lib.interface.inputs {
+                                out.insert((p.name.clone(), step.id.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The step strings that may carry `${{ … }}` interpolations (image, command,
@@ -3551,14 +3552,29 @@ fn expand_step(step: &StepSpec, work: &mut MatrixWork) -> Result<Vec<StepSpec>, 
         .collect())
 }
 
+/// Whether an invoke link is the clone library (ADR-0076 §9): an installed
+/// library named `clone`, under any publisher (`lib:thulasi-ram/clone`, or a
+/// mirror's). The missing-checkout lint reads it. A name proves nothing about
+/// where a library came from; this is a warning, and which Steps may hold a
+/// forge credential is decided at Run creation from the installation's
+/// content and source, never from its name.
+pub fn is_clone_library(link: &OriginEntry) -> bool {
+    link.kind == OriginKind::Library
+        && link
+            .name
+            .rsplit_once('/')
+            .is_some_and(|(_, name)| name == "clone")
+}
+
 /// Validate a compiled [`PipelineIr`], returning **all** discovered problems at
 /// once. Checks: unique step ids, no unexpanded matrix (a compile-invariant),
 /// `needs` resolve to real steps, and the `needs` graph is acyclic.
 /// Non-fatal lint diagnostics over a compiled pipeline (ADR-0045) — the rules
 /// behind `scarab lint`, also surfaced (as warnings, never failures) wherever
 /// a pipeline compiles. First rule: a `push`/`pull_request` pipeline with no
-/// `clone` step almost certainly forgot its source; some triggered pipelines
-/// legitimately need none, hence a lint and not a hard error. Repo-less
+/// checkout almost certainly forgot its source; some triggered pipelines
+/// legitimately need none, hence a lint and not a hard error. A checkout is a
+/// Step inlined from the clone library ([`is_clone_library`]). Repo-less
 /// triggers (`cron`, `upstream`, …) never warn. Second rule: a Step inlined
 /// from a library runs an image pinned only by tag (ADR-0076 §2).
 pub fn lint(ir: &PipelineIr) -> Vec<String> {
@@ -3568,12 +3584,15 @@ pub fn lint(ir: &PipelineIr) -> Vec<String> {
         .0
         .keys()
         .any(|k| k == "push" || k == "pull_request");
-    let has_clone = ir.steps.iter().any(|s| s.is_clone());
-    if source_triggered && !has_clone {
+    let has_checkout = ir
+        .steps
+        .iter()
+        .any(|s| s.origin.iter().any(is_clone_library));
+    if source_triggered && !has_checkout {
         warnings.push(
-            "pipeline triggers on push/pull_request but has no `clone` step — its steps will \
-             run without source (ADR-0045); add `- { id: checkout, clone: {} }` and depend on \
-             it via `needs`"
+            "pipeline triggers on push/pull_request but does not check out the repository — \
+             its steps will run without source; add `- { id: checkout, invoke: \
+             lib:thulasi-ram/clone }` and depend on it via `needs`"
                 .to_string(),
         );
     }
@@ -4191,6 +4210,9 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
             .push("`retention_profile` must be a non-empty operator profile name".to_string());
     }
 
+    // `${{ event.* }}` reads only the fields Scarab can check (ADR-0076 §9).
+    event::check(ir, &mut diagnostics);
+
     // Unique ids.
     let mut seen = BTreeSet::new();
     let mut ids = BTreeSet::new();
@@ -4209,20 +4231,25 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
         if step.invoke.is_some() {
             diagnostics.push(format!("step `{}`: invoke was not inlined", step.id));
         }
-        // Step kinds are mutually exclusive: a step is a gate, a clone, or an
+        // The `clone` kind is gone (ADR-0076 §9): say what replaces it.
+        if step.clone.is_some() {
+            diagnostics.push(format!("step `{}`: {RETIRED_CLONE}", step.id));
+        }
+        // Step kinds are mutually exclusive: a step is a gate, a build, or an
         // ordinary executed step — never two at once.
-        if [
-            step.gate.is_some(),
-            step.clone.is_some(),
-            step.build.is_some(),
-        ]
-        .iter()
-        .filter(|k| **k)
-        .count()
-            > 1
-        {
+        if step.gate.is_some() && step.build.is_some() {
             diagnostics.push(format!(
-                "step `{}`: `gate`, `clone`, and `build` are mutually exclusive step kinds",
+                "step `{}`: `gate` and `build` are mutually exclusive step kinds",
+                step.id
+            ));
+        }
+        // A forge credential is for a Step that runs a Pod with an image the
+        // Pipeline names: a gate runs nothing, and a build runs BuildKit,
+        // which reads its registry credential, not the forge's (ADR-0076 §9).
+        if step.forge_token.is_some() && (step.is_gate() || step.is_build()) {
+            diagnostics.push(format!(
+                "step `{}`: `forge_token` is only valid on a step that runs an image (not a \
+                 gate or build step)",
                 step.id
             ));
         }
@@ -4245,11 +4272,11 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
         }
         // Sidecar services (ADR-0058): a service co-locates in the *executed*
         // Step's Pod, so it is only meaningful on an ordinary step — never on a
-        // gate (no Pod), a clone (canonical image), or a build (rootless BuildKit).
-        if !step.services.is_empty() && (step.is_gate() || step.is_clone() || step.is_build()) {
+        // gate (no Pod) or a build (rootless BuildKit).
+        if !step.services.is_empty() && (step.is_gate() || step.is_build()) {
             diagnostics.push(format!(
                 "step `{}`: `services` is only valid on an ordinary executed step \
-                 (not a gate, clone, or build step)",
+                 (not a gate or build step)",
                 step.id
             ));
         }
@@ -4304,24 +4331,6 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                 diagnostics.push(format!(
                     "step `{}`: a build step is rootless by construction — it must not request \
                      privilege escalation",
-                    step.id
-                ));
-            }
-        }
-        // A clone step is zero-config by design (ADR-0045): the engine runs
-        // the canonical scarab-clone image with the run's trigger context —
-        // the author supplies no image/command/security.
-        if step.clone.is_some() {
-            if !step.image.is_empty() || !step.command.is_empty() {
-                diagnostics.push(format!(
-                    "step `{}`: a clone step runs the canonical scarab-clone image — it must not \
-                     set an image or command",
-                    step.id
-                ));
-            }
-            if step.security.as_ref().is_some_and(|s| !s.is_baseline()) {
-                diagnostics.push(format!(
-                    "step `{}`: a clone step must not request privilege escalation",
                     step.id
                 ));
             }
@@ -4404,7 +4413,7 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                 }
             }
             None => {
-                if step.image.is_empty() && !step.is_clone() && !step.is_build() {
+                if step.image.is_empty() && !step.is_build() && step.clone.is_none() {
                     diagnostics.push(format!("step `{}`: missing image", step.id));
                 }
                 if step.gate_after.is_some() {
@@ -6306,6 +6315,7 @@ mod tests {
             Facts::Launch {
                 params: &params,
                 results: &results,
+                event: &serde_json::Map::new(),
             },
         )
         .map(|mut r| {
@@ -7779,32 +7789,195 @@ mod tests {
         assert!(!plain.is_deploy());
     }
 
-    // --- clone step kind + missing-clone lint (ADR-0045) --------------------
+    // --- the clone library replaces the clone kind (ADR-0076 §9) ------------
+
+    /// `libs/clone.yaml`, as the release ships it.
+    const CLONE_LIBRARY: &str = include_str!("../../../libs/clone.yaml");
+
+    fn with_clone() -> Libraries {
+        Libraries {
+            files: BTreeMap::new(),
+            installed: installed(&[(
+                "thulasi-ram/clone",
+                "github.com/thulasi-ram/scarab-ci//libs/clone.yaml@1111111111111111111111111111111111111111",
+                CLONE_LIBRARY,
+            )]),
+        }
+    }
 
     #[test]
-    fn clone_compiles_to_a_distinct_kind_with_zero_config() {
-        let ir = compile(
+    fn a_clone_step_is_refused_naming_the_library() {
+        for yaml in [
+            "steps: [{ id: checkout, clone: {} }]",
+            "steps: [{ id: checkout, clone: { depth: full } }]",
+        ] {
+            let errs = errors(yaml);
+            assert!(
+                errs.iter()
+                    .any(|e| e.contains("step `checkout`") && e.contains("invoke: lib:thulasi-ram/clone")),
+                "{errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_clone_library_checks_out_and_needs_cross_the_seam() {
+        let ir = compile_with_libraries(
             r#"
+            on: { push: {} }
             steps:
-              - { id: checkout, clone: {} }
+              - id: checkout
+                invoke: lib:thulasi-ram/clone
+                with: { depth: full, lfs: "true" }
+                timeout: 1800
+                placement_profiles: [big]
               - { id: build, image: busybox, needs: [checkout] }
             "#,
+            &with_clone(),
+        )
+        .unwrap();
+        let git = ir.steps.iter().find(|s| s.id == "checkout/git").unwrap();
+        assert_eq!(git.forge_token, Some(ForgeToken::Read));
+        assert_eq!(git.timeout, Some(1800), "timeout carries");
+        assert!(
+            git.placement_profiles.is_empty(),
+            "placement_profiles never carries onto a forge_token Step"
         );
-        let checkout = &ir.steps[0];
-        assert!(checkout.is_clone());
-        assert!(!checkout.is_gate());
+        assert!(git.origin.last().is_some_and(is_clone_library));
+        assert!(git.image.contains("@sha256:"), "{}", git.image);
+        let build = ir.steps.iter().find(|s| s.id == "build").unwrap();
+        assert_eq!(build.needs.0, vec!["checkout/git".to_string()]);
+        // It reads the Run's commit and clone URL, and nothing else.
         assert_eq!(
-            checkout.clone,
-            Some(CloneSpec {
-                depth: CloneDepth::Shallow, // default
-                submodules: false,
-                lfs: false,
-                r#ref: None,
-            })
+            event::reads(&ir),
+            BTreeSet::from(["sha".to_string(), "repo.clone_url".to_string()])
         );
-        // Downstream inherits the clone workspace via a plain needs edge
-        // (ADR-0007 — no new inheritance rule).
-        assert_eq!(ir.steps[1].needs.0, vec!["checkout".to_string()]);
+        assert!(lint(&ir).is_empty(), "{:?}", lint(&ir));
+    }
+
+    #[test]
+    fn forge_token_is_for_a_step_that_runs_an_image() {
+        let errs = errors("steps: [{ id: g, gate: manual, forge_token: read }]");
+        assert!(errs.iter().any(|e| e.contains("`forge_token` is only valid")), "{errs:?}");
+        let errs = errors(r#"steps: [{ id: b, build: { image: "a/b:1" }, forge_token: read }]"#);
+        assert!(errs.iter().any(|e| e.contains("`forge_token` is only valid")), "{errs:?}");
+        let ir = compile("steps: [{ id: push, image: alpine/git, forge_token: write }]");
+        assert_eq!(ir.steps[0].forge_token, Some(ForgeToken::Write));
+        let errs = library_errors(
+            "steps: [{ id: c, invoke: lib:thulasi-ram/clone, forge_token: write }]",
+            &with_clone(),
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("cannot set `forge_token`")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn a_free_string_input_may_not_reach_a_forge_token_step() {
+        let lib = r#"
+            interface:
+              inputs:
+                - { name: url, type: string }
+                - { name: depth, type: string, validate: 'value.matches("^[0-9]+$")' }
+                - { name: lfs, type: boolean, required: false, default: false }
+            steps:
+              - id: git
+                image: "alpine/git@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                forge_token: read
+                env:
+                  - [U, "${{ inputs.url }}"]
+                  - [D, "${{ inputs.depth }}"]
+                  - [L, "${{ inputs.lfs }}"]
+            "#;
+        let libraries = Libraries {
+            files: BTreeMap::new(),
+            installed: installed(&[("acme/git", "github.com/acme/l//git.yaml@1", lib)]),
+        };
+        let errs = library_errors(
+            "steps: [{ id: c, invoke: lib:acme/git, with: { url: x, depth: '1' } }]",
+            &libraries,
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("input `url` reaches step `git`")),
+            "{errs:?}"
+        );
+        assert!(!errs.iter().any(|e| e.contains("input `depth`")), "{errs:?}");
+        assert!(!errs.iter().any(|e| e.contains("input `lfs`")), "{errs:?}");
+    }
+
+    #[test]
+    fn a_template_reads_only_the_allowlisted_event_fields() {
+        for (field, want) in [
+            ("event.actor", "may not read"),
+            ("event.body", "may not read"),
+            ("event", "whole"),
+            ("event.repo", "whole"),
+        ] {
+            let yaml = format!("steps: [{{ id: a, image: busybox, env: [[X, \"${{{{ {field} }}}}\"]] }}]");
+            let errs = errors(&yaml);
+            assert!(
+                errs.iter().any(|e| e.contains("step `a`") && e.contains(want)),
+                "{field}: {errs:?}"
+            );
+        }
+        let ir = compile(r#"steps: [{ id: a, image: busybox, env: [[B, "${{ event.branch }}"]] }]"#);
+        assert_eq!(event::reads(&ir), BTreeSet::from(["branch".to_string()]));
+    }
+
+    #[test]
+    fn a_library_step_renders_the_runs_event_values() {
+        let ir = compile_with_libraries(
+            "steps: [{ id: checkout, invoke: lib:thulasi-ram/clone }]",
+            &with_clone(),
+        )
+        .unwrap();
+        let git = &ir.steps[0];
+        let sha = "a".repeat(40);
+        let event = json!({ "sha": sha, "repo": { "clone_url": "https://github.com/acme/web.git" } });
+        let r = render(
+            Templates {
+                image: &git.image,
+                command: &git.command,
+                env: &git.env,
+            },
+            git.scope.as_ref(),
+            &git.matrix_values,
+            Facts::Launch {
+                params: &BTreeMap::new(),
+                results: &Results::new(),
+                event: event.as_object().unwrap(),
+            },
+        )
+        .unwrap();
+        let env: BTreeMap<_, _> = r.env.into_iter().collect();
+        assert_eq!(env["SCARAB_CLONE_SHA"], sha);
+        assert_eq!(env["SCARAB_CLONE_URL"], "https://github.com/acme/web.git");
+        assert_eq!(env["SCARAB_CLONE_DEPTH"], "1");
+        assert_eq!(env["SCARAB_CLONE_LFS"], "false");
+    }
+
+    #[test]
+    fn an_event_value_may_not_start_an_argument_with_a_dash() {
+        let ir = compile(r#"steps: [{ id: a, image: busybox, command: [git, fetch, origin, "${{ event.ref }}"] }]"#);
+        let s = &ir.steps[0];
+        let event = json!({ "ref": "-uevil" });
+        let err = render(
+            Templates {
+                image: &s.image,
+                command: &s.command,
+                env: &s.env,
+            },
+            None,
+            &BTreeMap::new(),
+            Facts::Launch {
+                params: &BTreeMap::new(),
+                results: &Results::new(),
+                event: event.as_object().unwrap(),
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("starts the argument with `-`"), "{err}");
     }
 
     // --- build step kind (ADR-0018) -----------------------------------------
@@ -7814,7 +7987,7 @@ mod tests {
         let ir = compile(
             r#"
             steps:
-              - { id: checkout, clone: {} }
+              - { id: checkout, image: alpine/git }
               - id: image
                 needs: [checkout]
                 build:
@@ -7824,7 +7997,7 @@ mod tests {
         );
         let image = &ir.steps[1];
         assert!(image.is_build());
-        assert!(!image.is_clone() && !image.is_gate());
+        assert!(!image.is_gate());
         let b = image.build.as_ref().unwrap();
         assert_eq!(b.image, "ghcr.io/acme/app:v1");
         assert!(b.push);
@@ -7891,60 +8064,6 @@ mod tests {
     }
 
     #[test]
-    fn clone_knobs_parse_and_round_trip() {
-        let ir = compile(
-            r#"
-            steps:
-              - id: checkout
-                clone: { depth: full, submodules: true, lfs: true, ref: refs/heads/release }
-            "#,
-        );
-        let spec = ir.steps[0].clone.as_ref().unwrap();
-        assert_eq!(spec.depth, CloneDepth::Full);
-        assert!(spec.submodules);
-        assert!(spec.lfs);
-        assert_eq!(spec.r#ref.as_deref(), Some("refs/heads/release"));
-        // The compiled IR serializes depth canonically (1 | "full").
-        let json = serde_json::to_value(&ir).unwrap();
-        assert_eq!(json["steps"][0]["clone"]["depth"], "full");
-        let shallow = compile("steps: [{ id: c, clone: { depth: 1 } }]");
-        let json = serde_json::to_value(&shallow).unwrap();
-        assert_eq!(json["steps"][0]["clone"]["depth"], 1);
-    }
-
-    #[test]
-    fn invalid_clone_depth_is_a_compile_error() {
-        for depth in ["2", "\"deep\"", "0"] {
-            let yaml = format!("steps: [{{ id: c, clone: {{ depth: {depth} }} }}]");
-            match compile_yaml(&yaml) {
-                Err(PipelineError::Parse(e)) => {
-                    assert!(e.to_string().contains("depth"), "depth={depth}: {e}")
-                }
-                other => panic!("depth={depth}: expected parse error, got {other:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn clone_is_zero_config_image_and_gate_are_rejected() {
-        match compile_yaml("steps: [{ id: c, clone: {}, image: busybox }]") {
-            Err(PipelineError::Validation(errs)) => {
-                assert!(errs.iter().any(|e| e.contains("scarab-clone")), "{errs:?}")
-            }
-            other => panic!("expected validation error, got {other:?}"),
-        }
-        match compile_yaml("steps: [{ id: c, clone: {}, gate: manual }]") {
-            Err(PipelineError::Validation(errs)) => {
-                assert!(
-                    errs.iter().any(|e| e.contains("mutually exclusive")),
-                    "{errs:?}"
-                )
-            }
-            other => panic!("expected validation error, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn missing_clone_on_push_pipeline_lints_but_compiles() {
         // The lint fires — and compilation still SUCCEEDS (non-fatal).
         let ir = compile(
@@ -7969,15 +8088,17 @@ mod tests {
 
     #[test]
     fn lint_is_quiet_with_a_clone_or_on_repo_less_triggers() {
-        // A push pipeline WITH a clone: quiet.
-        let ir = compile(
+        // A push pipeline WITH a checkout: quiet.
+        let ir = compile_with_libraries(
             r#"
             on: { push: {} }
             steps:
-              - { id: checkout, clone: {} }
+              - { id: checkout, invoke: lib:thulasi-ram/clone }
               - { id: build, image: busybox, needs: [checkout] }
             "#,
-        );
+            &with_clone(),
+        )
+        .unwrap();
         assert!(lint(&ir).is_empty());
 
         // Repo-less triggers (cron/upstream) never warn — they legitimately
@@ -8253,9 +8374,13 @@ mod tests {
     #[test]
     fn the_repos_own_ci_pipeline_compiles_and_keeps_an_unfiltered_push_trigger() {
         let ci = include_str!("../../../.scarab/ci.yaml");
-        let ir = compile_yaml(ci).expect("the repo's own .scarab/ci.yaml must compile to IR");
+        let ir = compile_with_libraries(ci, &with_clone())
+            .expect("the repo's own .scarab/ci.yaml must compile to IR");
 
-        assert!(ir.steps.iter().any(|s| s.is_clone()), "has a clone step");
+        assert!(
+            ir.steps.iter().any(|s| s.origin.iter().any(is_clone_library)),
+            "checks out the repository"
+        );
 
         assert_eq!(
             ir.triggers.0.keys().collect::<Vec<_>>(),
@@ -8280,8 +8405,14 @@ mod tests {
     fn the_dogfood_pipeline_is_dispatch_only() {
         let dogfood = include_str!("../../../.scarab/dogfood.yaml");
         let notify = include_str!("../../../.scarab/lib/notify.yaml");
-        let ir = compile_yaml_with_libs(dogfood, &libs(&[(".scarab/lib/notify.yaml", notify)]))
-            .expect("the dogfood sample must compile");
+        let ir = compile_with_libraries(
+            dogfood,
+            &Libraries {
+                files: libs(&[(".scarab/lib/notify.yaml", notify)]),
+                ..with_clone()
+            },
+        )
+        .expect("the dogfood sample must compile");
         assert_eq!(
             ir.triggers.0.keys().collect::<Vec<_>>(),
             vec!["manual"],
@@ -8298,12 +8429,18 @@ mod tests {
     fn dogfood_sample_compiles() {
         let dogfood = include_str!("../../../.scarab/dogfood.yaml");
         let notify = include_str!("../../../.scarab/lib/notify.yaml");
-        let libs = libs(&[(".scarab/lib/notify.yaml", notify)]);
-        let ir = compile_yaml_with_libs(dogfood, &libs)
+        let libraries = Libraries {
+            files: libs(&[(".scarab/lib/notify.yaml", notify)]),
+            ..with_clone()
+        };
+        let ir = compile_with_libraries(dogfood, &libraries)
             .expect("the dogfood kitchen-sink sample must compile to IR");
 
         // A few features must have survived compilation.
-        assert!(ir.steps.iter().any(|s| s.is_clone()), "has a clone step");
+        assert!(
+            ir.steps.iter().any(|s| s.origin.iter().any(is_clone_library)),
+            "checks out the repository"
+        );
         assert!(
             !ir.services.is_empty(),
             "has pipeline-level shared services"
@@ -8436,7 +8573,6 @@ mod tests {
                 "retry",
                 "steps: [{id: a, image: alpine, retry: {max: 2, onn: failure}}]\n",
             ),
-            ("clone", "steps: [{id: a, clone: {submodule: true}}]\n"),
             (
                 "build",
                 "steps: [{id: a, build: {image: x, dockerfle: D}}]\n",

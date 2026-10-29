@@ -79,6 +79,7 @@ fn launch(spec: &StepSpec, run_params: serde_json::Value, outputs: serde_json::V
         Facts::Launch {
             params: &params,
             results: &results,
+            event: &serde_json::Map::new(),
         },
     )
     .map(|s| s.command[1..].join(" | "))

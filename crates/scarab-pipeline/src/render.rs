@@ -23,19 +23,25 @@ pub type Results = BTreeMap<String, BTreeMap<String, Value>>;
 /// What is known when a Step's templates render.
 #[derive(Debug, Clone, Copy)]
 pub enum Facts<'a> {
-    /// The Step is launching: the Run's launch parameters and the results of
-    /// the Step's `needs` (a Step that is not a need is absent).
+    /// The Step is launching: the Run's launch parameters, the results of
+    /// the Step's `needs` (a Step that is not a need is absent), and the
+    /// `event` values stored with the Run (ADR-0076 §9, [`crate::event`]).
     Launch {
         params: &'a BTreeMap<String, Value>,
         results: &'a Results,
+        event: &'a Map<String, Value>,
     },
     /// The Run is being created and no Step has run. Only values known then
     /// render: the Run's launch parameters, literal `with:` values and
     /// defaults, `matrix`, and an input bound to a caller's template that
     /// reads only these. A `${{ … }}` that reads anything else (an output,
     /// an input bound to a template that reads one) is left as its template
-    /// text, so a leftover `${{` means "not known yet".
-    Preview { params: &'a BTreeMap<String, Value> },
+    /// text, so a leftover `${{` means "not known yet". The Run's `event`
+    /// values are known then.
+    Preview {
+        params: &'a BTreeMap<String, Value>,
+        event: &'a Map<String, Value>,
+    },
 }
 
 /// The templates of a Step that render: its image, command and env values.
@@ -72,8 +78,19 @@ pub fn render(
     facts: Facts<'_>,
 ) -> Result<Rendered, String> {
     match facts {
-        Facts::Launch { params, results } => {
-            let bound = bind(scope, matrix_values, params, Some(results), Mode::Launch)?;
+        Facts::Launch {
+            params,
+            results,
+            event,
+        } => {
+            let bound = bind(
+                scope,
+                matrix_values,
+                params,
+                event,
+                Some(results),
+                Mode::Launch,
+            )?;
             let ctx = Value::Object(bound.ctx);
             let one = |t: &str| cel::interpolate(t, &ctx).map_err(|e| e.to_string());
             let image = one(templates.image)?;
@@ -114,8 +131,8 @@ pub fn render(
                 env,
             })
         }
-        Facts::Preview { params } => {
-            let bound = bind(scope, matrix_values, params, None, Mode::Preview);
+        Facts::Preview { params, event } => {
+            let bound = bind(scope, matrix_values, params, event, None, Mode::Preview);
             let one = |t: &str| match &bound {
                 Ok(b) => preview(t, &b.ctx, &b.known),
                 Err(_) => t.to_string(),
@@ -268,6 +285,7 @@ pub fn preview_image(
     scope: Option<&Scope>,
     matrix_values: &BTreeMap<String, String>,
     params: &BTreeMap<String, Value>,
+    event: &Map<String, Value>,
 ) -> String {
     render(
         Templates {
@@ -277,7 +295,7 @@ pub fn preview_image(
         },
         scope,
         matrix_values,
-        Facts::Preview { params },
+        Facts::Preview { params, event },
     )
     .map(|r| r.image)
     .unwrap_or_else(|_| image.to_string())
@@ -293,7 +311,14 @@ pub(crate) fn guard_holds(
     scope: &Scope,
     params: &BTreeMap<String, Value>,
 ) -> Result<bool, crate::PipelineError> {
-    let bound = bind(Some(scope), &BTreeMap::new(), params, None, Mode::Guard)
+    let bound = bind(
+        Some(scope),
+        &BTreeMap::new(),
+        params,
+        &Map::new(),
+        None,
+        Mode::Guard,
+    )
         .map_err(crate::PipelineError::Cel)?;
     let mut ctx = bound.ctx;
     ctx.remove("outputs");
@@ -330,7 +355,7 @@ impl Known {
             return false;
         };
         reads.iter().all(|r| match r.var.as_str() {
-            "matrix" => true,
+            "matrix" | "event" => true,
             "outputs" => self.outputs,
             "inputs" => match (&self.inputs, &r.first) {
                 (None, _) => true,
@@ -367,6 +392,7 @@ fn bind(
     scope: Option<&Scope>,
     matrix_values: &BTreeMap<String, String>,
     params: &BTreeMap<String, Value>,
+    event: &Map<String, Value>,
     results: Option<&Results>,
     mode: Mode,
 ) -> Result<Bound, String> {
@@ -378,6 +404,9 @@ fn bind(
         )
     };
     let mut ctx = Map::new();
+    // The Run's checked `event` values (ADR-0076 §9) are trigger facts, not
+    // a caller's values: every scope reads them, a library's included.
+    ctx.insert("event".into(), Value::Object(event.clone()));
     let Some(scope) = scope else {
         // A Step written in the Pipeline file, rendered as it always was.
         let mut outputs = Map::new();
@@ -415,12 +444,21 @@ fn bind(
                 scope
                     .caller
                     .as_deref()
-                    .and_then(|c| bind(Some(c), &BTreeMap::new(), params, results, mode).ok())
+                    .and_then(|c| {
+                        bind(Some(c), &BTreeMap::new(), params, event, results, mode).ok()
+                    })
             } else {
                 let caller = scope.caller.as_deref().ok_or_else(|| {
                     "a caller's `with:` value has no caller scope to render in".to_string()
                 })?;
-                Some(bind(Some(caller), &BTreeMap::new(), params, results, mode)?)
+                Some(bind(
+                    Some(caller),
+                    &BTreeMap::new(),
+                    params,
+                    event,
+                    results,
+                    mode,
+                )?)
             };
             let mut values = BTreeMap::new();
             for (name, binding) in bindings {
@@ -605,7 +643,11 @@ mod tests {
             },
             scope,
             matrix,
-            Facts::Launch { params, results },
+            Facts::Launch {
+                params,
+                results,
+                event: &serde_json::Map::new(),
+            },
         )
     }
 
@@ -820,7 +862,7 @@ mod tests {
         assert!(e.contains("no caller scope"), "{e}");
         // A preview never fails: what it cannot render stays as written.
         let p =
-            |image: &str| preview_image(image, Some(&scope), &BTreeMap::new(), &BTreeMap::new());
+            |image: &str| preview_image(image, Some(&scope), &BTreeMap::new(), &BTreeMap::new(), &serde_json::Map::new());
         assert_eq!(p("app:${{ inputs.v }}"), "app:${{ inputs.v }}");
         assert_eq!(
             p("app:${{ event.x }}-${{ 1 + }}"),
@@ -854,7 +896,7 @@ mod tests {
         ]);
         let params = map(json!({ "d": "sha256:def" }));
         let p = |image: &str, scope: Option<&Scope>| {
-            preview_image(image, scope, &BTreeMap::new(), &params)
+            preview_image(image, scope, &BTreeMap::new(), &params, &serde_json::Map::new())
         };
         assert_eq!(p("img@${{ inputs.lit }}", Some(&scope)), "img@sha256:abc");
         // A caller's template that reads a launch parameter is known; one
@@ -966,7 +1008,10 @@ mod tests {
                 },
                 scope,
                 &matrix,
-                Facts::Preview { params: &params },
+                Facts::Preview {
+                params: &params,
+                event: &serde_json::Map::new(),
+            },
             )
         };
         let e = preview(&["git", "${{ inputs.p }}"], None).unwrap_err();
@@ -1026,7 +1071,10 @@ mod tests {
             },
             None,
             &matrix,
-            Facts::Preview { params: &params },
+            Facts::Preview {
+                params: &params,
+                event: &serde_json::Map::new(),
+            },
         );
         assert!(preview.unwrap_err().contains("names the program"));
     }

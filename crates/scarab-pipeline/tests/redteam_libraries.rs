@@ -78,6 +78,7 @@ fn launch(spec: &StepSpec, run_params: serde_json::Value) -> Result<Rendered, St
         Facts::Launch {
             params: &params,
             results: &Results::new(),
+            event: &serde_json::Map::new(),
         },
     )
 }
