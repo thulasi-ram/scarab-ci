@@ -75,13 +75,48 @@ pub enum OutputSource {
 }
 
 /// One bound input of a library invocation.
+///
+/// Stored on every Step the invocation inlines, so it holds only what
+/// rendering needs: no description, and no declaration at all for a value
+/// already checked when the Pipeline compiled.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Binding {
-    /// The input as the library declares it: its type, `options` and
-    /// `validate:`, which a template's value is checked against at launch.
-    pub param: ParamSpec,
+    /// For a [`BoundValue::Template`], the input as the library declares it,
+    /// without its description or default: its type, `options` and
+    /// `validate:`, which the template's value is checked against at launch.
+    /// `None` for a [`BoundValue::Literal`], converted and checked already. A
+    /// template without one does not render.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub param: Option<Box<ParamSpec>>,
     pub value: BoundValue,
+}
+
+impl Binding {
+    /// A literal `with:` value or default, converted and checked already.
+    pub fn literal(value: serde_json::Value) -> Self {
+        Binding {
+            param: None,
+            value: BoundValue::Literal(value),
+        }
+    }
+
+    /// A caller's template, checked against `param` when it renders. Only
+    /// the parts of `param` that check a value are kept.
+    pub fn template(template: String, param: &ParamSpec) -> Self {
+        Binding {
+            param: Some(Box::new(ParamSpec {
+                name: param.name.clone(),
+                r#type: param.r#type,
+                required: true,
+                default: None,
+                options: param.options.clone(),
+                validate: param.validate.clone(),
+                description: None,
+            })),
+            value: BoundValue::Template(template),
+        }
+    }
 }
 
 /// The value of a [`Binding`].

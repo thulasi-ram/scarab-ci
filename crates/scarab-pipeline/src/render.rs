@@ -387,7 +387,10 @@ fn bind(
                     None => cel::interpolate(template, &ctx).map(Value::String),
                 }
                 .map_err(|e| format!("input `{name}` (from the caller's `with:`): {e}"))?;
-                let value = params::resolve_one(&binding.param, &raw)
+                let param = binding.param.as_deref().ok_or_else(|| {
+                    format!("input `{name}` (from the caller's `with:`) has no declared type")
+                })?;
+                let value = params::resolve_one(param, &raw)
                     .map_err(|e| format!("input `{name}` (from the caller's `with:`): {e}"))?;
                 values.insert(name.clone(), value);
             }
@@ -530,9 +533,9 @@ mod tests {
                     .map(|(n, ty, value)| {
                         (
                             n.to_string(),
-                            Binding {
-                                param: param(n, ty),
-                                value,
+                            match value {
+                                BoundValue::Literal(v) => Binding::literal(v),
+                                BoundValue::Template(t) => Binding::template(t, &param(n, ty)),
                             },
                         )
                     })
@@ -701,7 +704,7 @@ mod tests {
         let ScopeInputs::Bound(b) = &mut scope.inputs else {
             unreachable!()
         };
-        b.get_mut("n").unwrap().param.validate = Some("value > 10".into());
+        b.get_mut("n").unwrap().param.as_mut().unwrap().validate = Some("value > 10".into());
         let e = launch(&[], Some(&scope), &BTreeMap::new(), &BTreeMap::new(), &res).unwrap_err();
         assert!(
             e.contains("input `n`") && e.contains("failed validation `value > 10`"),
@@ -850,5 +853,56 @@ mod tests {
         assert!(e.contains("starts the argument with `-`"), "{e}");
         let r = preview(&["${{ inputs.tpl }}", "${{ inputs.p"], Some(&scope)).unwrap();
         assert_eq!(r.command, ["${{ inputs.tpl }}", "${{ inputs.p"]);
+    }
+    /// A stored binding written before bindings were trimmed (with the
+    /// input's whole declaration) still loads and checks its value; a
+    /// template stored without a declaration does not render; a literal is
+    /// stored without one.
+    #[test]
+    fn a_binding_stores_only_what_rendering_needs() {
+        let old: Binding = serde_json::from_value(json!({
+            "param": {
+                "name": "v", "type": "number", "required": true,
+                "description": "a long description", "validate": "value < 10"
+            },
+            "value": { "template": "${{ inputs.p }}" }
+        }))
+        .unwrap();
+        let mut scope = library(vec![]);
+        scope.inputs = ScopeInputs::Bound(BTreeMap::from([("v".to_string(), old)]));
+        let run = |scope: &Scope, p: Value| {
+            launch(
+                &["${{ inputs.v }}"],
+                Some(scope),
+                &BTreeMap::new(),
+                &map(json!({ "p": p })),
+                &Results::new(),
+            )
+        };
+        assert_eq!(run(&scope, json!(5)).unwrap().command, ["5"]);
+        let e = run(&scope, json!(50)).unwrap_err();
+        assert!(e.contains("failed validation `value < 10`"), "{e}");
+
+        let ScopeInputs::Bound(b) = &mut scope.inputs else {
+            unreachable!()
+        };
+        b.get_mut("v").unwrap().param = None;
+        let e = run(&scope, json!(5)).unwrap_err();
+        assert!(e.contains("input `v`") && e.contains("no declared type"), "{e}");
+
+        let mut declared = param("v", ParamType::Number);
+        declared.description = Some("not stored".into());
+        declared.validate = Some("value < 10".into());
+        assert_eq!(
+            serde_json::to_value(Binding::literal(json!(1))).unwrap(),
+            json!({ "value": { "literal": 1 } })
+        );
+        assert_eq!(
+            serde_json::to_value(Binding::template("${{ inputs.p }}".into(), &declared)).unwrap(),
+            json!({
+                "param": { "name": "v", "type": "number", "required": true, "validate": "value < 10" },
+                "value": { "template": "${{ inputs.p }}" }
+            })
+        );
     }
 }

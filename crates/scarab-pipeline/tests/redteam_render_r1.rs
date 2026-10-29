@@ -514,7 +514,6 @@ fn survived_deep_stored_caller_chains() {
 /// many large inputs and many Steps multiplies the source size by the
 /// Step count in the compiled IR, which is stored per Step on the Run.
 #[test]
-#[ignore = "red: render r1"]
 fn compiled_ir_is_not_amplified_by_scope_copies() {
     let desc = "d".repeat(1000);
     let mut inputs = String::new();
@@ -581,7 +580,6 @@ fn survived_guard_storm_is_bounded() {
 /// 100 inputs with 4 KB descriptions (a ~0.4 MB file) compiles to an IR
 /// whose size, stored with the Run and again per Step, is bounded.
 #[test]
-#[ignore = "red: render r1"]
 fn compiled_ir_at_the_step_cap_is_bounded() {
     let desc = "d".repeat(4000);
     let mut inputs = String::new();

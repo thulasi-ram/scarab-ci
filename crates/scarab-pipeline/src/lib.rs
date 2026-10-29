@@ -1293,6 +1293,12 @@ struct LibsRef<'a> {
 }
 
 fn compile_libs(yaml: &str, libs: LibsRef<'_>) -> Result<PipelineIr, PipelineError> {
+    if yaml.len() > MAX_SOURCE_BYTES {
+        return Err(PipelineError::Validation(vec![source_too_large(
+            "the pipeline file",
+            yaml.len(),
+        )]));
+    }
     let authored: PipelineIr =
         serde_yaml::from_str(yaml).map_err(|e| PipelineError::Parse(e.to_string()))?;
 
@@ -1316,6 +1322,9 @@ fn compile_libs(yaml: &str, libs: LibsRef<'_>) -> Result<PipelineIr, PipelineErr
     // authored step id -> the concrete instance ids it expanded into.
     let mut instances: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
+    // The stored size of `expanded` so far: each instance is about the size
+    // of the Step it was expanded from.
+    let mut bytes: usize = 0;
     for step in &authored_steps {
         match expand_step(step) {
             Ok(concrete) => {
@@ -1323,9 +1332,15 @@ fn compile_libs(yaml: &str, libs: LibsRef<'_>) -> Result<PipelineIr, PipelineErr
                 // A duplicate authored id shadows an earlier expansion; the
                 // resulting duplicate concrete ids are caught by validate().
                 instances.insert(step.id.clone(), ids);
+                let each = json_len(step, MAX_COMPILED_IR_BYTES).unwrap_or(usize::MAX);
+                bytes = bytes.saturating_add(each.saturating_mul(concrete.len()));
                 expanded.extend(concrete);
                 if expanded.len() > MAX_COMPILED_STEPS {
                     diagnostics.push(too_many_steps(&format!("step `{}`", step.id)));
+                    break;
+                }
+                if bytes > MAX_COMPILED_IR_BYTES {
+                    diagnostics.push(ir_too_large(&format!("step `{}`", step.id)));
                     break;
                 }
             }
@@ -1407,6 +1422,9 @@ fn compile_libs(yaml: &str, libs: LibsRef<'_>) -> Result<PipelineIr, PipelineErr
         steps: expanded,
     };
 
+    if json_len(&ir, MAX_COMPILED_IR_BYTES).is_none() {
+        return Err(PipelineError::Validation(vec![ir_too_large("the pipeline")]));
+    }
     validate(&ir).map_err(PipelineError::Validation)?;
     Ok(ir)
 }
@@ -1648,6 +1666,60 @@ fn too_many_steps(at: &str) -> String {
     )
 }
 
+/// The largest Pipeline or library file the compiler reads, in bytes (1 MiB).
+pub const MAX_SOURCE_BYTES: usize = 1 << 20;
+
+/// The largest compiled Pipeline, as stored JSON, in bytes (16 MiB). A
+/// Run stores its compiled Pipeline, and each Step stores its own launch
+/// spec, scope included. A library's bound inputs are stored on every Step
+/// it inlines, and a matrix copies a Step, so a small file can compile to a
+/// large Pipeline: the compiler stops as soon as a list it builds passes
+/// this, instead of building the whole Pipeline.
+pub const MAX_COMPILED_IR_BYTES: usize = 16 << 20;
+
+/// The diagnostic for a file over [`MAX_SOURCE_BYTES`].
+fn source_too_large(what: &str, len: usize) -> String {
+    format!(
+        "{what} is {len} bytes; the limit is {MAX_SOURCE_BYTES} bytes (1 MiB) per Pipeline or \
+         library file"
+    )
+}
+
+/// The diagnostic for a Pipeline over [`MAX_COMPILED_IR_BYTES`].
+fn ir_too_large(at: &str) -> String {
+    format!(
+        "{at}: the pipeline compiles to more than {MAX_COMPILED_IR_BYTES} bytes (16 MiB) after \
+         inlining `invoke:` steps and expanding matrices; the limit is {MAX_COMPILED_IR_BYTES} \
+         bytes. Each Step a library inlines stores the library's inputs, and each matrix leg \
+         stores a copy of its Step"
+    )
+}
+
+/// The length of `value` as JSON, or `None` when it is longer than `limit`:
+/// serializing stops there, so the work is bounded by `limit`.
+fn json_len(value: &impl Serialize, limit: usize) -> Option<usize> {
+    struct Count {
+        len: usize,
+        limit: usize,
+    }
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.len += buf.len();
+            if self.len > self.limit {
+                return Err(std::io::Error::other("over the limit"));
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count { len: 0, limit };
+    serde_json::to_writer(&mut count, value)
+        .ok()
+        .map(|()| count.len)
+}
+
 /// Inline every `invoke:` step (ADR-0038, ADR-0076) into a flat step list
 /// with no invoke steps left. **Recursive**: a library that itself invokes is
 /// expanded to full depth, ids namespacing correctly at each level
@@ -1813,10 +1885,18 @@ fn inline_level(
         }
     }
 
-    // Stop when the list passes the cap.
-    let capped = |len: usize, at: &str, budget: &mut Budget, diagnostics: &mut Vec<String>| {
-        if len > MAX_COMPILED_STEPS {
+    // Stop when the list passes a cap: its length, or its stored size, which
+    // only grows as outer levels namespace it.
+    let mut bytes: usize = 0;
+    let mut capped = |out: &[StepSpec], at: &str, budget: &mut Budget, diagnostics: &mut Vec<String>| {
+        if out.len() > MAX_COMPILED_STEPS {
             budget.stop(too_many_steps(at), diagnostics);
+        } else if let Some(last) = out.last() {
+            let left = MAX_COMPILED_IR_BYTES - bytes;
+            match json_len(last, left) {
+                Some(n) => bytes += n,
+                None => budget.stop(ir_too_large(at), diagnostics),
+            }
         }
         budget.stopped
     };
@@ -1874,7 +1954,7 @@ fn inline_level(
             }
             out.push(step);
             if capped(
-                out.len(),
+                &out,
                 &format!("step `{}`", out[out.len() - 1].id),
                 budget,
                 diagnostics,
@@ -1995,6 +2075,14 @@ fn inline_level(
             ));
             continue;
         }
+        if src.len() > MAX_SOURCE_BYTES {
+            diagnostics.push(format!(
+                "step `{}`: {}",
+                step.id,
+                source_too_large(&format!("library `{label}`"), src.len())
+            ));
+            continue;
+        }
         let lib: PipelineIr = match serde_yaml::from_str(src) {
             Ok(ir) => ir,
             Err(e) => {
@@ -2111,13 +2199,11 @@ fn inline_level(
                     None => continue,
                 },
             };
-            bindings.insert(
-                p.name.clone(),
-                Binding {
-                    param: p.clone(),
-                    value,
-                },
-            );
+            let binding = match value {
+                BoundValue::Literal(v) => Binding::literal(v),
+                BoundValue::Template(t) => Binding::template(t, p),
+            };
+            bindings.insert(p.name.clone(), binding);
         }
         // `validate_interface` usually said why an input does not resolve;
         // when it did not, the resolve error is the diagnostic.
@@ -2322,7 +2408,7 @@ fn inline_level(
                 }
                 out.push(inst);
                 if capped(
-                    out.len(),
+                    &out,
                     &format!("step `{}`", step.id),
                     budget,
                     diagnostics,
@@ -3120,6 +3206,11 @@ fn expand_step(step: &StepSpec) -> Result<Vec<StepSpec>, String> {
         .collect();
     if kept.len() > MAX_COMPILED_STEPS {
         return Err(too_many_steps(&format!("step `{}`", step.id)));
+    }
+    // Each kept combination is a copy of the Step: refuse before copying.
+    let each = json_len(step, MAX_COMPILED_IR_BYTES).unwrap_or(usize::MAX);
+    if each.saturating_mul(kept.len()) > MAX_COMPILED_IR_BYTES {
+        return Err(ir_too_large(&format!("step `{}`", step.id)));
     }
 
     Ok(kept
@@ -6251,6 +6342,76 @@ mod tests {
             "{errs:?}"
         );
         assert!(!errs.iter().any(|e| e.contains("/n/t")), "{errs:?}");
+    }
+
+    /// A Pipeline or library file over 1 MiB is refused, and so is a small
+    /// file that compiles to more than 16 MiB: a library's default is stored
+    /// on each Step it inlines, and a matrix copies its Step.
+    #[test]
+    fn source_and_compiled_sizes_are_capped() {
+        let big = "x".repeat(MAX_SOURCE_BYTES);
+        let errs = errors(&format!(
+            "steps: [{{ id: a, image: busybox, command: [\"{big}\"] }}]"
+        ));
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("the pipeline file is") && e.contains("(1 MiB)")),
+            "{errs:?}"
+        );
+        let lib = format!("kind: library\n# {big}\nsteps: [{{ id: s, image: busybox }}]\n");
+        let errs = errors_with(
+            "steps: [{ id: c, invoke: file:l.yaml }]",
+            &raw_libs(&[("l.yaml", &lib)]),
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("step `c`: library `l.yaml` is") && e.contains("(1 MiB)")),
+            "{errs:?}"
+        );
+
+        let large = "d".repeat(600_000);
+        let too_large = |errs: &[String]| {
+            errs.iter()
+                .any(|e| e.contains("more than 16777216 bytes (16 MiB)"))
+        };
+        // A 600 KB default, stored on each of 40 inlined Steps.
+        let steps: String = (0..40)
+            .map(|i| format!("  - {{ id: s{i}, image: busybox }}\n"))
+            .collect();
+        let lib = format!(
+            "kind: library\ninterface: {{ inputs: [{{ name: v, type: string, required: false, default: \"{large}\" }}] }}\nsteps:\n{steps}"
+        );
+        let errs = errors_with(
+            "steps: [{ id: c, invoke: file:l.yaml }]",
+            &raw_libs(&[("l.yaml", &lib)]),
+        );
+        assert!(too_large(&errs), "{errs:?}");
+        // A 600 KB Step with 32 matrix legs.
+        let legs = (0..32).map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
+        let matrixed = format!(
+            "kind: library\nsteps: [{{ id: s, image: busybox, command: [\"{large}\"], matrix: {{ dimensions: {{ n: [{legs}] }} }} }}]\n"
+        );
+        let errs = errors_with(
+            "steps: [{ id: c, invoke: file:l.yaml }]",
+            &raw_libs(&[("l.yaml", &matrixed)]),
+        );
+        assert!(too_large(&errs), "{errs:?}");
+        // Two such Steps of 16 legs each: under the cap one at a time, over it
+        // together.
+        let legs = (0..16).map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
+        let half = format!(
+            "kind: library\nsteps: [{{ id: s, image: busybox, command: [\"{large}\"], matrix: {{ dimensions: {{ n: [{legs}] }} }} }}]\n"
+        );
+        let errs = errors_with(
+            "steps: [{ id: a, invoke: file:a.yaml }, { id: b, invoke: file:b.yaml }]",
+            &raw_libs(&[("a.yaml", &half), ("b.yaml", &half)]),
+        );
+        assert!(too_large(&errs), "{errs:?}");
+        // One of them compiles.
+        compile_with(
+            "steps: [{ id: a, invoke: file:a.yaml }]",
+            &raw_libs(&[("a.yaml", &half)]),
+        );
     }
 
     #[test]
