@@ -5882,8 +5882,10 @@ async fn persist_run_from_ir(
     let cancellable = matches!(gov, RunGovernance::Ungoverned) && !is_deploy_run;
     // Concurrency group (ADR-0011, 0032): serialize this run against others in the
     // same group under its policy. The `group` is interpolated here against the
-    // run's launch inputs and trigger event (the same CEL machinery as step
-    // `${{ … }}`, ADR-0009/0043), so `deploy-${{ inputs.deploy_env }}` resolves to
+    // run's launch inputs and its checked `event` values (ADR-0076 §9: the
+    // fields a template may read, each passing its check — never the raw
+    // trigger event, whose free text anyone who can comment writes), so
+    // `deploy-${{ inputs.deploy_env }}` resolves to
     // a *distinct* key per environment (`deploy-staging` vs `deploy-production`)
     // rather than colliding on the literal template. A `${{ … }}` that cannot be
     // resolved fails closed — never store a literal template as the slot key.
@@ -5891,7 +5893,7 @@ async fn persist_run_from_ir(
         let inputs = params
             .map(|p| serde_json::Value::Object(p.clone().into_iter().collect()))
             .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
-        let interp_ctx = serde_json::json!({ "inputs": inputs, "event": event.context() });
+        let interp_ctx = serde_json::json!({ "inputs": inputs, "event": admitted.event });
         let group = scarab_pipeline::cel::interpolate(&c.group, &interp_ctx)
             .map_err(|e| TriggerError::Pipeline(format!("concurrency group `{}`: {e}", c.group)))?;
         // Tenancy scope (QA finding; git-bug 5120335): the author's group name is

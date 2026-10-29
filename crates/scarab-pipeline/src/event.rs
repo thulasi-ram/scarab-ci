@@ -149,7 +149,8 @@ fn step_templates(step: &crate::StepSpec) -> Vec<(String, &str)> {
 }
 
 /// The `event` fields a compiled Pipeline's templates read, which Run
-/// creation checks ([`facts`]).
+/// creation checks ([`facts`]): its Steps' templates and its
+/// `concurrency.group`.
 pub fn reads(ir: &PipelineIr) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for step in &ir.steps {
@@ -157,11 +158,25 @@ pub fn reads(ir: &PipelineIr) -> BTreeSet<String> {
             out.extend(template_reads(text).0);
         }
     }
+    if let Some(c) = &ir.concurrency {
+        out.extend(template_reads(&c.group).0);
+    }
     out
 }
 
-/// Each template of `ir` that reads `event` in a way a template may not.
+/// Each template of `ir` that reads `event` in a way a template may not. A
+/// `concurrency.group` is a template too: Run creation renders it against
+/// the same checked values.
 pub(crate) fn check(ir: &PipelineIr, diagnostics: &mut Vec<String>) {
+    if let Some(c) = &ir.concurrency {
+        let mut seen = BTreeSet::new();
+        for e in template_reads(&c.group).1 {
+            let d = format!("concurrency: group {e}");
+            if seen.insert(d.clone()) {
+                diagnostics.push(d);
+            }
+        }
+    }
     for step in &ir.steps {
         let mut seen = BTreeSet::new();
         for (field, text) in step_templates(step) {
@@ -181,14 +196,41 @@ fn plain(s: &str, allowed: impl Fn(char) -> bool) -> bool {
     !s.is_empty() && !s.starts_with('-') && s.chars().all(allowed)
 }
 
+/// The longest value, in bytes, each text field accepts. A value is an
+/// environment variable or an argument in every Step that reads it.
+fn max_len(field: &str) -> usize {
+    match field {
+        "kind" => 32,
+        "run" => 64,
+        "repo.owner" | "repo.name" => 100,
+        "ref" | "branch" | "tag" => 255,
+        "repo.clone_url" => 2048,
+        _ => usize::MAX,
+    }
+}
+
 /// Check one field's value against its rule (ADR-0076 §9). `Err` is the
 /// reason, written to follow "`${{ event.<field> }}` does not accept".
 pub fn check_value(field: &str, value: &Value) -> Result<(), String> {
     let text = |v: &Value| v.as_str().map(str::to_string);
     let shown = |v: &Value| match v {
+        Value::String(s) if s.len() > 80 => {
+            let head: String = s.chars().take(40).collect();
+            format!("`{}…`", head.escape_debug())
+        }
         Value::String(s) => format!("`{}`", s.escape_debug()),
         other => format!("`{other}`"),
     };
+    if let Some(s) = value.as_str() {
+        let max = max_len(field);
+        if s.len() > max {
+            return Err(format!(
+                "{}, which is {} bytes long (at most {max})",
+                shown(value),
+                s.len()
+            ));
+        }
+    }
     match field {
         "kind" => match text(value) {
             Some(s) if plain(&s, |c| c.is_ascii_lowercase() || c == '_') => Ok(()),
@@ -216,10 +258,16 @@ pub fn check_value(field: &str, value: &Value) -> Result<(), String> {
             _ => Err(format!("{}, which is not a Run id", shown(value))),
         },
         "repo.owner" | "repo.name" => match text(value) {
-            Some(s) if plain(&s, |c| c.is_ascii_alphanumeric() || "._-".contains(c)) => Ok(()),
+            Some(s)
+                if plain(&s, |c| c.is_ascii_alphanumeric() || "._-".contains(c))
+                    && s != "."
+                    && s != ".." =>
+            {
+                Ok(())
+            }
             _ => Err(format!(
-                "{}, which may hold only letters, digits, `.`, `_` and `-`, and may not start \
-                 with `-`",
+                "{}, which may hold only letters, digits, `.`, `_` and `-`, may not start \
+                 with `-`, and may not be `.` or `..`",
                 shown(value)
             )),
         },

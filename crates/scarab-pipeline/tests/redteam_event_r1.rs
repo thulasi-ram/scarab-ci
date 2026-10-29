@@ -27,7 +27,6 @@ fn reads_env(expr: &str) -> String {
 
 /// ATTACK: each field gets values that must fail its check.
 #[test]
-#[ignore = "red: s3 r1"]
 fn rt_every_bad_value_fails_its_check() {
     let long = "a".repeat(100_000);
     let mut bad: Vec<(&str, Value)> = Vec::new();
@@ -75,7 +74,6 @@ fn rt_every_bad_value_fails_its_check() {
 /// ATTACK: unbounded length. A branch value of 100 000 characters is an
 /// environment variable or argument of that size in every Step that reads it.
 #[test]
-#[ignore = "red: s3 r1"]
 fn rt_a_very_long_ref_value_is_refused() {
     let long = format!("feat/{}", "a".repeat(100_000));
     assert!(check_value("branch", &json!(long)).is_err(), "a 100 kB branch passes its check");
@@ -141,7 +139,6 @@ fn rt_a_bad_branch_read_only_by_when_never_reaches_the_facts() {
 /// `event.body`, colliding with another Run's group (queue or cancel it).
 /// A group that reads a field a template may not must be a compile error.
 #[test]
-#[ignore = "red: s3 r1"]
 fn rt_a_concurrency_group_may_not_read_an_unreadable_event_field() {
     let libs = Libraries::default();
     let mut admitted = Vec::new();
