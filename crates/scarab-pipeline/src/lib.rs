@@ -2069,9 +2069,16 @@ fn inline_level(
         // which adds it there. An invoke Step `<X>` is checked by
         // `validate_interface`.
         let mut with_needs: Vec<String> = Vec::new();
-        for value in step.with.values() {
-            for expr in cel::interpolations(value).unwrap_or_default() {
-                for read in output_step_refs(expr) {
+        for (key, value) in &step.with {
+            for i in cel::scan_interpolations(value).0 {
+                let reads = match cel::static_output_reads(&value[i.inner]) {
+                    Ok(reads) => reads,
+                    Err(e) => {
+                        diagnostics.push(format!("step `{}`: `with.{key}` {e}", step.id));
+                        continue;
+                    }
+                };
+                for read in reads.into_iter().filter_map(|r| r.step) {
                     // A matrix instance (`build[os=l]`) is read through its
                     // authored Step, which fans onto every instance.
                     let Some(sibling) = steps.iter().find(|s| {
@@ -2198,10 +2205,8 @@ fn inline_level(
                 let name = std::slice::from_ref(name);
                 let mut read = false;
                 let mut rewrite = |text: &mut String| {
-                    let rewritten = rewrite_output_refs(text, invoke_id, name);
-                    if rewritten != *text {
+                    if rewrite_output_refs(text, invoke_id, name) {
                         read = true;
-                        *text = rewritten;
                     }
                 };
                 rewrite(&mut step.image);
@@ -2322,14 +2327,53 @@ fn bind_library_step(
             })
             .collect();
         let mut ignored = Vec::new();
-        unbound_input_reads(&bind_inputs(step, &plain, label, &mut ignored))
+        let library_only = bind_inputs(step, &plain, label, &mut ignored);
+        let mut unread = unbound_input_reads(&library_only);
+        unread.extend(unnamed_output_reads(&library_only));
+        unread
     } else {
-        unbound_input_reads(&bound)
+        let mut unread = unbound_input_reads(&bound);
+        unread.extend(unnamed_output_reads(&bound));
+        unread
     };
     for e in unread {
         diagnostics.push(format!("library `{label}`, step `{}`: {e}", step.id));
     }
     bound
+}
+
+/// Every `${{ … }}` of a library Step that reads `outputs` without naming the
+/// Step it reads (`outputs[k]`), or does not parse: the compiler must know
+/// the Step, to namespace the read and to wire `needs` (ADR-0076 §1). Checked
+/// against the CEL parser by [`cel::static_output_reads`].
+fn unnamed_output_reads(step: &StepSpec) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut strings: Vec<(String, &str)> = vec![("image".to_string(), step.image.as_str())];
+    strings.extend(
+        step.command
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (format!("command[{i}]"), c.as_str())),
+    );
+    strings.extend(
+        step.env
+            .iter()
+            .enumerate()
+            .map(|(i, (_, v))| (format!("env[{i}][1]"), v.as_str())),
+    );
+    strings.extend(
+        step.with
+            .iter()
+            .map(|(k, v)| (format!("with.{k}"), v.as_str())),
+    );
+    for (field, text) in strings {
+        for i in cel::scan_interpolations(text).0 {
+            if let Err(e) = cel::static_output_reads(&text[i.inner]) {
+                out.push(format!("`{field}` {e}"));
+            }
+        }
+    }
+    out
 }
 
 /// Every place in a bound library Step that still reads `inputs`, by the
@@ -2405,23 +2449,6 @@ fn unbound_input_reads(step: &StepSpec) -> Vec<String> {
     }
     if let Some(When(expr)) = &step.when {
         check(expr, "when", &mut out);
-    }
-    out
-}
-
-/// The Step ids an expression reads outputs of: `outputs.<id>` and
-/// `outputs["<id>"]`.
-fn output_step_refs(expr: &str) -> Vec<String> {
-    let mut out = field_accesses(expr, "outputs");
-    let mut rest = expr;
-    while let Some(at) = rest.find("outputs[") {
-        rest = &rest[at + "outputs[".len()..];
-        let key = rest.trim_start();
-        if let Some(q) = key.chars().next().filter(|c| matches!(c, '"' | '\'')) {
-            if let Some(end) = key[1..].find(q) {
-                out.push(key[1..1 + end].to_string());
-            }
-        }
     }
     out
 }
@@ -2559,40 +2586,33 @@ fn cel_literal(v: &serde_json::Value) -> String {
     }
 }
 
-/// Rewrite `outputs.<invoke_id>.<name>` references (for each exposed `<name>`) to
-/// `outputs["<invoke_id>/<name>"].<name>` — pointing at the concrete inlined
-/// backing step (ADR-0041). Boundary-guarded so `url` does not match `urls`.
-fn rewrite_output_refs(text: &str, invoke_id: &str, exposed: &[String]) -> String {
-    let mut result = text.to_string();
-    for name in exposed {
-        let needle = format!("outputs.{invoke_id}.{name}");
-        let replacement = format!("outputs[\"{invoke_id}/{name}\"].{name}");
-        result = replace_token(&result, &needle, &replacement);
-    }
-    result
-}
-
-/// Replace each occurrence of `needle` in `text` with `replacement`, but only
-/// where `needle` is not immediately followed by an identifier char (so
-/// `outputs.x.url` does not match inside `outputs.x.urls`).
-fn replace_token(text: &str, needle: &str, replacement: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while let Some(rel) = text[i..].find(needle) {
-        let start = i + rel;
-        let end = start + needle.len();
-        let boundary_ok = end >= bytes.len() || !is_ident_byte(bytes[end]);
-        out.push_str(&text[i..start]);
-        if boundary_ok {
-            out.push_str(replacement);
-        } else {
-            out.push_str(needle);
+/// Rewrite `outputs.<invoke_id>.<name>` reads (for each exposed `<name>`), in
+/// any form [`cel::output_reads`] finds (`outputs["<invoke_id>"]["<name>"]`,
+/// spaces around `.`), to `outputs["<invoke_id>/<name>"].<name>`, pointing at
+/// the concrete inlined backing step (ADR-0041). Returns whether any changed.
+fn rewrite_output_refs(text: &mut String, invoke_id: &str, exposed: &[String]) -> bool {
+    let mut edits = Vec::new();
+    for i in cel::scan_interpolations(text).0 {
+        for read in cel::output_reads(&text[i.inner.clone()]) {
+            let (Some(id), Some(name)) = (read.step.as_deref(), read.field.as_deref()) else {
+                continue;
+            };
+            if id == invoke_id && exposed.iter().any(|n| n == name) {
+                let backing = serde_json::Value::String(format!("{id}/{name}"));
+                let at = i.inner.start;
+                edits.push((
+                    at + read.start..at + read.end,
+                    format!("outputs[{}]", cel_literal(&backing)),
+                ));
+            }
         }
-        i = end;
     }
-    out.push_str(&text[i..]);
-    out
+    let changed = !edits.is_empty();
+    // From the end, so earlier byte ranges stay valid.
+    for (range, new) in edits.into_iter().rev() {
+        text.replace_range(range, &new);
+    }
+    changed
 }
 
 /// Namespace one `needs`/`inputs` reference of a library step: prefix it if it
@@ -2716,7 +2736,6 @@ fn validate_interface(
     // output, referencing without `needs`, or referencing a matrixed invoke
     // (ambiguous per-coordinate) — at compile.
     let exposed: BTreeSet<&str> = iface.outputs.iter().map(String::as_str).collect();
-    let outputs_base = format!("outputs.{}", step.id);
     let matrixed = step.matrix.is_some();
     for t in siblings {
         if t.id == step.id {
@@ -2724,7 +2743,11 @@ fn validate_interface(
         }
         for text in interpolatable_strings(t) {
             for expr in cel::interpolations(text).unwrap_or_default() {
-                for field in field_accesses(expr, &outputs_base) {
+                let fields = cel::output_reads(expr)
+                    .into_iter()
+                    .filter(|r| r.step.as_deref() == Some(step.id.as_str()))
+                    .filter_map(|r| r.field);
+                for field in fields {
                     if matrixed {
                         diagnostics.push(format!(
                             "step `{}`: references output `outputs.{}.{field}` of a matrixed invoke — per-coordinate output references are not supported (ADR-0041)",
@@ -7217,6 +7240,38 @@ mod tests {
         compile_with(
             caller,
             &libs(&[(".scarab/lib/deploy.yaml", &lib("images"))]),
+        );
+    }
+
+    /// The compiler must know which Step every `outputs` read names inside a
+    /// library and in a `with:` value; a computed one is refused.
+    #[test]
+    fn an_outputs_read_with_a_computed_step_is_refused() {
+        let refused = "reads `outputs` in a form the compiler cannot resolve to a Step";
+        let lib = |command: &str| {
+            format!(
+                "interface: {{ inputs: [{{ name: v, type: string, required: false, default: d }}] }}\nsteps:\n  - {{ id: s, image: busybox, command: [{command:?}] }}\n"
+            )
+        };
+        let ds = errors_with(
+            "steps: [{ id: c, invoke: file:a.yaml }]",
+            &libs(&[("a.yaml", &lib("${{ outputs[matrix.k].v }}"))]),
+        );
+        assert!(
+            ds.iter().any(
+                |d| d.starts_with("library `a.yaml`, step `s`: `command[0]` ")
+                    && d.contains(refused)
+            ),
+            "{ds:?}"
+        );
+        let ds = errors_with(
+            r#"steps: [{ id: c, invoke: file:a.yaml, with: { v: "${{ outputs.exists(k, true) }}" } }]"#,
+            &libs(&[("a.yaml", &lib("${{ inputs.v }}"))]),
+        );
+        assert!(
+            ds.iter()
+                .any(|d| d.starts_with("step `c`: `with.v` ") && d.contains(refused)),
+            "{ds:?}"
         );
     }
 

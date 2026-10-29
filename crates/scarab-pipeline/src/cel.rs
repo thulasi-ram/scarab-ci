@@ -12,6 +12,9 @@
 //! `matrix`). Bad expressions are caught at **submit time** by [`check`], never
 //! mid-run.
 
+use std::ops::Range;
+
+use cel::common::ast::{operators, EntryExpr, Expr, IdedExpr, LiteralValue};
 use cel::{Context, Program};
 
 use crate::PipelineError;
@@ -52,7 +55,7 @@ pub const CEL_STACK_BYTES: usize = if cfg!(debug_assertions) {
 };
 
 /// The expression as quoted in an error: whole when short, else its start.
-fn shown(expr: &str) -> String {
+pub(crate) fn shown(expr: &str) -> String {
     const MAX: usize = 80;
     if expr.len() <= MAX {
         return expr.to_string();
@@ -266,36 +269,65 @@ pub(crate) fn eval_bool_each(
 /// String results are inserted raw (no quotes); other JSON values use their
 /// compact JSON form.
 pub fn interpolate(template: &str, ctx: &serde_json::Value) -> Result<String, PipelineError> {
+    let (found, unterminated) = scan_interpolations(template);
     let mut out = String::new();
-    let mut rest = template;
-    while let Some(start) = rest.find("${{") {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 3..];
-        let end = after
-            .find("}}")
-            .ok_or_else(|| PipelineError::Cel(format!("unterminated `${{{{` in `{template}`")))?;
-        let expr = after[..end].trim();
-        out.push_str(&render(&eval(expr, ctx)?));
-        rest = &after[end + 2..];
+    let mut at = 0;
+    for i in found {
+        out.push_str(&template[at..i.outer.start]);
+        out.push_str(&render(&eval(template[i.inner].trim(), ctx)?));
+        at = i.outer.end;
     }
-    out.push_str(rest);
+    if unterminated.is_some() {
+        return Err(unterminated_error(template));
+    }
+    out.push_str(&template[at..]);
     Ok(out)
 }
 
 /// Extract the (trimmed) expressions inside each `${{ … }}` in `template`,
 /// erroring if any is unterminated.
 pub(crate) fn interpolations(template: &str) -> Result<Vec<&str>, PipelineError> {
-    let mut exprs = Vec::new();
-    let mut rest = template;
-    while let Some(start) = rest.find("${{") {
-        let after = &rest[start + 3..];
-        let end = after
-            .find("}}")
-            .ok_or_else(|| PipelineError::Cel(format!("unterminated `${{{{` in `{template}`")))?;
-        exprs.push(after[..end].trim());
-        rest = &after[end + 2..];
+    match scan_interpolations(template) {
+        (_, Some(_)) => Err(unterminated_error(template)),
+        (found, None) => Ok(found
+            .into_iter()
+            .map(|i| template[i.inner].trim())
+            .collect()),
     }
-    Ok(exprs)
+}
+
+fn unterminated_error(template: &str) -> PipelineError {
+    PipelineError::Cel(format!("unterminated `${{{{` in `{template}`"))
+}
+
+/// One `${{ … }}` in a template.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Interpolation {
+    /// Byte range of the whole `${{ … }}`.
+    pub outer: Range<usize>,
+    /// Byte range of the text between `${{` and `}}`, not trimmed.
+    pub inner: Range<usize>,
+}
+
+/// Each `${{ … }}` in `template`, in order, found the way [`interpolate`]
+/// finds them when a Step launches: a `${{`, then the first `}}` after it.
+/// The second value is the byte offset of a `${{` with no `}}` after it.
+pub(crate) fn scan_interpolations(template: &str) -> (Vec<Interpolation>, Option<usize>) {
+    let mut found = Vec::new();
+    let mut at = 0;
+    while let Some(rel) = template[at..].find("${{") {
+        let start = at + rel;
+        let Some(len) = template[start + 3..].find("}}") else {
+            return (found, Some(start));
+        };
+        let inner = start + 3..start + 3 + len;
+        at = inner.end + 2;
+        found.push(Interpolation {
+            outer: start..at,
+            inner,
+        });
+    }
+    (found, None)
 }
 
 /// One read of the `inputs` variable in a CEL expression (ADR-0076 §1).
@@ -317,6 +349,40 @@ pub(crate) struct InputRead {
 /// token before it, which is found by skipping whitespace and comments, never
 /// by reading the text before the `.`.
 pub(crate) fn input_reads(expr: &str) -> Vec<InputRead> {
+    let b = expr.as_bytes();
+    variable_names(expr, "inputs")
+        .into_iter()
+        .map(|(start, end)| {
+            let mut read = InputRead {
+                start,
+                end,
+                field: None,
+            };
+            if b.get(end) == Some(&b'.') {
+                let f = end + 1;
+                let mut e = f;
+                while e < b.len() && is_ident(b[e]) {
+                    e += 1;
+                }
+                if e > f && !b[f].is_ascii_digit() {
+                    read.field = Some(expr[f..e].to_string());
+                    read.end = e;
+                }
+            }
+            read
+        })
+        .collect()
+}
+
+fn is_ident(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_'
+}
+
+/// Each use of the top-level variable `name` in `expr`, as `(start, end)`
+/// byte offsets: the identifier, with the leading `.` of a root-qualified
+/// use. Skips string literals, `//` comments and a field of the same name
+/// (`x.name`).
+fn variable_names(expr: &str, name: &str) -> Vec<(usize, usize)> {
     /// The last token outside whitespace, comments and string contents.
     #[derive(Clone, Copy, PartialEq)]
     enum Last {
@@ -329,7 +395,6 @@ pub(crate) fn input_reads(expr: &str) -> Vec<InputRead> {
         Dot { at: usize, select: bool },
     }
     let b = expr.as_bytes();
-    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
     let mut out = Vec::new();
     let mut last = Last::Other;
     let mut i = 0;
@@ -356,40 +421,24 @@ pub(crate) fn input_reads(expr: &str) -> Vec<InputRead> {
                 last = Last::Operand;
                 i += 1;
             }
-            c if ident(c) => {
+            c if is_ident(c) => {
                 let mut start = i;
-                while i < b.len() && ident(b[i]) {
+                while i < b.len() && is_ident(b[i]) {
                     i += 1;
                 }
                 let before = last;
                 last = Last::Operand;
-                if &expr[start..i] != "inputs" || c.is_ascii_digit() {
+                if &expr[start..i] != name || c.is_ascii_digit() {
                     continue;
                 }
                 match before {
-                    // `x.inputs`: a field, not the variable.
+                    // `x.name`: a field, not the variable.
                     Last::Dot { select: true, .. } => continue,
-                    // `.inputs`: the variable, qualified from the root.
+                    // `.name`: the variable, qualified from the root.
                     Last::Dot { at, select: false } => start = at,
                     _ => {}
                 }
-                let mut field = None;
-                if b.get(i) == Some(&b'.') {
-                    let f = i + 1;
-                    let mut e = f;
-                    while e < b.len() && ident(b[e]) {
-                        e += 1;
-                    }
-                    if e > f && !b[f].is_ascii_digit() {
-                        field = Some(expr[f..e].to_string());
-                        i = e;
-                    }
-                }
-                out.push(InputRead {
-                    start,
-                    end: i,
-                    field,
-                });
+                out.push((start, i));
             }
             _ => {
                 last = Last::Other;
@@ -398,6 +447,199 @@ pub(crate) fn input_reads(expr: &str) -> Vec<InputRead> {
         }
     }
     out
+}
+
+/// One read of the `outputs` variable in a CEL expression (ADR-0041).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OutputRead {
+    /// Byte range of `outputs.<step>` or `outputs["<step>"]`, with the
+    /// leading `.` of a root-qualified read; `outputs` alone when the Step is
+    /// not written out.
+    pub start: usize,
+    pub end: usize,
+    /// The Step read, when written as `outputs.<step>` or as
+    /// `outputs["<step>"]` with a plain quoted string (spaces and comments
+    /// allowed around the `.` and inside the brackets).
+    pub step: Option<String>,
+    /// The result read from that Step when written the same way after it:
+    /// `.<field>` or `["<field>"]`.
+    pub field: Option<String>,
+}
+
+/// Each read of the top-level `outputs` variable in `expr`, in order. A scan
+/// of the text, which skips string literals and comments like
+/// [`input_reads`]; [`static_output_reads`] checks it against the parser.
+pub(crate) fn output_reads(expr: &str) -> Vec<OutputRead> {
+    let b = expr.as_bytes();
+    variable_names(expr, "outputs")
+        .into_iter()
+        .map(|(start, end)| {
+            let mut read = OutputRead {
+                start,
+                end,
+                step: None,
+                field: None,
+            };
+            if let Some((step, after)) = member(b, end) {
+                read.step = Some(step);
+                read.end = after;
+                read.field = member(b, after).map(|(field, _)| field);
+            }
+            read
+        })
+        .collect()
+}
+
+/// The member selected at byte `at` (after whitespace and comments) and the
+/// offset just past it: `.name` or `["name"]` / `['name']`.
+fn member(b: &[u8], at: usize) -> Option<(String, usize)> {
+    let i = skip_trivia(b, at);
+    match b.get(i)? {
+        b'.' => {
+            let f = skip_trivia(b, i + 1);
+            let mut e = f;
+            while e < b.len() && is_ident(b[e]) {
+                e += 1;
+            }
+            (e > f && !b[f].is_ascii_digit())
+                .then(|| (String::from_utf8_lossy(&b[f..e]).into_owned(), e))
+        }
+        b'[' => {
+            let q = skip_trivia(b, i + 1);
+            let quote = *b.get(q).filter(|c| matches!(c, b'\'' | b'"'))?;
+            if b.get(q + 1) == Some(&quote) {
+                // `""` or a triple-quoted literal.
+                return None;
+            }
+            let len = b[q + 1..].iter().position(|c| *c == quote)?;
+            let text = &b[q + 1..q + 1 + len];
+            if text.iter().any(|c| matches!(c, b'\\' | b'\n' | b'\r')) {
+                return None;
+            }
+            let close = skip_trivia(b, q + len + 2);
+            (b.get(close) == Some(&b']'))
+                .then(|| (String::from_utf8_lossy(text).into_owned(), close + 1))
+        }
+        _ => None,
+    }
+}
+
+/// The first byte at or after `i` outside whitespace and `//` comments.
+fn skip_trivia(b: &[u8], mut i: usize) -> usize {
+    loop {
+        match b.get(i) {
+            Some(c) if c.is_ascii_whitespace() => i += 1,
+            Some(b'/') if b.get(i + 1) == Some(&b'/') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            _ => return i,
+        }
+    }
+}
+
+/// The reads of `outputs` in `expr` by [`output_reads`], each naming its
+/// Step, checked against the CEL parser: the parser must find the same Step
+/// ids, and no read of `outputs` whose Step is computed (`outputs[k]`) or
+/// that uses `outputs` whole. Inside a library and in a `with:` value the
+/// compiler must know which Step every read names, to namespace it and to
+/// wire the Step's `needs` (ADR-0076 §1).
+pub(crate) fn static_output_reads(expr: &str) -> Result<Vec<OutputRead>, String> {
+    // An identifier cannot be escaped in CEL: a read has the word in it.
+    if !expr.contains("outputs") {
+        return Ok(Vec::new());
+    }
+    let refused = || {
+        "reads `outputs` in a form the compiler cannot resolve to a Step; read a Step's \
+         outputs as `outputs.<id>` or `outputs[\"<id>\"]`"
+            .to_string()
+    };
+    let parsed = with_program(expr, |program| {
+        let mut steps = Vec::new();
+        output_steps(program.expression(), &mut steps);
+        Ok(steps)
+    })
+    .map_err(|e| {
+        format!("mentions `outputs` and does not parse, so its reads cannot be checked: {e}")
+    })?;
+    let reads = output_reads(expr);
+    let mut scanned: Vec<Option<&str>> = reads.iter().map(|r| r.step.as_deref()).collect();
+    let mut parsed: Vec<Option<&str>> = parsed.iter().map(Option::as_deref).collect();
+    scanned.sort();
+    parsed.sort();
+    if scanned != parsed || scanned.contains(&None) {
+        return Err(refused());
+    }
+    Ok(reads)
+}
+
+/// Each use of the variable `outputs` in a parsed expression, with the Step
+/// it selects when that is a constant: `outputs.<step>`, `has(outputs.<step>)`
+/// and `outputs["<step>"]`. Any other use is `None`.
+fn output_steps(e: &IdedExpr, out: &mut Vec<Option<String>>) {
+    let is_outputs =
+        |e: &IdedExpr| matches!(&e.expr, Expr::Ident(n) if n.trim_start_matches('.') == "outputs");
+    match &e.expr {
+        Expr::Select(s) if is_outputs(&s.operand) => out.push(Some(s.field.clone())),
+        Expr::Call(c)
+            if c.func_name == operators::INDEX
+                && c.target.is_none()
+                && c.args.len() == 2
+                && is_outputs(&c.args[0]) =>
+        {
+            match &c.args[1].expr {
+                Expr::Literal(LiteralValue::String(s)) => out.push(Some(s.inner().to_string())),
+                _ => {
+                    out.push(None);
+                    output_steps(&c.args[1], out);
+                }
+            }
+        }
+        Expr::Ident(_) => {
+            if is_outputs(e) {
+                out.push(None);
+            }
+        }
+        Expr::Select(s) => output_steps(&s.operand, out),
+        Expr::Call(c) => {
+            if let Some(t) = &c.target {
+                output_steps(t, out);
+            }
+            c.args.iter().for_each(|a| output_steps(a, out));
+        }
+        Expr::Comprehension(c) => {
+            for part in [
+                &c.iter_range,
+                &c.accu_init,
+                &c.loop_cond,
+                &c.loop_step,
+                &c.result,
+            ] {
+                output_steps(part, out);
+            }
+        }
+        Expr::List(l) => l.elements.iter().for_each(|x| output_steps(x, out)),
+        Expr::Map(m) => m
+            .entries
+            .iter()
+            .for_each(|x| entry_output_steps(&x.expr, out)),
+        Expr::Struct(s) => s
+            .entries
+            .iter()
+            .for_each(|x| entry_output_steps(&x.expr, out)),
+        Expr::Literal(_) | Expr::Unspecified => {}
+    }
+}
+
+fn entry_output_steps(e: &EntryExpr, out: &mut Vec<Option<String>>) {
+    match e {
+        EntryExpr::StructField(f) => output_steps(&f.value, out),
+        EntryExpr::MapEntry(m) => {
+            output_steps(&m.key, out);
+            output_steps(&m.value, out);
+        }
+    }
 }
 
 /// Does `expr` read the variable `name`, as the CEL parser sees it? A
@@ -622,6 +864,95 @@ mod tests {
         assert_eq!(max_nesting(&format!("'unterminated\n{deep}")), 100);
         assert_eq!(max_nesting("(a[b]{c[d]})"), 3);
         on_worker_stack(move || check(&format!("'{deep}' == 'x'")).unwrap());
+    }
+
+    #[test]
+    fn the_scan_finds_interpolations_as_a_launch_does() {
+        let text = "a ${{ x }}b${{y}}} ${{ z";
+        let (found, open) = scan_interpolations(text);
+        let shown: Vec<(&str, &str)> = found
+            .iter()
+            .map(|i| (&text[i.outer.clone()], &text[i.inner.clone()]))
+            .collect();
+        assert_eq!(shown, vec![("${{ x }}", " x "), ("${{y}}", "y")]);
+        assert_eq!(open, Some(19));
+        assert_eq!(scan_interpolations("none").0, vec![]);
+    }
+
+    #[test]
+    fn output_reads_name_the_step_and_result_in_every_written_form() {
+        let reads = |expr: &str| -> Vec<(String, Option<String>, Option<String>)> {
+            output_reads(expr)
+                .into_iter()
+                .map(|r| (expr[r.start..r.end].to_string(), r.step, r.field))
+                .collect()
+        };
+        let read = |text: &str, step: Option<&str>, field: Option<&str>| {
+            (
+                text.to_string(),
+                step.map(str::to_string),
+                field.map(str::to_string),
+            )
+        };
+        assert_eq!(
+            reads("outputs.b.tag"),
+            vec![read("outputs.b", Some("b"), Some("tag"))]
+        );
+        assert_eq!(
+            reads("outputs . b // c\n . tag"),
+            vec![read("outputs . b", Some("b"), Some("tag"))]
+        );
+        assert_eq!(
+            reads(r#"x + .outputs[ "c/b" ]['tag']"#),
+            vec![read(r#".outputs[ "c/b" ]"#, Some("c/b"), Some("tag"))]
+        );
+        // Forms whose Step is not a plain constant name no Step.
+        for expr in [
+            "outputs[k].v",
+            r#"outputs["a\"b"].v"#,
+            r#"outputs["""b"""].v"#,
+            "outputs[''].v",
+            "outputs['b'.v",
+            "outputs.1",
+            "outputs",
+        ] {
+            assert_eq!(reads(expr)[0].1, None, "{expr}");
+        }
+        // Not the variable: a field named `outputs`, and string contents.
+        assert_eq!(reads("x.outputs.b + 'outputs.b'"), vec![]);
+    }
+
+    #[test]
+    fn static_output_reads_agree_with_the_parser() {
+        let steps = |expr: &str| {
+            static_output_reads(expr)
+                .map(|r| r.into_iter().map(|r| r.step.unwrap()).collect::<Vec<_>>())
+        };
+        assert_eq!(steps("1 + 2"), Ok(vec![]));
+        assert_eq!(
+            steps(r#"has(outputs.a) ? outputs["b"].v : [outputs.c][0].d.size()"#),
+            Ok(vec!["a".to_string(), "b".to_string(), "c".to_string()])
+        );
+        assert_eq!(
+            steps(r#"{"k": outputs.a}.k + {"x": 1}.x"#),
+            Ok(vec!["a".to_string()])
+        );
+        for expr in [
+            "outputs[matrix.k].v",
+            "outputs.exists(k, true)",
+            "size(outputs)",
+            "[1].map(x, outputs[x])",
+        ] {
+            assert!(
+                static_output_reads(expr)
+                    .unwrap_err()
+                    .starts_with("reads `outputs` in a form the compiler cannot resolve"),
+                "{expr}"
+            );
+        }
+        assert!(static_output_reads("outputs.")
+            .unwrap_err()
+            .starts_with("mentions `outputs` and does not parse"));
     }
 
     #[test]
