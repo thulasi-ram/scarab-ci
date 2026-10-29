@@ -42,6 +42,10 @@ contract_test!(versions_are_kept_per_org_by_hash, versions);
 contract_test!(install_upgrade_and_remove_check_what_they_replace, installs);
 contract_test!(yanks_are_per_org_and_keep_the_first_reason, yanks);
 contract_test!(defaults_are_claimed_once_per_org, defaults);
+contract_test!(
+    prune_deletes_the_oldest_versions_never_installed,
+    prune_never_installed
+);
 
 fn version(org: &str, content: &str, source: &str) -> LibraryVersion {
     LibraryVersion {
@@ -290,4 +294,78 @@ async fn defaults(store: &dyn LibraryStore) {
     assert_eq!(store.defaults("acme").await.unwrap(), Some(missing));
     // A record set by hand also blocks a claim.
     assert!(!store.claim_defaults("acme", 10).await.unwrap());
+}
+
+async fn prune_never_installed(store: &dyn LibraryStore) {
+    let content = |n: u32| format!("kind: library\nsteps: [{{id: s{n}, image: busybox}}]\n");
+    let mut hashes = Vec::new();
+    for n in 1..=5 {
+        let mut v = version(
+            "acme",
+            &content(n),
+            "github.com/acme/libs//deploy.yaml@aaaa",
+        );
+        v.fetched_at = i64::from(n);
+        hashes.push(store.put_version(&v).await.unwrap().content_hash);
+    }
+    let other = store
+        .put_version(&version(
+            "globex",
+            &content(1),
+            "github.com/globex/libs//x.yaml@aaaa",
+        ))
+        .await
+        .unwrap();
+    // 1: installed once, then removed. 2: yanked. 3: just fetched again.
+    store
+        .install(&install("acme", &hashes[0], 10), &Replaces::Nothing)
+        .await
+        .unwrap();
+    store.remove("acme", "acme", "deploy").await.unwrap();
+    store
+        .yank(&LibraryYank {
+            org: "acme".into(),
+            content_hash: hashes[1].clone(),
+            reason: "r".into(),
+            yanked_by: "amy".into(),
+            yanked_at: 11,
+        })
+        .await
+        .unwrap();
+
+    // Never installed and not yanked: 3, 4, 5. Keep the newest one besides
+    // 3, which is 5; 4 goes.
+    assert_eq!(
+        store
+            .prune_never_installed("acme", 1, &hashes[2])
+            .await
+            .unwrap(),
+        1
+    );
+    let mut left = Vec::new();
+    for (n, h) in hashes.iter().enumerate() {
+        if store.version("acme", h).await.unwrap().is_some() {
+            left.push(n + 1);
+        }
+    }
+    assert_eq!(left, vec![1, 2, 3, 5]);
+    assert!(store
+        .version("globex", &other.content_hash)
+        .await
+        .unwrap()
+        .is_some());
+    // An installed version is never pruned, even with nothing kept.
+    store
+        .install(&install("acme", &hashes[4], 12), &Replaces::Nothing)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .prune_never_installed("acme", 0, &"0".repeat(64))
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(store.version("acme", &hashes[2]).await.unwrap().is_none());
+    assert!(store.version("acme", &hashes[4]).await.unwrap().is_some());
 }

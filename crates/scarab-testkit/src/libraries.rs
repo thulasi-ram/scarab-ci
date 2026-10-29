@@ -3,7 +3,7 @@
 //! `scarab-db-postgres/tests/libraries_contract.rs` holds it to the Postgres
 //! adapter's semantics.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
@@ -21,6 +21,8 @@ struct State {
     installations: BTreeMap<(String, String, String), NewInstallation>,
     /// (org, hash) → yank.
     yanks: BTreeMap<(String, String), LibraryYank>,
+    /// (org, hash) of every version installed at least once.
+    installed_once: BTreeSet<(String, String)>,
     defaults: BTreeMap<String, OrgLibraryDefaults>,
 }
 
@@ -113,6 +115,8 @@ impl LibraryStore for InMemoryLibraries {
             return Err(LibraryStoreError::Conflict);
         }
         st.installations.insert(key, new.clone());
+        st.installed_once
+            .insert((new.org.clone(), new.content_hash.clone()));
         Ok(st.full(new))
     }
 
@@ -175,6 +179,34 @@ impl LibraryStore for InMemoryLibraries {
             st.installations
                 .remove(&(org.to_string(), publisher.to_string(), name.to_string()));
         Ok(removed.map(|i| st.full(&i)))
+    }
+
+    async fn prune_never_installed(
+        &self,
+        org: &str,
+        keep: usize,
+        except: &str,
+    ) -> Result<u64, LibraryStoreError> {
+        let mut st = self.state.lock().unwrap();
+        let mut candidates: Vec<(i64, String)> = st
+            .versions
+            .iter()
+            .filter(|((o, h), _)| {
+                let key = (o.clone(), h.clone());
+                o == org
+                    && h != except
+                    && !st.installed_once.contains(&key)
+                    && !st.yanks.contains_key(&key)
+            })
+            .map(|((_, h), v)| (v.fetched_at, h.clone()))
+            .collect();
+        // Newest first; the same order as the Postgres adapter.
+        candidates.sort_by(|a, b| b.cmp(a));
+        let doomed: Vec<String> = candidates.into_iter().skip(keep).map(|(_, h)| h).collect();
+        for h in &doomed {
+            st.versions.remove(&(org.to_string(), h.clone()));
+        }
+        Ok(doomed.len() as u64)
     }
 
     async fn yank(&self, yank: &LibraryYank) -> Result<LibraryYank, LibraryStoreError> {

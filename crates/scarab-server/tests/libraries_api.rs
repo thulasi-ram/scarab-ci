@@ -216,6 +216,68 @@ async fn install_then_upgrade_shows_the_diff_and_checks_what_it_replaces() {
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
 
+/// Fetches store what an admin reviews, so each fetch keeps the org's
+/// never-installed versions to a bound: past it the oldest go, the one just
+/// fetched and the installed one stay.
+#[tokio::test]
+async fn fetches_keep_a_bounded_number_of_versions_never_installed() {
+    let h = harness();
+    h.http.serve(&raw("acme", "libs", C1, "deploy.yaml"), V1);
+    fetch(
+        &h,
+        json!({ "source": format!("github.com/acme/libs//deploy.yaml@{C1}") }),
+    )
+    .await;
+    let (st, b) = call(
+        &h.app,
+        "PUT",
+        "/v1/orgs/acme/libraries/acme/deploy",
+        Some(json!({ "content_hash": content_hash(V1) })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+
+    let cap = scarab_server::libraries::MAX_NEVER_INSTALLED_VERSIONS;
+    let mut hashes = Vec::new();
+    for n in 0..cap + 5 {
+        let commit = format!("{n:040x}");
+        let content =
+            format!("kind: library\nsteps:\n  - id: s{n}\n    image: alpine@sha256:aaaa\n");
+        h.http
+            .serve(&raw("acme", "libs", &commit, "deploy.yaml"), &content);
+        let (st, b) = fetch(
+            &h,
+            json!({ "source": format!("github.com/acme/libs//deploy.yaml@{commit}") }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        hashes.push(content_hash(&content));
+    }
+    let mut kept = 0;
+    for h2 in &hashes {
+        if h.store.version("acme", h2).await.unwrap().is_some() {
+            kept += 1;
+        }
+    }
+    assert_eq!(kept, cap + 1);
+    let last = hashes.last().unwrap();
+    assert!(h.store.version("acme", last).await.unwrap().is_some());
+    assert!(h
+        .store
+        .version("acme", &content_hash(V1))
+        .await
+        .unwrap()
+        .is_some());
+    let (st, b) = call(
+        &h.app,
+        "PUT",
+        "/v1/orgs/acme/libraries/acme/deploy",
+        Some(json!({ "content_hash": last, "replaces": content_hash(V1) })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+}
+
 #[tokio::test]
 async fn a_publisher_can_be_chosen_at_install() {
     let h = harness();

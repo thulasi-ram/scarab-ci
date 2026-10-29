@@ -778,10 +778,15 @@ pub(crate) async fn list_libraries(
     }))
 }
 
+/// How many fetched versions that were never installed an org keeps, besides
+/// the one just fetched. A fetch past this deletes the oldest of them.
+pub const MAX_NEVER_INSTALLED_VERSIONS: usize = 50;
+
 /// Fetch a library from a git source pinned to a commit, check it compiles
 /// as a closed library, store it, and return it with the diff from the
-/// version installed under the same name. Installs nothing. Administer on
-/// the org.
+/// version installed under the same name. Installs nothing. The org keeps
+/// the [`MAX_NEVER_INSTALLED_VERSIONS`] most recent fetches that were never
+/// installed; an older one has to be fetched again. Administer on the org.
 #[utoipa::path(
     post,
     path = "/v1/orgs/{org}/libraries/fetch",
@@ -826,6 +831,15 @@ pub(crate) async fn fetch_library(
         })
         .await
         .map_err(store_api_error)?;
+    // Bound what fetches store: an org keeps its most recent fetched
+    // versions that were never installed, and the older ones go. A failed
+    // prune does not fail the fetch; the next fetch prunes again.
+    if let Err(e) = store
+        .prune_never_installed(&org, MAX_NEVER_INSTALLED_VERSIONS, &stored.content_hash)
+        .await
+    {
+        tracing::warn!(org = %org, error = %e, "pruning fetched library versions failed");
+    }
     let current = store
         .installation(&org, &publisher, &name)
         .await

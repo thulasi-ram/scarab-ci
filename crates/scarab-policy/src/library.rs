@@ -242,6 +242,17 @@ pub trait LibraryStore: Send + Sync {
         content_hashes: &[String],
     ) -> Result<Vec<LibraryYank>, LibraryStoreError>;
 
+    /// Deletes the org's fetched versions that were never installed, except
+    /// the `keep` most recently fetched and `except` (the one a fetch just
+    /// stored). A version that was installed once, or is yanked, stays: a
+    /// Run may have used it. Returns how many were deleted.
+    async fn prune_never_installed(
+        &self,
+        org: &str,
+        keep: usize,
+        except: &str,
+    ) -> Result<u64, LibraryStoreError>;
+
     /// Records the org's defaults as [`DefaultsState::Pending`] if the org
     /// has no record yet. `true` when this call made the record: the caller
     /// installs the defaults. Exactly one caller gets `true` per org.

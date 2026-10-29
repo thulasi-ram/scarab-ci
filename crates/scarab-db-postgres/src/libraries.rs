@@ -207,6 +207,15 @@ impl LibraryStore for PostgresDb {
         if written == 0 {
             return Err(LibraryStoreError::Conflict);
         }
+        sqlx::query(
+            "UPDATE library_versions SET installed_once = true \
+             WHERE org = $1 AND content_hash = $2 AND NOT installed_once",
+        )
+        .bind(&new.org)
+        .bind(&new.content_hash)
+        .execute(&mut *tx)
+        .await
+        .map_err(store_err)?;
         let row = sqlx::query(&format!(
             "{INSTALLATION_SELECT} WHERE i.org = $1 AND i.publisher = $2 AND i.name = $3"
         ))
@@ -321,6 +330,47 @@ impl LibraryStore for PostgresDb {
         .map_err(store_err)?;
         tx.commit().await.map_err(store_err)?;
         Ok(Some(installation_from_row(&row)))
+    }
+
+    async fn prune_never_installed(
+        &self,
+        org: &str,
+        keep: usize,
+        except: &str,
+    ) -> Result<u64, LibraryStoreError> {
+        // An install racing this marks its version `installed_once` before
+        // it commits; the DELETE waits on that row and re-checks it, so it
+        // skips the version (READ COMMITTED re-evaluates a locked row). The
+        // installations check covers an install by a binary from before
+        // `installed_once`, which does not set it.
+        let deleted = sqlx::query(
+            "DELETE FROM library_versions v \
+             WHERE v.org = $1 AND NOT v.installed_once AND v.content_hash <> $3 \
+               AND NOT EXISTS (SELECT 1 FROM library_yanks y \
+                               WHERE y.org = v.org AND y.content_hash = v.content_hash) \
+               AND NOT EXISTS (SELECT 1 FROM library_installations i \
+                               WHERE i.org = v.org AND i.content_hash = v.content_hash) \
+               AND v.content_hash NOT IN ( \
+                 SELECT k.content_hash FROM library_versions k \
+                 WHERE k.org = $1 AND NOT k.installed_once AND k.content_hash <> $3 \
+                   AND NOT EXISTS (SELECT 1 FROM library_yanks y \
+                                   WHERE y.org = k.org AND y.content_hash = k.content_hash) \
+                   AND NOT EXISTS (SELECT 1 FROM library_installations i \
+                                   WHERE i.org = k.org AND i.content_hash = k.content_hash) \
+                 ORDER BY k.fetched_at DESC, k.content_hash DESC LIMIT $2)",
+        )
+        .bind(org)
+        .bind(i64::try_from(keep).unwrap_or(i64::MAX))
+        .bind(except)
+        .execute(self.pool())
+        .await
+        .map_err(|e| match sqlstate(&e).as_deref() {
+            // A yank or an install committed between the read and the
+            // delete: nothing is lost by pruning on the next fetch instead.
+            Some(FOREIGN_KEY_VIOLATION) => LibraryStoreError::Conflict,
+            _ => store_err(e),
+        })?;
+        Ok(deleted.rows_affected())
     }
 
     async fn yank(&self, yank: &LibraryYank) -> Result<LibraryYank, LibraryStoreError> {
