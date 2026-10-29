@@ -14,8 +14,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Map, Value};
 
-use crate::scope::{BoundValue, OutputSource, Scope, ScopeInputs};
-use crate::{cel, params};
+use crate::scope::{BoundValue, InputSources, OutputSource, Scope, ScopeInputs};
+use crate::{cel, params, ValueSource};
 
 /// The results of a launching Step's `needs`, by Step id, then result name.
 pub type Results = BTreeMap<String, BTreeMap<String, Value>>;
@@ -60,8 +60,10 @@ pub struct Rendered {
 /// the results of its needs and `matrix` its `matrix_values`).
 ///
 /// At launch an error is the Step's failure reason: a template that does not
-/// evaluate, or a caller's value that does not convert to its input's type or
-/// fails its `validate:`. A preview never fails.
+/// evaluate, a caller's value that does not convert to its input's type or
+/// fails its `validate:`, or a value from outside the Pipeline that would
+/// start a `command` argument with `-` (see [`arguments`]). A preview fails
+/// only for that last reason, and only for a value it knows.
 pub fn render(
     templates: Templates<'_>,
     scope: Option<&Scope>,
@@ -83,11 +85,12 @@ pub fn render(
                     image.escape_debug()
                 ));
             }
-            let command = templates
-                .command
-                .iter()
-                .map(|c| one(c))
-                .collect::<Result<Vec<_>, _>>()?;
+            let sources = InputSources::of(scope);
+            let command = arguments(templates.command, &sources, true, |expr| {
+                cel::eval(expr, &ctx)
+                    .map(|v| Some(cel::render(&v)))
+                    .map_err(|e| e.to_string())
+            })?;
             // The Step's inputs reach it as `SCARAB_PARAM_*` too. Added after
             // rendering, so a value holding `${{` stays text; prepended, so
             // the Step's own env of the same name wins.
@@ -116,9 +119,24 @@ pub fn render(
                 Ok(b) => preview(t, &b.ctx, &b.known),
                 Err(_) => t.to_string(),
             };
+            // A value known now is refused as an argument the way the
+            // launch refuses it; what is not known is left as written.
+            let command = match &bound {
+                Ok(b) => {
+                    let ctx = Value::Object(b.ctx.clone());
+                    arguments(templates.command, &InputSources::of(scope), false, |expr| {
+                        Ok(b.known
+                            .covers(expr)
+                            .then(|| cel::eval(expr, &ctx).ok())
+                            .flatten()
+                            .map(|v| cel::render(&v)))
+                    })?
+                }
+                Err(_) => templates.command.to_vec(),
+            };
             Ok(Rendered {
                 image: one(templates.image),
-                command: templates.command.iter().map(|c| one(c)).collect(),
+                command,
                 env: templates
                     .env
                     .iter()
@@ -127,6 +145,72 @@ pub fn render(
             })
         }
     }
+}
+
+/// Render a Step's `command`, one argument at a time, each `${{ … }}` by
+/// `value` (`Ok(None)`: not known yet, left as written). `strict` (at
+/// launch) refuses an unterminated `${{`.
+///
+/// A value from outside the Pipeline ([`ValueSource::Outside`]: a Run
+/// parameter, a Step's results, a caller's `with:` that reads one) is data,
+/// but a program reads an argument that starts with `-` as an option: `git
+/// fetch origin ${{ inputs.ref }}` with `--upload-pack=…` runs a command. So
+/// such a value may not be the start of an argument. Text written before it
+/// (`--ref=${{ inputs.ref }}`) is the Pipeline's own, and an argument right
+/// after a `--` argument is an operand, so both are allowed. Which part of
+/// an argument is written and which is a value is known here, while the
+/// argument is built, so the check never reads the rendered text again.
+fn arguments(
+    command: &[String],
+    sources: &InputSources,
+    strict: bool,
+    mut value: impl FnMut(&str) -> Result<Option<String>, String>,
+) -> Result<Vec<String>, String> {
+    let mut out = Vec::with_capacity(command.len());
+    for (index, template) in command.iter().enumerate() {
+        let operand = index > 0 && command[index - 1] == "--";
+        let (found, unterminated) = cel::scan_interpolations(template);
+        let mut arg = String::with_capacity(template.len());
+        let mut at = 0;
+        for i in found {
+            arg.push_str(&template[at..i.outer.start]);
+            let expr = template[i.inner.clone()].trim();
+            match value(expr)? {
+                Some(text) => {
+                    if arg.is_empty()
+                        && !operand
+                        && text.starts_with('-')
+                        && sources.of_expr(expr) == ValueSource::Outside
+                    {
+                        return Err(leading_dash(index, &template[i.outer.clone()]));
+                    }
+                    arg.push_str(&text);
+                }
+                None => arg.push_str(&template[i.outer.clone()]),
+            }
+            at = i.outer.end;
+        }
+        // At launch, the same error as any other template's; a preview
+        // leaves it as written.
+        if strict && unterminated.is_some() {
+            if let Err(e) = cel::interpolations(template) {
+                return Err(e.to_string());
+            }
+        }
+        arg.push_str(&template[at..]);
+        out.push(arg);
+    }
+    Ok(out)
+}
+
+/// Why an argument is refused by [`arguments`].
+fn leading_dash(index: usize, shown: &str) -> String {
+    format!(
+        "`command[{index}]`: `{shown}` starts the argument with `-`, and its value comes from \
+         outside the Pipeline (a Run parameter, a Step's results or an event field), so the \
+         program would read it as an option; write the option in front of it \
+         (`--name={shown}`), or put a `--` argument just before it"
+    )
 }
 
 /// The image a Step will launch with, as far as Run creation knows it
@@ -685,5 +769,86 @@ mod tests {
         assert_eq!(p("img@${{ inputs.d }}", None), "img@sha256:def");
         assert_eq!(p("img@${{ outputs.a.d }}", None), "img@${{ outputs.a.d }}");
         assert_eq!(p("img:${{ unterminated", None), "img:${{ unterminated");
+    }
+    /// Decision B9: a value from outside the Pipeline may not start an
+    /// argument with `-`; the Pipeline's own values and authored text may.
+    #[test]
+    fn an_outside_value_may_not_start_an_argument_with_a_dash() {
+        let evil = "--upload-pack=touch /tmp/pwned";
+        let params = map(json!({ "p": evil, "empty": "" }));
+        let res = results(json!({ "a": { "v": "-x" } }));
+        let matrix = BTreeMap::from([("m".into(), "-m".into()), ("e".into(), String::new())]);
+        let run = |command: &[&str], scope: Option<&Scope>| {
+            launch(command, scope, &matrix, &params, &res)
+        };
+        // A Run parameter, a result, or a Pipeline value that renders empty
+        // in front of one: refused, naming the template.
+        for command in [
+            &["git", "fetch", "${{ inputs.p }}"][..],
+            &["${{ outputs.a.v }}"],
+            &["x", "${{ matrix.e }}${{ inputs.p }}"],
+            &["x", "${{ inputs.empty }}${{ inputs.p }}"],
+            &["x", "${{ inputs.p + 'x' }}"],
+        ] {
+            let e = run(command, None).unwrap_err();
+            assert!(
+                e.contains("starts the argument with `-`") && e.contains("from outside"),
+                "{command:?}: {e}"
+            );
+        }
+        let e = run(&["git", "${{ inputs.p }}"], None).unwrap_err();
+        assert!(e.contains("`command[1]`: `${{ inputs.p }}`"), "{e}");
+        // Authored text in front, an operand after `--`, the Pipeline's own
+        // value, an env value: allowed.
+        let r = run(
+            &[
+                "--ref=${{ inputs.p }}",
+                "-${{ inputs.p }}",
+                "--",
+                "${{ inputs.p }}",
+                "${{ matrix.m }}",
+                "x${{ outputs.a.v }}",
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(r.command[0], format!("--ref={evil}"));
+        assert_eq!(r.command[3], evil);
+        assert_eq!(r.command[4], "-m");
+
+        // In a library: a literal binding is the Pipeline's own; a caller's
+        // template is outside when it reads a Run parameter.
+        let scope = library(vec![
+            ("lit", ParamType::String, BoundValue::Literal(json!("-lit"))),
+            ("tpl", ParamType::String, BoundValue::Template("${{ inputs.p }}".into())),
+            ("wrapped", ParamType::String, BoundValue::Template("-${{ inputs.p }}".into())),
+        ]);
+        assert_eq!(run(&["${{ inputs.lit }}"], Some(&scope)).unwrap().command, ["-lit"]);
+        for arg in ["${{ inputs.tpl }}", "${{ inputs.wrapped }}"] {
+            let e = run(&[arg], Some(&scope)).unwrap_err();
+            assert!(e.contains("starts the argument with `-`"), "{arg}: {e}");
+        }
+        // An unterminated template is still an error at launch.
+        let e = run(&["${{ inputs.p"], None).unwrap_err();
+        assert!(e.contains("unterminated"), "{e}");
+
+        // A preview refuses what it knows and leaves the rest as written.
+        let preview = |command: &[&str], scope: Option<&Scope>| {
+            let command: Vec<String> = command.iter().map(|c| c.to_string()).collect();
+            render(
+                Templates {
+                    image: "busybox",
+                    command: &command,
+                    env: &[],
+                },
+                scope,
+                &matrix,
+                Facts::Preview { params: &params },
+            )
+        };
+        let e = preview(&["git", "${{ inputs.p }}"], None).unwrap_err();
+        assert!(e.contains("starts the argument with `-`"), "{e}");
+        let r = preview(&["${{ inputs.tpl }}", "${{ inputs.p"], Some(&scope)).unwrap();
+        assert_eq!(r.command, ["${{ inputs.tpl }}", "${{ inputs.p"]);
     }
 }

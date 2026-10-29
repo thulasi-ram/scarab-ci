@@ -24,7 +24,6 @@ fn repo() -> RepoRef {
 /// its parameters; a `--upload-pack=` value rendered into `git fetch`
 /// runs a command in the Step, which holds the Step's secrets.
 #[tokio::test]
-#[ignore = "red: render r1"]
 async fn a_dispatch_parameter_with_a_leading_dash_does_not_reach_argv() {
     let lib = "kind: library\ninterface: { inputs: [{ name: r, type: string }] }\nsteps: [{ id: s, image: alpine/git, command: [git, fetch, origin, \"${{ inputs.r }}\"] }]\n";
     let pipeline = "on: { manual: {} }\ninterface: { inputs: [{ name: ref, type: string }] }\nsteps:\n  - { id: p, image: alpine/git, command: [git, fetch, origin, \"${{ inputs.ref }}\"] }\n  - { id: c, invoke: file:.scarab/lib/fetch.yaml, with: { r: \"${{ inputs.ref }}\" } }\n";

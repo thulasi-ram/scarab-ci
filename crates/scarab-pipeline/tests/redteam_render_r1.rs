@@ -334,7 +334,6 @@ fn survived_preview_and_launch_agree_on_known_values() {
 /// leading `-` makes it an option: `git fetch origin --upload-pack=…` runs a
 /// command.
 #[test]
-#[ignore = "red: render r1"]
 fn a_run_parameter_with_a_leading_dash_is_refused_in_argv() {
     let yaml = "interface: { inputs: [{ name: ref, type: string }] }\non: { manual: {} }\nsteps:\n  - { id: s, image: alpine/git, command: [git, fetch, origin, \"${{ inputs.ref }}\"] }\n";
     let ir = ok(yaml, &Libraries::default());
@@ -353,7 +352,6 @@ fn a_run_parameter_with_a_leading_dash_is_refused_in_argv() {
 /// The same value passed through a library `with:`: the library's argument
 /// is still the outsider's text.
 #[test]
-#[ignore = "red: render r1"]
 fn a_run_parameter_with_a_leading_dash_is_refused_through_a_library() {
     let lib = "kind: library\ninterface: { inputs: [{ name: r, type: string }] }\nsteps: [{ id: s, image: alpine/git, command: [git, fetch, origin, \"${{ inputs.r }}\"] }]\n";
     let yaml = "interface: { inputs: [{ name: ref, type: string }] }\nsteps: [{ id: c, invoke: file:l.yaml, with: { r: \"${{ inputs.ref }}\" } }]\n";

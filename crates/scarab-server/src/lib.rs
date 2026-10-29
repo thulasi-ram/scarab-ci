@@ -5744,6 +5744,24 @@ async fn persist_run_from_ir(
                 &step.matrix_values,
                 params_or_none,
             );
+            // A command the launch will refuse (a Run parameter that starts an
+            // argument with `-`, ADR-0076) is reported now, with the reason
+            // the Step will fail with. The Run is still created: the refusal
+            // is the Step's, at launch, as for any value that does not render.
+            if let Err(reason) = scarab_pipeline::render(
+                scarab_pipeline::Templates {
+                    image: "",
+                    command: &step.command,
+                    env: &[],
+                },
+                step.scope.as_ref(),
+                &step.matrix_values,
+                scarab_pipeline::Facts::Preview {
+                    params: params_or_none,
+                },
+            ) {
+                tracing::warn!(step = %step.id, %reason, "step will fail when it launches");
+            }
             let admitted = admit_step_grants(
                 gov.privilege_grant_scope(),
                 step.security.as_ref(),
