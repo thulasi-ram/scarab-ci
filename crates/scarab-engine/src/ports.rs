@@ -206,6 +206,23 @@ pub trait Db: Send + Sync {
         run: &RunId,
     ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, DbError>;
 
+    /// Record the `event` values a Run's templates may read (ADR-0076 §9):
+    /// the trigger's allowlisted fields that passed their check, fixed when
+    /// the Run is created so every launch, rerun and retry renders the same
+    /// values. Overwrites any prior value.
+    async fn set_run_event_facts(
+        &self,
+        run: &RunId,
+        facts: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), DbError>;
+
+    /// A Run's stored `event` values, or an empty map if it has none (a Run
+    /// created before they were stored, or an unknown Run).
+    async fn run_event_facts(
+        &self,
+        run: &RunId,
+    ) -> Result<serde_json::Map<String, serde_json::Value>, DbError>;
+
     /// Record a run's **deploy context** (ADR-0037) — set once at creation for a
     /// run whose pipeline declared an `environment:`. Lets gate-approval-time
     /// admission look up the environment's protection rules directly.

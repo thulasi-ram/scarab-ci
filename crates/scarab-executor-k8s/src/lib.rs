@@ -156,9 +156,6 @@ pub struct K8sExecutor {
     /// Global default step deadline in seconds (ADR-0047), applied when a step
     /// declares no `timeout:`. Default 1h.
     default_step_timeout_secs: u32,
-    /// The canonical scarab-clone image a clone step runs (ADR-0045) —
-    /// digest-pinned in production, never the author's image.
-    clone_image: String,
     /// The workspace CAS (ADR-0029/0045). When wired, every step Pod gets the
     /// `/workspace` machinery: an init container that **fetches** the merged
     /// `needs` snapshots straight from the workspace service (ADR-0061 s3-feed),
@@ -227,7 +224,6 @@ impl K8sExecutor {
             workspace_fetch: None,
             workspace_depot: None,
             artifact_store: None,
-            clone_image: DEFAULT_CLONE_IMAGE.to_string(),
             placement: PlacementConfig::default(),
             ws_drain_fallback_anchors: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
@@ -243,7 +239,6 @@ impl K8sExecutor {
             workspace_fetch: None,
             workspace_depot: None,
             artifact_store: None,
-            clone_image: DEFAULT_CLONE_IMAGE.to_string(),
             placement: PlacementConfig::default(),
             ws_drain_fallback_anchors: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
@@ -253,12 +248,6 @@ impl K8sExecutor {
     /// step Pod and the named PlacementProfile registry steps select from.
     pub fn with_placement(mut self, placement: PlacementConfig) -> Self {
         self.placement = placement;
-        self
-    }
-
-    /// Override the canonical scarab-clone image (ADR-0045).
-    pub fn with_clone_image(mut self, image: impl Into<String>) -> Self {
-        self.clone_image = image.into();
         self
     }
 
@@ -366,13 +355,8 @@ impl K8sExecutor {
             .map(|m| truncate_message(m.trim())))
     }
 
-    /// Upsert the per-Pod Secret carrying the clone credential (ADR-0045
-    /// §Token delivery): mounted as tmpfs by the kubelet, read via
-    /// GIT_ASKPASS — the token is never in env, URL, or argv. Owner-referenced
-    /// to the Pod so it is garbage-collected with it. Re-drives refresh the
-    /// short-TTL token.
-    /// Upsert every per-Pod Secret a step may need before it can run: the clone
-    /// token (ADR-0045), the per-attempt OIDC token (ADR-0015), and a build
+    /// Upsert every per-Pod Secret a step may need before it can run: the forge
+    /// credential (ADR-0076 §9), the per-attempt OIDC token (ADR-0015), and a build
     /// step's registry dockerconfig (ADR-0018). Each helper is a no-op when the
     /// step doesn't use that credential. Idempotent (create-or-replace), so it
     /// is safe on the fresh-create path, on re-drive re-attach, and after a
@@ -385,7 +369,7 @@ impl K8sExecutor {
         step: &StepRun,
         spec: &StepSpec,
     ) -> Result<(), ExecError> {
-        self.ensure_clone_secret(pod_name, pod, spec).await?;
+        self.ensure_forge_token_secret(pod_name, pod, spec).await?;
         self.ensure_registry_secret(pod_name, pod, spec).await?;
         self.ensure_oidc_secret(pod_name, pod, spec).await?;
         self.ensure_workspace_secret(pod_name, pod, step, spec)
@@ -398,7 +382,7 @@ impl K8sExecutor {
     /// pointed at by `SCARAB_WORKSPACE_TOKEN_FILE`, and held only by the fetcher
     /// init container — never by the untrusted step container.
     ///
-    /// Re-minted on every call, exactly like the clone credential, because the
+    /// Re-minted on every call, exactly like the forge credential, because the
     /// token carries an **expiry**: a Pod adopted by a re-drive twenty minutes
     /// later must not present a token that expired while it was Pending.
     /// [`workspace_token::mint`] is deterministic in its claims, so a re-mint at
@@ -557,13 +541,22 @@ impl K8sExecutor {
         workspace_token::mint(&fetch.token_secret, &claims)
     }
 
-    async fn ensure_clone_secret(
+    /// Upsert the per-Pod Secret carrying a Step's forge credential (ADR-0076
+    /// §9): two keys, `forge-token` and `forge-username`, mounted read-only as
+    /// files on tmpfs by the kubelet. The token is never in env, a URL or
+    /// argv. Owner-referenced to the Pod so it is garbage-collected with it.
+    /// A re-drive replaces it with the credential minted for that launch.
+    async fn ensure_forge_token_secret(
         &self,
         pod_name: &str,
         pod: &Pod,
         spec: &StepSpec,
     ) -> Result<(), ExecError> {
-        let Some(cred) = spec.clone.as_ref().and_then(|c| c.credential.as_ref()) else {
+        let Some(cred) = spec
+            .forge_token
+            .as_ref()
+            .and_then(|c| c.credential.as_ref())
+        else {
             return Ok(());
         };
         let client = self.client.clone().ok_or(ExecError::Unavailable)?;
@@ -571,7 +564,7 @@ impl K8sExecutor {
             Api::namespaced(client, &self.namespace);
         let secret = k8s_openapi::api::core::v1::Secret {
             metadata: ObjectMeta {
-                name: Some(clone_secret_name(pod_name)),
+                name: Some(forge_token_secret_name(pod_name)),
                 namespace: Some(self.namespace.clone()),
                 owner_references: pod.metadata.uid.clone().map(|uid| {
                     vec![
@@ -586,25 +579,25 @@ impl K8sExecutor {
                 }),
                 ..Default::default()
             },
-            string_data: Some(std::collections::BTreeMap::from([(
-                CLONE_TOKEN_KEY.to_string(),
-                cred.token.clone(),
-            )])),
+            string_data: Some(std::collections::BTreeMap::from([
+                (FORGE_TOKEN_KEY.to_string(), cred.token.clone()),
+                (FORGE_USERNAME_KEY.to_string(), cred.username.clone()),
+            ])),
             ..Default::default()
         };
         match secrets.create(&PostParams::default(), &secret).await {
             Ok(_) => Ok(()),
-            // Exists: refresh the token in place (short-TTL rotation on re-drive).
+            // Exists: replace the token in place (a re-drive mints a new one).
             Err(kube::Error::Api(ae)) if ae.code == 409 => secrets
                 .replace(
-                    &clone_secret_name(pod_name),
+                    &forge_token_secret_name(pod_name),
                     &PostParams::default(),
                     &secret,
                 )
                 .await
                 .map(|_| ())
-                .map_err(|e| ExecError::Launch(format!("clone secret: {e}"))),
-            Err(e) => Err(ExecError::Launch(format!("clone secret: {e}"))),
+                .map_err(|e| ExecError::Launch(format!("forge token secret: {e}"))),
+            Err(e) => Err(ExecError::Launch(format!("forge token secret: {e}"))),
         }
     }
 
@@ -1640,9 +1633,9 @@ fn content_type_of(name: &str) -> &'static str {
     }
 }
 
-/// The per-Pod Secret carrying the clone credential (owner-referenced to the
-/// Pod, so it is garbage-collected with it).
-fn clone_secret_name(pod_name: &str) -> String {
+/// The per-Pod Secret carrying a Step's forge credential (owner-referenced to
+/// the Pod, so it is garbage-collected with it).
+fn forge_token_secret_name(pod_name: &str) -> String {
     format!("{pod_name}-token")
 }
 
@@ -2630,8 +2623,8 @@ impl Executor for K8sExecutor {
             .await
             .map_err(|e| ExecError::Launch(e.to_string()))?;
         if let Some(pod) = existing {
-            // Refresh the short-TTL clone credential and re-mint the expiring
-            // workspace token on re-drives (ADR-0045 / ADR-0061).
+            // Replace the forge credential with this launch's, and re-mint the
+            // expiring workspace token, on re-drives (ADR-0076 / ADR-0061).
             self.ensure_step_secrets(&name, &pod, step, spec).await?;
             return Ok(ExecHandle(name));
         }
@@ -2644,7 +2637,6 @@ impl Executor for K8sExecutor {
             self.results_egress.as_ref(),
             self.default_step_timeout_secs,
             self.workspace_cas.is_some(),
-            &self.clone_image,
             self.workspace_fetch.as_ref(),
         );
         // ADR-0055: stamp the baseline, merge the named PlacementProfiles + the
@@ -3619,16 +3611,14 @@ pub fn pod_name(step: &StepRun) -> String {
     format!("scarab-{slug}-{hash:08x}")
 }
 
-/// The default canonical scarab-clone image (ADR-0045). Overridable via
-/// `SCARAB_CLONE_IMAGE` (digest-pin in production).
-pub const DEFAULT_CLONE_IMAGE: &str = "ghcr.io/thulasi-ram/scarab-clone:edge";
-/// The tmpfs mount the clone credential is delivered on (ADR-0045 §Token
-/// delivery): a per-Pod k8s Secret volume (tmpfs on the node), read by
-/// GIT_ASKPASS — the token is never in env, URL, or argv.
-const CLONE_SECRETS_MOUNT_PATH: &str = "/scarab/secrets";
-const CLONE_SECRETS_VOLUME: &str = "scarab-clone-token";
-/// The key/file name the token lives under.
-const CLONE_TOKEN_KEY: &str = "clone-token";
+/// Where a Step's forge credential is mounted (ADR-0076 §9): a per-Pod k8s
+/// Secret volume (tmpfs on the node), read-only, on the Step container only.
+/// The token is never in env, a URL or argv.
+pub const FORGE_SECRETS_MOUNT_PATH: &str = "/scarab/secrets";
+const FORGE_SECRETS_VOLUME: &str = "scarab-forge-token";
+/// The file names the token and the username live under.
+pub const FORGE_TOKEN_KEY: &str = "forge-token";
+pub const FORGE_USERNAME_KEY: &str = "forge-username";
 
 /// The in-Pod workspace root (ADR-0007/0008): steps run here; the clone step
 /// and every producer write here; the snapshot covers it (incl. `.git`).
@@ -3679,17 +3669,17 @@ const WORKSPACE_EGRESS_CONTAINER: &str = "scarab-workspace-egress";
 /// s3-feed fetcher init container (a Step's input snapshots) and the s3-drain
 /// egress helper (`hold` + the exec'd `drain`) every workspace Pod carries.
 /// Overridable via `SCARAB_WSFETCH_IMAGE`; digest-pin in production, as with
-/// the clone image. Rollout order matters: publish this image BEFORE a
+/// the other helper images. Rollout order matters: publish this image BEFORE a
 /// control plane that execs `drain` (skew fails Attempts as a named Config
 /// error — legible, but failing). The old node-driver deletion note is dead
 /// (git-bug 0628369, closed as superseded by ADR-0062).
 pub const DEFAULT_WSFETCH_IMAGE: &str = "ghcr.io/thulasi-ram/scarab-wsfetch:edge";
 
 /// The volume name carrying the per-Pod workspace-token Secret. Distinct from
-/// `CLONE_SECRETS_VOLUME` even though both land on
+/// `FORGE_SECRETS_VOLUME` even though both land on
 /// [`workspace_token::WORKSPACE_SECRETS_MOUNT_PATH`]: they are mounted into
-/// *different containers* (the token into the fetcher, the clone credential into
-/// the step), so neither credential's presence implies the other's.
+/// *different containers* (the token into the fetcher, the forge credential
+/// into the step), so neither credential's presence implies the other's.
 const WORKSPACE_TOKEN_VOLUME: &str = "scarab-workspace-token";
 
 /// The env var carrying the input **Workspace Snapshot** roots into the fetcher,
@@ -3977,7 +3967,6 @@ pub fn build_pod(
     egress: Option<&ResultsEgress>,
     default_timeout_secs: u32,
     workspace: bool,
-    clone_image: &str,
     fetch: Option<&WorkspaceFetch>,
 ) -> Pod {
     debug_assert!(
@@ -4090,64 +4079,32 @@ pub fn build_pod(
         step_mounts.push(m);
     }
 
-    // Clone steps (ADR-0045): the canonical scarab-clone image (never the
-    // author's), context via env — and the credential ONLY via the tmpfs
-    // secret volume (never env/URL/argv). `clone_image` is threaded through
-    // `build_pod`'s caller (the executor's config).
-    let mut clone_token_volume: Option<Volume> = None;
-    let (image, command) = if let Some(clone) = &spec.clone {
-        for (k, v) in [
-            ("SCARAB_CLONE_URL", clone.url.clone()),
-            ("SCARAB_CLONE_SHA", clone.sha.clone()),
-            (
-                "SCARAB_CLONE_DEPTH",
-                if clone.depth_full {
-                    "full".into()
-                } else {
-                    "1".into()
-                },
-            ),
-            ("SCARAB_CLONE_SUBMODULES", clone.submodules.to_string()),
-            ("SCARAB_CLONE_LFS", clone.lfs.to_string()),
-        ] {
-            env.push(EnvVar {
-                name: k.to_string(),
-                value: Some(v),
-                value_from: None,
-            });
-        }
-        if let Some(cred) = &clone.credential {
-            // Point the askpass helper at the tmpfs file; the username is not
-            // secret. The token itself rides ONLY in the mounted Secret.
-            env.push(EnvVar {
-                name: "SCARAB_CLONE_TOKEN_FILE".to_string(),
-                value: Some(format!("{CLONE_SECRETS_MOUNT_PATH}/{CLONE_TOKEN_KEY}")),
-                value_from: None,
-            });
-            env.push(EnvVar {
-                name: "SCARAB_CLONE_USERNAME".to_string(),
-                value: Some(cred.username.clone()),
-                value_from: None,
-            });
-            step_mounts.push(VolumeMount {
-                name: CLONE_SECRETS_VOLUME.to_string(),
-                mount_path: CLONE_SECRETS_MOUNT_PATH.to_string(),
-                read_only: Some(true),
+    // A forge credential (ADR-0076 §9): ONLY as files on a read-only tmpfs
+    // Secret volume on the Step container — never env, a URL or argv. The
+    // image and command are the Step's own; Run creation decided this Step
+    // may hold the credential.
+    let mut forge_token_volume: Option<Volume> = None;
+    if spec
+        .forge_token
+        .as_ref()
+        .is_some_and(|f| f.credential.is_some())
+    {
+        step_mounts.push(VolumeMount {
+            name: FORGE_SECRETS_VOLUME.to_string(),
+            mount_path: FORGE_SECRETS_MOUNT_PATH.to_string(),
+            read_only: Some(true),
+            ..Default::default()
+        });
+        forge_token_volume = Some(Volume {
+            name: FORGE_SECRETS_VOLUME.to_string(),
+            secret: Some(k8s_openapi::api::core::v1::SecretVolumeSource {
+                secret_name: Some(forge_token_secret_name(name)),
                 ..Default::default()
-            });
-            clone_token_volume = Some(Volume {
-                name: CLONE_SECRETS_VOLUME.to_string(),
-                secret: Some(k8s_openapi::api::core::v1::SecretVolumeSource {
-                    secret_name: Some(clone_secret_name(name)),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            });
-        }
-        (clone_image.to_string(), Vec::new())
-    } else {
-        (spec.image.clone(), spec.command.clone())
-    };
+            }),
+            ..Default::default()
+        });
+    }
+    let (image, command) = (spec.image.clone(), spec.command.clone());
 
     // Build steps (ADR-0018): rootless BuildKit (never the author's image),
     // registry auth ONLY via a mounted dockerconfigjson (a per-Pod Secret —
@@ -4271,7 +4228,7 @@ pub fn build_pod(
             e,
         ));
     }
-    if let Some(v) = clone_token_volume {
+    if let Some(v) = forge_token_volume {
         volumes.push(v);
     }
     if let Some(v) = registry_volume {
@@ -5868,7 +5825,7 @@ mod tests {
             workspace_inputs: vec![],
             workspace_outputs: vec![],
             cache: None,
-            clone: None,
+            forge_token: None,
             build: None,
             artifacts: vec![],
             placement_profiles: vec![],
@@ -5900,7 +5857,6 @@ mod tests {
             None,
             DEFAULT_STEP_TIMEOUT_SECS,
             false,
-            DEFAULT_CLONE_IMAGE,
             None,
         )
     }
@@ -6051,7 +6007,6 @@ mod tests {
             None,
             DEFAULT_STEP_TIMEOUT_SECS,
             false,
-            DEFAULT_CLONE_IMAGE,
             None,
         );
         let sc = pod.spec.unwrap().containers[0]
@@ -6086,7 +6041,7 @@ mod tests {
             workspace_inputs: vec![],
             workspace_outputs: vec![],
             cache: None,
-            clone: None,
+            forge_token: None,
             build: None,
             artifacts: vec![],
             placement_profiles: vec![],
@@ -6106,7 +6061,6 @@ mod tests {
             None,
             DEFAULT_STEP_TIMEOUT_SECS,
             false,
-            DEFAULT_CLONE_IMAGE,
             None,
         );
         let sc = pod.spec.unwrap().containers[0]
@@ -6138,7 +6092,6 @@ mod tests {
             None,
             DEFAULT_STEP_TIMEOUT_SECS,
             false,
-            DEFAULT_CLONE_IMAGE,
             None,
         );
         let sc = pod.spec.unwrap().containers[0]
@@ -6543,7 +6496,6 @@ mod tests {
             None,
             DEFAULT_STEP_TIMEOUT_SECS,
             false,
-            DEFAULT_CLONE_IMAGE,
             None,
         );
 
@@ -6589,7 +6541,6 @@ mod tests {
             None,
             DEFAULT_STEP_TIMEOUT_SECS,
             false,
-            DEFAULT_CLONE_IMAGE,
             None,
         );
         let spec = pod.spec.unwrap();
@@ -6618,7 +6569,6 @@ mod tests {
             Some(&egress),
             DEFAULT_STEP_TIMEOUT_SECS,
             false,
-            DEFAULT_CLONE_IMAGE,
             None,
         );
         let spec = pod.spec.unwrap();
@@ -6726,7 +6676,6 @@ mod tests {
             None,
             DEFAULT_STEP_TIMEOUT_SECS,
             true,
-            DEFAULT_CLONE_IMAGE,
             Some(&fetch),
         );
         let c = &pod.spec.as_ref().unwrap().containers[0];
@@ -6801,7 +6750,6 @@ mod tests {
             None,
             DEFAULT_STEP_TIMEOUT_SECS,
             false,
-            DEFAULT_CLONE_IMAGE,
             None,
         );
         let c = &pod.spec.as_ref().unwrap().containers[0];
@@ -6865,7 +6813,6 @@ mod tests {
             Some(&egress),
             DEFAULT_STEP_TIMEOUT_SECS,
             false,
-            DEFAULT_CLONE_IMAGE,
             None,
         );
         let args = pod.spec.as_ref().unwrap().containers[0]
@@ -6894,7 +6841,6 @@ mod tests {
             None,
             DEFAULT_STEP_TIMEOUT_SECS,
             false,
-            DEFAULT_CLONE_IMAGE,
             None,
         );
         let c = &pod.spec.as_ref().unwrap().containers[0];
@@ -6934,7 +6880,6 @@ mod tests {
             None,
             DEFAULT_STEP_TIMEOUT_SECS,
             false,
-            DEFAULT_CLONE_IMAGE,
             None,
         );
         let c = &pod.spec.as_ref().unwrap().containers[0];
@@ -6971,7 +6916,6 @@ mod tests {
             None,
             DEFAULT_STEP_TIMEOUT_SECS,
             true,
-            DEFAULT_CLONE_IMAGE,
             Some(&fetch),
         );
         let c = &pod.spec.as_ref().unwrap().containers[0];
@@ -7017,7 +6961,6 @@ mod tests {
             None,
             DEFAULT_STEP_TIMEOUT_SECS,
             false,
-            DEFAULT_CLONE_IMAGE,
             None,
         );
         assert!(pod.spec.as_ref().unwrap().volumes.is_none());
@@ -7040,7 +6983,6 @@ mod tests {
             None,
             DEFAULT_STEP_TIMEOUT_SECS,
             true,
-            DEFAULT_CLONE_IMAGE,
             Some(&fetch),
         );
         assert_eq!(
@@ -7064,7 +7006,6 @@ mod tests {
             None,
             DEFAULT_STEP_TIMEOUT_SECS,
             true,
-            DEFAULT_CLONE_IMAGE,
             Some(&fetch),
         );
         assert!(
@@ -7096,7 +7037,6 @@ mod tests {
             None,
             DEFAULT_STEP_TIMEOUT_SECS,
             true,
-            DEFAULT_CLONE_IMAGE,
             Some(&fetch),
         );
         assert!(
@@ -7127,7 +7067,6 @@ mod tests {
             None,
             DEFAULT_STEP_TIMEOUT_SECS,
             true,
-            DEFAULT_CLONE_IMAGE,
             Some(&fetch),
         );
         assert_eq!(
@@ -7153,7 +7092,6 @@ mod tests {
                 None,
                 DEFAULT_STEP_TIMEOUT_SECS,
                 workspace,
-                DEFAULT_CLONE_IMAGE,
                 workspace.then_some(&fetch),
             )
             .spec
@@ -8548,7 +8486,6 @@ mod tests {
             None,
             DEFAULT_STEP_TIMEOUT_SECS,
             true,
-            DEFAULT_CLONE_IMAGE,
             Some(&fetch),
         );
 
@@ -8616,7 +8553,6 @@ mod tests {
             None,
             DEFAULT_STEP_TIMEOUT_SECS,
             true,
-            DEFAULT_CLONE_IMAGE,
             Some(&fetch),
         );
         let inits = pod.spec.as_ref().unwrap().init_containers.clone().unwrap();
@@ -8634,7 +8570,6 @@ mod tests {
             None,
             DEFAULT_STEP_TIMEOUT_SECS,
             false,
-            DEFAULT_CLONE_IMAGE,
             None,
         );
         assert!(pod.metadata.annotations.is_none());
@@ -8682,7 +8617,6 @@ mod tests {
             None,
             DEFAULT_STEP_TIMEOUT_SECS,
             true,
-            DEFAULT_CLONE_IMAGE,
             Some(&fetch),
         );
         let inits = pod.spec.as_ref().unwrap().init_containers.clone().unwrap();
@@ -8722,7 +8656,6 @@ mod tests {
             None,
             DEFAULT_STEP_TIMEOUT_SECS,
             true,
-            DEFAULT_CLONE_IMAGE,
             Some(&fetch),
         )
     }
@@ -8817,7 +8750,6 @@ mod tests {
             None,
             DEFAULT_STEP_TIMEOUT_SECS,
             true,
-            DEFAULT_CLONE_IMAGE,
             Some(&fetch),
         );
         let inits = pod.spec.as_ref().unwrap().init_containers.as_ref().unwrap();
@@ -8872,7 +8804,6 @@ mod tests {
             None,
             DEFAULT_STEP_TIMEOUT_SECS,
             true,
-            DEFAULT_CLONE_IMAGE,
             Some(&fetch),
         );
         let ps = pod.spec.as_ref().unwrap();
@@ -9168,7 +9099,6 @@ mod tests {
             None,
             DEFAULT_STEP_TIMEOUT_SECS,
             true,
-            DEFAULT_CLONE_IMAGE,
             Some(&fetch),
         );
         assert_eq!(
@@ -9202,7 +9132,6 @@ mod tests {
             None,
             DEFAULT_STEP_TIMEOUT_SECS,
             true,
-            DEFAULT_CLONE_IMAGE,
             Some(&fetch),
         );
         let ps = pod.spec.as_ref().unwrap();
@@ -9330,7 +9259,6 @@ mod tests {
                 None,
                 DEFAULT_STEP_TIMEOUT_SECS,
                 true,
-                DEFAULT_CLONE_IMAGE,
                 Some(&fetch),
             );
         }
@@ -9345,7 +9273,6 @@ mod tests {
             None,
             DEFAULT_STEP_TIMEOUT_SECS,
             true,
-            DEFAULT_CLONE_IMAGE,
             Some(&fetch),
         );
         assert_eq!(eager_fetch_total(), at);
@@ -9614,7 +9541,6 @@ mod tests {
                 None,
                 DEFAULT_STEP_TIMEOUT_SECS,
                 true,
-                DEFAULT_CLONE_IMAGE,
                 Some(&fetch),
             )
         };
@@ -9683,7 +9609,6 @@ mod tests {
             None,
             DEFAULT_STEP_TIMEOUT_SECS,
             false,
-            DEFAULT_CLONE_IMAGE,
             None,
         )
         .spec
@@ -9720,7 +9645,6 @@ mod tests {
             None,
             DEFAULT_STEP_TIMEOUT_SECS,
             true,
-            DEFAULT_CLONE_IMAGE,
             Some(&fetch),
         )
         .spec
@@ -9761,23 +9685,20 @@ mod tests {
         );
     }
 
+    /// ADR-0076 §9: a Step with a forge credential runs its own image and
+    /// command, and gets the token and username as files on a read-only
+    /// tmpfs Secret volume on its own container — never as env.
     #[test]
-    fn build_pod_clone_step_shape() {
-        use scarab_engine::{CloneConfig, CloneCredential};
-        let step = step_with_attempt("run-1", "checkout", "a1");
+    fn build_pod_mounts_a_forge_token_as_files_never_env() {
+        use scarab_engine::{ForgeCredential, ForgeTokenConfig};
+        let step = step_with_attempt("run-1", "checkout/git", "a1");
         let mut spec = busybox();
-        spec.image = String::new();
-        spec.command = vec![];
-        spec.clone = Some(CloneConfig {
+        spec.image = "ghcr.io/acme/scarab-clone@sha256:abc".into();
+        spec.forge_token = Some(ForgeTokenConfig {
+            access: scarab_pipeline::ForgeToken::Read,
             owner: "acme".into(),
             name: "web".into(),
-            sha: "cafe1234".into(),
-            depth_full: true,
-            submodules: true,
-            lfs: false,
-            read_only: true,
-            url: "https://github.com/acme/web.git".into(),
-            credential: Some(CloneCredential {
+            credential: Some(ForgeCredential {
                 username: "x-access-token".into(),
                 token: "sekret-token".into(),
             }),
@@ -9791,60 +9712,50 @@ mod tests {
             None,
             DEFAULT_STEP_TIMEOUT_SECS,
             true,
-            "ghcr.io/acme/scarab-clone@sha256:abc",
             Some(&fetch),
         );
-        let c = &pod.spec.as_ref().unwrap().containers[0];
-        // The canonical image, never the author's; entrypoint from the image.
-        assert_eq!(
-            c.image.as_deref(),
-            Some("ghcr.io/acme/scarab-clone@sha256:abc")
-        );
-        assert!(c.command.is_none());
+        let ps = pod.spec.as_ref().unwrap();
+        let c = &ps.containers[0];
+        assert_eq!(c.image.as_deref(), Some("ghcr.io/acme/scarab-clone@sha256:abc"));
         let env = c.env.as_ref().unwrap();
-        let get = |k: &str| {
-            env.iter()
-                .find(|e| e.name == k)
-                .and_then(|e| e.value.clone())
-        };
-        assert_eq!(
-            get("SCARAB_CLONE_URL").as_deref(),
-            Some("https://github.com/acme/web.git")
-        );
-        assert_eq!(get("SCARAB_CLONE_SHA").as_deref(), Some("cafe1234"));
-        assert_eq!(get("SCARAB_CLONE_DEPTH").as_deref(), Some("full"));
-        assert_eq!(get("SCARAB_CLONE_SUBMODULES").as_deref(), Some("true"));
-        assert_eq!(get("SCARAB_CLONE_LFS").as_deref(), Some("false"));
-        assert_eq!(
-            get("SCARAB_CLONE_TOKEN_FILE").as_deref(),
-            Some("/scarab/secrets/clone-token")
-        );
-        // THE INVARIANT (ADR-0045): the token appears in NO env var — tmpfs only.
         assert!(
-            env.iter()
-                .all(|e| e.value.as_deref() != Some("sekret-token")),
-            "token must never ride in env"
+            env.iter().all(|e| e.value.as_deref() != Some("sekret-token")
+                && !e.name.contains("TOKEN")),
+            "no env var carries or names the forge token: {env:?}"
         );
-        // The tmpfs secret volume is mounted read-only at /scarab/secrets.
-        let mounts = c.volume_mounts.as_ref().unwrap();
-        let m = mounts
+        let m = c
+            .volume_mounts
+            .as_ref()
+            .unwrap()
             .iter()
-            .find(|m| m.name == "scarab-clone-token")
+            .find(|m| m.name == FORGE_SECRETS_VOLUME)
             .unwrap();
         assert_eq!(m.mount_path, "/scarab/secrets");
         assert_eq!(m.read_only, Some(true));
-        let vols = pod.spec.as_ref().unwrap().volumes.as_ref().unwrap();
-        let v = vols
+        let v = ps
+            .volumes
+            .as_ref()
+            .unwrap()
             .iter()
-            .find(|v| v.name == "scarab-clone-token")
+            .find(|v| v.name == FORGE_SECRETS_VOLUME)
             .unwrap();
         assert_eq!(
             v.secret.as_ref().unwrap().secret_name.as_deref(),
             Some("scarab-x-token")
         );
+        // Only the Step container mounts it: no helper container does.
+        for helper in ps.init_containers.iter().flatten() {
+            assert!(helper
+                .volume_mounts
+                .iter()
+                .flatten()
+                .all(|m| m.name != FORGE_SECRETS_VOLUME));
+        }
+        // The token is in no part of the Pod spec.
+        assert!(!serde_json::to_string(&pod).unwrap().contains("sekret-token"));
 
-        // Anonymous clone (no credential): no token volume, no TOKEN_FILE env.
-        spec.clone.as_mut().unwrap().credential = None;
+        // No credential minted: no volume.
+        spec.forge_token.as_mut().unwrap().credential = None;
         let pod = build_pod(
             "scarab-x",
             "ns",
@@ -9853,25 +9764,16 @@ mod tests {
             None,
             DEFAULT_STEP_TIMEOUT_SECS,
             true,
-            "img",
             Some(&fetch),
         );
-        let c = &pod.spec.as_ref().unwrap().containers[0];
-        assert!(c
-            .env
-            .as_ref()
-            .unwrap()
-            .iter()
-            .all(|e| e.name != "SCARAB_CLONE_TOKEN_FILE"));
         assert!(pod
             .spec
             .as_ref()
             .unwrap()
             .volumes
-            .as_ref()
-            .unwrap()
             .iter()
-            .all(|v| v.name != "scarab-clone-token"));
+            .flatten()
+            .all(|v| v.name != FORGE_SECRETS_VOLUME));
     }
 
     #[test]
@@ -9886,7 +9788,6 @@ mod tests {
             None,
             DEFAULT_STEP_TIMEOUT_SECS,
             false,
-            DEFAULT_CLONE_IMAGE,
             None,
         );
         assert_eq!(
@@ -9904,7 +9805,6 @@ mod tests {
             None,
             DEFAULT_STEP_TIMEOUT_SECS,
             false,
-            DEFAULT_CLONE_IMAGE,
             None,
         );
         assert_eq!(

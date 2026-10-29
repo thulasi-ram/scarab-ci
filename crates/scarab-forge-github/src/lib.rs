@@ -450,6 +450,56 @@ impl GithubForge {
     /// Issue `req` with standard headers + `token`, honoring secondary rate
     /// limits: on 403/429 with `Retry-After` (or an exhausted rate-limit
     /// window) back off and retry, bounded by [`MAX_HTTP_ATTEMPTS`].
+    /// App mode: a fresh installation token for `repo`'s installation,
+    /// downscoped to that one repository with `permissions`.
+    async fn repo_installation_token(
+        &self,
+        repo: &RepoRef,
+        permissions: Value,
+    ) -> Result<String, ForgeError> {
+        let Auth::App { app, cache } = &self.auth else {
+            return Err(ForgeError::Unsupported(
+                "a GitHub token connection mints no installation token".into(),
+            ));
+        };
+        let now = now_unix_secs();
+        let jwt = sign_app_jwt(app, now)?;
+        // Resolve the installation (reuses the cached mapping).
+        let cached = cache
+            .lock()
+            .unwrap()
+            .installations
+            .get(&format!("{}/{}", repo.owner, repo.name))
+            .copied();
+        let installation_id = match cached {
+            Some(id) => id,
+            None => {
+                let url = self.url(&format!("/repos/{}/{}/installation", repo.owner, repo.name));
+                let resp = self.send(|| self.client.get(&url), &jwt).await?;
+                let body = ok_json(resp).await?;
+                body.get("id")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| ForgeError::Api("installation.id missing".into()))?
+            }
+        };
+        let url = self.url(&format!(
+            "/app/installations/{installation_id}/access_tokens"
+        ));
+        let body = serde_json::json!({
+            "repositories": [repo.name],
+            "permissions": permissions,
+        });
+        let resp = self
+            .send(|| self.client.post(&url).json(&body), &jwt)
+            .await?;
+        Ok(ok_json(resp)
+            .await?
+            .get("token")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ForgeError::Api("access_tokens.token missing".into()))?
+            .to_string())
+    }
+
     async fn send(
         &self,
         build: impl Fn() -> reqwest::RequestBuilder,
@@ -1054,46 +1104,9 @@ impl ForgePort for GithubForge {
         let now = now_unix_secs();
         let token = match &self.auth {
             Auth::Token(t) => t.clone(),
-            Auth::App { app, cache } => {
-                let jwt = sign_app_jwt(app, now)?;
-                // Resolve the installation (reuses the cached mapping).
-                let installation_id = {
-                    let cached = cache
-                        .lock()
-                        .unwrap()
-                        .installations
-                        .get(&format!("{}/{}", repo.owner, repo.name))
-                        .copied();
-                    match cached {
-                        Some(id) => id,
-                        None => {
-                            let url = self
-                                .url(&format!("/repos/{}/{}/installation", repo.owner, repo.name));
-                            let resp = self.send(|| self.client.get(&url), &jwt).await?;
-                            let body = ok_json(resp).await?;
-                            body.get("id")
-                                .and_then(Value::as_u64)
-                                .ok_or_else(|| ForgeError::Api("installation.id missing".into()))?
-                        }
-                    }
-                };
-                let url = self.url(&format!(
-                    "/app/installations/{installation_id}/access_tokens"
-                ));
-                let body = serde_json::json!({
-                    "repositories": [repo.name],
-                    // A checkout only reads — never request write (see doc above).
-                    "permissions": { "contents": "read" },
-                });
-                let resp = self
-                    .send(|| self.client.post(&url).json(&body), &jwt)
-                    .await?;
-                ok_json(resp)
+            Auth::App { .. } => {
+                self.repo_installation_token(repo, serde_json::json!({ "contents": "read" }))
                     .await?
-                    .get("token")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| ForgeError::Api("access_tokens.token missing".into()))?
-                    .to_string()
             }
         };
         Ok(CheckoutCredential {
@@ -1102,6 +1115,56 @@ impl ForgePort for GithubForge {
             expires_at: (now + CHECKOUT_CRED_TTL_SECS) * 1000,
             read_only,
         })
+    }
+
+    /// App mode mints a token for each request, scoped to one repository
+    /// (ADR-0076 §9). A fixed token is one long-lived credential.
+    async fn mints_repo_tokens(&self, _repo: &RepoRef) -> Result<bool, ForgeError> {
+        Ok(matches!(self.auth, Auth::App { .. }))
+    }
+
+    /// App mode: an installation token scoped to this one repository with
+    /// `contents: write` (ADR-0076 §9). A fixed token cannot be narrowed to
+    /// one repository, so it is refused.
+    async fn mint_write_credential(
+        &self,
+        repo: &RepoRef,
+    ) -> Result<CheckoutCredential, ForgeError> {
+        if !matches!(self.auth, Auth::App { .. }) {
+            return Err(ForgeError::Unsupported(
+                "a GitHub token connection cannot mint a write token; use GitHub App mode".into(),
+            ));
+        }
+        let token = self
+            .repo_installation_token(repo, serde_json::json!({ "contents": "write" }))
+            .await?;
+        Ok(CheckoutCredential {
+            username: "x-access-token".into(),
+            token,
+            expires_at: (now_unix_secs() + CHECKOUT_CRED_TTL_SECS) * 1000,
+            read_only: false,
+        })
+    }
+
+    /// App mode: `DELETE /installation/token`, authenticated with the token
+    /// itself, ends it before its hour is up (ADR-0076 §9). A fixed token
+    /// was not minted, and revoking it would break the connection: nothing
+    /// is sent.
+    async fn revoke_credential(&self, _repo: &RepoRef, token: &str) -> Result<(), ForgeError> {
+        if !matches!(self.auth, Auth::App { .. }) {
+            return Ok(());
+        }
+        let url = self.url("/installation/token");
+        let resp = self.send(|| self.client.delete(&url), token).await?;
+        let status = resp.status();
+        // 401: the token expired or was revoked already.
+        if status.is_success() || status == reqwest::StatusCode::UNAUTHORIZED {
+            Ok(())
+        } else {
+            Err(ForgeError::Api(format!(
+                "revoking an installation token: GitHub answered {status}"
+            )))
+        }
     }
 
     /// GHCR (ADR-0018 amendment): derive a push credential for github.com's

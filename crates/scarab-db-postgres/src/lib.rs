@@ -286,6 +286,42 @@ impl Db for PostgresDb {
         }
     }
 
+    async fn set_run_event_facts(
+        &self,
+        run: &RunId,
+        facts: &serde_json::Map<String, Value>,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE runs
+             SET event_facts = $2, updated_at = (extract(epoch from now()) * 1000)::bigint
+             WHERE id = $1",
+        )
+        .bind(&run.0)
+        .bind(Value::Object(facts.clone()))
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn run_event_facts(
+        &self,
+        run: &RunId,
+    ) -> Result<serde_json::Map<String, Value>, DbError> {
+        let row = sqlx::query("SELECT event_facts FROM runs WHERE id = $1")
+            .bind(&run.0)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(db_err)?;
+        match row.and_then(|r| r.get::<Option<Value>, _>("event_facts")) {
+            Some(Value::Object(m)) => Ok(m),
+            Some(other) => Err(DbError::Other(format!(
+                "runs.event_facts is not an object: {other}"
+            ))),
+            None => Ok(serde_json::Map::new()),
+        }
+    }
+
     async fn set_run_deploy_context(
         &self,
         run: &RunId,

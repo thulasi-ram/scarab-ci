@@ -16,7 +16,7 @@ use sqlx::Row;
 use scarab_pipeline::InstalledLibrary;
 use scarab_policy::library::{
     DefaultsState, LibraryInstallation, LibraryStore, LibraryStoreError, LibraryVersion,
-    LibraryYank, MissingDefault, NewInstallation, OrgLibraryDefaults, Replaces,
+    LibraryYank, MissingDefault, NewInstallation, OrgLibraryDefaults, Replaces, TrustedSource,
 };
 
 use crate::PostgresDb;
@@ -496,5 +496,70 @@ impl LibraryStore for PostgresDb {
         .await
         .map_err(store_err)?;
         Ok(())
+    }
+
+    async fn trusted_sources(&self, org: &str) -> Result<Vec<TrustedSource>, LibraryStoreError> {
+        let rows = sqlx::query(
+            "SELECT org, source, trusted_by, trusted_at, step_up_ref \
+             FROM library_trusted_sources WHERE org = $1 ORDER BY source COLLATE \"C\"",
+        )
+        .bind(org)
+        .fetch_all(self.pool())
+        .await
+        .map_err(store_err)?;
+        Ok(rows.iter().map(trusted_from_row).collect())
+    }
+
+    async fn trust_source(&self, t: &TrustedSource) -> Result<TrustedSource, LibraryStoreError> {
+        sqlx::query(
+            "INSERT INTO library_trusted_sources \
+               (org, source, trusted_by, trusted_at, step_up_ref) \
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (org, source) DO NOTHING",
+        )
+        .bind(&t.org)
+        .bind(&t.source)
+        .bind(&t.trusted_by)
+        .bind(t.trusted_at)
+        .bind(&t.step_up_ref)
+        .execute(self.pool())
+        .await
+        .map_err(store_err)?;
+        let row = sqlx::query(
+            "SELECT org, source, trusted_by, trusted_at, step_up_ref \
+             FROM library_trusted_sources WHERE org = $1 AND source = $2",
+        )
+        .bind(&t.org)
+        .bind(&t.source)
+        .fetch_one(self.pool())
+        .await
+        .map_err(store_err)?;
+        Ok(trusted_from_row(&row))
+    }
+
+    async fn untrust_source(
+        &self,
+        org: &str,
+        source: &str,
+    ) -> Result<Option<TrustedSource>, LibraryStoreError> {
+        let row = sqlx::query(
+            "DELETE FROM library_trusted_sources WHERE org = $1 AND source = $2 \
+             RETURNING org, source, trusted_by, trusted_at, step_up_ref",
+        )
+        .bind(org)
+        .bind(source)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(store_err)?;
+        Ok(row.as_ref().map(trusted_from_row))
+    }
+}
+
+fn trusted_from_row(r: &PgRow) -> TrustedSource {
+    TrustedSource {
+        org: r.get("org"),
+        source: r.get("source"),
+        trusted_by: r.get("trusted_by"),
+        trusted_at: r.get("trusted_at"),
+        step_up_ref: r.get("step_up_ref"),
     }
 }

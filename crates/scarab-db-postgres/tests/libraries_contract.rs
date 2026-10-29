@@ -9,7 +9,7 @@ use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_policy::library::{
     content_hash, DefaultsState, LibraryStore, LibraryStoreError, LibraryVersion, LibraryYank,
-    MissingDefault, NewInstallation, OrgLibraryDefaults, Replaces,
+    MissingDefault, NewInstallation, OrgLibraryDefaults, Replaces, TrustedSource,
 };
 use scarab_testkit::InMemoryLibraries;
 
@@ -46,6 +46,38 @@ contract_test!(
     prune_deletes_the_oldest_versions_never_installed,
     prune_never_installed
 );
+contract_test!(trust_is_per_org_by_source_and_keeps_the_first_record, trust);
+
+async fn trust(store: &dyn LibraryStore) {
+    let t = |by: &str, at: i64| TrustedSource {
+        org: "acme".into(),
+        source: "github.com/acme/libs//push.yaml".into(),
+        trusted_by: by.into(),
+        trusted_at: at,
+        step_up_ref: Some("su-1".into()),
+    };
+    assert!(store.trusted_sources("acme").await.unwrap().is_empty());
+    assert_eq!(store.trust_source(&t("amy", 1)).await.unwrap(), t("amy", 1));
+    // Trusting again keeps the first record.
+    assert_eq!(store.trust_source(&t("bob", 2)).await.unwrap(), t("amy", 1));
+    assert_eq!(store.trusted_sources("acme").await.unwrap(), vec![t("amy", 1)]);
+    assert!(store.trusted_sources("globex").await.unwrap().is_empty(), "per org");
+    assert_eq!(
+        store
+            .untrust_source("acme", "github.com/acme/libs//push.yaml")
+            .await
+            .unwrap(),
+        Some(t("amy", 1))
+    );
+    assert_eq!(
+        store
+            .untrust_source("acme", "github.com/acme/libs//push.yaml")
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(store.trusted_sources("acme").await.unwrap().is_empty());
+}
 
 fn version(org: &str, content: &str, source: &str) -> LibraryVersion {
     LibraryVersion {

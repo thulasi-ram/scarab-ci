@@ -632,11 +632,12 @@ pub struct StepSpec {
     /// cache for the attempt, never fails it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<CacheConfig>,
-    /// Set when this is a **clone** step (ADR-0045): the engine runs the
-    /// canonical scarab-clone image with this context instead of an authored
-    /// image/command.
+    /// The forge credential this Step receives (ADR-0076 §9), as Run
+    /// creation decided it: the access (a fork pull request's is always
+    /// `read`) and the repository. The credential itself is minted when each
+    /// Attempt launches and never stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub clone: Option<CloneConfig>,
+    pub forge_token: Option<ForgeTokenConfig>,
     /// Set when this is a **build** step (ADR-0018): the engine runs rootless
     /// BuildKit with this context instead of an authored image/command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -853,44 +854,28 @@ pub struct RegistryCredential {
     pub token: String,
 }
 
-/// The launch context of a clone step (ADR-0045), resolved from the run's
-/// trigger at creation (owner/name/sha/read_only + the authored knobs) and
-/// enriched at launch (URL from the ForgeConnection registry; the short-TTL
-/// checkout credential — in-memory only, never persisted).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CloneConfig {
-    /// The forge coordinate, pinned at run creation.
+/// A Step's forge credential (ADR-0076 §9): what Run creation decided, and
+/// the credential minted for one Attempt's launch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForgeTokenConfig {
+    /// `read` or `write`, fixed at Run creation. A fork pull request's is
+    /// always `read`.
+    pub access: scarab_pipeline::ForgeToken,
+    /// The Run's repository, the only one the credential is for.
     pub owner: String,
     pub name: String,
-    /// The commit the run is pinned to (resolved ONCE at trigger time,
-    /// ADR-0043/0044) — clone always fetches THIS, never re-resolves.
-    pub sha: String,
-    /// `depth: full` (complete history) vs the shallow default.
-    #[serde(default)]
-    pub depth_full: bool,
-    #[serde(default)]
-    pub submodules: bool,
-    #[serde(default)]
-    pub lfs: bool,
-    /// Fork-PR runs get a READ-ONLY credential (ADR-0045 trust model), fixed
-    /// immutably at run creation from the trigger.
-    #[serde(default)]
-    pub read_only: bool,
-    /// The credential-free clone URL — filled at LAUNCH by the composition
-    /// root (from the repo's ForgeConnection); empty in the stored spec.
-    #[serde(default)]
-    pub url: String,
-    /// The short-TTL checkout credential — filled at LAUNCH, **never
-    /// serialized** (in-memory enrichment only; delivery to the Pod is via a
-    /// tmpfs file, never env/URL/argv — ADR-0045 §Token delivery).
+    /// The credential minted for this launch — filled at LAUNCH, **never
+    /// serialized**. The executor mounts it as the files
+    /// `/scarab/secrets/forge-token` and `/scarab/secrets/forge-username`,
+    /// never as an environment variable.
     #[serde(skip)]
-    pub credential: Option<CloneCredential>,
+    pub credential: Option<ForgeCredential>,
 }
 
-/// The in-memory half of a minted checkout credential (mirrors the forge
+/// The in-memory half of a minted forge credential (mirrors the forge
 /// port's type without a crate dependency; the engine stays forge-free).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CloneCredential {
+pub struct ForgeCredential {
     pub username: String,
     pub token: String,
 }

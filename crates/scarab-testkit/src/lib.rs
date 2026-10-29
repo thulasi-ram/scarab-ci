@@ -174,6 +174,7 @@ struct InMemoryState {
     run_ir: HashMap<RunId, serde_json::Value>,
     /// Resolved launch parameters per run (ADR-0043).
     run_params: HashMap<RunId, std::collections::BTreeMap<String, serde_json::Value>>,
+    run_event_facts: HashMap<RunId, serde_json::Map<String, serde_json::Value>>,
     /// Per-run deploy context (ADR-0037); set only for deploy runs.
     run_deploy: HashMap<RunId, scarab_engine::DeployContext>,
     /// Deploy Runs (ADR-0074 §2) → their Steps marked `deploy: true`.
@@ -1322,6 +1323,33 @@ impl Db for InMemoryDb {
 
     async fn run_ir(&self, run: &RunId) -> Result<Option<serde_json::Value>, DbError> {
         Ok(self.state.lock().unwrap().run_ir.get(run).cloned())
+    }
+
+    async fn set_run_event_facts(
+        &self,
+        run: &RunId,
+        facts: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), DbError> {
+        self.state
+            .lock()
+            .unwrap()
+            .run_event_facts
+            .insert(run.clone(), facts.clone());
+        Ok(())
+    }
+
+    async fn run_event_facts(
+        &self,
+        run: &RunId,
+    ) -> Result<serde_json::Map<String, serde_json::Value>, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .run_event_facts
+            .get(run)
+            .cloned()
+            .unwrap_or_default())
     }
 
     async fn set_run_params(
@@ -2952,11 +2980,30 @@ pub struct FakeForge {
     /// [`registry_credential`](ForgePort::registry_credential) call. A test
     /// asserts a refused launch reached neither.
     credential_calls: Mutex<usize>,
+    /// Whether this forge mints a short-lived token per request, like GitHub
+    /// App mode (ADR-0076 §9). `false` (default) models a Forgejo or PAT
+    /// connection: one long-lived token, no write mint, nothing to revoke.
+    mints: Mutex<bool>,
+    /// The tokens [`revoke_credential`](ForgePort::revoke_credential) ended.
+    revoked: Mutex<Vec<String>>,
 }
 
 impl FakeForge {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A forge that mints short-lived repository tokens (GitHub App mode):
+    /// each mint returns a new token, a write mint is possible, and tokens
+    /// are revoked.
+    pub fn with_minted_tokens(self) -> Self {
+        *self.mints.lock().unwrap() = true;
+        self
+    }
+
+    /// The tokens revoked so far, in order.
+    pub fn revoked(&self) -> Vec<String> {
+        self.revoked.lock().unwrap().clone()
     }
 
     /// How many checkout or registry credentials were asked for.
@@ -3421,15 +3468,59 @@ impl ForgePort for FakeForge {
         repo: &RepoRef,
         read_only: bool,
     ) -> Result<CheckoutCredential, ForgeError> {
-        *self.credential_calls.lock().unwrap() += 1;
+        let n = {
+            let mut calls = self.credential_calls.lock().unwrap();
+            *calls += 1;
+            *calls
+        };
         // Deterministic fake credential: scoped to the repo, short TTL,
-        // read-only honored verbatim (the contract forbids widening it).
+        // read-only honored verbatim (the contract forbids widening it). A
+        // minting forge returns a new token each time; a long-lived one the
+        // same token.
+        let token = if *self.mints.lock().unwrap() {
+            format!("fake-token-{}-{}-{n}", repo.owner, repo.name)
+        } else {
+            format!("fake-token-{}-{}", repo.owner, repo.name)
+        };
         Ok(CheckoutCredential {
             username: "x-access-token".into(),
-            token: format!("fake-token-{}-{}", repo.owner, repo.name),
+            token,
             expires_at: 9_999_999_999_999,
             read_only,
         })
+    }
+
+    async fn mints_repo_tokens(&self, _repo: &RepoRef) -> Result<bool, ForgeError> {
+        Ok(*self.mints.lock().unwrap())
+    }
+
+    async fn mint_write_credential(
+        &self,
+        repo: &RepoRef,
+    ) -> Result<CheckoutCredential, ForgeError> {
+        if !*self.mints.lock().unwrap() {
+            return Err(ForgeError::Unsupported(
+                "this forge hands out one long-lived token".into(),
+            ));
+        }
+        let n = {
+            let mut calls = self.credential_calls.lock().unwrap();
+            *calls += 1;
+            *calls
+        };
+        Ok(CheckoutCredential {
+            username: "x-access-token".into(),
+            token: format!("fake-write-token-{}-{}-{n}", repo.owner, repo.name),
+            expires_at: 9_999_999_999_999,
+            read_only: false,
+        })
+    }
+
+    async fn revoke_credential(&self, _repo: &RepoRef, token: &str) -> Result<(), ForgeError> {
+        if *self.mints.lock().unwrap() {
+            self.revoked.lock().unwrap().push(token.to_string());
+        }
+        Ok(())
     }
 
     async fn list_collaborators(

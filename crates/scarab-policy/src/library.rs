@@ -159,6 +159,45 @@ pub struct OrgLibraryDefaults {
     pub updated_at: i64,
 }
 
+/// A library source an org trusts with long-lived forge credentials
+/// (ADR-0076 §9). Keyed by the source without its commit ([`trust_key`]), so
+/// trust carries across upgrades from the same source.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustedSource {
+    pub org: String,
+    /// `<host>/<owner>/<repo>//<path>`, no `@<commit>`.
+    pub source: String,
+    pub trusted_by: String,
+    pub trusted_at: i64,
+    /// The StepUpConfirmation that approved it, when one was needed.
+    pub step_up_ref: Option<String>,
+}
+
+/// What an org's trust in a library source is keyed by: the source without
+/// its `@<commit>` (ADR-0076 §9), so an upgrade from the same source keeps
+/// it.
+pub fn trust_key(source: &str) -> &str {
+    match source.rsplit_once('@') {
+        Some((path, commit)) if !commit.contains('/') => path,
+        _ => source,
+    }
+}
+
+/// Whether a stored version is the first-party clone library (ADR-0076 §5,
+/// §9): content listed in a Scarab release manifest, read from a file named
+/// `clone.yaml` (a manifest names each library after its file). The org
+/// trusts it with long-lived forge credentials by default, wherever the copy
+/// was fetched from.
+pub fn is_first_party_clone(v: &LibraryVersion) -> bool {
+    v.first_party
+        && v.source
+            .split("//")
+            .nth(1)
+            .map(trust_key)
+            .and_then(|path| path.rsplit('/').next())
+            == Some("clone.yaml")
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum LibraryStoreError {
     /// No such version in the org (for an install or a yank).
@@ -262,6 +301,30 @@ pub trait LibraryStore: Send + Sync {
 
     /// Replaces the org's defaults record.
     async fn set_defaults(&self, d: &OrgLibraryDefaults) -> Result<(), LibraryStoreError>;
+
+    /// The sources the org trusts with long-lived forge credentials
+    /// (ADR-0076 §9), by source. A store that keeps none trusts none, which
+    /// only ever refuses more.
+    async fn trusted_sources(&self, _org: &str) -> Result<Vec<TrustedSource>, LibraryStoreError> {
+        Ok(Vec::new())
+    }
+
+    /// Trusts a source ([`trust_key`] form). Trusting a trusted source keeps
+    /// the first record and returns it.
+    async fn trust_source(&self, _t: &TrustedSource) -> Result<TrustedSource, LibraryStoreError> {
+        Err(LibraryStoreError::Store(
+            "this library store does not keep trusted sources".into(),
+        ))
+    }
+
+    /// Stops trusting a source; the record removed, or `None`.
+    async fn untrust_source(
+        &self,
+        _org: &str,
+        _source: &str,
+    ) -> Result<Option<TrustedSource>, LibraryStoreError> {
+        Ok(None)
+    }
 }
 
 /// The `lib:` content hashes in an `origin` chain.
@@ -371,6 +434,41 @@ mod tests {
             &"a".repeat(64),
         )];
         assert!(yank_refusals("step `x`", &origin, &[yank(&"a".repeat(64), "r")]).is_empty());
+    }
+
+    #[test]
+    fn trust_is_keyed_by_the_source_without_its_commit() {
+        assert_eq!(
+            trust_key("github.com/acme/libs//ci/git.yaml@0123abcd"),
+            "github.com/acme/libs//ci/git.yaml"
+        );
+        assert_eq!(trust_key("github.com/acme/libs//git.yaml"), "github.com/acme/libs//git.yaml");
+    }
+
+    #[test]
+    fn the_first_party_clone_is_first_party_content_from_clone_yaml() {
+        let v = |first_party: bool, source: &str| LibraryVersion {
+            org: "acme".into(),
+            content_hash: "a".repeat(64),
+            content: String::new(),
+            source: source.into(),
+            publisher: "thulasi-ram".into(),
+            name: "clone".into(),
+            first_party,
+            fetched_by: "u".into(),
+            fetched_at: 0,
+        };
+        let src = "github.com/thulasi-ram/scarab-ci//libs/clone.yaml@1111";
+        assert!(is_first_party_clone(&v(true, src)));
+        assert!(is_first_party_clone(&v(
+            true,
+            "git.example.com/mirrors/scarab-ci//libs/clone.yaml@1111"
+        )));
+        assert!(!is_first_party_clone(&v(false, src)), "not first-party");
+        assert!(!is_first_party_clone(&v(
+            true,
+            "github.com/thulasi-ram/scarab-ci//libs/deploy.yaml@1111"
+        )));
     }
 
     #[test]

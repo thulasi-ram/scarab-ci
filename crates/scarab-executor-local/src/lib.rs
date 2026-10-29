@@ -177,13 +177,15 @@ impl Executor for LocalExecutor {
             }
         }
 
-        // Clone steps run the canonical scarab-clone image with tmpfs token
-        // delivery (ADR-0045) — a Pod-shaped contract the host-process backend
-        // cannot honor. Fail with direction, never a silent no-source run.
-        if spec.clone.is_some() {
+        // A forge credential is delivered as files on a tmpfs Secret volume
+        // mounted into one container (ADR-0076 §9). A host process has no
+        // such boundary: refuse with direction, never run without it or with
+        // the token where other processes can read it.
+        if spec.forge_token.is_some() {
             return Err(ExecError::Launch(
-                "clone steps require the k8s executor (scarab-clone image + tmpfs \
-                 credential delivery, ADR-0045); the local backend has no clone support"
+                "a step with `forge_token` requires the k8s executor (the token is mounted as \
+                 files into the step's own container, ADR-0076 §9); the local backend cannot \
+                 deliver it"
                     .into(),
             ));
         }
@@ -200,7 +202,7 @@ impl Executor for LocalExecutor {
         // in the step's Pod (localhost-reachable, restricted baseline). The
         // host-process backend runs a bare command, not a container image, so it
         // cannot honor a sidecar — fail with direction, never a silent no-service
-        // run. Same Pod-shaped contract as clone/build above.
+        // run. Same Pod-shaped contract as forge_token/build above.
         if !spec.services.is_empty() {
             return Err(ExecError::Launch(
                 "sidecar services require the k8s executor (a co-located container in \

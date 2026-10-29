@@ -50,7 +50,7 @@ async fn crash_mid_run_resumes_and_runs_step_exactly_once() {
         workspace_inputs: vec![],
         workspace_outputs: vec![],
         cache: None,
-        clone: None,
+        forge_token: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],

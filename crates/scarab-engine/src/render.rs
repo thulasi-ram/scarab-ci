@@ -51,7 +51,18 @@ pub async fn render_launch_spec(
             }
         }
     }
+    // A spec stored as a `clone` Step, a kind ADR-0076 §9 removed, decodes
+    // with no image and nothing to run instead.
+    if spec.image.is_empty() && spec.build.is_none() {
+        return Ok(Err(
+            "this Step has no image to run: it was stored as a `clone` Step, a kind this \
+             server no longer runs (ADR-0076 §9); start a new Run, which checks out with \
+             `invoke: lib:thulasi-ram/clone`"
+                .to_string(),
+        ));
+    }
     let params = db.run_params(run).await?;
+    let event = db.run_event_facts(run).await?;
     let has_template = spec.image.contains("${{")
         || spec.command.iter().any(|c| c.contains("${{"))
         || spec.env.iter().any(|(_, v)| v.contains("${{"));
@@ -83,6 +94,7 @@ pub async fn render_launch_spec(
         scarab_pipeline::Facts::Launch {
             params: &params,
             results: &results,
+            event: &event,
         },
     );
     Ok(rendered.map(|r| StepSpec {

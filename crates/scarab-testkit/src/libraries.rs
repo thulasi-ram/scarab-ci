@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use scarab_pipeline::InstalledLibrary;
 use scarab_policy::library::{
     DefaultsState, LibraryInstallation, LibraryStore, LibraryStoreError, LibraryVersion,
-    LibraryYank, NewInstallation, OrgLibraryDefaults, Replaces,
+    LibraryYank, NewInstallation, OrgLibraryDefaults, Replaces, TrustedSource,
 };
 
 #[derive(Default)]
@@ -24,6 +24,8 @@ struct State {
     /// (org, hash) of every version installed at least once.
     installed_once: BTreeSet<(String, String)>,
     defaults: BTreeMap<String, OrgLibraryDefaults>,
+    /// (org, source) → trust.
+    trusted: BTreeMap<(String, String), TrustedSource>,
 }
 
 impl State {
@@ -288,5 +290,41 @@ impl LibraryStore for InMemoryLibraries {
             .defaults
             .insert(d.org.clone(), d.clone());
         Ok(())
+    }
+
+    async fn trusted_sources(&self, org: &str) -> Result<Vec<TrustedSource>, LibraryStoreError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .trusted
+            .iter()
+            .filter(|((o, _), _)| o == org)
+            .map(|(_, t)| t.clone())
+            .collect())
+    }
+
+    async fn trust_source(&self, t: &TrustedSource) -> Result<TrustedSource, LibraryStoreError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .trusted
+            .entry((t.org.clone(), t.source.clone()))
+            .or_insert_with(|| t.clone())
+            .clone())
+    }
+
+    async fn untrust_source(
+        &self,
+        org: &str,
+        source: &str,
+    ) -> Result<Option<TrustedSource>, LibraryStoreError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .trusted
+            .remove(&(org.to_string(), source.to_string())))
     }
 }
