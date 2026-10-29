@@ -447,6 +447,7 @@ impl AppState {
         AdmissionPorts {
             governance: self.environment_governance.as_deref(),
             policies: self.policies.as_deref(),
+            libraries: self.libraries.as_deref(),
             links: self.actor_links(),
         }
     }
@@ -2122,7 +2123,10 @@ async fn pipeline_interface(
             .map_err(DispatchError::Forge)?
             .sha;
         let (_, yaml) = read_named_pipeline(forge, &repo, &sha, &name).await?;
-        let ir = prefetch_libs_and_compile(forge, &repo, &sha, &yaml).await?;
+        let installed = installed_libraries(st.libraries.as_deref(), &repo.owner)
+            .await
+            .map_err(DispatchError::Db)?;
+        let ir = prefetch_libs_and_compile(forge, &repo, &sha, &yaml, &installed).await?;
         Ok::<_, DispatchError>(PipelineInterfaceResponse {
             sha,
             manual: ir.triggers.0.contains_key("manual"),
@@ -4244,6 +4248,10 @@ pub struct AdmissionPorts<'a> {
     /// Stored Policies (ADR-0075), consulted at `run.create`. `None`: no
     /// Policy is consulted and no decision recorded.
     pub policies: Option<&'a dyn scarab_policy::store::PolicyStore>,
+    /// The org's installed libraries (ADR-0076): compiling resolves `lib:`
+    /// against them, and admission refuses a yanked version. `None`: no
+    /// `lib:` target resolves, and nothing is checked for yanks.
+    pub libraries: Option<&'a dyn scarab_policy::library::LibraryStore>,
     /// What links a webhook actor to a Principal (ADR-0069) for the
     /// `run.create` input. Unset: a webhook Run has no `principal`.
     pub links: ActorLinks<'a>,
@@ -4317,8 +4325,18 @@ impl<'a> AdmissionPorts<'a> {
         AdmissionPorts {
             governance,
             policies: None,
+            libraries: None,
             links: ActorLinks::default(),
         }
+    }
+
+    /// The same ports, resolving `lib:` against `libraries` (ADR-0076).
+    pub fn with_libraries(
+        mut self,
+        libraries: &'a dyn scarab_policy::library::LibraryStore,
+    ) -> Self {
+        self.libraries = Some(libraries);
+        self
     }
 
     /// The same ports, consulting `policies` at `run.create`.
@@ -4393,6 +4411,10 @@ pub async fn trigger_runs_from_event(
     let ctx = event.context();
     let kind = event.trigger_kind();
     let mut outcome = TriggerOutcome::default();
+    // The org's installed libraries, read once for the whole delivery.
+    let installed = installed_libraries(ports.libraries, &repo.owner)
+        .await
+        .map_err(TriggerError::Db)?;
     for path in &paths {
         let bytes = match forge.read_file_at_ref(repo, &git_ref, path).await {
             Ok(b) => b,
@@ -4410,7 +4432,7 @@ pub async fn trigger_runs_from_event(
         // Pre-fetch transitive `invoke:` libraries at this ref and compile
         // (ADR-0038) — the shared read-at-ref → compile primitive also used by
         // the manual/api dispatch path.
-        let ir = prefetch_libs_and_compile(forge, repo, &git_ref, &yaml).await?;
+        let ir = prefetch_libs_and_compile(forge, repo, &git_ref, &yaml, &installed).await?;
 
         let matched = scarab_pipeline::matches_trigger(&ir, kind.as_str(), &ctx)
             .map_err(|e| TriggerError::Pipeline(e.to_string()))?;
@@ -4504,6 +4526,9 @@ pub async fn trigger_runs_from_event(
 /// compile). A library that vanished between list and read surfaces as a compile
 /// diagnostic ("no library found at …"), not a fetch error.
 ///
+/// `lib:` targets resolve against `installed`, the org's installed libraries
+/// ([`installed_libraries`]); nothing is fetched for them (ADR-0076 §1).
+///
 /// Shared by [`trigger_run_from_event`] (looping over discovered pipelines) and
 /// [`dispatch_run`] (one named pipeline) so both produce byte-identical IR.
 async fn prefetch_libs_and_compile(
@@ -4511,6 +4536,7 @@ async fn prefetch_libs_and_compile(
     repo: &scarab_forge::RepoRef,
     read_ref: &str,
     yaml: &str,
+    installed: &std::collections::BTreeMap<String, scarab_pipeline::InstalledLibrary>,
 ) -> Result<scarab_pipeline::PipelineIr, TriggerError> {
     let mut libs = std::collections::BTreeMap::new();
     let mut seen = std::collections::BTreeSet::new();
@@ -4529,7 +4555,11 @@ async fn prefetch_libs_and_compile(
             Err(e) => return Err(TriggerError::Forge(e)),
         }
     }
-    let ir = scarab_pipeline::compile_yaml_with_libs(yaml, &libs)
+    let libraries = scarab_pipeline::Libraries {
+        files: libs,
+        installed: installed.clone(),
+    };
+    let ir = scarab_pipeline::compile_with_libraries(yaml, &libraries)
         .map_err(|e| TriggerError::Pipeline(e.to_string()))?;
     // Non-fatal lint diagnostics (ADR-0045), surfaced on the compile path —
     // warnings only, never failures.
@@ -4537,6 +4567,22 @@ async fn prefetch_libs_and_compile(
         tracing::warn!(lint = %warning, "pipeline lint");
     }
     Ok(ir)
+}
+
+/// What `lib:` resolves to in `org` (ADR-0076 §4): its installed libraries,
+/// or none when no library store is wired. A store failure is an error, so
+/// a Pipeline is never compiled as if a library were not installed.
+pub(crate) async fn installed_libraries(
+    libraries: Option<&dyn scarab_policy::library::LibraryStore>,
+    org: &str,
+) -> Result<std::collections::BTreeMap<String, scarab_pipeline::InstalledLibrary>, DbError> {
+    match libraries {
+        Some(l) => l
+            .installed_for_compile(org)
+            .await
+            .map_err(|e| DbError::Other(format!("library store: {e}"))),
+        None => Ok(Default::default()),
+    }
 }
 
 /// Why admission refused to create a Deploy Run. Every refusal is decided
@@ -5338,7 +5384,10 @@ pub async fn dispatch_run(
 
     // Compile at the resolved commit (transitive `invoke:` libraries pre-fetched
     // there) — the shared read-at-ref → compile primitive.
-    let ir = prefetch_libs_and_compile(forge, &repo, &sha, &yaml).await?;
+    let installed = installed_libraries(ports.libraries, &repo.owner)
+        .await
+        .map_err(DispatchError::Db)?;
+    let ir = prefetch_libs_and_compile(forge, &repo, &sha, &yaml, &installed).await?;
 
     // Build the repo+ref-aware event: the config is read/pinned at the resolved
     // commit (`sha`), while allowed_refs (ADR-0037) matches the *symbolic* ref the

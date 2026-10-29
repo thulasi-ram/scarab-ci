@@ -1,9 +1,10 @@
 //! `scarab validate <file> [--server URL --org O --project P]`.
 //!
 //! Offline, it compiles the Pipeline file with the same compiler the server
-//! runs, after reading every library it invokes (transitively) from the
-//! repository on disk, so a Pipeline with `invoke:` compiles without a
-//! server.
+//! runs, after reading every `file:` library it invokes (transitively) from
+//! the repository on disk, so a Pipeline with `invoke:` compiles without a
+//! server. A `lib:` library is installed on the server: offline it is
+//! reported as unresolved and the rest is checked.
 //!
 //! With `--server`, it also asks the server's policy test API
 //! (`POST /v1/orgs/{org}/policy-test`, ADR-0075 §2 and §9) what the
@@ -159,8 +160,26 @@ pub fn read_sources(file: &str) -> Result<Sources, i32> {
 }
 
 /// Compile `sources`. Errors print one diagnostic per line.
+///
+/// A `lib:` target is a library installed in an org on the server, which an
+/// offline check cannot see (ADR-0076 §4). Each one is reported as
+/// unresolved and stood in for, so the rest of the Pipeline is still
+/// checked; with `--server`, the server compiles it against the org's
+/// installed libraries.
 pub fn compile(sources: &Sources) -> Result<scarab_pipeline::PipelineIr, ()> {
-    match scarab_pipeline::compile_yaml_with_libs(&sources.yaml, &sources.libs) {
+    let all =
+        std::iter::once(sources.yaml.as_str()).chain(sources.libs.values().map(String::as_str));
+    let installed = scarab_pipeline::unresolved_library_stubs(all, &BTreeMap::new());
+    for name in installed.keys() {
+        println!(
+            "unresolved: `lib:{name}` is installed on the server, not on disk; its Steps were              not checked (use --server to check them)"
+        );
+    }
+    let libraries = scarab_pipeline::Libraries {
+        files: sources.libs.clone(),
+        installed,
+    };
+    match scarab_pipeline::compile_with_libraries(&sources.yaml, &libraries) {
         Ok(ir) => Ok(ir),
         Err(scarab_pipeline::PipelineError::Validation(diags)) => {
             for d in diags {

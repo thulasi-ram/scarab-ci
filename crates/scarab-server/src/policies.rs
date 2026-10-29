@@ -1261,8 +1261,16 @@ async fn pipeline_input(
         name: p.project.clone(),
     };
     let event = test_event(p.trigger, repo.clone(), caller)?;
-    let (yaml, libs) = (p.yaml, p.libs);
-    let ir = blocking(move || scarab_pipeline::compile_yaml_with_libs(&yaml, &libs))
+    // `lib:` resolves against the org's installations, as at admission.
+    let installed = crate::installed_libraries(st.libraries.as_deref(), org)
+        .await
+        .map_err(ApiError::Db)?;
+    let libraries = scarab_pipeline::Libraries {
+        files: p.libs,
+        installed,
+    };
+    let yaml = p.yaml;
+    let ir = blocking(move || scarab_pipeline::compile_with_libraries(&yaml, &libraries))
         .await?
         .map_err(|e| ApiError::BadRequest(format!("the Pipeline does not compile: {e}")))?;
 

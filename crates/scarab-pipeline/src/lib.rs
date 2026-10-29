@@ -1473,6 +1473,84 @@ pub fn is_library(yaml: &str) -> bool {
     serde_yaml::from_str::<ShallowKind>(yaml).is_ok_and(|k| k.kind == Some(PipelineKind::Library))
 }
 
+/// For a check with no server (`scarab validate` offline): a stand-in for
+/// each `lib:` target that `sources` (the Pipeline and its `file:`
+/// libraries) invoke and `installed` does not have. A stand-in declares the
+/// inputs the callers pass, as optional strings, and a Step for each output
+/// they read (an exposed output names a library Step), so the rest of the
+/// Pipeline can be checked; what the library itself
+/// checks is not. The names of the targets stood in for are the keys.
+pub fn unresolved_library_stubs<'a>(
+    sources: impl IntoIterator<Item = &'a str>,
+    installed: &BTreeMap<String, InstalledLibrary>,
+) -> BTreeMap<String, InstalledLibrary> {
+    // name -> (input names, output names)
+    let mut wanted: BTreeMap<String, (BTreeSet<String>, BTreeSet<String>)> = BTreeMap::new();
+    for src in sources {
+        let Ok(authored) = serde_yaml::from_str::<PipelineIr>(src) else {
+            continue;
+        };
+        for step in &authored.steps {
+            let Some(Ok(InvokeTarget::Lib(name))) = step.invoke.as_deref().map(parse_invoke_target)
+            else {
+                continue;
+            };
+            if installed.contains_key(&name) {
+                continue;
+            }
+            let entry = wanted.entry(name).or_default();
+            entry.0.extend(step.with.keys().cloned());
+            // `outputs.<invoke id>.<name>` read anywhere in the file.
+            let needle = format!("outputs.{}.", step.id);
+            let mut rest = src;
+            while let Some(at) = rest.find(&needle) {
+                rest = &rest[at + needle.len()..];
+                let out: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                    .collect();
+                if !out.is_empty() {
+                    entry.1.insert(out);
+                }
+            }
+        }
+    }
+    wanted
+        .into_iter()
+        .map(|(name, (inputs, outputs))| {
+            // An exposed output names a library Step.
+            let image = format!("unresolved.invalid/library@sha256:{}", "0".repeat(64));
+            let ids: Vec<&str> = if outputs.is_empty() {
+                vec!["unresolved"]
+            } else {
+                outputs.iter().map(String::as_str).collect()
+            };
+            let steps: Vec<serde_json::Value> = ids
+                .iter()
+                .map(|id| serde_json::json!({ "id": id, "image": image }))
+                .collect();
+            let stub = serde_json::json!({
+                "kind": "library",
+                "interface": {
+                    "inputs": inputs.iter().map(|i| serde_json::json!({
+                        "name": i, "type": "string", "required": false, "default": ""
+                    })).collect::<Vec<_>>(),
+                    "outputs": outputs,
+                },
+                "steps": steps,
+            });
+            let content = serde_yaml::to_string(&stub).unwrap_or_default();
+            (
+                name,
+                InstalledLibrary {
+                    content,
+                    source: String::new(),
+                },
+            )
+        })
+        .collect()
+}
+
 /// Check that `content` can be installed as `lib:<qualified>` (ADR-0076 §4):
 /// it is a library (`kind: library`, no `on:`), it is closed (it invokes only
 /// `lib:` and `plugin:` targets), every `lib:` it invokes is in `installed`,
