@@ -46,7 +46,10 @@ fn map(v: Value) -> BTreeMap<String, Value> {
     serde_json::from_value(v).unwrap()
 }
 
-/// The engine at launch: the one renderer, in the Step's scope.
+/// The engine at launch: the one renderer, in the Step's scope. A probe
+/// whose `command` is a list of values (its first is not a program) renders
+/// them as the arguments of `echo`, which the result leaves out: a value
+/// from outside may not name the program.
 fn launch(
     spec: &StepSpec,
     params: Value,
@@ -54,10 +57,16 @@ fn launch(
 ) -> Result<scarab_pipeline::Rendered, String> {
     let params = map(params);
     let results: Results = serde_json::from_value(outputs).unwrap();
+    let probe = spec.command.first().is_some_and(|c| c.starts_with("${{"));
+    let command: Vec<String> = probe
+        .then(|| "echo".to_string())
+        .into_iter()
+        .chain(spec.command.iter().cloned())
+        .collect();
     render(
         Templates {
             image: &spec.image,
-            command: &spec.command,
+            command: &command,
             env: &spec.env,
         },
         spec.scope.as_ref(),
@@ -67,6 +76,12 @@ fn launch(
             results: &results,
         },
     )
+    .map(|mut r| {
+        if probe {
+            r.command.remove(0);
+        }
+        r
+    })
 }
 
 fn all_text(r: &scarab_pipeline::Rendered) -> String {

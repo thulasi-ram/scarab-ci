@@ -423,15 +423,25 @@ Each `${{ … }}` is rendered once, when the step launches, and its value is dat
 reads a `${{` inside a value again. Where you put a value decides what it can do.
 
 **In a `command` argument or an `env` value**, the value is passed as it is, with no quoting
-needed. The one exception: a value from outside the pipeline may not start an argument with `-`.
-A program reads such an argument as an option, so `git fetch origin ${{ inputs.ref }}` with the
-value `--upload-pack=touch /tmp/x` would run a command. The step fails before it starts, and the
-error names the template. Write the option in front of the value, or put a `--` argument right
-before it:
+needed. A value from outside the pipeline has two exceptions, and a step that breaks either fails
+before it starts, with an error that names the template:
+
+- It may not start an argument with `-`. A program reads such an argument as an option, so
+  `git fetch origin ${{ inputs.ref }}` with the value `--upload-pack=touch /tmp/x` would run a
+  command. A `--` argument in front does not help: it ends the options of one program, and the
+  value can still reach another one (`sh -c 'git fetch "$1"' -- …`, `npm run lint -- …`). Write
+  the option in front of the value, or pass the value in `env:`.
+- It may not name the program. That is the first thing in `command[0]`, and the program that
+  `env`, `sudo`, `timeout`, `nice`, `nohup`, `stdbuf`, `setsid`, `exec`, `busybox` or `xargs`
+  runs when one of them comes first, including the command line of `env -S`. Write the program
+  in the pipeline and pass the value to it.
 
 ```yaml
-- { id: fetch, image: alpine/git, command: ["git", "fetch", "origin", "--", "${{ inputs.ref }}"] }
 - { id: ship, image: deployer, command: ["deploy", "--ref=${{ inputs.ref }}"] }
+- id: fetch
+  image: alpine/git
+  env: [[REF, "${{ inputs.ref }}"]]
+  command: ["sh", "-c", 'git fetch origin "refs/heads/$REF"']
 ```
 
 **In a script**, the value becomes part of the code. This covers the script of `sh -c` (and

@@ -19,6 +19,7 @@
 //! `when:` guards are kept as raw CEL strings; binding/evaluation of CEL lives in
 //! the [`cel`] submodule and is wired up by a later slice.
 
+mod argv;
 pub mod cel;
 pub mod oci;
 pub mod params;
@@ -3460,6 +3461,10 @@ struct ScriptFlags {
     long_takes_arg: &'static [&'static str],
     /// Short options after which no script follows (`python -m`).
     stop: &'static [char],
+    /// Whether a short option's argument may be written in its own group
+    /// (`python -c'…'`). `node` reads none so: `-pe` is `-p -e`, and the
+    /// script is the next argument.
+    attached: bool,
 }
 
 const PYTHON: ScriptFlags = ScriptFlags {
@@ -3468,6 +3473,7 @@ const PYTHON: ScriptFlags = ScriptFlags {
     takes_arg: &['W', 'X'],
     long_takes_arg: &[],
     stop: &['m'],
+    attached: true,
 };
 const NODE: ScriptFlags = ScriptFlags {
     script: &['e', 'p'],
@@ -3481,6 +3487,7 @@ const NODE: ScriptFlags = ScriptFlags {
         "--experimental-loader",
     ],
     stop: &[],
+    attached: false,
 };
 const PERL: ScriptFlags = ScriptFlags {
     script: &['e', 'E'],
@@ -3488,6 +3495,7 @@ const PERL: ScriptFlags = ScriptFlags {
     takes_arg: &['I', 'M', 'm', 'i', 'x', 'd', 'D'],
     long_takes_arg: &[],
     stop: &[],
+    attached: true,
 };
 const RUBY: ScriptFlags = ScriptFlags {
     script: &['e'],
@@ -3495,6 +3503,7 @@ const RUBY: ScriptFlags = ScriptFlags {
     takes_arg: &['I', 'r', 'C', 'E', 'F', 'x', 'K', 'W', 'T', '0'],
     long_takes_arg: &[],
     stop: &[],
+    attached: true,
 };
 
 /// The index of the script in an interpreter's command (see
@@ -3530,7 +3539,11 @@ fn flag_script(command: &[String], start: usize, flags: &ScriptFlags) -> Option<
                 return None;
             }
             if flags.script.contains(&c) {
-                return if rest.is_empty() { next(i) } else { Some(i) };
+                return if rest.is_empty() || !flags.attached {
+                    next(i)
+                } else {
+                    Some(i)
+                };
             }
             if flags.takes_arg.contains(&c) {
                 if rest.is_empty() {
@@ -5875,10 +5888,19 @@ mod tests {
     ) -> Result<Rendered, String> {
         let params: BTreeMap<String, serde_json::Value> = serde_json::from_value(params).unwrap();
         let results: Results = serde_json::from_value(results).unwrap();
+        // A probe whose `command` is a list of values renders them as the
+        // arguments of `echo`, left out of the result: a value from outside
+        // may not name the program.
+        let probe = step.command.first().is_some_and(|c| c.starts_with("${{"));
+        let command: Vec<String> = probe
+            .then(|| "echo".to_string())
+            .into_iter()
+            .chain(step.command.iter().cloned())
+            .collect();
         render(
             Templates {
                 image: &step.image,
-                command: &step.command,
+                command: &command,
                 env: &step.env,
             },
             step.scope.as_ref(),
@@ -5888,6 +5910,12 @@ mod tests {
                 results: &results,
             },
         )
+        .map(|mut r| {
+            if probe {
+                r.command.remove(0);
+            }
+            r
+        })
     }
 
     #[test]

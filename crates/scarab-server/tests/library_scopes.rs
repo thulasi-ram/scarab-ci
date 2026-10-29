@@ -114,10 +114,12 @@ impl Driven {
 
 const ON_MANUAL: &str = "on: { manual: {} }\n";
 
-/// A one-Step library whose Step runs `command`.
-fn lib(inputs: &str, command: &str) -> String {
+/// A one-Step library whose Step runs `echo` with `args` (a YAML flow
+/// list): a value from outside may be an argument, never the program.
+fn lib(inputs: &str, args: &str) -> String {
+    let args = args.trim_start_matches('[');
     format!(
-        "kind: library\ninterface: {{ inputs: [{inputs}] }}\nsteps:\n  - {{ id: s, image: busybox, command: {command} }}\n"
+        "kind: library\ninterface: {{ inputs: [{inputs}] }}\nsteps:\n  - {{ id: s, image: busybox, command: [echo, {args} }}\n"
     )
 }
 
@@ -138,7 +140,7 @@ async fn a_literal_reaches_the_library_and_its_params_are_its_own_inputs() {
     )
     .await;
     let launched = d.launched("c/s").expect("launched");
-    assert_eq!(launched.command, ["v1", "1"]);
+    assert_eq!(launched.command, ["echo", "v1", "1"]);
     // `SCARAB_PARAM_*` for a library Step is its own inputs only, never the
     // Run's launch parameters.
     assert_eq!(
@@ -152,7 +154,7 @@ async fn a_caller_template_reads_the_callers_outputs() {
     let pipeline = format!(
         "{ON_MANUAL}steps:\n  - {{ id: build, image: busybox, results: [image] }}\n  - {{ id: c, invoke: file:.scarab/lib/l.yaml, needs: [build], with: {{ img: \"${{{{ outputs.build.image }}}}\" }} }}\n"
     );
-    let l = "kind: library\ninterface: { inputs: [{ name: img, type: string }] }\nsteps:\n  - { id: build, image: busybox, results: [image] }\n  - { id: s, image: \"${{ inputs.img }}\", needs: [build], command: [\"${{ outputs.build.image }}\"] }\n";
+    let l = "kind: library\ninterface: { inputs: [{ name: img, type: string }] }\nsteps:\n  - { id: build, image: busybox, results: [image] }\n  - { id: s, image: \"${{ inputs.img }}\", needs: [build], command: [echo, \"${{ outputs.build.image }}\"] }\n";
     let d = drive(
         &pipeline,
         &[(".scarab/lib/l.yaml", l)],
@@ -167,7 +169,7 @@ async fn a_caller_template_reads_the_callers_outputs() {
     // The caller's `outputs.build` is the caller's Step; the library's
     // `outputs.build` is its own Step of the same name.
     assert_eq!(s.image, "registry/app@sha256:caller");
-    assert_eq!(s.command, ["library-own"]);
+    assert_eq!(s.command, ["echo", "library-own"]);
 }
 
 #[tokio::test]
@@ -184,7 +186,7 @@ async fn a_launch_parameter_passes_through_two_levels() {
         &[],
     )
     .await;
-    assert_eq!(d.command("c/n/s"), ["w-P"]);
+    assert_eq!(d.command("c/n/s"), ["echo", "w-P"]);
     assert_eq!(
         d.launched("c/n/s").unwrap().env,
         [("SCARAB_PARAM_W".to_string(), "w-P".to_string())]
@@ -206,8 +208,8 @@ async fn a_caller_passes_its_coordinate_and_a_library_never_reads_it() {
         &[],
     )
     .await;
-    assert_eq!(d.command("c[os=linux]/s"), ["linux"]);
-    assert_eq!(d.command("c[os=mac]/s"), ["mac"]);
+    assert_eq!(d.command("c[os=linux]/s"), ["echo", "linux"]);
+    assert_eq!(d.command("c[os=mac]/s"), ["echo", "mac"]);
     // The library's `matrix` is its own Step's coordinate, which is empty:
     // reading the caller's fails the Step before it launches.
     assert!(d.launched("peek[os=linux]/s").is_none());
@@ -241,7 +243,7 @@ async fn a_template_is_typed_and_checked_against_validate_at_launch() {
     .await;
     // An exact `${{ e }}` keeps its type: a number does arithmetic, a
     // boolean negates.
-    assert_eq!(d.command("c/s"), ["6", "false"]);
+    assert_eq!(d.command("c/s"), ["echo", "6", "false"]);
     // A value that fails `validate:` fails the Step, as a config failure,
     // before anything launches.
     assert!(d.launched("v/s").is_none());
@@ -260,7 +262,7 @@ async fn a_template_is_typed_and_checked_against_validate_at_launch() {
 #[tokio::test]
 async fn a_parameter_or_result_holding_a_template_stays_text() {
     let pipeline = format!(
-        "{ON_MANUAL}interface: {{ inputs: [{{ name: p, type: string }}] }}\nsteps:\n  - {{ id: b, image: busybox, results: [v] }}\n  - {{ id: c, invoke: file:.scarab/lib/l.yaml, needs: [b], with: {{ p: \"${{{{ inputs.p }}}}\", v: \"${{{{ outputs.b.v }}}}\" }} }}\n  - {{ id: down, image: busybox, needs: [b], command: [\"${{{{ outputs.b.v }}}}\", \"${{{{ inputs.p }}}}\"] }}\n"
+        "{ON_MANUAL}interface: {{ inputs: [{{ name: p, type: string }}] }}\nsteps:\n  - {{ id: b, image: busybox, results: [v] }}\n  - {{ id: c, invoke: file:.scarab/lib/l.yaml, needs: [b], with: {{ p: \"${{{{ inputs.p }}}}\", v: \"${{{{ outputs.b.v }}}}\" }} }}\n  - {{ id: down, image: busybox, needs: [b], command: [echo, \"${{{{ outputs.b.v }}}}\", \"${{{{ inputs.p }}}}\"] }}\n"
     );
     let l = lib(
         "{ name: p, type: string }, { name: v, type: string }",
@@ -274,8 +276,8 @@ async fn a_parameter_or_result_holding_a_template_stays_text() {
         &[("b", json!({ "v": evil }))],
     )
     .await;
-    assert_eq!(d.command("c/s"), [evil, evil]);
-    assert_eq!(d.command("down"), [evil, evil]);
+    assert_eq!(d.command("c/s"), ["echo", evil, evil]);
+    assert_eq!(d.command("down"), ["echo", evil, evil]);
     assert!(d
         .launched("c/s")
         .unwrap()
@@ -307,7 +309,7 @@ async fn a_library_when_reads_its_own_inputs_when_the_run_is_created() {
 #[tokio::test]
 async fn a_pipeline_step_reads_an_invoke_output_through_its_view() {
     let pipeline = format!(
-        "{ON_MANUAL}interface: {{ inputs: [{{ name: p, type: string }}] }}\nsteps:\n  - {{ id: other, image: busybox, results: [o] }}\n  - {{ id: d, invoke: file:.scarab/lib/l.yaml }}\n  - {{ id: notify, image: busybox, needs: [d, other], command: [\"${{{{ outputs.d.url }}}}\", \"${{{{ outputs.other.o }}}}\", \"${{{{ inputs.p }}}}\"] }}\n"
+        "{ON_MANUAL}interface: {{ inputs: [{{ name: p, type: string }}] }}\nsteps:\n  - {{ id: other, image: busybox, results: [o] }}\n  - {{ id: d, invoke: file:.scarab/lib/l.yaml }}\n  - {{ id: notify, image: busybox, needs: [d, other], command: [echo, \"${{{{ outputs.d.url }}}}\", \"${{{{ outputs.other.o }}}}\", \"${{{{ inputs.p }}}}\"] }}\n"
     );
     let l = "kind: library\ninterface: { outputs: [url] }\nsteps:\n  - { id: url, image: busybox, results: [url] }\n  - { id: post, image: busybox, needs: [url] }\n";
     let d = drive(
@@ -321,6 +323,6 @@ async fn a_pipeline_step_reads_an_invoke_output_through_its_view() {
     )
     .await;
     let n = d.launched("notify").expect("launched");
-    assert_eq!(n.command, ["https://svc", "O", "P"]);
+    assert_eq!(n.command, ["echo", "https://svc", "O", "P"]);
     assert_eq!(n.env, [("SCARAB_PARAM_P".to_string(), "P".to_string())]);
 }

@@ -247,7 +247,6 @@ fn survived_matrix_value_naming_an_input_is_not_a_read() {
 /// `git fetch origin --upload-pack=…` runs a command. The script holds no
 /// `${{`, so the script check is silent too.
 #[test]
-#[ignore = "red: render r2"]
 fn dash_dash_exemption_does_not_cover_a_shell_positional() {
     let ir = run_level(&[
         "sh",
@@ -269,7 +268,6 @@ fn dash_dash_exemption_does_not_cover_a_shell_positional() {
 /// <args>` hand `<args>` to the script / binary, which reads `-` as an
 /// option.
 #[test]
-#[ignore = "red: render r2"]
 fn dash_dash_exemption_does_not_cover_forwarded_arguments() {
     let mut launched = Vec::new();
     for cmd in [
@@ -289,7 +287,6 @@ fn dash_dash_exemption_does_not_cover_forwarded_arguments() {
 /// leading-`-` rule refuses a library Step's command: the value is a Run
 /// parameter, known at Run creation, reached through an exact `with:`.
 #[test]
-#[ignore = "red: render r2"]
 fn preview_and_launch_agree_on_leading_dash_through_a_library() {
     let lib = "kind: library\ninterface: { inputs: [{ name: r, type: string }] }\nsteps: [{ id: s, image: alpine/git, command: [git, fetch, origin, \"${{ inputs.r }}\"] }]\n";
     let yaml = "interface: { inputs: [{ name: ref, type: string }] }\nsteps: [{ id: c, invoke: file:l.yaml, with: { r: \"${{ inputs.ref }}\" } }]\n";
@@ -350,7 +347,6 @@ fn an_outside_value_in_a_re_split_argument_is_refused() {
 /// An outside value as the program a Step runs, directly or after a
 /// wrapper. Whoever dispatches the Run chooses the program.
 #[test]
-#[ignore = "red: render r2"]
 fn an_outside_value_may_not_name_the_program() {
     let mut launched = Vec::new();
     for cmd in [
@@ -428,7 +424,6 @@ fn survived_script_check_reads_these_forms() {
 /// `-pe` as `-p` with its script glued on (`e`), so the script it checks
 /// is `-pe` and the next argument, the real script, is not checked.
 #[test]
-#[ignore = "red: render r2"]
 fn script_check_reads_node_pe() {
     let m = missed(&[
         r#"[node, -pe, "${{ inputs.p }}"]"#,
