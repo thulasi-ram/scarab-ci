@@ -629,6 +629,33 @@ mod tests {
     }
 
     #[test]
+    fn a_template_binding_without_a_caller_scope_fails_and_previews_as_text() {
+        let mut scope = library(vec![(
+            "v",
+            ParamType::String,
+            BoundValue::Template("${{ inputs.p }}".into()),
+        )]);
+        scope.caller = None;
+        let e = launch(
+            &["${{ inputs.v }}"],
+            Some(&scope),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &Results::new(),
+        )
+        .unwrap_err();
+        assert!(e.contains("no caller scope"), "{e}");
+        // A preview never fails: what it cannot render stays as written.
+        let p =
+            |image: &str| preview_image(image, Some(&scope), &BTreeMap::new(), &BTreeMap::new());
+        assert_eq!(p("app:${{ inputs.v }}"), "app:${{ inputs.v }}");
+        assert_eq!(
+            p("app:${{ event.x }}-${{ 1 + }}"),
+            "app:${{ event.x }}-${{ 1 + }}"
+        );
+    }
+
+    #[test]
     fn a_preview_renders_only_what_is_known_at_run_creation() {
         let scope = library(vec![
             (

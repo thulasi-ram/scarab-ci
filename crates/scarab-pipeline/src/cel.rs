@@ -696,6 +696,20 @@ mod tests {
     }
 
     #[test]
+    fn json_values_bind_with_their_cel_types() {
+        let ctx =
+            json!({ "n": null, "i": 5, "u": u64::MAX, "f": 1.5, "l": [1], "m": { "k": "v" } });
+        assert_eq!(
+            eval(
+                "[n == null, i + 1 == 6, u > 0u, f > 1.0, l[0] == 1, m.k == 'v']",
+                &ctx
+            )
+            .unwrap(),
+            json!([true, true, true, true, true, true])
+        );
+    }
+
+    #[test]
     fn reads_name_each_variable_and_its_constant_members_by_the_parser() {
         let got = |expr: &str| {
             reads(expr)
