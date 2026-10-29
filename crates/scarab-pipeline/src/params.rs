@@ -235,6 +235,21 @@ pub fn validate_param_specs(specs: &[ParamSpec], label: &str, diagnostics: &mut 
         if let Some(expr) = &p.validate {
             if let Err(e) = cel::check(expr) {
                 diagnostics.push(format!("{label}: parameter `{}` validate {e}", p.name));
+            } else if let Some(Ok(def)) = p.default.as_ref().map(|d| coerce(d, p.r#type)) {
+                // A default must pass its own `validate:`: a launch or an
+                // invoke that omits the parameter would otherwise fail.
+                let ctx = serde_json::json!({ "value": def });
+                match cel::eval_bool(expr, &ctx) {
+                    Ok(true) => {}
+                    Ok(false) => diagnostics.push(format!(
+                        "{label}: parameter `{}` default {def} fails its own validate `{expr}`",
+                        p.name
+                    )),
+                    Err(e) => diagnostics.push(format!(
+                        "{label}: parameter `{}` default {def}: validate {e}",
+                        p.name
+                    )),
+                }
             }
         }
     }

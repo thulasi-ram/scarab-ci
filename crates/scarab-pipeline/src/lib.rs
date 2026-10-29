@@ -1809,6 +1809,7 @@ fn inline_level(
 
         // Interface (ADR-0038): validate the caller's `with:` inputs and the
         // library's declared/exposed outputs at compile — explicit over ambient.
+        let before_interface = diagnostics.len();
         validate_interface(step, &label, &lib, steps, diagnostics);
         // Record exposed outputs for the reference rewrite (ADR-0041). A matrixed
         // invoke's outputs are unaddressable (validate_interface errors on any
@@ -1819,23 +1820,41 @@ fn inline_level(
 
         // The caller's inputs, coerced to their declared types with defaults
         // applied — the same typed resolution the launch path uses
-        // (ADR-0043). `None` when they do not resolve: `validate_interface`
-        // reported why and the compile fails, so nothing is bound or injected.
+        // (ADR-0043). `None` when they do not resolve, and the compile fails,
+        // so nothing is bound or injected. `validate_interface` usually said
+        // why; when it did not, the resolve error is the diagnostic, so the
+        // library is never left unbound without one.
         let supplied: BTreeMap<String, serde_json::Value> = step
             .with
             .iter()
             .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
             .collect();
-        let values = params::resolve_params(&lib.interface, &supplied).ok();
+        let values = match params::resolve_params(&lib.interface, &supplied) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                if diagnostics.len() == before_interface {
+                    let detail = match e {
+                        PipelineError::Validation(lines) => lines.join("; "),
+                        other => other.to_string(),
+                    };
+                    diagnostics.push(format!(
+                        "step `{}`: inputs for library `{label}` do not resolve: {detail}",
+                        step.id
+                    ));
+                }
+                None
+            }
+        };
 
         // Bind the library's `${{ inputs.* }}` to those values (ADR-0076 §1)
         // before inlining its own invokes, so a nested invoke's `with:` that
-        // reads `inputs.*` passes this level's values down.
+        // reads `inputs.*` passes this level's values down. Each bound Step
+        // is then checked with the CEL parser for any `inputs` read left.
         let lib_steps: Vec<StepSpec> = match &values {
             Some(v) => lib
                 .steps
                 .iter()
-                .map(|ls| bind_inputs(ls, v, &label, diagnostics))
+                .map(|ls| bind_library_step(ls, v, &label, diagnostics))
                 .collect(),
             None => lib.steps.clone(),
         };
@@ -2040,6 +2059,131 @@ fn bind_inputs(
     errors.dedup();
     for e in errors {
         diagnostics.push(format!("library `{label}`, step `{}`: {e}", step.id));
+    }
+    out
+}
+
+/// Bind a library Step's inputs with [`bind_inputs`], then check the result
+/// with the CEL parser: no `inputs` read may be left anywhere in the Step
+/// (ADR-0076 §1). The scan in [`cel::input_reads`] decides what to replace; this
+/// check does not rely on it, so a form the scan misses is a compile error
+/// instead of a read of the Run's launch parameters. It also refuses an
+/// `inputs` read in a field that is never interpolated (a sidecar's image or
+/// env, `results`, `artifacts`, `secrets`, cache keys, ...).
+///
+/// A `with:` value may hold the caller's own `${{ … }}`, which is inserted as
+/// text and may read the caller's `inputs`. The check binds a second copy with
+/// those values replaced by plain text, so that only reads written in the
+/// library itself are left to find.
+fn bind_library_step(
+    step: &StepSpec,
+    values: &BTreeMap<String, serde_json::Value>,
+    label: &str,
+    diagnostics: &mut Vec<String>,
+) -> StepSpec {
+    let before = diagnostics.len();
+    let bound = bind_inputs(step, values, label, diagnostics);
+    if diagnostics.len() > before {
+        // Binding failed and the compile fails with its diagnostic.
+        return bound;
+    }
+    let holds_expression = |v: &serde_json::Value| v.as_str().is_some_and(|s| s.contains("${{"));
+    let unread = if values.values().any(holds_expression) {
+        let plain: BTreeMap<String, serde_json::Value> = values
+            .iter()
+            .map(|(k, v)| {
+                let v = if holds_expression(v) {
+                    serde_json::Value::String(String::new())
+                } else {
+                    v.clone()
+                };
+                (k.clone(), v)
+            })
+            .collect();
+        let mut ignored = Vec::new();
+        unbound_input_reads(&bind_inputs(step, &plain, label, &mut ignored))
+    } else {
+        unbound_input_reads(&bound)
+    };
+    for e in unread {
+        diagnostics.push(format!("library `{label}`, step `{}`: {e}", step.id));
+    }
+    bound
+}
+
+/// Every place in a bound library Step that still reads `inputs`, by the
+/// CEL parser: each `${{ … }}` in every string field, and `when:`. An
+/// expression that mentions `inputs` and does not parse is reported too,
+/// since what it reads cannot be checked.
+fn unbound_input_reads(step: &StepSpec) -> Vec<String> {
+    /// The fields [`bind_inputs`] binds.
+    const BOUND: [&str; 4] = ["image", "command", "env", "with"];
+    fn check(expr: &str, field: &str, out: &mut Vec<String>) {
+        // An identifier cannot be escaped in CEL: a read of `inputs` has the
+        // word in its text.
+        if !expr.contains("inputs") {
+            return;
+        }
+        let top = field.split(['.', '[']).next().unwrap_or(field);
+        match cel::reads_variable(expr, "inputs") {
+            Ok(false) => {}
+            Ok(true) if BOUND.contains(&top) || top == "when" => out.push(format!(
+                "`{field}` reads `inputs` in a form the compiler cannot bind; read an input \
+                 as `inputs.<name>`"
+            )),
+            Ok(true) => out.push(format!(
+                "`{field}` reads `inputs`, but `{top}` is not interpolated when the Step \
+                 launches; a library can read its inputs only in image, command, env, when \
+                 and a nested invoke's with:"
+            )),
+            Err(e) => out.push(format!(
+                "`{field}` mentions `inputs` and does not parse, so its reads cannot be \
+                 checked: {e}"
+            )),
+        }
+    }
+    fn walk(value: &serde_json::Value, path: &str, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::String(text) => {
+                let mut rest = text.as_str();
+                while let Some(start) = rest.find("${{") {
+                    let after = &rest[start + 3..];
+                    // An unterminated `${{` is checked to the end of the text.
+                    let end = after.find("}}").unwrap_or(after.len());
+                    check(after[..end].trim(), path, out);
+                    rest = &after[(end + 2).min(after.len())..];
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    walk(item, &format!("{path}[{i}]"), out);
+                }
+            }
+            serde_json::Value::Object(fields) => {
+                for (k, v) in fields {
+                    // `when:` is a whole expression, checked below.
+                    if path.is_empty() && k == "when" {
+                        continue;
+                    }
+                    let key = if path.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{path}.{k}")
+                    };
+                    walk(&serde_json::Value::String(k.clone()), &key, out);
+                    walk(v, &key, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    match serde_json::to_value(step) {
+        Ok(value) => walk(&value, "", &mut out),
+        Err(e) => out.push(format!("cannot be checked for `inputs` reads: {e}")),
+    }
+    if let Some(When(expr)) = &step.when {
+        check(expr, "when", &mut out);
     }
     out
 }
@@ -2264,6 +2408,21 @@ fn validate_interface(
     // Declared param specs must be well-formed (env-safe names, sensible
     // required/default/choice, a parsable `validate:`) — ADR-0043 §2.
     params::validate_param_specs(&iface.inputs, &format!("library `{key}`"), diagnostics);
+    // A default is a plain value. Only the caller's `with:` may hold a
+    // `${{ … }}`: one in a default would be inserted as text and read the
+    // calling Run's launch parameters or outputs at launch.
+    for p in &iface.inputs {
+        if p.default
+            .as_ref()
+            .is_some_and(|d| d.to_string().contains("${{"))
+        {
+            diagnostics.push(format!(
+                "library `{key}`: input `{}` has a default holding `${{{{ … }}}}`; a default \
+                 is a plain value, and only the caller's `with:` may hold an expression",
+                p.name
+            ));
+        }
+    }
 
     // Every required input must be supplied; a supplied value must coerce to the
     // declared type (and be a valid choice / pass `validate:`); no unknown extras.
@@ -4915,6 +5074,86 @@ mod tests {
                 .any(|e| e.contains("reads `outputs.build.image` but does not `needs: [build]`")),
             "{errs:?}"
         );
+    }
+
+    #[test]
+    fn the_parser_check_finds_every_inputs_read_left_in_a_step() {
+        // Checked on the Step as written, with no binding: this is the
+        // check that catches a read the scan in `cel::input_reads` misses.
+        let step: StepSpec = serde_yaml::from_str(
+            r#"
+            id: s
+            image: "${{ .inputs.x }}"
+            command: ["${{ [1].map(inputs, inputs) }}", "${{ 'inputs.x' + matrix.inputs }}"]
+            env: [[A, "${{ inputs. }}"]]
+            when: "x.y || inputs.z"
+            services: [{ image: "${{ 'inputs' }}" }]
+            artifacts: ["${{ inputs.a"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            unbound_input_reads(&step),
+            vec![
+                "`artifacts[0]` reads `inputs`, but `artifacts` is not interpolated when the \
+                 Step launches; a library can read its inputs only in image, command, env, when \
+                 and a nested invoke's with:"
+                    .to_string(),
+                "`command[0]` reads `inputs` in a form the compiler cannot bind; read an input \
+                 as `inputs.<name>`"
+                    .to_string(),
+                format!(
+                    "`env[0][1]` mentions `inputs` and does not parse, so its reads cannot be \
+                     checked: {}",
+                    cel::check("inputs.").unwrap_err()
+                ),
+                "`image` reads `inputs` in a form the compiler cannot bind; read an input as \
+                 `inputs.<name>`"
+                    .to_string(),
+                "`when` reads `inputs` in a form the compiler cannot bind; read an input as \
+                 `inputs.<name>`"
+                    .to_string(),
+            ]
+        );
+        assert!(cel::reads_variable(".inputs", "inputs").unwrap());
+        assert!(!cel::reads_variable("x.inputs", "inputs").unwrap());
+    }
+
+    #[test]
+    fn a_caller_launch_parameter_passes_through_with_as_text() {
+        // In the Pipeline, `inputs` is the Run's: the caller may hand one to
+        // a library, and the check does not mistake it for the library's.
+        let ir = compile_with(
+            r#"
+            interface: { inputs: [{ name: p, type: string }] }
+            steps:
+              - { id: c, invoke: file:l.yaml, with: { v: "${{ inputs.p }}" } }
+            "#,
+            &libs(&[
+                (
+                    "l.yaml",
+                    r#"
+                interface: { inputs: [{ name: v, type: string }] }
+                steps:
+                  - { id: a, image: busybox, command: ["${{ inputs.v }}"] }
+                  - id: n
+                    invoke: file:m.yaml
+                    with: { w: "${{ inputs.v }}" }
+                "#,
+                ),
+                (
+                    "m.yaml",
+                    r#"
+                interface: { inputs: [{ name: w, type: string }] }
+                steps: [{ id: b, image: busybox, command: ["${{ inputs.w }}"] }]
+                "#,
+                ),
+            ]),
+        );
+        for id in ["c/a", "c/n/b"] {
+            let s = ir.steps.iter().find(|s| s.id == id).unwrap();
+            assert_eq!(s.command, vec!["${{ inputs.p }}"], "{id}");
+        }
     }
 
     #[test]

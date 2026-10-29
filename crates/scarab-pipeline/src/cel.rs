@@ -268,7 +268,8 @@ pub(crate) fn interpolations(template: &str) -> Result<Vec<&str>, PipelineError>
 /// One read of the `inputs` variable in a CEL expression (ADR-0076 §1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InputRead {
-    /// Byte range of the read: `inputs.<name>`, or `inputs` alone.
+    /// Byte range of the read: `inputs.<name>`, or `inputs` alone, with the
+    /// leading `.` of a root-qualified read.
     pub start: usize,
     pub end: usize,
     /// `<name>` when read as `inputs.<name>`; `None` for any other use
@@ -276,13 +277,28 @@ pub(crate) struct InputRead {
     pub field: Option<String>,
 }
 
-/// Each read of the top-level `inputs` variable in `expr`, in order. Skips
-/// string literals and `//` comments, and a field that happens to be named
-/// `inputs` (`x.inputs`).
+/// Each read of the top-level `inputs` variable in `expr`, in order: `inputs`
+/// and CEL's root-qualified `.inputs`. Skips string literals and `//`
+/// comments, and a field that happens to be named `inputs` (`x.inputs`).
+/// Whether a `.` selects a field or qualifies a root name depends on the
+/// token before it, which is found by skipping whitespace and comments, never
+/// by reading the text before the `.`.
 pub(crate) fn input_reads(expr: &str) -> Vec<InputRead> {
+    /// The last token outside whitespace, comments and string contents.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Last {
+        /// Start of the expression, an operator or an opening bracket.
+        Other,
+        /// The end of an operand: a name, a number, a literal or a closing
+        /// bracket. A `.` after it selects a field.
+        Operand,
+        /// A `.` at byte `at`; `select` when it follows an operand.
+        Dot { at: usize, select: bool },
+    }
     let b = expr.as_bytes();
     let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
     let mut out = Vec::new();
+    let mut last = Last::Other;
     let mut i = 0;
     while i < b.len() {
         match b[i] {
@@ -291,15 +307,38 @@ pub(crate) fn input_reads(expr: &str) -> Vec<InputRead> {
                     i += 1;
                 }
             }
-            q @ (b'\'' | b'"') => i = skip_string(b, i, q),
+            c if c.is_ascii_whitespace() => i += 1,
+            q @ (b'\'' | b'"') => {
+                i = skip_string(b, i, q);
+                last = Last::Operand;
+            }
+            b'.' => {
+                last = Last::Dot {
+                    at: i,
+                    select: last == Last::Operand,
+                };
+                i += 1;
+            }
+            b')' | b']' | b'}' => {
+                last = Last::Operand;
+                i += 1;
+            }
             c if ident(c) => {
-                let start = i;
+                let mut start = i;
                 while i < b.len() && ident(b[i]) {
                     i += 1;
                 }
-                let after_dot = expr[..start].trim_end().ends_with('.');
-                if &expr[start..i] != "inputs" || after_dot || c.is_ascii_digit() {
+                let before = last;
+                last = Last::Operand;
+                if &expr[start..i] != "inputs" || c.is_ascii_digit() {
                     continue;
+                }
+                match before {
+                    // `x.inputs`: a field, not the variable.
+                    Last::Dot { select: true, .. } => continue,
+                    // `.inputs`: the variable, qualified from the root.
+                    Last::Dot { at, select: false } => start = at,
+                    _ => {}
                 }
                 let mut field = None;
                 if b.get(i) == Some(&b'.') {
@@ -319,10 +358,28 @@ pub(crate) fn input_reads(expr: &str) -> Vec<InputRead> {
                     field,
                 });
             }
-            _ => i += 1,
+            _ => {
+                last = Last::Other;
+                i += 1;
+            }
         }
     }
     out
+}
+
+/// Does `expr` read the variable `name`, as the CEL parser sees it? A
+/// root-qualified read (`.name`) counts. This is the parser's own answer, not
+/// a scan of the text: [`input_reads`] is checked against it, so a form the
+/// scan misses is refused instead of left unbound. An expression that does
+/// not parse is an error.
+pub(crate) fn reads_variable(expr: &str, name: &str) -> Result<bool, PipelineError> {
+    with_program(expr, |program| {
+        Ok(program
+            .references()
+            .variables()
+            .iter()
+            .any(|v| v.strip_prefix('.').unwrap_or(v) == name))
+    })
 }
 
 fn render(v: &serde_json::Value) -> String {
