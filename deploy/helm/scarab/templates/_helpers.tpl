@@ -165,6 +165,20 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end -}}
 
 {{/* Directory the operator placement config (ADR-0055) is projected into. */}}
+{{- define "scarab.libsManifestDir" -}}
+/etc/scarab/libs
+{{- end -}}
+
+{{/* Absolute path of the first-party library manifest — the value of
+     SCARAB_LIBS_MANIFEST (ADR-0076 §5). */}}
+{{- define "scarab.libsManifestPath" -}}
+{{- printf "%s/libs-manifest.json" (include "scarab.libsManifestDir" .) -}}
+{{- end -}}
+
+{{- define "scarab.libsManifestConfigMapName" -}}
+{{- printf "%s-libs-manifest" (include "scarab.fullname" .) -}}
+{{- end -}}
+
 {{- define "scarab.placementDir" -}}
 /etc/scarab/placement
 {{- end -}}

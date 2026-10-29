@@ -75,8 +75,8 @@ data:
   {{- with .Values.scarab.publicUrl }}
   SCARAB_PUBLIC_URL: {{ . | quote }}
   {{- end }}
-  {{- with .Values.scarab.cloneImage }}
-  SCARAB_CLONE_IMAGE: {{ . | quote }}
+  {{- if .Values.scarab.libsManifest }}
+  SCARAB_LIBS_MANIFEST: {{ include "scarab.libsManifestPath" . | quote }}
   {{- end }}
   {{- with .Values.scarab.stepTimeoutSecs }}
   SCARAB_STEP_TIMEOUT_SECS: {{ . | quote }}

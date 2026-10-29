@@ -169,6 +169,14 @@ just local-helm             # pull + deploy the latest ghcr `edge` (pullPolicy A
 just local-helm sha-<sha>   # pull + deploy a specific published SHA
 just local-helm local       # build server+clone+sidecar+wsfetch from the tree, then deploy
 ```
+Checkouts run the clone library (`invoke: lib:thulasi-ram/clone`, ADR-0076 §9),
+and the image is the one the library pins. Each deploy writes a copy of
+`libs/clone.yaml` that pins `SCARAB_CLONE_IMAGE` (`scarab-clone:dogfood` for
+`local`, the ghcr tag otherwise), hands the server a library manifest that lists
+that copy as first-party, and installs it into `SCARAB_ORG`, replacing an earlier
+copy. The install uses the dev-insecure API (`DEV_INSECURE=true`); with auth on,
+install it from Settings → Libraries.
+
 Or drive the script directly (image source then comes from `.env`):
 ```sh
 deploy/local-helm/deploy.sh [image-tag]         # postgres + helm upgrade --install
