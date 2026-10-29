@@ -1290,6 +1290,99 @@ pub async fn offer_defaults_on_bind(st: &AppState, org: &str) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Yank: a PolicyInvariant (ADR-0076 §6, ADR-0075 §7)
+// ---------------------------------------------------------------------------
+
+/// The refusals for every yanked version that `items` (each a thing's
+/// description and its `origin`) use in `org`. Asks the store only when an
+/// origin has a `lib:` link. Empty when nothing is yanked.
+pub async fn yank_refusals_for(
+    store: &dyn LibraryStore,
+    org: &str,
+    items: &[(String, &[scarab_pipeline::OriginEntry])],
+) -> Result<Vec<String>, LibraryStoreError> {
+    let hashes: BTreeSet<String> = items
+        .iter()
+        .flat_map(|(_, o)| scarab_policy::library::library_hashes(o).map(str::to_string))
+        .collect();
+    if hashes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let hashes: Vec<String> = hashes.into_iter().collect();
+    let yanks = store.yanked(org, &hashes).await?;
+    if yanks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for (what, origin) in items {
+        for m in scarab_policy::library::yank_refusals(what, origin, &yanks) {
+            if !out.contains(&m) {
+                out.push(m);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Just the part of a stored IR the yank check reads.
+#[derive(Deserialize)]
+struct StoredIr {
+    #[serde(default)]
+    steps: Vec<StoredStep>,
+}
+
+#[derive(Deserialize)]
+struct StoredStep {
+    id: String,
+    #[serde(default)]
+    origin: Vec<scarab_pipeline::OriginEntry>,
+}
+
+/// The refusal for launching or releasing `step` of `run`, when its stored
+/// `origin` uses a version yanked in the Run's org (ADR-0076 §6). Checked at
+/// every launch and gate release, so a Rerun or Retry of a Run created
+/// before the yank is refused too: a Rerun does not recompile, and the
+/// stored IR keeps the version it ran. `Ok(None)`: not yanked, or no store
+/// is wired, or the Run has no org.
+///
+/// This is where `step.admit` and `gate.resolve` (ADR-0075 §3) will be
+/// consulted; the yank check moves inside them as a PolicyInvariant.
+pub async fn stored_step_yank_refusal(
+    db: &dyn scarab_engine::Db,
+    store: Option<&dyn LibraryStore>,
+    run: &scarab_engine::RunId,
+    step: &str,
+) -> Result<Option<String>, String> {
+    let Some(store) = store else {
+        return Ok(None);
+    };
+    let Some((org, _)) = db.run_tenant(run).await.map_err(|e| e.to_string())? else {
+        return Ok(None);
+    };
+    // Most orgs have no yank: answer without reading the Run's IR.
+    if store
+        .yanks(&org)
+        .await
+        .map_err(|e| format!("library store: {e}"))?
+        .is_empty()
+    {
+        return Ok(None);
+    }
+    let Some(ir) = db.run_ir(run).await.map_err(|e| e.to_string())? else {
+        return Ok(None);
+    };
+    let ir: StoredIr = serde_json::from_value(ir)
+        .map_err(|e| format!("run {}: the stored IR has no readable origin: {e}", run.0))?;
+    let Some(s) = ir.steps.iter().find(|s| s.id == step) else {
+        return Ok(None);
+    };
+    let refusals = yank_refusals_for(store, &org, &[(format!("`{step}`"), &s.origin)])
+        .await
+        .map_err(|e| format!("library store: {e}"))?;
+    Ok((!refusals.is_empty()).then(|| refusals.join("; ")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

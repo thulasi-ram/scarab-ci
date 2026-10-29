@@ -1589,7 +1589,8 @@ impl From<DispatchError> for ApiError {
             // the actionable text, not a malformed request.
             refused @ (DispatchError::UnknownEnvironment { .. }
             | DispatchError::NotEligible { .. }
-            | DispatchError::PolicyDenied { .. }) => ApiError::Denied(refused.to_string()),
+            | DispatchError::PolicyDenied { .. }
+            | DispatchError::LibraryYanked(_)) => ApiError::Denied(refused.to_string()),
             other => ApiError::BadRequest(other.to_string()),
         }
     }
@@ -4512,6 +4513,24 @@ pub async fn trigger_runs_from_event(
                     messages: messages.clone(),
                 });
             }
+            // ADR-0076 §6: a yanked library version, refused whatever the
+            // Policies say.
+            Admission::Refused(ref refusal @ AdmissionRefusal::LibraryYanked { ref messages }) => {
+                let reason = admission_refusal_message(refusal, &repo.owner, &repo.name);
+                tracing::warn!(
+                    org = %repo.owner,
+                    project = %repo.name,
+                    pipeline = %path,
+                    "pipeline not run: {reason}"
+                );
+                outcome.refused.push(RefusedPipeline {
+                    pipeline: path.clone(),
+                    environment: ir.environment.clone(),
+                    reason,
+                    decision_id: None,
+                    messages: messages.clone(),
+                });
+            }
         }
     }
     Ok(outcome)
@@ -4607,6 +4626,10 @@ enum AdmissionRefusal {
         decision_id: String,
         messages: Vec<String>,
     },
+    /// The Run uses a library version yanked in its org (ADR-0076 §6), a
+    /// PolicyInvariant: checked whether or not any Policy exists, and no
+    /// Policy can allow it. Each message names the version and the reason.
+    LibraryYanked { messages: Vec<String> },
 }
 
 /// The outcome of admitting one compiled pipeline (ADR-0037, ADR-0071 §2):
@@ -4801,6 +4824,24 @@ async fn admit_and_create_run(
         Ok(gov) => gov,
         Err(refusal) => return Ok(Admission::Refused(refusal)),
     };
+
+    // ADR-0076 §6: a yanked library version is a PolicyInvariant, checked
+    // before (and whether or not) any Policy is consulted.
+    if let Some(libraries) = ports.libraries {
+        let items: Vec<(String, &[scarab_pipeline::OriginEntry])> = ir
+            .steps
+            .iter()
+            .map(|s| (format!("`{}`", s.id), s.origin.as_slice()))
+            .collect();
+        let messages = libraries::yank_refusals_for(libraries, &repo.owner, &items)
+            .await
+            .map_err(|e| TriggerError::Db(DbError::Other(format!("library store: {e}"))))?;
+        if !messages.is_empty() {
+            return Ok(Admission::Refused(AdmissionRefusal::LibraryYanked {
+                messages,
+            }));
+        }
+    }
 
     let now = clock.now().await;
     let run = new_run_id();
@@ -5218,6 +5259,9 @@ pub enum DispatchError {
         decision_id: String,
         messages: Vec<String>,
     },
+    /// The Run uses a yanked library version (ADR-0076 §6).
+    #[error("{}", library_yanked_message(.0))]
+    LibraryYanked(Vec<String>),
     #[error(transparent)]
     Db(DbError),
 }
@@ -5240,7 +5284,12 @@ fn admission_refusal_message(refusal: &AdmissionRefusal, org: &str, project: &st
             decision_id,
             messages,
         } => policy_denied_message(decision_id, messages),
+        AdmissionRefusal::LibraryYanked { messages } => library_yanked_message(messages),
     }
+}
+
+fn library_yanked_message(messages: &[String]) -> String {
+    format!("this Run uses a yanked library: {}", messages.join("; "))
 }
 
 fn policy_denied_message(decision_id: &str, messages: &[String]) -> String {
@@ -5471,6 +5520,7 @@ pub async fn dispatch_run(
             decision_id,
             messages,
         },
+        AdmissionRefusal::LibraryYanked { messages } => DispatchError::LibraryYanked(messages),
     })
 }
 
@@ -8026,6 +8076,11 @@ async fn approve_gate(
         _ => guard.exempt("no approvers required"),
     }
 
+    // ADR-0076 §6: a gate inlined from a yanked library version neither
+    // takes an approval nor releases. Where `gate.resolve` (ADR-0075 §2)
+    // will be consulted.
+    refuse_yanked_gate(&st, &run, &step).await?;
+
     // 1. Record this principal's approval — append-only, no resume, idempotent
     //    per (step, subject).
     match scarab_engine::record_gate_approval(
@@ -8393,6 +8448,8 @@ async fn release_gate_external(
     // still proceed at all.
     let ctx = st.db.run_deploy_context(&run).await?;
     gate_release_governance(&st, ctx.as_ref(), "the gate cannot release").await?;
+    // ADR-0076 §6: nor does one inlined from a yanked library version.
+    refuse_yanked_gate(&st, &run, &step).await?;
 
     match scarab_engine::release_gate(st.db.as_ref(), st.clock.as_ref(), &run, &step).await {
         Ok(()) => Ok(StatusCode::ACCEPTED),
@@ -8406,6 +8463,20 @@ async fn release_gate_external(
             | RerunError::NotARejectableGate(_)),
         ) => Err(ApiError::Conflict(e.to_string())),
         Err(RerunError::Db(e)) => Err(ApiError::Db(e)),
+    }
+}
+
+/// 409 when gate `step` of `run` was inlined from a library version yanked
+/// in the run's org (ADR-0076 §6), naming the version and the reason.
+async fn refuse_yanked_gate(st: &AppState, run: &RunId, step: &StepId) -> Result<(), ApiError> {
+    match libraries::stored_step_yank_refusal(st.db.as_ref(), st.libraries.as_deref(), run, &step.0)
+        .await
+    {
+        Ok(None) => Ok(()),
+        Ok(Some(refusal)) => Err(ApiError::Conflict(format!(
+            "the gate cannot release: {refusal}"
+        ))),
+        Err(e) => Err(ApiError::Db(DbError::Other(e))),
     }
 }
 
