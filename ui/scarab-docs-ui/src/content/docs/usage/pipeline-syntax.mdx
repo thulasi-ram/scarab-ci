@@ -285,9 +285,9 @@ The target always has a prefix that says where it comes from:
 
 A `file:` path is repo-relative: no leading `/`, no `..`, and no remote or cross-repo forms
 (cross-repo causation is `on: upstream`). A bare path is a compile error that tells you to add
-`file:`, and `url:` is refused: Scarab does not invoke from a URL. Org-installed libraries are not
-available yet, so a `lib:` target compiles only once your org has one installed; until then it
-fails with "`lib:<publisher>/<name>` is not installed in this org".
+`file:`, and `url:` is refused: Scarab does not invoke from a URL. A `lib:` target resolves to the
+version your org installed ([Libraries](/scarab-ci/usage/libraries/)); a name the org has not
+installed fails with "`lib:<publisher>/<name>` is not installed in this org".
 
 A library is a YAML file marked `kind: library`. It has no `on:` triggers and never runs on its
 own: Scarab does not trigger it or list it for dispatch, even directly under `.scarab/`. It
