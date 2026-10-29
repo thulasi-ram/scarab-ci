@@ -864,6 +864,19 @@ pub struct ForgeTokenConfig {
     /// The Run's repository, the only one the credential is for.
     pub owner: String,
     pub name: String,
+    /// The Run is a fork pull request, or is locked out of its
+    /// Environment's secrets: every launch gets `read`, whatever `access`
+    /// says.
+    #[serde(default)]
+    pub read_only: bool,
+    /// The content hash of the library version this Step was written in,
+    /// set when Run creation let the Step hold a long-lived token because
+    /// the org trusts that library. Each launch on a connection that does
+    /// not mint short-lived tokens checks the org still trusts it. `None`:
+    /// the Step may hold only a short-lived token, and a launch on a
+    /// long-lived connection fails.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_library: Option<String>,
     /// The credential minted for this launch — filled at LAUNCH, **never
     /// serialized**. The executor mounts it as the files
     /// `/scarab/secrets/forge-token` and `/scarab/secrets/forge-username`,

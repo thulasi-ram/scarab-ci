@@ -213,12 +213,12 @@ async fn a_repositorys_own_forge_token_step_on_a_long_lived_connection_is_refuse
 #[tokio::test]
 async fn the_first_party_clone_step_gets_the_credential_and_no_env_carries_it() {
     let db = Arc::new(InMemoryDb::new());
-    let libs = with_first_party_clone().await;
+    let libs = Arc::new(with_first_party_clone().await);
     let forge = Arc::new(long_lived(&[(".scarab/ci.yaml", CHECKOUT_YAML)]));
     let out = trigger(
         db.as_ref(),
         forge.as_ref(),
-        AdmissionPorts::default().with_libraries(&libs),
+        AdmissionPorts::default().with_libraries(libs.as_ref()),
         &push(),
     )
     .await;
@@ -234,7 +234,10 @@ async fn the_first_party_clone_step_gets_the_credential_and_no_env_carries_it() 
     assert_eq!(facts["repo"]["clone_url"], "https://github.com/acme/web.git");
 
     let inner = Arc::new(FakeExecutor::new());
-    let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone());
+    // Each launch on a long-lived connection checks the org still trusts
+    // the Step's library, so the launch reads the library store too.
+    let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone())
+        .with_libraries(db.clone(), libs.clone());
     let clock = FakeClock::new(1_000);
     let sched = Scheduler::new(db.as_ref(), &clock as &dyn Clock, &exec, "sched");
     inner.script_outcome(ExecState::Succeeded); // prep

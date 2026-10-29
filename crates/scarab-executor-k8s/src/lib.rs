@@ -9698,6 +9698,8 @@ mod tests {
             access: scarab_pipeline::ForgeToken::Read,
             owner: "acme".into(),
             name: "web".into(),
+            read_only: false,
+            trusted_library: None,
             credential: Some(ForgeCredential {
                 username: "x-access-token".into(),
                 token: "sekret-token".into(),

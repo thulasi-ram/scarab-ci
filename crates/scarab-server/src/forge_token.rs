@@ -6,11 +6,13 @@
 //! `/scarab/secrets/forge-username`, never as an environment variable. The
 //! credential lives **in memory only**: the stored spec carries the access
 //! and the repository, never a token. A minted token is revoked when the
-//! Attempt ends.
+//! Attempt ends, or when a re-drive of the Attempt replaces it.
 //!
 //! Which Steps may have one is decided when the Run is created
 //! ([`forge_token_refusals`]), as fixed checks every Run passes whatever its
-//! Policies say:
+//! Policies say, and checked again when each Attempt launches (a rerun, a
+//! retry and a re-drive included), because the repository's connection and
+//! the org's trust may have changed since:
 //!
 //! - A Step receives a forge credential only when the forge mints a
 //!   short-lived token scoped to the Run's repository (GitHub App mode), or
@@ -26,7 +28,7 @@
 //! The Run's `event` values are fixed here too ([`event_facts`]), including
 //! `event.repo.clone_url`, computed from the connection registry.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -111,9 +113,10 @@ pub struct ForgeTokenAdmission {
     /// Each Step that may not have the credential it asks for, and why.
     pub refusals: Vec<String>,
     /// Steps whose credential is long-lived and allowed only because their
-    /// library is trusted. They consume no workspace, so no file another
-    /// Step wrote (a `.git/config`, a hook) runs while the token is mounted.
-    pub trusted_only: BTreeSet<String>,
+    /// library is trusted, each with that library version's content hash.
+    /// They consume no workspace, so no file another Step wrote (a
+    /// `.git/config`, a hook) runs while the token is mounted.
+    pub trusted_only: BTreeMap<String, String>,
 }
 
 /// Decide each `forge_token` Step of `ir` (see the module docs). `fork` is
@@ -137,14 +140,8 @@ pub async fn forge_token_refusals(
     // A forge that cannot say is treated as handing out a long-lived token:
     // that only ever refuses more.
     let mints = forge.mints_repo_tokens(repo).await.unwrap_or(false);
-    let trusted_sources: BTreeSet<String> = match libraries {
-        Some(l) => l
-            .trusted_sources(org)
-            .await
-            .map_err(|e| format!("library store: {e}"))?
-            .into_iter()
-            .map(|t| t.source)
-            .collect(),
+    let trusted_sources = match libraries {
+        Some(l) => trusted_sources(l, org).await?,
         None => BTreeSet::new(),
     };
     for step in asking {
@@ -152,32 +149,42 @@ pub async fn forge_token_refusals(
         let access = if fork { ForgeToken::Read } else { asked };
         if access == ForgeToken::Write && !mints {
             out.refusals.push(format!(
-                "step `{}` asks for `forge_token: write`, and this repository's forge connection                  hands out one long-lived token, which cannot be narrowed to a write token for                  one Run; only a forge that mints tokens (GitHub App mode) can give one",
+                "step `{}` asks for `forge_token: write`, and this repository's forge connection \
+                 hands out one long-lived token, which cannot be narrowed to a write token for \
+                 one Run; only a forge that mints tokens (GitHub App mode) can give one",
                 step.id
             ));
             continue;
         }
         if !mints {
-            if !trusted_library_step(step, libraries, org, &trusted_sources).await? {
+            let Some(hash) = trusted_library_step(step, libraries, org, &trusted_sources).await?
+            else {
                 out.refusals.push(format!(
-                    "step `{}` asks for `forge_token`, and this repository's forge connection hands                      out one long-lived token, which only a Step from a library the org trusts may                      receive (the first-party `lib:thulasi-ram/clone`, or a source an org admin                      trusted); a repository's own Steps never receive it",
+                    "step `{}` asks for `forge_token`, and this repository's forge connection hands \
+                     out one long-lived token, which only a Step from a library the org trusts may \
+                     receive (the first-party `lib:thulasi-ram/clone`, or a source an org admin \
+                     trusted); a repository's own Steps never receive it",
                     step.id
                 ));
                 continue;
-            }
-            out.trusted_only.insert(step.id.clone());
+            };
+            out.trusted_only.insert(step.id.clone(), hash);
         }
         if access == ForgeToken::Write {
             if !write.restricts_refs {
                 out.refusals.push(format!(
-                    "step `{}` asks for `forge_token: write`, which is allowed only in a Run                      governed by an Environment that restricts the refs it deploys from                      (non-empty allowed refs)",
+                    "step `{}` asks for `forge_token: write`, which is allowed only in a Run \
+                     governed by an Environment that restricts the refs it deploys from \
+                     (non-empty allowed refs)",
                     step.id
                 ));
                 continue;
             }
             if write.has_approvers && !has_manual_gate_upstream(ir, &step.id) {
                 out.refusals.push(format!(
-                    "step `{}` asks for `forge_token: write`, which uses the Environment's                      authority, and the Environment has approvers: put a `gate: manual` in its                      `needs` so an approver releases it first",
+                    "step `{}` asks for `forge_token: write`, which uses the Environment's \
+                     authority, and the Environment has approvers: put a `gate: manual` in its \
+                     `needs` so an approver releases it first",
                     step.id
                 ));
             }
@@ -186,28 +193,43 @@ pub async fn forge_token_refusals(
     Ok(out)
 }
 
-/// Whether `step` was written in a library the org trusts with long-lived
-/// forge credentials: the library that defines it (the last link of its
-/// `origin`) is installed, and its version is the first-party clone library
-/// or its source is one the org trusts. A Step written in the Pipeline file,
-/// or in a `file:` library, is the repository's own code.
+/// The content hash of the library version `step` was written in, when the
+/// org trusts that library with long-lived forge credentials: the library
+/// that defines it (the last link of its `origin`) is stored in the org,
+/// and is the first-party clone library or from a source the org trusts. A
+/// Step written in the Pipeline file, or in a `file:` library, is the
+/// repository's own code: `None`.
 async fn trusted_library_step(
     step: &scarab_pipeline::StepSpec,
     libraries: Option<&dyn LibraryStore>,
     org: &str,
     trusted_sources: &BTreeSet<String>,
-) -> Result<bool, String> {
+) -> Result<Option<String>, String> {
     let Some(link) = step.origin.last() else {
-        return Ok(false);
+        return Ok(None);
     };
     if link.kind != scarab_pipeline::OriginKind::Library {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(libraries) = libraries else {
-        return Ok(false);
+        return Ok(None);
     };
+    Ok(library_trusted(libraries, org, &link.content_hash, trusted_sources)
+        .await?
+        .then(|| link.content_hash.clone()))
+}
+
+/// Whether the org trusts the library version `hash` with long-lived forge
+/// credentials: it is stored in the org, and is the first-party clone
+/// library or from a source in `trusted_sources`.
+async fn library_trusted(
+    libraries: &dyn LibraryStore,
+    org: &str,
+    hash: &str,
+    trusted_sources: &BTreeSet<String>,
+) -> Result<bool, String> {
     let Some(version) = libraries
-        .version(org, &link.content_hash)
+        .version(org, hash)
         .await
         .map_err(|e| format!("library store: {e}"))?
     else {
@@ -215,6 +237,17 @@ async fn trusted_library_step(
     };
     Ok(scarab_policy::library::is_first_party_clone(&version)
         || trusted_sources.contains(scarab_policy::library::trust_key(&version.source)))
+}
+
+/// The org's trusted sources, as [`library_trusted`] reads them.
+async fn trusted_sources(libraries: &dyn LibraryStore, org: &str) -> Result<BTreeSet<String>, String> {
+    Ok(libraries
+        .trusted_sources(org)
+        .await
+        .map_err(|e| format!("library store: {e}"))?
+        .into_iter()
+        .map(|t| t.source)
+        .collect())
 }
 
 /// Whether a `gate: manual` is upstream of `step` through `needs`.
@@ -248,9 +281,10 @@ pub struct ForgeCredentialExecutor {
     inner: Arc<dyn Executor>,
     forge: Arc<dyn ForgePort>,
     secrets: Option<Arc<dyn scarab_secrets::SecretProvider>>,
-    /// The Run store and the library store for the yank check (ADR-0076
-    /// §6), so a yanked Step is refused before a credential is asked for.
-    yanks: Option<(Arc<dyn Db>, Arc<dyn LibraryStore>)>,
+    /// The Run store and the library store: for the yank check (ADR-0076
+    /// §6), so a yanked Step is refused before a credential is asked for,
+    /// and to check at launch that the org still trusts a Step's library.
+    libraries: Option<(Arc<dyn Db>, Arc<dyn LibraryStore>)>,
     /// The tokens minted for each launched unit, revoked when its Attempt
     /// ends. In memory: a control plane that restarts first leaves a minted
     /// token to its own expiry (an hour on GitHub).
@@ -263,9 +297,61 @@ impl ForgeCredentialExecutor {
             inner,
             forge,
             secrets: None,
-            yanks: None,
+            libraries: None,
             minted: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Why a Step whose credential would be the connection's long-lived
+    /// token may not launch, or `None` when it may: it does not ask for
+    /// `write`, and it is from a library the org trusts now. Run creation
+    /// decided the same, but the connection and the org's trust may have
+    /// changed since, and a rerun, retry or re-drive launches the stored
+    /// spec without Run creation running again.
+    async fn long_lived_refusal(
+        &self,
+        config: &scarab_engine::ForgeTokenConfig,
+        access: ForgeToken,
+    ) -> Result<Option<String>, ExecError> {
+        if access == ForgeToken::Write {
+            return Ok(Some(
+                "the step asks for `forge_token: write`, and this repository's forge connection \
+                 now hands out one long-lived token, which cannot be narrowed to a write token \
+                 for one Run; nothing was minted"
+                    .to_string(),
+            ));
+        }
+        let Some(hash) = &config.trusted_library else {
+            return Ok(Some(
+                "the step asks for `forge_token`, and this repository's forge connection now \
+                 hands out one long-lived token, which only a Step from a library the org \
+                 trusts may receive; this Step was admitted when the connection minted \
+                 short-lived tokens, or is the repository's own; nothing was minted"
+                    .to_string(),
+            ));
+        };
+        let Some((_, libraries)) = &self.libraries else {
+            return Ok(Some(
+                "the step's forge token would be the connection's long-lived token, and this \
+                 server has no library store to check that the org still trusts its library; \
+                 nothing was minted"
+                    .to_string(),
+            ));
+        };
+        let org = &config.owner;
+        let trusted = async {
+            let sources = trusted_sources(libraries.as_ref(), org).await?;
+            library_trusted(libraries.as_ref(), org, hash, &sources).await
+        }
+        .await
+        .map_err(ExecError::Other)?;
+        Ok((!trusted).then(|| {
+            format!(
+                "the step's forge token would be the connection's long-lived token, and the \
+                 org `{org}` no longer trusts the library version it is from ({hash}); \
+                 nothing was minted"
+            )
+        }))
     }
 
     /// Revoke every token minted for `handle`'s unit. A failed revocation is
@@ -288,12 +374,12 @@ impl ForgeCredentialExecutor {
     /// decorator runs before `SecretInjectingExecutor`, whose own yank check
     /// would come after the credential was minted.
     pub fn with_libraries(mut self, db: Arc<dyn Db>, libraries: Arc<dyn LibraryStore>) -> Self {
-        self.yanks = Some((db, libraries));
+        self.libraries = Some((db, libraries));
         self
     }
 
     async fn ensure_not_yanked(&self, step: &StepRun) -> Result<(), ExecError> {
-        let Some((db, libraries)) = &self.yanks else {
+        let Some((db, libraries)) = &self.libraries else {
             return Ok(());
         };
         match crate::libraries::stored_step_yank_refusal(
@@ -418,9 +504,25 @@ impl Executor for ForgeCredentialExecutor {
             owner: config.owner.clone(),
             name: config.name.clone(),
         };
-        // Minted fresh for each launch (short TTL by contract). The access
-        // was fixed at Run creation: a fork pull request's is `read`.
-        let credential = match config.access {
+        // The access was fixed at Run creation; a fork pull request's, or a
+        // Run locked out of its Environment's secrets, is `read` at every
+        // launch.
+        let access = if config.read_only {
+            ForgeToken::Read
+        } else {
+            config.access
+        };
+        // Whether this Step may hold the token is checked again here, from
+        // what the connection is now (see `long_lived_refusal`). A forge
+        // that cannot say is treated as handing out a long-lived token.
+        let mints = self.forge.mints_repo_tokens(&repo).await.unwrap_or(false);
+        if !mints {
+            if let Some(reason) = self.long_lived_refusal(config, access).await? {
+                return Err(ExecError::Refused(reason));
+            }
+        }
+        // Minted fresh for each launch (short TTL by contract).
+        let credential = match access {
             // A read credential that cannot be minted (no connection, no
             // credential material) degrades to none: a public repository
             // still clones, a private one fails at git with an auth error.
@@ -445,6 +547,9 @@ impl Executor for ForgeCredentialExecutor {
             ),
         };
         let mut enriched = spec.clone();
+        if let Some(f) = enriched.forge_token.as_mut() {
+            f.access = access;
+        }
         if let (Some(f), Some(c)) = (enriched.forge_token.as_mut(), &credential) {
             f.credential = Some(ForgeCredential {
                 username: c.username.clone(),
@@ -454,13 +559,21 @@ impl Executor for ForgeCredentialExecutor {
         let launched = self.inner.launch(step, &enriched).await;
         if let Some(c) = credential {
             match &launched {
-                Ok(handle) => self
-                    .minted
-                    .lock()
-                    .unwrap()
-                    .entry(handle.0.clone())
-                    .or_default()
-                    .push((repo.clone(), c.token)),
+                // A re-drive of the same Attempt replaces the token the unit
+                // holds (the executor writes the new one over it): the one
+                // it replaces ends now, not when the Attempt ends.
+                Ok(handle) => {
+                    let replaced = self
+                        .minted
+                        .lock()
+                        .unwrap()
+                        .insert(handle.0.clone(), vec![(repo.clone(), c.token)]);
+                    for (repo, token) in replaced.into_iter().flatten() {
+                        if let Err(e) = self.forge.revoke_credential(&repo, &token).await {
+                            tracing::warn!(error = %e, "revoking a replaced forge token failed");
+                        }
+                    }
+                }
                 // Nothing holds it: end it now.
                 Err(_) => {
                     if let Err(e) = self.forge.revoke_credential(&repo, &c.token).await {

@@ -13,7 +13,8 @@ use scarab_engine::{
 use scarab_forge::{ForgeKind, RepoRef};
 use scarab_pipeline::ForgeToken;
 use scarab_server::forge_token::{clone_url, ForgeCredentialExecutor};
-use scarab_testkit::{FakeExecutor, FakeForge};
+use scarab_policy::library::{content_hash, LibraryStore, LibraryVersion, TrustedSource};
+use scarab_testkit::{FakeExecutor, FakeForge, InMemoryDb, InMemoryLibraries};
 
 fn step_run(id: &str) -> StepRun {
     StepRun {
@@ -49,6 +50,8 @@ fn token_spec(access: ForgeToken) -> StepSpec {
             access,
             owner: "acme".into(),
             name: "web".into(),
+            read_only: false,
+            trusted_library: None,
             credential: None,
         }),
         build: None,
@@ -161,13 +164,47 @@ async fn a_cancelled_attempt_revokes_its_tokens_including_a_re_drives() {
     assert_eq!(forge.revoked().len(), 2, "both launches' tokens end");
 }
 
+/// A library from a source `acme` trusts, stored in `acme`; its hash.
+async fn trusted_library(libs: &InMemoryLibraries) -> String {
+    let content = "kind: library\nsteps: [{ id: git, image: alpine/git, forge_token: read }]\n";
+    libs.put_version(&LibraryVersion {
+        org: "acme".into(),
+        content_hash: content_hash(content),
+        content: content.into(),
+        source: format!("{TRUSTED}@{}", "1".repeat(40)),
+        publisher: "acme".into(),
+        name: "git".into(),
+        first_party: false,
+        fetched_by: "amy".into(),
+        fetched_at: 1,
+    })
+    .await
+    .unwrap();
+    libs.trust_source(&TrustedSource {
+        org: "acme".into(),
+        source: TRUSTED.into(),
+        trusted_by: "amy".into(),
+        trusted_at: 2,
+        step_up_ref: Some("su-1".into()),
+    })
+    .await
+    .unwrap();
+    content_hash(content)
+}
+
+const TRUSTED: &str = "github.com/acme/libs//git.yaml";
+
 #[tokio::test]
 async fn a_long_lived_token_is_handed_over_and_never_revoked() {
     let inner = Arc::new(FakeExecutor::new());
     let forge = Arc::new(FakeForge::new()); // Forgejo / PAT: one long-lived token
-    let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone());
+    let libs = Arc::new(InMemoryLibraries::new());
+    let mut spec = token_spec(ForgeToken::Read);
+    spec.forge_token.as_mut().unwrap().trusted_library = Some(trusted_library(&libs).await);
+    let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone())
+        .with_libraries(Arc::new(InMemoryDb::new()), libs.clone());
     let handle = exec
-        .launch(&step_run("checkout/git"), &token_spec(ForgeToken::Read))
+        .launch(&step_run("checkout/git"), &spec)
         .await
         .unwrap();
     assert!(inner
@@ -180,6 +217,37 @@ async fn a_long_lived_token_is_handed_over_and_never_revoked() {
     inner.script_outcome(ExecState::Succeeded);
     exec.poll(&handle).await.unwrap();
     assert!(forge.revoked().is_empty(), "the connection's own token is not revoked");
+}
+
+/// Each launch on a long-lived connection checks the org trusts the Step's
+/// library now: once the admin removes the trust, a rerun or re-drive of
+/// the stored spec fails before anything is minted.
+#[tokio::test]
+async fn a_launch_after_the_trust_is_removed_mints_nothing() {
+    let inner = Arc::new(FakeExecutor::new());
+    let forge = Arc::new(FakeForge::new());
+    let libs = Arc::new(InMemoryLibraries::new());
+    let mut spec = token_spec(ForgeToken::Read);
+    spec.forge_token.as_mut().unwrap().trusted_library = Some(trusted_library(&libs).await);
+    libs.untrust_source("acme", TRUSTED).await.unwrap();
+    let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone())
+        .with_libraries(Arc::new(InMemoryDb::new()), libs.clone());
+    let err = exec
+        .launch(&step_run("checkout/git"), &spec)
+        .await
+        .expect_err("no longer trusted");
+    assert!(err.to_string().contains("no longer trusts"), "{err}");
+    assert_eq!(forge.credential_calls(), 0);
+    // A Run stored as fork-locked stays `read` even where its stored
+    // access says `write`.
+    let minting = Arc::new(FakeForge::new().with_minted_tokens());
+    let exec = ForgeCredentialExecutor::new(inner.clone(), minting.clone());
+    let mut write = token_spec(ForgeToken::Write);
+    write.forge_token.as_mut().unwrap().read_only = true;
+    let handle = exec.launch(&step_run("push"), &write).await.unwrap();
+    let launched = inner.launched_spec(&handle).unwrap().forge_token.unwrap();
+    assert_eq!(launched.access, ForgeToken::Read);
+    assert!(!launched.credential.unwrap().token.starts_with("fake-write-token"));
 }
 
 #[tokio::test]

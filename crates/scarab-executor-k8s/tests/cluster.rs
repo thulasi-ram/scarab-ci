@@ -405,6 +405,8 @@ fn clone_forge_token() -> Option<scarab_engine::ForgeTokenConfig> {
         access: scarab_pipeline::ForgeToken::Read,
         owner: "thulasi-ram".into(),
         name: "scarab-ci".into(),
+        read_only: false,
+        trusted_library: None,
         credential: clone_credential(),
     })
 }

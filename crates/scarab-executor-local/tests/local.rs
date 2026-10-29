@@ -245,6 +245,8 @@ async fn a_forge_token_step_is_rejected() {
         access: scarab_pipeline::ForgeToken::Read,
         owner: "acme".into(),
         name: "web".into(),
+        read_only: false,
+        trusted_library: None,
         credential: None,
     });
 

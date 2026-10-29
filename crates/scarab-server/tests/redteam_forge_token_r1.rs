@@ -200,7 +200,6 @@ steps:
 /// the connection is now. The repository's own `cat` must never receive
 /// the long-lived token.
 #[tokio::test]
-#[ignore = "red: s3 r1"]
 async fn rt_rerun_after_the_connection_turns_long_lived_must_not_hand_repo_code_the_token() {
     let db = InMemoryDb::new();
     let app = minting(&[(".scarab/ci.yaml", OWN_STEP_YAML)]);
@@ -673,7 +672,6 @@ async fn rt_a_skipped_gate_does_not_release_a_write_step() {
 /// is no longer the one mounted; it should end before (or when) the new one
 /// is handed over, not stay live until the Attempt ends.
 #[tokio::test]
-#[ignore = "red: s3 r1"]
 async fn rt_a_re_drive_revokes_the_token_it_replaces() {
     let db = InMemoryDb::new();
     let forge = Arc::new(minting(&[(".scarab/ci.yaml", OWN_STEP_YAML)]));

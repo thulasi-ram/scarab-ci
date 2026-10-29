@@ -4721,8 +4721,9 @@ struct AdmittedFacts<'a> {
     /// The checked `event` values every launch renders.
     event: &'a serde_json::Map<String, serde_json::Value>,
     /// Steps that hold a long-lived forge credential only because their
-    /// library is trusted: they consume no workspace.
-    trusted_only: &'a std::collections::BTreeSet<String>,
+    /// library is trusted, each with that library's content hash: they
+    /// consume no workspace.
+    trusted_only: &'a std::collections::BTreeMap<String, String>,
 }
 
 /// The outcome of admitting one compiled pipeline (ADR-0037, ADR-0071 §2):
@@ -5993,6 +5994,7 @@ async fn persist_run_from_ir(
             ) {
                 tracing::warn!(step = %step.id, %reason, "step will fail when it launches");
             }
+            let trusted_library = admitted.trusted_only.get(&step.id).cloned();
             let admitted = admit_step_grants(
                 gov.privilege_grant_scope(),
                 step.security.as_ref(),
@@ -6050,16 +6052,22 @@ async fn persist_run_from_ir(
                 // The forge credential (ADR-0076 §9), as admission decided
                 // it: a fork pull request (or a Run locked out of its
                 // Environment's secrets) gets `read` whatever it asked for.
+                // What each launch checks again is stored with it: that
+                // lock to `read`, and the library the org trusted when the
+                // Step may hold a long-lived token.
                 forge_token: step.forge_token.and_then(|asked| {
                     let repo = event.repo()?;
+                    let read_only = locked_out || event.is_fork_pr();
                     Some(scarab_engine::ForgeTokenConfig {
-                        access: if locked_out || event.is_fork_pr() {
+                        access: if read_only {
                             scarab_pipeline::ForgeToken::Read
                         } else {
                             asked
                         },
                         owner: repo.owner.clone(),
                         name: repo.name.clone(),
+                        read_only,
+                        trusted_library: trusted_library.clone(),
                         credential: None,
                     })
                 }),
@@ -6092,7 +6100,7 @@ async fn persist_run_from_ir(
         // library is trusted consumes no workspace (ADR-0076 §9): no file
         // another Step wrote (a `.git/config`, a hook) is present while the
         // token is mounted.
-        if admitted.trusted_only.contains(&step.id) {
+        if admitted.trusted_only.contains_key(&step.id) {
             db.set_step_inputs(run, &step_id, &[]).await?;
         } else if let Some(inputs) = &step.inputs {
             // Explicit input workspaces (ADR-0007), when the step declares a
