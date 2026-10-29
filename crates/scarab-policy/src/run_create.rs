@@ -210,6 +210,10 @@ pub struct RunCreateFacts {
     /// The human or token creating the Run; `None` for a webhook.
     pub principal: Option<String>,
     pub time: Timestamp,
+    /// The Run's resolved launch parameters (empty for a webhook). Not part
+    /// of the input: each Step's `image` is previewed with them, the image
+    /// as Run creation knows it (ADR-0076).
+    pub params: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// A Run whose Steps or gates do not fit a list cap of the input schema. Its
@@ -474,14 +478,24 @@ pub fn input_from_pipeline(
                     .map(|c| format!("add-capabilities:{c}")),
             );
         }
+        // The image the Step will launch with, as far as Run creation knows
+        // it: the same renderer as the launch, with only literal values
+        // (ADR-0076). A `${{` left in it is not known yet, so it pins
+        // nothing.
+        let image = scarab_pipeline::preview_image(
+            &s.image,
+            s.scope.as_ref(),
+            &s.matrix_values,
+            &facts.params,
+        );
+        let digest = (!image.contains("${{"))
+            .then(|| image.rsplit_once('@').map(|(_, d)| d.to_string()))
+            .flatten()
+            .filter(|d| !d.is_empty());
         steps.push(Step {
             id: s.id.clone(),
-            image: s.image.clone(),
-            digest: s
-                .image
-                .split_once('@')
-                .map(|(_, d)| d.to_string())
-                .filter(|d| !d.is_empty()),
+            image,
+            digest,
             grants: capped(grants, &what, "grants")?,
             k8s_overlay: s.k8s_overlay.is_some(),
             secrets: capped(s.secrets.clone(), &what, "secrets")?,

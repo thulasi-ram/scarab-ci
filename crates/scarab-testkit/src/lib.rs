@@ -2441,11 +2441,12 @@ impl FakeExecutor {
 
     /// `(step id, attempt id)` out of a `fake://{run}/{step}/{attempt}` handle.
     fn step_and_attempt(handle: &ExecHandle) -> Option<(String, String)> {
+        // `fake://<run>/<step>/<attempt>`: a Step inlined from a library has
+        // `/` in its id (`deploy/build`), so the attempt is the last part.
         let rest = handle.0.strip_prefix("fake://")?;
-        let mut parts = rest.split('/').skip(1);
-        let step = parts.next()?.to_string();
-        let attempt = parts.next()?.to_string();
-        Some((step, attempt))
+        let (run_and_step, attempt) = rest.rsplit_once('/')?;
+        let (_, step) = run_and_step.split_once('/')?;
+        Some((step.to_string(), attempt.to_string()))
     }
 
     /// Set the named results `step` (by id) emits on success (ADR-0041).
@@ -2724,12 +2725,9 @@ impl Executor for FakeExecutor {
         &self,
         handle: &ExecHandle,
     ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, ExecError> {
-        let step = handle
-            .0
-            .strip_prefix("fake://")
-            .and_then(|rest| rest.split('/').nth(1));
+        let step = Self::step_and_attempt(handle).map(|(step, _)| step);
         Ok(step
-            .and_then(|s| self.inner.lock().unwrap().results.get(s).cloned())
+            .and_then(|s| self.inner.lock().unwrap().results.get(&s).cloned())
             .unwrap_or_default())
     }
 
@@ -2751,12 +2749,9 @@ impl Executor for FakeExecutor {
         &self,
         handle: &ExecHandle,
     ) -> Result<Vec<scarab_engine::ArtifactMeta>, ExecError> {
-        let step = handle
-            .0
-            .strip_prefix("fake://")
-            .and_then(|rest| rest.split('/').nth(1));
+        let step = Self::step_and_attempt(handle).map(|(step, _)| step);
         Ok(step
-            .and_then(|s| self.inner.lock().unwrap().artifacts.get(s).cloned())
+            .and_then(|s| self.inner.lock().unwrap().artifacts.get(&s).cloned())
             .unwrap_or_default())
     }
 

@@ -97,6 +97,23 @@ pub enum BoundValue {
     Template(String),
 }
 
+/// A `when:` that decides whether an inlined Step or gate runs, evaluated when
+/// the Run is created (ADR-0076): the library Step's own `when`, and the
+/// `when` of each invoke Step it was inlined through. Each reads the scope it
+/// was written in, named by its distance from the Step's own scope, so the
+/// two never share text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Guard {
+    /// Where the expression was written, in callers out from the Step's
+    /// [`scope`](crate::StepSpec::scope): `0` is the library Step's own
+    /// `when`; `n` is the `when` of the invoke Step `n` levels out, read in
+    /// that invoke Step's scope.
+    pub caller_hops: usize,
+    /// The CEL expression.
+    pub when: String,
+}
+
 impl Scope {
     /// The scope of a Step written in the Pipeline file: `inputs` are the
     /// Run's launch parameters.
@@ -117,5 +134,14 @@ impl Scope {
     /// The scope `hops` callers out from this one (`0` is this scope).
     pub fn at(&self, hops: usize) -> Option<&Scope> {
         self.chain().nth(hops)
+    }
+
+    /// Mutable form of [`at`](Self::at).
+    pub(crate) fn at_mut(&mut self, hops: usize) -> Option<&mut Scope> {
+        let mut cur = Some(self);
+        for _ in 0..hops {
+            cur = cur.and_then(|s| s.caller.as_deref_mut());
+        }
+        cur
     }
 }

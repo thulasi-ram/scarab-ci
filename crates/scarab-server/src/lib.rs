@@ -4733,6 +4733,7 @@ async fn admit_and_create_run(
             &gov,
             &run,
             now,
+            params,
         )
         .await?
         {
@@ -4871,6 +4872,7 @@ fn run_create_facts(
     repo: &scarab_forge::RepoRef,
     gov: &RunGovernance,
     now_ms: i64,
+    params: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
 ) -> (
     Result<scarab_policy::run_create::RunCreateFacts, String>,
     scarab_policy::evaluate::MatchContext,
@@ -4895,6 +4897,7 @@ fn run_create_facts(
             environment,
             principal,
             time,
+            params: params.cloned().unwrap_or_default(),
         });
     (facts, ctx)
 }
@@ -4937,6 +4940,7 @@ async fn consult_run_create(
     gov: &RunGovernance,
     run: &RunId,
     now: scarab_engine::Timestamp,
+    params: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
 ) -> Result<Result<(), AdmissionRefusal>, TriggerError> {
     use scarab_policy::evaluate::{evaluate_stored, PolicyOutcome};
     use scarab_policy::policy::{Checkpoint, Mode};
@@ -4953,7 +4957,7 @@ async fn consult_run_create(
     }
 
     let linked = links.principal_of(event, repo).await?;
-    let (facts, ctx) = run_create_facts(event, linked, path, repo, gov, now.0);
+    let (facts, ctx) = run_create_facts(event, linked, path, repo, gov, now.0, params);
     // Building the input and evaluating it are CPU work; both run off the
     // async workers. The Run-level caps are checked here first, so a Run
     // that cannot be checked is not copied to get there.
@@ -5330,7 +5334,7 @@ pub async fn dispatch_run(
 
     // Step-level `when:` guards, applied at creation exactly as the webhook path
     // does (ADR-0033).
-    let excluded = scarab_pipeline::excluded_steps(&ir, &ctx)
+    let excluded = scarab_pipeline::excluded_steps_with_params(&ir, &ctx, &resolved)
         .map_err(|e| DispatchError::Pipeline(e.to_string()))?;
 
     // Create the run through the shared admission path (Environment
@@ -5498,6 +5502,8 @@ async fn persist_run_from_ir(
     now: Timestamp,
 ) -> Result<(), TriggerError> {
     let locked_out = gov.locked_out();
+    let no_params = std::collections::BTreeMap::new();
+    let params_or_none = params.unwrap_or(&no_params);
     db.create_run(run, ir.ir_version, EVENT_VERSION, now)
         .await?;
     // Tenancy (ADR-0049): stamp the owning (org, project) from the trigger's
@@ -5720,7 +5726,7 @@ async fn persist_run_from_ir(
                 uses: Vec::new(),
                 // Carried for uniformity; a clone step is never matrixed.
                 matrix_values: step.matrix_values.clone(),
-                scope: None,
+                scope: step.scope.clone(),
             };
             db.create_step_run(run, &step_id, Some(&spec), &needs, now)
                 .await?;
@@ -5729,10 +5735,19 @@ async fn persist_run_from_ir(
             // Project's privilege grant in the target Environment (ADR-0071
             // §8), fail-closed. A rejected request aborts the
             // whole run creation with a diagnostic — never a silent downgrade.
+            // Admitted against the image as Run creation knows it, rendered
+            // by the launch's own renderer (ADR-0076): a stored template is
+            // not an image, and a `${{` left in it pins no digest.
+            let image = scarab_pipeline::preview_image(
+                &step.image,
+                step.scope.as_ref(),
+                &step.matrix_values,
+                params_or_none,
+            );
             let admitted = admit_step_grants(
                 gov.privilege_grant_scope(),
                 step.security.as_ref(),
-                &step.image,
+                &image,
                 locked_out,
             )
             .map_err(|v| {
@@ -5804,7 +5819,7 @@ async fn persist_run_from_ir(
                 // Matrix coordinate (ADR-0023): carried through so launch-time
                 // interpolation resolves this leg's `${{ matrix.<dim> }}`.
                 matrix_values: step.matrix_values.clone(),
-                scope: None,
+                scope: step.scope.clone(),
             };
             db.create_step_run(run, &step_id, Some(&spec), &needs, now)
                 .await?;

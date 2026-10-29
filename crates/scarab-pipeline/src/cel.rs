@@ -330,50 +330,6 @@ pub(crate) fn scan_interpolations(template: &str) -> (Vec<Interpolation>, Option
     (found, None)
 }
 
-/// One read of the `inputs` variable in a CEL expression (ADR-0076 §1).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct InputRead {
-    /// Byte range of the read: `inputs.<name>`, or `inputs` alone, with the
-    /// leading `.` of a root-qualified read.
-    pub start: usize,
-    pub end: usize,
-    /// `<name>` when read as `inputs.<name>`; `None` for any other use
-    /// (`inputs["x"]`, `inputs` passed whole).
-    pub field: Option<String>,
-}
-
-/// Each read of the top-level `inputs` variable in `expr`, in order: `inputs`
-/// and CEL's root-qualified `.inputs`. Skips string literals and `//`
-/// comments, and a field that happens to be named `inputs` (`x.inputs`).
-/// Whether a `.` selects a field or qualifies a root name depends on the
-/// token before it, which is found by skipping whitespace and comments, never
-/// by reading the text before the `.`.
-pub(crate) fn input_reads(expr: &str) -> Vec<InputRead> {
-    let b = expr.as_bytes();
-    variable_names(expr, "inputs")
-        .into_iter()
-        .map(|(start, end)| {
-            let mut read = InputRead {
-                start,
-                end,
-                field: None,
-            };
-            if b.get(end) == Some(&b'.') {
-                let f = end + 1;
-                let mut e = f;
-                while e < b.len() && is_ident(b[e]) {
-                    e += 1;
-                }
-                if e > f && !b[f].is_ascii_digit() {
-                    read.field = Some(expr[f..e].to_string());
-                    read.end = e;
-                }
-            }
-            read
-        })
-        .collect()
-}
-
 fn is_ident(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_'
 }
@@ -539,124 +495,6 @@ fn skip_trivia(b: &[u8], mut i: usize) -> usize {
     }
 }
 
-/// The reads of `outputs` in `expr` by [`output_reads`], each naming its
-/// Step, checked against the CEL parser: the parser must find the same Step
-/// ids, and no read of `outputs` whose Step is computed (`outputs[k]`) or
-/// that uses `outputs` whole. Inside a library and in a `with:` value the
-/// compiler must know which Step every read names, to namespace it and to
-/// wire the Step's `needs` (ADR-0076 §1).
-pub(crate) fn static_output_reads(expr: &str) -> Result<Vec<OutputRead>, String> {
-    // An identifier cannot be escaped in CEL: a read has the word in it.
-    if !expr.contains("outputs") {
-        return Ok(Vec::new());
-    }
-    let refused = || {
-        "reads `outputs` in a form the compiler cannot resolve to a Step; read a Step's \
-         outputs as `outputs.<id>` or `outputs[\"<id>\"]`"
-            .to_string()
-    };
-    let parsed = with_program(expr, |program| {
-        let mut steps = Vec::new();
-        output_steps(program.expression(), &mut steps);
-        Ok(steps)
-    })
-    .map_err(|e| {
-        format!("mentions `outputs` and does not parse, so its reads cannot be checked: {e}")
-    })?;
-    let reads = output_reads(expr);
-    let mut scanned: Vec<Option<&str>> = reads.iter().map(|r| r.step.as_deref()).collect();
-    let mut parsed: Vec<Option<&str>> = parsed.iter().map(Option::as_deref).collect();
-    scanned.sort();
-    parsed.sort();
-    if scanned != parsed || scanned.contains(&None) {
-        return Err(refused());
-    }
-    Ok(reads)
-}
-
-/// Each use of the variable `outputs` in a parsed expression, with the Step
-/// it selects when that is a constant: `outputs.<step>`, `has(outputs.<step>)`
-/// and `outputs["<step>"]`. Any other use is `None`.
-fn output_steps(e: &IdedExpr, out: &mut Vec<Option<String>>) {
-    let is_outputs =
-        |e: &IdedExpr| matches!(&e.expr, Expr::Ident(n) if n.trim_start_matches('.') == "outputs");
-    match &e.expr {
-        Expr::Select(s) if is_outputs(&s.operand) => out.push(Some(s.field.clone())),
-        Expr::Call(c)
-            if c.func_name == operators::INDEX
-                && c.target.is_none()
-                && c.args.len() == 2
-                && is_outputs(&c.args[0]) =>
-        {
-            match &c.args[1].expr {
-                Expr::Literal(LiteralValue::String(s)) => out.push(Some(s.inner().to_string())),
-                _ => {
-                    out.push(None);
-                    output_steps(&c.args[1], out);
-                }
-            }
-        }
-        Expr::Ident(_) => {
-            if is_outputs(e) {
-                out.push(None);
-            }
-        }
-        Expr::Select(s) => output_steps(&s.operand, out),
-        Expr::Call(c) => {
-            if let Some(t) = &c.target {
-                output_steps(t, out);
-            }
-            c.args.iter().for_each(|a| output_steps(a, out));
-        }
-        Expr::Comprehension(c) => {
-            for part in [
-                &c.iter_range,
-                &c.accu_init,
-                &c.loop_cond,
-                &c.loop_step,
-                &c.result,
-            ] {
-                output_steps(part, out);
-            }
-        }
-        Expr::List(l) => l.elements.iter().for_each(|x| output_steps(x, out)),
-        Expr::Map(m) => m
-            .entries
-            .iter()
-            .for_each(|x| entry_output_steps(&x.expr, out)),
-        Expr::Struct(s) => s
-            .entries
-            .iter()
-            .for_each(|x| entry_output_steps(&x.expr, out)),
-        Expr::Literal(_) | Expr::Unspecified => {}
-    }
-}
-
-fn entry_output_steps(e: &EntryExpr, out: &mut Vec<Option<String>>) {
-    match e {
-        EntryExpr::StructField(f) => output_steps(&f.value, out),
-        EntryExpr::MapEntry(m) => {
-            output_steps(&m.key, out);
-            output_steps(&m.value, out);
-        }
-    }
-}
-
-/// Does `expr` read the variable `name`, as the CEL parser sees it? A
-/// root-qualified read (`.name`) counts. This is the parser's own answer, not
-/// a scan of the text: [`input_reads`] is checked against it, so a form the
-/// scan misses is refused instead of left unbound. An expression that does
-/// not parse is an error.
-pub(crate) fn reads_variable(expr: &str, name: &str) -> Result<bool, PipelineError> {
-    with_program(expr, |program| {
-        Ok(program
-            .references()
-            .variables()
-            .iter()
-            .any(|v| v.strip_prefix('.').unwrap_or(v) == name))
-    })
-}
-
 /// One read of a variable in a parsed CEL expression: the variable, then the
 /// members selected from it while each is a constant (`v.a.b`, `v["a"].b`,
 /// `has(v.a)`). Found from the parser's tree, never from the text.
@@ -781,15 +619,41 @@ pub(crate) fn render(v: &serde_json::Value) -> String {
     }
 }
 
+/// A JSON value as CEL sees it. An integer is an `int` whenever it fits one,
+/// so a whole-number input or result does arithmetic with a literal
+/// (`inputs.count + 1`); the `cel` crate's own JSON mapping makes every
+/// non-negative integer a `uint`, which CEL does not add to an `int`.
+fn to_cel(v: &serde_json::Value) -> cel::Value {
+    use std::sync::Arc;
+    match v {
+        serde_json::Value::Null => cel::Value::Null,
+        serde_json::Value::Bool(b) => cel::Value::Bool(*b),
+        serde_json::Value::Number(n) => match (n.as_i64(), n.as_u64()) {
+            (Some(i), _) => cel::Value::Int(i),
+            (None, Some(u)) => cel::Value::UInt(u),
+            _ => cel::Value::Float(n.as_f64().unwrap_or(f64::NAN)),
+        },
+        serde_json::Value::String(s) => cel::Value::String(Arc::new(s.clone())),
+        serde_json::Value::Array(items) => {
+            cel::Value::List(Arc::new(items.iter().map(to_cel).collect()))
+        }
+        serde_json::Value::Object(fields) => cel::Value::Map(
+            fields
+                .iter()
+                .map(|(k, v)| (k.clone(), to_cel(v)))
+                .collect::<std::collections::HashMap<String, cel::Value>>()
+                .into(),
+        ),
+    }
+}
+
 /// Bind each key of a JSON object `ctx` as a CEL variable. A null context binds
 /// nothing; any non-object context is an error.
 fn bind(context: &mut Context, ctx: &serde_json::Value, expr: &str) -> Result<(), PipelineError> {
     match ctx {
         serde_json::Value::Object(map) => {
             for (k, v) in map {
-                context.add_variable(k.clone(), v.clone()).map_err(|e| {
-                    PipelineError::Cel(format!("`{}`: binding `{k}`: {e}", shown(expr)))
-                })?;
+                context.add_variable_from_value(k.clone(), to_cel(v));
             }
             Ok(())
         }
@@ -1040,36 +904,45 @@ mod tests {
     }
 
     #[test]
-    fn static_output_reads_agree_with_the_parser() {
-        let steps = |expr: &str| {
-            static_output_reads(expr)
-                .map(|r| r.into_iter().map(|r| r.step.unwrap()).collect::<Vec<_>>())
+    fn reads_name_each_variable_and_its_constant_members_by_the_parser() {
+        let got = |expr: &str| {
+            reads(expr)
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.var, r.first, r.second))
+                .collect::<Vec<_>>()
         };
-        assert_eq!(steps("1 + 2"), Ok(vec![]));
+        let read = |v: &str, a: Option<&str>, b: Option<&str>| {
+            (v.to_string(), a.map(String::from), b.map(String::from))
+        };
+        assert_eq!(got("1 + 2"), vec![]);
         assert_eq!(
-            steps(r#"has(outputs.a) ? outputs["b"].v : [outputs.c][0].d.size()"#),
-            Ok(vec!["a".to_string(), "b".to_string(), "c".to_string()])
+            got(r#"has(outputs.a) ? outputs["b"].v : [outputs.c][0].d.size()"#),
+            vec![
+                read("outputs", Some("a"), None),
+                read("outputs", Some("b"), Some("v")),
+                read("outputs", Some("c"), None),
+            ]
         );
         assert_eq!(
-            steps(r#"{"k": outputs.a}.k + {"x": 1}.x"#),
-            Ok(vec!["a".to_string()])
+            got(r#"{"k": .inputs.a}.k + inputs .b + 'inputs.x'"#),
+            vec![
+                read("inputs", Some("a"), None),
+                read("inputs", Some("b"), None)
+            ]
         );
-        for expr in [
-            "outputs[matrix.k].v",
-            "outputs.exists(k, true)",
-            "size(outputs)",
-            "[1].map(x, outputs[x])",
-        ] {
-            assert!(
-                static_output_reads(expr)
-                    .unwrap_err()
-                    .starts_with("reads `outputs` in a form the compiler cannot resolve"),
-                "{expr}"
-            );
-        }
-        assert!(static_output_reads("outputs.")
-            .unwrap_err()
-            .starts_with("mentions `outputs` and does not parse"));
+        // A computed key, or the variable used whole, names no member; the
+        // key's own reads are found too.
+        assert_eq!(
+            got("outputs[matrix.k].v"),
+            vec![read("outputs", None, None), read("matrix", Some("k"), None)]
+        );
+        assert_eq!(got("size(inputs)"), vec![read("inputs", None, None)]);
+        assert_eq!(
+            got("x.outputs.b"),
+            vec![read("x", Some("outputs"), Some("b"))]
+        );
+        assert!(reads("outputs.").is_err());
     }
 
     #[test]

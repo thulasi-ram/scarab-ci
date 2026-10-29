@@ -1298,7 +1298,7 @@ async fn pipeline_input(
         .principal_of(&event, &repo)
         .await
         .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;
-    let (facts, ctx) = crate::run_create_facts(&event, linked, &path, &repo, &gov, now);
+    let (facts, ctx) = crate::run_create_facts(&event, linked, &path, &repo, &gov, now, None);
     let plugin_gates = run_create::plugin_gates(&ir);
     let input = match facts {
         Ok(facts) => blocking(move || crate::run_create_input(&ir, facts)).await?,

@@ -25,7 +25,7 @@ pub mod render;
 pub mod scope;
 
 pub use render::{preview_image, render, Facts, Rendered, Results, Templates};
-pub use scope::{Binding, BoundValue, OutputSource, Scope, ScopeInputs};
+pub use scope::{Binding, BoundValue, Guard, OutputSource, Scope, ScopeInputs};
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -39,6 +39,11 @@ use serde::{Deserialize, Serialize};
 /// 1`, bare-string inputs) still load — the custom [`ParamSpec`] deserialize
 /// accepts a bare string as `{ name, type: string, required: true }`.
 pub const IR_VERSION: u32 = 2;
+
+/// The IR version of a Pipeline with a Step that has a [`Scope`] (ADR-0076):
+/// a Step inlined from a library, whose `inputs` are its own bindings and not
+/// the Run's launch parameters. Recorded on the Run (`runs.ir_version`).
+pub const IR_VERSION_SCOPED: u32 = 3;
 
 fn default_ir_version() -> u32 {
     IR_VERSION
@@ -572,6 +577,22 @@ pub struct StepSpec {
     /// `run.create` PolicyCheckpoint reads it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub origin: Vec<OriginEntry>,
+    /// What this Step's `${{ … }}` templates read (ADR-0076): set by the
+    /// compiler on every Step and gate inlined from a library (its own
+    /// inputs, a view of the library's Steps, its own coordinate), and on a
+    /// Step in the Pipeline file that reads an invoke's exposed output.
+    /// `None` renders `inputs` as the Run's launch parameters and `outputs`
+    /// as the results of its direct needs. Written only by the compiler, like
+    /// [`origin`](Self::origin): an authored `scope` is a compile error. It
+    /// is read back from a stored IR, which stays self-describing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<Scope>,
+    /// For a Step or gate inlined from a library, the `when:`s that decide
+    /// whether it runs, each with the scope it was written in (ADR-0076).
+    /// Its own [`when`](Self::when) is kept as written and is one of them.
+    /// Written only by the compiler, like [`scope`](Self::scope).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guards: Vec<Guard>,
 }
 
 /// The kind of one link in an invoke chain (ADR-0076). The compiler writes
@@ -1342,8 +1363,15 @@ fn compile_libs(yaml: &str, libs: LibsRef<'_>) -> Result<PipelineIr, PipelineErr
         }
     }
 
+    // A Step with a scope renders differently from one without: a server
+    // that predates scopes must not launch it (see [`IR_VERSION_SCOPED`]).
+    let ir_version = if expanded.iter().any(|s| s.scope.is_some()) {
+        authored.ir_version.max(IR_VERSION_SCOPED)
+    } else {
+        authored.ir_version
+    };
     let ir = PipelineIr {
-        ir_version: authored.ir_version,
+        ir_version,
         kind: None,
         name: authored.name,
         triggers: authored.triggers,
@@ -1616,7 +1644,22 @@ fn inline_invokes(steps: &[StepSpec], libs: LibsRef<'_>) -> Result<Vec<StepSpec>
     let mut diagnostics = Vec::new();
     let mut stack: Vec<Frame> = Vec::new();
     let mut budget = Budget::default();
-    let out = inline_level(steps, libs, &mut stack, &mut budget, &mut diagnostics);
+    // The Pipeline file's own scope: `inputs` are the Run's launch parameters.
+    let root = Scope::run();
+    let late = BTreeSet::new();
+    let level = Level {
+        scope: &root,
+        library: None,
+        late: &late,
+    };
+    let out = inline_level(
+        steps,
+        libs,
+        &level,
+        &mut stack,
+        &mut budget,
+        &mut diagnostics,
+    );
     if diagnostics.is_empty() {
         Ok(out)
     } else {
@@ -1721,9 +1764,16 @@ fn invoke_step_extra_fields(step: &StepSpec) -> Vec<&'static str> {
 /// with one diagnostic, once a level's list passes [`MAX_COMPILED_STEPS`];
 /// every level then returns at once. A level's list is part of the final list
 /// at least once, so the check never refuses a Pipeline under the cap.
+///
+/// Each library invocation is a scope (ADR-0076): a library Step gets a
+/// [`Scope`] whose `inputs` are the invocation's bindings, whose `outputs`
+/// name the library's own Steps, and whose caller is the scope of the invoke
+/// Step that wrote the `with:`. Nothing a caller writes is inserted into a
+/// library's text.
 fn inline_level(
     steps: &[StepSpec],
     libs: LibsRef<'_>,
+    level: &Level<'_>,
     stack: &mut Vec<Frame>,
     budget: &mut Budget,
     diagnostics: &mut Vec<String>,
@@ -1732,8 +1782,20 @@ fn inline_level(
     // invoke-step id -> the namespaced leaf ids that a `needs: [that id]` maps to.
     let mut seam: BTreeMap<String, Vec<String>> = BTreeMap::new();
     // Non-matrixed invoke id -> its exposed output names, for the output-reference
-    // rewrite (ADR-0041): `outputs.<id>.<name>` -> `outputs["<id>/<name>"].<name>`.
+    // rewrite of the Pipeline file's own Steps (ADR-0041):
+    // `outputs.<id>.<name>` -> `outputs["<id>/<name>"].<name>`.
     let mut output_aliases: Vec<(String, Vec<String>)> = Vec::new();
+    // What each invoke Step at this level exposes, so a sibling read before
+    // the invoke is inlined resolves too.
+    let exposed = exposed_outputs(steps, libs);
+
+    // An invoke Step's id names its library's Steps (`<id>/…`) and its
+    // outputs (`outputs.<id>`): it must not be any other Step's id here.
+    for (i, s) in steps.iter().enumerate() {
+        if s.invoke.is_some() && steps[..i].iter().any(|t| t.id == s.id) {
+            diagnostics.push(format!("duplicate step id `{}`", s.id));
+        }
+    }
 
     // Stop when the list passes the cap.
     let capped = |len: usize, at: &str, budget: &mut Budget, diagnostics: &mut Vec<String>| {
@@ -1761,6 +1823,24 @@ fn inline_level(
                 step.id
             ));
         }
+        // A Step's scope decides what its templates read (ADR-0076); an
+        // authored one would let a library read the Run's parameters.
+        for (field, set) in [
+            ("scope", step.scope.is_some()),
+            ("guards", !step.guards.is_empty()),
+        ] {
+            if set {
+                let place = match stack.last() {
+                    Some(lib) => format!(" in library `{}`", lib.label),
+                    None => String::new(),
+                };
+                diagnostics.push(format!(
+                    "step `{}`{place}: `{field}` is written by the compiler and cannot be set \
+                     in a pipeline file",
+                    step.id
+                ));
+            }
+        }
         let Some(raw_target) = &step.invoke else {
             // `with:` supplies inputs to a library — meaningless off an invoke step.
             if !step.with.is_empty() {
@@ -1769,10 +1849,14 @@ fn inline_level(
                     step.id
                 ));
             }
-            out.push(step.clone());
+            let mut step = step.clone();
+            if let Some((label, _)) = level.library {
+                library_step_scope(&mut step, level, label, steps, &exposed, diagnostics);
+            }
+            out.push(step);
             if capped(
                 out.len(),
-                &format!("step `{}`", step.id),
+                &format!("step `{}`", out[out.len() - 1].id),
                 budget,
                 diagnostics,
             ) {
@@ -1903,8 +1987,8 @@ fn inline_level(
             }
         };
         // Every invoke target is marked as a library (ADR-0076 §2): inside
-        // one, `${{ inputs.* }}` binds to the caller's `with:`, which is not
-        // what it means in a Pipeline.
+        // one, `${{ inputs.* }}` reads the caller's `with:`, which is not what
+        // it means in a Pipeline.
         if lib.kind != Some(PipelineKind::Library) {
             diagnostics.push(format!(
                 "step `{}`: `{written}` is not a library; add `kind: library` to it",
@@ -1948,52 +2032,129 @@ fn inline_level(
         // library's declared/exposed outputs at compile — explicit over ambient.
         let before_interface = diagnostics.len();
         validate_interface(step, &label, &lib, steps, diagnostics);
-        // Record exposed outputs for the reference rewrite (ADR-0041). A matrixed
-        // invoke's outputs are unaddressable (validate_interface errors on any
-        // reference), so it contributes no alias.
-        if step.matrix.is_none() && !lib.interface.outputs.is_empty() {
+        // Record exposed outputs for the reference rewrite of the Pipeline
+        // file's own Steps (ADR-0041). A matrixed invoke's outputs are
+        // unaddressable (validate_interface errors on any reference).
+        if level.library.is_none() && step.matrix.is_none() && !lib.interface.outputs.is_empty() {
             output_aliases.push((step.id.clone(), lib.interface.outputs.clone()));
         }
 
-        // The caller's inputs, coerced to their declared types with defaults
-        // applied — the same typed resolution the launch path uses
-        // (ADR-0043). `None` when they do not resolve, and the compile fails,
-        // so nothing is bound or injected. `validate_interface` usually said
-        // why; when it did not, the resolve error is the diagnostic, so the
-        // library is never left unbound without one.
-        let supplied: BTreeMap<String, serde_json::Value> = step
-            .with
-            .iter()
-            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-            .collect();
-        let values = match params::resolve_params(&lib.interface, &supplied) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                if diagnostics.len() == before_interface {
-                    let detail = match e {
-                        PipelineError::Validation(lines) => lines.join("; "),
-                        other => other.to_string(),
-                    };
-                    diagnostics.push(format!(
-                        "step `{}`: inputs for library `{label}` do not resolve: {detail}",
-                        step.id
-                    ));
-                }
-                None
-            }
+        // Bind the library's inputs (ADR-0076): a literal `with:` value or a
+        // default, converted to the declared type now; a caller's template,
+        // kept as written, rendered in this level's scope when a Step of the
+        // library launches. A `with:` template is checked like any template
+        // written here.
+        let at = match level.library {
+            Some((l, _)) => format!("library `{l}`, step `{}`:", step.id),
+            None => format!("step `{}`:", step.id),
         };
-
-        // Bind the library's `${{ inputs.* }}` to those values (ADR-0076 §1)
-        // before inlining its own invokes, so a nested invoke's `with:` that
-        // reads `inputs.*` passes this level's values down. Each bound Step
-        // is then checked with the CEL parser for any `inputs` read left.
-        let lib_steps: Vec<StepSpec> = match &values {
-            Some(v) => lib
-                .steps
-                .iter()
-                .map(|ls| bind_library_step(ls, v, &label, diagnostics))
-                .collect(),
-            None => lib.steps.clone(),
+        let who = format!("{at} `with:`");
+        let mut bindings: BTreeMap<String, Binding> = BTreeMap::new();
+        let mut late: BTreeSet<String> = BTreeSet::new();
+        let mut with_reads: OutputNames = Vec::new();
+        let mut unresolved: Vec<String> = Vec::new();
+        for p in &lib.interface.inputs {
+            let value = match step.with.get(&p.name) {
+                Some(raw) if raw.contains("${{") => {
+                    if let Err(e) = cel::check_interpolation(raw) {
+                        diagnostics.push(format!("{at} `with.{}` {e}", p.name));
+                        continue;
+                    }
+                    let mut reads = Vec::new();
+                    let mut errors = Vec::new();
+                    check_reads(
+                        raw,
+                        Written::Template,
+                        level,
+                        &format!("with.{}", p.name),
+                        &mut reads,
+                        &mut errors,
+                    );
+                    diagnostics.extend(errors.into_iter().map(|e| format!("{at} {e}")));
+                    if !reads.is_empty() || reads_late_inputs(raw, level.late) {
+                        late.insert(p.name.clone());
+                    }
+                    with_reads.extend(reads);
+                    BoundValue::Template(raw.clone())
+                }
+                Some(raw) => {
+                    match params::resolve_one(p, &serde_json::Value::String(raw.clone())) {
+                        Ok(v) => BoundValue::Literal(v),
+                        Err(e) => {
+                            unresolved.push(format!("`{}`: {e}", p.name));
+                            continue;
+                        }
+                    }
+                }
+                None => match &p.default {
+                    Some(d) => match params::resolve_one(p, d) {
+                        Ok(v) => BoundValue::Literal(v),
+                        Err(e) => {
+                            unresolved.push(format!("`{}` (default): {e}", p.name));
+                            continue;
+                        }
+                    },
+                    // A missing required input, reported by validate_interface.
+                    None => continue,
+                },
+            };
+            bindings.insert(
+                p.name.clone(),
+                Binding {
+                    param: p.clone(),
+                    value,
+                },
+            );
+        }
+        // `validate_interface` usually said why an input does not resolve;
+        // when it did not, the resolve error is the diagnostic.
+        if !unresolved.is_empty() && diagnostics.len() == before_interface {
+            diagnostics.push(format!(
+                "step `{}`: inputs for library `{label}` do not resolve: {}",
+                step.id,
+                unresolved.join("; ")
+            ));
+        }
+        // The Steps the `with:` templates read: every Step the library
+        // inlines renders them, so each needs them (the engine gives a Step
+        // the results of its own needs only). A library root already needs
+        // what the invoke Step needs, so the schedule does not change.
+        let mut with_needs: Vec<String> = Vec::new();
+        let caller_view = output_view(
+            &with_reads,
+            steps,
+            &exposed,
+            &step.needs.0,
+            &who,
+            level,
+            diagnostics,
+            &mut with_needs,
+        );
+        // A library's invoke `when` is decided at Run creation, in this
+        // level's scope (the Pipeline file's is unchanged).
+        if let (Some((l, _)), Some(When(w))) = (level.library, &step.when) {
+            let mut errors = Vec::new();
+            check_reads(
+                w,
+                Written::Guard,
+                level,
+                "when",
+                &mut Vec::new(),
+                &mut errors,
+            );
+            diagnostics.extend(
+                errors
+                    .into_iter()
+                    .map(|e| format!("library `{l}`, step `{}`: {e}", step.id)),
+            );
+        }
+        let mut caller = level.scope.clone();
+        caller.outputs = caller_view;
+        let lib_scope = Scope {
+            inputs: ScopeInputs::Bound(bindings),
+            outputs: BTreeMap::new(),
+            matrix: BTreeMap::new(),
+            caller: Some(Box::new(caller)),
         };
 
         // Recurse: resolve the library's own invokes first, so `resolved` is a
@@ -2004,7 +2165,18 @@ fn inline_level(
             label: label.clone(),
             installed: kind == OriginKind::Library,
         });
-        let resolved = inline_level(&lib_steps, libs, stack, budget, diagnostics);
+        let resolved = inline_level(
+            &lib.steps,
+            libs,
+            &Level {
+                scope: &lib_scope,
+                library: Some((&label, &lib.interface.inputs)),
+                late: &late,
+            },
+            stack,
+            budget,
+            diagnostics,
+        );
         stack.pop();
         if budget.stopped {
             return out;
@@ -2037,19 +2209,6 @@ fn inline_level(
             source,
             content_hash: sha256_hex(src.as_bytes()),
         };
-        // The caller's inputs also reach every inlined step as
-        // `SCARAB_PARAM_<NAME>` env (ADR-0008 param convention). Prepended so a
-        // library step's own explicit env of the same name still wins.
-        let param_env: Vec<(String, String)> = values
-            .iter()
-            .flatten()
-            .map(|(k, v)| {
-                (
-                    format!("SCARAB_PARAM_{}", k.to_uppercase()),
-                    params::stringify(v),
-                )
-            })
-            .collect();
 
         // `matrix` × `invoke` (ADR-0038): a matrix on the invoke step fans out N
         // copies of the whole subgraph, once per coordinate. `expand_step` gives
@@ -2063,50 +2222,6 @@ fn inline_level(
                 continue;
             }
         };
-
-        // A `with:` value that reads `outputs.<X>` of a Step at this level
-        // reaches every Step the library inlines, as bound text and as
-        // `SCARAB_PARAM_*`. The engine gives a Step the outputs of its direct
-        // needs only, so `<X>` must be a need of the invoke step, and it
-        // becomes a need of every inlined Step. A root already needs it, and
-        // every other Step runs after a root, so the schedule is unchanged. An
-        // `<X>` that is not a Step here came from an outer level's `with:`,
-        // which adds it there. An invoke Step `<X>` is checked by
-        // `validate_interface`.
-        let mut with_needs: Vec<String> = Vec::new();
-        for (key, value) in &step.with {
-            for i in cel::scan_interpolations(value).0 {
-                let reads = match cel::static_output_reads(&value[i.inner]) {
-                    Ok(reads) => reads,
-                    Err(e) => {
-                        diagnostics.push(format!("step `{}`: `with.{key}` {e}", step.id));
-                        continue;
-                    }
-                };
-                for read in reads.into_iter().filter_map(|r| r.step) {
-                    // A matrix instance (`build[os=l]`) is read through its
-                    // authored Step, which fans onto every instance.
-                    let Some(sibling) = steps.iter().find(|s| {
-                        read == s.id
-                            || read
-                                .strip_prefix(s.id.as_str())
-                                .is_some_and(|r| r.starts_with('['))
-                    }) else {
-                        continue;
-                    };
-                    let x = sibling.id.clone();
-                    if !step.needs.0.contains(&x) && sibling.invoke.is_none() {
-                        diagnostics.push(format!(
-                            "step `{}`: `with:` reads `outputs.{x}` but does not `needs: [{x}]`",
-                            step.id
-                        ));
-                    }
-                    if !with_needs.contains(&x) {
-                        with_needs.push(x);
-                    }
-                }
-            }
-        }
 
         let internal: BTreeSet<&str> = resolved.iter().map(|s| s.id.as_str()).collect();
         let needed_inside: BTreeSet<&str> = resolved
@@ -2157,9 +2272,10 @@ fn inline_level(
                             .collect(),
                     );
                 }
-                // Propagate the invoke coordinate so CEL inside the subgraph can
-                // read it; a library step's own coordinate (added later by the
-                // main matrix pass) wins on key conflict.
+                // The invoke coordinate is recorded on the Step (its id and
+                // `matrix_values` show it); a library Step's own coordinate
+                // (added later by the main matrix pass) wins on key conflict.
+                // A library does not read it: its scope's `matrix` is its own.
                 for (k, v) in &inv.matrix_values {
                     inst.matrix_values
                         .entry(k.clone())
@@ -2170,10 +2286,26 @@ fn inline_level(
                         inst.needs.0.push(n.clone());
                     }
                 }
-                if !param_env.is_empty() {
-                    let mut env = param_env.clone();
-                    env.append(&mut inst.env);
-                    inst.env = env;
+                // The scopes inside the library name its Steps as the library
+                // does; from here they are `<invoke>/<id>`. The scope `hops`
+                // callers out is this invoke Step's: its `matrix` is this
+                // copy's coordinate, and its `when` reads it.
+                let hops = inst.origin.len();
+                if let Some(scope) = &mut inst.scope {
+                    for hop in 0..hops {
+                        if let Some(s) = scope.at_mut(hop) {
+                            namespace_view(s, &ns);
+                        }
+                    }
+                    if let Some(s) = scope.at_mut(hops) {
+                        s.matrix = inv.matrix_values.clone();
+                    }
+                }
+                if let Some(When(w)) = &inv.when {
+                    inst.guards.push(Guard {
+                        caller_hops: hops,
+                        when: w.clone(),
+                    });
                 }
                 out.push(inst);
                 if capped(
@@ -2197,15 +2329,15 @@ fn inline_level(
         }
     }
 
-    // Output-reference rewrite (ADR-0041): resolve `outputs.<invoke-id>.<name>`
-    // to the concrete inlined backing step so the launch context stays generic
-    // (just `outputs[<step-id>] = <that step's results>`). The backing step of a
-    // non-matrixed invoke's exposed output `<name>` is `<invoke-id>/<name>`.
-    // The engine gives a Step the outputs of its direct needs only, and
-    // `needs: [<invoke-id>]` reaches the library's leaves, so a Step that
-    // reads the output also needs its backing step, which need not be a leaf.
+    // Output-reference rewrite (ADR-0041) of the Pipeline file's own Steps:
+    // resolve `outputs.<invoke-id>.<name>` to the concrete inlined backing
+    // step `<invoke-id>/<name>`. A library Step reads an invoke's outputs
+    // through its scope's view instead, and is never rewritten. The engine
+    // gives a Step the outputs of its direct needs only, and `needs:
+    // [<invoke-id>]` reaches the library's leaves, so a Step that reads the
+    // output also needs its backing step, which need not be a leaf.
     for (invoke_id, exposed) in &output_aliases {
-        for step in &mut out {
+        for step in out.iter_mut().filter(|s| s.scope.is_none()) {
             for name in exposed {
                 let name = std::slice::from_ref(name);
                 let mut read = false;
@@ -2228,200 +2360,348 @@ fn inline_level(
     out
 }
 
-/// What an invoke step carries onto each Step and gate it inlines
-/// (ADR-0076 §1). Its `timeout`, `resources` and `placement_profiles` apply to
-/// a Step that is not a gate, only where the library Step leaves the field
-/// unset: the library's own value wins (`resources` per field, `cpu_millis`
-/// and `memory_mib`). Its `when` is ANDed with the inlined Step's or gate's
-/// own. `env` never carries.
-fn carry_invoke_fields(invoke: &StepSpec, inst: &mut StepSpec) {
-    if !inst.is_gate() {
-        if inst.timeout.is_none() {
-            inst.timeout = invoke.timeout;
-        }
-        if inst.resources.cpu_millis.is_none() {
-            inst.resources.cpu_millis = invoke.resources.cpu_millis;
-        }
-        if inst.resources.memory_mib.is_none() {
-            inst.resources.memory_mib = invoke.resources.memory_mib;
-        }
-        if inst.placement_profiles.is_empty() {
-            inst.placement_profiles = invoke.placement_profiles.clone();
-        }
-    }
-    if let Some(When(outer)) = &invoke.when {
-        inst.when = Some(When(match &inst.when {
-            // On their own lines, so a `//` comment ending either side does
-            // not swallow the `)` after it.
-            Some(When(inner)) => format!("(\n{outer}\n) && (\n{inner}\n)"),
-            None => outer.clone(),
-        }));
-    }
+/// The scope that the templates written at one level of `invoke:` nesting
+/// read (ADR-0076).
+struct Level<'a> {
+    /// Its `inputs` and its callers; `outputs` and `matrix` are set for each
+    /// Step or `with:` that reads them.
+    scope: &'a Scope,
+    /// The library inlined at this level and the inputs it declares; `None`
+    /// for the Pipeline file.
+    library: Option<(&'a str, &'a [ParamSpec])>,
+    /// This level's inputs bound to a caller's template that reads
+    /// `outputs`, directly or through the caller's own inputs: they have no
+    /// value until a Step launches, so a `when:` cannot read them.
+    late: &'a BTreeSet<String>,
 }
 
-/// Bind a library Step's `${{ inputs.* }}` to the caller's resolved `values`
-/// (ADR-0076 §1), in every field that is interpolated or evaluated: `image`,
-/// `command`, `env` values, the `with:` values of a nested invoke, and
-/// `when:`. Inside a library, `inputs` never means the calling Run's launch
-/// parameters, so a read of an input the library does not declare, or of
-/// `inputs` other than as `inputs.<name>`, is a compile error.
-fn bind_inputs(
-    step: &StepSpec,
-    values: &BTreeMap<String, serde_json::Value>,
-    label: &str,
-    diagnostics: &mut Vec<String>,
-) -> StepSpec {
-    let mut out = step.clone();
-    let mut errors: Vec<String> = Vec::new();
-    let mut template = |text: &mut String| match bind_template(text, values) {
-        Ok(bound) => *text = bound,
-        Err(e) => errors.push(e),
-    };
-    template(&mut out.image);
-    out.command.iter_mut().for_each(&mut template);
-    out.env.iter_mut().for_each(|(_, v)| template(v));
-    out.with.values_mut().for_each(&mut template);
-    if let Some(When(expr)) = &mut out.when {
-        match bind_expr(expr, values, false) {
-            Ok(bound) => *expr = bound,
-            Err(e) => errors.push(e),
-        }
-    }
-    errors.dedup();
-    for e in errors {
-        diagnostics.push(format!("library `{label}`, step `{}`: {e}", step.id));
-    }
-    out
+/// The `outputs.<name>` reads of templates written at one level: each name
+/// with the result read from it, when that is a constant.
+type OutputNames = Vec<(String, Option<String>)>;
+
+/// What is being checked by [`check_reads`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Written {
+    /// A `${{ … }}` template, rendered when a Step launches.
+    Template,
+    /// A `when:` expression, decided when the Run is created.
+    Guard,
 }
 
-/// Bind a library Step's inputs with [`bind_inputs`], then check the result
-/// with the CEL parser: no `inputs` read may be left anywhere in the Step
-/// (ADR-0076 §1). The scan in [`cel::input_reads`] decides what to replace; this
-/// check does not rely on it, so a form the scan misses is a compile error
-/// instead of a read of the Run's launch parameters. It also refuses an
-/// `inputs` read in a field that is never interpolated (a sidecar's image or
-/// env, `results`, `artifacts`, `secrets`, cache keys, ...).
+/// Check what a template (or a `when:` expression) written at `level` reads,
+/// by the CEL parser (ADR-0076). Pushes the static `outputs.<name>` reads
+/// onto `outputs` and each problem onto `errors`, naming `field`:
 ///
-/// A `with:` value may hold the caller's own `${{ … }}`, which is inserted as
-/// text and may read the caller's `inputs`. The check binds a second copy with
-/// those values replaced by plain text, so that only reads written in the
-/// library itself are left to find.
-fn bind_library_step(
-    step: &StepSpec,
-    values: &BTreeMap<String, serde_json::Value>,
-    label: &str,
-    diagnostics: &mut Vec<String>,
-) -> StepSpec {
-    let before = diagnostics.len();
-    let bound = bind_inputs(step, values, label, diagnostics);
-    if diagnostics.len() > before {
-        // Binding failed and the compile fails with its diagnostic.
-        return bound;
-    }
-    let holds_expression = |v: &serde_json::Value| v.as_str().is_some_and(|s| s.contains("${{"));
-    let unread = if values.values().any(holds_expression) {
-        let plain: BTreeMap<String, serde_json::Value> = values
-            .iter()
-            .map(|(k, v)| {
-                let v = if holds_expression(v) {
-                    serde_json::Value::String(String::new())
-                } else {
-                    v.clone()
-                };
-                (k.clone(), v)
-            })
-            .collect();
-        let mut ignored = Vec::new();
-        let library_only = bind_inputs(step, &plain, label, &mut ignored);
-        let mut unread = unbound_input_reads(&library_only);
-        unread.extend(unnamed_output_reads(&library_only));
-        unread
-    } else {
-        let mut unread = unbound_input_reads(&bound);
-        unread.extend(unnamed_output_reads(&bound));
-        unread
+/// - inside a library, an `inputs.<name>` the library does not declare;
+/// - an `outputs` read whose Step is computed (`outputs[k]`): the compiler
+///   must know the Step, to give the reading Step its view and its `needs`;
+/// - in a library `when:`, any `outputs` read, and a read of an input bound
+///   to a caller's template that reads `outputs`: no Step has run when the
+///   Run is created.
+///
+/// An expression that does not parse is left to [`validate`] (a `with:`
+/// value is checked by the caller).
+fn check_reads(
+    text: &str,
+    written: Written,
+    level: &Level<'_>,
+    field: &str,
+    outputs: &mut OutputNames,
+    errors: &mut Vec<String>,
+) {
+    let exprs: Vec<&str> = match written {
+        Written::Guard => vec![text],
+        Written::Template => cel::scan_interpolations(text)
+            .0
+            .into_iter()
+            .map(|i| text[i.inner].trim())
+            .collect(),
     };
-    for e in unread {
-        diagnostics.push(format!("library `{label}`, step `{}`: {e}", step.id));
+    for expr in exprs {
+        let Ok(reads) = cel::reads(expr) else {
+            continue;
+        };
+        for r in reads {
+            match r.var.as_str() {
+                "inputs" => {
+                    if let (Some((label, declared)), Some(name)) = (level.library, &r.first) {
+                        if !declared.iter().any(|p| &p.name == name) {
+                            errors.push(format!(
+                                "`{field}` reads `inputs.{name}`, which library `{label}` does \
+                                 not declare in `interface.inputs`"
+                            ));
+                        }
+                    }
+                    if written == Written::Guard {
+                        let late = match &r.first {
+                            Some(name) => level.late.contains(name).then(|| name.clone()),
+                            None => level.late.first().cloned(),
+                        };
+                        if let Some(name) = late {
+                            errors.push(format!(
+                                "`{field}` reads `inputs.{name}`, which the caller binds to a \
+                                 template that reads `outputs`; a `when:` is decided when the \
+                                 Run is created, before any Step has run"
+                            ));
+                        }
+                    }
+                }
+                "outputs" => {
+                    if written == Written::Guard {
+                        errors.push(format!(
+                            "`{field}` reads `outputs`; a `when:` in a library is decided when \
+                             the Run is created, before any Step has run"
+                        ));
+                        continue;
+                    }
+                    match r.first {
+                        Some(name) => outputs.push((name, r.second)),
+                        None => errors.push(format!(
+                            "`{field}` reads `outputs` in a form the compiler cannot resolve to \
+                             a Step; read a Step's outputs as `outputs.<id>` or \
+                             `outputs[\"<id>\"]`"
+                        )),
+                    }
+                }
+                _ => {}
+            }
+        }
     }
-    bound
 }
 
-/// Every `${{ … }}` of a library Step that reads `outputs` without naming the
-/// Step it reads (`outputs[k]`), or does not parse: the compiler must know
-/// the Step, to namespace the read and to wire `needs` (ADR-0076 §1). Checked
-/// against the CEL parser by [`cel::static_output_reads`].
-fn unnamed_output_reads(step: &StepSpec) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut strings: Vec<(String, &str)> = vec![("image".to_string(), step.image.as_str())];
-    strings.extend(
+/// Whether a template reads an input of `late` (or `inputs` whole while any
+/// input is late).
+fn reads_late_inputs(template: &str, late: &BTreeSet<String>) -> bool {
+    if late.is_empty() {
+        return false;
+    }
+    cel::scan_interpolations(template).0.iter().any(|i| {
+        cel::reads(template[i.inner.clone()].trim()).is_ok_and(|reads| {
+            reads.iter().any(|r| {
+                r.var == "inputs" && r.first.as_ref().is_none_or(|name| late.contains(name))
+            })
+        })
+    })
+}
+
+/// What each invoke Step in `steps` exposes: its id → its exposed output
+/// names, or `None` when they cannot be read (a matrixed invoke, or a
+/// library that does not resolve; both are reported where the invoke is
+/// inlined). A shallow read of the library's `interface:` only.
+fn exposed_outputs(steps: &[StepSpec], libs: LibsRef<'_>) -> BTreeMap<String, Option<Vec<String>>> {
+    #[derive(Deserialize)]
+    struct Shallow {
+        #[serde(default)]
+        interface: Interface,
+    }
+    steps
+        .iter()
+        .filter_map(|s| {
+            let raw = s.invoke.as_ref()?;
+            let outputs = (s.matrix.is_none())
+                .then(|| {
+                    let src = match parse_invoke_target(raw).ok()? {
+                        InvokeTarget::File(key) => libs.files.get(&key)?.as_str(),
+                        InvokeTarget::Lib(name) => libs.installed.get(&name)?.content.as_str(),
+                        InvokeTarget::Plugin(_) => return None,
+                    };
+                    serde_yaml::from_str::<Shallow>(src)
+                        .ok()
+                        .map(|l| l.interface.outputs)
+                })
+                .flatten();
+            Some((s.id.clone(), outputs))
+        })
+        .collect()
+}
+
+/// The `outputs` view of a template's reads at one level (ADR-0076): each
+/// name read → a sibling Step, or a sibling invoke's exposed outputs. A
+/// name that is neither is refused. A sibling Step read must be among
+/// `needs`, which the reader wrote; each Step the view reads is pushed onto
+/// `data_needs` (an invoke's backing Steps by their ids at this level,
+/// `<invoke>/<output>`). `who` begins each message.
+#[allow(clippy::too_many_arguments)] // one resolution, called from two places
+fn output_view(
+    reads: &OutputNames,
+    siblings: &[StepSpec],
+    exposed: &BTreeMap<String, Option<Vec<String>>>,
+    needs: &[String],
+    who: &str,
+    level: &Level<'_>,
+    diagnostics: &mut Vec<String>,
+    data_needs: &mut Vec<String>,
+) -> BTreeMap<String, OutputSource> {
+    let push = |n: String, data_needs: &mut Vec<String>| {
+        if !data_needs.contains(&n) {
+            data_needs.push(n);
+        }
+    };
+    let mut view = BTreeMap::new();
+    for (name, field) in reads {
+        if let Some(outs) = exposed.get(name) {
+            // An invoke here: its exposed outputs. A read of an output it
+            // does not expose, or without `needs: [<invoke>]`, is reported
+            // by validate_interface.
+            let Some(outs) = outs else { continue };
+            for out in outs {
+                if field.as_ref().is_none_or(|f| f == out) {
+                    push(format!("{name}/{out}"), data_needs);
+                }
+            }
+            view.insert(
+                name.clone(),
+                OutputSource::Invoke(
+                    outs.iter()
+                        .map(|o| (o.clone(), format!("{name}/{o}")))
+                        .collect(),
+                ),
+            );
+            continue;
+        }
+        // A Step here, by its id or, for a matrixed Step, one instance's id
+        // (`build[os=linux]`), which its authored id fans onto.
+        let sibling = siblings.iter().find(|s| {
+            s.invoke.is_none()
+                && (*name == s.id
+                    || name
+                        .strip_prefix(s.id.as_str())
+                        .is_some_and(|r| r.starts_with('[')))
+        });
+        match sibling {
+            Some(s) => {
+                if !needs.contains(&s.id) {
+                    diagnostics.push(format!(
+                        "{who} reads `outputs.{}` but does not `needs: [{}]`",
+                        s.id, s.id
+                    ));
+                }
+                push(s.id.clone(), data_needs);
+                view.insert(name.clone(), OutputSource::Step(name.clone()));
+            }
+            None => diagnostics.push(format!(
+                "{who} reads `outputs.{name}`, which is not a Step {}",
+                match level.library {
+                    Some((l, _)) => format!("of library `{l}`"),
+                    None => "of this Pipeline".to_string(),
+                }
+            )),
+        }
+    }
+    view
+}
+
+/// Give a Step written in a library its scope (ADR-0076): this level's
+/// `inputs` and callers, an `outputs` view of the Steps it reads, and its
+/// own `when` as a guard. Each template is checked against the library's
+/// interface; a Step that reads another Step's outputs must need it.
+fn library_step_scope(
+    step: &mut StepSpec,
+    level: &Level<'_>,
+    label: &str,
+    siblings: &[StepSpec],
+    exposed: &BTreeMap<String, Option<Vec<String>>>,
+    diagnostics: &mut Vec<String>,
+) {
+    let prefix = format!("library `{label}`, step `{}`", step.id);
+    let mut reads = Vec::new();
+    let mut errors = Vec::new();
+    let mut fields: Vec<(String, &str)> = vec![("image".to_string(), step.image.as_str())];
+    fields.extend(
         step.command
             .iter()
             .enumerate()
             .map(|(i, c)| (format!("command[{i}]"), c.as_str())),
     );
-    strings.extend(
+    fields.extend(
         step.env
             .iter()
             .enumerate()
             .map(|(i, (_, v))| (format!("env[{i}][1]"), v.as_str())),
     );
-    strings.extend(
-        step.with
-            .iter()
-            .map(|(k, v)| (format!("with.{k}"), v.as_str())),
+    for (field, text) in fields {
+        check_reads(
+            text,
+            Written::Template,
+            level,
+            &field,
+            &mut reads,
+            &mut errors,
+        );
+    }
+    if let Some(When(w)) = &step.when {
+        check_reads(
+            w,
+            Written::Guard,
+            level,
+            "when",
+            &mut Vec::new(),
+            &mut errors,
+        );
+        step.guards.push(Guard {
+            caller_hops: 0,
+            when: w.clone(),
+        });
+    }
+    errors.extend(uninterpolated_input_reads(step));
+    diagnostics.extend(errors.into_iter().map(|e| format!("{prefix}: {e}")));
+    let mut data_needs = Vec::new();
+    let view = output_view(
+        &reads,
+        siblings,
+        exposed,
+        &step.needs.0,
+        &format!("{prefix}:"),
+        level,
+        diagnostics,
+        &mut data_needs,
     );
-    for (field, text) in strings {
-        for i in cel::scan_interpolations(text).0 {
-            if let Err(e) = cel::static_output_reads(&text[i.inner]) {
-                out.push(format!("`{field}` {e}"));
-            }
+    // An invoke's backing Steps: `needs: [<invoke>]` reaches only its leaves.
+    for n in data_needs {
+        if !step.needs.0.contains(&n) {
+            step.needs.0.push(n);
         }
     }
-    out
+    let mut scope = level.scope.clone();
+    scope.outputs = view;
+    step.scope = Some(scope);
 }
 
-/// Every place in a bound library Step that still reads `inputs`, by the
-/// CEL parser: each `${{ … }}` in every string field, and `when:`. An
-/// expression that mentions `inputs` and does not parse is reported too,
-/// since what it reads cannot be checked.
-fn unbound_input_reads(step: &StepSpec) -> Vec<String> {
-    /// The fields [`bind_inputs`] binds.
-    const BOUND: [&str; 4] = ["image", "command", "env", "with"];
-    fn check(expr: &str, field: &str, out: &mut Vec<String>) {
-        // An identifier cannot be escaped in CEL: a read of `inputs` has the
-        // word in its text.
-        if !expr.contains("inputs") {
-            return;
-        }
-        let top = field.split(['.', '[']).next().unwrap_or(field);
-        match cel::reads_variable(expr, "inputs") {
-            Ok(false) => {}
-            Ok(true) if BOUND.contains(&top) || top == "when" => out.push(format!(
-                "`{field}` reads `inputs` in a form the compiler cannot bind; read an input \
-                 as `inputs.<name>`"
-            )),
-            Ok(true) => out.push(format!(
-                "`{field}` reads `inputs`, but `{top}` is not interpolated when the Step \
-                 launches; a library can read its inputs only in image, command, env, when \
-                 and a nested invoke's with:"
-            )),
-            Err(e) => out.push(format!(
-                "`{field}` mentions `inputs` and does not parse, so its reads cannot be \
-                 checked: {e}"
-            )),
-        }
-    }
+/// Every `${{ … }}` of a library Step that reads `inputs` in a field that is
+/// not rendered when the Step launches (a sidecar's image or env,
+/// `results`, `artifacts`, `secrets`, cache keys, ...): it would reach the
+/// Step as text, so it is refused. An expression that mentions `inputs` and
+/// does not parse is refused too, since what it reads cannot be checked.
+fn uninterpolated_input_reads(step: &StepSpec) -> Vec<String> {
+    /// The fields that render (or, for `when`, are evaluated), and what the
+    /// compiler writes.
+    const RENDERED: [&str; 8] = [
+        "image", "command", "env", "with", "when", "scope", "guards", "origin",
+    ];
     fn walk(value: &serde_json::Value, path: &str, out: &mut Vec<String>) {
         match value {
             serde_json::Value::String(text) => {
-                let mut rest = text.as_str();
-                while let Some(start) = rest.find("${{") {
-                    let after = &rest[start + 3..];
-                    // An unterminated `${{` is checked to the end of the text.
-                    let end = after.find("}}").unwrap_or(after.len());
-                    check(after[..end].trim(), path, out);
-                    rest = &after[(end + 2).min(after.len())..];
+                let (found, unterminated) = cel::scan_interpolations(text);
+                let mut exprs: Vec<&str> =
+                    found.iter().map(|i| text[i.inner.clone()].trim()).collect();
+                // An unterminated `${{` is checked to the end of the text.
+                if let Some(at) = unterminated {
+                    exprs.push(text[at + 3..].trim());
+                }
+                for expr in exprs.into_iter().filter(|e| e.contains("inputs")) {
+                    let top = path.split(['.', '[']).next().unwrap_or(path);
+                    match cel::reads(expr) {
+                        Ok(reads) if !reads.iter().any(|r| r.var == "inputs") => {}
+                        Ok(_) => out.push(format!(
+                            "`{path}` reads `inputs`, but `{top}` is not interpolated when the \
+                             Step launches; a library can read its inputs only in image, \
+                             command, env, when and a nested invoke's with:"
+                        )),
+                        Err(e) => out.push(format!(
+                            "`{path}` mentions `inputs` and does not parse, so its reads cannot \
+                             be checked: {e}"
+                        )),
+                    }
                 }
             }
             serde_json::Value::Array(items) => {
@@ -2431,8 +2711,7 @@ fn unbound_input_reads(step: &StepSpec) -> Vec<String> {
             }
             serde_json::Value::Object(fields) => {
                 for (k, v) in fields {
-                    // `when:` is a whole expression, checked below.
-                    if path.is_empty() && k == "when" {
+                    if path.is_empty() && RENDERED.contains(&k.as_str()) {
                         continue;
                     }
                     let key = if path.is_empty() {
@@ -2452,141 +2731,43 @@ fn unbound_input_reads(step: &StepSpec) -> Vec<String> {
         Ok(value) => walk(&value, "", &mut out),
         Err(e) => out.push(format!("cannot be checked for `inputs` reads: {e}")),
     }
-    if let Some(When(expr)) = &step.when {
-        check(expr, "when", &mut out);
-    }
     out
 }
 
-/// Bind each `${{ … }}` of a template. An interpolation that is exactly
-/// `${{ inputs.<name> }}` becomes the value's text, which may itself hold the
-/// caller's `${{ outputs.… }}` for the launch-time interpolator; an
-/// `inputs.<name>` inside a larger expression becomes a CEL literal. An
-/// unterminated `${{` is left for [`validate`] to report.
-fn bind_template(
-    text: &str,
-    values: &BTreeMap<String, serde_json::Value>,
-) -> Result<String, String> {
-    if !text.contains("${{") {
-        return Ok(text.to_string());
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find("${{") {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 3..];
-        let Some(end) = after.find("}}") else {
-            out.push_str(&rest[start..]);
-            return Ok(out);
-        };
-        let inner = &after[..end];
-        let expr = inner.trim();
-        let reads = cel::input_reads(expr);
-        match reads.as_slice() {
-            [] => {
-                out.push_str("${{");
-                out.push_str(inner);
-                out.push_str("}}");
-            }
-            [cel::InputRead {
-                start: 0,
-                end,
-                field: Some(name),
-            }] if *end == expr.len() => {
-                out.push_str(&params::stringify(input_value(values, name)?))
-            }
-            _ => {
-                out.push_str("${{ ");
-                out.push_str(&bind_expr(expr, values, true)?);
-                out.push_str(" }}");
-            }
-        }
-        rest = &after[end + 2..];
-    }
-    out.push_str(rest);
-    Ok(out)
-}
-
-/// Replace each `inputs.<name>` read in a CEL expression with the value as a
-/// CEL literal. `in_template` is set for an expression inside `${{ … }}`.
-fn bind_expr(
-    expr: &str,
-    values: &BTreeMap<String, serde_json::Value>,
-    in_template: bool,
-) -> Result<String, String> {
-    let reads = cel::input_reads(expr);
-    let mut out = expr.to_string();
-    // From the end, so earlier byte ranges stay valid.
-    for read in reads.iter().rev() {
-        let Some(name) = &read.field else {
-            return Err("reads `inputs` other than as `inputs.<name>`".to_string());
-        };
-        let value = input_value(values, name)?;
-        if value.as_str().is_some_and(|s| s.contains("${{")) {
-            let place = if in_template {
-                format!("inside a larger expression; read it alone as `${{{{ inputs.{name} }}}}`")
-            } else {
-                "in `when:`, which is decided when the Run is created".to_string()
-            };
-            return Err(format!(
-                "input `{name}` holds a `${{{{ … }}}}` expression, which cannot be read {place}"
-            ));
-        }
-        out.replace_range(read.start..read.end, &cel_literal(value));
-    }
-    Ok(out)
-}
-
-/// The value of a declared input, or the undeclared-input error.
-fn input_value<'v>(
-    values: &'v BTreeMap<String, serde_json::Value>,
-    name: &str,
-) -> Result<&'v serde_json::Value, String> {
-    values.get(name).ok_or_else(|| {
-        format!("reads `inputs.{name}`, which the library does not declare in `interface.inputs`")
-    })
-}
-
-/// A resolved input value as a CEL literal: a number or boolean as itself, a
-/// string double-quoted. `{` and `}` are written as `\u` escapes, so a value
-/// cannot end the enclosing `${{ … }}` early.
-fn cel_literal(v: &serde_json::Value) -> String {
-    use std::fmt::Write;
-    match v {
-        serde_json::Value::Number(n) => {
-            let n = n.to_string();
-            if n.starts_with('-') {
-                format!("({n})")
-            } else {
-                n
-            }
-        }
-        serde_json::Value::Bool(b) => b.to_string(),
-        other => {
-            let text = match other {
-                serde_json::Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-            let mut lit = String::with_capacity(text.len() + 2);
-            lit.push('"');
-            for c in text.chars() {
-                match c {
-                    '\\' => lit.push_str("\\\\"),
-                    '"' => lit.push_str("\\\""),
-                    '\n' => lit.push_str("\\n"),
-                    '\r' => lit.push_str("\\r"),
-                    '\t' => lit.push_str("\\t"),
-                    '{' | '}' => {
-                        let _ = write!(lit, "\\u{:04x}", c as u32);
-                    }
-                    c if c.is_control() => {
-                        let _ = write!(lit, "\\u{:04x}", c as u32);
-                    }
-                    c => lit.push(c),
+/// Namespace the Step ids a scope's `outputs` view names: they were ids in
+/// a library, and are `<invoke>/<id>` in its caller.
+fn namespace_view(scope: &mut Scope, ns: &impl Fn(&str) -> String) {
+    for source in scope.outputs.values_mut() {
+        match source {
+            OutputSource::Step(id) => *id = ns(id),
+            OutputSource::Invoke(exposed) => {
+                for id in exposed.values_mut() {
+                    *id = ns(id);
                 }
             }
-            lit.push('"');
-            lit
+        }
+    }
+}
+
+/// What an invoke step carries onto each Step and gate it inlines
+/// (ADR-0076 §1). Its `timeout`, `resources` and `placement_profiles` apply to
+/// a Step that is not a gate, only where the library Step leaves the field
+/// unset: the library's own value wins (`resources` per field, `cpu_millis`
+/// and `memory_mib`). Its `when` becomes a [`Guard`] of each, read in the
+/// invoke Step's own scope. `env` never carries.
+fn carry_invoke_fields(invoke: &StepSpec, inst: &mut StepSpec) {
+    if !inst.is_gate() {
+        if inst.timeout.is_none() {
+            inst.timeout = invoke.timeout;
+        }
+        if inst.resources.cpu_millis.is_none() {
+            inst.resources.cpu_millis = invoke.resources.cpu_millis;
+        }
+        if inst.resources.memory_mib.is_none() {
+            inst.resources.memory_mib = invoke.resources.memory_mib;
+        }
+        if inst.placement_profiles.is_empty() {
+            inst.placement_profiles = invoke.placement_profiles.clone();
         }
     }
 }
@@ -2603,11 +2784,12 @@ fn rewrite_output_refs(text: &mut String, invoke_id: &str, exposed: &[String]) -
                 continue;
             };
             if id == invoke_id && exposed.iter().any(|n| n == name) {
-                let backing = serde_json::Value::String(format!("{id}/{name}"));
+                // A JSON string is a CEL string literal.
+                let backing = serde_json::Value::String(format!("{id}/{name}")).to_string();
                 let at = i.inner.start;
                 edits.push((
                     at + read.start..at + read.end,
-                    format!("outputs[{}]", cel_literal(&backing)),
+                    format!("outputs[{backing}]"),
                 ));
             }
         }
@@ -2671,9 +2853,9 @@ fn validate_interface(
     // Declared param specs must be well-formed (env-safe names, sensible
     // required/default/choice, a parsable `validate:`) — ADR-0043 §2.
     params::validate_param_specs(&iface.inputs, &format!("library `{key}`"), diagnostics);
-    // A default is a plain value. Only the caller's `with:` may hold a
-    // `${{ … }}`: one in a default would be inserted as text and read the
-    // calling Run's launch parameters or outputs at launch.
+    // A default is a plain value. Only the caller's `with:` holds a template
+    // the compiler renders; a `${{` in a default would reach the Step as
+    // text, which is never what its author meant.
     for p in &iface.inputs {
         if p.default
             .as_ref()
@@ -2687,9 +2869,10 @@ fn validate_interface(
         }
     }
 
-    // Every required input must be supplied; a supplied value must coerce to the
-    // declared type (and be a valid choice / pass `validate:`); no unknown extras.
-    // Optional inputs (a `default`) may be omitted — the default is injected.
+    // Every required input must be supplied; a literal value must coerce to
+    // the declared type (and be a valid choice / pass `validate:`); no unknown
+    // extras. A template is converted and checked when a Step launches.
+    // Optional inputs (a `default`) may be omitted — the default is bound.
     for p in &iface.inputs {
         match step.with.get(&p.name) {
             None => {
@@ -2700,6 +2883,7 @@ fn validate_interface(
                     ));
                 }
             }
+            Some(raw) if raw.contains("${{") => {}
             Some(raw) => {
                 // `with:` values are authored as strings; coerce to the type.
                 let supplied = serde_json::Value::String(raw.clone());
@@ -2747,11 +2931,14 @@ fn validate_interface(
             continue;
         }
         for text in interpolatable_strings(t) {
-            for expr in cel::interpolations(text).unwrap_or_default() {
-                let fields = cel::output_reads(expr)
+            for i in cel::scan_interpolations(text).0 {
+                let Ok(reads) = cel::reads(text[i.inner].trim()) else {
+                    continue;
+                };
+                let fields = reads
                     .into_iter()
-                    .filter(|r| r.step.as_deref() == Some(step.id.as_str()))
-                    .filter_map(|r| r.field);
+                    .filter(|r| r.var == "outputs" && r.first.as_deref() == Some(step.id.as_str()))
+                    .filter_map(|r| r.second);
                 for field in fields {
                     if matrixed {
                         diagnostics.push(format!(
@@ -2780,49 +2967,14 @@ fn validate_interface(
 }
 
 /// The step strings that may carry `${{ … }}` interpolations (image, command,
-/// env values, and an invoke step's `with:` values, which are bound into the
-/// library's Steps) — the surfaces scanned for invoke-output references.
+/// env values, and an invoke step's `with:` values, which its library's Steps
+/// render) — the surfaces scanned for invoke-output references.
 fn interpolatable_strings(step: &StepSpec) -> Vec<&str> {
     let mut out: Vec<&str> = vec![step.image.as_str()];
     out.extend(step.command.iter().map(String::as_str));
     out.extend(step.env.iter().map(|(_, v)| v.as_str()));
     out.extend(step.with.values().map(String::as_str));
     out
-}
-
-/// The field names accessed on `base` in a CEL expression (`base.<field>`), where
-/// `base` stands alone (not itself the tail of a longer `x.base` access). Used to
-/// find `<invoke-id>.<output>` references.
-fn field_accesses(expr: &str, base: &str) -> Vec<String> {
-    let bytes = expr.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while let Some(rel) = expr[i..].find(base) {
-        let start = i + rel;
-        let end = start + base.len();
-        // A standalone `base`: the char before is neither an identifier char nor
-        // a `.` (which would make it `x.base`, a field of something else).
-        let before_ok = start == 0 || {
-            let prev = bytes[start - 1];
-            !is_ident_byte(prev) && prev != b'.'
-        };
-        if before_ok && end < bytes.len() && bytes[end] == b'.' {
-            let fstart = end + 1;
-            let mut fend = fstart;
-            while fend < bytes.len() && is_ident_byte(bytes[fend]) {
-                fend += 1;
-            }
-            if fend > fstart {
-                out.push(expr[fstart..fend].to_string());
-            }
-        }
-        i = end.max(start + 1);
-    }
-    out
-}
-
-fn is_ident_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 /// Is `s` an RFC-1123 DNS label (lowercase alnum + interior `-`, ≤63 chars)? A
@@ -2976,7 +3128,11 @@ fn expand_step(step: &StepSpec) -> Result<Vec<StepSpec>, String> {
             // Merge onto any coordinate the step already carries (an invoke
             // step's coordinate propagated onto an inlined library step, ADR-0038)
             // rather than replacing it; for an ordinary step the map starts empty.
-            instance.matrix_values.extend(coord);
+            instance.matrix_values.extend(coord.clone());
+            // A library Step's `matrix` is its own coordinate only (ADR-0076).
+            if let Some(scope) = &mut instance.scope {
+                scope.matrix = coord;
+            }
             instance
         })
         .collect())
@@ -3188,33 +3344,48 @@ fn validate_results(step: &StepSpec, diagnostics: &mut Vec<String>) {
 /// `results:` must name a declared result (ADR-0070 §7, kept by ADR-0074 §3),
 /// so a typo fails the Pipeline check instead of the reading Step at launch.
 /// A Step that declares nothing keeps the open ADR-0041 map and is not
-/// checked. Both spellings are read: `outputs.<id>.<name>` and, for a
-/// namespaced id, `outputs["<id>"].<name>`.
+/// checked. A read names a Step through the reader's scope (ADR-0076): a
+/// library Step's `outputs.b` is its own library's `b`, never a Step of the
+/// same name elsewhere.
 fn validate_output_reads(ir: &PipelineIr, diagnostics: &mut Vec<String>) {
-    let declaring: Vec<&StepSpec> = ir.steps.iter().filter(|s| !s.results.is_empty()).collect();
-    if declaring.is_empty() {
+    let declared: BTreeMap<&str, &[String]> = ir
+        .steps
+        .iter()
+        .filter(|s| !s.results.is_empty())
+        .map(|s| (s.id.as_str(), s.results.as_slice()))
+        .collect();
+    if declared.is_empty() {
         return;
     }
     for t in &ir.steps {
         for text in interpolatable_strings(t) {
-            for expr in cel::interpolations(text).unwrap_or_default() {
-                for s in &declaring {
-                    let bases = [
-                        format!("outputs.{}", s.id),
-                        format!("outputs[\"{}\"]", s.id),
-                    ];
-                    for base in &bases {
-                        for field in field_accesses(expr, base) {
-                            if !s.results.iter().any(|r| *r == field) {
-                                diagnostics.push(format!(
-                                    "step `{}`: reads `outputs.{}.{field}`, which step `{}` does \
-                                     not declare (it declares results: [{}])",
-                                    t.id,
-                                    s.id,
-                                    s.id,
-                                    s.results.join(", ")
-                                ));
-                            }
+            for i in cel::scan_interpolations(text).0 {
+                let Ok(reads) = cel::reads(text[i.inner].trim()) else {
+                    continue;
+                };
+                for r in reads.into_iter().filter(|r| r.var == "outputs") {
+                    let (Some(name), Some(field)) = (r.first, r.second) else {
+                        continue;
+                    };
+                    let step = match &t.scope {
+                        None => name.clone(),
+                        Some(scope) => match scope.outputs.get(&name) {
+                            Some(OutputSource::Step(id)) => id.clone(),
+                            Some(OutputSource::Invoke(exposed)) => match exposed.get(&field) {
+                                Some(id) => id.clone(),
+                                None => continue,
+                            },
+                            None => continue,
+                        },
+                    };
+                    if let Some(results) = declared.get(step.as_str()) {
+                        if !results.contains(&field) {
+                            diagnostics.push(format!(
+                                "step `{}`: reads `outputs.{name}.{field}`, which step `{step}` \
+                                 does not declare (it declares results: [{}])",
+                                t.id,
+                                results.join(", ")
+                            ));
                         }
                     }
                 }
@@ -3571,6 +3742,13 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                 diagnostics.push(format!("step `{}`: when {e}", step.id));
             }
         }
+        // An invoke Step's `when`, carried onto what it inlines (its own
+        // `when` was checked where it is the Step's own).
+        for g in step.guards.iter().filter(|g| g.caller_hops > 0) {
+            if let Err(e) = cel::check(&g.when) {
+                diagnostics.push(format!("step `{}`: when {e}", step.id));
+            }
+        }
         let mut templates = vec![&step.image];
         templates.extend(&step.command);
         templates.extend(step.env.iter().map(|(_, v)| v));
@@ -3745,6 +3923,7 @@ fn find_cycle(steps: &[StepSpec]) -> Option<Vec<String>> {
 
 /// Return the ids of steps whose `when:` guard is **false** under `ctx` — the
 /// steps to prune (ADR-0009, 0033). A step with no `when:` is always included.
+/// [`excluded_steps_with_params`] with no launch parameters (a webhook Run).
 ///
 /// The run keeps the *full* DAG (edges intact) and marks these steps `Skipped`,
 /// so the engine's dep cascade transitively skips their descendants (ADR-0033) —
@@ -3753,11 +3932,31 @@ pub fn excluded_steps(
     ir: &PipelineIr,
     ctx: &serde_json::Value,
 ) -> Result<Vec<String>, PipelineError> {
+    excluded_steps_with_params(ir, ctx, &BTreeMap::new())
+}
+
+/// [`excluded_steps`] for a Run created with launch parameters `params`.
+///
+/// A Step written in the Pipeline file is decided by its `when:` against
+/// `ctx` (the trigger event), as it always was. A Step or gate inlined from a
+/// library is decided by its [`guards`](StepSpec::guards), outermost first,
+/// each in the scope it was written in (ADR-0076): an invoke Step's `when` in
+/// the Pipeline file against `ctx`, any other in its library scope, where a
+/// caller's `with:` template renders with `params`.
+pub fn excluded_steps_with_params(
+    ir: &PipelineIr,
+    ctx: &serde_json::Value,
+    params: &BTreeMap<String, serde_json::Value>,
+) -> Result<Vec<String>, PipelineError> {
     let mut excluded = Vec::new();
     for step in &ir.steps {
-        let include = match &step.when {
-            Some(When(expr)) => cel::eval_bool(expr, ctx)?,
-            None => true,
+        let include = if step.origin.is_empty() {
+            match &step.when {
+                Some(When(expr)) => cel::eval_bool(expr, ctx)?,
+                None => true,
+            }
+        } else {
+            guards_hold(step, ctx, params)?
         };
         if !include {
             excluded.push(step.id.clone());
@@ -3766,31 +3965,36 @@ pub fn excluded_steps(
     Ok(excluded)
 }
 
-/// Resolve `${{ … }}` interpolations in a step's launchable surfaces — `image`,
-/// `command`, and `env` values — against `ctx` (ADR-0041). Pure: the engine
-/// builds `ctx` at launch from the step's upstream results (`outputs`) and its
-/// own matrix coordinate (`matrix`), then launches the returned spec.
-///
-/// **Fail-fast:** a bad reference — an unbound name, a type error in a guard —
-/// is a hard error that fails the step; it never renders empty or degrades
-/// silently (ADR-0041 §5). A surface with no `${{ … }}` is returned verbatim.
-pub fn interpolate_spec(
-    spec: &StepSpec,
+/// Whether every guard of an inlined Step holds, outermost first (an inner
+/// guard is not evaluated once an outer one is false).
+fn guards_hold(
+    step: &StepSpec,
     ctx: &serde_json::Value,
-) -> Result<StepSpec, PipelineError> {
-    let mut out = spec.clone();
-    out.image = cel::interpolate(&spec.image, ctx)?;
-    out.command = spec
-        .command
-        .iter()
-        .map(|c| cel::interpolate(c, ctx))
-        .collect::<Result<Vec<_>, _>>()?;
-    out.env = spec
-        .env
-        .iter()
-        .map(|(k, v)| cel::interpolate(v, ctx).map(|v| (k.clone(), v)))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(out)
+    params: &BTreeMap<String, serde_json::Value>,
+) -> Result<bool, PipelineError> {
+    for g in step.guards.iter().rev() {
+        let scope = step
+            .scope
+            .as_ref()
+            .and_then(|s| s.at(g.caller_hops))
+            .ok_or_else(|| {
+                PipelineError::Cel(format!(
+                    "step `{}`: a `when:` has no scope to be read in",
+                    step.id
+                ))
+            })?;
+        let holds = match scope.inputs {
+            // Written in the Pipeline file: the trigger context, as a
+            // Pipeline Step's own `when` reads.
+            ScopeInputs::Run => cel::eval_bool(&g.when, ctx)?,
+            ScopeInputs::Bound(_) => render::guard_holds(&g.when, scope, params)
+                .map_err(|e| PipelineError::Cel(format!("step `{}`: {e}", step.id)))?,
+        };
+        if !holds {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -5204,6 +5408,30 @@ mod tests {
         );
     }
 
+    /// Launch `step` as the engine does: the one renderer, with the Run's
+    /// launch parameters and the results of the Step's needs.
+    fn launch(
+        step: &StepSpec,
+        params: serde_json::Value,
+        results: serde_json::Value,
+    ) -> Result<Rendered, String> {
+        let params: BTreeMap<String, serde_json::Value> = serde_json::from_value(params).unwrap();
+        let results: Results = serde_json::from_value(results).unwrap();
+        render(
+            Templates {
+                image: &step.image,
+                command: &step.command,
+                env: &step.env,
+            },
+            step.scope.as_ref(),
+            &step.matrix_values,
+            Facts::Launch {
+                params: &params,
+                results: &results,
+            },
+        )
+    }
+
     #[test]
     fn library_inputs_bind_to_with_through_nested_invokes() {
         let outer = r#"
@@ -5245,64 +5473,93 @@ mod tests {
                 (".scarab/lib/inner.yaml", inner),
             ]),
         );
+        assert_eq!(ir.ir_version, IR_VERSION_SCOPED);
         let step = |id: &str| ir.steps.iter().find(|s| s.id == id).unwrap();
-        // The Pipeline's own `inputs` are its launch parameters: untouched.
-        assert_eq!(step("top").command, vec!["${{ inputs.region }}"]);
-
-        let a = step("d/a");
-        assert_eq!(a.image, "registry/app:eu");
-        assert_eq!(a.command, vec!["echo", "eu"]);
-        assert!(a.env.contains(&("R".to_string(), "r-eu".to_string())));
-        assert!(a
-            .env
-            .contains(&("SCARAB_PARAM_REGION".to_string(), "eu".to_string())));
-        assert_eq!(a.when, Some(When(r#""eu" == 'eu' && !false"#.to_string())));
-
-        // The nested `with:` got the outer value before the inner library bound it.
-        let b = step("d/inner/b");
-        assert_eq!(b.command[0], "eu-1");
-        assert_eq!(b.command[1], "${{ 3 + 1 }}");
-        assert_eq!(b.command[2], r#"${{ 'z=' + "eu-1" }}"#);
-        assert!(b
-            .env
-            .contains(&("SCARAB_PARAM_ZONE".to_string(), "eu-1".to_string())));
-        let launched: Vec<String> = b
-            .command
-            .iter()
-            .map(|c| cel::interpolate(c, &json!({})).unwrap())
-            .collect();
-        assert_eq!(launched, vec!["eu-1", "4", "z=eu-1"]);
-        assert!(
-            cel::eval_bool(&a.when.as_ref().unwrap().0, &json!({})).unwrap(),
-            "the bound guard evaluates with no launch parameters"
+        // The Pipeline's own `inputs` are its launch parameters: untouched,
+        // and no scope.
+        let top = step("top");
+        assert_eq!(top.scope, None);
+        let run = json!({ "region": "RUN" });
+        assert_eq!(
+            launch(top, run.clone(), json!({})).unwrap().command,
+            ["RUN"]
         );
+
+        // Nothing is pasted: the library's text is as written.
+        let a = step("d/a");
+        assert_eq!(a.image, "registry/app:${{ inputs.region }}");
+        assert_eq!(
+            a.when,
+            Some(When("inputs.region == 'eu' && !inputs.canary".into()))
+        );
+        let ScopeInputs::Bound(bound) = &a.scope.as_ref().unwrap().inputs else {
+            panic!("a library Step's inputs are its bindings");
+        };
+        assert_eq!(bound["region"].value, BoundValue::Literal(json!("eu")));
+        assert_eq!(bound["canary"].value, BoundValue::Literal(json!(false)));
+        let r = launch(a, run.clone(), json!({})).unwrap();
+        assert_eq!(r.image, "registry/app:eu");
+        assert_eq!(r.command, ["echo", "eu"]);
+        assert_eq!(
+            r.env,
+            [
+                ("SCARAB_PARAM_CANARY".to_string(), "false".to_string()),
+                ("SCARAB_PARAM_REGION".to_string(), "eu".to_string()),
+                ("R".to_string(), "r-eu".to_string()),
+            ]
+        );
+
+        // The nested `with:` is rendered in `d`'s scope, then typed.
+        let b = step("d/inner/b");
+        assert_eq!(b.command[0], "${{ inputs.zone }}");
+        let r = launch(b, run, json!({})).unwrap();
+        assert_eq!(r.command, ["eu-1", "4", "z=eu-1"]);
+        assert_eq!(
+            r.env,
+            [
+                ("SCARAB_PARAM_COUNT".to_string(), "3".to_string()),
+                ("SCARAB_PARAM_ZONE".to_string(), "eu-1".to_string()),
+            ]
+        );
+        // The guard is decided at Run creation, in the library's scope.
+        assert!(excluded_steps(&ir, &json!({ "event": {} }))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
-    fn a_bound_string_is_a_cel_literal_that_round_trips() {
+    fn a_caller_value_is_data_in_the_library() {
         let lib = r#"
             interface:
               inputs: [{ name: msg, type: string }]
             steps:
-              - { id: a, image: busybox, command: ["${{ inputs.msg + '' }}"] }
+              - { id: a, image: busybox, command: ["${{ inputs.msg + '' }}"], when: "inputs.msg != ''" }
         "#;
-        let msg = "a\"b\\c}}d\ne{x}\u{1}";
-        let caller = format!(
-            "steps: [{{ id: s, invoke: file:.scarab/lib/a.yaml, with: {{ msg: {} }} }}]",
-            serde_json::to_string(msg).unwrap()
-        );
-        let ir = compile_with(&caller, &libs(&[(".scarab/lib/a.yaml", lib)]));
-        let a = ir.steps.iter().find(|s| s.id == "s/a").unwrap();
-        assert_eq!(cel::interpolate(&a.command[0], &json!({})).unwrap(), msg);
+        for msg in ["a\"b\\c}}d\ne{x}\u{1}", "' || true || '", "}} ${{ true"] {
+            let caller = format!(
+                "steps: [{{ id: s, invoke: file:.scarab/lib/a.yaml, with: {{ msg: {} }} }}]",
+                serde_json::to_string(msg).unwrap()
+            );
+            match compile_yaml_with_libs(&caller, &libs(&[(".scarab/lib/a.yaml", lib)])) {
+                // A value holding `${{` is the caller's template.
+                Err(e) => assert!(msg.contains("${{"), "{msg}: {e}"),
+                Ok(ir) => {
+                    let a = ir.steps.iter().find(|s| s.id == "s/a").unwrap();
+                    let r = launch(a, json!({ "msg": "RUN", "secret": "RUN" }), json!({}));
+                    assert_eq!(r.unwrap().command[0], msg);
+                }
+            }
+        }
     }
 
     #[test]
-    fn a_caller_output_passes_through_with_as_text() {
+    fn a_caller_output_is_read_in_the_callers_scope() {
         let lib = r#"
             interface:
               inputs: [{ name: image, type: string }]
             steps:
               - { id: run, image: "${{ inputs.image }}" }
+              - { id: tag, image: "busybox", needs: [run], command: ["${{ inputs.image + ':1' }}"] }
         "#;
         let ir = compile_with(
             r#"
@@ -5316,34 +5573,26 @@ mod tests {
             &libs(&[(".scarab/lib/run.yaml", lib)]),
         );
         let run = ir.steps.iter().find(|s| s.id == "deploy/run").unwrap();
-        assert_eq!(run.image, "${{ outputs.build.image }}");
+        assert_eq!(run.image, "${{ inputs.image }}");
         assert_eq!(run.needs.0, vec!["build".to_string()]);
+        let caller = run.scope.as_ref().unwrap().at(1).unwrap();
+        assert_eq!(
+            caller.outputs,
+            BTreeMap::from([("build".into(), OutputSource::Step("build".into()))])
+        );
+        let results = json!({ "build": { "image": "registry/app@sha256:1" } });
+        assert_eq!(
+            launch(run, json!({}), results.clone()).unwrap().image,
+            "registry/app@sha256:1"
+        );
+        // Read inside a larger expression, it is a value like any other.
+        let tag = ir.steps.iter().find(|s| s.id == "deploy/tag").unwrap();
+        assert!(tag.needs.0.contains(&"build".to_string()));
+        assert_eq!(
+            launch(tag, json!({}), results).unwrap().command,
+            ["registry/app@sha256:1:1"]
+        );
 
-        // Read inside a larger expression it cannot stay text.
-        let errs = errors_with(
-            r#"
-            steps:
-              - { id: build, image: busybox }
-              - id: deploy
-                invoke: file:.scarab/lib/run.yaml
-                needs: [build]
-                with: { image: "${{ outputs.build.image }}" }
-            "#,
-            &libs(&[(
-                ".scarab/lib/run.yaml",
-                r#"
-                interface:
-                  inputs: [{ name: image, type: string }]
-                steps:
-                  - { id: run, image: "${{ inputs.image + ':1' }}" }
-                "#,
-            )]),
-        );
-        assert!(
-            errs.iter()
-                .any(|e| e.contains("input `image` holds a `${{ … }}` expression")),
-            "{errs:?}"
-        );
         // Reading the output of an invoke sibling through `with:` needs it.
         let errs = errors_with(
             r#"
@@ -5366,55 +5615,58 @@ mod tests {
                 .any(|e| e.contains("reads `outputs.build.image` but does not `needs: [build]`")),
             "{errs:?}"
         );
+        // A name that is no Step of the caller is refused.
+        let errs = errors_with(
+            r#"
+            steps:
+              - id: deploy
+                invoke: file:.scarab/lib/run.yaml
+                with: { image: "${{ outputs.ghost.image }}" }
+            "#,
+            &libs(&[(".scarab/lib/run.yaml", lib)]),
+        );
+        assert!(
+            errs.iter().any(|e| e
+                == "step `deploy`: `with:` reads `outputs.ghost`, which is not a Step of this \
+                    Pipeline"),
+            "{errs:?}"
+        );
     }
 
     #[test]
-    fn the_parser_check_finds_every_inputs_read_left_in_a_step() {
-        // Checked on the Step as written, with no binding: this is the
-        // check that catches a read the scan in `cel::input_reads` misses.
+    fn an_inputs_read_in_a_field_that_does_not_render_is_refused() {
         let step: StepSpec = serde_yaml::from_str(
             r#"
             id: s
             image: "${{ .inputs.x }}"
-            command: ["${{ [1].map(inputs, inputs) }}", "${{ 'inputs.x' + matrix.inputs }}"]
-            env: [[A, "${{ inputs. }}"]]
+            command: ["${{ [1].map(inputs, inputs) }}"]
             when: "x.y || inputs.z"
             services: [{ image: "${{ 'inputs' }}" }]
             artifacts: ["${{ inputs.a"]
+            results: ["${{ inputs. }}"]
             "#,
         )
         .unwrap();
         assert_eq!(
-            unbound_input_reads(&step),
+            uninterpolated_input_reads(&step),
             vec![
                 "`artifacts[0]` reads `inputs`, but `artifacts` is not interpolated when the \
                  Step launches; a library can read its inputs only in image, command, env, when \
                  and a nested invoke's with:"
                     .to_string(),
-                "`command[0]` reads `inputs` in a form the compiler cannot bind; read an input \
-                 as `inputs.<name>`"
-                    .to_string(),
                 format!(
-                    "`env[0][1]` mentions `inputs` and does not parse, so its reads cannot be \
+                    "`results[0]` mentions `inputs` and does not parse, so its reads cannot be \
                      checked: {}",
                     cel::check("inputs.").unwrap_err()
                 ),
-                "`image` reads `inputs` in a form the compiler cannot bind; read an input as \
-                 `inputs.<name>`"
-                    .to_string(),
-                "`when` reads `inputs` in a form the compiler cannot bind; read an input as \
-                 `inputs.<name>`"
-                    .to_string(),
             ]
         );
-        assert!(cel::reads_variable(".inputs", "inputs").unwrap());
-        assert!(!cel::reads_variable("x.inputs", "inputs").unwrap());
     }
 
     #[test]
-    fn a_caller_launch_parameter_passes_through_with_as_text() {
+    fn a_caller_launch_parameter_reaches_a_library_through_with() {
         // In the Pipeline, `inputs` is the Run's: the caller may hand one to
-        // a library, and the check does not mistake it for the library's.
+        // a library, through two levels; the library never reads the Run's.
         let ir = compile_with(
             r#"
             interface: { inputs: [{ name: p, type: string }] }
@@ -5444,16 +5696,17 @@ mod tests {
         );
         for id in ["c/a", "c/n/b"] {
             let s = ir.steps.iter().find(|s| s.id == id).unwrap();
-            assert_eq!(s.command, vec!["${{ inputs.p }}"], "{id}");
+            let r = launch(s, json!({ "p": "RUN-P", "v": "NO", "w": "NO" }), json!({}));
+            assert_eq!(r.unwrap().command, ["RUN-P"], "{id}");
         }
     }
 
     #[test]
     fn a_library_reads_only_the_inputs_it_declares() {
         for (field, yaml) in [
-            ("command", r#"command: ["${{ inputs.ghost }}"]"#),
+            ("command[0]", r#"command: ["${{ inputs.ghost }}"]"#),
             ("when", r#"when: "inputs.ghost == 'x'""#),
-            ("env", r#"env: [[A, "${{ 'x' + inputs.ghost }}"]]"#),
+            ("env[0][1]", r#"env: [[A, "${{ 'x' + inputs['ghost'] }}"]]"#),
         ] {
             let lib = format!(
                 "interface: {{ inputs: [{{ name: known, type: string }}] }}\n\
@@ -5464,34 +5717,105 @@ mod tests {
                 &libs(&[(".scarab/lib/a.yaml", &lib)]),
             );
             assert!(
-                errs.iter().any(|e| e.contains(
-                    "library `.scarab/lib/a.yaml`, step `a`: reads `inputs.ghost`, which the \
-                     library does not declare"
-                )),
+                errs.iter().any(|e| e
+                    == &format!(
+                        "library `.scarab/lib/a.yaml`, step `a`: `{field}` reads `inputs.ghost`, \
+                         which library `.scarab/lib/a.yaml` does not declare in \
+                         `interface.inputs`"
+                    )),
                 "{field}: {errs:?}"
             );
         }
-        // A read of `inputs` other than by name.
-        let errs = errors_with(
-            "steps: [{ id: s, invoke: file:.scarab/lib/a.yaml }]",
+        // `inputs` used whole reads the library's own inputs.
+        let ir = compile_with(
+            "steps: [{ id: s, invoke: file:.scarab/lib/a.yaml, with: { x: X } }]",
             &libs(&[(
                 ".scarab/lib/a.yaml",
-                r#"steps: [{ id: a, image: busybox, command: ["${{ inputs['x'] }}"] }]"#,
+                r#"
+                interface: { inputs: [{ name: x, type: string }] }
+                steps: [{ id: a, image: busybox, command: ["${{ inputs['x'] + string(size(inputs)) }}"] }]
+                "#,
             )]),
         );
-        assert!(
-            errs.iter()
-                .any(|e| e.contains("reads `inputs` other than as `inputs.<name>`")),
-            "{errs:?}"
+        let a = ir.steps.iter().find(|s| s.id == "s/a").unwrap();
+        assert_eq!(
+            launch(a, json!({ "x": "RUN", "y": 1 }), json!({}))
+                .unwrap()
+                .command,
+            ["X1"]
         );
-        // A field named `inputs`, or the word in a string, is not a read.
-        compile_with(
-            "steps: [{ id: s, invoke: file:.scarab/lib/a.yaml }]",
-            &libs(&[(
-                ".scarab/lib/a.yaml",
-                r#"steps: [{ id: a, image: busybox, command: ["${{ matrix.inputs + ' inputs.x' }}"] }]"#,
-            )]),
+    }
+
+    #[test]
+    fn a_library_when_reads_only_what_exists_when_the_run_is_created() {
+        let lib = |when: &str| {
+            format!(
+                "interface: {{ inputs: [{{ name: a, type: string }}, {{ name: b, type: string }}] }}\n\
+                 steps:\n  - {{ id: x, image: busybox, results: [r] }}\n  - {{ id: s, image: busybox, needs: [x], when: {when:?} }}\n"
+            )
+        };
+        let caller = r#"
+            interface: { inputs: [{ name: p, type: string }] }
+            steps:
+              - { id: up, image: busybox, results: [v] }
+              - { id: c, invoke: file:l.yaml, needs: [up], with: { a: "${{ outputs.up.v }}", b: "${{ inputs.p }}" } }
+        "#;
+        for (when, refused) in [
+            ("outputs.x.r == 'y'", "`when` reads `outputs`"),
+            (
+                "inputs.a == 'y'",
+                "`when` reads `inputs.a`, which the caller binds",
+            ),
+            (
+                "size(inputs) > 0",
+                "`when` reads `inputs.a`, which the caller binds",
+            ),
+        ] {
+            let errs = errors_with(caller, &libs(&[("l.yaml", &lib(when))]));
+            assert!(errs.iter().any(|e| e.contains(refused)), "{when}: {errs:?}");
+        }
+        // An input bound to a launch parameter is known at creation.
+        let ir = compile_with(caller, &libs(&[("l.yaml", &lib("inputs.b == 'go'"))]));
+        let params = BTreeMap::from([("p".to_string(), json!("go"))]);
+        let ctx = json!({ "event": {} });
+        assert!(excluded_steps_with_params(&ir, &ctx, &params)
+            .unwrap()
+            .is_empty());
+        let params = BTreeMap::from([("p".to_string(), json!("stop"))]);
+        assert_eq!(
+            excluded_steps_with_params(&ir, &ctx, &params).unwrap(),
+            ["c/s"]
         );
+    }
+
+    #[test]
+    fn scope_and_guards_are_written_only_by_the_compiler() {
+        for field in [
+            "scope: { inputs: run }",
+            "guards: [{ caller_hops: 0, when: 'true' }]",
+        ] {
+            let errs = errors(&format!("steps: [{{ id: a, image: busybox, {field} }}]"));
+            let name = field.split(':').next().unwrap();
+            assert!(
+                errs.iter().any(|e| e.contains(&format!(
+                    "step `a`: `{name}` is written by the compiler and cannot be set"
+                ))),
+                "{errs:?}"
+            );
+            let errs = errors_with(
+                "steps: [{ id: c, invoke: file:l.yaml }]",
+                &libs(&[(
+                    "l.yaml",
+                    &format!("steps: [{{ id: a, image: busybox, {field} }}]"),
+                )]),
+            );
+            assert!(
+                errs.iter().any(|e| e.contains(&format!(
+                    "step `a` in library `l.yaml`: `{name}` is written by the compiler"
+                ))),
+                "{errs:?}"
+            );
+        }
     }
 
     #[test]
@@ -5534,9 +5858,17 @@ mod tests {
             }
         );
         assert_eq!(x.placement_profiles, vec!["big"]);
-        assert_eq!(x.when, Some(When(guard.to_string())));
+        // The invoke `when` is a guard read in the invoke Step's scope (one
+        // caller out); the library Step's own `when` stays as written.
+        let outer = Guard {
+            caller_hops: 1,
+            when: guard.to_string(),
+        };
+        assert_eq!(x.when, None);
+        assert_eq!(x.guards, vec![outer.clone()]);
 
-        // Set on the library Step: the library wins, field by field; `when` is ANDed.
+        // Set on the library Step: the library wins, field by field; each
+        // `when` is its own guard.
         let y = step("d/y");
         assert_eq!(y.timeout, Some(60));
         assert_eq!(
@@ -5547,16 +5879,26 @@ mod tests {
             }
         );
         assert_eq!(y.placement_profiles, vec!["gpu"]);
-        assert_eq!(y.when, Some(When(format!("(\n{guard}\n) && (\ntrue\n)"))));
+        assert_eq!(y.when, Some(When("true".to_string())));
+        assert_eq!(
+            y.guards,
+            vec![
+                Guard {
+                    caller_hops: 0,
+                    when: "true".into()
+                },
+                outer.clone()
+            ]
+        );
 
         // A gate gets only the `when`.
         let g = step("d/g");
         assert_eq!(g.timeout, None);
         assert!(g.placement_profiles.is_empty());
         assert_eq!(g.resources, Resources::default());
-        assert_eq!(g.when, Some(When(guard.to_string())));
+        assert_eq!(g.guards, vec![outer]);
 
-        // The ANDed guard prunes the whole library.
+        // The invoke Step's guard prunes the whole library.
         let ctx = json!({ "event": { "branch": "dev" } });
         let mut skipped = excluded_steps(&ir, &ctx).unwrap();
         skipped.sort();
@@ -5809,14 +6151,13 @@ mod tests {
             "#,
             &libs(&[(".scarab/lib/deploy.yaml", IFACE_LIB)]),
         );
-        // Inputs reach every inlined step as SCARAB_PARAM_* env (ADR-0008).
+        // Inputs reach every inlined step as SCARAB_PARAM_* env (ADR-0008),
+        // added when it launches.
         let plan = ir.steps.iter().find(|s| s.id == "deploy/plan").unwrap();
-        assert!(plan
-            .env
-            .contains(&("SCARAB_PARAM_REGION".to_string(), "us-east-1".to_string())));
-        assert!(plan
-            .env
-            .contains(&("SCARAB_PARAM_REPLICAS".to_string(), "3".to_string())));
+        assert!(plan.env.is_empty());
+        let env = launch(plan, json!({}), json!({})).unwrap().env;
+        assert!(env.contains(&("SCARAB_PARAM_REGION".to_string(), "us-east-1".to_string())));
+        assert!(env.contains(&("SCARAB_PARAM_REPLICAS".to_string(), "3".to_string())));
         // The invoke step is gone; the exposed-output reference compiled fine.
         assert!(ir.steps.iter().all(|s| !s.is_invoke()));
         assert!(ir.steps.iter().any(|s| s.id == "deploy/url"));
@@ -5919,26 +6260,26 @@ mod tests {
     }
 
     #[test]
-    fn interpolate_spec_resolves_outputs_and_matrix_and_fails_fast() {
-        use serde_json::json;
+    fn a_step_renders_outputs_and_matrix_and_fails_fast() {
         let mut spec = compile("steps: [{ id: notify, image: busybox }]")
             .steps
             .pop()
             .unwrap();
         spec.command = vec!["post".into(), r#"${{ outputs["deploy/url"].url }}"#.into()];
         spec.env = vec![("TARGET".into(), "${{ matrix.region }}".into())];
+        spec.matrix_values = BTreeMap::from([("region".into(), "us-east-1".into())]);
 
-        let ctx = json!({
-            "outputs": { "deploy/url": { "url": "https://svc.example" } },
-            "matrix": { "region": "us-east-1" },
-        });
-        let out = interpolate_spec(&spec, &ctx).unwrap();
+        let out = launch(
+            &spec,
+            json!({}),
+            json!({ "deploy/url": { "url": "https://svc.example" } }),
+        )
+        .unwrap();
         assert_eq!(out.command[1], "https://svc.example");
         assert_eq!(out.env[0].1, "us-east-1");
 
         // Fail-fast: an unbound reference is a hard error, never empty.
-        let bad = json!({ "outputs": {} });
-        assert!(interpolate_spec(&spec, &bad).is_err());
+        assert!(launch(&spec, json!({}), json!({})).is_err());
     }
 
     #[test]
@@ -6111,7 +6452,8 @@ mod tests {
             &libs(&[(".scarab/lib/x.yaml", lib)]),
         );
         let run = ir.steps.iter().find(|s| s.id == "deploy/run").unwrap();
-        assert!(run
+        assert!(launch(run, json!({}), json!({}))
+            .unwrap()
             .env
             .contains(&("SCARAB_PARAM_REPLICAS".to_string(), "3".to_string())));
     }
@@ -6862,10 +7204,11 @@ mod tests {
         let post = ir.steps.iter().find(|s| s.id == "notify/post");
         let post = post.expect("library step inlined");
         // The library's `${{ inputs.channel }}` is the caller's `with:` value.
+        let launched = launch(post, json!({}), json!({})).unwrap();
         assert!(
-            post.command.iter().any(|c| c.contains("#deploys")),
+            launched.command.iter().any(|c| c.contains("#deploys")),
             "{:?}",
-            post.command
+            launched.command
         );
 
         // The sample is not just a compile fixture — it is the LOCAL DOGFOOD

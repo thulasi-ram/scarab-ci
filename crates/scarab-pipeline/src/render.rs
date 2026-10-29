@@ -143,6 +143,23 @@ pub fn preview_image(
     .unwrap_or_else(|_| image.to_string())
 }
 
+/// Evaluate a guard (`when:`) of a library Step or gate at Run creation, in
+/// `scope` (ADR-0076): `inputs` are the scope's bound inputs, `matrix` its
+/// coordinate. No Step has run, so `outputs` is not readable, and an input
+/// bound to a caller's template that reads `outputs` is absent; the compiler
+/// refuses a guard that reads one.
+pub(crate) fn guard_holds(
+    expr: &str,
+    scope: &Scope,
+    params: &BTreeMap<String, Value>,
+) -> Result<bool, crate::PipelineError> {
+    let bound = bind(Some(scope), &BTreeMap::new(), params, None, Mode::Guard)
+        .map_err(crate::PipelineError::Cel)?;
+    let mut ctx = bound.ctx;
+    ctx.remove("outputs");
+    cel::eval_bool(expr, &Value::Object(ctx))
+}
+
 /// How [`bind`] treats a value that is not known.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {

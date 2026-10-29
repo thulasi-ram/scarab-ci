@@ -7,8 +7,8 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use scarab_pipeline::{
-    compile_with_libraries, excluded_steps, interpolate_spec, Libraries, PipelineError, PipelineIr,
-    StepSpec, MAX_COMPILED_STEPS,
+    compile_with_libraries, excluded_steps, render, Facts, Libraries, PipelineError, PipelineIr,
+    Results, StepSpec, Templates, MAX_COMPILED_STEPS,
 };
 use serde_json::json;
 
@@ -56,84 +56,77 @@ fn step<'a>(ir: &'a PipelineIr, id: &str) -> &'a StepSpec {
     })
 }
 
-/// The engine at launch: `inputs` = the RUN's launch parameters; `outputs`
-/// keyed by direct-need id.
+/// The engine at launch: the one renderer, in the Step's scope, with the
+/// Run's launch parameters `run_params` (which a library Step must never
+/// read) and `outputs`, the results of Steps by id (the engine gives only
+/// the Step's needs: the callers below pass needs only).
 fn launch(spec: &StepSpec, run_params: serde_json::Value, outputs: serde_json::Value) -> String {
-    interpolate_spec(
-        spec,
-        &json!({ "inputs": run_params, "outputs": outputs, "matrix": spec.matrix_values }),
+    let params: BTreeMap<String, serde_json::Value> = serde_json::from_value(run_params).unwrap();
+    let results: Results = serde_json::from_value(outputs).unwrap();
+    render(
+        Templates {
+            image: &spec.image,
+            command: &spec.command,
+            env: &spec.env,
+        },
+        spec.scope.as_ref(),
+        &spec.matrix_values,
+        Facts::Launch {
+            params: &params,
+            results: &results,
+        },
     )
     .map(|s| s.command.join(" | "))
     .unwrap_or_else(|e| format!("LAUNCH ERROR: {e}"))
 }
 
-// ===================================================== blanking of with: values
+// ================================================ joins across a with: value
 
-/// A caller value that ENDS in `$` (a regex anchor) joins library text
-/// `{{ inputs.p }}` into `${{ inputs.p }}`, which at launch would read the
-/// Run's launch parameter `p`. The check scans the bound string by where each
-/// byte came from, so a `${{ … }}` that crosses from the value into the
-/// library's text is refused.
+/// A caller value that ENDS in `$` (a regex anchor) next to library text
+/// `{{ inputs.p }}`: when values were pasted into a library's text, the two
+/// joined into `${{ inputs.p }}`, which read the Run's launch parameter `p`.
+/// A value is data and rendered output is never parsed again, so the
+/// rendered command holds that text and nothing reads `p`.
 #[test]
-#[ignore = "held: finding 1, span-based binding (local branch wip/libraries-span-binding)"]
 fn a_caller_value_ending_in_dollar_cannot_join_a_library_read() {
     let lib = "kind: library\ninterface: { inputs: [{ name: pat, type: string }] }\nsteps:\n  - id: s\n    image: busybox\n    command: [\"${{ inputs.pat }}{{ inputs.p }}\"]\n";
     let yaml = "interface: { inputs: [{ name: p, type: string, required: false, default: secret }] }\nsteps:\n  - { id: b, image: busybox, results: [name] }\n  - id: c\n    invoke: file:l.yaml\n    needs: [b]\n    with: { pat: \"^${{ outputs.b.name }}$\" }\n";
-    match compile(yaml, &files(&[("l.yaml", lib)])) {
-        Err(e) => assert!(
-            e.iter()
-                .any(|e| e.contains("holds `${{ inputs.p }}`, which an input's value forms")),
-            "{e:?}"
+    let ir = ok(yaml, &files(&[("l.yaml", lib)]));
+    let s = step(&ir, "c/s");
+    assert_eq!(s.command, ["${{ inputs.pat }}{{ inputs.p }}"]);
+    assert_eq!(
+        launch(
+            s,
+            json!({ "p": "RUN-PARAM" }),
+            json!({ "b": { "name": "x" } })
         ),
-        Ok(ir) => {
-            let s = step(&ir, "c/s");
-            let launched = launch(
-                s,
-                json!({ "p": "RUN-PARAM" }),
-                json!({ "b": { "name": "x" } }),
-            );
-            panic!(
-                "library read the Run's launch parameter: IR command {:?} launches as {launched:?}",
-                s.command
-            );
-        }
-    }
+        "^x${{ inputs.p }}"
+    );
 }
 
-/// Same join, through a nested invoke's `with:`: refused where the `with:`
-/// value is bound.
+/// The same join through a nested invoke's `with:`: the `with:` template
+/// renders to text in the library's scope, and the nested library reads
+/// that text as its input's value.
 #[test]
-#[ignore = "held: finding 1, span-based binding (local branch wip/libraries-span-binding)"]
 fn a_join_through_a_nested_with_is_refused() {
     let a = "kind: library\ninterface: { inputs: [{ name: pat, type: string }] }\nsteps:\n  - id: n\n    invoke: file:b.yaml\n    with: { x: \"${{ inputs.pat }}{{ inputs.p }}\" }\n";
     let b = "kind: library\ninterface: { inputs: [{ name: x, type: string }] }\nsteps: [{ id: s, image: busybox, command: [\"${{ inputs.x }}\"] }]\n";
     let yaml = "interface: { inputs: [{ name: p, type: string, required: false, default: d }] }\nsteps:\n  - { id: b, image: busybox, results: [name] }\n  - { id: c, invoke: file:a.yaml, needs: [b], with: { pat: \"^${{ outputs.b.name }}$\" } }\n";
-    let ab = files(&[("a.yaml", a), ("b.yaml", b)]);
-    if let Err(e) = compile(yaml, &ab) {
-        assert!(
-            e.iter()
-                .any(|e| e.contains("`with.x` holds `${{ inputs.p }}`")),
-            "{e:?}"
-        );
-    }
-    if let Ok(ir) = compile(yaml, &ab) {
-        let s = step(&ir, "c/n/s");
-        panic!(
-            "nested: library read the Run's `p`: {:?} -> {:?}",
-            s.command,
-            launch(
-                s,
-                json!({ "p": "RUN-PARAM" }),
-                json!({ "b": { "name": "x" } })
-            )
-        );
-    }
+    let ir = ok(yaml, &files(&[("a.yaml", a), ("b.yaml", b)]));
+    let s = step(&ir, "c/n/s");
+    assert_eq!(
+        launch(
+            s,
+            json!({ "p": "RUN-PARAM" }),
+            json!({ "b": { "name": "x" } })
+        ),
+        "^x${{ inputs.p }}"
+    );
 }
 
-/// A join built only from library text and plain caller values is not
-/// blanked, so the parser check sees it: a library default `$` plus a caller
-/// value `inputs` cannot assemble `${{ inputs.p }}`, even when another input
-/// holds a caller expression (so the blanking path runs).
+/// Library text and plain caller values cannot assemble a read either: a
+/// default `$` and a caller value `inputs` render next to `{{ … .p }}` as
+/// text.
 #[test]
 fn survived_library_text_and_plain_values_cannot_assemble_a_read() {
     let lib = "kind: library\ninterface:\n  inputs:\n    - { name: d, type: string, required: false, default: \"$\" }\n    - { name: v, type: string }\n    - { name: e, type: string }\nsteps:\n  - id: s\n    image: busybox\n    command: [\"${{ inputs.d }}{{ ${{ inputs.v }}.p }}\", \"${{ inputs.e }}\"]\n";
@@ -141,8 +134,16 @@ fn survived_library_text_and_plain_values_cannot_assemble_a_read() {
         let yaml = format!(
             "interface: {{ inputs: [{{ name: q, type: string }}] }}\nsteps:\n  - {{ id: c, invoke: file:l.yaml, with: {{ v: \"{v}\", e: \"${{{{ inputs.q }}}}\" }} }}\n"
         );
-        let e = errs(&yaml, &files(&[("l.yaml", lib)]));
-        assert!(e.iter().any(|e| e.contains("reads `inputs`")), "{v}: {e:?}");
+        let ir = ok(&yaml, &files(&[("l.yaml", lib)]));
+        assert_eq!(
+            launch(
+                step(&ir, "c/s"),
+                json!({ "p": "RUN-PARAM", "q": "Q" }),
+                json!({})
+            ),
+            format!("${{{{ {v}.p }}}} | Q"),
+            "{v}"
+        );
     }
 }
 
@@ -172,7 +173,7 @@ fn survived_values_bind_correctly_through_two_levels() {
         &l,
     );
     let s = step(&ir, "c/k/s");
-    assert_eq!(s.command[0], "${{ inputs.p }}");
+    assert_eq!(s.command[0], "${{ inputs.x }}");
     assert_eq!(launch(s, json!({ "p": "RUN-P" }), json!({})), "RUN-P | 6");
 }
 
@@ -207,7 +208,6 @@ fn bracket_read_of_an_invoke_output_through_with() {
 /// X is a Step inside the SAME library as the nested invoke. The read
 /// `outputs.b.tag` must reach library step `b` (now `c/b`).
 #[test]
-#[ignore = "held: finding 4 needs who wrote each byte, or caller reads are renamed too (wip/libraries-span-binding)"]
 fn library_internal_output_read_through_nested_with() {
     let a = "kind: library\nsteps:\n  - { id: b, image: busybox, results: [tag] }\n  - id: n\n    invoke: file:b.yaml\n    needs: [b]\n    with: { x: \"${{ outputs.b.tag }}\" }\n";
     let b = "kind: library\ninterface: { inputs: [{ name: x, type: string }] }\nsteps: [{ id: s, image: busybox, command: [\"${{ inputs.x }}\"] }]\n";
@@ -232,11 +232,10 @@ fn library_internal_output_read_through_nested_with() {
 }
 
 /// The caller reads ITS step `b`; the library also has a step `b`. The
-/// caller value `${{ outputs.b.tag }}` flows into the library's nested
-/// `with:`; it was written by the caller, so it is not matched against the
-/// library's own `b`, and the Pipeline compiles.
+/// caller value `${{ outputs.b.tag }}` is read in the caller's scope, so it
+/// names the caller's `b`, the Pipeline compiles, and the nested library
+/// Step gets the caller's value, never the library's `b`.
 #[test]
-#[ignore = "held: finding 3 needs who wrote each byte of a with: value (wip/libraries-span-binding)"]
 fn caller_output_name_colliding_with_a_library_step_compiles() {
     let a = "kind: library\ninterface: { inputs: [{ name: v, type: string }] }\nsteps:\n  - { id: b, image: busybox }\n  - { id: n, invoke: file:b.yaml, with: { x: \"${{ inputs.v }}\" } }\n";
     let b = "kind: library\ninterface: { inputs: [{ name: x, type: string }] }\nsteps: [{ id: s, image: busybox, command: [\"${{ inputs.x }}\"] }]\n";
@@ -244,7 +243,15 @@ fn caller_output_name_colliding_with_a_library_step_compiles() {
     let ir = ok(yaml, &files(&[("a.yaml", a), ("b.yaml", b)]));
     let s = step(&ir, "c/n/s");
     assert!(s.needs.0.contains(&"b".to_string()));
-    assert_eq!(s.command, vec!["${{ outputs.b.tag }}"]);
+    assert_eq!(s.command, vec!["${{ inputs.x }}"]);
+    assert_eq!(
+        launch(
+            s,
+            json!({}),
+            json!({ "b": { "tag": "CALLER" }, "c/b": { "tag": "LIBRARY" } })
+        ),
+        "CALLER"
+    );
 }
 
 #[test]
@@ -471,7 +478,6 @@ fn survived_plain_pipeline_text_is_unchanged() {
 /// too, the defect is the library-internal `outputs.<id>` namespacing, not
 /// the round-1 `with:` wiring.
 #[test]
-#[ignore = "held: finding 4 needs who wrote each byte, or caller reads are renamed too (wip/libraries-span-binding)"]
 fn library_internal_output_read_direct() {
     let a = "kind: library\nsteps:\n  - { id: b, image: busybox, results: [tag] }\n  - { id: s, image: busybox, needs: [b], command: [\"${{ outputs.b.tag }}\"] }\n";
     let ir = ok(

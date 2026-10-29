@@ -8,8 +8,8 @@
 use std::collections::BTreeMap;
 
 use scarab_pipeline::{
-    compile_with_libraries, excluded_steps, interpolate_spec, InstalledLibrary, Libraries,
-    OriginKind, PipelineError, PipelineIr, StepSpec,
+    compile_with_libraries, excluded_steps, render, Facts, InstalledLibrary, Libraries, OriginKind,
+    PipelineError, PipelineIr, Rendered, Results, StepSpec, Templates,
 };
 use serde_json::json;
 
@@ -62,13 +62,23 @@ fn step<'a>(ir: &'a PipelineIr, id: &str) -> &'a StepSpec {
     })
 }
 
-/// What the engine does at launch (scheduler::interpolate_spec): `inputs`
-/// is the RUN's launch parameters. A library input that survives inlining
-/// resolves here to the Run's value.
-fn launch(spec: &StepSpec, run_params: serde_json::Value) -> Result<StepSpec, PipelineError> {
-    interpolate_spec(
-        spec,
-        &json!({ "inputs": run_params, "outputs": {}, "matrix": spec.matrix_values }),
+/// What the engine does at launch: the one renderer, in the Step's scope,
+/// with the Run's launch parameters `run_params` (which a library Step must
+/// never read) and no upstream results.
+fn launch(spec: &StepSpec, run_params: serde_json::Value) -> Result<Rendered, String> {
+    let params: BTreeMap<String, serde_json::Value> = serde_json::from_value(run_params).unwrap();
+    render(
+        Templates {
+            image: &spec.image,
+            command: &spec.command,
+            env: &spec.env,
+        },
+        spec.scope.as_ref(),
+        &spec.matrix_values,
+        Facts::Launch {
+            params: &params,
+            results: &Results::new(),
+        },
     )
 }
 
@@ -320,23 +330,33 @@ fn survived_typed_inputs_refuse_expressions() {
     )));
 }
 
-/// Forms of `inputs` other than `inputs.<name>` are refused inside a library;
-/// `inputs.x` inside a string literal is not a read.
+/// Every form of `inputs` inside a library reads the library's own inputs
+/// (its scope), never the Run's launch parameters: there is no form to
+/// escape to. A read of an input the library does not declare is refused,
+/// by name or by constant key. `inputs.x` inside a string literal is not a
+/// read. (Before scopes, these forms escaped the text binding and were
+/// refused for that reason.)
 #[test]
 fn survived_inputs_escapes_are_refused_or_literal() {
     for expr in [
         "inputs['x'] == 'a'",
         "inputs .x == 'a'",
         "inputs. x == 'a'",
-        "'x' in inputs",
+        "'x' in inputs && !('p' in inputs)",
         "[1].exists(inputs, inputs == 1)",
-        "inputs.y == 'a'",
-        "size(inputs) > 0",
+        "size(inputs) == 1",
+        ".inputs.x == 'a'",
     ] {
+        let lib = lib_when("{ name: x, type: string }", &format!("\"{expr}\""));
+        let ir = ok(&caller("{ x: a }"), &files(&[("l.yaml", &lib)]));
+        assert!(kept(&ir), "`{expr}` must read the library's own `x`");
+    }
+    for expr in ["inputs.y == 'a'", "inputs['y'] == 'a'", "has(inputs.y)"] {
         let lib = lib_when("{ name: x, type: string }", &format!("\"{expr}\""));
         let e = errs(&caller("{ x: a }"), &files(&[("l.yaml", &lib)]));
         assert!(
-            e.iter().any(|e| e.contains("inputs")),
+            e.iter()
+                .any(|e| e.contains("reads `inputs.y`, which library `l.yaml` does not declare")),
             "`{expr}` should be refused: {e:?}"
         );
     }
@@ -700,25 +720,25 @@ fn a_leading_dot_inputs_read_is_bound() {
     let lib = lib_when("{ name: x, type: string }", "\".inputs.x == 'a'\"");
     assert!(kept(&ok(&caller("{ x: a }"), &files(&[("l.yaml", &lib)]))));
     // A whole `.inputs` is refused like `inputs`.
+    // A whole `.inputs` is the library's inputs, like `inputs`.
     let lib = lib_cmd("{ name: tag, type: string }", "\"${{ size(.inputs) }}\"");
-    let e = errs(&caller("{ tag: t }"), &files(&[("l.yaml", &lib)]));
-    assert!(
-        e.iter()
-            .any(|e| e.contains("reads `inputs` other than as `inputs.<name>`")),
-        "{e:?}"
-    );
+    let ir = ok(&caller("{ tag: t }"), &files(&[("l.yaml", &lib)]));
+    let l = launch(step(&ir, "c/s"), json!({ "tag": "RUN", "a": 1, "b": 2 })).unwrap();
+    assert_eq!(l.command[0], "1");
 }
 
-/// `has(inputs.x)` is bound to `has("v")`, which CEL refuses: no escape.
+/// `has(inputs.x)` asks the library's own inputs: true for a declared,
+/// bound input, whatever the Run's parameters hold.
 #[test]
 fn survived_has_inputs_field() {
     let lib = lib_when("{ name: x, type: string }", "\"has(inputs.x)\"");
-    let r = compile_with_libraries(&caller("{ x: a }"), &files(&[("l.yaml", &lib)]));
-    // Refusal is acceptable; a compile that keeps `inputs` unbound is not.
-    if let Ok(ir) = r {
-        let w = step(&ir, "c/s").when.as_ref().unwrap().0.clone();
-        assert!(!w.contains("inputs"), "unbound: {w}");
-    }
+    let ir = ok(&caller("{ x: a }"), &files(&[("l.yaml", &lib)]));
+    assert!(kept(&ir));
+    assert_eq!(
+        step(&ir, "c/s").when.as_ref().unwrap().0,
+        "has(inputs.x)",
+        "the library's text is kept as written"
+    );
 }
 
 /// Was: `${{ inputs.x }}` in a sidecar service's image/env (and in
