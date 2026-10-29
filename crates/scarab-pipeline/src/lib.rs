@@ -1423,7 +1423,9 @@ fn compile_libs(yaml: &str, libs: LibsRef<'_>) -> Result<PipelineIr, PipelineErr
     };
 
     if json_len(&ir, MAX_COMPILED_IR_BYTES).is_none() {
-        return Err(PipelineError::Validation(vec![ir_too_large("the pipeline")]));
+        return Err(PipelineError::Validation(vec![ir_too_large(
+            "the pipeline",
+        )]));
     }
     validate(&ir).map_err(PipelineError::Validation)?;
     Ok(ir)
@@ -1888,18 +1890,19 @@ fn inline_level(
     // Stop when the list passes a cap: its length, or its stored size, which
     // only grows as outer levels namespace it.
     let mut bytes: usize = 0;
-    let mut capped = |out: &[StepSpec], at: &str, budget: &mut Budget, diagnostics: &mut Vec<String>| {
-        if out.len() > MAX_COMPILED_STEPS {
-            budget.stop(too_many_steps(at), diagnostics);
-        } else if let Some(last) = out.last() {
-            let left = MAX_COMPILED_IR_BYTES - bytes;
-            match json_len(last, left) {
-                Some(n) => bytes += n,
-                None => budget.stop(ir_too_large(at), diagnostics),
+    let mut capped =
+        |out: &[StepSpec], at: &str, budget: &mut Budget, diagnostics: &mut Vec<String>| {
+            if out.len() > MAX_COMPILED_STEPS {
+                budget.stop(too_many_steps(at), diagnostics);
+            } else if let Some(last) = out.last() {
+                let left = MAX_COMPILED_IR_BYTES - bytes;
+                match json_len(last, left) {
+                    Some(n) => bytes += n,
+                    None => budget.stop(ir_too_large(at), diagnostics),
+                }
             }
-        }
-        budget.stopped
-    };
+            budget.stopped
+        };
 
     for step in steps {
         if budget.spent(diagnostics) {
@@ -2407,12 +2410,7 @@ fn inline_level(
                     });
                 }
                 out.push(inst);
-                if capped(
-                    &out,
-                    &format!("step `{}`", step.id),
-                    budget,
-                    diagnostics,
-                ) {
+                if capped(&out, &format!("step `{}`", step.id), budget, diagnostics) {
                     return out;
                 }
             }
@@ -3354,9 +3352,28 @@ fn skip_wrappers(command: &[String]) -> usize {
             ),
             "sudo" => (
                 &[
-                    "-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-U", "-T", "-R", "--user",
-                    "--group", "--host", "--prompt", "--close-from", "--chdir", "--role",
-                    "--type", "--other-user", "--command-timeout", "--chroot",
+                    "-u",
+                    "-g",
+                    "-h",
+                    "-p",
+                    "-C",
+                    "-D",
+                    "-r",
+                    "-t",
+                    "-U",
+                    "-T",
+                    "-R",
+                    "--user",
+                    "--group",
+                    "--host",
+                    "--prompt",
+                    "--close-from",
+                    "--chdir",
+                    "--role",
+                    "--type",
+                    "--other-user",
+                    "--command-timeout",
+                    "--chroot",
                 ],
                 true,
                 0,
@@ -6278,8 +6295,9 @@ mod tests {
         ] {
             let errs = errors(&yaml(command));
             assert!(
-                errs.iter().any(|e| e.contains("from outside the Pipeline")
-                    && e.contains("pass it in `env:`")),
+                errs.iter()
+                    .any(|e| e.contains("from outside the Pipeline")
+                        && e.contains("pass it in `env:`")),
                 "{command}: {errs:?}"
             );
         }
@@ -6387,7 +6405,10 @@ mod tests {
         );
         assert!(too_large(&errs), "{errs:?}");
         // A 600 KB Step with 32 matrix legs.
-        let legs = (0..32).map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
+        let legs = (0..32)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
         let matrixed = format!(
             "kind: library\nsteps: [{{ id: s, image: busybox, command: [\"{large}\"], matrix: {{ dimensions: {{ n: [{legs}] }} }} }}]\n"
         );
@@ -6398,7 +6419,10 @@ mod tests {
         assert!(too_large(&errs), "{errs:?}");
         // Two such Steps of 16 legs each: under the cap one at a time, over it
         // together.
-        let legs = (0..16).map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
+        let legs = (0..16)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
         let half = format!(
             "kind: library\nsteps: [{{ id: s, image: busybox, command: [\"{large}\"], matrix: {{ dimensions: {{ n: [{legs}] }} }} }}]\n"
         );

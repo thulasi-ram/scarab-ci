@@ -823,10 +823,21 @@ mod tests {
         // template is outside when it reads a Run parameter.
         let scope = library(vec![
             ("lit", ParamType::String, BoundValue::Literal(json!("-lit"))),
-            ("tpl", ParamType::String, BoundValue::Template("${{ inputs.p }}".into())),
-            ("wrapped", ParamType::String, BoundValue::Template("-${{ inputs.p }}".into())),
+            (
+                "tpl",
+                ParamType::String,
+                BoundValue::Template("${{ inputs.p }}".into()),
+            ),
+            (
+                "wrapped",
+                ParamType::String,
+                BoundValue::Template("-${{ inputs.p }}".into()),
+            ),
         ]);
-        assert_eq!(run(&["${{ inputs.lit }}"], Some(&scope)).unwrap().command, ["-lit"]);
+        assert_eq!(
+            run(&["${{ inputs.lit }}"], Some(&scope)).unwrap().command,
+            ["-lit"]
+        );
         for arg in ["${{ inputs.tpl }}", "${{ inputs.wrapped }}"] {
             let e = run(&[arg], Some(&scope)).unwrap_err();
             assert!(e.contains("starts the argument with `-`"), "{arg}: {e}");
@@ -888,7 +899,10 @@ mod tests {
         };
         b.get_mut("v").unwrap().param = None;
         let e = run(&scope, json!(5)).unwrap_err();
-        assert!(e.contains("input `v`") && e.contains("no declared type"), "{e}");
+        assert!(
+            e.contains("input `v`") && e.contains("no declared type"),
+            "{e}"
+        );
 
         let mut declared = param("v", ParamType::Number);
         declared.description = Some("not stored".into());
