@@ -1381,7 +1381,31 @@ struct StoredIr {
 struct StoredStep {
     id: String,
     #[serde(default)]
-    origin: Vec<scarab_pipeline::OriginEntry>,
+    origin: Vec<StoredOrigin>,
+}
+
+/// One link of a stored `origin`, read so that a field this release does not
+/// know is ignored: a Run created by a newer server still answers the yank
+/// check here. The compiler's [`OriginEntry`](scarab_pipeline::OriginEntry)
+/// stays strict, and an authored `origin` is refused at compile either way.
+#[derive(Deserialize)]
+struct StoredOrigin {
+    kind: scarab_pipeline::OriginKind,
+    name: String,
+    #[serde(default)]
+    source: Option<String>,
+    content_hash: String,
+}
+
+impl From<StoredOrigin> for scarab_pipeline::OriginEntry {
+    fn from(o: StoredOrigin) -> Self {
+        Self {
+            kind: o.kind,
+            name: o.name,
+            source: o.source,
+            content_hash: o.content_hash,
+        }
+    }
 }
 
 /// The refusal for launching or releasing `step` of `run`, when its stored
@@ -1419,10 +1443,11 @@ pub async fn stored_step_yank_refusal(
     };
     let ir: StoredIr = serde_json::from_value(ir)
         .map_err(|e| format!("run {}: the stored IR has no readable origin: {e}", run.0))?;
-    let Some(s) = ir.steps.iter().find(|s| s.id == step) else {
+    let Some(s) = ir.steps.into_iter().find(|s| s.id == step) else {
         return Ok(None);
     };
-    let refusals = yank_refusals_for(store, &org, &[(format!("`{step}`"), &s.origin)])
+    let origin: Vec<scarab_pipeline::OriginEntry> = s.origin.into_iter().map(Into::into).collect();
+    let refusals = yank_refusals_for(store, &org, &[(format!("`{step}`"), &origin)])
         .await
         .map_err(|e| format!("library store: {e}"))?;
     Ok((!refusals.is_empty()).then(|| refusals.join("; ")))

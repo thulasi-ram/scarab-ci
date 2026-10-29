@@ -1150,3 +1150,70 @@ async fn race_an_install_racing_a_prune_fails_as_unknown_version() {
     );
     assert!(now.is_none());
 }
+
+// ===========================================================================
+// 6. A stored origin from a newer server
+// ===========================================================================
+
+/// A Run's stored IR written by a newer server carries an origin field this
+/// release does not know. Once the org has a yank, every launch reads that
+/// origin; it must still answer the yank check, not error on the field.
+#[tokio::test]
+async fn stored_origin_with_an_unknown_field_still_answers_the_yank_check() {
+    const CI: &str = "on:\n  push: {}\nsteps:\n  - { id: ship, invoke: lib:acme/deploy }\n";
+    let db = Arc::new(InMemoryDb::new());
+    let libs = Arc::new(InMemoryLibraries::new());
+    seed(libs.as_ref(), "acme", "acme", "deploy", DEPLOY).await;
+    let run = create_run(&db, libs.as_ref(), CI, "web").await;
+    let mut ir = db.run_ir(&run).await.unwrap().unwrap();
+    let mut links = 0;
+    for step in ir["steps"].as_array_mut().unwrap() {
+        if let Some(origin) = step.get_mut("origin").and_then(Value::as_array_mut) {
+            for link in origin {
+                link["added_by_a_newer_server"] = json!({ "any": "thing" });
+                links += 1;
+            }
+        }
+    }
+    assert!(links > 0, "the IR has no origin to extend: {ir}");
+    db.store_run_ir(&run, &ir).await.unwrap();
+    yank(libs.as_ref(), DEPLOY).await;
+    let refusal = scarab_server::libraries::stored_step_yank_refusal(
+        db.as_ref(),
+        Some(libs.as_ref() as &dyn LibraryStore),
+        &run,
+        "ship/helm",
+    )
+    .await;
+    match refusal {
+        Ok(Some(m)) => assert!(m.contains(REASON), "{m}"),
+        other => panic!("the yank check did not refuse the step: {other:?}"),
+    }
+}
+
+/// Reading a stored origin leniently does not open the authored surface: a
+/// Pipeline that writes `origin` itself, with or without an unknown field,
+/// is refused at compile.
+#[tokio::test]
+async fn an_authored_origin_with_an_unknown_field_is_still_refused() {
+    let h = content_hash(DEPLOY);
+    for extra in ["", ", added_by_a_newer_server: 1"] {
+        let ci = format!(
+            "on:\n  push: {{}}\nsteps:\n  - id: a\n    image: alpine@sha256:aaaa\n    origin: \
+             [{{ kind: library, name: acme/deploy, content_hash: '{h}'{extra} }}]\n"
+        );
+        let db = InMemoryDb::new();
+        let out = trigger_runs_from_event(
+            &forge(&ci),
+            &db,
+            &FakeClock::new(1_000),
+            AdmissionPorts::default(),
+            &push_to("web"),
+        )
+        .await;
+        match out {
+            Err(e) => assert!(e.to_string().contains("origin"), "{e}"),
+            Ok(o) => panic!("an authored origin was not refused at compile: {o:?}"),
+        }
+    }
+}
