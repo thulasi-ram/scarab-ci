@@ -62,6 +62,7 @@ pub mod converged;
 pub mod depot_expiry;
 pub mod forge_router;
 pub mod infra_observer;
+pub mod library_fetch;
 pub mod log_tail;
 pub mod logs;
 pub mod metrics;

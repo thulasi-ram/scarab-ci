@@ -1473,6 +1473,68 @@ pub fn is_library(yaml: &str) -> bool {
     serde_yaml::from_str::<ShallowKind>(yaml).is_ok_and(|k| k.kind == Some(PipelineKind::Library))
 }
 
+/// Check that `content` can be installed as `lib:<qualified>` (ADR-0076 §4):
+/// it is a library (`kind: library`, no `on:`), it is closed (it invokes only
+/// `lib:` and `plugin:` targets), every `lib:` it invokes is in `installed`,
+/// and it compiles when invoked. Each input the library requires with no
+/// default is bound to a template, as a caller's `${{ … }}` would be, so the
+/// check needs no values for them; defaults are checked as written.
+///
+/// `installed` is the org's other installations; `content` is checked under
+/// `qualified` in their place, so an upgrade is checked against the rest of
+/// the org as it is.
+pub fn check_installed_library(
+    qualified: &str,
+    content: &str,
+    installed: &BTreeMap<String, InstalledLibrary>,
+) -> Result<(), Vec<String>> {
+    if content.len() > MAX_SOURCE_BYTES {
+        return Err(vec![source_too_large("the library", content.len())]);
+    }
+    let lib: PipelineIr = serde_yaml::from_str(content)
+        .map_err(|e| vec![format!("the library failed to parse: {e}")])?;
+    if lib.kind != Some(PipelineKind::Library) {
+        return Err(vec![
+            "the file is not a library; a library starts with `kind: library`".to_string(),
+        ]);
+    }
+    let mut inputs = Vec::new();
+    let mut with = serde_json::Map::new();
+    for p in &lib.interface.inputs {
+        if p.required && p.default.is_none() {
+            inputs.push(serde_json::json!({ "name": p.name, "type": "string" }));
+            with.insert(
+                p.name.clone(),
+                serde_json::Value::String(format!("${{{{ inputs.{} }}}}", p.name)),
+            );
+        }
+    }
+    let wrapper = serde_json::json!({
+        "interface": { "inputs": inputs },
+        "steps": [{ "id": "library", "invoke": format!("lib:{qualified}"), "with": with }],
+    });
+    let yaml = serde_yaml::to_string(&wrapper).map_err(|e| vec![e.to_string()])?;
+    let mut all = installed.clone();
+    all.insert(
+        qualified.to_string(),
+        InstalledLibrary {
+            content: content.to_string(),
+            source: String::new(),
+        },
+    );
+    match compile_with_libraries(
+        &yaml,
+        &Libraries {
+            files: BTreeMap::new(),
+            installed: all,
+        },
+    ) {
+        Ok(_) => Ok(()),
+        Err(PipelineError::Validation(d)) => Err(d),
+        Err(e) => Err(vec![e.to_string()]),
+    }
+}
+
 /// A lightweight, `on:`-only read of an authored pipeline (ADR-0043 catalog).
 /// Parses **just the trigger block** — no `invoke:` pre-fetch, no matrix
 /// expansion, no full compile — so the manual-dispatch catalog can list what a
