@@ -272,12 +272,55 @@ struct InMemoryState {
 /// fake for driving the pure engine.
 pub struct InMemoryDb {
     state: Mutex<InMemoryState>,
+    /// A one-shot hook the next call of the named method awaits before it
+    /// does anything — see [`interleave_before_next`](Self::interleave_before_next).
+    /// Kept outside `state` so the hook can call back into this store.
+    interleave: Mutex<Option<(&'static str, DbHook)>>,
 }
+
+/// Work a test runs at a chosen point inside a sequence of [`Db`] calls.
+pub type DbHook =
+    Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
 
 impl InMemoryDb {
     pub fn new() -> Self {
         Self {
             state: Mutex::new(InMemoryState::default()),
+            interleave: Mutex::new(None),
+        }
+    }
+
+    /// Run `hook` to completion at the start of the next call of `method`
+    /// (test seam): models another task — a scheduler tick on this replica or
+    /// another — that commits between two of a caller's separate writes.
+    /// Constructs the interleaving instead of scheduling it. Supported
+    /// methods: `set_run_params`, `set_run_concurrency`,
+    /// `commit_step_transition`.
+    pub fn interleave_before_next(&self, method: &'static str, hook: DbHook) {
+        *self.interleave.lock().unwrap() = Some((method, hook));
+    }
+
+    /// Whether an [`interleave_before_next`](Self::interleave_before_next)
+    /// hook is still armed — `false` once it ran.
+    pub fn interleave_armed(&self) -> bool {
+        self.interleave.lock().unwrap().is_some()
+    }
+
+    /// Fire the armed hook if it names `method`. The hook is taken before it
+    /// runs, so the calls it makes do not fire it again.
+    async fn interleave_point(&self, method: &'static str) {
+        let hook = {
+            let mut slot = self.interleave.lock().unwrap();
+            match slot.take() {
+                Some((m, hook)) if m == method => Some(hook),
+                other => {
+                    *slot = other;
+                    None
+                }
+            }
+        };
+        if let Some(hook) = hook {
+            hook().await;
         }
     }
 
@@ -955,6 +998,7 @@ impl Db for InMemoryDb {
         group: &str,
         policy: ConcurrencyPolicy,
     ) -> Result<(), DbError> {
+        self.interleave_point("set_run_concurrency").await;
         self.state
             .lock()
             .unwrap()
@@ -1321,6 +1365,7 @@ impl Db for InMemoryDb {
         run: &RunId,
         params: &std::collections::BTreeMap<String, serde_json::Value>,
     ) -> Result<(), DbError> {
+        self.interleave_point("set_run_params").await;
         self.state
             .lock()
             .unwrap()
@@ -1573,6 +1618,7 @@ impl Db for InMemoryDb {
         events: &[EventKind],
         outbox: &[OutboxMessage],
     ) -> Result<(), DbError> {
+        self.interleave_point("commit_step_transition").await;
         // One lock = the Postgres transaction: every check (including the
         // crash injector) runs before the first mutation, so a failure leaves
         // nothing behind.
