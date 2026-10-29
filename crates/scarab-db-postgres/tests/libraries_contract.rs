@@ -131,6 +131,22 @@ async fn installs(store: &dyn LibraryStore) {
         "{err:?}"
     );
 
+    // An upgrade from a version when nothing is installed is a conflict.
+    assert_eq!(
+        store
+            .install(
+                &install("acme", &v2.content_hash, 9),
+                &Replaces::Version(v1.content_hash.clone())
+            )
+            .await
+            .unwrap_err(),
+        LibraryStoreError::Conflict
+    );
+    assert_eq!(
+        store.installation("acme", "acme", "deploy").await.unwrap(),
+        None
+    );
+
     let i = store
         .install(&install("acme", &v1.content_hash, 10), &Replaces::Nothing)
         .await
@@ -158,6 +174,11 @@ async fn installs(store: &dyn LibraryStore) {
             .await
             .unwrap_err(),
         LibraryStoreError::Conflict
+    );
+    // Neither conflict changed what is installed.
+    assert_eq!(
+        store.installation("acme", "acme", "deploy").await.unwrap(),
+        Some(i.clone())
     );
     let up = store
         .install(

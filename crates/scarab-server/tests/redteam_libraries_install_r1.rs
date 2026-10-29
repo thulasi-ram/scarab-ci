@@ -993,7 +993,6 @@ async fn yank_refuses_a_debug_pod_of_a_yanked_library_step() {
 /// B named `replaces: nothing`, which is no longer true, so B must get a
 /// Conflict; installing over A without seeing A's diff is the race
 /// `replaces` exists to stop.
-#[ignore = "red: s2 r1"]
 #[tokio::test]
 async fn race_a_second_first_install_does_not_overwrite_the_first() {
     let Some(tdb) = common::fresh_db().await else {

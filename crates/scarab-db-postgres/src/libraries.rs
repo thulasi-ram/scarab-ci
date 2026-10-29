@@ -164,48 +164,49 @@ impl LibraryStore for PostgresDb {
         if !known {
             return Err(LibraryStoreError::UnknownVersion(new.content_hash.clone()));
         }
-        let current: Option<String> = sqlx::query_scalar(
-            "SELECT content_hash FROM library_installations \
-             WHERE org = $1 AND publisher = $2 AND name = $3 FOR UPDATE",
-        )
-        .bind(&new.org)
-        .bind(&new.publisher)
-        .bind(&new.name)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(store_err)?;
-        let ok = match replaces {
-            Replaces::Nothing => current.is_none(),
-            Replaces::Version(h) => current.as_deref() == Some(h.as_str()),
+        // The write itself checks `replaces`, so two admins racing cannot
+        // both pass a read and then overwrite each other: a first install
+        // only inserts (a row another install committed is a unique
+        // violation), and an upgrade only updates the row that still holds
+        // the version it names.
+        let map_write = |e: sqlx::Error| match sqlstate(&e).as_deref() {
+            Some(UNIQUE_VIOLATION) => LibraryStoreError::Conflict,
+            Some(FOREIGN_KEY_VIOLATION) => {
+                LibraryStoreError::UnknownVersion(new.content_hash.clone())
+            }
+            _ => store_err(e),
         };
-        if !ok {
-            return Err(LibraryStoreError::Conflict);
+        let write = match replaces {
+            Replaces::Nothing => sqlx::query(
+                "INSERT INTO library_installations \
+                 (org, publisher, name, content_hash, installed_by, installed_at, step_up_ref) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            ),
+            Replaces::Version(_) => sqlx::query(
+                "UPDATE library_installations SET \
+                   content_hash = $4, installed_by = $5, installed_at = $6, step_up_ref = $7 \
+                 WHERE org = $1 AND publisher = $2 AND name = $3 AND content_hash = $8",
+            ),
         }
-        sqlx::query(
-            "INSERT INTO library_installations \
-             (org, publisher, name, content_hash, installed_by, installed_at, step_up_ref) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7) \
-             ON CONFLICT (org, publisher, name) DO UPDATE SET \
-               content_hash = EXCLUDED.content_hash, installed_by = EXCLUDED.installed_by, \
-               installed_at = EXCLUDED.installed_at, step_up_ref = EXCLUDED.step_up_ref",
-        )
         .bind(&new.org)
         .bind(&new.publisher)
         .bind(&new.name)
         .bind(&new.content_hash)
         .bind(&new.installed_by)
         .bind(new.installed_at)
-        .bind(&new.step_up_ref)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| match sqlstate(&e).as_deref() {
-            // Two first installs: the other one committed first.
-            Some(UNIQUE_VIOLATION) => LibraryStoreError::Conflict,
-            Some(FOREIGN_KEY_VIOLATION) => {
-                LibraryStoreError::UnknownVersion(new.content_hash.clone())
-            }
-            _ => store_err(e),
-        })?;
+        .bind(&new.step_up_ref);
+        let write = match replaces {
+            Replaces::Nothing => write,
+            Replaces::Version(h) => write.bind(h),
+        };
+        let written = write
+            .execute(&mut *tx)
+            .await
+            .map_err(map_write)?
+            .rows_affected();
+        if written == 0 {
+            return Err(LibraryStoreError::Conflict);
+        }
         let row = sqlx::query(&format!(
             "{INSTALLATION_SELECT} WHERE i.org = $1 AND i.publisher = $2 AND i.name = $3"
         ))
