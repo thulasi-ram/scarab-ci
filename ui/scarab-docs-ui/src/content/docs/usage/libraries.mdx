@@ -37,7 +37,8 @@ Installing takes two steps:
 1. **Fetch and review.** Scarab reads the file, checks that it is a library, that it invokes only
    `lib:` and `plugin:` targets (never `file:`), and that every library it invokes is installed in
    the org. It stores the file as a version, keyed by its SHA-256, and shows you the content.
-   Nothing is installed yet.
+   Nothing is installed yet. An org keeps its 50 most recent fetches that were never installed;
+   an older one is deleted and has to be fetched again before you install it.
 2. **Install.** Scarab installs the version you reviewed, by its hash. This asks you to confirm
    with your passkey.
 
@@ -59,7 +60,7 @@ came from: the installation records its source, and Policies match on the source
 connection, is read without credentials, over https only, from public addresses only, with no
 redirects and a 1 MiB limit. Any other host is refused. For a private repository, pick a
 connection: Scarab reads the file through it, but only from a repository owned by your org or bound
-to it.
+to it through that connection.
 
 ## Upgrade
 
@@ -86,7 +87,9 @@ refuses:
 - a new Run whose Steps or gates come from it, at Run creation;
 - each launch of a Step that comes from it, including Reruns and Retries of Runs created before the
   yank (the Step fails with a configuration error naming the version and the reason);
-- approving or releasing a gate that comes from it.
+- approving or releasing a gate that comes from it; a timer gate from it fails with the reason
+  when its timer runs out;
+- a debug Pod of a Step that comes from it.
 
 A Policy cannot allow a yanked version, in `audit` mode or with `except_projects`. A yank applies
 to one org. Yanking needs no passkey; lifting a yank does.
