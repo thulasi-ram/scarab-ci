@@ -4,8 +4,15 @@
 # opt-in submodules/LFS, and the config-scrub guard before handing the tree
 # to the CAS snapshot.
 #
+# Credential scope: the token is offered only for SCARAB_CLONE_URL's own
+# repository over https (see scarab-askpass). Submodules are fetched with no
+# credential, so a private submodule fails with SubmoduleUnavailable. LFS
+# objects come from the cloned repository's own LFS endpoint; an `lfs.url` in
+# the repository's `.lfsconfig` is overridden.
+#
 # Env contract (set by the engine from the run's trigger context):
-#   SCARAB_CLONE_URL         credential-free https clone URL      (required)
+#   SCARAB_CLONE_URL         credential-free https clone URL      (required;
+#                            a non-https URL is cloned without the token)
 #   SCARAB_CLONE_SHA         the pinned commit                    (required)
 #   SCARAB_CLONE_DEPTH       "1" (default) | "full"
 #   SCARAB_CLONE_SUBMODULES  "true" to fetch submodules recursively
@@ -28,6 +35,19 @@ export GIT_TERMINAL_PROMPT=0
 # this single-purpose container git's dubious-ownership guard is noise, and it
 # must also cover submodule paths.
 git config --global --add safe.directory '*'
+# Put the repository path in git's credential prompts, so scarab-askpass can
+# check it (without this git names only the host, and the helper refuses).
+# git-lfs reads the same setting.
+git config --global credential.useHttpPath true
+
+case "$SCARAB_CLONE_URL" in
+  https://*) ;;
+  *)
+    if [ -s "${SCARAB_CLONE_TOKEN_FILE:-/scarab/secrets/clone-token}" ]; then
+      echo "scarab-clone: $SCARAB_CLONE_URL is not https; cloning without the token" >&2
+    fi
+    ;;
+esac
 
 mkdir -p "$dest"
 cd "$dest"
@@ -58,23 +78,31 @@ fi
 git checkout -q "$SCARAB_CLONE_SHA"
 
 if [ "${SCARAB_CLONE_SUBMODULES:-false}" = "true" ]; then
-  if ! git submodule update --init --recursive -q; then
-    # DOCUMENTED LIMITATION (ADR-0045): the clone credential is scoped to the
-    # run's repository on its own forge. A private submodule in another
-    # org/installation (or on another host — the askpass helper is
-    # host-pinned) is not covered by it.
+  # Submodule URLs come from the checked-out .gitmodules, which the commit
+  # being built controls (a fork pull request included). They are fetched
+  # with no askpass helper, so no credential: an empty GIT_ASKPASS turns git's
+  # helper lookup off, and GIT_TERMINAL_PROMPT=0 stops it asking anywhere else.
+  if ! GIT_ASKPASS= git submodule update --init --recursive -q; then
+    # DOCUMENTED LIMITATION (ADR-0045): the clone credential covers only the
+    # run's repository, so private submodules are not supported.
     echo "SubmoduleUnavailable: recursive submodule checkout failed for $SCARAB_CLONE_URL" >&2
-    echo "  The run's clone credential covers only its own repository; a private" >&2
-    echo "  submodule in another org/installation or on another host cannot be" >&2
-    echo "  fetched with it (documented limitation, ADR-0045). Make the submodule" >&2
-    echo "  public, vendor it, or host it under the same forge installation." >&2
+    echo "  Submodules are fetched without the run's clone credential, so a private" >&2
+    echo "  submodule cannot be fetched. Make the submodule public or vendor it." >&2
     exit 87
   fi
 fi
 if [ "${SCARAB_CLONE_LFS:-false}" = "true" ]; then
   git lfs install --local >/dev/null
+  # Pin the LFS endpoint to the cloned repository's own. `.lfsconfig` is
+  # content of the commit being built, and git-lfs answers an endpoint on the
+  # clone URL's host with the git remote's credential, so an `lfs.url`
+  # naming another repository there would receive the token. Command-line
+  # config overrides `.lfsconfig`.
+  lfs_repo=$SCARAB_CLONE_URL
+  while [ "${lfs_repo%/}" != "$lfs_repo" ]; do lfs_repo=${lfs_repo%/}; done
+  lfs_url="${lfs_repo%.git}.git/info/lfs"
   # NB: `git lfs pull` has no -q flag; quiet it via stdout redirect.
-  if ! git lfs pull >/dev/null; then
+  if ! git -c lfs.url="$lfs_url" lfs pull >/dev/null; then
     echo "LfsUnavailable: git-lfs pull failed for $SCARAB_CLONE_URL" >&2
     echo "  (LFS objects unreachable or not covered by the clone credential)" >&2
     exit 88
