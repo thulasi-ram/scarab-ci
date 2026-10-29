@@ -2829,6 +2829,54 @@ mod tests {
         }
     }
 
+    /// Zero, misplaced, and duplicated values are refused at authoring time,
+    /// each with its own diagnostic.
+    #[test]
+    fn zero_misplaced_and_duplicate_fields_are_refused() {
+        let cases = [
+            (
+                "budget: 0\nsteps: [{id: a, image: alpine}]",
+                "`budget` must be greater than zero",
+            ),
+            (
+                "concurrency: {group: ''}\nsteps: [{id: a, image: alpine}]",
+                "group must not be empty",
+            ),
+            (
+                "steps: [{id: a, image: alpine, timeout: 0}]",
+                "`timeout` must be greater than zero",
+            ),
+            (
+                "steps: [{id: a, image: alpine, gate_expires_after: 60}]",
+                "only valid on a gate step",
+            ),
+            (
+                "steps: [{id: g, gate: manual, timeout: 60}]",
+                "must not set `timeout`",
+            ),
+            (
+                "steps: [{id: g, gate: manual, gate_expires_after: 0}]",
+                "`gate_expires_after` must be greater",
+            ),
+            (
+                "steps: [{id: g, gate: manual, results: [r]}]",
+                "must not declare `results`",
+            ),
+            (
+                "steps: [{id: a, image: alpine, results: [r, r]}]",
+                "declared twice",
+            ),
+            (
+                "steps: [{id: a, image: alpine, results: ['a/b']}]",
+                "non-empty file stem",
+            ),
+        ];
+        for (yaml, want) in cases {
+            let errs = errors(yaml);
+            assert!(errs.iter().any(|e| e.contains(want)), "{yaml}: {errs:?}");
+        }
+    }
+
     /// The timeout ceiling (ticket 16a7768 item 3): a step past 23h would
     /// outlive its own 24h-capped workspace drain token — refused at
     /// authoring time. The ceiling itself is valid: the token still keeps its
