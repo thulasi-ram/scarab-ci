@@ -7875,9 +7875,11 @@ mod tests {
         // The library's `${{ inputs.channel }}` is the caller's `with:` value.
         let launched = launch(post, json!({}), json!({})).unwrap();
         assert!(
-            launched.command.iter().any(|c| c.contains("#deploys")),
+            launched
+                .env
+                .contains(&("CHANNEL".to_string(), "deploys".to_string())),
             "{:?}",
-            launched.command
+            launched.env
         );
 
         // The sample is not just a compile fixture — it is the LOCAL DOGFOOD

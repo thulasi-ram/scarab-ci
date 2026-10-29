@@ -262,6 +262,13 @@ step `build`: when cel error: `1+1+1+…`: expression is 5000 bytes; the limit i
 The CEL parser recurses once per nesting level and once per operator in a chain such as
 `a + b + c`, so these limits bound how much stack one expression can use on the server.
 
+### Size limits
+
+A pipeline or library file can be at most **1 MiB**. The compiled pipeline can be at most
+**16 MiB** of JSON: each step a library inlines stores the library's inputs, and each matrix leg
+stores a copy of its step, so a small file can compile to a large pipeline. A pipeline over
+either limit is rejected at submit time, and the error names the file or step and the limit.
+
 ## Reuse: `invoke`
 
 `invoke` inlines a **library** into the caller's DAG at compile time; it is not a runtime call.
@@ -317,13 +324,14 @@ steps:
 The interface is checked at compile time: every required input present, no unknown extras, each
 value of its declared type, and every referenced output declared.
 
-**Inputs bind at compile time.** Each `${{ inputs.<name> }}` in a library step's `image`,
-`command`, `env`, `when:` and the `with:` of its own invokes is replaced with the caller's value,
-so in the example above `plan` runs `plan us-east-1`. Inside a library, `inputs` never means the
+**Inputs are read at launch.** Inside a library step, `${{ inputs.<name> }}` in its `image`,
+`command`, `env`, `when:` and the `with:` of its own invokes reads the value its caller bound, so
+in the example above `plan` runs `plan us-east-1`. Inside a library, `inputs` never means the
 Run's launch parameters, and reading an input the library does not declare is a compile error. A
-`with:` value can carry the caller's `${{ outputs.<step>.<name> }}`; it reaches the library step as
-text and is resolved at launch like any other result. The inputs also reach each inlined step as
-`SCARAB_PARAM_<NAME>`.
+literal `with:` value is checked against the input's type when the pipeline compiles. A `with:`
+value that holds a template, such as the caller's `${{ outputs.<step>.<name> }}`, is rendered in
+the caller's scope when the library step launches, then checked against the input's type and
+`validate:`. The inputs also reach each inlined step as `SCARAB_PARAM_<NAME>`.
 
 **What the invoke step carries.** An invoke step may set `needs`, `with`, `matrix`, `when`,
 `deploy`, `timeout`, `resources` and `placement_profiles`. Its `timeout`, `resources` and
@@ -392,20 +400,51 @@ guess, publishes **nothing**: the glob matches no file, the sidecar logs only
 they produced no result.
 
 So make the consumer check that its interpolation resolved. That turns the silent no-op into a
-failure where the value is used:
+failure where the value is used. The value goes in through `env:`, not into the script (see
+[Values in commands and scripts](#values-in-commands-and-scripts)):
 
 ```yaml
 - id: notify
   image: busybox
   needs: [version]
+  env:
+    - [TAG, "${{ outputs.version.tag }}"]
   command:
     - sh
     - -c
     - |
-      TAG='${{ outputs.version.tag }}'
       test -n "$TAG"    # a producer-side typo fails HERE instead of shipping ""
       echo "release $TAG"
 ```
+
+### Values in commands and scripts
+
+Each `${{ … }}` is rendered once, when the step launches, and its value is data: Scarab never
+reads a `${{` inside a value again. Where you put a value decides what it can do.
+
+**In a `command` argument or an `env` value**, the value is passed as it is, with no quoting
+needed. The one exception: a value from outside the pipeline may not start an argument with `-`.
+A program reads such an argument as an option, so `git fetch origin ${{ inputs.ref }}` with the
+value `--upload-pack=touch /tmp/x` would run a command. The step fails before it starts, and the
+error names the template. Write the option in front of the value, or put a `--` argument right
+before it:
+
+```yaml
+- { id: fetch, image: alpine/git, command: ["git", "fetch", "origin", "--", "${{ inputs.ref }}"] }
+- { id: ship, image: deployer, command: ["deploy", "--ref=${{ inputs.ref }}"] }
+```
+
+**In a script**, the value becomes part of the code. This covers the script of `sh -c` (and
+`bash`, `dash`, `zsh`, `ash`, `ksh`), `python -c`, `node -e`, `perl -e` and `ruby -e`, also behind
+`env`, `busybox`, `timeout`, `nice`, `nohup`, `stdbuf`, `setsid`, `sudo` and `exec`. A value from
+outside the pipeline in a script is a compile error; a value written in the pipeline is a lint
+warning. Pass the value in `env:` and read it from the environment, as in the `notify` example
+above.
+
+A value is **from outside the pipeline** when it comes from a launch parameter (`inputs` in a
+pipeline file), a step's results (`outputs`), or a library input whose caller's `with:` reads one
+of these, through any number of callers. Literals, `matrix` values, a literal `with:` value and an
+input's `default` are the pipeline's own.
 
 ## Environments & gates
 

@@ -9,8 +9,8 @@ kind: library
 interface:
   inputs:
     # A typed, optional input with a default, supplied by the caller's `with:`.
-    # `${{ inputs.channel }}` below is replaced with it at compile time, and
-    # every inlined step also gets it as `SCARAB_PARAM_CHANNEL`.
+    # `${{ inputs.channel }}` below reads it when the step launches, and every
+    # inlined step also gets it as `SCARAB_PARAM_CHANNEL`.
     - name: channel
       type: string
       required: false
@@ -20,8 +20,11 @@ interface:
 steps:
   - id: post
     image: curlimages/curl:8.10.1
+    # `${{ inputs.channel }}` reads the caller's `with: { channel: … }`. It goes
+    # in through env, not into the script: a value in a script becomes code.
+    env:
+      - [CHANNEL, "${{ inputs.channel }}"]
     command:
       - sh
       - -c
-      # `${{ inputs.channel }}` reads the caller's `with: { channel: … }`.
-      - 'echo "posting deploy notification to #${{ inputs.channel }}"'
+      - 'echo "posting deploy notification to #$CHANNEL"'
