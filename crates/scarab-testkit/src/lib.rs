@@ -715,6 +715,10 @@ impl Db for InMemoryDb {
         Ok(())
     }
 
+    async fn run_creation_unfinished(&self, run: &RunId) -> Result<bool, DbError> {
+        Ok(self.state.lock().unwrap().creating.contains(run))
+    }
+
     async fn create_step_run(
         &self,
         run: &RunId,

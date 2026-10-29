@@ -216,6 +216,23 @@ pub enum RerunError {
     /// gate. Mapped to 409.
     #[error("step {0:?} is not a gate that can be rejected")]
     NotARejectableGate(StepId),
+    /// Rerun, retry or a gate action refused: the run's creation never
+    /// finished ([`Db::run_creation_unfinished`]) — it failed partway, or is
+    /// still being written. Its step set may be partial, and the scheduler
+    /// never picks it up, so a reopened run would sit `Running` for good.
+    /// Mapped to 409.
+    #[error("this Run's creation failed; start a new Run")]
+    CreationUnfinished,
+}
+
+/// Refuse to act on `run` while its creation is unfinished
+/// ([`RerunError::CreationUnfinished`]). Called first by every entry point that
+/// re-arms a step or resolves a gate.
+async fn ensure_creation_finished(db: &dyn Db, run: &RunId) -> Result<(), RerunError> {
+    if db.run_creation_unfinished(run).await? {
+        return Err(RerunError::CreationUnfinished);
+    }
+    Ok(())
 }
 
 /// One expired input on a rerun: the Workspace Snapshot `consumer` would have
@@ -675,6 +692,7 @@ pub async fn rerun_step_widened(
     target: &StepId,
     by: Option<String>,
 ) -> Result<RerunPlan, RerunError> {
+    ensure_creation_finished(db, run).await?;
     let steps = db.steps_of_run(run).await?;
     let Some(target_step) = steps.iter().find(|s| &s.step == target) else {
         return Err(RerunError::StepNotFound(target.clone()));
@@ -766,6 +784,7 @@ pub async fn retry_step_widened(
     target: &StepId,
     by: Option<String>,
 ) -> Result<RerunPlan, RerunError> {
+    ensure_creation_finished(db, run).await?;
     let steps = db.steps_of_run(run).await?;
     let Some(target_step) = steps.iter().find(|s| &s.step == target) else {
         return Err(RerunError::StepNotFound(target.clone()));
@@ -1086,6 +1105,7 @@ pub async fn release_gate(
     run: &RunId,
     step: &StepId,
 ) -> Result<(), RerunError> {
+    ensure_creation_finished(db, run).await?;
     // The target must be a known gate step.
     let steps = db.steps_of_run(run).await?;
     let Some(gate) = steps.iter().find(|s| &s.step == step && s.is_gate()) else {
@@ -1131,6 +1151,7 @@ pub async fn reject_gate(
     by: &str,
     reason: &str,
 ) -> Result<bool, RerunError> {
+    ensure_creation_finished(db, run).await?;
     let steps = db.steps_of_run(run).await?;
     let Some(gate) = steps.iter().find(|s| &s.step == step) else {
         return Err(RerunError::StepNotFound(step.clone()));
@@ -1502,6 +1523,7 @@ pub async fn record_gate_approval(
     step: &StepId,
     by: &str,
 ) -> Result<(), RerunError> {
+    ensure_creation_finished(db, run).await?;
     // The target must be a known step (404 otherwise) ...
     let steps = db.steps_of_run(run).await?;
     let Some(gate) = steps.iter().find(|s| &s.step == step) else {

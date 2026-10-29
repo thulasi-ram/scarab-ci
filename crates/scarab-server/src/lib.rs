@@ -2661,6 +2661,7 @@ fn rerun_outcome<T>(res: Result<T, RerunError>) -> Result<T, ApiError> {
             Err(ApiError::Conflict(e.to_string()))
         }
         Err(e @ RerunError::NotFailed { .. }) => Err(ApiError::Conflict(e.to_string())),
+        Err(e @ RerunError::CreationUnfinished) => Err(ApiError::Conflict(e.to_string())),
         // Gate-approval-only variants (never produced by rerun/retry); mapped to
         // 409 for exhaustiveness.
         Err(
@@ -2688,7 +2689,7 @@ fn rerun_outcome<T>(res: Result<T, RerunError>) -> Result<T, ApiError> {
     responses(
         (status = 202, description = "rerun accepted — the body is the EXECUTED plan", body = RerunPlanResponse),
         (status = 404, description = "no such run or step"),
-        (status = 409, description = "target's dependencies have not succeeded")
+        (status = 409, description = "target's dependencies have not succeeded, or the run's creation failed")
     )
 )]
 async fn rerun_step(
@@ -2752,7 +2753,7 @@ fn snapshot_oracle(st: &AppState) -> Option<Box<dyn scarab_engine::WorkspaceSnap
     responses(
         (status = 202, description = "retry accepted — the body is the EXECUTED plan", body = RerunPlanResponse),
         (status = 404, description = "no such run or step"),
-        (status = 409, description = "step is not failed")
+        (status = 409, description = "step is not failed, or the run's creation failed")
     )
 )]
 async fn retry_step(
@@ -7509,7 +7510,8 @@ async fn approve_gate(
             | RerunError::NotAManualGate(_)
             | RerunError::GateNotPending { .. }
             | RerunError::GateNotReached { .. }
-            | RerunError::NotARejectableGate(_)),
+            | RerunError::NotARejectableGate(_)
+            | RerunError::CreationUnfinished),
         ) => return Err(ApiError::Conflict(e.to_string())),
         Err(RerunError::Db(e)) => return Err(ApiError::Db(e)),
     }
@@ -7563,7 +7565,8 @@ async fn approve_gate(
             | RerunError::NotAManualGate(_)
             | RerunError::GateNotPending { .. }
             | RerunError::GateNotReached { .. }
-            | RerunError::NotARejectableGate(_)),
+            | RerunError::NotARejectableGate(_)
+            | RerunError::CreationUnfinished),
         ) => return Err(ApiError::Conflict(e.to_string())),
         Err(RerunError::Db(e)) => return Err(ApiError::Db(e)),
     }
@@ -7864,7 +7867,8 @@ async fn release_gate_external(
             | RerunError::NotAManualGate(_)
             | RerunError::GateNotPending { .. }
             | RerunError::GateNotReached { .. }
-            | RerunError::NotARejectableGate(_)),
+            | RerunError::NotARejectableGate(_)
+            | RerunError::CreationUnfinished),
         ) => Err(ApiError::Conflict(e.to_string())),
         Err(RerunError::Db(e)) => Err(ApiError::Db(e)),
     }

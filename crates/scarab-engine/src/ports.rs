@@ -190,6 +190,12 @@ pub trait Db: Send + Sync {
     /// to [`active_runs`](Db::active_runs).
     async fn finish_run_creation(&self, run: &RunId) -> Result<(), DbError>;
 
+    /// Whether `run` came from [`begin_run_creation`](Db::begin_run_creation)
+    /// and its creation never finished — still being written, or failed
+    /// partway. `false` for a run created any other way, and for an unknown
+    /// run.
+    async fn run_creation_unfinished(&self, run: &RunId) -> Result<bool, DbError>;
+
     /// Create a step projection in `Pending`, storing its durable launch `spec`
     /// and its `needs` (dependency in-edges) for dependency-aware admission.
     async fn create_step_run(

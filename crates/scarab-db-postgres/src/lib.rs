@@ -227,6 +227,15 @@ impl Db for PostgresDb {
         Ok(())
     }
 
+    async fn run_creation_unfinished(&self, run: &RunId) -> Result<bool, DbError> {
+        let row = sqlx::query("SELECT creating FROM runs WHERE id = $1")
+            .bind(&run.0)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(row.is_some_and(|r| r.get::<bool, _>("creating")))
+    }
+
     async fn create_step_run(
         &self,
         run: &RunId,

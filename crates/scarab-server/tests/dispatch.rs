@@ -1323,13 +1323,20 @@ async fn a_creation_that_fails_partway_ends_the_run_failed_and_launches_nothing(
     )
     .await
     .expect_err("the privileged step is refused");
-    assert!(err.to_string().contains("privilege request rejected"), "{err}");
+    assert!(
+        err.to_string().contains("privilege request rejected"),
+        "{err}"
+    );
 
     let runs = db.list_runs(10).await.unwrap();
     assert_eq!(runs.len(), 1, "the run row existed before the refusal");
     let run = runs[0].run.clone();
     assert!(
-        db.steps_of_run(&run).await.unwrap().iter().any(|s| s.step.0 == "build"),
+        db.steps_of_run(&run)
+            .await
+            .unwrap()
+            .iter()
+            .any(|s| s.step.0 == "build"),
         "the refusal came after a step was written"
     );
     assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Failed));
@@ -1348,6 +1355,83 @@ async fn a_creation_that_fails_partway_ends_the_run_failed_and_launches_nothing(
     let exec = Arc::new(RecordingExec::default());
     let sched = Scheduler::new(&*db as &dyn Db, &*clock as &dyn Clock, &*exec, "sched");
     assert!(db.active_runs().await.unwrap().is_empty());
+    sched.tick_all().await.unwrap();
+    sched.tick(&run).await.unwrap();
+    assert!(exec.launches.lock().unwrap().is_empty(), "nothing launched");
+    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Failed));
+}
+
+/// A Run whose creation failed cannot be reopened: rerun and retry of a step
+/// it left behind are refused 409, the Run stays Failed, and nothing launches.
+/// (Reopened, it would sit Running forever: its creation never finished, so
+/// the scheduler never sees it.)
+#[tokio::test]
+async fn rerun_and_retry_of_a_creation_failed_run_are_refused() {
+    let forge: Arc<dyn scarab_forge::ForgePort> = Arc::new(
+        scarab_testkit::FakeForge::new()
+            .with_file(".scarab/ci.yaml", REFUSED_SECOND_STEP_YAML)
+            .with_commit("refs/heads/main", "sha-1"),
+    );
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        db.clone(),
+    ));
+    let app = router(AppState::new(db.clone(), clock.clone(), logs).with_forge(forge));
+    let post = |uri: String, body: serde_json::Value| {
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+    };
+
+    let (status, body) = post(
+        "/v1/repos/acme/web/dispatch".into(),
+        json!({ "ref": "refs/heads/main", "pipeline": "ci" }),
+    )
+    .await;
+    assert!(
+        status.is_client_error() || status.is_server_error(),
+        "{status}: {body}"
+    );
+    let runs = db.list_runs(10).await.unwrap();
+    assert_eq!(runs.len(), 1);
+    let run = runs[0].run.clone();
+    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Failed));
+
+    for action in ["rerun", "retry"] {
+        let (status, body) = post(
+            format!("/v1/runs/{}/steps/build/{action}", run.0),
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{action}: {body}");
+        assert!(body.contains("creation failed"), "{action}: {body}");
+        assert_eq!(
+            db.run_status(&run).await.unwrap(),
+            Some(RunStatus::Failed),
+            "{action} left the run Failed"
+        );
+    }
+
+    let exec = RecordingExec::default();
+    let sched = Scheduler::new(&*db as &dyn Db, &*clock as &dyn Clock, &exec, "sched");
     sched.tick_all().await.unwrap();
     sched.tick(&run).await.unwrap();
     assert!(exec.launches.lock().unwrap().is_empty(), "nothing launched");
