@@ -1252,6 +1252,7 @@ pub fn compile_yaml_with_libs(
         LibsRef {
             files: libs,
             installed: &BTreeMap::new(),
+            work: &Default::default(),
         },
     )
 }
@@ -1282,15 +1283,99 @@ pub fn compile_with_libraries(
         LibsRef {
             files: &libraries.files,
             installed: &libraries.installed,
+            work: &Default::default(),
         },
     )
 }
 
-/// A borrowed [`Libraries`], so [`compile_yaml_with_libs`] needs no copy.
+/// A borrowed [`Libraries`], so [`compile_yaml_with_libs`] needs no copy,
+/// with what one compile has parsed of them.
 #[derive(Clone, Copy)]
 struct LibsRef<'a> {
     files: &'a BTreeMap<String, String>,
     installed: &'a BTreeMap<String, InstalledLibrary>,
+    work: &'a std::cell::RefCell<Work>,
+}
+
+/// The most bytes of library source one compile reads, counting each
+/// library once however often it is invoked.
+pub const MAX_LIBRARY_SOURCE_BYTES: usize = 16 << 20;
+
+/// What one compile has done so far, so its work is bounded: each library
+/// source it has read, by its target as written (`file:…`, `lib:…`), parsed
+/// once however often it is invoked; and the matrices it has expanded.
+#[derive(Default)]
+struct Work {
+    /// The library, its content hash, or why it cannot be used.
+    full: BTreeMap<String, Result<(std::rc::Rc<PipelineIr>, String), String>>,
+    /// The outputs its interface exposes, if it reads.
+    exposed: BTreeMap<String, Option<Vec<String>>>,
+    /// The library sources read, counted against
+    /// [`MAX_LIBRARY_SOURCE_BYTES`].
+    admitted: BTreeSet<String>,
+    bytes: usize,
+    matrix: MatrixWork,
+}
+
+impl Work {
+    /// Whether the library `written` may be read: it was, or its source
+    /// `src` fits under [`MAX_LIBRARY_SOURCE_BYTES`] with those that were.
+    fn admit(&mut self, written: &str, src: &str) -> bool {
+        if self.admitted.contains(written) {
+            return true;
+        }
+        if self.bytes.saturating_add(src.len()) > MAX_LIBRARY_SOURCE_BYTES {
+            return false;
+        }
+        self.bytes += src.len();
+        self.admitted.insert(written.to_string());
+        true
+    }
+}
+
+impl LibsRef<'_> {
+    /// The library `written` names, with source `src`, parsed once per
+    /// compile, and its content hash; or why it cannot be used ("failed to
+    /// parse: …").
+    fn parse(&self, written: &str, src: &str) -> Result<(std::rc::Rc<PipelineIr>, String), String> {
+        let mut parsed = self.work.borrow_mut();
+        if let Some(done) = parsed.full.get(written) {
+            return done.clone();
+        }
+        let done = if !parsed.admit(written, src) {
+            Err(format!(
+                "is past the limit on library source: the libraries one Pipeline invokes may \
+                 hold {MAX_LIBRARY_SOURCE_BYTES} bytes (16 MiB) in all, each counted once"
+            ))
+        } else {
+            serde_yaml::from_str::<PipelineIr>(src)
+                .map(|ir| (std::rc::Rc::new(ir), sha256_hex(src.as_bytes())))
+                .map_err(|e| format!("failed to parse: {e}"))
+        };
+        parsed.full.insert(written.to_string(), done.clone());
+        done
+    }
+
+    /// The outputs the interface of the library `written` exposes (a
+    /// shallow read of its `interface:` only), read once per compile.
+    fn exposed(&self, written: &str, src: &str) -> Option<Vec<String>> {
+        #[derive(Deserialize)]
+        struct Shallow {
+            #[serde(default)]
+            interface: Interface,
+        }
+        let mut parsed = self.work.borrow_mut();
+        if let Some(done) = parsed.exposed.get(written) {
+            return done.clone();
+        }
+        let done = parsed
+            .admit(written, src)
+            .then(|| serde_yaml::from_str::<Shallow>(src).ok())
+            .flatten()
+            .map(|l| l.interface.outputs);
+        parsed.exposed.insert(written.to_string(), done.clone());
+        done
+    }
 }
 
 fn compile_libs(yaml: &str, libs: LibsRef<'_>) -> Result<PipelineIr, PipelineError> {
@@ -1327,7 +1412,7 @@ fn compile_libs(yaml: &str, libs: LibsRef<'_>) -> Result<PipelineIr, PipelineErr
     // of the Step it was expanded from.
     let mut bytes: usize = 0;
     for step in &authored_steps {
-        match expand_step(step) {
+        match expand_step(step, &mut libs.work.borrow_mut().matrix) {
             Ok(concrete) => {
                 let ids = concrete.iter().map(|s| s.id.clone()).collect();
                 // A duplicate authored id shadows an earlier expansion; the
@@ -1660,6 +1745,28 @@ pub const MAX_COMPILED_STEPS: usize = 1024;
 /// any. Kept combinations count against [`MAX_COMPILED_STEPS`]; this bounds
 /// the work of building and filtering the rest.
 pub const MAX_MATRIX_COMBINATIONS: usize = 65_536;
+
+/// The most `exclude` predicates one `matrix:` may have.
+pub const MAX_MATRIX_EXCLUDES: usize = 256;
+
+/// The most checks of a combination against an `exclude` predicate one
+/// compile may make: for each matrix, its combinations before `exclude`
+/// times its predicates. A predicate is evaluated once per distinct value
+/// of the dimensions it reads, so this bounds the evaluations too.
+pub const MAX_MATRIX_EXCLUDE_CHECKS: usize = 1 << 18;
+
+/// The most combinations, before `exclude`, of all the matrices one
+/// compile expands.
+pub const MAX_MATRIX_COMBINATIONS_PER_COMPILE: usize = 1 << 20;
+
+/// The matrix work one compile has done, against
+/// [`MAX_MATRIX_COMBINATIONS_PER_COMPILE`] and
+/// [`MAX_MATRIX_EXCLUDE_CHECKS`].
+#[derive(Default)]
+struct MatrixWork {
+    combinations: usize,
+    checks: usize,
+}
 
 /// The diagnostic for a Pipeline over [`MAX_COMPILED_STEPS`].
 fn too_many_steps(at: &str) -> String {
@@ -2087,13 +2194,10 @@ fn inline_level(
             ));
             continue;
         }
-        let lib: PipelineIr = match serde_yaml::from_str(src) {
-            Ok(ir) => ir,
-            Err(e) => {
-                diagnostics.push(format!(
-                    "step `{}`: library `{label}` failed to parse: {e}",
-                    step.id
-                ));
+        let (lib, content_hash) = match libs.parse(&written, src) {
+            Ok(parsed) => parsed,
+            Err(why) => {
+                diagnostics.push(format!("step `{}`: library `{label}` {why}", step.id));
                 continue;
             }
         };
@@ -2310,7 +2414,7 @@ fn inline_level(
             kind,
             name: name.clone(),
             source,
-            content_hash: sha256_hex(src.as_bytes()),
+            content_hash,
         };
 
         // `matrix` × `invoke` (ADR-0038): a matrix on the invoke step fans out N
@@ -2318,7 +2422,7 @@ fn inline_level(
         // the coordinate instances (id `deploy[svc=api]`, `matrix_values` set,
         // `exclude` applied); a step without a matrix yields exactly one instance
         // whose id is the step id — the single-copy path falls out for free.
-        let invoke_instances = match expand_step(step) {
+        let invoke_instances = match expand_step(step, &mut libs.work.borrow_mut().matrix) {
             Ok(v) => v,
             Err(msg) => {
                 diagnostics.push(msg);
@@ -2559,25 +2663,22 @@ fn reads_late_inputs(template: &str, late: &BTreeSet<String>) -> bool {
 /// library that does not resolve; both are reported where the invoke is
 /// inlined). A shallow read of the library's `interface:` only.
 fn exposed_outputs(steps: &[StepSpec], libs: LibsRef<'_>) -> BTreeMap<String, Option<Vec<String>>> {
-    #[derive(Deserialize)]
-    struct Shallow {
-        #[serde(default)]
-        interface: Interface,
-    }
     steps
         .iter()
         .filter_map(|s| {
             let raw = s.invoke.as_ref()?;
             let outputs = (s.matrix.is_none())
                 .then(|| {
-                    let src = match parse_invoke_target(raw).ok()? {
-                        InvokeTarget::File(key) => libs.files.get(&key)?.as_str(),
-                        InvokeTarget::Lib(name) => libs.installed.get(&name)?.content.as_str(),
+                    let target = parse_invoke_target(raw).ok()?;
+                    let src = match &target {
+                        InvokeTarget::File(key) => libs.files.get(key)?.as_str(),
+                        InvokeTarget::Lib(name) => libs.installed.get(name)?.content.as_str(),
                         InvokeTarget::Plugin(_) => return None,
                     };
-                    serde_yaml::from_str::<Shallow>(src)
-                        .ok()
-                        .map(|l| l.interface.outputs)
+                    if src.len() > MAX_SOURCE_BYTES {
+                        return None;
+                    }
+                    libs.exposed(&target.written(), src)
                 })
                 .flatten();
             Some((s.id.clone(), outputs))
@@ -3126,7 +3227,7 @@ pub(crate) fn is_identifier(s: &str) -> bool {
 /// A step with a matrix yields the cartesian product of its dimensions; each
 /// instance gets a deterministic id `id[k1=v1,k2=v2]` (keys sorted) and its
 /// coordinate recorded in [`StepSpec::matrix_values`].
-fn expand_step(step: &StepSpec) -> Result<Vec<StepSpec>, String> {
+fn expand_step(step: &StepSpec, work: &mut MatrixWork) -> Result<Vec<StepSpec>, String> {
     let Some(matrix) = &step.matrix else {
         let mut base = step.clone();
         base.matrix = None;
@@ -3158,63 +3259,137 @@ fn expand_step(step: &StepSpec) -> Result<Vec<StepSpec>, String> {
         ));
     }
 
-    // Cartesian product over the (sorted) dimensions.
-    let mut combos: Vec<BTreeMap<String, String>> = vec![BTreeMap::new()];
-    for (dim, values) in &matrix.dimensions {
-        let mut next = Vec::with_capacity(combos.len() * values.len());
-        for combo in &combos {
-            for value in values {
-                let mut c = combo.clone();
-                c.insert(dim.clone(), value.clone());
-                next.push(c);
-            }
-        }
-        combos = next;
+    let n = combinations.unwrap_or(0);
+    // Every matrix of the compile (a library's, each time it is inlined)
+    // counts against one bound.
+    work.combinations = work.combinations.saturating_add(n);
+    if work.combinations > MAX_MATRIX_COMBINATIONS_PER_COMPILE {
+        return Err(format!(
+            "step `{}`: the pipeline's matrices have more than \
+             {MAX_MATRIX_COMBINATIONS_PER_COMPILE} combinations in all before `exclude`, \
+             counting a library's each time it is inlined; the limit is \
+             {MAX_MATRIX_COMBINATIONS_PER_COMPILE}",
+            step.id
+        ));
+    }
+    if matrix.exclude.len() > MAX_MATRIX_EXCLUDES {
+        return Err(format!(
+            "step `{}`: the matrix has {} `exclude` predicates; the limit is \
+             {MAX_MATRIX_EXCLUDES}",
+            step.id,
+            matrix.exclude.len()
+        ));
+    }
+    work.checks = work
+        .checks
+        .saturating_add(n.saturating_mul(matrix.exclude.len()));
+    if work.checks > MAX_MATRIX_EXCLUDE_CHECKS {
+        return Err(format!(
+            "step `{}`: the pipeline's matrices need more than {MAX_MATRIX_EXCLUDE_CHECKS} \
+             `exclude` checks in all (each matrix's combinations times its predicates, counting \
+             a library's each time it is inlined); the limit is {MAX_MATRIX_EXCLUDE_CHECKS}",
+            step.id
+        ));
     }
 
-    // Drop combinations excluded by a CEL predicate (evaluated against the
-    // combination's own coordinate — each dimension bound as a variable). A
-    // predicate is parsed once and checked on the combinations still kept.
-    let ctxs: Vec<serde_json::Value> = combos
+    // A combination is a number: each dimension's value index, in the
+    // (sorted) dimension order, the last changing fastest. Nothing is copied
+    // per combination until the kept ones are known to fit.
+    let dims: Vec<(&String, &Vec<String>)> = matrix.dimensions.iter().collect();
+    let mut stride = vec![1usize; dims.len()];
+    for k in (0..dims.len().saturating_sub(1)).rev() {
+        stride[k] = stride[k + 1] * dims[k + 1].1.len();
+    }
+    let index = |c: usize, k: usize| (c / stride[k]) % dims[k].1.len();
+    let values: Vec<Vec<std::sync::Arc<String>>> = dims
         .iter()
-        .map(|coord| {
-            serde_json::Value::Object(
-                coord
-                    .iter()
-                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-                    .collect(),
-            )
-        })
+        .map(|(_, v)| v.iter().map(|s| std::sync::Arc::new(s.clone())).collect())
         .collect();
-    let mut keep = vec![true; combos.len()];
+
+    // Drop combinations excluded by a CEL predicate (evaluated against the
+    // combination's own coordinate, each dimension bound as a variable). A
+    // predicate is parsed once and evaluated once per distinct value of the
+    // dimensions it reads, among the combinations still kept.
+    let mut keep = vec![true; n];
     for pred in &matrix.exclude {
-        let live: Vec<usize> = (0..combos.len()).filter(|i| keep[*i]).collect();
-        let live_ctxs: Vec<&serde_json::Value> = live.iter().map(|i| &ctxs[*i]).collect();
-        let excluded = cel::eval_bool_each(pred, &live_ctxs)
+        let reads = cel::reads(pred).map_err(|e| format!("step `{}`: {e}", step.id))?;
+        let read: BTreeSet<&str> = reads.iter().map(|r| r.var.as_str()).collect();
+        let mut fixed = Vec::new();
+        let mut varying = Vec::new();
+        for (k, (name, v)) in dims.iter().enumerate() {
+            if !read.contains(name.as_str()) {
+                continue;
+            }
+            if v.len() == 1 {
+                fixed.push((name.as_str(), values[k][0].clone()));
+            } else {
+                varying.push(k);
+            }
+        }
+        // A point: the read dimensions' value indexes, the last fastest.
+        let point = |c: usize| {
+            varying
+                .iter()
+                .fold(0usize, |p, &k| p * dims[k].1.len() + index(c, k))
+        };
+        let size: usize = varying.iter().map(|&k| dims[k].1.len()).product();
+        let mut wanted = vec![false; size];
+        let mut points = Vec::new();
+        for c in (0..n).filter(|&c| keep[c]) {
+            let p = point(c);
+            if !wanted[p] {
+                wanted[p] = true;
+                points.push(p);
+            }
+        }
+        let read_dims: Vec<cel::Dim<'_>> = varying
+            .iter()
+            .map(|&k| cel::Dim {
+                name: dims[k].0,
+                values: &values[k],
+            })
+            .collect();
+        let excluded = cel::eval_bool_product(pred, &fixed, &read_dims, &points)
             .map_err(|e| format!("step `{}`: {e}", step.id))?;
-        for (i, out) in live.into_iter().zip(excluded) {
-            if out {
-                keep[i] = false;
+        let mut table = vec![false; size];
+        for (p, out) in points.into_iter().zip(excluded) {
+            table[p] = out;
+        }
+        for (c, k) in keep.iter_mut().enumerate() {
+            if *k && table[point(c)] {
+                *k = false;
             }
         }
     }
-    let kept: Vec<BTreeMap<String, String>> = combos
-        .into_iter()
-        .zip(keep)
-        .filter_map(|(coord, k)| k.then_some(coord))
-        .collect();
+    let kept: Vec<usize> = (0..n).filter(|&c| keep[c]).collect();
     if kept.len() > MAX_COMPILED_STEPS {
         return Err(too_many_steps(&format!("step `{}`", step.id)));
     }
-    // Each kept combination is a copy of the Step: refuse before copying.
+    // Each kept combination is a copy of the Step plus its coordinate,
+    // written three times (id, `matrix_values`, the scope's `matrix`):
+    // refuse before copying.
     let each = json_len(step, MAX_COMPILED_IR_BYTES).unwrap_or(usize::MAX);
-    if each.saturating_mul(kept.len()) > MAX_COMPILED_IR_BYTES {
+    let coordinate_len = |c: usize| -> usize {
+        (0..dims.len())
+            .map(|k| dims[k].0.len() + dims[k].1[index(c, k)].len() + 8)
+            .sum()
+    };
+    let total = kept.iter().try_fold(0usize, |t, &c| {
+        let next = t
+            .saturating_add(each)
+            .saturating_add(coordinate_len(c).saturating_mul(3));
+        (next <= MAX_COMPILED_IR_BYTES).then_some(next)
+    });
+    if total.is_none() {
         return Err(ir_too_large(&format!("step `{}`", step.id)));
     }
 
     Ok(kept
         .into_iter()
-        .map(|coord| {
+        .map(|c| {
+            let coord: BTreeMap<String, String> = (0..dims.len())
+                .map(|k| (dims[k].0.clone(), dims[k].1[index(c, k)].clone()))
+                .collect();
             let suffix = coord
                 .iter()
                 .map(|(k, v)| format!("{k}={v}"))
@@ -4897,6 +5072,89 @@ mod tests {
         assert_eq!(ir.steps.len(), 3, "one combo excluded, got {ids:?}");
         assert!(!ids.contains(&"build[arch=arm64,os=windows]"));
         assert!(ids.contains(&"build[arch=amd64,os=windows]"));
+    }
+
+    /// `exclude` is evaluated once per distinct value of the dimensions a
+    /// predicate reads, with a dimension of one value bound too, and only
+    /// where an earlier predicate kept the combination; its length and its
+    /// checks are capped.
+    #[test]
+    fn matrix_exclude_reads_its_dimensions_and_is_capped() {
+        let ir = compile(
+            r#"
+            steps:
+              - id: t
+                image: rust
+                matrix:
+                  dimensions:
+                    a: ["1", "2", "3"]
+                    b: [x, y]
+                    c: [k]
+                  exclude:
+                    - "a == '1'"
+                    - "c == 'k' && b == 'y' && int(a) > 2"
+                    - "int(a) == 2 && b == 'x'"
+            "#,
+        );
+        let ids: Vec<&str> = ir.steps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["t[a=2,b=y,c=k]", "t[a=3,b=x,c=k]"]);
+        assert_eq!(ir.steps[0].matrix_values["c"], "k");
+
+        // A predicate that errors where an earlier one excluded everything
+        // is never evaluated; one that is not a boolean is an error.
+        compile(
+            r#"steps: [{ id: t, image: rust, matrix: { dimensions: { a: [x] }, exclude: ["true", "int(a) > 0"] } }]"#,
+        );
+        let e = errors(
+            r#"steps: [{ id: t, image: rust, matrix: { dimensions: { a: [x] }, exclude: ["a"] } }]"#,
+        );
+        assert!(e[0].contains("expected a boolean"), "{e:?}");
+
+        let many = ["\"a == 'z'\""; MAX_MATRIX_EXCLUDES + 1].join(", ");
+        let e = errors(&format!(
+            "steps: [{{ id: t, image: rust, matrix: {{ dimensions: {{ a: [x] }}, exclude: [{many}] }} }}]"
+        ));
+        assert!(
+            e[0].contains(&format!("the limit is {MAX_MATRIX_EXCLUDES}")),
+            "{e:?}"
+        );
+
+        let dims: Vec<String> = (0..16).map(|d| format!("d{d}: [a, b]")).collect();
+        let preds = ["\"d0 == 'z'\""; MAX_MATRIX_EXCLUDE_CHECKS / 65_536 + 1].join(", ");
+        let e = errors(&format!(
+            "steps: [{{ id: t, image: rust, matrix: {{ dimensions: {{ {} }}, exclude: [{preds}] }} }}]",
+            dims.join(", ")
+        ));
+        assert!(
+            e[0].contains(&format!("the limit is {MAX_MATRIX_EXCLUDE_CHECKS}")),
+            "{e:?}"
+        );
+
+        // The bounds are per compile: matrices that each fit, and exclude
+        // every combination, still add up.
+        let step = |i: usize, exclude: &str| {
+            format!(
+                "  - {{ id: s{i}, image: rust, matrix: {{ dimensions: {{ {} }}, exclude: [{exclude}] }} }}\n",
+                dims.join(", ")
+            )
+        };
+        let per = MAX_MATRIX_EXCLUDE_CHECKS / 65_536;
+        let yaml: String = (0..=per).map(|i| step(i, "\"true\"")).collect();
+        let e = errors(&format!("steps:\n{yaml}"));
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(
+            e[0].starts_with(&format!("step `s{per}`: the pipeline's matrices need more")),
+            "{e:?}"
+        );
+        let per = MAX_MATRIX_COMBINATIONS_PER_COMPILE / 65_536;
+        let yaml: String = (0..=per).map(|i| step(i, "")).collect();
+        let e = errors(&format!("steps:\n{yaml}"));
+        assert!(
+            e.last()
+                .unwrap()
+                .starts_with(&format!("step `s{per}`: the pipeline's matrices have more")),
+            "{e:?}"
+        );
     }
 
     #[test]
@@ -8342,6 +8600,37 @@ mod tests {
         assert!(
             ds.iter()
                 .any(|d| d.starts_with("step `c`: `with.v` ") && d.contains(refused)),
+            "{ds:?}"
+        );
+    }
+
+    /// The libraries one compile reads are bounded in all, each counted once
+    /// however often it is invoked. (Each source here fails to parse at its
+    /// first byte, so the test reads little.)
+    #[test]
+    fn library_source_is_bounded_per_compile() {
+        let big = format!("@{}", "x".repeat(MAX_SOURCE_BYTES - 1));
+        let n = MAX_LIBRARY_SOURCE_BYTES / MAX_SOURCE_BYTES;
+        let names: Vec<String> = (0..=n).map(|i| format!("l{i}.yaml")).collect();
+        let files: BTreeMap<String, String> =
+            names.iter().map(|k| (k.clone(), big.clone())).collect();
+        // The same library invoked many times counts once.
+        let mut yaml = String::from("steps:\n");
+        for i in 0..50 {
+            yaml.push_str(&format!("  - {{ id: a{i}, invoke: file:l0.yaml }}\n"));
+        }
+        let ds = errors_with(&yaml, &files);
+        assert!(ds.iter().all(|d| d.contains("failed to parse")), "{ds:?}");
+        // One more library than fits is refused, by name.
+        let mut yaml = String::from("steps:\n");
+        for (i, name) in names.iter().enumerate() {
+            yaml.push_str(&format!("  - {{ id: b{i}, invoke: file:{name} }}\n"));
+        }
+        let ds = errors_with(&yaml, &files);
+        assert!(
+            ds.iter().any(|d| d.starts_with(&format!(
+                "step `b{n}`: library `l{n}.yaml` is past the limit"
+            ))),
             "{ds:?}"
         );
     }

@@ -1262,8 +1262,8 @@ async fn pipeline_input(
     };
     let event = test_event(p.trigger, repo.clone(), caller)?;
     let (yaml, libs) = (p.yaml, p.libs);
-    let ir = blocking(move || scarab_pipeline::compile_yaml_with_libs(&yaml, &libs))
-        .await?
+    let (ir, _) = crate::compile_bounded(yaml, libs)
+        .await
         .map_err(|e| ApiError::BadRequest(format!("the Pipeline does not compile: {e}")))?;
 
     let refused = |why: String| {

@@ -550,7 +550,6 @@ fn survived_yaml_alias_expansion_is_bounded() {
 /// invokes x library size, not with what is compiled. 1000 invokes took
 /// 7.8 s (release) and 70 s (debug); 8192 invoke expansions are allowed.
 #[test]
-#[ignore = "red: render r2"]
 fn compile_time_is_bounded_for_many_invokes_of_a_large_library() {
     let small = String::from("kind: library\nsteps: [{ id: s, image: busybox }]\n");
     let mut large = small.clone();
@@ -582,7 +581,6 @@ fn compile_time_is_bounded_for_many_invokes_of_a_large_library() {
 /// the list has no length cap. A 1.2 KB file with 64 predicates took 6-8 s
 /// (release) and 17.5 s (debug); 1 MiB holds ~50 000 predicates.
 #[test]
-#[ignore = "red: render r2"]
 fn compile_time_is_bounded_for_a_long_matrix_exclude_list() {
     let mut dims = String::new();
     for d in 0..16 {
@@ -642,7 +640,6 @@ fn peak_rss_growth<T>(f: impl FnOnce() -> T) -> (T, u64) {
 /// combination) before the Step cap is checked. A 33 KB file; memory grows
 /// with value length x 65 536 x 2, so a file near 1 MiB asks for ~70 GB.
 #[test]
-#[ignore = "red: render r2"]
 fn compile_memory_is_bounded_for_a_matrix_of_long_values() {
     let v = "v".repeat(1024);
     let mut dims = String::new();

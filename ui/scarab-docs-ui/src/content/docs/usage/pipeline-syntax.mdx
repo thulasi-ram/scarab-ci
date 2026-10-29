@@ -235,6 +235,11 @@ CEL predicates (evaluated against each combination's own coordinate) drops combi
 Each instance gets a deterministic id like `test[arch=amd64,os=linux]`, and a downstream
 `needs: [test]` fans in over every surviving instance.
 
+A matrix can have at most 65,536 combinations before `exclude`, and 256 `exclude` predicates. All
+the matrices of one pipeline, counting a library's matrix each time the library is inlined, can
+have at most 1,048,576 combinations, and at most 262,144 `exclude` checks (combinations times
+predicates).
+
 ## Conditions: `when`
 
 A `when:` CEL guard skips a step whose predicate is false; expressions read the run's context
@@ -264,10 +269,13 @@ The CEL parser recurses once per nesting level and once per operator in a chain 
 
 ### Size limits
 
-A pipeline or library file can be at most **1 MiB**. The compiled pipeline can be at most
-**16 MiB** of JSON: each step a library inlines stores the library's inputs, and each matrix leg
-stores a copy of its step, so a small file can compile to a large pipeline. A pipeline over
-either limit is rejected at submit time, and the error names the file or step and the limit.
+A pipeline or library file can be at most **1 MiB**, and the libraries one pipeline invokes can
+hold at most **16 MiB** in all, each counted once however often it is invoked. The compiled
+pipeline can be at most **16 MiB** of JSON: each step a library inlines stores the library's
+inputs, and each matrix leg stores a copy of its step, so a small file can compile to a large
+pipeline. A pipeline over any of these limits is rejected at submit time, and the error names the
+file or step and the limit. The server also stops a compile that takes longer than 10 seconds,
+and the trigger fails with that reason.
 
 ## Reuse: `invoke`
 
