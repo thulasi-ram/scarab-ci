@@ -16,7 +16,7 @@ are triggered and wired together. Structurally a pipeline is a **flat recursive 
 
 You write YAML, with **CEL** for expressions. Scarab compiles it to a **typed IR**, and the IR
 (not the YAML) defines what a valid pipeline is.
-`invoke` reuses a library pipeline by inlining it into the caller's DAG at compile time.
+`invoke` reuses a library by inlining it into the caller's DAG at compile time.
 `matrix` is a modifier that fans a step out over a set of inputs.
 
 Compilation is **static**: the whole DAG (every matrix combination, every inlined library step) is
@@ -37,8 +37,8 @@ dropped.
 
 A repo's CI lives in `.scarab/`. A triggered pipeline is a YAML file such as `.scarab/ci.yaml`;
 its file name is the default display name (`ci.yaml` reads as `ci`, overridable with a top-level
-`name:`). Reusable **library** pipelines live under `.scarab/lib/` and are pulled in with
-[`invoke`](#reuse-invoke). Start from
+`name:`). Reusable **libraries** (files marked `kind: library`) live under `.scarab/lib/` by
+convention and are pulled in with [`invoke`](#reuse-invoke). Start from
 [Run locally](/scarab-ci/get-started/run-locally/) to submit your first pipeline.
 
 :::caution[Commit `.scarab/`, and never blanket-ignore it]
@@ -136,8 +136,9 @@ steps:
   with a bad value (fail-closed).
 
 Resolved parameters are read in steps as `${{ inputs.<name> }}` and are also injected into the
-step environment as `SCARAB_PARAM_<NAME>`. A **reusable library** pipeline additionally declares the
-`outputs` it exposes to its caller (see [Reuse: `invoke`](#reuse-invoke)).
+step environment as `SCARAB_PARAM_<NAME>`. A **library** additionally declares the `outputs` it
+exposes to its caller, and inside a library `${{ inputs.<name> }}` reads the caller's `with:`, not
+the Run's launch parameters (see [Reuse: `invoke`](#reuse-invoke)).
 
 ## Steps: the step shape
 
@@ -181,7 +182,7 @@ Some steps are **kinds** with no image that the engine runs on your behalf (you 
 - **`clone: {}`**: source provisioning (see [The `clone` step](#the-clone-step)).
 - **`build: { image: ..., push: true }`**: a rootless BuildKit image build.
 - **`gate: manual`**: a durable approval/wait point (see [Environments & gates](#environments--gates)).
-- **`invoke: .scarab/lib/...`**: reuse at compile time (see [Reuse: `invoke`](#reuse-invoke)).
+- **`invoke: file:.scarab/lib/...`**: reuse at compile time (see [Reuse: `invoke`](#reuse-invoke)).
 
 ### The `clone` step
 
@@ -263,32 +264,49 @@ The CEL parser recurses once per nesting level and once per operator in a chain 
 
 ## Reuse: `invoke`
 
-`invoke` inlines a **library** pipeline (under `.scarab/lib/` by convention) into the caller's DAG
-at compile time; it is not a runtime call.
-It is local only, and will stay that way: repo-relative paths, read at the caller's ref; no `../` escape and no
-cross-repo references (cross-repo causation is `on: upstream`). The invoked steps are namespaced
-by the invoke step's id (`deploy/plan`, `deploy/url`), and `matrix` on an invoke step fans out the
-whole subgraph.
+`invoke` inlines a **library** into the caller's DAG at compile time; it is not a runtime call.
+The invoked steps are namespaced by the invoke step's id (`deploy/plan`, `deploy/url`), and
+`matrix` on an invoke step fans out the whole subgraph.
 
-A library declares its contract with `interface` (the `inputs` it requires and the `outputs` it
-exposes) and the caller supplies inputs with `with:`:
+The target always has a prefix that says where it comes from:
+
+| `invoke:` | Target |
+|---|---|
+| `file:<path>` | a library file in the repository, read at the caller's ref |
+| `lib:<publisher>/<name>` | a library installed in your org |
+| `plugin:<installation>/<gate>` | a gate a plugin resolves (not available yet) |
+
+A `file:` path is repo-relative: no leading `/`, no `..`, and no remote or cross-repo forms
+(cross-repo causation is `on: upstream`). A bare path is a compile error that tells you to add
+`file:`, and `url:` is refused: Scarab does not invoke from a URL. Org-installed libraries are not
+available yet, so a `lib:` target compiles only once your org has one installed; until then it
+fails with "`lib:<publisher>/<name>` is not installed in this org".
+
+A library is a YAML file marked `kind: library`. It has no `on:` triggers and never runs on its
+own: Scarab does not trigger it or list it for dispatch, even directly under `.scarab/`. It
+declares its contract with `interface` (the `inputs` it takes and the `outputs` it exposes) and the
+caller supplies inputs with `with:`:
 
 ```yaml
 # .scarab/lib/deploy.yaml
+kind: library
 interface:
-  inputs:  [region, replicas]
+  inputs:
+    - { name: region, type: string }
+    - { name: replicas, type: number, required: false, default: 2 }
   outputs: [url]
 steps:
-  - { id: plan, image: tf, command: ["plan"] }
-  - { id: url,  image: tf, command: ["apply"], needs: [plan] }
+  - { id: plan, image: tf@sha256:…, command: ["plan", "${{ inputs.region }}"] }
+  - { id: url,  image: tf@sha256:…, command: ["apply"], needs: [plan] }
 ```
 
 ```yaml
 # .scarab/ci.yaml
 steps:
   - id: deploy
-    invoke: .scarab/lib/deploy.yaml
+    invoke: file:.scarab/lib/deploy.yaml
     with: { region: us-east-1, replicas: "3" }
+    timeout: 1800
 
   - id: notify
     image: busybox
@@ -296,8 +314,31 @@ steps:
     command: ["echo", "${{ outputs.deploy.url }}"]
 ```
 
-The interface is validated at compile time: every required input present, no unknown extras, and every
-referenced output declared. Supplied inputs reach each inlined step as `SCARAB_PARAM_<NAME>`.
+The interface is checked at compile time: every required input present, no unknown extras, each
+value of its declared type, and every referenced output declared.
+
+**Inputs bind at compile time.** Each `${{ inputs.<name> }}` in a library step's `image`,
+`command`, `env`, `when:` and the `with:` of its own invokes is replaced with the caller's value,
+so in the example above `plan` runs `plan us-east-1`. Inside a library, `inputs` never means the
+Run's launch parameters, and reading an input the library does not declare is a compile error. A
+`with:` value can carry the caller's `${{ outputs.<step>.<name> }}`; it reaches the library step as
+text and is resolved at launch like any other result. The inputs also reach each inlined step as
+`SCARAB_PARAM_<NAME>`.
+
+**What the invoke step carries.** An invoke step may set `needs`, `with`, `matrix`, `when`,
+`deploy`, `timeout`, `resources` and `placement_profiles`. Its `timeout`, `resources` and
+`placement_profiles` apply to each inlined step that leaves them unset (the library's own value
+wins), and never to a gate. Its `when` is ANDed with the `when` of every inlined step and gate.
+Any other field, `env` included, is a compile error on an invoke step.
+
+**Installed libraries are closed.** A `lib:` library may invoke only `lib:` and `plugin:`
+targets, never `file:`, so a repository cannot change the steps of a library its org installed.
+
+**Every inlined step records where it came from** in `origin`: the chain of libraries that
+produced it, outermost first, each with its kind, name and content hash (and, for `lib:`, the
+source it was installed from). Policies read it, so a library can be allowed or blocked through
+any depth of nesting. A library should pin its images by digest; `scarab lint` warns about a
+library image pinned only by tag.
 
 ## Results & interpolation
 
@@ -530,4 +571,5 @@ for them.
 - [ADR-0056: Run Takes and attempt-grain evidence](/scarab-ci/tech/adr/0056-run-takes-and-attempt-grain-evidence/)
 - [ADR-0057: Run provenance: trigger context and origin details](/scarab-ci/tech/adr/0057-run-provenance-trigger-context/)
 - [ADR-0074: Deployments leave core](/scarab-ci/tech/adr/0074-deployments-leave-core/)
+- [ADR-0076: Libraries and plugins through `invoke`](/scarab-ci/tech/adr/0076-libraries-and-plugins-through-invoke/)
 ```
