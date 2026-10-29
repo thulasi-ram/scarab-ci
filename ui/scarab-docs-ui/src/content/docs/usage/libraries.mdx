@@ -122,6 +122,26 @@ first-party, wherever its copy came from.
 The server reads the manifest of its own release from GitHub. `SCARAB_LIBS_MANIFEST` changes
 that: an https URL, a file path (for an install with no internet access), or `off`.
 
+The first-party clone library, `lib:thulasi-ram/clone`, pins the scarab-clone image by digest.
+To run checkouts from a mirror's image, install a copy of `libs/clone.yaml` that pins the mirror's
+image under the same name.
+
+## Trusting a library with forge credentials
+
+A step with `forge_token` receives a forge credential ([Pipeline syntax](/scarab-ci/usage/pipeline-syntax/#forge-credentials-forge_token)).
+On a Forgejo or GitHub token connection that credential is one long-lived token, so only a step
+from a library your org trusts receives it. Your org trusts its first-party clone library by
+default, wherever its copy came from. An org admin can trust another library by its source:
+
+```sh
+curl -X POST "$SCARAB/v1/orgs/acme/library-trust" \
+  -d '{"source": "github.com/acme/scarab-libs//release.yaml"}'
+```
+
+Trust is for the source without a commit, so it holds when you upgrade the library from the same
+source, and each upgrade still shows you its diff. Trusting needs a step-up; removing trust
+(`DELETE …/library-trust?source=<source>`) does not. Settings › Libraries lists the trusted sources.
+
 ## Check a Pipeline before you push
 
 `scarab validate` without `--server` reports each `lib:` target as unresolved and checks the rest

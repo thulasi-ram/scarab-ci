@@ -28,7 +28,7 @@ struct Cli {
 enum Command {
     /// Trigger a pipeline run (manual/API dispatch, ADR-0043).
     Run(RunArgs),
-    /// Lint a pipeline file (compile-time lints, e.g. missing-clone).
+    /// Lint a pipeline file (compile-time lints, e.g. a missing checkout).
     Lint(FileArgs),
     /// Validate a pipeline file: compile + semantic checks offline, with the
     /// libraries it invokes read from the repository. With `--server`, also
@@ -209,7 +209,7 @@ fn compile_file(path: &str) -> Result<scarab_pipeline::PipelineIr, i32> {
 }
 
 /// `scarab lint <file>`: the compile-time lints (e.g. a push/PR pipeline with
-/// no clone step, ADR-0045). Lint findings exit 1.
+/// no checkout, ADR-0076 §9). Lint findings exit 1.
 fn lint(args: &FileArgs) -> i32 {
     match compile_file(&args.file) {
         Ok(ir) => {
