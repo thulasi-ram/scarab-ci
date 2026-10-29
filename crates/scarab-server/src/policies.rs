@@ -267,8 +267,8 @@ pub struct PolicyTestPipeline {
     /// declares none. Default `.scarab/ci.yaml`.
     #[serde(default)]
     pub path: Option<String>,
-    /// Every library the Pipeline invokes, transitively: repository path
-    /// (`.scarab/lib/deploy.yaml`) to source.
+    /// Every `file:` library the Pipeline invokes, transitively: repository
+    /// path (`.scarab/lib/deploy.yaml`) to source.
     #[serde(default)]
     pub libs: BTreeMap<String, String>,
     /// The Project the Run would be created in.

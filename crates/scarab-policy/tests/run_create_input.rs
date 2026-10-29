@@ -94,16 +94,16 @@ fn the_deepest_invoke_chain_fits_the_origin_cap() {
     for i in 0..depth {
         let src = if i + 1 < depth {
             format!(
-                "steps: [{{ id: s{i}, invoke: .scarab/lib/l{}.yaml }}]",
+                "kind: library\nsteps: [{{ id: s{i}, invoke: file:.scarab/lib/l{}.yaml }}]",
                 i + 1
             )
         } else {
-            format!("steps: [{{ id: s{i}, image: busybox }}]")
+            format!("kind: library\nsteps: [{{ id: s{i}, image: busybox }}]")
         };
         libs.insert(format!(".scarab/lib/l{i}.yaml"), src);
     }
     let ir = scarab_pipeline::compile_yaml_with_libs(
-        "steps: [{ id: t, invoke: .scarab/lib/l0.yaml }]",
+        "steps: [{ id: t, invoke: file:.scarab/lib/l0.yaml }]",
         &libs,
     )
     .expect("a chain at the cap compiles");

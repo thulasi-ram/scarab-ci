@@ -265,6 +265,66 @@ pub(crate) fn interpolations(template: &str) -> Result<Vec<&str>, PipelineError>
     Ok(exprs)
 }
 
+/// One read of the `inputs` variable in a CEL expression (ADR-0076 §1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InputRead {
+    /// Byte range of the read: `inputs.<name>`, or `inputs` alone.
+    pub start: usize,
+    pub end: usize,
+    /// `<name>` when read as `inputs.<name>`; `None` for any other use
+    /// (`inputs["x"]`, `inputs` passed whole).
+    pub field: Option<String>,
+}
+
+/// Each read of the top-level `inputs` variable in `expr`, in order. Skips
+/// string literals and `//` comments, and a field that happens to be named
+/// `inputs` (`x.inputs`).
+pub(crate) fn input_reads(expr: &str) -> Vec<InputRead> {
+    let b = expr.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            q @ (b'\'' | b'"') => i = skip_string(b, i, q),
+            c if ident(c) => {
+                let start = i;
+                while i < b.len() && ident(b[i]) {
+                    i += 1;
+                }
+                let after_dot = expr[..start].trim_end().ends_with('.');
+                if &expr[start..i] != "inputs" || after_dot || c.is_ascii_digit() {
+                    continue;
+                }
+                let mut field = None;
+                if b.get(i) == Some(&b'.') {
+                    let f = i + 1;
+                    let mut e = f;
+                    while e < b.len() && ident(b[e]) {
+                        e += 1;
+                    }
+                    if e > f && !b[f].is_ascii_digit() {
+                        field = Some(expr[f..e].to_string());
+                        i = e;
+                    }
+                }
+                out.push(InputRead {
+                    start,
+                    end: i,
+                    field,
+                });
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
 fn render(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::String(s) => s.clone(),

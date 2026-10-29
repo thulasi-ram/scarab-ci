@@ -28,6 +28,7 @@ use step_up_harness::*;
 const SHA: &str = "1234567890abcdef1234567890abcdef12345678";
 
 const LIB: &str = r#"
+kind: library
 steps:
   - { id: helm, image: busybox, command: ["true"] }
 "#;
@@ -38,7 +39,7 @@ on:
   manual: {}
 steps:
   - { id: test, image: busybox, command: ["true"] }
-  - { id: ship, invoke: .scarab/lib/deploy.yaml, needs: [test] }
+  - { id: ship, invoke: file:.scarab/lib/deploy.yaml, needs: [test] }
 "#;
 
 const DENY_MESSAGE: &str = "The repository's own deploy library may not be used.";
@@ -674,7 +675,7 @@ on:
   pull_request: {}
 steps:
   - { id: test, image: busybox, command: ["true"] }
-  - { id: ship, invoke: .scarab/lib/deploy.yaml, needs: [test] }
+  - { id: ship, invoke: file:.scarab/lib/deploy.yaml, needs: [test] }
 "#;
 
 /// The policy test API builds its input through admission's own code: for

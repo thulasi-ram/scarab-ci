@@ -331,9 +331,9 @@ steps:
         test "${#PREV_COMMIT}" -eq 40
         echo "$COMMIT_COUNT" | grep -qE '^[0-9]+$'
 
-  # --- invoke (ADR-0038): inline a library pipeline with typed inputs -------
+  # --- invoke (ADR-0038, ADR-0076): inline a library with typed inputs -----
   - id: notify
-    invoke: .scarab/lib/notify.yaml
+    invoke: file:.scarab/lib/notify.yaml
     needs: [deploy]
     with:
       channel: deploys

@@ -1320,7 +1320,8 @@ export interface paths {
          * The manually-dispatchable catalog at a ref (ADR-0043 §4). Resolves `ref` to a
          *     concrete commit (echoed back), enumerates every `.scarab/*.{yaml,yml}` at it
          *     (direct children only — `.scarab/lib/**` is excluded, mirroring webhook
-         *     discovery), and reports each pipeline's `manual`/`api` opt-in from a
+         *     discovery, and so is a file marked `kind: library`), and reports each
+         *     pipeline's `manual`/`api` opt-in from a
          *     **lightweight `on:`-only parse** (no `invoke:` pre-fetch, no full compile —
          *     that cost is deferred to the on-selection interface read). A single file that
          *     fails to parse is flagged with an `error` rather than failing the whole list;
@@ -3054,8 +3055,8 @@ export interface components {
          */
         PipelineCatalogResponse: {
             /**
-             * @description Every `.scarab/*.{yaml,yml}` at the commit (excluding `.scarab/lib/**`),
-             *     path-sorted.
+             * @description Every `.scarab/*.{yaml,yml}` at the commit (excluding `.scarab/lib/**`
+             *     and files marked `kind: library`), path-sorted.
              */
             pipelines: components["schemas"]["CatalogEntry"][];
             /**
@@ -3339,8 +3340,8 @@ export interface components {
          */
         PolicyTestPipeline: {
             /**
-             * @description Every library the Pipeline invokes, transitively: repository path
-             *     (`.scarab/lib/deploy.yaml`) to source.
+             * @description Every `file:` library the Pipeline invokes, transitively: repository
+             *     path (`.scarab/lib/deploy.yaml`) to source.
              */
             libs?: {
                 [key: string]: string;

@@ -52,6 +52,11 @@ pub struct PipelineIr {
     /// Schema version of the IR, for forward/backward compatibility.
     #[serde(default = "default_ir_version")]
     pub ir_version: u32,
+    /// `kind: library` marks a file as a library (ADR-0076 §2): it is only
+    /// ever inlined by an `invoke:`, has no `on:` triggers, and cannot run as
+    /// a Pipeline. Absent means a Pipeline. A compiled IR never carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<PipelineKind>,
     /// Optional human display name (`name:`) — what the UI shows for the run's
     /// pipeline. Absent means the caller falls back to the `.scarab/<file>` bare
     /// name (so `ci.yaml` reads as `ci`). Overriding it lets a workflow present a
@@ -135,6 +140,15 @@ impl PipelineIr {
             .map(|s| s.id.clone())
             .collect()
     }
+}
+
+/// The `kind:` of an authored file (ADR-0076 §2). `library` is the only value;
+/// a file without `kind:` is a Pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PipelineKind {
+    /// A file only an `invoke:` can use.
+    Library,
 }
 
 /// A pipeline's reuse / launch interface (ADR-0038, ADR-0043) — its explicit
@@ -377,14 +391,15 @@ pub struct StepSpec {
     /// `gate`/`clone`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<BuildSpec>,
-    /// If set, this is an **invoke** step (ADR-0038): a repo-relative path to a
-    /// Library pipeline (under `.scarab/lib/` by convention) that is *inlined at
-    /// compile time*, not a runtime object. The step launches nothing itself;
-    /// [`compile_yaml_with_libs`] flattens the referenced pipeline's steps into
-    /// the caller's DAG, id-namespaced by this step's id (`deploy/build`), with
-    /// `needs` rewritten across the seam. Local-only forever: repo-relative,
-    /// read at the caller's ref — no absolute paths, no `../` escape, no
-    /// cross-repo. After compile this field is always `None` (like `matrix`).
+    /// If set, this is an **invoke** step (ADR-0038, ADR-0076 §1): the library
+    /// it inlines *at compile time*, named with a prefix: `file:<path>` (a
+    /// repo-relative library file, read at the caller's ref; no absolute
+    /// paths, no `..`, no remote forms), `lib:<publisher>/<name>` (a library
+    /// installed in the org) or `plugin:<installation>/<gate>` (not available
+    /// yet). The step launches nothing itself; [`compile_with_libraries`]
+    /// flattens the library's steps into the caller's DAG, id-namespaced by
+    /// this step's id (`deploy/build`), with `needs` rewritten across the
+    /// seam. After compile this field is always `None` (like `matrix`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invoke: Option<String>,
     /// Inputs supplied to an invoked library (ADR-0038), `name → value`. Only
@@ -554,8 +569,9 @@ pub struct StepSpec {
     pub origin: Vec<OriginEntry>,
 }
 
-/// The kind of one link in an invoke chain (ADR-0076). Today the compiler
-/// writes only [`File`](OriginKind::File): `invoke:` is repo-local.
+/// The kind of one link in an invoke chain (ADR-0076). The compiler writes
+/// [`File`](OriginKind::File) for `invoke: file:` and
+/// [`Library`](OriginKind::Library) for `invoke: lib:`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OriginKind {
@@ -572,9 +588,12 @@ pub enum OriginKind {
 #[serde(deny_unknown_fields)]
 pub struct OriginEntry {
     pub kind: OriginKind,
-    /// For a `file` link, the repo-relative library path.
+    /// For a `file` link, the repo-relative library path; for a `library`
+    /// link, the installed `<publisher>/<name>`.
     pub name: String,
-    /// Where an installed library comes from; `None` for a `file` link.
+    /// Where an installed library comes from (its git source and commit);
+    /// `None` for a `file` link. Policies match a library by this, since the
+    /// name is chosen at install (ADR-0076 §1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     /// SHA-256 of the library source, lowercase hex.
@@ -1161,26 +1180,96 @@ pub fn compile_yaml(yaml: &str) -> Result<PipelineIr, PipelineError> {
     compile_yaml_with_libs(yaml, &BTreeMap::new())
 }
 
-/// Compile authored YAML into a validated [`PipelineIr`], resolving `invoke:`
-/// steps against a pre-fetched `{repo-relative path → source}` map of the
-/// repo's `.scarab/**` library files (ADR-0038).
-///
-/// Compilation is **pure** (ADR-0031): the caller (a server trigger path) does
-/// the I/O — fetching the library sources at the caller's ref via `ForgePort` —
-/// and passes them in here as `libs`. This function performs no I/O.
-///
-/// Pipeline: parse → **inline every `invoke:` step** by flattening its
-/// referenced library's steps into the DAG, id-namespaced by the invoke-step id
-/// and with `needs` rewritten across the seam → statically expand every matrix
-/// into concrete steps (ADR-0023) → fan each `needs` edge onto every expanded
-/// instance of its target → run full [`validate`]. All problems are reported
-/// together via [`PipelineError::Validation`].
+/// An installed library (ADR-0076 §4) as the caller hands it to the compiler:
+/// content already stored in Scarab, never fetched while compiling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledLibrary {
+    /// The library file's YAML.
+    pub content: String,
+    /// Where it was installed from, e.g.
+    /// `github.com/acme/scarab-libs//deploy-helm.yaml@<commit>`. Recorded in
+    /// each inlined Step's [`origin`](StepSpec::origin).
+    pub source: String,
+}
+
+/// Everything an `invoke:` may name, pre-fetched by the caller (ADR-0038,
+/// ADR-0076 §1).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Libraries {
+    /// `file:` targets: repo-relative path → source, read at the caller's
+    /// ref. [`invoke_refs`] lists the paths to read.
+    pub files: BTreeMap<String, String>,
+    /// `lib:` targets: `<publisher>/<name>` → the library installed in the
+    /// caller's org. A name missing here is "not installed in this org".
+    pub installed: BTreeMap<String, InstalledLibrary>,
+}
+
+/// Compile authored YAML into a validated [`PipelineIr`], resolving `invoke:
+/// file:` steps against a pre-fetched `{repo-relative path → source}` map and
+/// with no installed libraries. A thin wrapper over
+/// [`compile_with_libraries`].
 pub fn compile_yaml_with_libs(
     yaml: &str,
     libs: &BTreeMap<String, String>,
 ) -> Result<PipelineIr, PipelineError> {
+    compile_libs(
+        yaml,
+        LibsRef {
+            files: libs,
+            installed: &BTreeMap::new(),
+        },
+    )
+}
+
+/// Compile authored YAML into a validated [`PipelineIr`], resolving each
+/// `invoke:` against `libraries`: `file:` targets against
+/// [`Libraries::files`], `lib:` targets against [`Libraries::installed`]
+/// (ADR-0038, ADR-0076).
+///
+/// Compilation is **pure** (ADR-0031): the caller does the I/O (reading the
+/// `file:` libraries at the caller's ref via `ForgePort`, and the org's
+/// installed libraries from its store) and passes them in. This function
+/// performs no I/O.
+///
+/// Pipeline: parse → **inline every `invoke:` step** by binding the library's
+/// `${{ inputs.* }}` to the caller's `with:` and flattening its steps into the
+/// DAG, id-namespaced by the invoke-step id and with `needs` rewritten across
+/// the seam → statically expand every matrix into concrete steps (ADR-0023) →
+/// fan each `needs` edge onto every expanded instance of its target → run full
+/// [`validate`]. All problems are reported together via
+/// [`PipelineError::Validation`].
+pub fn compile_with_libraries(
+    yaml: &str,
+    libraries: &Libraries,
+) -> Result<PipelineIr, PipelineError> {
+    compile_libs(
+        yaml,
+        LibsRef {
+            files: &libraries.files,
+            installed: &libraries.installed,
+        },
+    )
+}
+
+/// A borrowed [`Libraries`], so [`compile_yaml_with_libs`] needs no copy.
+#[derive(Clone, Copy)]
+struct LibsRef<'a> {
+    files: &'a BTreeMap<String, String>,
+    installed: &'a BTreeMap<String, InstalledLibrary>,
+}
+
+fn compile_libs(yaml: &str, libs: LibsRef<'_>) -> Result<PipelineIr, PipelineError> {
     let authored: PipelineIr =
         serde_yaml::from_str(yaml).map_err(|e| PipelineError::Parse(e.to_string()))?;
+
+    // A library is only ever inlined (ADR-0076 §2).
+    if authored.kind == Some(PipelineKind::Library) {
+        return Err(PipelineError::Validation(vec![
+            "this file is a library (`kind: library`) and cannot run as a Pipeline; use it \
+             from a Pipeline with `invoke: file:<its path>`"
+                .to_string(),
+        ]));
+    }
 
     // Inline `invoke:` steps first (ADR-0038): the result is a flat step list
     // with no invoke steps, over which matrix expansion and validation run
@@ -1246,6 +1335,7 @@ pub fn compile_yaml_with_libs(
 
     let ir = PipelineIr {
         ir_version: authored.ir_version,
+        kind: None,
         name: authored.name,
         triggers: authored.triggers,
         concurrency: authored.concurrency,
@@ -1264,14 +1354,16 @@ pub fn compile_yaml_with_libs(
     Ok(ir)
 }
 
-/// The library paths an authored pipeline's `invoke:` steps reference, so an
-/// I/O edge (the server trigger path) can pre-fetch their sources before the
-/// pure [`compile_yaml_with_libs`] (ADR-0038). Returns the normalized,
-/// safety-checked repo-relative keys (the same keys [`compile_yaml_with_libs`]
-/// looks up in its `libs` map), in declaration order and de-duplicated.
+/// The repository paths an authored pipeline's `invoke: file:` steps name, so
+/// an I/O edge (the server trigger path) can pre-fetch their sources before
+/// the pure compile (ADR-0038). Only `file:` targets are read from the
+/// repository (ADR-0076 §1); `lib:` and `plugin:` targets are not listed.
+/// Returns the normalized, safety-checked repo-relative keys (the keys the
+/// compiler looks up in [`Libraries::files`]), in declaration order and
+/// de-duplicated.
 ///
-/// Best-effort: yaml that does not parse, and paths that fail the path-safety
-/// check, are silently omitted here — [`compile_yaml_with_libs`] is the sole
+/// Best-effort: yaml that does not parse, and targets that fail the prefix
+/// or path-safety check, are silently omitted here — the compiler is the sole
 /// authority that turns those into diagnostics. This function only answers
 /// "what is safe to fetch?".
 pub fn invoke_refs(yaml: &str) -> Vec<String> {
@@ -1281,7 +1373,7 @@ pub fn invoke_refs(yaml: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for step in &authored.steps {
         if let Some(raw) = &step.invoke {
-            if let Ok(key) = resolve_lib_path(raw) {
+            if let Ok(InvokeTarget::File(key)) = parse_invoke_target(raw) {
                 if !out.contains(&key) {
                     out.push(key);
                 }
@@ -1289,6 +1381,19 @@ pub fn invoke_refs(yaml: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// Is this authored file a library (`kind: library`, ADR-0076 §2)? A shallow
+/// read of the `kind:` field only, so pipeline discovery can skip a library
+/// without compiling it. `false` for a file that does not parse: the compile
+/// reports that.
+pub fn is_library(yaml: &str) -> bool {
+    #[derive(Deserialize)]
+    struct ShallowKind {
+        #[serde(default)]
+        kind: Option<PipelineKind>,
+    }
+    serde_yaml::from_str::<ShallowKind>(yaml).is_ok_and(|k| k.kind == Some(PipelineKind::Library))
 }
 
 /// A lightweight, `on:`-only read of an authored pipeline (ADR-0043 catalog).
@@ -1313,14 +1418,94 @@ pub fn triggers_of(yaml: &str) -> Result<Triggers, PipelineError> {
         .map_err(|e| PipelineError::Parse(e.to_string()))
 }
 
-/// Normalize and safety-check a repo-relative library path referenced by an
-/// `invoke:` step (ADR-0038), returning the canonical key used to look its
-/// source up in the pre-fetched `{path → source}` map.
+/// What an `invoke:` names (ADR-0076 §1), parsed from its prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InvokeTarget {
+    /// `file:<path>`: a library file in the repository, by its normalized
+    /// repo-relative path.
+    File(String),
+    /// `lib:<publisher>/<name>`: a library installed in the caller's org.
+    Lib(String),
+    /// `plugin:<installation>/<gate>`: a gate a plugin resolves. Parsed, and
+    /// refused until plugin gates exist (ADR-0076 §7).
+    Plugin(String),
+}
+
+impl InvokeTarget {
+    /// The target as an author writes it, for diagnostics and cycle paths.
+    fn written(&self) -> String {
+        match self {
+            InvokeTarget::File(p) => format!("file:{p}"),
+            InvokeTarget::Lib(n) => format!("lib:{n}"),
+            InvokeTarget::Plugin(n) => format!("plugin:{n}"),
+        }
+    }
+}
+
+/// Parse an `invoke:` value into its [`InvokeTarget`] (ADR-0076 §1). Every
+/// target has a prefix: a bare path is an error that names `file:`, an
+/// unknown prefix is an error, and `url:` is reserved and refused (remote
+/// `invoke` stays refused, ADR-0038).
+fn parse_invoke_target(raw: &str) -> Result<InvokeTarget, String> {
+    let text = raw.trim();
+    // A prefix is the lowercase word before the first `:`. Anything else
+    // (`./x.yaml`, `.scarab/lib/x.yaml`) is a bare path.
+    let prefixed = text
+        .split_once(':')
+        .filter(|(p, _)| !p.is_empty() && p.bytes().all(|b| b.is_ascii_lowercase()));
+    let Some((prefix, rest)) = prefixed else {
+        return Err(if resolve_lib_path(text).is_ok() {
+            format!("`invoke: {text}` needs a prefix: write `invoke: file:{text}`")
+        } else {
+            format!(
+                "`invoke: {text}` needs a prefix: `file:<path>`, `lib:<publisher>/<name>` or \
+                 `plugin:<installation>/<gate>`"
+            )
+        });
+    };
+    match prefix {
+        "file" => resolve_lib_path(rest).map(InvokeTarget::File),
+        "lib" => two_segment_name(rest, "lib", "<publisher>/<name>").map(InvokeTarget::Lib),
+        "plugin" => {
+            two_segment_name(rest, "plugin", "<installation>/<gate>").map(InvokeTarget::Plugin)
+        }
+        "url" => Err(format!(
+            "`invoke: {text}`: `url:` is reserved and Scarab does not invoke from a URL \
+             (ADR-0038); copy the file into the repository and use `file:`, or have an org \
+             admin install it and use `lib:`"
+        )),
+        other => Err(format!(
+            "`invoke: {text}` has an unknown prefix `{other}:`; use `file:`, `lib:` or `plugin:`"
+        )),
+    }
+}
+
+/// Check a `<a>/<b>` target name: one `/`, each segment non-empty, made of
+/// `[A-Za-z0-9._-]`, and not starting with `.` or `-`.
+fn two_segment_name(rest: &str, prefix: &str, shape: &str) -> Result<String, String> {
+    let segment_ok = |s: &str| {
+        !s.is_empty()
+            && !s.starts_with(['.', '-'])
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    };
+    match rest.split_once('/') {
+        Some((a, b)) if segment_ok(a) && segment_ok(b) => Ok(rest.to_string()),
+        _ => Err(format!(
+            "`invoke: {prefix}:{rest}` must be `{prefix}:{shape}`: two names made of letters, \
+             digits, `.`, `_` and `-`, joined by one `/`, neither starting with `.` or `-`"
+        )),
+    }
+}
+
+/// Normalize and safety-check the repo-relative path of an `invoke: file:`
+/// target (ADR-0038), returning the canonical key used to look its source up
+/// in [`Libraries::files`].
 ///
-/// `invoke` is **local-only, forever**: the path must be repo-relative and
-/// resolve inside the repo tree. Absolute paths, `..` traversal, and cross-repo
-/// / remote references are rejected — cross-repo *causation* is `on: upstream`,
-/// not `invoke`. A single leading `./` is accepted and stripped.
+/// The path must be repo-relative and resolve inside the repo tree. Absolute
+/// paths, `..` traversal, and cross-repo / remote references are rejected —
+/// cross-repo *causation* is `on: upstream`, not `invoke`. A single leading
+/// `./` is accepted and stripped.
 fn resolve_lib_path(raw: &str) -> Result<String, String> {
     let path = raw.trim();
     if path.is_empty() {
@@ -1368,19 +1553,17 @@ fn resolve_lib_path(raw: &str) -> Result<String, String> {
 /// `scarab_policy::run_create::MAX_ORIGIN` is this constant.
 pub const MAX_INVOKE_DEPTH: usize = 8;
 
-/// Inline every `invoke:` step (ADR-0038) into a flat step list with no invoke
-/// steps left. **Recursive**: a library that itself invokes is expanded to full
-/// depth, ids namespacing correctly at each level (`deploy/db/migrate`).
+/// Inline every `invoke:` step (ADR-0038, ADR-0076) into a flat step list
+/// with no invoke steps left. **Recursive**: a library that itself invokes is
+/// expanded to full depth, ids namespacing correctly at each level
+/// (`deploy/db/migrate`).
 ///
 /// Termination (ADR-0038): a direct or indirect invoke **cycle** is rejected
 /// with a diagnostic naming the offending path, and a hard **depth cap**
 /// ([`MAX_INVOKE_DEPTH`]) bounds nesting.
-fn inline_invokes(
-    steps: &[StepSpec],
-    libs: &BTreeMap<String, String>,
-) -> Result<Vec<StepSpec>, Vec<String>> {
+fn inline_invokes(steps: &[StepSpec], libs: LibsRef<'_>) -> Result<Vec<StepSpec>, Vec<String>> {
     let mut diagnostics = Vec::new();
-    let mut stack: Vec<String> = Vec::new();
+    let mut stack: Vec<Frame> = Vec::new();
     let out = inline_level(steps, libs, &mut stack, &mut diagnostics);
     if diagnostics.is_empty() {
         Ok(out)
@@ -1389,14 +1572,58 @@ fn inline_invokes(
     }
 }
 
+/// One library on the current invoke path.
+struct Frame {
+    /// The target as written (`file:…`, `lib:…`): the cycle key.
+    written: String,
+    /// How messages name it: a file by its path, an installed library by
+    /// `lib:<publisher>/<name>`.
+    label: String,
+    /// An installed (`lib:`) library, which may invoke only `lib:` and
+    /// `plugin:` targets (ADR-0076 §1).
+    installed: bool,
+}
+
+/// The Step fields an invoke step may set (ADR-0076 §1), besides `id`,
+/// `invoke` and `with`. Each other field that is set is a compile error
+/// naming it, so nothing on an invoke step is dropped without a word.
+fn invoke_step_extra_fields(step: &StepSpec) -> Vec<&'static str> {
+    let set = [
+        ("image", !step.image.is_empty()),
+        ("command", !step.command.is_empty()),
+        ("env", !step.env.is_empty()),
+        ("secrets", !step.secrets.is_empty()),
+        ("security", step.security.is_some()),
+        ("gate", step.gate.is_some()),
+        ("gate_after", step.gate_after.is_some()),
+        ("clone", step.clone.is_some()),
+        ("build", step.build.is_some()),
+        ("artifacts", !step.artifacts.is_empty()),
+        ("inputs", step.inputs.is_some()),
+        ("outputs", step.outputs.is_some()),
+        ("cache", step.cache.is_some()),
+        ("retry", step.retry.is_some()),
+        ("k8s_overlay", step.k8s_overlay.is_some()),
+        ("matrix_values", !step.matrix_values.is_empty()),
+        ("services", !step.services.is_empty()),
+        ("uses", !step.uses.is_empty()),
+        ("results", !step.results.is_empty()),
+    ];
+    set.into_iter()
+        .filter(|(_, s)| *s)
+        .map(|(f, _)| f)
+        .collect()
+}
+
 /// Resolve every `invoke:` in `steps` into a flat list, ids relative to *this*
-/// level (an outer caller applies its own prefix). `stack` holds the library
-/// keys currently being expanded on this DFS path — used both for cycle
-/// detection (a key already on the stack) and the depth cap (its length).
+/// level (an outer caller applies its own prefix). `stack` holds the libraries
+/// currently being expanded on this DFS path — used for cycle detection (a
+/// target already on the stack), the depth cap (its length) and the closed
+/// rule for installed libraries (its last frame).
 fn inline_level(
     steps: &[StepSpec],
-    libs: &BTreeMap<String, String>,
-    stack: &mut Vec<String>,
+    libs: LibsRef<'_>,
+    stack: &mut Vec<Frame>,
     diagnostics: &mut Vec<String>,
 ) -> Vec<StepSpec> {
     let mut out: Vec<StepSpec> = Vec::new();
@@ -1412,7 +1639,7 @@ fn inline_level(
         // library Policy by claiming another source.
         if !step.origin.is_empty() {
             let place = match stack.last() {
-                Some(lib) => format!(" in library `{lib}`"),
+                Some(lib) => format!(" in library `{}`", lib.label),
                 None => String::new(),
             };
             diagnostics.push(format!(
@@ -1421,7 +1648,7 @@ fn inline_level(
                 step.id
             ));
         }
-        let Some(raw_path) = &step.invoke else {
+        let Some(raw_target) = &step.invoke else {
             // `with:` supplies inputs to a library — meaningless off an invoke step.
             if !step.with.is_empty() {
                 diagnostics.push(format!(
@@ -1433,31 +1660,11 @@ fn inline_level(
             continue;
         };
 
-        // An invoke step inlines a library; it launches nothing itself.
-        if !step.image.is_empty() || !step.command.is_empty() {
+        // An invoke step inlines a library and launches nothing itself: only
+        // the fields that carry onto what it inlines are allowed (ADR-0076 §1).
+        for field in invoke_step_extra_fields(step) {
             diagnostics.push(format!(
-                "step `{}`: an invoke step inlines a library — it must not set an image or command",
-                step.id
-            ));
-        }
-        if step.gate.is_some() {
-            diagnostics.push(format!(
-                "step `{}`: a step is either a gate or an invoke, not both",
-                step.id
-            ));
-        }
-        if step.security.as_ref().is_some_and(|s| !s.is_baseline()) {
-            diagnostics.push(format!(
-                "step `{}`: an invoke step launches nothing — it must not set `security`",
-                step.id
-            ));
-        }
-        // An invoke step runs nothing, so it writes no results: declare them
-        // on the library step that writes them.
-        if !step.results.is_empty() {
-            diagnostics.push(format!(
-                "step `{}`: an invoke step launches nothing — it must not set `results` \
-                 (declare them on the library step that writes them)",
+                "step `{}`: an invoke step cannot set `{field}`; set it on the library's Steps",
                 step.id
             ));
         }
@@ -1465,17 +1672,75 @@ fn inline_level(
             diagnostics.push(format!("step `{}`: {RETIRED_DEPLOYMENTS}", step.id));
         }
 
-        let key = match resolve_lib_path(raw_path) {
-            Ok(k) => k,
+        let target = match parse_invoke_target(raw_target) {
+            Ok(t) => t,
             Err(msg) => {
                 diagnostics.push(format!("step `{}`: {msg}", step.id));
                 continue;
             }
         };
+        let written = target.written();
+        if step.gate_expires_after.is_some() && !matches!(target, InvokeTarget::Plugin(_)) {
+            diagnostics.push(format!(
+                "step `{}`: `gate_expires_after` is allowed on an invoke step only for a \
+                 `plugin:` gate",
+                step.id
+            ));
+        }
+        // Installed libraries are closed (ADR-0076 §1): a repository cannot
+        // replace Steps inside an approved library.
+        if let Some(parent) = stack.last().filter(|f| f.installed) {
+            if matches!(target, InvokeTarget::File(_)) {
+                diagnostics.push(format!(
+                    "step `{}` in library `{}`: an installed library can invoke only `lib:` and \
+                     `plugin:` targets, not `{written}`",
+                    step.id, parent.label
+                ));
+                continue;
+            }
+        }
+        // Where the library comes from, and how messages name it: a file by
+        // its path, an installed library by `lib:<publisher>/<name>`.
+        let (src, kind, name, source, label) = match &target {
+            InvokeTarget::File(key) => match libs.files.get(key) {
+                Some(src) => (src.as_str(), OriginKind::File, key, None, key.clone()),
+                None => {
+                    diagnostics.push(format!(
+                        "step `{}`: no library found at `{key}` (a `file:` library is read from \
+                         the repository at the caller's ref)",
+                        step.id
+                    ));
+                    continue;
+                }
+            },
+            InvokeTarget::Lib(lib_name) => match libs.installed.get(lib_name) {
+                Some(l) => (
+                    l.content.as_str(),
+                    OriginKind::Library,
+                    lib_name,
+                    Some(l.source.clone()),
+                    written.clone(),
+                ),
+                None => {
+                    diagnostics.push(format!(
+                        "step `{}`: `{written}` is not installed in this org",
+                        step.id
+                    ));
+                    continue;
+                }
+            },
+            InvokeTarget::Plugin(_) => {
+                diagnostics.push(format!(
+                    "step `{}`: plugin gates are not available yet (`invoke: {written}`)",
+                    step.id
+                ));
+                continue;
+            }
+        };
         // Cycle: this library is already being expanded on the current path.
-        if let Some(pos) = stack.iter().position(|k| k == &key) {
-            let mut path = stack[pos..].to_vec();
-            path.push(key.clone());
+        if let Some(pos) = stack.iter().position(|f| f.written == written) {
+            let mut path: Vec<&str> = stack[pos..].iter().map(|f| f.written.as_str()).collect();
+            path.push(&written);
             diagnostics.push(format!(
                 "step `{}`: invoke cycle detected: {}",
                 step.id,
@@ -1486,36 +1751,49 @@ fn inline_level(
         // Depth cap: refuse to nest deeper than the backstop.
         if stack.len() >= MAX_INVOKE_DEPTH {
             diagnostics.push(format!(
-                "step `{}`: invoke nesting exceeds the depth cap of {MAX_INVOKE_DEPTH} (at `{key}`)",
+                "step `{}`: invoke nesting exceeds the depth cap of {MAX_INVOKE_DEPTH} (at `{written}`)",
                 step.id
             ));
             continue;
         }
-        let Some(src) = libs.get(&key) else {
-            diagnostics.push(format!(
-                "step `{}`: no library found at `{key}` (invoke is local-only; read at the caller's ref)",
-                step.id
-            ));
-            continue;
-        };
         let lib: PipelineIr = match serde_yaml::from_str(src) {
             Ok(ir) => ir,
             Err(e) => {
                 diagnostics.push(format!(
-                    "step `{}`: library `{key}` failed to parse: {e}",
+                    "step `{}`: library `{label}` failed to parse: {e}",
                     step.id
                 ));
                 continue;
             }
         };
+        // Every invoke target is marked as a library (ADR-0076 §2): inside
+        // one, `${{ inputs.* }}` binds to the caller's `with:`, which is not
+        // what it means in a Pipeline.
+        if lib.kind != Some(PipelineKind::Library) {
+            diagnostics.push(format!(
+                "step `{}`: `{written}` is not a library; add `kind: library` to it",
+                step.id
+            ));
+            continue;
+        }
+        if !lib.triggers.is_empty() {
+            diagnostics.push(format!(
+                "step `{}`: library `{label}` has `on:` triggers; a library runs only where it \
+                 is invoked",
+                step.id
+            ));
+        }
         if lib.steps.is_empty() {
-            diagnostics.push(format!("step `{}`: library `{key}` has no steps", step.id));
+            diagnostics.push(format!(
+                "step `{}`: library `{label}` has no steps",
+                step.id
+            ));
             continue;
         }
 
         // Interface (ADR-0038): validate the caller's `with:` inputs and the
         // library's declared/exposed outputs at compile — explicit over ambient.
-        validate_interface(step, &key, &lib, steps, diagnostics);
+        validate_interface(step, &label, &lib, steps, diagnostics);
         // Record exposed outputs for the reference rewrite (ADR-0041). A matrixed
         // invoke's outputs are unaddressable (validate_interface errors on any
         // reference), so it contributes no alias.
@@ -1523,20 +1801,60 @@ fn inline_level(
             output_aliases.push((step.id.clone(), lib.interface.outputs.clone()));
         }
 
+        // The caller's inputs, coerced to their declared types with defaults
+        // applied — the same typed resolution the launch path uses
+        // (ADR-0043). `None` when they do not resolve: `validate_interface`
+        // reported why and the compile fails, so nothing is bound or injected.
+        let supplied: BTreeMap<String, serde_json::Value> = step
+            .with
+            .iter()
+            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+            .collect();
+        let values = params::resolve_params(&lib.interface, &supplied).ok();
+
+        // Bind the library's `${{ inputs.* }}` to those values (ADR-0076 §1)
+        // before inlining its own invokes, so a nested invoke's `with:` that
+        // reads `inputs.*` passes this level's values down.
+        let lib_steps: Vec<StepSpec> = match &values {
+            Some(v) => lib
+                .steps
+                .iter()
+                .map(|ls| bind_inputs(ls, v, &label, diagnostics))
+                .collect(),
+            None => lib.steps.clone(),
+        };
+
         // Recurse: resolve the library's own invokes first, so `resolved` is a
         // flat list in the library's namespace (ids may already contain `/`).
         // Coordinate-independent, so it runs once even under a matrix.
-        stack.push(key.clone());
-        let resolved = inline_level(&lib.steps, libs, stack, diagnostics);
+        stack.push(Frame {
+            written: written.clone(),
+            label: label.clone(),
+            installed: kind == OriginKind::Library,
+        });
+        let resolved = inline_level(&lib_steps, libs, stack, diagnostics);
         stack.pop();
         // This library is the outermost link so far of every Step it
         // inlines: the nested levels already recorded theirs.
         let link = OriginEntry {
-            kind: OriginKind::File,
-            name: key.clone(),
-            source: None,
+            kind,
+            name: name.clone(),
+            source,
             content_hash: sha256_hex(src.as_bytes()),
         };
+        // The caller's inputs also reach every inlined step as
+        // `SCARAB_PARAM_<NAME>` env (ADR-0008 param convention). Prepended so a
+        // library step's own explicit env of the same name still wins.
+        let param_env: Vec<(String, String)> = values
+            .iter()
+            .flatten()
+            .map(|(k, v)| {
+                (
+                    format!("SCARAB_PARAM_{}", k.to_uppercase()),
+                    params::stringify(v),
+                )
+            })
+            .collect();
 
         // `matrix` × `invoke` (ADR-0038): a matrix on the invoke step fans out N
         // copies of the whole subgraph, once per coordinate. `expand_step` gives
@@ -1578,6 +1896,7 @@ fn inline_level(
                 if (step.deploy || lib.deploy) && !inst.is_gate() {
                     inst.deploy = true;
                 }
+                carry_invoke_fields(inv, &mut inst);
                 // Entry seam: a library root inherits the invoke step's upstreams;
                 // an internal need is namespaced.
                 inst.needs = if ls.needs.0.is_empty() {
@@ -1607,33 +1926,8 @@ fn inline_level(
                         .entry(k.clone())
                         .or_insert_with(|| v.clone());
                 }
-                // Inject the caller's inputs as `SCARAB_PARAM_<NAME>` env
-                // (ADR-0008 param convention), coerced to their declared types
-                // and with optional defaults applied — the same typed resolution
-                // the launch path uses (ADR-0043). Prepended so a library step's
-                // own explicit env of the same name still wins (applied later).
-                let supplied: BTreeMap<String, serde_json::Value> = step
-                    .with
-                    .iter()
-                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-                    .collect();
-                let lib_inputs = params::resolve_params(&lib.interface, &supplied).ok();
-                let param_env: Vec<(String, String)> = match lib_inputs {
-                    Some(resolved) => resolved
-                        .iter()
-                        .map(|(k, v)| {
-                            (
-                                format!("SCARAB_PARAM_{}", k.to_uppercase()),
-                                params::stringify(v),
-                            )
-                        })
-                        .collect(),
-                    // A resolution error was already reported by
-                    // `validate_interface`; the compile fails, so inject nothing.
-                    None => Vec::new(),
-                };
                 if !param_env.is_empty() {
-                    let mut env = param_env;
+                    let mut env = param_env.clone();
                     env.append(&mut inst.env);
                     inst.env = env;
                 }
@@ -1668,6 +1962,203 @@ fn inline_level(
     }
 
     out
+}
+
+/// What an invoke step carries onto each Step and gate it inlines
+/// (ADR-0076 §1). Its `timeout`, `resources` and `placement_profiles` apply to
+/// a Step that is not a gate, only where the library Step leaves the field
+/// unset: the library's own value wins (`resources` per field, `cpu_millis`
+/// and `memory_mib`). Its `when` is ANDed with the inlined Step's or gate's
+/// own. `env` never carries.
+fn carry_invoke_fields(invoke: &StepSpec, inst: &mut StepSpec) {
+    if !inst.is_gate() {
+        if inst.timeout.is_none() {
+            inst.timeout = invoke.timeout;
+        }
+        if inst.resources.cpu_millis.is_none() {
+            inst.resources.cpu_millis = invoke.resources.cpu_millis;
+        }
+        if inst.resources.memory_mib.is_none() {
+            inst.resources.memory_mib = invoke.resources.memory_mib;
+        }
+        if inst.placement_profiles.is_empty() {
+            inst.placement_profiles = invoke.placement_profiles.clone();
+        }
+    }
+    if let Some(When(outer)) = &invoke.when {
+        inst.when = Some(When(match &inst.when {
+            Some(When(inner)) => format!("({outer}) && ({inner})"),
+            None => outer.clone(),
+        }));
+    }
+}
+
+/// Bind a library Step's `${{ inputs.* }}` to the caller's resolved `values`
+/// (ADR-0076 §1), in every field that is interpolated or evaluated: `image`,
+/// `command`, `env` values, the `with:` values of a nested invoke, and
+/// `when:`. Inside a library, `inputs` never means the calling Run's launch
+/// parameters, so a read of an input the library does not declare, or of
+/// `inputs` other than as `inputs.<name>`, is a compile error.
+fn bind_inputs(
+    step: &StepSpec,
+    values: &BTreeMap<String, serde_json::Value>,
+    label: &str,
+    diagnostics: &mut Vec<String>,
+) -> StepSpec {
+    let mut out = step.clone();
+    let mut errors: Vec<String> = Vec::new();
+    let mut template = |text: &mut String| match bind_template(text, values) {
+        Ok(bound) => *text = bound,
+        Err(e) => errors.push(e),
+    };
+    template(&mut out.image);
+    out.command.iter_mut().for_each(&mut template);
+    out.env.iter_mut().for_each(|(_, v)| template(v));
+    out.with.values_mut().for_each(&mut template);
+    if let Some(When(expr)) = &mut out.when {
+        match bind_expr(expr, values, false) {
+            Ok(bound) => *expr = bound,
+            Err(e) => errors.push(e),
+        }
+    }
+    errors.dedup();
+    for e in errors {
+        diagnostics.push(format!("library `{label}`, step `{}`: {e}", step.id));
+    }
+    out
+}
+
+/// Bind each `${{ … }}` of a template. An interpolation that is exactly
+/// `${{ inputs.<name> }}` becomes the value's text, which may itself hold the
+/// caller's `${{ outputs.… }}` for the launch-time interpolator; an
+/// `inputs.<name>` inside a larger expression becomes a CEL literal. An
+/// unterminated `${{` is left for [`validate`] to report.
+fn bind_template(
+    text: &str,
+    values: &BTreeMap<String, serde_json::Value>,
+) -> Result<String, String> {
+    if !text.contains("${{") {
+        return Ok(text.to_string());
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("${{") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 3..];
+        let Some(end) = after.find("}}") else {
+            out.push_str(&rest[start..]);
+            return Ok(out);
+        };
+        let inner = &after[..end];
+        let expr = inner.trim();
+        let reads = cel::input_reads(expr);
+        match reads.as_slice() {
+            [] => {
+                out.push_str("${{");
+                out.push_str(inner);
+                out.push_str("}}");
+            }
+            [cel::InputRead {
+                start: 0,
+                end,
+                field: Some(name),
+            }] if *end == expr.len() => {
+                out.push_str(&params::stringify(input_value(values, name)?))
+            }
+            _ => {
+                out.push_str("${{ ");
+                out.push_str(&bind_expr(expr, values, true)?);
+                out.push_str(" }}");
+            }
+        }
+        rest = &after[end + 2..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// Replace each `inputs.<name>` read in a CEL expression with the value as a
+/// CEL literal. `in_template` is set for an expression inside `${{ … }}`.
+fn bind_expr(
+    expr: &str,
+    values: &BTreeMap<String, serde_json::Value>,
+    in_template: bool,
+) -> Result<String, String> {
+    let reads = cel::input_reads(expr);
+    let mut out = expr.to_string();
+    // From the end, so earlier byte ranges stay valid.
+    for read in reads.iter().rev() {
+        let Some(name) = &read.field else {
+            return Err("reads `inputs` other than as `inputs.<name>`".to_string());
+        };
+        let value = input_value(values, name)?;
+        if value.as_str().is_some_and(|s| s.contains("${{")) {
+            let place = if in_template {
+                format!("inside a larger expression; read it alone as `${{{{ inputs.{name} }}}}`")
+            } else {
+                "in `when:`, which is decided when the Run is created".to_string()
+            };
+            return Err(format!(
+                "input `{name}` holds a `${{{{ … }}}}` expression, which cannot be read {place}"
+            ));
+        }
+        out.replace_range(read.start..read.end, &cel_literal(value));
+    }
+    Ok(out)
+}
+
+/// The value of a declared input, or the undeclared-input error.
+fn input_value<'v>(
+    values: &'v BTreeMap<String, serde_json::Value>,
+    name: &str,
+) -> Result<&'v serde_json::Value, String> {
+    values.get(name).ok_or_else(|| {
+        format!("reads `inputs.{name}`, which the library does not declare in `interface.inputs`")
+    })
+}
+
+/// A resolved input value as a CEL literal: a number or boolean as itself, a
+/// string double-quoted. `{` and `}` are written as `\u` escapes, so a value
+/// cannot end the enclosing `${{ … }}` early.
+fn cel_literal(v: &serde_json::Value) -> String {
+    use std::fmt::Write;
+    match v {
+        serde_json::Value::Number(n) => {
+            let n = n.to_string();
+            if n.starts_with('-') {
+                format!("({n})")
+            } else {
+                n
+            }
+        }
+        serde_json::Value::Bool(b) => b.to_string(),
+        other => {
+            let text = match other {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            let mut lit = String::with_capacity(text.len() + 2);
+            lit.push('"');
+            for c in text.chars() {
+                match c {
+                    '\\' => lit.push_str("\\\\"),
+                    '"' => lit.push_str("\\\""),
+                    '\n' => lit.push_str("\\n"),
+                    '\r' => lit.push_str("\\r"),
+                    '\t' => lit.push_str("\\t"),
+                    '{' | '}' => {
+                        let _ = write!(lit, "\\u{:04x}", c as u32);
+                    }
+                    c if c.is_control() => {
+                        let _ = write!(lit, "\\u{:04x}", c as u32);
+                    }
+                    c => lit.push(c),
+                }
+            }
+            lit.push('"');
+            lit
+        }
+    }
 }
 
 /// Rewrite `outputs.<invoke_id>.<name>` references (for each exposed `<name>`) to
@@ -1848,11 +2339,13 @@ fn validate_interface(
 }
 
 /// The step strings that may carry `${{ … }}` interpolations (image, command,
-/// env values) — the surfaces scanned for invoke-output references.
+/// env values, and an invoke step's `with:` values, which are bound into the
+/// library's Steps) — the surfaces scanned for invoke-output references.
 fn interpolatable_strings(step: &StepSpec) -> Vec<&str> {
     let mut out: Vec<&str> = vec![step.image.as_str()];
     out.extend(step.command.iter().map(String::as_str));
     out.extend(step.env.iter().map(|(_, v)| v.as_str()));
+    out.extend(step.with.values().map(String::as_str));
     out
 }
 
@@ -2030,7 +2523,8 @@ fn expand_step(step: &StepSpec) -> Result<Vec<StepSpec>, String> {
 /// a pipeline compiles. First rule: a `push`/`pull_request` pipeline with no
 /// `clone` step almost certainly forgot its source; some triggered pipelines
 /// legitimately need none, hence a lint and not a hard error. Repo-less
-/// triggers (`cron`, `upstream`, …) never warn.
+/// triggers (`cron`, `upstream`, …) never warn. Second rule: a Step inlined
+/// from a library runs an image pinned only by tag (ADR-0076 §2).
 pub fn lint(ir: &PipelineIr) -> Vec<String> {
     let mut warnings = Vec::new();
     let source_triggered = ir
@@ -2046,6 +2540,31 @@ pub fn lint(ir: &PipelineIr) -> Vec<String> {
              it via `needs`"
                 .to_string(),
         );
+    }
+    // A library pins the images it runs by digest (ADR-0076 §2). One warning
+    // per library and image, however many Steps or matrix legs use it.
+    let mut seen: BTreeSet<(&str, &str)> = BTreeSet::new();
+    for step in &ir.steps {
+        let Some(lib) = step.origin.last() else {
+            continue;
+        };
+        let images = std::iter::once(step.image.as_str())
+            .chain(step.services.iter().map(|svc| svc.image.as_str()));
+        for image in images {
+            // Empty (a gate, clone or build) or computed at launch: nothing
+            // to check here.
+            if image.is_empty() || image.contains("${{") || image.contains("@sha256:") {
+                continue;
+            }
+            if seen.insert((lib.name.as_str(), image)) {
+                warnings.push(format!(
+                    "library `{}` runs image `{image}` pinned only by tag (step `{}`); pin it \
+                     by digest (`{image}@sha256:…`) so the library runs the same image every \
+                     time",
+                    lib.name, step.id
+                ));
+            }
+        }
     }
     warnings
 }
@@ -3667,11 +4186,35 @@ mod tests {
 
     // --- invoke / local reuse (ADR-0038) --------------------------------------
 
+    /// The `file:` libraries map. Each source is marked `kind: library`
+    /// (ADR-0076 §2) unless it sets `kind:` itself; [`raw_libs`] does not
+    /// mark them.
     fn libs(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), as_library(v)))
+            .collect()
+    }
+
+    fn raw_libs(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
         entries
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    /// `src` with `kind: library` added at its own indentation, unless it
+    /// already sets `kind:`.
+    fn as_library(src: &str) -> String {
+        if src.lines().any(|l| l.trim_start().starts_with("kind:")) {
+            return src.to_string();
+        }
+        let indent: String = src
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .map(|l| l.chars().take_while(|c| *c == ' ').collect())
+            .unwrap_or_default();
+        format!("{indent}kind: library\n{}", src.trim_start_matches('\n'))
     }
 
     fn compile_with(yaml: &str, libs: &BTreeMap<String, String>) -> PipelineIr {
@@ -3696,7 +4239,7 @@ mod tests {
             r#"
             steps:
               - { id: checkout, image: busybox }
-              - { id: ci, invoke: .scarab/lib/ci.yaml, needs: [checkout] }
+              - { id: ci, invoke: file:.scarab/lib/ci.yaml, needs: [checkout] }
               - { id: publish, image: busybox, needs: [ci] }
             "#,
             &libs(&[(".scarab/lib/ci.yaml", lib)]),
@@ -3730,14 +4273,14 @@ mod tests {
         let outer = r#"
             steps:
               - { id: approve, gate: manual }
-              - { id: db, invoke: .scarab/lib/db.yaml, needs: [approve] }
+              - { id: db, invoke: file:.scarab/lib/db.yaml, needs: [approve] }
         "#;
         let inner = "steps: [{ id: migrate, image: busybox }]";
         let ir = compile_with(
             r#"
             steps:
               - { id: checkout, image: busybox }
-              - { id: deploy, invoke: ./.scarab/lib/deploy.yaml, needs: [checkout] }
+              - { id: deploy, invoke: file:./.scarab/lib/deploy.yaml, needs: [checkout] }
             "#,
             &libs(&[
                 (".scarab/lib/deploy.yaml", outer),
@@ -3749,7 +4292,7 @@ mod tests {
             kind: OriginKind::File,
             name: name.to_string(),
             source: None,
-            content_hash: sha256_hex(src.as_bytes()),
+            content_hash: sha256_hex(as_library(src).as_bytes()),
         };
 
         assert!(
@@ -3793,7 +4336,7 @@ mod tests {
 
         let lib = format!("steps: [{{ id: b, image: busybox, {spoof} }}]");
         let errs = errors_with(
-            "steps: [{ id: ci, invoke: .scarab/lib/ci.yaml }]",
+            "steps: [{ id: ci, invoke: file:.scarab/lib/ci.yaml }]",
             &libs(&[(".scarab/lib/ci.yaml", &lib)]),
         );
         assert!(
@@ -3818,7 +4361,7 @@ mod tests {
             r#"
             steps:
               - { id: prep, image: busybox }
-              - { id: mod, invoke: .scarab/lib/x.yaml, needs: [prep] }
+              - { id: mod, invoke: file:.scarab/lib/x.yaml, needs: [prep] }
               - { id: after, image: busybox, needs: [mod] }
             "#,
             &libs(&[(".scarab/lib/x.yaml", lib)]),
@@ -3847,7 +4390,7 @@ mod tests {
                 matrix: { dimensions: { os: [linux, mac] } }
         "#;
         let ir = compile_with(
-            "steps: [{ id: ci, invoke: .scarab/lib/m.yaml }]",
+            "steps: [{ id: ci, invoke: file:.scarab/lib/m.yaml }]",
             &libs(&[(".scarab/lib/m.yaml", lib)]),
         );
         let ids: Vec<&str> = ir.steps.iter().map(|s| s.id.as_str()).collect();
@@ -3865,8 +4408,8 @@ mod tests {
         let ir = compile_with(
             r#"
             steps:
-              - { id: first, invoke: .scarab/lib/a.yaml }
-              - { id: second, invoke: .scarab/lib/b.yaml, needs: [first] }
+              - { id: first, invoke: file:.scarab/lib/a.yaml }
+              - { id: second, invoke: file:.scarab/lib/b.yaml, needs: [first] }
             "#,
             &libs(&[(".scarab/lib/a.yaml", a), (".scarab/lib/b.yaml", b)]),
         );
@@ -3889,7 +4432,7 @@ mod tests {
             ("github.com/org/repo//lib@sha", "cross-repo"),
             ("https://evil.example/x.yaml", "cross-repo"),
         ] {
-            let yaml = format!("steps: [{{ id: s, invoke: \"{path}\" }}]");
+            let yaml = format!("steps: [{{ id: s, invoke: \"file:{path}\" }}]");
             let errs = errors_with(&yaml, &l);
             assert!(
                 errs.iter().any(|e| e.contains(needle)),
@@ -3901,7 +4444,7 @@ mod tests {
     #[test]
     fn invoke_of_a_missing_library_is_a_diagnostic_not_a_panic() {
         let errs = errors_with(
-            "steps: [{ id: s, invoke: .scarab/lib/absent.yaml }]",
+            "steps: [{ id: s, invoke: file:.scarab/lib/absent.yaml }]",
             &BTreeMap::new(),
         );
         assert!(
@@ -3921,11 +4464,11 @@ mod tests {
         "#;
         let deploy = r#"
             steps:
-              - { id: db, invoke: .scarab/lib/db.yaml }
+              - { id: db, invoke: file:.scarab/lib/db.yaml }
               - { id: app, image: busybox, needs: [db] }
         "#;
         let ir = compile_with(
-            "steps: [{ id: deploy, invoke: .scarab/lib/deploy.yaml }]",
+            "steps: [{ id: deploy, invoke: file:.scarab/lib/deploy.yaml }]",
             &libs(&[
                 (".scarab/lib/deploy.yaml", deploy),
                 (".scarab/lib/db.yaml", db),
@@ -3944,14 +4487,14 @@ mod tests {
     #[test]
     fn a_direct_invoke_cycle_is_rejected() {
         // A library that invokes itself.
-        let selfref = "steps: [{ id: loop, invoke: .scarab/lib/self.yaml }]";
+        let selfref = "steps: [{ id: loop, invoke: file:.scarab/lib/self.yaml }]";
         let errs = errors_with(
-            "steps: [{ id: s, invoke: .scarab/lib/self.yaml }]",
+            "steps: [{ id: s, invoke: file:.scarab/lib/self.yaml }]",
             &libs(&[(".scarab/lib/self.yaml", selfref)]),
         );
         assert!(
             errs.iter().any(|e| e.contains("invoke cycle detected")
-                && e.contains(".scarab/lib/self.yaml -> .scarab/lib/self.yaml")),
+                && e.contains("file:.scarab/lib/self.yaml -> file:.scarab/lib/self.yaml")),
             "got {errs:?}"
         );
     }
@@ -3959,15 +4502,17 @@ mod tests {
     #[test]
     fn an_indirect_invoke_cycle_is_rejected_with_its_path() {
         // a -> b -> a.
-        let a = "steps: [{ id: x, invoke: .scarab/lib/b.yaml }]";
-        let b = "steps: [{ id: y, invoke: .scarab/lib/a.yaml }]";
+        let a = "steps: [{ id: x, invoke: file:.scarab/lib/b.yaml }]";
+        let b = "steps: [{ id: y, invoke: file:.scarab/lib/a.yaml }]";
         let errs = errors_with(
-            "steps: [{ id: s, invoke: .scarab/lib/a.yaml }]",
+            "steps: [{ id: s, invoke: file:.scarab/lib/a.yaml }]",
             &libs(&[(".scarab/lib/a.yaml", a), (".scarab/lib/b.yaml", b)]),
         );
         assert!(
             errs.iter().any(|e| e.contains("invoke cycle detected")
-                && e.contains(".scarab/lib/a.yaml -> .scarab/lib/b.yaml -> .scarab/lib/a.yaml")),
+                && e.contains(
+                    "file:.scarab/lib/a.yaml -> file:.scarab/lib/b.yaml -> file:.scarab/lib/a.yaml"
+                )),
             "got {errs:?}"
         );
     }
@@ -3977,13 +4522,13 @@ mod tests {
         // top invokes A and B, both invoke C — C appears twice but on separate
         // DFS paths, so it must NOT be rejected as a cycle.
         let c = "steps: [{ id: leaf, image: busybox }]";
-        let a = "steps: [{ id: x, invoke: .scarab/lib/c.yaml }]";
-        let b = "steps: [{ id: y, invoke: .scarab/lib/c.yaml }]";
+        let a = "steps: [{ id: x, invoke: file:.scarab/lib/c.yaml }]";
+        let b = "steps: [{ id: y, invoke: file:.scarab/lib/c.yaml }]";
         let ir = compile_with(
             r#"
             steps:
-              - { id: pa, invoke: .scarab/lib/a.yaml }
-              - { id: pb, invoke: .scarab/lib/b.yaml }
+              - { id: pa, invoke: file:.scarab/lib/a.yaml }
+              - { id: pb, invoke: file:.scarab/lib/b.yaml }
             "#,
             &libs(&[
                 (".scarab/lib/a.yaml", a),
@@ -4007,17 +4552,17 @@ mod tests {
             for i in 0..len {
                 let src = if i + 1 < len {
                     format!(
-                        "steps: [{{ id: s{i}, invoke: .scarab/lib/l{}.yaml }}]",
+                        "kind: library\nsteps: [{{ id: s{i}, invoke: file:.scarab/lib/l{}.yaml }}]",
                         i + 1
                     )
                 } else {
-                    format!("steps: [{{ id: s{i}, image: busybox }}]")
+                    format!("kind: library\nsteps: [{{ id: s{i}, image: busybox }}]")
                 };
                 m.insert(format!(".scarab/lib/l{i}.yaml"), src);
             }
             m
         }
-        let top = "steps: [{ id: t, invoke: .scarab/lib/l0.yaml }]";
+        let top = "steps: [{ id: t, invoke: file:.scarab/lib/l0.yaml }]";
 
         // At the cap (stack never reaches MAX_INVOKE_DEPTH before the leaf) it
         // compiles; one deeper is rejected.
@@ -4031,19 +4576,558 @@ mod tests {
         );
     }
 
+    // --- libraries through `invoke` (ADR-0076 step 1) --------------------------
+
+    fn installed(entries: &[(&str, &str, &str)]) -> BTreeMap<String, InstalledLibrary> {
+        entries
+            .iter()
+            .map(|(name, source, content)| {
+                (
+                    name.to_string(),
+                    InstalledLibrary {
+                        content: as_library(content),
+                        source: source.to_string(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn library_errors(yaml: &str, libraries: &Libraries) -> Vec<String> {
+        match compile_with_libraries(yaml, libraries) {
+            Err(PipelineError::Validation(d)) => d,
+            other => panic!("expected validation error, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn invoke_step_must_not_carry_an_image() {
-        let lib = "steps: [{ id: a, image: busybox }]";
-        let with_image = errors_with(
-            "steps: [{ id: s, invoke: .scarab/lib/a.yaml, image: busybox }]",
-            &libs(&[(".scarab/lib/a.yaml", lib)]),
+    fn invoke_targets_are_refused_with_a_reason() {
+        let libraries = Libraries {
+            files: libs(&[(".scarab/lib/a.yaml", "steps: [{ id: a, image: busybox }]")]),
+            installed: BTreeMap::new(),
+        };
+        for (target, needle) in [
+            (
+                ".scarab/lib/a.yaml",
+                "`invoke: .scarab/lib/a.yaml` needs a prefix: write `invoke: file:.scarab/lib/a.yaml`",
+            ),
+            ("../a.yaml", "needs a prefix: `file:<path>`, `lib:<publisher>/<name>`"),
+            ("https://evil.example/x.yaml", "unknown prefix `https:`"),
+            ("git:acme/x", "unknown prefix `git:`"),
+            ("url:https://evil.example/x.yaml", "`url:` is reserved"),
+            ("file:", "must not be empty"),
+            ("lib:acme", "must be `lib:<publisher>/<name>`"),
+            ("lib:acme/x/y", "must be `lib:<publisher>/<name>`"),
+            ("lib:/x", "must be `lib:<publisher>/<name>`"),
+            ("lib:-acme/x", "must be `lib:<publisher>/<name>`"),
+            ("lib:acme/.x", "must be `lib:<publisher>/<name>`"),
+            ("lib:ac me/x", "must be `lib:<publisher>/<name>`"),
+            ("lib:acme/missing", "`lib:acme/missing` is not installed in this org"),
+            ("plugin:argocd", "must be `plugin:<installation>/<gate>`"),
+            ("plugin:argocd/wait-live", "plugin gates are not available yet"),
+        ] {
+            let errs = library_errors(
+                &format!("steps: [{{ id: s, invoke: \"{target}\" }}]"),
+                &libraries,
+            );
+            assert!(
+                errs.iter().any(|e| e.starts_with("step `s`: ") && e.contains(needle)),
+                "`{target}` should be refused with `{needle}`, got {errs:?}"
+            );
+        }
+        // `gate_expires_after` belongs to a plugin gate only.
+        let errs = library_errors(
+            "steps: [{ id: s, invoke: file:.scarab/lib/a.yaml, gate_expires_after: 60 }]",
+            &libraries,
         );
         assert!(
-            with_image
-                .iter()
-                .any(|e| e.contains("must not set an image")),
-            "got {with_image:?}"
+            errs.iter()
+                .any(|e| e.contains("`gate_expires_after` is allowed on an invoke step only")),
+            "{errs:?}"
         );
+    }
+
+    #[test]
+    fn an_invoke_step_refuses_each_field_it_cannot_carry() {
+        let l = libs(&[(".scarab/lib/a.yaml", "steps: [{ id: a, image: busybox }]")]);
+        for (field, yaml) in [
+            ("image", "image: busybox"),
+            ("command", "command: [echo]"),
+            ("env", "env: [[A, b]]"),
+            ("secrets", "secrets: [TOKEN]"),
+            ("security", "security: {}"),
+            ("gate", "gate: manual"),
+            ("gate_after", "gate_after: 5"),
+            ("artifacts", "artifacts: ['*.tar']"),
+            ("inputs", "inputs: []"),
+            ("outputs", "outputs: [dist]"),
+            ("cache", "cache: { key: [Cargo.lock], dirs: [target] }"),
+            ("retry", "retry: { on: failure, max: 2 }"),
+            ("k8s_overlay", "k8s_overlay: { spec: {} }"),
+            ("services", "services: [{ image: postgres:16 }]"),
+            ("uses", "uses: [db]"),
+            ("results", "results: [v]"),
+        ] {
+            let errs = errors_with(
+                &format!("steps: [{{ id: s, invoke: file:.scarab/lib/a.yaml, {yaml} }}]"),
+                &l,
+            );
+            assert!(
+                errs.iter()
+                    .any(|e| e.contains(&format!("step `s`: an invoke step cannot set `{field}`"))),
+                "`{field}` should be refused, got {errs:?}"
+            );
+        }
+        // The fields it carries compile.
+        compile_with(
+            r#"
+            steps:
+              - { id: pre, image: busybox }
+              - id: s
+                invoke: file:.scarab/lib/a.yaml
+                needs: [pre]
+                matrix: { dimensions: { r: [eu, us] } }
+                when: "true"
+                deploy: true
+                timeout: 60
+                resources: { cpu_millis: 100 }
+                placement_profiles: [big]
+            "#,
+            &l,
+        );
+    }
+
+    #[test]
+    fn a_library_file_is_not_a_pipeline() {
+        // Compiled on its own, a library names the way to use it.
+        let errs = errors("kind: library\nsteps: [{ id: a, image: busybox }]");
+        assert!(
+            errs.iter().any(|e| e.contains("cannot run as a Pipeline")
+                && e.contains("`invoke: file:<its path>`")),
+            "{errs:?}"
+        );
+        assert!(is_library("kind: library\nsteps: []"));
+        assert!(!is_library("steps: []"));
+        // A file that does not parse is not a library here; the compile says why.
+        assert!(!is_library("steps: ["));
+        // `library` is the only kind.
+        assert!(parse_error("kind: pipeline\nsteps: []").contains("unknown variant"));
+
+        // Every invoke target is marked as a library.
+        let errs = errors_with(
+            "steps: [{ id: s, invoke: file:.scarab/lib/a.yaml }]",
+            &raw_libs(&[(".scarab/lib/a.yaml", "steps: [{ id: a, image: busybox }]")]),
+        );
+        assert!(
+            errs.iter().any(|e| e
+                .contains("`file:.scarab/lib/a.yaml` is not a library; add `kind: library` to it")),
+            "{errs:?}"
+        );
+        // A library has no triggers.
+        let errs = errors_with(
+            "steps: [{ id: s, invoke: file:.scarab/lib/a.yaml }]",
+            &libs(&[(
+                ".scarab/lib/a.yaml",
+                "on: { push: {} }\nsteps: [{ id: a, image: busybox }]",
+            )]),
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("has `on:` triggers")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn library_inputs_bind_to_with_through_nested_invokes() {
+        let outer = r#"
+            interface:
+              inputs:
+                - { name: region, type: string }
+                - { name: canary, type: boolean, required: false, default: false }
+            steps:
+              - id: a
+                image: "registry/app:${{ inputs.region }}"
+                command: [echo, "${{ inputs.region }}"]
+                env: [[R, "r-${{ inputs.region }}"]]
+                when: "inputs.region == 'eu' && !inputs.canary"
+              - id: inner
+                invoke: file:.scarab/lib/inner.yaml
+                needs: [a]
+                with: { zone: "${{ inputs.region }}-1" }
+        "#;
+        let inner = r#"
+            interface:
+              inputs:
+                - { name: zone, type: string }
+                - { name: count, type: number, required: false, default: 3 }
+            steps:
+              - id: b
+                image: busybox
+                command: ["${{ inputs.zone }}", "${{ inputs.count + 1 }}", "${{ 'z=' + inputs.zone }}"]
+        "#;
+        let ir = compile_with(
+            r#"
+            interface:
+              inputs: [{ name: region, type: string }]
+            steps:
+              - { id: top, image: busybox, command: ["${{ inputs.region }}"] }
+              - { id: d, invoke: file:.scarab/lib/outer.yaml, with: { region: eu } }
+            "#,
+            &libs(&[
+                (".scarab/lib/outer.yaml", outer),
+                (".scarab/lib/inner.yaml", inner),
+            ]),
+        );
+        let step = |id: &str| ir.steps.iter().find(|s| s.id == id).unwrap();
+        // The Pipeline's own `inputs` are its launch parameters: untouched.
+        assert_eq!(step("top").command, vec!["${{ inputs.region }}"]);
+
+        let a = step("d/a");
+        assert_eq!(a.image, "registry/app:eu");
+        assert_eq!(a.command, vec!["echo", "eu"]);
+        assert!(a.env.contains(&("R".to_string(), "r-eu".to_string())));
+        assert!(a
+            .env
+            .contains(&("SCARAB_PARAM_REGION".to_string(), "eu".to_string())));
+        assert_eq!(a.when, Some(When(r#""eu" == 'eu' && !false"#.to_string())));
+
+        // The nested `with:` got the outer value before the inner library bound it.
+        let b = step("d/inner/b");
+        assert_eq!(b.command[0], "eu-1");
+        assert_eq!(b.command[1], "${{ 3 + 1 }}");
+        assert_eq!(b.command[2], r#"${{ 'z=' + "eu-1" }}"#);
+        assert!(b
+            .env
+            .contains(&("SCARAB_PARAM_ZONE".to_string(), "eu-1".to_string())));
+        let launched: Vec<String> = b
+            .command
+            .iter()
+            .map(|c| cel::interpolate(c, &json!({})).unwrap())
+            .collect();
+        assert_eq!(launched, vec!["eu-1", "4", "z=eu-1"]);
+        assert!(
+            cel::eval_bool(&a.when.as_ref().unwrap().0, &json!({})).unwrap(),
+            "the bound guard evaluates with no launch parameters"
+        );
+    }
+
+    #[test]
+    fn a_bound_string_is_a_cel_literal_that_round_trips() {
+        let lib = r#"
+            interface:
+              inputs: [{ name: msg, type: string }]
+            steps:
+              - { id: a, image: busybox, command: ["${{ inputs.msg + '' }}"] }
+        "#;
+        let msg = "a\"b\\c}}d\ne{x}\u{1}";
+        let caller = format!(
+            "steps: [{{ id: s, invoke: file:.scarab/lib/a.yaml, with: {{ msg: {} }} }}]",
+            serde_json::to_string(msg).unwrap()
+        );
+        let ir = compile_with(&caller, &libs(&[(".scarab/lib/a.yaml", lib)]));
+        let a = ir.steps.iter().find(|s| s.id == "s/a").unwrap();
+        assert_eq!(cel::interpolate(&a.command[0], &json!({})).unwrap(), msg);
+    }
+
+    #[test]
+    fn a_caller_output_passes_through_with_as_text() {
+        let lib = r#"
+            interface:
+              inputs: [{ name: image, type: string }]
+            steps:
+              - { id: run, image: "${{ inputs.image }}" }
+        "#;
+        let ir = compile_with(
+            r#"
+            steps:
+              - { id: build, image: busybox, results: [image] }
+              - id: deploy
+                invoke: file:.scarab/lib/run.yaml
+                needs: [build]
+                with: { image: "${{ outputs.build.image }}" }
+            "#,
+            &libs(&[(".scarab/lib/run.yaml", lib)]),
+        );
+        let run = ir.steps.iter().find(|s| s.id == "deploy/run").unwrap();
+        assert_eq!(run.image, "${{ outputs.build.image }}");
+        assert_eq!(run.needs.0, vec!["build".to_string()]);
+
+        // Read inside a larger expression it cannot stay text.
+        let errs = errors_with(
+            r#"
+            steps:
+              - { id: build, image: busybox }
+              - id: deploy
+                invoke: file:.scarab/lib/run.yaml
+                needs: [build]
+                with: { image: "${{ outputs.build.image }}" }
+            "#,
+            &libs(&[(
+                ".scarab/lib/run.yaml",
+                r#"
+                interface:
+                  inputs: [{ name: image, type: string }]
+                steps:
+                  - { id: run, image: "${{ inputs.image + ':1' }}" }
+                "#,
+            )]),
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("input `image` holds a `${{ … }}` expression")),
+            "{errs:?}"
+        );
+        // Reading the output of an invoke sibling through `with:` needs it.
+        let errs = errors_with(
+            r#"
+            steps:
+              - { id: build, invoke: file:.scarab/lib/b.yaml }
+              - id: deploy
+                invoke: file:.scarab/lib/run.yaml
+                with: { image: "${{ outputs.build.image }}" }
+            "#,
+            &libs(&[
+                (".scarab/lib/run.yaml", lib),
+                (
+                    ".scarab/lib/b.yaml",
+                    "interface: { outputs: [image] }\nsteps: [{ id: image, image: busybox }]",
+                ),
+            ]),
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("reads `outputs.build.image` but does not `needs: [build]`")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn a_library_reads_only_the_inputs_it_declares() {
+        for (field, yaml) in [
+            ("command", r#"command: ["${{ inputs.ghost }}"]"#),
+            ("when", r#"when: "inputs.ghost == 'x'""#),
+            ("env", r#"env: [[A, "${{ 'x' + inputs.ghost }}"]]"#),
+        ] {
+            let lib = format!(
+                "interface: {{ inputs: [{{ name: known, type: string }}] }}\n\
+                 steps: [{{ id: a, image: busybox, {yaml} }}]"
+            );
+            let errs = errors_with(
+                "steps: [{ id: s, invoke: file:.scarab/lib/a.yaml, with: { known: k } }]",
+                &libs(&[(".scarab/lib/a.yaml", &lib)]),
+            );
+            assert!(
+                errs.iter().any(|e| e.contains(
+                    "library `.scarab/lib/a.yaml`, step `a`: reads `inputs.ghost`, which the \
+                     library does not declare"
+                )),
+                "{field}: {errs:?}"
+            );
+        }
+        // A read of `inputs` other than by name.
+        let errs = errors_with(
+            "steps: [{ id: s, invoke: file:.scarab/lib/a.yaml }]",
+            &libs(&[(
+                ".scarab/lib/a.yaml",
+                r#"steps: [{ id: a, image: busybox, command: ["${{ inputs['x'] }}"] }]"#,
+            )]),
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("reads `inputs` other than as `inputs.<name>`")),
+            "{errs:?}"
+        );
+        // A field named `inputs`, or the word in a string, is not a read.
+        compile_with(
+            "steps: [{ id: s, invoke: file:.scarab/lib/a.yaml }]",
+            &libs(&[(
+                ".scarab/lib/a.yaml",
+                r#"steps: [{ id: a, image: busybox, command: ["${{ matrix.inputs + ' inputs.x' }}"] }]"#,
+            )]),
+        );
+    }
+
+    #[test]
+    fn an_invoke_step_carries_when_timeout_resources_and_placement() {
+        let lib = r#"
+            steps:
+              - { id: x, image: busybox }
+              - id: y
+                image: busybox
+                needs: [x]
+                timeout: 60
+                resources: { cpu_millis: 500 }
+                placement_profiles: [gpu]
+                when: "true"
+              - { id: g, gate: manual, needs: [y] }
+        "#;
+        let ir = compile_with(
+            r#"
+            steps:
+              - id: d
+                invoke: file:.scarab/lib/a.yaml
+                timeout: 1800
+                resources: { cpu_millis: 1000, memory_mib: 256 }
+                placement_profiles: [big]
+                when: "event.branch == 'main'"
+            "#,
+            &libs(&[(".scarab/lib/a.yaml", lib)]),
+        );
+        let step = |id: &str| ir.steps.iter().find(|s| s.id == id).unwrap();
+        let guard = "event.branch == 'main'";
+
+        // Unset on the library Step: the invoke step's value applies.
+        let x = step("d/x");
+        assert_eq!(x.timeout, Some(1800));
+        assert_eq!(
+            x.resources,
+            Resources {
+                cpu_millis: Some(1000),
+                memory_mib: Some(256)
+            }
+        );
+        assert_eq!(x.placement_profiles, vec!["big"]);
+        assert_eq!(x.when, Some(When(guard.to_string())));
+
+        // Set on the library Step: the library wins, field by field; `when` is ANDed.
+        let y = step("d/y");
+        assert_eq!(y.timeout, Some(60));
+        assert_eq!(
+            y.resources,
+            Resources {
+                cpu_millis: Some(500),
+                memory_mib: Some(256)
+            }
+        );
+        assert_eq!(y.placement_profiles, vec!["gpu"]);
+        assert_eq!(y.when, Some(When(format!("({guard}) && (true)"))));
+
+        // A gate gets only the `when`.
+        let g = step("d/g");
+        assert_eq!(g.timeout, None);
+        assert!(g.placement_profiles.is_empty());
+        assert_eq!(g.resources, Resources::default());
+        assert_eq!(g.when, Some(When(guard.to_string())));
+
+        // The ANDed guard prunes the whole library.
+        let ctx = json!({ "event": { "branch": "dev" } });
+        let mut skipped = excluded_steps(&ir, &ctx).unwrap();
+        skipped.sort();
+        assert_eq!(skipped, vec!["d/g", "d/x", "d/y"]);
+    }
+
+    #[test]
+    fn installed_libraries_are_closed_and_recorded_by_source() {
+        let outer_src = "github.com/acme/scarab-libs//deploy.yaml@1111111";
+        let inner_src = "github.com/acme/scarab-libs//helm.yaml@2222222";
+        let outer = r#"
+            steps:
+              - { id: approve, gate: manual }
+              - { id: helm, invoke: "lib:acme/helm", needs: [approve] }
+        "#;
+        let inner = "steps: [{ id: upgrade, image: alpine/helm@sha256:00 }]";
+        let libraries = Libraries {
+            files: libs(&[(
+                ".scarab/lib/local.yaml",
+                "steps: [{ id: deploy, invoke: \"lib:acme/deploy\" }]",
+            )]),
+            installed: installed(&[
+                ("acme/deploy", outer_src, outer),
+                ("acme/helm", inner_src, inner),
+            ]),
+        };
+        let ir = compile_with_libraries(
+            "steps: [{ id: d, invoke: file:.scarab/lib/local.yaml }]",
+            &libraries,
+        )
+        .expect("a file library may invoke installed ones");
+        let lib_link = |name: &str, source: &str, content: &str| OriginEntry {
+            kind: OriginKind::Library,
+            name: name.to_string(),
+            source: Some(source.to_string()),
+            content_hash: sha256_hex(as_library(content).as_bytes()),
+        };
+        let local = OriginEntry {
+            kind: OriginKind::File,
+            name: ".scarab/lib/local.yaml".to_string(),
+            source: None,
+            content_hash: sha256_hex(libraries.files[".scarab/lib/local.yaml"].as_bytes()),
+        };
+        let step = |id: &str| ir.steps.iter().find(|s| s.id == id).unwrap();
+        assert_eq!(
+            step("d/deploy/helm/upgrade").origin,
+            vec![
+                local.clone(),
+                lib_link("acme/deploy", outer_src, outer),
+                lib_link("acme/helm", inner_src, inner)
+            ]
+        );
+        assert_eq!(
+            step("d/deploy/approve").origin,
+            vec![local, lib_link("acme/deploy", outer_src, outer)]
+        );
+
+        // An installed library cannot invoke a repository file.
+        let libraries = Libraries {
+            files: libs(&[(".scarab/lib/x.yaml", "steps: [{ id: x, image: busybox }]")]),
+            installed: installed(&[(
+                "acme/open",
+                outer_src,
+                "steps: [{ id: inner, invoke: file:.scarab/lib/x.yaml }]",
+            )]),
+        };
+        let errs = library_errors("steps: [{ id: d, invoke: \"lib:acme/open\" }]", &libraries);
+        assert!(
+            errs.iter().any(|e| e.contains(
+                "step `inner` in library `lib:acme/open`: an installed library can invoke only \
+                 `lib:` and `plugin:` targets, not `file:.scarab/lib/x.yaml`"
+            )),
+            "{errs:?}"
+        );
+
+        // The thin wrapper sees no installed libraries.
+        let errs = errors_with(
+            "steps: [{ id: d, invoke: \"lib:acme/deploy\" }]",
+            &BTreeMap::new(),
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("`lib:acme/deploy` is not installed in this org")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn lint_warns_on_a_library_image_pinned_only_by_tag() {
+        let lib = r#"
+            steps:
+              - id: a
+                image: alpine:3.20
+                matrix: { dimensions: { n: ["1", "2"] } }
+                services: [{ image: postgres:16 }]
+              - { id: b, image: "alpine:3.20@sha256:0000" }
+              - { id: c, image: "${{ 'alpine' }}" }
+        "#;
+        let ir = compile_with(
+            r#"
+            steps:
+              - { id: top, image: busybox }
+              - { id: d, invoke: file:.scarab/lib/a.yaml }
+            "#,
+            &libs(&[(".scarab/lib/a.yaml", lib)]),
+        );
+        let warnings = lint(&ir);
+        let tagged: Vec<&String> = warnings
+            .iter()
+            .filter(|w| w.contains("pinned only by tag"))
+            .collect();
+        assert_eq!(
+            tagged.len(),
+            2,
+            "one per library image, matrix legs folded: {warnings:?}"
+        );
+        assert!(tagged[0].contains("library `.scarab/lib/a.yaml` runs image `alpine:3.20`"));
+        assert!(tagged[1].contains("`postgres:16`"));
     }
 
     #[test]
@@ -4057,7 +5141,7 @@ mod tests {
             r#"
             steps:
               - id: svc
-                invoke: .scarab/lib/ci.yaml
+                invoke: file:.scarab/lib/ci.yaml
                 matrix: { dimensions: { svc: [api, web] } }
               - { id: gate, image: busybox, needs: [svc] }
             "#,
@@ -4109,7 +5193,7 @@ mod tests {
             r#"
             steps:
               - id: m
-                invoke: .scarab/lib/x.yaml
+                invoke: file:.scarab/lib/x.yaml
                 matrix:
                   dimensions:
                     os: [linux, windows]
@@ -4134,12 +5218,17 @@ mod tests {
     fn invoke_refs_lists_safe_fetchable_paths_only() {
         let yaml = r#"
             steps:
-              - { id: a, invoke: ./.scarab/lib/one.yaml }
-              - { id: b, invoke: .scarab/lib/two.yaml }
-              - { id: c, invoke: ../escape.yaml }
+              - { id: a, invoke: file:./.scarab/lib/one.yaml }
+              - { id: b, invoke: file:.scarab/lib/two.yaml }
+              - { id: c, invoke: file:../escape.yaml }
               - { id: d, image: busybox }
+              - { id: e, invoke: .scarab/lib/bare.yaml }
+              - { id: f, invoke: lib:acme/deploy }
+              - { id: g, invoke: plugin:argocd/wait-live }
         "#;
-        // `./` is normalized; the traversal path is omitted (unsafe → not fetched).
+        // `./` is normalized; the traversal path, the bare path and the
+        // `lib:`/`plugin:` targets are omitted: only `file:` targets are read
+        // from the repository (ADR-0076 §1).
         assert_eq!(
             invoke_refs(yaml),
             vec![
@@ -4167,7 +5256,7 @@ mod tests {
             r#"
             steps:
               - id: deploy
-                invoke: .scarab/lib/deploy.yaml
+                invoke: file:.scarab/lib/deploy.yaml
                 with: { region: us-east-1, replicas: "3" }
               - { id: notify, image: busybox, command: ["echo", "${{ outputs.deploy.url }}"], needs: [deploy] }
             "#,
@@ -4196,7 +5285,7 @@ mod tests {
             r#"
             steps:
               - id: deploy
-                invoke: .scarab/lib/deploy.yaml
+                invoke: file:.scarab/lib/deploy.yaml
                 with: { region: us-east-1 }
             "#,
             &libs(&[(".scarab/lib/deploy.yaml", IFACE_LIB)]),
@@ -4214,7 +5303,7 @@ mod tests {
             r#"
             steps:
               - id: deploy
-                invoke: .scarab/lib/deploy.yaml
+                invoke: file:.scarab/lib/deploy.yaml
                 with: { region: us-east-1, replicas: "3", bogus: x }
             "#,
             &libs(&[(".scarab/lib/deploy.yaml", IFACE_LIB)]),
@@ -4231,7 +5320,7 @@ mod tests {
             r#"
             steps:
               - id: deploy
-                invoke: .scarab/lib/deploy.yaml
+                invoke: file:.scarab/lib/deploy.yaml
                 with: { region: us-east-1, replicas: "3" }
               - { id: notify, image: busybox, command: ["echo", "${{ outputs.deploy.secret_ip }}"], needs: [deploy] }
             "#,
@@ -4250,7 +5339,7 @@ mod tests {
             r#"
             steps:
               - id: deploy
-                invoke: .scarab/lib/deploy.yaml
+                invoke: file:.scarab/lib/deploy.yaml
                 with: { region: us-east-1, replicas: "3" }
               - { id: notify, image: busybox, command: ["echo", "${{ outputs.deploy.url }}"] }
             "#,
@@ -4269,7 +5358,7 @@ mod tests {
             r#"
             steps:
               - id: deploy
-                invoke: .scarab/lib/deploy.yaml
+                invoke: file:.scarab/lib/deploy.yaml
                 with: { region: us-east-1, replicas: "3" }
                 matrix: { dimensions: { region: [a, b] } }
               - { id: notify, image: busybox, command: ["${{ outputs.deploy.url }}"], needs: [deploy] }
@@ -4314,7 +5403,7 @@ mod tests {
               - { id: run, image: busybox }
         "#;
         let errs = errors_with(
-            "steps: [{ id: s, invoke: .scarab/lib/bad.yaml }]",
+            "steps: [{ id: s, invoke: file:.scarab/lib/bad.yaml }]",
             &libs(&[(".scarab/lib/bad.yaml", bad_lib)]),
         );
         assert!(
@@ -4469,7 +5558,7 @@ mod tests {
             r#"
             steps:
               - id: deploy
-                invoke: .scarab/lib/x.yaml
+                invoke: file:.scarab/lib/x.yaml
                 with: { replicas: "3" }
             "#,
             &libs(&[(".scarab/lib/x.yaml", lib)]),
@@ -4492,7 +5581,7 @@ mod tests {
             r#"
             steps:
               - id: deploy
-                invoke: .scarab/lib/x.yaml
+                invoke: file:.scarab/lib/x.yaml
                 with: { replicas: "not-a-number" }
             "#,
             &libs(&[(".scarab/lib/x.yaml", lib)]),
@@ -4664,11 +5753,11 @@ mod tests {
         let marked_lib = lib.replacen("steps:", "deploy: true\n            steps:", 1);
         for (caller, libs) in [
             (
-                "steps:\n  - { id: prod, invoke: .scarab/lib/ship.yaml, deploy: true }\n",
+                "steps:\n  - { id: prod, invoke: file:.scarab/lib/ship.yaml, deploy: true }\n",
                 libs(&[(".scarab/lib/ship.yaml", lib)]),
             ),
             (
-                "steps:\n  - { id: prod, invoke: .scarab/lib/ship.yaml }\n",
+                "steps:\n  - { id: prod, invoke: file:.scarab/lib/ship.yaml }\n",
                 libs(&[(".scarab/lib/ship.yaml", &marked_lib)]),
             ),
         ] {
@@ -4676,7 +5765,7 @@ mod tests {
             assert_eq!(ir.deploy_steps(), ["prod/ship"], "{caller}");
         }
         let plain = compile_with(
-            "steps:\n  - { id: prod, invoke: .scarab/lib/ship.yaml }\n",
+            "steps:\n  - { id: prod, invoke: file:.scarab/lib/ship.yaml }\n",
             &libs(&[(".scarab/lib/ship.yaml", lib)]),
         );
         assert!(!plain.is_deploy());
@@ -5223,9 +6312,13 @@ mod tests {
             "matrix expanded with the excluded combo dropped"
         );
         assert!(ir.steps.iter().all(|s| !s.is_invoke()), "invokes inlined");
+        let post = ir.steps.iter().find(|s| s.id == "notify/post");
+        let post = post.expect("library step inlined");
+        // The library's `${{ inputs.channel }}` is the caller's `with:` value.
         assert!(
-            ir.steps.iter().any(|s| s.id == "notify/post"),
-            "library step inlined"
+            post.command.iter().any(|c| c.contains("#deploys")),
+            "{:?}",
+            post.command
         );
 
         // The sample is not just a compile fixture — it is the LOCAL DOGFOOD
@@ -5498,7 +6591,7 @@ mod tests {
             r#"
             steps:
               - id: deploy
-                invoke: .scarab/lib/deploy.yaml
+                invoke: file:.scarab/lib/deploy.yaml
                 deployment_requests: []
             "#,
             &libs(&[(".scarab/lib/deploy.yaml", lib)]),
@@ -5589,7 +6682,7 @@ mod tests {
         };
         let caller = r#"
             steps:
-              - { id: deploy, invoke: .scarab/lib/deploy.yaml }
+              - { id: deploy, invoke: file:.scarab/lib/deploy.yaml }
               - { id: wait, image: busybox, needs: [deploy], command: ["${{ outputs.deploy.images }}"] }
             "#;
         let ds = errors_with(

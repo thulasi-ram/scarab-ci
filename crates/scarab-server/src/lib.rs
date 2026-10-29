@@ -890,8 +890,8 @@ pub struct PipelineCatalogResponse {
     /// The ref resolved to a concrete commit — the catalog reflects this exact
     /// commit, and a subsequent describe/dispatch should pin to it.
     pub sha: String,
-    /// Every `.scarab/*.{yaml,yml}` at the commit (excluding `.scarab/lib/**`),
-    /// path-sorted.
+    /// Every `.scarab/*.{yaml,yml}` at the commit (excluding `.scarab/lib/**`
+    /// and files marked `kind: library`), path-sorted.
     pub pipelines: Vec<CatalogEntry>,
 }
 
@@ -1865,7 +1865,8 @@ fn bare_pipeline_name(path: &str) -> String {
 /// The manually-dispatchable catalog at a ref (ADR-0043 §4). Resolves `ref` to a
 /// concrete commit (echoed back), enumerates every `.scarab/*.{yaml,yml}` at it
 /// (direct children only — `.scarab/lib/**` is excluded, mirroring webhook
-/// discovery), and reports each pipeline's `manual`/`api` opt-in from a
+/// discovery, and so is a file marked `kind: library`), and reports each
+/// pipeline's `manual`/`api` opt-in from a
 /// **lightweight `on:`-only parse** (no `invoke:` pre-fetch, no full compile —
 /// that cost is deferred to the on-selection interface read). A single file that
 /// fails to parse is flagged with an `error` rather than failing the whole list;
@@ -1925,6 +1926,8 @@ async fn list_pipelines(
         let name = bare_pipeline_name(&path);
         let entry = match forge.read_file_at_ref(&repo, &sha, &path).await {
             Ok(bytes) => match String::from_utf8(bytes) {
+                // A library is not dispatchable (ADR-0076 §2): leave it out.
+                Ok(yaml) if scarab_pipeline::is_library(&yaml) => continue,
                 // Lightweight: parse only the `on:` block (ADR-0043 §4).
                 Ok(yaml) => match scarab_pipeline::triggers_of(&yaml) {
                     Ok(triggers) => CatalogEntry {
@@ -4342,6 +4345,11 @@ pub async fn trigger_runs_from_event(
             Err(e) => return Err(TriggerError::Forge(e)),
         };
         let yaml = String::from_utf8(bytes).map_err(|_| TriggerError::NotUtf8)?;
+        // A library (`kind: library`, ADR-0076 §2) runs only where it is
+        // invoked, wherever it sits under `.scarab/`.
+        if scarab_pipeline::is_library(&yaml) {
+            continue;
+        }
 
         // Pre-fetch transitive `invoke:` libraries at this ref and compile
         // (ADR-0038) — the shared read-at-ref → compile primitive also used by
