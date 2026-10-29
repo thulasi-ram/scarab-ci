@@ -29,6 +29,7 @@ type EnvironmentProjectDto = components["schemas"]["EnvironmentProjectDto"];
 type MigrationReportDto = components["schemas"]["EnvironmentMigrationReportDto"];
 type PluginCatalogEntryDto = components["schemas"]["PluginCatalogEntryDto"];
 type PluginInstallationDto = components["schemas"]["PluginInstallationDto"];
+type OrgLibrariesDto = components["schemas"]["OrgLibrariesDto"];
 type PluginConnectionDto = components["schemas"]["PluginConnectionDto"];
 
 const now = Date.now();
@@ -803,6 +804,43 @@ const pluginInstallation = (
   storage: null,
   ...o,
 });
+// Libraries (ADR-0076): one installed library with a newer first-party
+// version that fixes a security problem.
+const orgLibraries: OrgLibrariesDto = {
+  installations: [
+    {
+      publisher: "acme",
+      name: "deploy-helm",
+      content_hash: "5d1e0c7a9b3f".padEnd(64, "0"),
+      source: "github.com/acme/scarab-libs//deploy-helm.yaml@8c2f4e1a9d7b3c5e0f6a2b8d4c1e7f9a3b5d2c6e",
+      first_party: false,
+      installed_by: "a.kim",
+      installed_at: Date.now() - 6 * 86_400_000,
+      yanked: null,
+      update: null,
+    },
+    {
+      publisher: "thulasi-ram",
+      name: "clone",
+      content_hash: "a3c9e1f7b5d2".padEnd(64, "0"),
+      source: "github.com/thulasi-ram/scarab-ci//libs/clone.yaml@1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e",
+      first_party: true,
+      installed_by: "scarab:defaults",
+      installed_at: Date.now() - 20 * 86_400_000,
+      yanked: null,
+      update: {
+        content_hash: "b4d0f2a8c6e3".padEnd(64, "0"),
+        source: "github.com/thulasi-ram/scarab-ci//libs/clone.yaml@2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b",
+        release: "v0.4.1",
+        security_fix: true,
+      },
+    },
+  ],
+  yanks: [],
+  first_party: [],
+  manifest_error: null,
+  defaults: { state: "installed", missing: [], mirror: null, updated_at: Date.now() - 20 * 86_400_000 },
+};
 const plugins: PluginInstallationDto[] = [
   pluginInstallation("argocd", "4f2a1c9e7b3d", {
     runtime_message: "watching 6 applications",
@@ -1322,6 +1360,7 @@ function route(pathname: string, search: string, method: string): Response | nul
     return json({ ...line, acknowledged_at: line.acknowledged_at ?? now, acknowledged_by: line.acknowledged_by ?? "a.kim" });
   }
 
+  if (/^\/v1\/orgs\/[^/]+\/libraries$/.test(p)) return json(orgLibraries);
   // Plugins (ADR-0072): catalog, installations, kill/enable, uninstall.
   if (/^\/v1\/orgs\/[^/]+\/plugin-catalog$/.test(p)) return json(pluginCatalog);
   if (/^\/v1\/orgs\/[^/]+\/plugins$/.test(p)) {

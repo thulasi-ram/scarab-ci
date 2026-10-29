@@ -30,6 +30,7 @@ import ApiTokens from "../components/ApiTokens";
 import Members from "../components/Members";
 import OrgEnvironments from "../components/OrgEnvironments";
 import Plugins from "../components/Plugins";
+import Libraries from "../components/Libraries";
 import OrgSecurity from "../components/OrgSecurity";
 import Icon from "../components/Icon";
 
@@ -97,6 +98,8 @@ export default function Settings() {
                 <OrgEnvironments org={o()} />
                 {/* Plugins (ADR-0072): installed, killed and connected here. */}
                 <Plugins org={o()} />
+                {/* Libraries (ADR-0076): installed, upgraded and yanked here. */}
+                <Libraries org={o()} />
                 <ApiTokens org={o()} />
                 <ScopedSecrets
                   scope={{ org: o() }}

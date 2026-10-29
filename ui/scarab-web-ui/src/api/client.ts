@@ -736,6 +736,96 @@ export type PluginInstallation = components["schemas"]["PluginInstallationDto"];
 /** What an uninstall returns. */
 export type UninstalledPlugin = components["schemas"]["UninstalledPluginDto"];
 
+// --- Libraries (ADR-0076) ---------------------------------------------------
+
+export type OrgLibraries = components["schemas"]["OrgLibrariesDto"];
+export type LibraryInstallation = components["schemas"]["LibraryInstallationDto"];
+export type FetchedLibrary = components["schemas"]["FetchedLibraryDto"];
+export type LibraryDefaults = components["schemas"]["LibraryDefaultsDto"];
+
+/** The org's libraries (`GET …/libraries`); `null` = this server does not
+ *  manage libraries (404). */
+export async function listLibraries(org: string): Promise<OrgLibraries | null> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/libraries", {
+    params: { path: { org } },
+  });
+  if (response.status === 404) return null;
+  if (error || !data) throw new Error(errorText(error) || "failed to load the org's libraries");
+  return data;
+}
+
+/** Fetch a version to review (`POST …/libraries/fetch`): stored, not installed. */
+export async function fetchLibrary(
+  org: string,
+  body: components["schemas"]["FetchLibraryRequest"],
+): Promise<FetchedLibrary> {
+  const { data, error, response } = await api.POST("/v1/orgs/{org}/libraries/fetch", {
+    params: { path: { org } },
+    body,
+  });
+  if (error || !data) throw new Error(errorText(error) || `could not fetch ${body.source} (${response.status})`);
+  return data;
+}
+
+/** Install or upgrade to a fetched version (`PUT …/libraries/{publisher}/{name}`).
+ *  Asks for a step-up. */
+export async function installLibrary(
+  org: string,
+  publisher: string,
+  name: string,
+  body: components["schemas"]["InstallLibraryRequest"],
+): Promise<LibraryInstallation> {
+  const { data, error, response } = await api.PUT("/v1/orgs/{org}/libraries/{publisher}/{name}", {
+    params: { path: { org, publisher, name } },
+    body,
+  });
+  if (error || !data) {
+    throw new Error(errorText(error) || `could not install lib:${publisher}/${name} (${response.status})`);
+  }
+  return data;
+}
+
+/** Remove an installation (`DELETE …/libraries/{publisher}/{name}`). */
+export async function removeLibrary(org: string, publisher: string, name: string): Promise<void> {
+  const { error, response } = await api.DELETE("/v1/orgs/{org}/libraries/{publisher}/{name}", {
+    params: { path: { org, publisher, name } },
+  });
+  if (!response.ok) {
+    throw new Error(errorText(error) || `could not remove lib:${publisher}/${name} (${response.status})`);
+  }
+}
+
+/** Yank a version in this org (`POST …/library-yanks`). */
+export async function yankLibrary(org: string, content_hash: string, reason: string): Promise<void> {
+  const { error, response } = await api.POST("/v1/orgs/{org}/library-yanks", {
+    params: { path: { org } },
+    body: { content_hash, reason },
+  });
+  if (!response.ok) throw new Error(errorText(error) || `could not yank the version (${response.status})`);
+}
+
+/** Lift a yank (`DELETE …/library-yanks/{hash}`). Asks for a step-up. */
+export async function unyankLibrary(org: string, hash: string): Promise<void> {
+  const { error, response } = await api.DELETE("/v1/orgs/{org}/library-yanks/{hash}", {
+    params: { path: { org, hash } },
+  });
+  if (!response.ok) throw new Error(errorText(error) || `could not lift the yank (${response.status})`);
+}
+
+/** Install the missing first-party libraries (`POST …/library-defaults/retry`),
+ *  optionally from a mirror. Asks for a step-up. */
+export async function retryLibraryDefaults(
+  org: string,
+  body: components["schemas"]["RetryDefaultsRequest"],
+): Promise<LibraryDefaults> {
+  const { data, error, response } = await api.POST("/v1/orgs/{org}/library-defaults/retry", {
+    params: { path: { org } },
+    body,
+  });
+  if (error || !data) throw new Error(errorText(error) || `could not install the libraries (${response.status})`);
+  return data;
+}
+
 /** The installable plugins (`GET …/plugin-catalog`); `null` = this server
  *  runs no plugins (404). */
 export async function listPluginCatalog(org: string): Promise<PluginCatalogEntry[] | null> {

@@ -3254,6 +3254,18 @@ h1, .crumb-head, .run-title {
    and an expandable list of its connections. */
 .plg-enabled { color: var(--emerald); }
 .plg-killed { color: var(--danger); }
+/* Libraries (ADR-0076): a fetched version's content or diff. */
+.lib-diff {
+  max-height: 22rem;
+  overflow: auto;
+  white-space: pre;
+  font-size: 12px;
+  padding: 8px;
+  border: 1px solid var(--line, rgba(127, 127, 127, 0.3));
+  border-radius: 6px;
+}
+.lib-add { color: var(--ok); }
+.lib-del { color: var(--danger); }
 .plg-msg { color: var(--sage); }
 .plg-toggle { margin-left: auto; }
 .plg-conns {
