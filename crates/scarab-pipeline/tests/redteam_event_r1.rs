@@ -172,7 +172,6 @@ fn installed(name: &str, content: &str) -> Libraries {
 /// that holds the token. Either the permissive rule or the script must be
 /// refused at compile.
 #[test]
-#[ignore = "red: s3 r1"]
 fn rt_a_permissive_validate_does_not_let_a_caller_script_a_token_step() {
     for validate in ["true", "value.size() > 0", "value.matches('.*')", "value == value"] {
         let lib = format!(
@@ -203,7 +202,6 @@ steps:
 /// ATTACK: the same rule with the input reaching `image:` of the
 /// `forge_token` Step: the caller picks the image that holds the token.
 #[test]
-#[ignore = "red: s3 r1"]
 fn rt_a_caller_may_not_pick_the_image_of_a_token_step() {
     let lib = r#"kind: library
 interface:

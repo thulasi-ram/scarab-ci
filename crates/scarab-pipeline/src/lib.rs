@@ -4253,6 +4253,40 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                 step.id
             ));
         }
+        // The image and command of a Step that holds a forge credential are
+        // written where the Step is written (ADR-0076 §2): a `${{ … }}` in
+        // either would let a value from outside (a caller's input, a Step's
+        // result, the trigger) choose what runs beside the token. Outside
+        // values reach it only through `env:`.
+        if step.forge_token.is_some() {
+            let mut templated: Vec<String> = Vec::new();
+            if step.image.contains("${{") {
+                templated.push("`image`".to_string());
+            }
+            for (i, c) in step.command.iter().enumerate() {
+                if c.contains("${{") {
+                    templated.push(format!("`command[{i}]`"));
+                }
+            }
+            for field in templated {
+                diagnostics.push(format!(
+                    "step `{}`: {field} holds `${{{{ … }}}}`, and the step has `forge_token`; \
+                     its image and command must be written out in full, and a value from an \
+                     input, a result or the trigger may reach it only through `env:`",
+                    step.id
+                ));
+            }
+            // A Cache restores files an earlier Run's Steps saved under the
+            // same key, and those may be the repository's own Steps.
+            if step.cache.is_some() {
+                diagnostics.push(format!(
+                    "step `{}`: `cache` is not allowed on a step with `forge_token`: a cache \
+                     restores files other Steps saved, and a forge credential is mounted beside \
+                     them",
+                    step.id
+                ));
+            }
+        }
         // Placement (ADR-0055): profile names must be non-empty, and a raw
         // `k8s_overlay`, if present, must be a JSON object (a pod-spec fragment) —
         // never a scalar/array — so it can strategic-merge onto the Pod.
@@ -7871,6 +7905,24 @@ mod tests {
             errs.iter().any(|e| e.contains("cannot set `forge_token`")),
             "{errs:?}"
         );
+    }
+
+    #[test]
+    fn a_forge_token_step_has_a_literal_image_and_command_and_no_cache() {
+        let errs = errors(
+            r#"steps: [{ id: g, image: "a/${{ matrix.x }}", matrix: { dimensions: { x: [b] } }, forge_token: read }]"#,
+        );
+        assert!(errs.iter().any(|e| e.contains("`image` holds")), "{errs:?}");
+        let errs = errors(
+            r#"steps: [{ id: g, image: alpine/git, command: [git, "${{ event.sha }}"], forge_token: read }]"#,
+        );
+        assert!(errs.iter().any(|e| e.contains("`command[1]` holds")), "{errs:?}");
+        let errs = errors(
+            r#"steps: [{ id: g, image: alpine/git, cache: { dirs: [d], key: [k] }, forge_token: read }]"#,
+        );
+        assert!(errs.iter().any(|e| e.contains("`cache` is not allowed")), "{errs:?}");
+        // The same values through `env:` compile.
+        compile(r#"steps: [{ id: g, image: alpine/git, env: [[S, "${{ event.sha }}"]], forge_token: read }]"#);
     }
 
     #[test]
