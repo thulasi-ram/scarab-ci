@@ -879,14 +879,15 @@ async fn prune_contract_postgres() {
     tdb.cleanup().await;
 }
 
-/// The migration's expand step: a binary from before `installed_once`
-/// stores and installs V (its install does not set `installed_once`); a Run
-/// is created from V. The new binary then upgrades the installation to W
-/// and prunes. V was installed, so a Run may use it, and it must stay
-/// yankable; the prune must not delete it.
+/// `installed_once` ships in the migration that creates `library_versions`
+/// (0071), so no binary runs against the table without it, and no install
+/// leaves it unset. Round 2 found the window when it came in a later
+/// migration (0072): an older binary's install did not set it. What stays to
+/// check: a fresh schema has the column, a fetch leaves it false, an install
+/// sets it, and a version installed then replaced survives the prune and can
+/// still be yanked.
 #[tokio::test]
-#[ignore = "red: s2 r2"]
-async fn prune_keeps_a_version_an_older_binary_installed() {
+async fn prune_keeps_a_replaced_version_and_the_column_ships_with_the_table() {
     let Some(tdb) = common::fresh_db().await else {
         return;
     };
@@ -894,27 +895,34 @@ async fn prune_keeps_a_version_an_older_binary_installed() {
     pg.migrate().await.unwrap();
     const V: &str = "kind: library\nsteps:\n  - { id: a, image: alpine@sha256:aaaa }\n";
     const W: &str = "kind: library\nsteps:\n  - { id: b, image: alpine@sha256:bbbb }\n";
-    // The older binary's put_version and install (0071's columns only).
-    sqlx::query(
-        "INSERT INTO library_versions \
-         (org, content_hash, content, source, publisher, name, first_party, fetched_by, fetched_at) \
-         VALUES ('acme', $1, $2, 's', 'acme', 'x', false, 'amy', 1)",
-    )
-    .bind(content_hash(V))
-    .bind(V)
-    .execute(&tdb.pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO library_installations \
-         (org, publisher, name, content_hash, installed_by, installed_at) \
-         VALUES ('acme', 'acme', 'x', $1, 'amy', 1)",
-    )
-    .bind(content_hash(V))
-    .execute(&tdb.pool)
-    .await
-    .unwrap();
-    // The new binary: fetch W, upgrade V → W, a later fetch prunes.
+    let installed_once = |hash: String| {
+        let pool = tdb.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT installed_once FROM library_versions \
+                 WHERE org = 'acme' AND content_hash = $1",
+            )
+            .bind(hash)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    pg.put_version(&version("acme", "acme", "x", V, 1))
+        .await
+        .unwrap();
+    assert!(
+        !installed_once(content_hash(V)).await,
+        "a fetch is not an install"
+    );
+    pg.install(&new_install("acme", "x", V), &Replaces::Nothing)
+        .await
+        .unwrap();
+    assert!(
+        installed_once(content_hash(V)).await,
+        "the install did not set it"
+    );
+    // Upgrade V → W, then a later fetch prunes.
     pg.put_version(&version("acme", "acme", "x", W, 2))
         .await
         .unwrap();

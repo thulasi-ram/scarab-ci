@@ -341,8 +341,8 @@ impl LibraryStore for PostgresDb {
         // An install racing this marks its version `installed_once` before
         // it commits; the DELETE waits on that row and re-checks it, so it
         // skips the version (READ COMMITTED re-evaluates a locked row). The
-        // installations check covers an install by a binary from before
-        // `installed_once`, which does not set it.
+        // installations check is a second guard: a version an installation
+        // points at is never deleted, whatever `installed_once` says.
         let deleted = sqlx::query(
             "DELETE FROM library_versions v \
              WHERE v.org = $1 AND NOT v.installed_once AND v.content_hash <> $3 \

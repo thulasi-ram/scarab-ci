@@ -20,6 +20,11 @@ CREATE TABLE library_versions (
     first_party  BOOLEAN NOT NULL DEFAULT false,
     fetched_by   TEXT    NOT NULL,
     fetched_at   BIGINT  NOT NULL,
+    -- Whether the version was ever installed in its org (ADR-0076 §4). A
+    -- fetch stores a version for review; one never installed was never
+    -- compiled into a Run, so the oldest of those can be deleted to keep an
+    -- org's fetches bounded. An install sets it in the same transaction.
+    installed_once BOOLEAN NOT NULL DEFAULT false,
     PRIMARY KEY (org, content_hash)
 );
 
