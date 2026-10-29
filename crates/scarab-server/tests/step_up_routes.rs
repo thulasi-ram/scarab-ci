@@ -415,6 +415,8 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "library.defaults_retry",
         "CJ-W",
     ),
+    ("POST", "/v1/orgs/{org}/library-trust", "library.trust", "CJ-W"),
+    ("DELETE", "/v1/orgs/{org}/library-trust", "library.untrust", "EX"),
     ("GET", "/v1/orgs/{org}/plugin-catalog", "read", "READ"),
     ("GET", "/v1/orgs/{org}/plugins", "read", "READ"),
     ("POST", "/v1/orgs/{org}/plugins", "plugin.install", "CJ-A"),
@@ -886,6 +888,9 @@ fn well_formed(r: &scarab_server::RouteEntry) -> (String, Option<Value>) {
             Some(json!({"content_hash": "a".repeat(64)}))
         }
         ("POST", "/v1/orgs/{org}/library-defaults/retry") => Some(json!({})),
+        ("POST", "/v1/orgs/{org}/library-trust") => {
+            Some(json!({"source": "github.com/acme/libs//push.yaml"}))
+        }
         ("DELETE", _)
         | ("POST", "/v1/connections/{id}/resync")
         | ("POST", "/v1/orgs/{org}/plugins/{name}/enable")
@@ -962,7 +967,7 @@ async fn exempt_and_ungoverned_routes_never_ask_for_a_step_up() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 34, "the EX + NG mutating routes");
+    assert_eq!(checked, 35, "the EX + NG mutating routes");
     assert!(h.events_of("step_up.refused").is_empty());
 }
 

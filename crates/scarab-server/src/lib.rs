@@ -55,7 +55,7 @@ pub mod broker_proxy;
 /// (git-bug `0ec3b39`); this module survives as the revival package, exercised
 /// by `tests/changeset_overlay.rs`.
 pub mod changeset;
-pub mod clone_executor;
+pub mod forge_token;
 pub mod config;
 pub mod connections_config;
 pub mod converged;
@@ -449,6 +449,7 @@ impl AppState {
             policies: self.policies.as_deref(),
             libraries: self.libraries.as_deref(),
             links: self.actor_links(),
+            connections: self.connections.as_deref(),
         }
     }
 
@@ -1590,7 +1591,8 @@ impl From<DispatchError> for ApiError {
             refused @ (DispatchError::UnknownEnvironment { .. }
             | DispatchError::NotEligible { .. }
             | DispatchError::PolicyDenied { .. }
-            | DispatchError::LibraryYanked(_)) => ApiError::Denied(refused.to_string()),
+            | DispatchError::LibraryYanked(_)
+            | DispatchError::ForgeToken(_)) => ApiError::Denied(refused.to_string()),
             other => ApiError::BadRequest(other.to_string()),
         }
     }
@@ -1749,7 +1751,7 @@ async fn create_run(
             // are untenanted (no `runs.project`), and the cache mapping is
             // project-namespaced — the scheduler would disable it anyway.
             cache: None,
-            clone: None,
+            forge_token: None,
             build: None,
             artifacts: vec![],
             placement_profiles: step.placement_profiles.clone(),
@@ -4261,6 +4263,10 @@ pub struct AdmissionPorts<'a> {
     /// What links a webhook actor to a Principal (ADR-0069) for the
     /// `run.create` input. Unset: a webhook Run has no `principal`.
     pub links: ActorLinks<'a>,
+    /// The forge connection registry, which `event.repo.clone_url` is
+    /// computed from at Run creation (ADR-0076 §9). Unset: a repo is read
+    /// from public github.com.
+    pub connections: Option<&'a dyn scarab_forge::ForgeConnectionStore>,
 }
 
 /// The stores that resolve a webhook actor to a Principal (ADR-0069): the
@@ -4333,6 +4339,7 @@ impl<'a> AdmissionPorts<'a> {
             policies: None,
             libraries: None,
             links: ActorLinks::default(),
+            connections: None,
         }
     }
 
@@ -4462,7 +4469,9 @@ pub async fn trigger_runs_from_event(
         // skips this pipeline only (the dispatch path turns the same refusal
         // into a fail-closed error). Webhook-triggered runs supply no launch
         // parameters.
-        match admit_and_create_run(db, clock, ports, event, &ir, path, &excluded, None).await? {
+        match admit_and_create_run(forge, db, clock, ports, event, &ir, path, &excluded, None)
+            .await?
+        {
             Admission::Created(run) => outcome.runs.push(run),
             // A branch-scoped Environment ignoring every other branch is the
             // rule working, not news: silent, as it always was.
@@ -4520,6 +4529,25 @@ pub async fn trigger_runs_from_event(
             }
             // ADR-0076 §6: a yanked library version, refused whatever the
             // Policies say.
+            Admission::Refused(
+                ref refusal @ (AdmissionRefusal::EventField { ref messages }
+                | AdmissionRefusal::ForgeToken { ref messages }),
+            ) => {
+                let reason = admission_refusal_message(refusal, &repo.owner, &repo.name);
+                tracing::warn!(
+                    org = %repo.owner,
+                    project = %repo.name,
+                    pipeline = %path,
+                    "pipeline not run: {reason}"
+                );
+                outcome.refused.push(RefusedPipeline {
+                    pipeline: path.clone(),
+                    environment: ir.environment.clone(),
+                    reason,
+                    decision_id: None,
+                    messages: messages.clone(),
+                });
+            }
             Admission::Refused(ref refusal @ AdmissionRefusal::LibraryYanked { ref messages }) => {
                 let reason = admission_refusal_message(refusal, &repo.owner, &repo.name);
                 tracing::warn!(
@@ -4679,6 +4707,22 @@ enum AdmissionRefusal {
     /// PolicyInvariant: checked whether or not any Policy exists, and no
     /// Policy can allow it. Each message names the version and the reason.
     LibraryYanked { messages: Vec<String> },
+    /// The Pipeline reads an `event` field the trigger does not have, or
+    /// one whose value fails its check (ADR-0076 §9).
+    EventField { messages: Vec<String> },
+    /// A Step asks for a forge credential it may not have (ADR-0076 §9), a
+    /// PolicyInvariant like a yank.
+    ForgeToken { messages: Vec<String> },
+}
+
+/// What admission fixed for a Run besides its governance (ADR-0076 §9),
+/// which [`persist_run_from_ir`] stores.
+struct AdmittedFacts<'a> {
+    /// The checked `event` values every launch renders.
+    event: &'a serde_json::Map<String, serde_json::Value>,
+    /// Steps that hold a long-lived forge credential only because their
+    /// library is trusted: they consume no workspace.
+    trusted_only: &'a std::collections::BTreeSet<String>,
 }
 
 /// The outcome of admitting one compiled pipeline (ADR-0037, ADR-0071 §2):
@@ -4854,6 +4898,7 @@ async fn resolve_governance(
 /// are the already-resolved launch parameters frozen onto the run (ADR-0043 §5).
 #[allow(clippy::too_many_arguments)] // a cohesive admission routine; splitting hides the flow
 async fn admit_and_create_run(
+    forge: &dyn scarab_forge::ForgePort,
     db: &dyn Db,
     clock: &dyn Clock,
     ports: AdmissionPorts<'_>,
@@ -4892,6 +4937,42 @@ async fn admit_and_create_run(
         }
     }
 
+    // ADR-0076 §9: the `event` values the Pipeline's templates read, checked
+    // and fixed now, and which Steps may receive a forge credential. Both are
+    // fixed checks, decided before any Policy is consulted.
+    let facts = match forge_token::event_facts(event, ports.connections, ir)
+        .await
+        .map_err(|e| TriggerError::Db(DbError::Other(e)))?
+    {
+        Ok(facts) => facts,
+        Err(messages) => {
+            return Ok(Admission::Refused(AdmissionRefusal::EventField { messages }))
+        }
+    };
+    let write = match gov.protection() {
+        Some(p) => forge_token::WriteGovernance {
+            restricts_refs: !p.unrestricted_refs(),
+            has_approvers: !p.approvers.is_empty(),
+        },
+        None => forge_token::WriteGovernance::default(),
+    };
+    let tokens = forge_token::forge_token_refusals(
+        forge,
+        ports.libraries,
+        &repo.owner,
+        repo,
+        ir,
+        event.is_fork_pr() || gov.locked_out(),
+        write,
+    )
+    .await
+    .map_err(|e| TriggerError::Db(DbError::Other(e)))?;
+    if !tokens.refusals.is_empty() {
+        return Ok(Admission::Refused(AdmissionRefusal::ForgeToken {
+            messages: tokens.refusals,
+        }));
+    }
+
     let now = clock.now().await;
     let run = new_run_id();
     // ADR-0075: the `run.create` Policies, after the Environment's ref and
@@ -4910,13 +4991,18 @@ async fn admit_and_create_run(
             &run,
             now,
             params,
+            &facts,
         )
         .await?
         {
             return Ok(Admission::Refused(refusal));
         }
     }
-    persist_run_from_ir(db, &run, ir, event, path, &gov, excluded, params, now).await?;
+    let admitted = AdmittedFacts {
+        event: &facts,
+        trusted_only: &tokens.trusted_only,
+    };
+    persist_run_from_ir(db, &run, ir, event, path, &gov, excluded, params, &admitted, now).await?;
     // Freeze the resolved launch parameters on the run so every step's
     // interpolation (`${{ inputs.… }}`) and `SCARAB_PARAM_*` env re-derive
     // deterministically (ADR-0043 §5).
@@ -5074,6 +5160,7 @@ fn run_create_facts(
             principal,
             time,
             params: params.cloned().unwrap_or_default(),
+            event: serde_json::Map::new(),
         });
     (facts, ctx)
 }
@@ -5117,6 +5204,7 @@ async fn consult_run_create(
     run: &RunId,
     now: scarab_engine::Timestamp,
     params: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
+    event_facts: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<Result<(), AdmissionRefusal>, TriggerError> {
     use scarab_policy::evaluate::{evaluate_stored, PolicyOutcome};
     use scarab_policy::policy::{Checkpoint, Mode};
@@ -5134,6 +5222,10 @@ async fn consult_run_create(
 
     let linked = links.principal_of(event, repo).await?;
     let (facts, ctx) = run_create_facts(event, linked, path, repo, gov, now.0, params);
+    let facts = facts.map(|mut f| {
+        f.event = event_facts.clone();
+        f
+    });
     // Building the input and evaluating it are CPU work; both run off the
     // async workers. The Run-level caps are checked here first, so a Run
     // that cannot be checked is not copied to get there.
@@ -5311,6 +5403,13 @@ pub enum DispatchError {
     /// The Run uses a yanked library version (ADR-0076 §6).
     #[error("{}", library_yanked_message(.0))]
     LibraryYanked(Vec<String>),
+    /// The Pipeline reads an `event` field the dispatch cannot give it
+    /// (ADR-0076 §9).
+    #[error("{}", event_field_message(.0))]
+    EventField(Vec<String>),
+    /// A Step asks for a forge credential it may not have (ADR-0076 §9).
+    #[error("{}", forge_token_message(.0))]
+    ForgeToken(Vec<String>),
     #[error(transparent)]
     Db(DbError),
 }
@@ -5334,7 +5433,20 @@ fn admission_refusal_message(refusal: &AdmissionRefusal, org: &str, project: &st
             messages,
         } => policy_denied_message(decision_id, messages),
         AdmissionRefusal::LibraryYanked { messages } => library_yanked_message(messages),
+        AdmissionRefusal::EventField { messages } => event_field_message(messages),
+        AdmissionRefusal::ForgeToken { messages } => forge_token_message(messages),
     }
+}
+
+fn event_field_message(messages: &[String]) -> String {
+    format!("this Run reads a trigger value it cannot use: {}", messages.join("; "))
+}
+
+fn forge_token_message(messages: &[String]) -> String {
+    format!(
+        "this Run asks for a forge credential it may not have: {}",
+        messages.join("; ")
+    )
 }
 
 fn library_yanked_message(messages: &[String]) -> String {
@@ -5529,6 +5641,7 @@ pub async fn dispatch_run(
     // params. A refusal is a fail-closed error here (the webhook path skips the
     // pipeline; a dispatch is an explicit, answerable request).
     let refusal = match admit_and_create_run(
+        forge,
         db,
         clock,
         ports,
@@ -5570,6 +5683,8 @@ pub async fn dispatch_run(
             messages,
         },
         AdmissionRefusal::LibraryYanked { messages } => DispatchError::LibraryYanked(messages),
+        AdmissionRefusal::EventField { messages } => DispatchError::EventField(messages),
+        AdmissionRefusal::ForgeToken { messages } => DispatchError::ForgeToken(messages),
     })
 }
 
@@ -5659,24 +5774,9 @@ fn admit_k8s_overlay(
 
 /// Durably materialize a compiled pipeline IR into a Run: store the IR on the
 /// run (self-describing, ADR-0022), record RunCreated + the normalized trigger
-/// The (repo, pinned sha) a clone step fetches, from a sha-carrying trigger
-/// (ADR-0045: the run pins its commit ONCE at trigger time and clone always
-/// fetches that — never a re-resolved ref). `None` for triggers without a
-/// concrete commit (tag/release resolution is a follow-up; cron/comment/
-/// upstream have no source).
-fn clone_context(event: &scarab_forge::Event) -> Option<(scarab_forge::RepoRef, String)> {
-    use scarab_forge::Event;
-    match event {
-        Event::Push { repo, after, .. } => Some((repo.clone(), after.clone())),
-        Event::PullRequest { repo, head, .. } => Some((repo.clone(), head.clone())),
-        Event::Manual { repo, sha, .. } | Event::Api { repo, sha, .. } => {
-            Some((repo.clone(), sha.clone()))
-        }
-        _ => None,
-    }
-}
-
 /// on the event log, and create each step with its `needs`.
+///
+/// `admitted` is what admission fixed besides governance (ADR-0076 §9).
 #[allow(clippy::too_many_arguments)] // a cohesive persist routine; splitting hides the flow
 async fn persist_run_from_ir(
     db: &dyn Db,
@@ -5687,6 +5787,7 @@ async fn persist_run_from_ir(
     gov: &RunGovernance,
     excluded: &[String],
     params: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
+    admitted: &AdmittedFacts<'_>,
     now: Timestamp,
 ) -> Result<(), TriggerError> {
     let locked_out = gov.locked_out();
@@ -5739,6 +5840,9 @@ async fn persist_run_from_ir(
         &serde_json::to_value(ir).unwrap_or(serde_json::Value::Null),
     )
     .await?;
+    // The checked `event` values every launch renders (ADR-0076 §9), fixed
+    // now so a rerun or retry renders the same ones.
+    db.set_run_event_facts(run, admitted.event).await?;
     // ADR-0037: record the deploy context (repo + environment + git ref) so
     // gate-approval-time admission can look up the environment's protection
     // rules directly, without parsing the stored IR blob. Deploy runs only.
@@ -5853,71 +5957,6 @@ async fn persist_run_from_ir(
             db.create_step_run(run, &step_id, None, &needs, now).await?;
             let timer = step.gate_after.map(|s| s as i64);
             db.set_step_gate(run, &step_id, kind, timer).await?;
-        } else if let Some(clone) = &step.clone {
-            // A clone step (ADR-0045): the engine runs the canonical
-            // scarab-clone image with context pinned from the trigger. The
-            // URL and the short-TTL credential are resolved at LAUNCH by the
-            // composition root (registry + forge); read_only is fixed here —
-            // a fork PR can never escalate to a writable credential later.
-            let Some((repo, sha)) = clone_context(event) else {
-                return Err(TriggerError::Pipeline(format!(
-                    "step `{}`: a clone step needs a sha-carrying trigger \
-                     (push/pull_request/manual/api) — this run was triggered by `{}`",
-                    step.id,
-                    event.trigger_kind().as_str()
-                )));
-            };
-            let spec = StepSpec {
-                image: String::new(),
-                command: Vec::new(),
-                env: step.env.clone(),
-                secrets: Vec::new(),
-                run_as_root: false,
-                add_capabilities: Vec::new(),
-                privileged: false,
-                timeout_seconds: step.timeout,
-                workspace_inputs: vec![],
-                // Honored on a clone step too (ADR-0007) — same egress prune, no
-                // special case. Narrowing a checkout is unusual and drops `.git`
-                // unless declared, but it is the author's call, and silently
-                // ignoring the field here would be the one thing we won't do.
-                workspace_outputs: step.outputs.clone().unwrap_or_default(),
-                // Carried for uniformity; caching a clone step's checkout is
-                // legal but unusual (the clone itself is already CAS-deduped).
-                cache: cache_config(step),
-                clone: Some(scarab_engine::CloneConfig {
-                    owner: repo.owner.clone(),
-                    name: repo.name.clone(),
-                    sha,
-                    depth_full: clone.depth == scarab_pipeline::CloneDepth::Full,
-                    submodules: clone.submodules,
-                    lfs: clone.lfs,
-                    read_only: locked_out || event.is_fork_pr(),
-                    url: String::new(),
-                    credential: None,
-                }),
-                build: None,
-                artifacts: vec![],
-                placement_profiles: step.placement_profiles.clone(),
-                resources: step.resources.clone(),
-                k8s_overlay: admit_k8s_overlay(
-                    gov.privilege_grant_scope(),
-                    step.k8s_overlay.as_ref(),
-                )
-                .map_err(|v| {
-                    TriggerError::Pipeline(format!("step `{}`: {}", step.id, v.join("; ")))
-                })?,
-                oidc_token: None,
-                // A clone step runs the canonical scarab-clone image; validation
-                // forbids `services` on it, so this is always empty.
-                services: Vec::new(),
-                uses: Vec::new(),
-                // Carried for uniformity; a clone step is never matrixed.
-                matrix_values: step.matrix_values.clone(),
-                scope: step.scope.clone(),
-            };
-            db.create_step_run(run, &step_id, Some(&spec), &needs, now)
-                .await?;
         } else {
             // ADR-0039: admit the step's privilege request against the
             // Project's privilege grant in the target Environment (ADR-0071
@@ -5931,6 +5970,7 @@ async fn persist_run_from_ir(
                 step.scope.as_ref(),
                 &step.matrix_values,
                 params_or_none,
+                admitted.event,
             );
             // A command the launch will refuse (a Run parameter that starts an
             // argument with `-`, ADR-0076) is reported now, with the reason
@@ -5946,6 +5986,7 @@ async fn persist_run_from_ir(
                 &step.matrix_values,
                 scarab_pipeline::Facts::Preview {
                     params: params_or_none,
+                    event: admitted.event,
                 },
             ) {
                 tracing::warn!(step = %step.id, %reason, "step will fail when it launches");
@@ -6004,7 +6045,22 @@ async fn persist_run_from_ir(
                 // files persist with the spec; the scheduler resolves the key
                 // and restore hints at launch.
                 cache: cache_config(step),
-                clone: None,
+                // The forge credential (ADR-0076 §9), as admission decided
+                // it: a fork pull request (or a Run locked out of its
+                // Environment's secrets) gets `read` whatever it asked for.
+                forge_token: step.forge_token.and_then(|asked| {
+                    let repo = event.repo()?;
+                    Some(scarab_engine::ForgeTokenConfig {
+                        access: if locked_out || event.is_fork_pr() {
+                            scarab_pipeline::ForgeToken::Read
+                        } else {
+                            asked
+                        },
+                        owner: repo.owner.clone(),
+                        name: repo.name.clone(),
+                        credential: None,
+                    })
+                }),
                 build,
                 artifacts: step.artifacts.clone(),
                 placement_profiles: step.placement_profiles.clone(),
@@ -6030,9 +6086,16 @@ async fn persist_run_from_ir(
             db.create_step_run(run, &step_id, Some(&spec), &needs, now)
                 .await?;
         }
-        // Explicit input workspaces (ADR-0007), when the step declares a subset
-        // of its needs — sharpens restart skip-if-unchanged (ADR-0027).
-        if let Some(inputs) = &step.inputs {
+        // A Step that holds a long-lived forge credential only because its
+        // library is trusted consumes no workspace (ADR-0076 §9): no file
+        // another Step wrote (a `.git/config`, a hook) is present while the
+        // token is mounted.
+        if admitted.trusted_only.contains(&step.id) {
+            db.set_step_inputs(run, &step_id, &[]).await?;
+        } else if let Some(inputs) = &step.inputs {
+            // Explicit input workspaces (ADR-0007), when the step declares a
+            // subset of its needs — sharpens restart skip-if-unchanged
+            // (ADR-0027).
             let inputs: Vec<StepId> = inputs.iter().map(|i| StepId(i.clone())).collect();
             db.set_step_inputs(run, &step_id, &inputs).await?;
         }
@@ -10916,6 +10979,8 @@ impl utoipa::Modify for StepUpResponses {
         libraries::yank_library,
         libraries::unyank_library,
         libraries::retry_library_defaults,
+        libraries::trust_library_source,
+        libraries::untrust_library_source,
         policies::list_org_policies,
         policies::create_org_policy,
         policies::get_org_policy,
@@ -11092,6 +11157,8 @@ impl utoipa::Modify for StepUpResponses {
         libraries::InstallLibraryRequest,
         libraries::YankLibraryRequest,
         libraries::RetryDefaultsRequest,
+        libraries::TrustedSourceDto,
+        libraries::TrustSourceRequest,
         policies::PolicyDto,
         policies::PolicyVersionDto,
         policies::CreatePolicyRequest,

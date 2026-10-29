@@ -591,7 +591,7 @@ async fn run_at_gate(pg: &Arc<PostgresDb>, run: &RunId, ctx: &DeployContext) {
         workspace_inputs: vec![],
         workspace_outputs: vec![],
         cache: None,
-        clone: None,
+        forge_token: None,
         build: None,
         artifacts: vec![],
         placement_profiles: vec![],

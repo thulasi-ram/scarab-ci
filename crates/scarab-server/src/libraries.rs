@@ -32,7 +32,7 @@ use scarab_identity::Action;
 use scarab_policy::library::{
     content_hash, valid_segment, DefaultsState, LibraryInstallation, LibraryStore,
     LibraryStoreError, LibraryVersion, LibraryYank, MissingDefault, NewInstallation,
-    OrgLibraryDefaults, Replaces,
+    OrgLibraryDefaults, Replaces, TrustedSource,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -317,6 +317,35 @@ pub struct OrgLibrariesDto {
     /// Why the release manifest could not be read, if it could not.
     pub manifest_error: Option<String>,
     pub defaults: Option<LibraryDefaultsDto>,
+    /// The library sources this org trusts with long-lived forge credentials
+    /// (ADR-0076 §9), besides the first-party clone library, which it trusts
+    /// by default.
+    pub trusted_sources: Vec<TrustedSourceDto>,
+}
+
+/// A library source the org trusts with long-lived forge credentials
+/// (ADR-0076 §9). Trust holds across upgrades from the same source.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TrustedSourceDto {
+    /// `<host>/<owner>/<repo>//<path>`, without a commit.
+    pub source: String,
+    pub trusted_by: String,
+    pub trusted_at: i64,
+}
+
+/// `DELETE …/library-trust?source=…`.
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct UntrustSourceQuery {
+    /// The trusted source, `<host>/<owner>/<repo>//<path>`.
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct TrustSourceRequest {
+    /// `<host>/<owner>/<repo>//<path>`; an `@<commit>` is dropped, since
+    /// trust is for every version from the source.
+    pub source: String,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -768,6 +797,7 @@ pub(crate) async fn list_libraries(
     let installations = store.installations(&org).await.map_err(store_api_error)?;
     let yanks = store.yanks(&org).await.map_err(store_api_error)?;
     let defaults = store.defaults(&org).await.map_err(store_api_error)?;
+    let trusted = store.trusted_sources(&org).await.map_err(store_api_error)?;
     let (manifest, manifest_error) = match st.first_party.manifest().await {
         Ok(m) => (m, None),
         Err(e) => (None, Some(e)),
@@ -803,7 +833,105 @@ pub(crate) async fn list_libraries(
         first_party,
         manifest_error,
         defaults: defaults.as_ref().map(defaults_dto),
+        trusted_sources: trusted.iter().map(trusted_dto).collect(),
     }))
+}
+
+fn trusted_dto(t: &TrustedSource) -> TrustedSourceDto {
+    TrustedSourceDto {
+        source: t.source.clone(),
+        trusted_by: t.trusted_by.clone(),
+        trusted_at: t.trusted_at,
+    }
+}
+
+/// `source` in its trust form ([`trust_key`](scarab_policy::library::trust_key)),
+/// checked by parsing it as a source pinned to a commit.
+fn trust_source_key(source: &str) -> Result<String, ApiError> {
+    let key = scarab_policy::library::trust_key(source.trim()).to_string();
+    LibrarySource::parse(&format!("{key}@{}", "0".repeat(40))).map_err(|e| {
+        ApiError::BadRequest(format!(
+            "`{key}` is not a library source: write `<host>/<owner>/<repo>//<path>` ({e})"
+        ))
+    })?;
+    Ok(key)
+}
+
+/// Trust a library source with long-lived forge credentials (ADR-0076 §9):
+/// a Step from a library installed from it may receive a Forgejo or GitHub
+/// PAT connection's token. Trust holds across upgrades from the same
+/// source. Needs a step-up: it loosens. Administer on the org.
+#[utoipa::path(
+    post,
+    path = "/v1/orgs/{org}/library-trust",
+    params(("org" = String, Path, description = "org")),
+    request_body = TrustSourceRequest,
+    summary = "Trust a library source with forge credentials (ADR-0076 §9)",
+    responses(
+        (status = 200, body = TrustedSourceDto),
+        (status = 400, description = "not a library source"),
+        (status = 403, description = "not an org admin, or no step-up"),
+        (status = 404, description = "libraries not configured")
+    )
+)]
+pub(crate) async fn trust_library_source(
+    State(st): State<AppState>,
+    guard: Option<Extension<GuardCtx>>,
+    headers: HeaderMap,
+    Path(org): Path<String>,
+    Json(body): Json<TrustSourceRequest>,
+) -> Result<Json<TrustedSourceDto>, ApiError> {
+    let by = org_caller(&st, &headers, &org, Action::Administer).await?;
+    super::refuse_reserved_org(&org, "trust a library source")?;
+    let source = trust_source_key(&body.source)?;
+    let now = st.clock.now().await.0;
+    let t = store(&st)?
+        .trust_source(&TrustedSource {
+            org,
+            source,
+            trusted_by: by.clone(),
+            trusted_at: now,
+            step_up_ref: guard.and_then(|Extension(g)| g.confirmation_id()),
+        })
+        .await
+        .map_err(store_api_error)?;
+    tracing::warn!(org = %t.org, source = %t.source, by = %by, "library source trusted with forge credentials");
+    Ok(Json(trusted_dto(&t)))
+}
+
+/// Stop trusting a library source with forge credentials. It tightens: no
+/// step-up. Runs created after it refuse a Step from that source asking for
+/// a long-lived token. Administer on the org.
+#[utoipa::path(
+    delete,
+    path = "/v1/orgs/{org}/library-trust",
+    params(("org" = String, Path, description = "org"), UntrustSourceQuery),
+    summary = "Stop trusting a library source with forge credentials (ADR-0076 §9)",
+    responses(
+        (status = 204, description = "no longer trusted"),
+        (status = 400, description = "no `source`, or not a library source"),
+        (status = 403, description = "not an org admin"),
+        (status = 404, description = "not trusted, or libraries not configured")
+    )
+)]
+pub(crate) async fn untrust_library_source(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(org): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<UntrustSourceQuery>,
+) -> Result<StatusCode, ApiError> {
+    org_caller(&st, &headers, &org, Action::Administer).await?;
+    let source = q
+        .source
+        .as_deref()
+        .ok_or_else(|| ApiError::BadRequest("name the trusted `source`".into()))?;
+    let source = trust_source_key(source)?;
+    store(&st)?
+        .untrust_source(&org, &source)
+        .await
+        .map_err(store_api_error)?
+        .ok_or(ApiError::NotFound)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// How many fetched versions that were never installed an org keeps, besides

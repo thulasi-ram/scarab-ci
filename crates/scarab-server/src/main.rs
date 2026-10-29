@@ -671,8 +671,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // This is the drain's READ half (tiered, falls through
                         // to cold); the WRITE half is the Depot handle below.
                         .with_workspace_cas(workspace_cas.clone())
-                        // The canonical clone image (ADR-0045).
-                        .with_clone_image(config.clone_image.clone())
                         // Artifact harvest (ADR-0052): /scarab/artifacts →
                         // object blobs + Pod-annotation metadata.
                         .with_artifact_store(store.clone())
@@ -746,20 +744,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::info!("per-run OIDC token injection enabled (ADR-0015)");
             }
             let executor: Arc<dyn Executor> = Arc::new(secret_exec);
-            // Enrich clone-step launches (ADR-0045): resolve the clone URL
-            // from the registry and mint the short-TTL, read-only-for-forks
-            // checkout credential — in memory only, delivered via tmpfs.
+            // Mint a Step's forge credential at each launch and revoke it
+            // when its Attempt ends (ADR-0076 §9) — in memory only,
+            // delivered as files on tmpfs.
             let executor: Arc<dyn Executor> = Arc::new(
-                scarab_server::clone_executor::CloneEnrichingExecutor::new(
-                    executor,
-                    pg.clone(),
-                    forge.clone(),
-                )
+                scarab_server::forge_token::ForgeCredentialExecutor::new(executor, forge.clone())
                 // Build-step registry auth (ADR-0018): scoped REGISTRY_AUTH
                 // secret first, forge-derived credential as fallback.
                 .with_secrets(secrets.clone())
-                // A yanked library Step is refused before its checkout
-                // token or registry auth is asked for (ADR-0076 §6).
+                // A yanked library Step is refused before its forge
+                // credential or registry auth is asked for (ADR-0076 §6).
                 .with_libraries(db.clone(), pg.clone()),
             );
             // Local host processes finish instantly, so re-poll them quickly; k8s

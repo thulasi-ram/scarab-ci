@@ -27,7 +27,7 @@ use scarab_policy::library::{
     content_hash, LibraryInstallation, LibraryStore, LibraryStoreError, LibraryVersion,
     LibraryYank, NewInstallation, OrgLibraryDefaults, Replaces,
 };
-use scarab_server::clone_executor::CloneEnrichingExecutor;
+use scarab_server::forge_token::ForgeCredentialExecutor;
 use scarab_server::libraries::{LibraryManifest, ManifestLibrary, ManifestSource, ManifestVersion};
 use scarab_server::library_fetch::{
     append_capped, check_literal_host, is_public_ip, AnonymousFetcher, FetchError, HttpsFetcher,
@@ -166,11 +166,10 @@ fn production_executor(
     libs: Arc<dyn LibraryStore>,
     inner: Arc<FakeExecutor>,
     forge: Arc<FakeForge>,
-) -> CloneEnrichingExecutor {
+) -> ForgeCredentialExecutor {
     let secret: Arc<dyn Executor> = Arc::new(secret_executor(db, libs.clone(), inner));
-    CloneEnrichingExecutor::new(
+    ForgeCredentialExecutor::new(
         secret,
-        db.clone() as Arc<dyn ForgeConnectionStore>,
         forge as Arc<dyn ForgePort>,
     )
     .with_libraries(db.clone() as Arc<dyn Db>, libs)
@@ -1224,8 +1223,8 @@ async fn an_authored_origin_with_an_unknown_field_is_still_refused() {
 // 7. A yanked Step mints no credential
 // ===========================================================================
 
-/// A library with a clone Step and a build Step, both roots.
-const SOURCED: &str = "kind: library\nsteps:\n  - { id: checkout, clone: {} }\n  - { id: img, build: { image: \"ghcr.io/acme/web:1\" } }\n";
+/// A library with a forge-token Step and a build Step, both roots.
+const SOURCED: &str = "kind: library\nsteps:\n  - { id: checkout, image: \"alpine/git@sha256:aaaa\", forge_token: read }\n  - { id: img, build: { image: \"ghcr.io/acme/web:1\" } }\n";
 
 /// Runs the production chain over `run` with a fresh fake forge, and
 /// returns how many credentials the forge was asked for.
@@ -1246,14 +1245,26 @@ async fn credentials_asked(
     forge.credential_calls()
 }
 
-/// In production CloneEnriching is outermost: it mints the checkout token
-/// and resolves registry auth before SecretInjecting's yank check refuses.
-/// A yanked clone or build Step must be refused before either is asked for.
+/// In production ForgeCredential is outermost: it mints the forge token and
+/// resolves registry auth before SecretInjecting's yank check refuses. A
+/// yanked forge-token or build Step must be refused before either is asked
+/// for.
 #[tokio::test]
-async fn a_yanked_clone_or_build_step_mints_no_credential() {
+async fn a_yanked_forge_token_or_build_step_mints_no_credential() {
     const CI: &str = "on:\n  push: {}\nsteps:\n  - { id: src, invoke: lib:acme/sourced }\n";
     let libs = Arc::new(InMemoryLibraries::new());
     seed(libs.as_ref(), "acme", "acme", "sourced", SOURCED).await;
+    // The org trusts the library's source with its long-lived forge token
+    // (ADR-0076 §9), so the forge-token Step is admitted.
+    libs.trust_source(&scarab_policy::library::TrustedSource {
+        org: "acme".into(),
+        source: "github.com/acme/libs//sourced.yaml".into(),
+        trusted_by: "amy".into(),
+        trusted_at: 1,
+        step_up_ref: None,
+    })
+    .await
+    .unwrap();
 
     // Both Runs are created before the yank; a Run created after it is
     // refused at creation.

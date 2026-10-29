@@ -1357,6 +1357,26 @@ pub static LIBRARY_DEFAULTS_RETRY: Op = op(
     &[],
     &["path:org", "body:/mirror"],
 );
+pub static LIBRARY_TRUST: Op = op(
+    "library.trust",
+    "Trust a library source with forge credentials",
+    Class::CrownJewel(W),
+    "ADR-0076 §9: trusting a source loosens",
+    ADMIN,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org", "body:/source"],
+);
+pub static LIBRARY_UNTRUST: Op = op(
+    "library.untrust",
+    "Stop trusting a library source",
+    Class::Exempt("removing trust tightens"),
+    "ADR-0076 §9",
+    ADMIN,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org"],
+);
 
 #[cfg(test)]
 mod tests {

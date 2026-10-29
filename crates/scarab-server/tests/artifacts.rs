@@ -21,7 +21,7 @@ use scarab_engine::{
     ArtifactMeta, AttemptId, Clock, Db, Executor, RunId, RunStatus, Scheduler, StepId, StepSpec,
     Timestamp,
 };
-use scarab_server::clone_executor::CloneEnrichingExecutor;
+use scarab_server::forge_token::ForgeCredentialExecutor;
 use scarab_server::{router, AppState, LogService, SecretInjectingExecutor};
 use scarab_storage::ObjectStore;
 use scarab_testkit::{
@@ -286,7 +286,7 @@ async fn of_record_never_silently_serves_a_failed_version() {
 /// the backend already uploaded is ALWAYS indexed, and therefore listed and
 /// downloadable — driven through the **production executor stack**, i.e. the
 /// decorators the server actually wraps the backend in
-/// (`CloneEnrichingExecutor` → `SecretInjectingExecutor` → backend), the real
+/// (`ForgeCredentialExecutor` → `SecretInjectingExecutor` → backend), the real
 /// router and the real `Scheduler`.
 ///
 /// The stack is the point. `Executor::artifacts` has an EMPTY trait default and
@@ -312,9 +312,8 @@ async fn published_artifacts_are_indexed_through_the_decorated_executor_stack() 
         Arc::new(FakeSecrets::new()),
         logs.clone(),
     ));
-    let exec: Arc<dyn Executor> = Arc::new(CloneEnrichingExecutor::new(
+    let exec: Arc<dyn Executor> = Arc::new(ForgeCredentialExecutor::new(
         secret_exec,
-        db.clone(),
         Arc::new(FakeForge::new()),
     ));
 
@@ -426,7 +425,7 @@ async fn published_artifacts_are_indexed_through_the_decorated_executor_stack() 
 /// the real backend they were silently discarded and the scheduler's
 /// `ExecState::Failed` harvest branch never fired. This drives that branch end to
 /// end: real router, real `Scheduler`, the production decorator chain
-/// (`CloneEnrichingExecutor` → `SecretInjectingExecutor` → backend).
+/// (`ForgeCredentialExecutor` → `SecretInjectingExecutor` → backend).
 ///
 /// Note the of-record contract that goes with it (ADR-0056): the version is
 /// tagged `succeeded: false`, so the bare name-addressed download refuses rather
@@ -446,9 +445,8 @@ async fn a_failing_steps_artifacts_are_indexed_and_downloadable() {
         Arc::new(FakeSecrets::new()),
         logs.clone(),
     ));
-    let exec: Arc<dyn Executor> = Arc::new(CloneEnrichingExecutor::new(
+    let exec: Arc<dyn Executor> = Arc::new(ForgeCredentialExecutor::new(
         secret_exec,
-        db.clone(),
         Arc::new(FakeForge::new()),
     ));
 
@@ -611,7 +609,7 @@ async fn published_artifacts_are_durably_indexed_in_postgres() {
         workspace_inputs: vec![],
         workspace_outputs: vec![],
         cache: None,
-        clone: None,
+        forge_token: None,
         build: None,
         // The feature: this step publishes artifacts of record (ADR-0052).
         artifacts: vec!["dist/*".into()],
@@ -649,9 +647,8 @@ async fn published_artifacts_are_durably_indexed_in_postgres() {
         Arc::new(FakeSecrets::new()),
         logs.clone(),
     ));
-    let exec: Arc<dyn Executor> = Arc::new(CloneEnrichingExecutor::new(
+    let exec: Arc<dyn Executor> = Arc::new(ForgeCredentialExecutor::new(
         secret_exec,
-        pg.clone(),
         Arc::new(FakeForge::new()),
     ));
 

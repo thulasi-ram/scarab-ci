@@ -468,6 +468,16 @@ pub(crate) fn governed_routes() -> Routes {
             &ops::LIBRARY_DEFAULTS_RETRY,
             lib::retry_library_defaults,
         )
+        .post(
+            "/v1/orgs/{org}/library-trust",
+            &ops::LIBRARY_TRUST,
+            lib::trust_library_source,
+        )
+        .delete(
+            "/v1/orgs/{org}/library-trust",
+            &ops::LIBRARY_UNTRUST,
+            lib::untrust_library_source,
+        )
         .get("/v1/orgs/{org}/plugin-catalog", plugins::plugin_catalog)
         .get("/v1/orgs/{org}/plugins", plugins::list_plugins)
         .post(

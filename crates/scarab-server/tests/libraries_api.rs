@@ -512,6 +512,41 @@ async fn yank_needs_a_reason_and_unyank_lifts_it() {
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
 
+/// ADR-0076 §9: an org admin trusts a library source with forge
+/// credentials; trust is keyed by the source without its commit, listed with
+/// the org's libraries, and removed with DELETE.
+#[tokio::test]
+async fn a_source_is_trusted_without_its_commit_and_untrusted() {
+    let h = harness();
+    let (st, b) = call(
+        &h.app,
+        "POST",
+        "/v1/orgs/acme/library-trust",
+        Some(json!({ "source": format!("github.com/acme/libs//push.yaml@{C1}") })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["source"], "github.com/acme/libs//push.yaml");
+    let (_, list) = call(&h.app, "GET", "/v1/orgs/acme/libraries", None).await;
+    assert_eq!(
+        list["trusted_sources"][0]["source"],
+        "github.com/acme/libs//push.yaml"
+    );
+    let (st, _) = call(
+        &h.app,
+        "POST",
+        "/v1/orgs/acme/library-trust",
+        Some(json!({ "source": "not a source" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let uri = "/v1/orgs/acme/library-trust?source=github.com%2Facme%2Flibs%2F%2Fpush.yaml";
+    let (st, _) = call(&h.app, "DELETE", uri, None).await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let (st, _) = call(&h.app, "DELETE", uri, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
 // ---------------------------------------------------------------------------
 // First-party
 // ---------------------------------------------------------------------------

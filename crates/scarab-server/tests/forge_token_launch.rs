@@ -1,18 +1,19 @@
-//! Clone-step launch enrichment (ADR-0045): the decorator resolves the clone
-//! URL from the ForgeConnection registry and mints the short-TTL,
-//! read-only-for-forks credential — in memory only. Hermetic: FakeForge +
-//! InMemoryDb registry + FakeExecutor (whose launched_spec captures the
-//! enriched copy).
+//! A Step's forge credential at launch (ADR-0076 §9): the decorator mints
+//! it for each launch — in memory only — hands it to the executor, and
+//! revokes a minted token when the Attempt ends. Hermetic: FakeForge +
+//! FakeExecutor (whose launched_spec captures the enriched copy).
 
 use std::sync::Arc;
 
+use scarab_engine::ports::ExecState;
 use scarab_engine::{
-    Attempt, AttemptId, AttemptOutcome, CloneConfig, Executor, RunId, StepId, StepRun, StepSpec,
-    StepStatus, Timestamp,
+    Attempt, AttemptId, AttemptOutcome, Executor, ForgeTokenConfig, RunId, StepId, StepRun,
+    StepSpec, StepStatus, Timestamp,
 };
-use scarab_forge::{ForgeConnection, ForgeConnectionStore, ForgeKind, RepoRef};
-use scarab_server::clone_executor::{clone_url, CloneEnrichingExecutor};
-use scarab_testkit::{FakeExecutor, FakeForge, InMemoryDb};
+use scarab_forge::{ForgeKind, RepoRef};
+use scarab_pipeline::ForgeToken;
+use scarab_server::forge_token::{clone_url, ForgeCredentialExecutor};
+use scarab_testkit::{FakeExecutor, FakeForge};
 
 fn step_run(id: &str) -> StepRun {
     StepRun {
@@ -31,9 +32,9 @@ fn step_run(id: &str) -> StepRun {
     }
 }
 
-fn clone_spec(read_only: bool) -> StepSpec {
+fn token_spec(access: ForgeToken) -> StepSpec {
     StepSpec {
-        image: String::new(),
+        image: "ghcr.io/thulasi-ram/scarab-clone@sha256:abc".into(),
         command: vec![],
         env: vec![],
         secrets: vec![],
@@ -44,12 +45,11 @@ fn clone_spec(read_only: bool) -> StepSpec {
         workspace_inputs: vec![],
         workspace_outputs: vec![],
         cache: None,
-        clone: Some(CloneConfig {
+        forge_token: Some(ForgeTokenConfig {
+            access,
             owner: "acme".into(),
             name: "web".into(),
-            sha: "cafe1234".into(),
-            read_only,
-            ..Default::default()
+            credential: None,
         }),
         build: None,
         artifacts: vec![],
@@ -85,78 +85,120 @@ fn clone_urls_are_credential_free_per_forge() {
 }
 
 #[tokio::test]
-async fn launch_enriches_url_and_mints_a_credential_honoring_read_only() {
-    let registry = Arc::new(InMemoryDb::new());
-    registry
-        .put_connection(&ForgeConnection {
-            id: "fj-1".into(),
-            kind: ForgeKind::Forgejo,
-            base_url: "https://git.example.com".into(),
-            credential_ref: "h".into(),
-        })
-        .await
-        .unwrap();
-    registry
-        .bind_repo(
-            "fj-1",
-            &RepoRef {
-                owner: "acme".into(),
-                name: "web".into(),
-            },
-            "acme",
-            "web",
-        )
-        .await
-        .unwrap();
-
+async fn each_launch_mints_a_credential_that_is_never_stored() {
     let inner = Arc::new(FakeExecutor::new());
-    let exec = CloneEnrichingExecutor::new(inner.clone(), registry, Arc::new(FakeForge::new()));
-
-    // A fork-PR clone: read_only fixed at creation, honored at mint time.
-    let step = step_run("checkout");
-    let handle = exec.launch(&step, &clone_spec(true)).await.unwrap();
-    let enriched = inner
+    let forge = Arc::new(FakeForge::new().with_minted_tokens());
+    let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone());
+    let spec = token_spec(ForgeToken::Read);
+    let handle = exec.launch(&step_run("checkout/git"), &spec).await.unwrap();
+    let launched = inner.launched_spec(&handle).unwrap().forge_token.unwrap();
+    let first = launched.credential.expect("minted at launch");
+    assert_eq!(first.username, "x-access-token");
+    // The stored spec never carries it, and a serialized spec drops it.
+    assert_eq!(spec.forge_token.as_ref().unwrap().credential, None);
+    let wire = serde_json::to_string(&inner.launched_spec(&handle).unwrap()).unwrap();
+    assert!(!wire.contains(&first.token), "{wire}");
+    // A re-drive of the same Attempt mints again.
+    let handle = exec.launch(&step_run("checkout/git"), &spec).await.unwrap();
+    let second = inner
         .launched_spec(&handle)
-        .expect("captured")
-        .clone
+        .unwrap()
+        .forge_token
+        .unwrap()
+        .credential
         .unwrap();
-    assert_eq!(enriched.url, "https://git.example.com/acme/web.git");
-    let cred = enriched.credential.expect("credential minted");
-    assert!(!cred.token.is_empty());
-    // The stored spec never carried it; the enrichment is launch-time only.
-    assert_eq!(clone_spec(true).clone.unwrap().credential, None);
+    assert_ne!(first.token, second.token);
+    assert_eq!(forge.credential_calls(), 2);
 }
 
 #[tokio::test]
-async fn unregistered_repo_falls_back_to_public_github_url() {
+async fn a_minted_token_is_revoked_when_the_attempt_ends() {
+    for end in [
+        ExecState::Succeeded,
+        ExecState::Failed {
+            exit_code: Some(1),
+            class: scarab_engine::ports::FailureClass::Step,
+            cause: None,
+        },
+    ] {
+        let inner = Arc::new(FakeExecutor::new());
+        let forge = Arc::new(FakeForge::new().with_minted_tokens());
+        let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone());
+        let handle = exec
+            .launch(&step_run("push"), &token_spec(ForgeToken::Write))
+            .await
+            .unwrap();
+        let token = inner
+            .launched_spec(&handle)
+            .unwrap()
+            .forge_token
+            .unwrap()
+            .credential
+            .unwrap()
+            .token;
+        assert!(token.starts_with("fake-write-token"), "{token}");
+        // Still running: nothing revoked.
+        assert_eq!(exec.poll(&handle).await.unwrap(), ExecState::Running);
+        assert!(forge.revoked().is_empty());
+        inner.script_outcome(end.clone());
+        assert_eq!(exec.poll(&handle).await.unwrap(), end);
+        assert_eq!(forge.revoked(), vec![token.clone()], "revoked once at the end");
+        // A later poll revokes nothing more.
+        let _ = exec.poll(&handle).await;
+        assert_eq!(forge.revoked().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn a_cancelled_attempt_revokes_its_tokens_including_a_re_drives() {
     let inner = Arc::new(FakeExecutor::new());
-    let exec = CloneEnrichingExecutor::new(
-        inner.clone(),
-        Arc::new(InMemoryDb::new()), // empty registry
-        Arc::new(FakeForge::new()),
-    );
+    let forge = Arc::new(FakeForge::new().with_minted_tokens());
+    let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone());
+    let spec = token_spec(ForgeToken::Read);
+    let handle = exec.launch(&step_run("checkout/git"), &spec).await.unwrap();
+    exec.launch(&step_run("checkout/git"), &spec).await.unwrap();
+    exec.cancel(&handle).await.unwrap();
+    assert_eq!(forge.revoked().len(), 2, "both launches' tokens end");
+}
+
+#[tokio::test]
+async fn a_long_lived_token_is_handed_over_and_never_revoked() {
+    let inner = Arc::new(FakeExecutor::new());
+    let forge = Arc::new(FakeForge::new()); // Forgejo / PAT: one long-lived token
+    let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone());
     let handle = exec
-        .launch(&step_run("checkout"), &clone_spec(false))
+        .launch(&step_run("checkout/git"), &token_spec(ForgeToken::Read))
         .await
         .unwrap();
-    let enriched = inner
+    assert!(inner
         .launched_spec(&handle)
-        .expect("captured")
-        .clone
-        .unwrap();
-    assert_eq!(enriched.url, "https://github.com/acme/web.git");
+        .unwrap()
+        .forge_token
+        .unwrap()
+        .credential
+        .is_some());
+    inner.script_outcome(ExecState::Succeeded);
+    exec.poll(&handle).await.unwrap();
+    assert!(forge.revoked().is_empty(), "the connection's own token is not revoked");
 }
 
 #[tokio::test]
-async fn non_clone_steps_pass_through_untouched() {
+async fn a_write_token_the_forge_cannot_mint_fails_the_launch() {
     let inner = Arc::new(FakeExecutor::new());
-    let exec = CloneEnrichingExecutor::new(
-        inner.clone(),
-        Arc::new(InMemoryDb::new()),
-        Arc::new(FakeForge::new()),
-    );
-    let mut spec = clone_spec(false);
-    spec.clone = None;
+    let exec = ForgeCredentialExecutor::new(inner.clone(), Arc::new(FakeForge::new()));
+    let err = exec
+        .launch(&step_run("push"), &token_spec(ForgeToken::Write))
+        .await
+        .expect_err("no silent downgrade to read");
+    assert!(err.to_string().contains("write"), "{err}");
+}
+
+#[tokio::test]
+async fn steps_without_forge_token_pass_through_untouched() {
+    let inner = Arc::new(FakeExecutor::new());
+    let exec = ForgeCredentialExecutor::new(inner.clone(), Arc::new(FakeForge::new()));
+    let mut spec = token_spec(ForgeToken::Read);
+    spec.forge_token = None;
     spec.image = "busybox".into();
     let handle = exec.launch(&step_run("build"), &spec).await.unwrap();
     assert_eq!(inner.launched_spec(&handle).unwrap(), spec);
@@ -183,7 +225,7 @@ fn build_spec(image: &str) -> StepSpec {
         workspace_inputs: vec![],
         workspace_outputs: vec![],
         cache: None,
-        clone: None,
+        forge_token: None,
         build: Some(BuildConfig {
             context: ".".into(),
             dockerfile: "Dockerfile".into(),
@@ -223,7 +265,7 @@ async fn scoped_registry_auth_secret_takes_precedence_over_forge_derived() {
             token: "derived".into(),
         },
     ));
-    let exec = CloneEnrichingExecutor::new(inner.clone(), Arc::new(InMemoryDb::new()), forge)
+    let exec = ForgeCredentialExecutor::new(inner.clone(), forge)
         .with_secrets(secrets);
     let handle = exec
         .launch(&step_run("image"), &build_spec("ghcr.io/acme/web:1"))
@@ -248,7 +290,7 @@ async fn forge_derived_credential_is_the_fallback_and_only_for_its_own_registry(
         },
     ));
     let inner = Arc::new(FakeExecutor::new());
-    let exec = CloneEnrichingExecutor::new(inner.clone(), Arc::new(InMemoryDb::new()), forge)
+    let exec = ForgeCredentialExecutor::new(inner.clone(), forge)
         .with_secrets(Arc::new(FakeSecrets::new())); // no scoped secret
 
     // Pushing to the forge's own registry: derived credential applies.
@@ -286,7 +328,7 @@ async fn inline_dev_builds_get_no_auth() {
         },
     ));
     let inner = Arc::new(FakeExecutor::new());
-    let exec = CloneEnrichingExecutor::new(inner.clone(), Arc::new(InMemoryDb::new()), forge);
+    let exec = ForgeCredentialExecutor::new(inner.clone(), forge);
     let mut spec = build_spec("ghcr.io/acme/web:1");
     spec.build.as_mut().unwrap().repo_owner = String::new(); // no trigger repo
     spec.build.as_mut().unwrap().repo_name = String::new();

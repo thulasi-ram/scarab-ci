@@ -47,7 +47,6 @@
 //! | `SCARAB_STEP_UP` | env | step-up confirmation (ADR-0073). Unset/blank or `enforce` = **enforce** (production: crown-jewel operations need a passkey confirmation); any other value refuses boot — there is no `off` or `log` mode. Under `SCARAB_DEV_INSECURE=1` it is off unless explicitly `enforce` (local passkey testing). Enforce with OAuth login needs an `https` (or loopback) `SCARAB_PUBLIC_URL` |
 //! | `SCARAB_STEP_TIMEOUT_SECS` | env | global default step deadline (ADR-0047); default 3600 (1h), per-step overridable via `timeout:` |
 //! | `SCARAB_PUBLIC_URL` | env | Scarab's public base URL — the run deep-link every forge status carries (ADR-0046); default `http://localhost:8080` (dev) |
-//! | `SCARAB_CLONE_IMAGE` | env | the canonical scarab-clone image a `clone` step runs (ADR-0045); default `ghcr.io/thulasi-ram/scarab-clone:edge` — digest-pin in production |
 //! | `SCARAB_PLACEMENT_CONFIG_FILE` | env | path to the operator placement config (ADR-0055): cluster baseline + PlacementProfile registry (YAML/JSON, gitops-managed); a bad path/parse is a boot failure |
 //! | `SCARAB_GITHUB_APP_ID` | env | GitHub App id (ADR-0046): when set, GitHub connections authenticate in **App mode** (their credential secret is the App PEM); absent = token mode (dev) |
 //! | `SCARAB_OAUTH_CLIENT_ID` … `_CLIENT_SECRET`, `_AUTHORIZE_URL`, `_TOKEN_URL`, `_USERINFO_URL` | env | OAuth/OIDC login provider (ADR-0049): all five together enable real authn (GitHub, Forgejo, or any OIDC issuer); a partial set refuses boot |
@@ -305,7 +304,7 @@ pub struct WorkspaceServiceConfig {
     pub data_dir: String,
     /// The **fetcher** image a Step Pod's init container runs to pull its input
     /// snapshots from the service (ADR-0061 s3-feed). Digest-pin in production,
-    /// exactly as with `clone_image`.
+    /// as a library pins its images.
     ///
     /// ⚠ A temporally-ordered stepping stone, not the design: it is *eager*, and
     /// the CSI/FUSE node driver replaces it — at which point this knob, the image
@@ -567,9 +566,10 @@ pub struct Config {
     /// Read at boot (a bad path is a boot failure, ADR-0048), mirroring the OIDC
     /// signing key. Overridden by `github_app_pem` if both are set.
     pub github_app_pem_file: Option<String>,
-    /// The canonical scarab-clone image (ADR-0045) — the image every `clone`
-    /// step runs, digest-pinned in production.
-    pub clone_image: String,
+    /// `SCARAB_CLONE_IMAGE` was set. Nothing reads it since ADR-0076 §9:
+    /// the clone library pins its image, and an org that mirrors it installs
+    /// a version that pins the mirror. The startup report says so.
+    pub clone_image_ignored: bool,
     /// Path to the operator **placement config** file (ADR-0055): the cluster
     /// baseline (tolerations/nodeSelector/default resources) + the named
     /// PlacementProfile registry, YAML/JSON, gitops-managed. `None` = no baseline
@@ -1650,9 +1650,7 @@ impl Config {
             github_app_id: env("SCARAB_GITHUB_APP_ID").filter(|v| !v.is_empty()),
             github_app_pem: env("SCARAB_GITHUB_APP_PEM").filter(|v| !v.is_empty()),
             github_app_pem_file: env("SCARAB_GITHUB_APP_PEM_FILE").filter(|v| !v.is_empty()),
-            clone_image: env("SCARAB_CLONE_IMAGE")
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| "ghcr.io/thulasi-ram/scarab-clone:edge".into()),
+            clone_image_ignored: env("SCARAB_CLONE_IMAGE").is_some_and(|v| !v.is_empty()),
             placement_config_file: env("SCARAB_PLACEMENT_CONFIG_FILE").filter(|v| !v.is_empty()),
             oauth,
             retention_log_days: match env("SCARAB_RETENTION_LOG_DAYS").filter(|v| !v.is_empty()) {
@@ -1834,7 +1832,14 @@ impl Config {
             ),
             format!("public url: {} (run deep-links, ADR-0046)", self.public_url),
             self.step_up_report(),
-            format!("clone image: {} (ADR-0045)", self.clone_image),
+            if self.clone_image_ignored {
+                "SCARAB_CLONE_IMAGE is set and not read: checkouts run the image \
+                 `lib:thulasi-ram/clone` pins; to use a mirror, install a library version \
+                 that pins the mirror's image (ADR-0076 §9)"
+                    .to_string()
+            } else {
+                "checkout: `lib:thulasi-ram/clone` (ADR-0076 §9)".to_string()
+            },
             format!(
                 "forge: registry-routed; github auth {} (ADR-0046)",
                 match &self.github_app_id {
