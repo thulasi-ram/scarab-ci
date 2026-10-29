@@ -1693,8 +1693,10 @@ async fn create_run(
     let now = st.clock.now().await;
     let run = new_run_id();
 
+    // Out of the scheduler's work list until its steps and their `inputs:`
+    // are all written (`finish_run_creation` below), as in `persist_run_from_ir`.
     st.db
-        .create_run(&run, req.pipeline.ir_version, EVENT_VERSION, now)
+        .begin_run_creation(&run, req.pipeline.ir_version, EVENT_VERSION, now)
         .await?;
     // Store the compiled IR on the run — self-describing (ADR-0022).
     let ir = serde_json::to_value(&req.pipeline)
@@ -1742,6 +1744,7 @@ async fn create_run(
                 .await?;
         }
     }
+    st.db.finish_run_creation(&run).await?;
 
     Ok((
         StatusCode::CREATED,
@@ -4556,12 +4559,6 @@ async fn admit_and_create_run(
     let now = clock.now().await;
     let run = new_run_id();
     persist_run_from_ir(db, &run, ir, event, path, &gov, excluded, params, now).await?;
-    // Freeze the resolved launch parameters on the run so every step's
-    // interpolation (`${{ inputs.… }}`) and `SCARAB_PARAM_*` env re-derive
-    // deterministically (ADR-0043 §5).
-    if let Some(params) = params {
-        db.set_run_params(&run, params).await?;
-    }
     Ok(Admission::Created(run))
 }
 
@@ -5019,8 +5016,20 @@ async fn persist_run_from_ir(
     now: Timestamp,
 ) -> Result<(), TriggerError> {
     let locked_out = gov.locked_out();
-    db.create_run(run, ir.ir_version, EVENT_VERSION, now)
+    // The run stays out of the scheduler's work list until every write below
+    // has landed (`finish_run_creation` at the end): a tick between two of
+    // them would launch a step without its params, launch a `when:`-excluded
+    // step before it is Skipped, or start the run before its concurrency
+    // group exists. A creation that fails partway leaves a run nothing
+    // schedules.
+    db.begin_run_creation(run, ir.ir_version, EVENT_VERSION, now)
         .await?;
+    // Freeze the resolved launch parameters on the run so every step's
+    // interpolation (`${{ inputs.… }}`) and `SCARAB_PARAM_*` env re-derive
+    // deterministically (ADR-0043 §5).
+    if let Some(params) = params {
+        db.set_run_params(run, params).await?;
+    }
     // Tenancy (ADR-0049): stamp the owning (org, project) from the trigger's
     // repo, so run reads/lists can be scoped by the caller's bindings.
     // Untenanted runs (no repo — inline dev submissions) stay global-only.
@@ -5362,6 +5371,7 @@ async fn persist_run_from_ir(
             .await?;
         }
     }
+    db.finish_run_creation(run).await?;
     Ok(())
 }
 

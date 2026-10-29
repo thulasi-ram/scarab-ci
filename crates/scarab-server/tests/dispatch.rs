@@ -92,9 +92,11 @@ fn prod_rules(approvers: &[&str], allowed_refs: &[&str]) -> ProtectionRules {
 type Launch = (Vec<String>, Vec<(String, String)>);
 
 /// An executor recording the (already-interpolated) command + env of each launch.
+/// Its units succeed on the first poll unless `keep_running` is set.
 #[derive(Default)]
 struct RecordingExec {
     launches: Mutex<Vec<Launch>>,
+    keep_running: bool,
 }
 #[async_trait]
 impl Executor for RecordingExec {
@@ -130,7 +132,11 @@ impl Executor for RecordingExec {
         Ok(ExecHandle("h".into()))
     }
     async fn poll(&self, _h: &ExecHandle) -> Result<ExecState, ExecError> {
-        Ok(ExecState::Succeeded)
+        Ok(if self.keep_running {
+            ExecState::Running
+        } else {
+            ExecState::Succeeded
+        })
     }
     async fn cancel(&self, _h: &ExecHandle) -> Result<(), ExecError> {
         Ok(())
@@ -1082,5 +1088,202 @@ async fn concurrency_group_is_scoped_to_the_owning_project() {
         db.run_status(&acme_again).await.unwrap(),
         Some(RunStatus::Pending),
         "the same project's second run still queues behind its slot holder"
+    );
+}
+
+// --- a scheduler tick during run creation --------------------------------------
+//
+// Run creation is a sequence of separate writes. Another task — this replica's
+// scheduler loop, or another replica's — can tick between any two of them. A
+// Run must not be schedulable until every one of those writes has landed.
+
+/// Arm `db` so a full scheduler tick (`tick_all`, the production loop) runs at
+/// the start of the next call of `method`, launching through `exec`.
+fn tick_before_next(
+    db: &Arc<InMemoryDb>,
+    clock: &Arc<FakeClock>,
+    exec: &Arc<RecordingExec>,
+    method: &'static str,
+) {
+    let (db2, clock, exec) = (db.clone(), clock.clone(), exec.clone());
+    db.interleave_before_next(
+        method,
+        Box::new(move || {
+            Box::pin(async move {
+                // The same owner as the tests' own scheduler: the leader's
+                // loop, which may run on the replica creating the run or not.
+                let sched =
+                    Scheduler::new(&*db2 as &dyn Db, &*clock as &dyn Clock, &*exec, "sched");
+                sched.tick_all().await.expect("tick");
+            })
+        }),
+    );
+}
+
+/// A tick that lands before the dispatch's launch parameters are written must
+/// not launch a step without them: every launch carries `SCARAB_PARAM_*`.
+#[tokio::test]
+async fn a_tick_during_creation_never_launches_a_step_without_its_params() {
+    let forge = scarab_testkit::FakeForge::new()
+        .with_file(".scarab/ship.yaml", MANUAL_YAML)
+        .with_commit("refs/heads/main", "sha-deadbeef");
+    let db = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+    let exec = Arc::new(RecordingExec::default());
+    tick_before_next(&db, &clock, &exec, "set_run_params");
+
+    let run = dispatch_run(
+        &forge,
+        db.as_ref(),
+        clock.as_ref(),
+        None,
+        "alice".into(),
+        repo(),
+        "refs/heads/main".into(),
+        "ship".into(),
+        std::collections::BTreeMap::from([("region".to_string(), json!("us-east-1"))]),
+        DispatchKind::Manual,
+        None,
+    )
+    .await
+    .expect("dispatch");
+    assert!(!db.interleave_armed(), "the tick ran inside run creation");
+
+    Scheduler::new(&*db as &dyn Db, &*clock as &dyn Clock, &*exec, "sched")
+        .tick(&run)
+        .await
+        .unwrap();
+    let launches = exec.launches.lock().unwrap().clone();
+    assert_eq!(
+        launches.len(),
+        1,
+        "the step launches once; steps: {:?}",
+        db.steps_of_run(&run).await.unwrap()
+    );
+    for (_, env) in &launches {
+        assert!(
+            env.contains(&("SCARAB_PARAM_REGION".into(), "us-east-1".into())),
+            "a step launched without the run's frozen params: {env:?}"
+        );
+    }
+}
+
+// `deploy` is `when:`-excluded on a manual dispatch; `build` always runs.
+const EXCLUDED_DEPLOY_YAML: &str = r#"
+on:
+  manual: {}
+steps:
+  - { id: deploy, image: busybox, command: ["deploy"], when: "event.kind == 'push'" }
+  - { id: build, image: busybox, command: ["build"] }
+"#;
+
+/// A tick that lands between creating a `when:`-excluded step and marking it
+/// Skipped must not launch that step.
+#[tokio::test]
+async fn a_tick_during_creation_never_launches_a_when_excluded_step() {
+    let forge = scarab_testkit::FakeForge::new()
+        .with_file(".scarab/ci.yaml", EXCLUDED_DEPLOY_YAML)
+        .with_commit("refs/heads/main", "sha-1");
+    let db = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+    let exec = Arc::new(RecordingExec::default());
+    tick_before_next(&db, &clock, &exec, "commit_step_transition");
+
+    let created = dispatch_run(
+        &forge,
+        db.as_ref(),
+        clock.as_ref(),
+        None,
+        "alice".into(),
+        repo(),
+        "refs/heads/main".into(),
+        "ci".into(),
+        std::collections::BTreeMap::new(),
+        DispatchKind::Manual,
+        None,
+    )
+    .await;
+    assert!(!db.interleave_armed(), "the tick ran inside run creation");
+    let launched: Vec<Vec<String>> = exec
+        .launches
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(cmd, _)| cmd.clone())
+        .collect();
+    assert!(
+        !launched.contains(&vec!["deploy".to_string()]),
+        "a `when:`-excluded step was launched: {launched:?}"
+    );
+    let run = created.expect("dispatch");
+
+    Scheduler::new(&*db as &dyn Db, &*clock as &dyn Clock, &*exec, "sched")
+        .tick(&run)
+        .await
+        .unwrap();
+    let steps = db.steps_of_run(&run).await.unwrap();
+    let status = |id: &str| steps.iter().find(|s| s.step.0 == id).unwrap().status;
+    assert_eq!(status("deploy"), scarab_engine::StepStatus::Skipped);
+    let launched: Vec<Vec<String>> = exec
+        .launches
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(cmd, _)| cmd.clone())
+        .collect();
+    assert_eq!(launched, vec![vec!["build".to_string()]]);
+}
+
+/// A tick that lands before the run's concurrency group is written must not
+/// start the run past a slot another run holds.
+#[tokio::test]
+async fn a_tick_during_creation_never_starts_a_run_past_its_concurrency_slot() {
+    let forge = scarab_testkit::FakeForge::new()
+        .with_file(".scarab/deploy.yaml", LITERAL_GROUP_YAML)
+        .with_commit("refs/heads/main", "sha-1");
+    let db = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+    let exec = Arc::new(RecordingExec {
+        keep_running: true,
+        ..Default::default()
+    });
+    let dispatch = || {
+        dispatch_run(
+            &forge,
+            db.as_ref(),
+            clock.as_ref(),
+            None,
+            "alice".into(),
+            repo(),
+            "refs/heads/main".into(),
+            "deploy".into(),
+            std::collections::BTreeMap::new(),
+            DispatchKind::Manual,
+            None,
+        )
+    };
+    let sched = Scheduler::new(&*db as &dyn Db, &*clock as &dyn Clock, &*exec, "sched");
+
+    // The holder takes the `deploy` slot.
+    let holder = dispatch().await.expect("dispatch the holder");
+    sched.tick(&holder).await.unwrap();
+    assert_eq!(
+        db.run_status(&holder).await.unwrap(),
+        Some(RunStatus::Running)
+    );
+
+    tick_before_next(&db, &clock, &exec, "set_run_concurrency");
+    let next = dispatch().await.expect("dispatch the next run");
+    assert!(!db.interleave_armed(), "the tick ran inside run creation");
+    sched.tick(&next).await.unwrap();
+    assert_eq!(
+        db.run_status(&next).await.unwrap(),
+        Some(RunStatus::Pending),
+        "the next run queues behind the slot holder"
+    );
+    assert_eq!(
+        exec.launches.lock().unwrap().len(),
+        1,
+        "only the holder launched"
     );
 }

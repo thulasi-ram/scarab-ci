@@ -123,3 +123,28 @@ async fn higher_priority_admits_first() {
 
     tdb.cleanup().await;
 }
+
+/// A run from `begin_run_creation` stays out of the scheduler's work list
+/// until `finish_run_creation`: a tick must never admit a run whose params,
+/// steps or `when:` skips are still being written.
+#[tokio::test]
+async fn a_run_being_created_is_not_active_until_finished() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+
+    let run = RunId("creating".into());
+    db.begin_run_creation(&run, 1, 1, Timestamp(1))
+        .await
+        .unwrap();
+    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Pending));
+    assert!(db.active_runs().await.unwrap().is_empty());
+
+    db.finish_run_creation(&run).await.unwrap();
+    assert_eq!(db.active_runs().await.unwrap(), vec![run]);
+
+    tdb.cleanup().await;
+}

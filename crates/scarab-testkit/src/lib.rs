@@ -185,6 +185,9 @@ struct InMemoryState {
     slots: HashMap<String, RunId>,
     /// Per-run creation time (for supersede ordering).
     run_created: HashMap<RunId, Timestamp>,
+    /// Runs from `begin_run_creation` whose creation has not finished —
+    /// left out of `active_runs`.
+    creating: std::collections::HashSet<RunId>,
     /// Per-run Workspace-Snapshot **pin** (ADR-0061 s5): `(by, at)` while pinned,
     /// absent otherwise — mirrors `runs.snapshots_pinned_{at,by}`.
     snapshot_pins: HashMap<RunId, (Option<String>, Timestamp)>,
@@ -689,6 +692,26 @@ impl Db for InMemoryDb {
         let mut st = self.state.lock().unwrap();
         st.runs.insert(run.clone(), RunStatus::Pending);
         st.run_created.insert(run.clone(), at);
+        Ok(())
+    }
+
+    async fn begin_run_creation(
+        &self,
+        run: &RunId,
+        _ir_version: u32,
+        _event_schema_version: u32,
+        at: Timestamp,
+    ) -> Result<(), DbError> {
+        // One lock: the run is never visible without its `creating` mark.
+        let mut st = self.state.lock().unwrap();
+        st.runs.insert(run.clone(), RunStatus::Pending);
+        st.run_created.insert(run.clone(), at);
+        st.creating.insert(run.clone());
+        Ok(())
+    }
+
+    async fn finish_run_creation(&self, run: &RunId) -> Result<(), DbError> {
+        self.state.lock().unwrap().creating.remove(run);
         Ok(())
     }
 
@@ -1436,7 +1459,7 @@ impl Db for InMemoryDb {
         let mut out: Vec<RunId> = st
             .runs
             .iter()
-            .filter(|(_, s)| !s.is_terminal())
+            .filter(|(r, s)| !s.is_terminal() && !st.creating.contains(*r))
             .map(|(r, _)| r.clone())
             .collect();
         // Priority desc, then creation order, then id — matches the adapter so
