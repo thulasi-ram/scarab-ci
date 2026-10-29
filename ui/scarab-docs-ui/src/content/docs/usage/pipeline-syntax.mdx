@@ -233,6 +233,9 @@ minted.
   org admin trusted ([Libraries](/scarab-ci/usage/libraries/#trusting-a-library-with-forge-credentials)).
   A repository's own steps never read that token. Such a step also starts with an empty
   workspace: no file another step wrote is present while the token is mounted.
+- **The forge connection** must be served over `https://`. A Run with a step that asks for
+  `forge_token` on a connection whose base URL is `http://` is refused: the token is never sent
+  over plain HTTP.
 - **A fork pull request** always gets `read`, whatever the step asks for.
 - **`write`** needs a GitHub App connection, and a Run governed by an environment that restricts
   the refs it deploys from. Where that environment has approvers, put a `gate: manual` in the

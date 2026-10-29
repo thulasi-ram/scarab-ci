@@ -262,6 +262,42 @@ async fn the_first_party_clone_step_gets_the_credential_and_no_env_carries_it() 
     assert_eq!(env["SCARAB_CLONE_URL"], "https://github.com/acme/web.git");
 }
 
+/// A forge connection served over `http://`: a Run with a forge-token Step
+/// is refused, so the token is never sent over plain HTTP. A Run without
+/// one is admitted.
+#[tokio::test]
+async fn a_forge_token_step_on_an_http_connection_is_refused() {
+    use scarab_forge::{ForgeConnection, ForgeConnectionStore, ForgeKind};
+    let db = InMemoryDb::new();
+    db.put_connection(&ForgeConnection {
+        id: "fj".into(),
+        kind: ForgeKind::Forgejo,
+        base_url: "http://git.example.com".into(),
+        credential_ref: "fj-token".into(),
+    })
+    .await
+    .unwrap();
+    db.bind_repo("fj", &repo(), "acme", "web").await.unwrap();
+    let libs = with_first_party_clone().await;
+    let forge = minting(&[(".scarab/ci.yaml", CHECKOUT_YAML)]);
+    let ports = AdmissionPorts {
+        connections: Some(&db),
+        ..AdmissionPorts::default().with_libraries(&libs)
+    };
+    let reason = refused_reason(&trigger(&db, &forge, ports, &push()).await);
+    assert!(
+        reason.contains("step `checkout/git`") && reason.contains("not `https://`"),
+        "{reason}"
+    );
+    let plain = "on: { push: {} }\nsteps: [{ id: s, image: busybox }]\n";
+    let forge = minting(&[(".scarab/ci.yaml", plain)]);
+    let ports = AdmissionPorts {
+        connections: Some(&db),
+        ..AdmissionPorts::default().with_libraries(&libs)
+    };
+    assert_eq!(trigger(&db, &forge, ports, &push()).await.runs.len(), 1);
+}
+
 /// The same clone library content, not first-party, from another source:
 /// the org has not trusted it, so it is the repository's choice of code.
 #[tokio::test]

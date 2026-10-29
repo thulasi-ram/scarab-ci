@@ -9,7 +9,8 @@
 //! it for the unit (on k8s, a per-Pod Secret) and hands it back when the
 //! Attempt ends, deleting it there; a minted token is then revoked by
 //! whichever control plane saw the end. A re-drive that replaces a token
-//! revokes the one it replaced.
+//! revokes the one it replaced. A token is never sent to an `http://`
+//! clone URL.
 //!
 //! Which Steps may have one is decided when the Run is created
 //! ([`forge_token_refusals`]), as fixed checks every Run passes whatever its
@@ -64,40 +65,52 @@ pub fn clone_url(kind: ForgeKind, base_url: &str, repo: &RepoRef) -> String {
     format!("{host}/{}/{}.git", repo.owner, repo.name)
 }
 
-/// The `event` values to store with a Run (ADR-0076 §9): the trigger's
-/// allowlisted fields that pass their check, with `repo.clone_url` computed
-/// from the connection registry (an unregistered repo is read from public
-/// github.com, anonymously). `Ok(Err(reasons))` refuses the Run: the
-/// Pipeline reads a field the trigger lacks, or one whose value fails its
-/// check.
-pub async fn event_facts(
+/// The clone URL of the trigger's repository, computed from the connection
+/// registry (an unregistered repo is read from public github.com,
+/// anonymously). `None` for a trigger with no repository.
+pub async fn repo_clone_url(
     event: &scarab_forge::Event,
     connections: Option<&dyn ForgeConnectionStore>,
+) -> Result<Option<String>, String> {
+    let Some(repo) = event.repo() else {
+        return Ok(None);
+    };
+    let resolved = match connections {
+        Some(c) => c
+            .resolve(repo)
+            .await
+            .map_err(|e| format!("forge connections: {e}"))?,
+        None => None,
+    };
+    Ok(Some(match &resolved {
+        Some(hit) => clone_url(hit.connection.kind, &hit.connection.base_url, repo),
+        None => clone_url(ForgeKind::GitHub, "https://api.github.com", repo),
+    }))
+}
+
+/// The `event` values to store with a Run (ADR-0076 §9): the trigger's
+/// allowlisted fields that pass their check, with `repo.clone_url` set to
+/// `clone_url` ([`repo_clone_url`]). `Ok(Err(reasons))` refuses the Run:
+/// the Pipeline reads a field the trigger lacks, or one whose value fails
+/// its check.
+pub fn event_facts(
+    event: &scarab_forge::Event,
+    clone_url: Option<&str>,
     ir: &PipelineIr,
-) -> Result<Result<serde_json::Map<String, serde_json::Value>, Vec<String>>, String> {
+) -> Result<serde_json::Map<String, serde_json::Value>, Vec<String>> {
     let mut fields = event.template_fields();
-    if let Some(repo) = event.repo() {
-        let resolved = match connections {
-            Some(c) => c
-                .resolve(repo)
-                .await
-                .map_err(|e| format!("forge connections: {e}"))?,
-            None => None,
-        };
-        let url = match &resolved {
-            Some(hit) => clone_url(hit.connection.kind, &hit.connection.base_url, repo),
-            None => clone_url(ForgeKind::GitHub, "https://api.github.com", repo),
-        };
+    if let Some(url) = clone_url {
         if let Some(serde_json::Value::Object(r)) = fields.get_mut("repo") {
-            r.insert("clone_url".into(), serde_json::Value::String(url));
+            r.insert("clone_url".into(), serde_json::Value::String(url.to_string()));
         }
     }
     let reads = scarab_pipeline::event::reads(ir);
-    Ok(scarab_pipeline::event::facts(
-        &fields,
-        event.trigger_kind().as_str(),
-        &reads,
-    ))
+    scarab_pipeline::event::facts(&fields, event.trigger_kind().as_str(), &reads)
+}
+
+/// Whether a forge token may be sent to `url`: only over HTTPS.
+fn https(url: &str) -> bool {
+    url.starts_with("https://")
 }
 
 /// What a Run's Environment says about `forge_token: write` (ADR-0076 §9).
@@ -124,12 +137,16 @@ pub struct ForgeTokenAdmission {
 
 /// Decide each `forge_token` Step of `ir` (see the module docs). `fork` is
 /// a fork pull request, or a Run locked out of its Environment's secrets:
-/// its Steps get `read`. A store failure is an `Err`: no Run.
+/// its Steps get `read`. `clone_url` is the repository's
+/// ([`repo_clone_url`]): a token is never sent over plain HTTP. A store
+/// failure is an `Err`: no Run.
+#[allow(clippy::too_many_arguments)]
 pub async fn forge_token_refusals(
     forge: &dyn ForgePort,
     libraries: Option<&dyn LibraryStore>,
     org: &str,
     repo: &RepoRef,
+    clone_url: Option<&str>,
     ir: &PipelineIr,
     fork: bool,
     write: WriteGovernance,
@@ -138,6 +155,17 @@ pub async fn forge_token_refusals(
     let asking: Vec<&scarab_pipeline::StepSpec> =
         ir.steps.iter().filter(|s| s.forge_token.is_some()).collect();
     if asking.is_empty() {
+        return Ok(out);
+    }
+    if let Some(url) = clone_url.filter(|u| !https(u)) {
+        for step in &asking {
+            out.refusals.push(format!(
+                "step `{}` asks for `forge_token`, and this repository's clone URL `{url}` is \
+                 not `https://`; a forge token is never sent over plain HTTP, so set the forge \
+                 connection's base URL to `https://`",
+                step.id
+            ));
+        }
         return Ok(out);
     }
     // A forge that cannot say is treated as handing out a long-lived token:
@@ -359,6 +387,31 @@ impl ForgeCredentialExecutor {
         }))
     }
 
+    /// Refuse to mint when the Run's stored `event.repo.clone_url` is not
+    /// `https://`. Run creation refuses such a Run; this covers a Run
+    /// stored before that check. A Run whose Pipeline does not read the URL
+    /// has none stored, and Run creation's check stands.
+    async fn ensure_https_clone_url(&self, step: &StepRun) -> Result<(), ExecError> {
+        let Some((db, _)) = &self.libraries else {
+            return Ok(());
+        };
+        let facts = db
+            .run_event_facts(&step.run)
+            .await
+            .map_err(|e| ExecError::Other(format!("reading the Run's event values: {e}")))?;
+        match facts
+            .get("repo")
+            .and_then(|r| r.get("clone_url"))
+            .and_then(|u| u.as_str())
+        {
+            Some(url) if !https(url) => Err(ExecError::Refused(format!(
+                "the Run's clone URL `{url}` is not `https://`, and a forge token is never sent \
+                 over plain HTTP; nothing was minted"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
     /// Revoke every token minted for `handle`'s unit: the ones this process
     /// minted, and the one the unit holds, which the executor removes as it
     /// hands it back. A long-lived token is removed and never revoked. A
@@ -550,6 +603,9 @@ impl Executor for ForgeCredentialExecutor {
         } else {
             config.access
         };
+        // The token goes to the URL the Run's clone library fetches from:
+        // never over plain HTTP.
+        self.ensure_https_clone_url(step).await?;
         // Whether this Step may hold the token is checked again here, from
         // what the connection is now (see `long_lived_refusal`). A Step that
         // may hold only a minted token asks first whether the connection

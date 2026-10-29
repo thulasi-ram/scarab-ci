@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use scarab_engine::ports::ExecState;
 use scarab_engine::{
-    Attempt, AttemptId, AttemptOutcome, Executor, ForgeTokenConfig, RunId, StepId, StepRun,
+    Attempt, AttemptId, AttemptOutcome, Db, Executor, ForgeTokenConfig, RunId, StepId, StepRun,
     StepSpec, StepStatus, Timestamp,
 };
 use scarab_forge::{ForgeKind, RepoRef};
@@ -223,6 +223,26 @@ async fn a_long_lived_token_is_handed_over_and_never_revoked() {
     assert!(!inner.holds_forge_credential(&handle), "a kept unit still holds the token");
 }
 
+/// A Run stored with an `http://` clone URL (before Run creation refused
+/// one): the launch mints nothing, so the token never goes over plain HTTP.
+#[tokio::test]
+async fn a_launch_for_a_run_with_an_http_clone_url_mints_nothing() {
+    let db = Arc::new(InMemoryDb::new());
+    let facts = serde_json::json!({ "repo": { "clone_url": "http://git.example.com/acme/web.git" } });
+    db.set_run_event_facts(&RunId("r1".into()), facts.as_object().unwrap())
+        .await
+        .unwrap();
+    let inner = Arc::new(FakeExecutor::new());
+    let forge = Arc::new(FakeForge::new().with_minted_tokens());
+    let exec = ForgeCredentialExecutor::new(inner.clone(), forge.clone())
+        .with_libraries(db.clone(), Arc::new(InMemoryLibraries::new()));
+    let err = exec
+        .launch(&step_run("checkout/git"), &token_spec(ForgeToken::Read))
+        .await
+        .expect_err("refused");
+    assert!(err.to_string().contains("not `https://`"), "{err}");
+    assert_eq!(forge.credential_calls(), 0);
+}
 
 /// Each launch on a long-lived connection checks the org trusts the Step's
 /// library now: once the admin removes the trust, a rerun or re-drive of

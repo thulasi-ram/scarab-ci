@@ -4941,10 +4941,10 @@ async fn admit_and_create_run(
     // ADR-0076 §9: the `event` values the Pipeline's templates read, checked
     // and fixed now, and which Steps may receive a forge credential. Both are
     // fixed checks, decided before any Policy is consulted.
-    let facts = match forge_token::event_facts(event, ports.connections, ir)
+    let clone_url = forge_token::repo_clone_url(event, ports.connections)
         .await
-        .map_err(|e| TriggerError::Db(DbError::Other(e)))?
-    {
+        .map_err(|e| TriggerError::Db(DbError::Other(e)))?;
+    let facts = match forge_token::event_facts(event, clone_url.as_deref(), ir) {
         Ok(facts) => facts,
         Err(messages) => {
             return Ok(Admission::Refused(AdmissionRefusal::EventField { messages }))
@@ -4962,6 +4962,7 @@ async fn admit_and_create_run(
         ports.libraries,
         &repo.owner,
         repo,
+        clone_url.as_deref(),
         ir,
         event.is_fork_pr() || gov.locked_out(),
         write,
