@@ -116,6 +116,13 @@ impl CloneEnrichingExecutor {
 
 #[async_trait]
 impl Executor for CloneEnrichingExecutor {
+    async fn gate_refusal(
+        &self,
+        gate: &scarab_engine::StepRun,
+    ) -> Result<Option<String>, scarab_engine::ExecError> {
+        self.inner.gate_refusal(gate).await
+    }
+
     async fn infra_condition(
         &self,
         handle: &ExecHandle,

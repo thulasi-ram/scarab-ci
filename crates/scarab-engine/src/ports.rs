@@ -1251,6 +1251,19 @@ pub trait Executor: Send + Sync {
         handle: &ExecHandle,
     ) -> Result<Option<crate::ProvisioningReport>, ExecError>;
 
+    /// Why gate `gate` may not pass now, or `Ok(None)`. The scheduler asks
+    /// before it releases a gate on its own verdict (a timer that elapsed),
+    /// and fails the gate with this reason instead; the API's release and
+    /// approve routes make the same check themselves. The yank check of
+    /// ADR-0076 §6 answers here, the same check a launch makes, because a
+    /// gate launches nothing and so never reaches [`launch`](Self::launch).
+    ///
+    /// **Deliberately REQUIRED — no default**, for the reason spelled out on
+    /// [`workspace_provisioning`](Self::workspace_provisioning): a decorator
+    /// that inherited a `None` default would release a gate the executor it
+    /// wraps refuses, and nothing would fail. Decorators forward it.
+    async fn gate_refusal(&self, gate: &StepRun) -> Result<Option<String>, ExecError>;
+
     /// The backend's current **infra condition** for a launched unit, or
     /// `Ok(None)` when it has nothing noteworthy to say — the unit is running,
     /// or is merely early in a normal start (ADR-0068).

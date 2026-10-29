@@ -132,6 +132,13 @@ impl Executor for HookExec {
     ) -> Result<Option<scarab_engine::ProvisioningReport>, ExecError> {
         self.inner.workspace_provisioning(handle).await
     }
+    async fn gate_refusal(
+        &self,
+        gate: &scarab_engine::StepRun,
+    ) -> Result<Option<String>, scarab_engine::ExecError> {
+        self.inner.gate_refusal(gate).await
+    }
+
     async fn infra_condition(
         &self,
         handle: &ExecHandle,

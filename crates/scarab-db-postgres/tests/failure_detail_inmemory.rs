@@ -128,6 +128,13 @@ impl scarab_engine::Executor for RefusingExec {
     ) -> Result<Option<String>, scarab_engine::ExecError> {
         Ok(None)
     }
+    async fn gate_refusal(
+        &self,
+        _gate: &scarab_engine::StepRun,
+    ) -> Result<Option<String>, scarab_engine::ExecError> {
+        Ok(None)
+    }
+
     async fn infra_condition(
         &self,
         _handle: &scarab_engine::ports::ExecHandle,

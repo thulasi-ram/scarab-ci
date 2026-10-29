@@ -3798,10 +3798,22 @@ impl<'a> Scheduler<'a> {
                 .and_then(|m| m.get(gate.step.0.as_str()).cloned())
                 .unwrap_or_default();
             let now = self.clock.now().await;
-            if let Some(verdict) = self
+            if let Some(mut verdict) = self
                 .gate_verdict(run, gate, &attempt, &gate_settings, now)
                 .await?
             {
+                // A pass is the executor's to refuse (ADR-0076 §6: a gate
+                // from a yanked library version), as a launch is: the gate
+                // fails with the reason instead of releasing.
+                if verdict.passed {
+                    if let Some(refusal) = self.executor.gate_refusal(gate).await? {
+                        verdict = GateVerdict {
+                            passed: false,
+                            reason: format!("the gate cannot release: {refusal}"),
+                            expired: false,
+                        };
+                    }
+                }
                 // Fenced on THIS wait: a wait superseded or cancelled since the
                 // snapshot takes no verdict.
                 resolve_gate(

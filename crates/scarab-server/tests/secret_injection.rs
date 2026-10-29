@@ -28,6 +28,13 @@ impl Executor for CapturingExec {
         Ok(None)
     }
 
+    async fn gate_refusal(
+        &self,
+        _gate: &scarab_engine::StepRun,
+    ) -> Result<Option<String>, scarab_engine::ExecError> {
+        Ok(None)
+    }
+
     async fn infra_condition(
         &self,
         _handle: &ExecHandle,
@@ -252,6 +259,13 @@ impl Executor for SpecCapturingExec {
         Ok(None)
     }
 
+    async fn gate_refusal(
+        &self,
+        _gate: &scarab_engine::StepRun,
+    ) -> Result<Option<String>, scarab_engine::ExecError> {
+        Ok(None)
+    }
+
     async fn infra_condition(
         &self,
         _handle: &ExecHandle,
@@ -449,6 +463,13 @@ impl Executor for ConditionExec {
         &self,
         _handle: &ExecHandle,
     ) -> Result<Option<String>, ExecError> {
+        Ok(None)
+    }
+
+    async fn gate_refusal(
+        &self,
+        _gate: &scarab_engine::StepRun,
+    ) -> Result<Option<String>, scarab_engine::ExecError> {
         Ok(None)
     }
 

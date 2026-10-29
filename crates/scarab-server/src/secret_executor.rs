@@ -317,6 +317,20 @@ impl Executor for SecretInjectingExecutor {
         })
     }
 
+    async fn gate_refusal(
+        &self,
+        gate: &scarab_engine::StepRun,
+    ) -> Result<Option<String>, ExecError> {
+        // ADR-0076 §6: a gate inlined from a yanked library version does not
+        // pass, as a step from one does not launch. Then whatever the wrapped
+        // executor says.
+        match self.ensure_not_yanked(gate).await {
+            Ok(()) => self.inner.gate_refusal(gate).await,
+            Err(ExecError::Refused(refusal)) => Ok(Some(refusal)),
+            Err(e) => Err(e),
+        }
+    }
+
     async fn infra_condition(
         &self,
         handle: &ExecHandle,

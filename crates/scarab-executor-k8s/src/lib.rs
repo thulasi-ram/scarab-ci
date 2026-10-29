@@ -2939,6 +2939,13 @@ impl Executor for K8sExecutor {
     /// do old wsfetch images) ⇒ `None`; malformed where a summary was
     /// expected (kubelet truncation, garbage) ⇒ `None` + a warn — collision
     /// evidence must never fail a settle that would otherwise succeed.
+    async fn gate_refusal(
+        &self,
+        _gate: &scarab_engine::StepRun,
+    ) -> Result<Option<String>, scarab_engine::ExecError> {
+        Ok(None)
+    }
+
     async fn infra_condition(
         &self,
         handle: &ExecHandle,

@@ -860,7 +860,6 @@ async fn yank_refuses_a_rerun_of_a_matrix_expanded_library_step() {
 /// A timer gate inlined from a yanked version does not release when its
 /// timer passes (ADR-0076 §6: gates whose origin includes a yanked version
 /// are refused at `gate.resolve`), in a Run created before the yank.
-#[ignore = "red: s2 r1"]
 #[tokio::test]
 async fn yank_holds_a_timer_gate_from_a_yanked_version() {
     const TIMED: &str = "kind: library\nsteps:\n  - { id: soak, gate: timer, gate_after: 60 }\n  - { id: helm, image: alpine/helm@sha256:aaaa, needs: [soak] }\n";
@@ -883,6 +882,25 @@ async fn yank_holds_a_timer_gate_from_a_yanked_version() {
         step_status(&db, &run, "ship/soak").await,
         StepStatus::Succeeded,
         "a timer gate from a yanked version released"
+    );
+    // It fails with the yank as its reason, rather than waiting on a timer
+    // that has passed.
+    assert_eq!(
+        step_status(&db, &run, "ship/soak").await,
+        StepStatus::Failed
+    );
+    let attempts = db
+        .attempts_of_step(&run, &StepId("ship/soak".into()))
+        .await
+        .unwrap();
+    let detail = format!("{:?}", attempts.last().unwrap());
+    assert!(
+        detail.contains("yanked") && detail.contains(REASON),
+        "{detail}"
+    );
+    assert_ne!(
+        step_status(&db, &run, "ship/helm").await,
+        StepStatus::Succeeded
     );
 }
 

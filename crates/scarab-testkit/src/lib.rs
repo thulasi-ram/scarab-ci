@@ -2698,6 +2698,13 @@ impl Executor for FakeExecutor {
         Ok(self.inner.lock().unwrap().cache_saves.get(&step).cloned())
     }
 
+    async fn gate_refusal(
+        &self,
+        _gate: &scarab_engine::StepRun,
+    ) -> Result<Option<String>, scarab_engine::ExecError> {
+        Ok(None)
+    }
+
     async fn infra_condition(
         &self,
         handle: &ExecHandle,
