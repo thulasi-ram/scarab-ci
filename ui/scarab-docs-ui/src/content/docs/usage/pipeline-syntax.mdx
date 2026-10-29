@@ -221,7 +221,9 @@ mounts it as two files: `/scarab/secrets/forge-token` and `/scarab/secrets/forge
 never an environment variable. A token GitHub minted is revoked when the attempt ends.
 
 Whether a step may have one is decided when the Run is created; a Run that asks for more is
-refused with the reason:
+refused with the reason. Each launch checks again, from the connection and the org's trust as
+they are then: a step that may no longer have the token fails with the reason, and nothing is
+minted.
 
 - **On a GitHub App connection**, which mints a short-lived token for one repository, any step may
   ask. **On a Forgejo or GitHub token connection**, which hands out one long-lived token, only a
@@ -233,8 +235,12 @@ refused with the reason:
 - **`write`** needs a GitHub App connection, and a Run governed by an environment that restricts
   the refs it deploys from. Where that environment has approvers, put a `gate: manual` in the
   step's `needs`.
+- **The `image` and `command`** of a step with `forge_token` are written out in full: a
+  `${{ … }}` in either is a compile error. An input, a result or an `event` value reaches the step
+  only through `env:`.
 - **A library input** that reaches a step with `forge_token` must be a `boolean`, a `number`, a
   `choice`, or a `string` with a `validate:` rule.
+- A step with `forge_token` may not have a `cache`.
 - An invoke step's `placement_profiles` is never carried onto a step with `forge_token`.
 
 The local executor refuses a step with `forge_token`; it needs the Kubernetes executor.
@@ -512,11 +518,14 @@ a library. Only fields whose values Scarab can check are readable:
 | `fork` | `true` for a pull request from a fork |
 | `run` | the upstream Run's id |
 | `repo.clone_url` | the repository's clone URL, from its forge connection |
-| `repo.owner`, `repo.name` | letters, digits, `.`, `_` and `-`; no leading `-` |
-| `ref`, `branch`, `tag` | letters, digits, `.`, `_`, `/`, `@` and `-`; no leading `-`, no `..` or `//` |
+| `repo.owner`, `repo.name` | letters, digits, `.`, `_` and `-`; no leading `-`, not `.` or `..`; at most 100 bytes |
+| `ref`, `branch`, `tag` | letters, digits, `.`, `_`, `/`, `@` and `-`; no leading `-`, no `..` or `//`; at most 255 bytes |
+
+`repo.clone_url` is at most 2048 bytes, `run` 64 and `kind` 32.
 
 `actor`, a comment's `body` and `schedule` are not readable, and neither is `${{ event }}` as a
-whole: each is a compile error. A `when:` still sees the whole event.
+whole: each is a compile error. The same holds for a `concurrency.group`, which renders against the
+same checked values. A `when:` still sees the whole event.
 
 The values are checked and stored when the Run is created, so a rerun reads the same ones. A
 pipeline that reads a field the trigger does not have, or one whose value fails its check, is
