@@ -544,7 +544,8 @@ impl K8sExecutor {
     /// Upsert the per-Pod Secret carrying a Step's forge credential (ADR-0076
     /// §9): two keys, `forge-token` and `forge-username`, mounted read-only as
     /// files on tmpfs by the kubelet. The token is never in env, a URL or
-    /// argv. Owner-referenced to the Pod so it is garbage-collected with it.
+    /// argv. Owner-referenced to the Pod so it is garbage-collected with it,
+    /// and deleted when the Attempt ends ([`Executor::take_forge_credential`]).
     /// A re-drive replaces it with the credential minted for that launch.
     async fn ensure_forge_token_secret(
         &self,
@@ -552,39 +553,12 @@ impl K8sExecutor {
         pod: &Pod,
         spec: &StepSpec,
     ) -> Result<(), ExecError> {
-        let Some(cred) = spec
-            .forge_token
-            .as_ref()
-            .and_then(|c| c.credential.as_ref())
-        else {
+        let Some(secret) = forge_token_secret(pod_name, &self.namespace, pod, spec) else {
             return Ok(());
         };
         let client = self.client.clone().ok_or(ExecError::Unavailable)?;
         let secrets: Api<k8s_openapi::api::core::v1::Secret> =
             Api::namespaced(client, &self.namespace);
-        let secret = k8s_openapi::api::core::v1::Secret {
-            metadata: ObjectMeta {
-                name: Some(forge_token_secret_name(pod_name)),
-                namespace: Some(self.namespace.clone()),
-                owner_references: pod.metadata.uid.clone().map(|uid| {
-                    vec![
-                        k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
-                            api_version: "v1".into(),
-                            kind: "Pod".into(),
-                            name: pod_name.to_string(),
-                            uid,
-                            ..Default::default()
-                        },
-                    ]
-                }),
-                ..Default::default()
-            },
-            string_data: Some(std::collections::BTreeMap::from([
-                (FORGE_TOKEN_KEY.to_string(), cred.token.clone()),
-                (FORGE_USERNAME_KEY.to_string(), cred.username.clone()),
-            ])),
-            ..Default::default()
-        };
         match secrets.create(&PostParams::default(), &secret).await {
             Ok(_) => Ok(()),
             // Exists: replace the token in place (a re-drive mints a new one).
@@ -1637,6 +1611,88 @@ fn content_type_of(name: &str) -> &'static str {
 /// the Pod, so it is garbage-collected with it).
 fn forge_token_secret_name(pod_name: &str) -> String {
     format!("{pod_name}-token")
+}
+
+/// Annotations on the forge-token Secret: the repository the credential is
+/// for, and whether the forge minted it. Annotations, not data keys, so
+/// they are not mounted into the Step. Whichever control plane sees the
+/// Attempt end reads them back to revoke a minted token (ADR-0076 §9).
+const ANNOTATION_FORGE_OWNER: &str = "scarab.io/forge-repo-owner";
+const ANNOTATION_FORGE_NAME: &str = "scarab.io/forge-repo-name";
+const ANNOTATION_FORGE_MINTED: &str = "scarab.io/forge-token-minted";
+
+/// The forge-token Secret for `spec`'s credential, or `None` when the
+/// launch carries none.
+fn forge_token_secret(
+    pod_name: &str,
+    namespace: &str,
+    pod: &Pod,
+    spec: &StepSpec,
+) -> Option<k8s_openapi::api::core::v1::Secret> {
+    let config = spec.forge_token.as_ref()?;
+    let cred = config.credential.as_ref()?;
+    Some(k8s_openapi::api::core::v1::Secret {
+        metadata: ObjectMeta {
+            name: Some(forge_token_secret_name(pod_name)),
+            namespace: Some(namespace.to_string()),
+            annotations: Some(std::collections::BTreeMap::from([
+                (ANNOTATION_FORGE_OWNER.to_string(), config.owner.clone()),
+                (ANNOTATION_FORGE_NAME.to_string(), config.name.clone()),
+                (ANNOTATION_FORGE_MINTED.to_string(), cred.minted.to_string()),
+            ])),
+            owner_references: pod.metadata.uid.clone().map(|uid| {
+                vec![
+                    k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+                        api_version: "v1".into(),
+                        kind: "Pod".into(),
+                        name: pod_name.to_string(),
+                        uid,
+                        ..Default::default()
+                    },
+                ]
+            }),
+            ..Default::default()
+        },
+        string_data: Some(std::collections::BTreeMap::from([
+            (FORGE_TOKEN_KEY.to_string(), cred.token.clone()),
+            (FORGE_USERNAME_KEY.to_string(), cred.username.clone()),
+        ])),
+        ..Default::default()
+    })
+}
+
+/// The credential a forge-token Secret holds, read back as the API server
+/// returns it (`data`, or `stringData` as written). `None` when it lacks
+/// the token or the repository. A Secret written before the `minted`
+/// annotation existed reads as long-lived: never revoked.
+fn mounted_forge_credential(
+    secret: &k8s_openapi::api::core::v1::Secret,
+) -> Option<scarab_engine::MountedForgeCredential> {
+    let value = |key: &str| -> Option<String> {
+        secret
+            .data
+            .as_ref()
+            .and_then(|d| d.get(key))
+            .and_then(|b| String::from_utf8(b.0.clone()).ok())
+            .or_else(|| secret.string_data.as_ref().and_then(|d| d.get(key)).cloned())
+    };
+    let annotation = |key: &str| -> Option<String> {
+        secret
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get(key))
+            .cloned()
+    };
+    Some(scarab_engine::MountedForgeCredential {
+        owner: annotation(ANNOTATION_FORGE_OWNER)?,
+        name: annotation(ANNOTATION_FORGE_NAME)?,
+        credential: scarab_engine::ForgeCredential {
+            username: value(FORGE_USERNAME_KEY).unwrap_or_default(),
+            token: value(FORGE_TOKEN_KEY)?,
+            minted: annotation(ANNOTATION_FORGE_MINTED).as_deref() == Some("true"),
+        },
+    })
 }
 
 /// Is the named (init) container currently in a `running` state?
@@ -2936,6 +2992,35 @@ impl Executor for K8sExecutor {
         _gate: &scarab_engine::StepRun,
     ) -> Result<Option<String>, scarab_engine::ExecError> {
         Ok(None)
+    }
+
+    /// Read the Pod's forge-token Secret, then delete it (ADR-0076 §9): a
+    /// kept Pod no longer leaves a long-lived token in etcd, and the caller
+    /// revokes a minted one whichever replica minted it. Gone already
+    /// (taken, or collected with its Pod): `Ok(None)`.
+    async fn take_forge_credential(
+        &self,
+        handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
+        let client = self.client.clone().ok_or(ExecError::Unavailable)?;
+        let secrets: Api<k8s_openapi::api::core::v1::Secret> =
+            Api::namespaced(client, &self.namespace);
+        let name = forge_token_secret_name(&handle.0);
+        let Some(secret) = secrets
+            .get_opt(&name)
+            .await
+            .map_err(|e| ExecError::Other(format!("forge token secret: {e}")))?
+        else {
+            return Ok(None);
+        };
+        match secrets.delete(&name, &DeleteParams::default()).await {
+            Ok(_) => {}
+            // Another control plane took it between the read and the delete;
+            // revoking the same token twice is harmless.
+            Err(kube::Error::Api(ae)) if ae.code == 404 => {}
+            Err(e) => return Err(ExecError::Other(format!("forge token secret: {e}"))),
+        }
+        Ok(mounted_forge_credential(&secret))
     }
 
     async fn infra_condition(
@@ -9703,6 +9788,7 @@ mod tests {
             credential: Some(ForgeCredential {
                 username: "x-access-token".into(),
                 token: "sekret-token".into(),
+                minted: true,
             }),
         });
         let fetch = sample_fetch();
@@ -9776,6 +9862,50 @@ mod tests {
             .iter()
             .flatten()
             .all(|v| v.name != FORGE_SECRETS_VOLUME));
+    }
+
+    /// The forge-token Secret carries what a control plane that did not
+    /// mint the token needs to revoke it: the repository and whether it was
+    /// minted, as annotations the Step does not see. Read back the way the
+    /// API server returns it (`data`, not `stringData`).
+    #[test]
+    fn the_forge_token_secret_reads_back_as_the_credential_it_holds() {
+        use scarab_engine::{ForgeCredential, ForgeTokenConfig};
+        let mut spec = busybox();
+        spec.forge_token = Some(ForgeTokenConfig {
+            access: scarab_pipeline::ForgeToken::Read,
+            owner: "acme".into(),
+            name: "web".into(),
+            read_only: false,
+            trusted_library: None,
+            credential: Some(ForgeCredential {
+                username: "x-access-token".into(),
+                token: "ghs_minted".into(),
+                minted: true,
+            }),
+        });
+        let mut secret = forge_token_secret("scarab-x", "ns", &Pod::default(), &spec).unwrap();
+        let data = secret.string_data.take().unwrap();
+        secret.data = Some(
+            data.into_iter()
+                .map(|(k, v)| (k, k8s_openapi::ByteString(v.into_bytes())))
+                .collect(),
+        );
+        let got = mounted_forge_credential(&secret).unwrap();
+        assert_eq!((got.owner.as_str(), got.name.as_str()), ("acme", "web"));
+        assert_eq!(got.credential.token, "ghs_minted");
+        assert!(got.credential.minted);
+        // No annotation (a Secret from before it existed): long-lived.
+        secret
+            .metadata
+            .annotations
+            .as_mut()
+            .unwrap()
+            .remove(ANNOTATION_FORGE_MINTED);
+        assert!(!mounted_forge_credential(&secret).unwrap().credential.minted);
+        // No credential on the launch: no Secret.
+        spec.forge_token.as_mut().unwrap().credential = None;
+        assert!(forge_token_secret("scarab-x", "ns", &Pod::default(), &spec).is_none());
     }
 
     /// The Pipeline check refuses a templated value on a `forge_token` Step

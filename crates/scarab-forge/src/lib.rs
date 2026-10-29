@@ -614,6 +614,14 @@ pub struct CheckoutCredential {
     /// Whether the credential is read-only. A fork-PR checkout MUST be
     /// read-only (ADR-0045); an adapter must honor `read_only: true`.
     pub read_only: bool,
+    /// The forge minted this token for this request, scoped to one
+    /// repository, and it ends on its own (a GitHub App installation token).
+    /// `false`: the connection's one long-lived token (a Forgejo token, a
+    /// GitHub token connection). A launch decides from this, the credential
+    /// it holds, which Steps may receive it (ADR-0076 §9); absent reads as
+    /// long-lived.
+    #[serde(default)]
+    pub minted: bool,
 }
 
 /// A derived **registry credential** for the forge's own container registry

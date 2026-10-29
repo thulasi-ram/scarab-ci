@@ -214,10 +214,15 @@ async fn a_long_lived_token_is_handed_over_and_never_revoked() {
         .unwrap()
         .credential
         .is_some());
+    assert!(inner.holds_forge_credential(&handle));
     inner.script_outcome(ExecState::Succeeded);
     exec.poll(&handle).await.unwrap();
     assert!(forge.revoked().is_empty(), "the connection's own token is not revoked");
+    // The unit no longer holds it once the Attempt ends (on k8s: the token
+    // Secret is deleted, though the Pod is kept).
+    assert!(!inner.holds_forge_credential(&handle), "a kept unit still holds the token");
 }
+
 
 /// Each launch on a long-lived connection checks the org trusts the Step's
 /// library now: once the admin removes the trust, a rerun or re-drive of

@@ -150,6 +150,13 @@ impl Executor for SeamExec {
     ) -> Result<Option<scarab_engine::InfraCondition>, ExecError> {
         self.inner.infra_condition(handle).await
     }
+
+    async fn take_forge_credential(
+        &self,
+        handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
+        self.inner.take_forge_credential(handle).await
+    }
 }
 
 // ===========================================================================

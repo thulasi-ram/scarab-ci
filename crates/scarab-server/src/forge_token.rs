@@ -4,9 +4,12 @@
 //! by the forge port when each Attempt launches — a re-drive included — and
 //! mounted into its container as the files `/scarab/secrets/forge-token` and
 //! `/scarab/secrets/forge-username`, never as an environment variable. The
-//! credential lives **in memory only**: the stored spec carries the access
-//! and the repository, never a token. A minted token is revoked when the
-//! Attempt ends, or when a re-drive of the Attempt replaces it.
+//! credential lives **in memory only** in the control plane: the stored spec
+//! carries the access and the repository, never a token. The executor holds
+//! it for the unit (on k8s, a per-Pod Secret) and hands it back when the
+//! Attempt ends, deleting it there; a minted token is then revoked by
+//! whichever control plane saw the end. A re-drive that replaces a token
+//! revokes the one it replaced.
 //!
 //! Which Steps may have one is decided when the Run is created
 //! ([`forge_token_refusals`]), as fixed checks every Run passes whatever its
@@ -285,9 +288,11 @@ pub struct ForgeCredentialExecutor {
     /// §6), so a yanked Step is refused before a credential is asked for,
     /// and to check at launch that the org still trusts a Step's library.
     libraries: Option<(Arc<dyn Db>, Arc<dyn LibraryStore>)>,
-    /// The tokens minted for each launched unit, revoked when its Attempt
-    /// ends. In memory: a control plane that restarts first leaves a minted
-    /// token to its own expiry (an hour on GitHub).
+    /// The tokens this process minted for each launched unit, so a re-drive
+    /// that replaces one can revoke it. When the Attempt ends the token is
+    /// also read back from the unit itself
+    /// ([`Executor::take_forge_credential`]), so a control plane that did
+    /// not mint it, or restarted since, still revokes it.
     minted: Mutex<HashMap<String, Vec<(RepoRef, String)>>>,
 }
 
@@ -354,11 +359,35 @@ impl ForgeCredentialExecutor {
         }))
     }
 
-    /// Revoke every token minted for `handle`'s unit. A failed revocation is
-    /// logged: the token still expires on its own.
+    /// Revoke every token minted for `handle`'s unit: the ones this process
+    /// minted, and the one the unit holds, which the executor removes as it
+    /// hands it back. A long-lived token is removed and never revoked. A
+    /// failed revocation is logged: the token still expires on its own.
     async fn revoke(&self, handle: &ExecHandle) {
-        let tokens = self.minted.lock().unwrap().remove(&handle.0);
-        for (repo, token) in tokens.into_iter().flatten() {
+        let mut tokens = self
+            .minted
+            .lock()
+            .unwrap()
+            .remove(&handle.0)
+            .unwrap_or_default();
+        match self.inner.take_forge_credential(handle).await {
+            Ok(Some(held)) if held.credential.minted => {
+                if !tokens.iter().any(|(_, t)| *t == held.credential.token) {
+                    let repo = RepoRef {
+                        owner: held.owner,
+                        name: held.name,
+                    };
+                    tokens.push((repo, held.credential.token));
+                }
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                unit = %handle.0,
+                error = %e,
+                "reading back a unit's forge token failed; it expires on its own"
+            ),
+        }
+        for (repo, token) in tokens {
             if let Err(e) = self.forge.revoke_credential(&repo, &token).await {
                 tracing::warn!(
                     repo = %format!("{}/{}", repo.owner, repo.name),
@@ -470,6 +499,15 @@ impl Executor for ForgeCredentialExecutor {
         self.inner.infra_condition(handle).await
     }
 
+    async fn take_forge_credential(
+        &self,
+        handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
+        // Forward. This decorator takes the credential itself when the
+        // Attempt ends (`revoke`); nothing else calls this through it.
+        self.inner.take_forge_credential(handle).await
+    }
+
     async fn workspace_provisioning(
         &self,
         handle: &ExecHandle,
@@ -513,12 +551,14 @@ impl Executor for ForgeCredentialExecutor {
             config.access
         };
         // Whether this Step may hold the token is checked again here, from
-        // what the connection is now (see `long_lived_refusal`). A forge
+        // what the connection is now (see `long_lived_refusal`). A Step that
+        // may hold only a minted token asks first whether the connection
+        // mints, so a long-lived token is not fetched for it at all. A forge
         // that cannot say is treated as handing out a long-lived token.
-        let mints = self.forge.mints_repo_tokens(&repo).await.unwrap_or(false);
-        if !mints {
-            if let Some(reason) = self.long_lived_refusal(config, access).await? {
-                return Err(ExecError::Refused(reason));
+        let refusal = self.long_lived_refusal(config, access).await?;
+        if let Some(reason) = &refusal {
+            if !self.forge.mints_repo_tokens(&repo).await.unwrap_or(false) {
+                return Err(ExecError::Refused(reason.clone()));
             }
         }
         // Minted fresh for each launch (short TTL by contract).
@@ -546,6 +586,18 @@ impl Executor for ForgeCredentialExecutor {
                     .map_err(|e| ExecError::Launch(format!("minting a write forge token: {e}")))?,
             ),
         };
+        // The decision rests on the credential the forge handed over, not on
+        // the answer `mints_repo_tokens` gave: the connection may have been
+        // swapped between the two calls. A long-lived token for a Step that
+        // may hold only a minted one is dropped, and the Step fails.
+        if let (Some(reason), Some(c)) = (&refusal, &credential) {
+            if !c.minted {
+                return Err(ExecError::Refused(format!(
+                    "{reason} (the connection handed over a long-lived token although it said \
+                     it mints short-lived ones; it changed during the launch)"
+                )));
+            }
+        }
         let mut enriched = spec.clone();
         if let Some(f) = enriched.forge_token.as_mut() {
             f.access = access;
@@ -554,10 +606,12 @@ impl Executor for ForgeCredentialExecutor {
             f.credential = Some(ForgeCredential {
                 username: c.username.clone(),
                 token: c.token.clone(),
+                minted: c.minted,
             });
         }
         let launched = self.inner.launch(step, &enriched).await;
-        if let Some(c) = credential {
+        // A long-lived token is never revoked: only a minted one is tracked.
+        if let Some(c) = credential.filter(|c| c.minted) {
             match &launched {
                 // A re-drive of the same Attempt replaces the token the unit
                 // holds (the executor writes the new one over it): the one

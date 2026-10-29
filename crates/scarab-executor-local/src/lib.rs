@@ -155,6 +155,15 @@ impl Executor for LocalExecutor {
         Ok(None)
     }
 
+    async fn take_forge_credential(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
+        // The local executor refuses a Step with `forge_token`: it never
+        // mounts one.
+        Ok(None)
+    }
+
     async fn workspace_provisioning(
         &self,
         _handle: &ExecHandle,

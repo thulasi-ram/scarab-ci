@@ -1102,18 +1102,20 @@ impl ForgePort for GithubForge {
         read_only: bool,
     ) -> Result<CheckoutCredential, ForgeError> {
         let now = now_unix_secs();
-        let token = match &self.auth {
-            Auth::Token(t) => t.clone(),
-            Auth::App { .. } => {
+        let (token, minted) = match &self.auth {
+            Auth::Token(t) => (t.clone(), false),
+            Auth::App { .. } => (
                 self.repo_installation_token(repo, serde_json::json!({ "contents": "read" }))
-                    .await?
-            }
+                    .await?,
+                true,
+            ),
         };
         Ok(CheckoutCredential {
             username: "x-access-token".into(),
             token,
             expires_at: (now + CHECKOUT_CRED_TTL_SECS) * 1000,
             read_only,
+            minted,
         })
     }
 
@@ -1143,6 +1145,7 @@ impl ForgePort for GithubForge {
             token,
             expires_at: (now_unix_secs() + CHECKOUT_CRED_TTL_SECS) * 1000,
             read_only: false,
+            minted: true,
         })
     }
 

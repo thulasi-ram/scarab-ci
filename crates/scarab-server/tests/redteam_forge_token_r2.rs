@@ -275,7 +275,6 @@ impl ForgePort for SwappedBetweenCalls {
 /// calls. A connection swapped from App to PAT between them hands the
 /// repository's own Step (no `trusted_library`) the long-lived token.
 #[tokio::test]
-#[ignore = "red: s3 r2"]
 async fn rt2_a_connection_swapped_between_the_check_and_the_mint_hands_over_nothing() {
     let spec = spec_from(serde_json::json!({ "access": "read", "owner": "acme", "name": "web" }));
     let inner = Arc::new(FakeExecutor::new());
@@ -416,7 +415,6 @@ async fn rt2_concurrent_launches_of_one_attempt_leave_no_live_token() {
 /// lease or restarted). The token must still be revoked when the Attempt
 /// ends, not live to its own expiry.
 #[tokio::test]
-#[ignore = "red: s3 r2"]
 async fn rt2_a_token_minted_on_one_replica_is_revoked_when_another_sees_the_end() {
     let spec = spec_from(serde_json::json!({ "access": "read", "owner": "acme", "name": "web" }));
     let inner = Arc::new(FakeExecutor::new());

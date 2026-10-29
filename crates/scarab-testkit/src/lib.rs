@@ -2269,6 +2269,9 @@ impl Db for InMemoryDb {
 struct FakeExecState {
     /// Scripted outcomes a test wants `poll` to return, in order.
     scripted: Vec<ExecState>,
+    /// The forge credential each launched unit holds (ADR-0076 §9), as the
+    /// k8s per-Pod token Secret holds it, until `take_forge_credential`.
+    forge_credentials: HashMap<String, scarab_engine::MountedForgeCredential>,
     /// Handles the test has declared "dead" (backend lost them).
     dead: Vec<ExecHandle>,
     /// How many times each handle has been launched — proves idempotent
@@ -2534,6 +2537,12 @@ impl FakeExecutor {
 
     /// The spec `handle` was most recently launched with (after launch-time
     /// interpolation, ADR-0041), or `None` if it was never launched.
+    /// Whether `handle`'s unit still holds a forge credential: launched with
+    /// one, and not yet taken by `take_forge_credential`.
+    pub fn holds_forge_credential(&self, handle: &ExecHandle) -> bool {
+        self.inner.lock().unwrap().forge_credentials.contains_key(&handle.0)
+    }
+
     pub fn launched_spec(&self, handle: &ExecHandle) -> Option<StepSpec> {
         self.inner
             .lock()
@@ -2645,6 +2654,20 @@ impl Executor for FakeExecutor {
         let mut st = self.inner.lock().unwrap();
         *st.launches.entry(handle.0.clone()).or_insert(0) += 1;
         st.launched_specs.insert(handle.0.clone(), spec.clone());
+        // A re-drive writes its credential over the unit's, as the k8s
+        // executor replaces the Secret.
+        if let Some(f) = &spec.forge_token {
+            if let Some(c) = &f.credential {
+                st.forge_credentials.insert(
+                    handle.0.clone(),
+                    scarab_engine::MountedForgeCredential {
+                        owner: f.owner.clone(),
+                        name: f.name.clone(),
+                        credential: c.clone(),
+                    },
+                );
+            }
+        }
         Ok(handle)
     }
 
@@ -2731,6 +2754,13 @@ impl Executor for FakeExecutor {
         _gate: &scarab_engine::StepRun,
     ) -> Result<Option<String>, scarab_engine::ExecError> {
         Ok(None)
+    }
+
+    async fn take_forge_credential(
+        &self,
+        handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
+        Ok(self.inner.lock().unwrap().forge_credentials.remove(&handle.0))
     }
 
     async fn infra_condition(
@@ -3477,7 +3507,8 @@ impl ForgePort for FakeForge {
         // read-only honored verbatim (the contract forbids widening it). A
         // minting forge returns a new token each time; a long-lived one the
         // same token.
-        let token = if *self.mints.lock().unwrap() {
+        let minted = *self.mints.lock().unwrap();
+        let token = if minted {
             format!("fake-token-{}-{}-{n}", repo.owner, repo.name)
         } else {
             format!("fake-token-{}-{}", repo.owner, repo.name)
@@ -3487,6 +3518,7 @@ impl ForgePort for FakeForge {
             token,
             expires_at: 9_999_999_999_999,
             read_only,
+            minted,
         })
     }
 
@@ -3513,6 +3545,7 @@ impl ForgePort for FakeForge {
             token: format!("fake-write-token-{}-{}-{n}", repo.owner, repo.name),
             expires_at: 9_999_999_999_999,
             read_only: false,
+            minted: true,
         })
     }
 

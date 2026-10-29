@@ -381,6 +381,7 @@ fn clone_credential() -> Option<scarab_engine::ForgeCredential> {
         .map(|token| scarab_engine::ForgeCredential {
             username: "x-access-token".into(),
             token,
+            minted: false,
         })
 }
 

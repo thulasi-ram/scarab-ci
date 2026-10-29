@@ -141,6 +141,13 @@ impl scarab_engine::Executor for RefusingExec {
     ) -> Result<Option<scarab_engine::InfraCondition>, scarab_engine::ExecError> {
         Ok(None)
     }
+
+    async fn take_forge_credential(
+        &self,
+        _handle: &scarab_engine::ports::ExecHandle,
+    ) -> Result<Option<scarab_engine::MountedForgeCredential>, scarab_engine::ExecError> {
+        Ok(None)
+    }
     async fn workspace_provisioning(
         &self,
         _handle: &scarab_engine::ports::ExecHandle,

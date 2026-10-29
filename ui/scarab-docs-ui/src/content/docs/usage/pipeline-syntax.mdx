@@ -218,7 +218,9 @@ A step that needs to talk to the Run's repository asks for a forge credential:
 
 Scarab mints the credential each time the step's attempt launches, a rerun or retry included, and
 mounts it as two files: `/scarab/secrets/forge-token` and `/scarab/secrets/forge-username`. It is
-never an environment variable. A token GitHub minted is revoked when the attempt ends.
+never an environment variable. When the attempt ends, the Kubernetes Secret that holds it is
+deleted, even if the Pod is kept, and a token GitHub minted is revoked, by whichever Scarab server
+sees the end.
 
 Whether a step may have one is decided when the Run is created; a Run that asks for more is
 refused with the reason. Each launch checks again, from the connection and the org's trust as

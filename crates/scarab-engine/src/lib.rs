@@ -891,6 +891,21 @@ pub struct ForgeTokenConfig {
 pub struct ForgeCredential {
     pub username: String,
     pub token: String,
+    /// The forge minted it for this launch and it can be revoked (a GitHub
+    /// App installation token). `false`: the connection's long-lived token,
+    /// which is never revoked.
+    pub minted: bool,
+}
+
+/// The forge credential an execution's unit held, read back from the
+/// backend by [`Executor::take_forge_credential`] so that whichever control
+/// plane sees the Attempt end can revoke it (ADR-0076 §9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountedForgeCredential {
+    /// The repository the credential is for.
+    pub owner: String,
+    pub name: String,
+    pub credential: ForgeCredential,
 }
 
 /// One artifact of record (ADR-0052): an output a step published to

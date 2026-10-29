@@ -42,6 +42,13 @@ impl Executor for CapturingExec {
         Ok(None)
     }
 
+    async fn take_forge_credential(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
+        Ok(None)
+    }
+
     async fn workspace_provisioning(
         &self,
         _handle: &ExecHandle,
@@ -273,6 +280,13 @@ impl Executor for SpecCapturingExec {
         Ok(None)
     }
 
+    async fn take_forge_credential(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
+        Ok(None)
+    }
+
     async fn workspace_provisioning(
         &self,
         _handle: &ExecHandle,
@@ -481,6 +495,13 @@ impl Executor for ConditionExec {
             "ErrImagePull",
             Some("pulling https://u:sup3r-s3cret@registry.test/acme:v1 failed".into()),
         )))
+    }
+
+    async fn take_forge_credential(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
+        Ok(None)
     }
 
     async fn workspace_provisioning(

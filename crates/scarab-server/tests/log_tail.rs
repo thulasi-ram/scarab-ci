@@ -163,6 +163,13 @@ impl Executor for GatedExec {
         Ok(None)
     }
 
+    async fn take_forge_credential(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
+        Ok(None)
+    }
+
     async fn workspace_provisioning(
         &self,
         _handle: &ExecHandle,

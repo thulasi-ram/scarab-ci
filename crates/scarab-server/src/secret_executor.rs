@@ -348,6 +348,15 @@ impl Executor for SecretInjectingExecutor {
             }))
     }
 
+    async fn take_forge_credential(
+        &self,
+        handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::MountedForgeCredential>, ExecError> {
+        // Forward: the default would leave every token of the wrapped
+        // executor unrevoked.
+        self.inner.take_forge_credential(handle).await
+    }
+
     async fn cancel(&self, handle: &ExecHandle) -> Result<(), ExecError> {
         self.inner.cancel(handle).await
     }

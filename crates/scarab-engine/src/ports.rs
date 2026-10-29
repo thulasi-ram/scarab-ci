@@ -1306,6 +1306,23 @@ pub trait Executor: Send + Sync {
         handle: &ExecHandle,
     ) -> Result<Option<crate::InfraCondition>, ExecError>;
 
+    /// Remove the forge credential `handle`'s unit holds from the backend,
+    /// and return it (ADR-0076 §9). Called once the Attempt has ended, so
+    /// the control plane that sees the end can revoke a minted token,
+    /// whichever replica minted it, and a long-lived token does not stay
+    /// stored for as long as the unit is kept. On k8s that is the per-Pod
+    /// token Secret. `Ok(None)`: the unit holds none, or it was taken
+    /// already. A backend that never mounts one answers `Ok(None)`.
+    ///
+    /// **Deliberately REQUIRED — no default**, for the reason spelled out on
+    /// [`workspace_provisioning`](Self::workspace_provisioning): a decorator
+    /// that inherited a `None` default would leave every token of the
+    /// executor it wraps unrevoked, and nothing would fail.
+    async fn take_forge_credential(
+        &self,
+        handle: &ExecHandle,
+    ) -> Result<Option<crate::MountedForgeCredential>, ExecError>;
+
     /// Open a best-effort **live tail** of the unit's stdout/stderr for `step`,
     /// keyed by its fence (ADR-0013). The control plane drains the returned
     /// [`LogChunks`] into the log pipeline while the step runs. `Ok(None)` means

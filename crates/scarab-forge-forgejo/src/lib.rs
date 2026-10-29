@@ -786,6 +786,8 @@ impl ForgePort for ForgejoForge {
             token: self.token.clone(),
             expires_at: (now + CHECKOUT_CRED_TTL_SECS) * 1000,
             read_only,
+            // The configured token itself: long-lived.
+            minted: false,
         })
     }
 
