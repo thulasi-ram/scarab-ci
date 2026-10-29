@@ -1582,6 +1582,11 @@ pub const MAX_INVOKE_DEPTH: usize = 8;
 /// stops as soon as a count passes this, instead of building the whole list.
 pub const MAX_COMPILED_STEPS: usize = 1024;
 
+/// The most combinations one `matrix:` may have before `exclude` removes
+/// any. Kept combinations count against [`MAX_COMPILED_STEPS`]; this bounds
+/// the work of building and filtering the rest.
+pub const MAX_MATRIX_COMBINATIONS: usize = 65_536;
+
 /// The diagnostic for a Pipeline over [`MAX_COMPILED_STEPS`].
 fn too_many_steps(at: &str) -> String {
     format!(
@@ -2802,13 +2807,18 @@ fn expand_step(step: &StepSpec) -> Result<Vec<StepSpec>, String> {
             ));
         }
     }
-    // Refuse a product over the cap before building it.
+    // Refuse a product over the bound before building it. The cap on Steps
+    // applies to the combinations `exclude` keeps, below.
     let combinations = matrix
         .dimensions
         .values()
         .try_fold(1usize, |n, v| n.checked_mul(v.len()));
-    if combinations.is_none_or(|n| n > MAX_COMPILED_STEPS) {
-        return Err(too_many_steps(&format!("step `{}`", step.id)));
+    if combinations.is_none_or(|n| n > MAX_MATRIX_COMBINATIONS) {
+        return Err(format!(
+            "step `{}`: the matrix has more than {MAX_MATRIX_COMBINATIONS} combinations before \
+             `exclude`; the limit is {MAX_MATRIX_COMBINATIONS}",
+            step.id
+        ));
     }
 
     // Cartesian product over the (sorted) dimensions.
@@ -2826,25 +2836,38 @@ fn expand_step(step: &StepSpec) -> Result<Vec<StepSpec>, String> {
     }
 
     // Drop combinations excluded by a CEL predicate (evaluated against the
-    // combination's own coordinate — each dimension bound as a variable).
-    let mut kept = Vec::with_capacity(combos.len());
-    for coord in combos {
-        let ctx = serde_json::Value::Object(
-            coord
-                .iter()
-                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-                .collect(),
-        );
-        let mut excluded = false;
-        for pred in &matrix.exclude {
-            if cel::eval_bool(pred, &ctx).map_err(|e| format!("step `{}`: {e}", step.id))? {
-                excluded = true;
-                break;
+    // combination's own coordinate — each dimension bound as a variable). A
+    // predicate is parsed once and checked on the combinations still kept.
+    let ctxs: Vec<serde_json::Value> = combos
+        .iter()
+        .map(|coord| {
+            serde_json::Value::Object(
+                coord
+                    .iter()
+                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                    .collect(),
+            )
+        })
+        .collect();
+    let mut keep = vec![true; combos.len()];
+    for pred in &matrix.exclude {
+        let live: Vec<usize> = (0..combos.len()).filter(|i| keep[*i]).collect();
+        let live_ctxs: Vec<&serde_json::Value> = live.iter().map(|i| &ctxs[*i]).collect();
+        let excluded = cel::eval_bool_each(pred, &live_ctxs)
+            .map_err(|e| format!("step `{}`: {e}", step.id))?;
+        for (i, out) in live.into_iter().zip(excluded) {
+            if out {
+                keep[i] = false;
             }
         }
-        if !excluded {
-            kept.push(coord);
-        }
+    }
+    let kept: Vec<BTreeMap<String, String>> = combos
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(coord, k)| k.then_some(coord))
+        .collect();
+    if kept.len() > MAX_COMPILED_STEPS {
+        return Err(too_many_steps(&format!("step `{}`", step.id)));
     }
 
     Ok(kept

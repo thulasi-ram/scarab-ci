@@ -229,6 +229,39 @@ pub fn eval_bool(expr: &str, ctx: &serde_json::Value) -> Result<bool, PipelineEr
     }
 }
 
+/// Evaluate the guard `expr` against each of `ctxs`, parsing it once: the
+/// result of [`eval_bool`] for each context, in order, or its first error.
+/// Every context must bind the same keys.
+pub(crate) fn eval_bool_each(
+    expr: &str,
+    ctxs: &[&serde_json::Value],
+) -> Result<Vec<bool>, PipelineError> {
+    with_program(expr, |program| {
+        // One context: building one registers the standard functions, which
+        // costs more than the evaluation. Each binding replaces the last; the
+        // contexts given share their keys (a matrix coordinate's dimensions).
+        let mut context = Context::default();
+        ctxs.iter()
+            .map(|ctx| {
+                bind(&mut context, ctx, expr)?;
+                let value = program
+                    .execute(&context)
+                    .map_err(|e| PipelineError::Cel(format!("`{}`: {e}", shown(expr))))?;
+                match value
+                    .json()
+                    .map_err(|e| PipelineError::Cel(format!("`{}`: {e:?}", shown(expr))))?
+                {
+                    serde_json::Value::Bool(b) => Ok(b),
+                    other => Err(PipelineError::Cel(format!(
+                        "`{}`: expected a boolean, got `{other}`",
+                        shown(expr)
+                    ))),
+                }
+            })
+            .collect()
+    })
+}
+
 /// Resolve every `${{ <cel> }}` interpolation in `template` against `ctx`.
 /// String results are inserted raw (no quotes); other JSON values use their
 /// compact JSON form.
@@ -589,5 +622,19 @@ mod tests {
         assert_eq!(max_nesting(&format!("'unterminated\n{deep}")), 100);
         assert_eq!(max_nesting("(a[b]{c[d]})"), 3);
         on_worker_stack(move || check(&format!("'{deep}' == 'x'")).unwrap());
+    }
+
+    #[test]
+    fn eval_bool_each_checks_each_context() {
+        let a = json!({ "a": "x" });
+        let b = json!({ "a": "y" });
+        assert_eq!(
+            eval_bool_each("a == 'x'", &[&a, &b]).unwrap(),
+            vec![true, false]
+        );
+        let err = eval_bool_each("a", &[&a]).unwrap_err().to_string();
+        assert!(err.contains("expected a boolean"), "{err}");
+        assert!(eval_bool_each("missing", &[&a]).is_err());
+        assert!(eval_bool_each("a", &[&json!(1)]).is_err());
     }
 }
