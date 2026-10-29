@@ -22,6 +22,21 @@ pub async fn render_launch_spec(
     step: &StepId,
     spec: StepSpec,
 ) -> Result<Result<StepSpec, String>, DbError> {
+    // A Run compiled by a newer server may render in a way this one does
+    // not know (a scope it cannot read, say): refuse it rather than render
+    // it the old way. Every Run this server and its predecessors stored has
+    // a version it knows.
+    let ir_version = db
+        .run_ir(run)
+        .await?
+        .and_then(|ir| ir.get("ir_version").and_then(|v| v.as_u64()));
+    if let Some(v) = ir_version.filter(|v| *v > u64::from(scarab_pipeline::IR_VERSION_MAX)) {
+        return Ok(Err(format!(
+            "this Run was compiled for IR version {v}; this server understands versions up to \
+             {}",
+            scarab_pipeline::IR_VERSION_MAX
+        )));
+    }
     let params = db.run_params(run).await?;
     let has_template = spec.image.contains("${{")
         || spec.command.iter().any(|c| c.contains("${{"))

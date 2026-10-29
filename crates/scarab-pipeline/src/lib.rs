@@ -20,6 +20,7 @@
 //! the [`cel`] submodule and is wired up by a later slice.
 
 pub mod cel;
+pub mod oci;
 pub mod params;
 pub mod render;
 pub mod scope;
@@ -44,6 +45,13 @@ pub const IR_VERSION: u32 = 2;
 /// a Step inlined from a library, whose `inputs` are its own bindings and not
 /// the Run's launch parameters. Recorded on the Run (`runs.ir_version`).
 pub const IR_VERSION_SCOPED: u32 = 3;
+
+/// The highest IR version this build understands. A Run stored with a higher
+/// one was compiled by a newer server, whose Steps may render in a way this
+/// one does not know: the engine refuses to launch them
+/// (`scarab_engine::render::render_launch_spec`), and the compiler refuses a
+/// Pipeline that declares one.
+pub const IR_VERSION_MAX: u32 = IR_VERSION_SCOPED;
 
 fn default_ir_version() -> u32 {
     IR_VERSION
@@ -3164,6 +3172,13 @@ pub fn lint(ir: &PipelineIr) -> Vec<String> {
                 .to_string(),
         );
     }
+    // A `${{ … }}` in a shell script (ADR-0076): the value becomes code.
+    warnings.extend(
+        script_templates(ir)
+            .into_iter()
+            .filter(|(severity, _)| *severity == Severity::Warning)
+            .map(|(_, finding)| finding),
+    );
     // A library pins the images it runs by digest (ADR-0076 §2). One warning
     // per library and image, however many Steps or matrix legs use it.
     let mut seen: BTreeSet<(&str, &str)> = BTreeSet::new();
@@ -3190,6 +3205,122 @@ pub fn lint(ir: &PipelineIr) -> Vec<String> {
         }
     }
     warnings
+}
+
+/// Where a value that a template reads comes from, for the script check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ValueSource {
+    /// Written in the repository: a Step's results, a matrix coordinate, a
+    /// library's inputs.
+    Pipeline,
+    /// From outside the repository: a trigger event's fields, or a Run's
+    /// launch parameters, which whoever dispatches the Run supplies.
+    Outside,
+}
+
+/// How the Pipeline check reports a finding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    /// A lint warning; the Pipeline still compiles.
+    Warning,
+    /// A compile error.
+    Error,
+}
+
+/// What the Pipeline check does about a `${{ … }}` in a shell script, by
+/// where the value comes from. Both warn for now; a later step makes a
+/// value from outside the repository an error.
+pub fn script_template_severity(source: ValueSource) -> Severity {
+    match source {
+        ValueSource::Pipeline | ValueSource::Outside => Severity::Warning,
+    }
+}
+
+/// The shells whose `-c` argument is a script.
+const SHELLS: [&str; 9] = [
+    "sh",
+    "bash",
+    "zsh",
+    "ash",
+    "dash",
+    "ksh",
+    "mksh",
+    "yash",
+    "busybox-sh",
+];
+
+/// The index of the script in a shell command: the argument after `-c`, or
+/// after a group of short flags that holds `c` (`sh -ec`, `bash -xc`), when
+/// `command[0]` is a shell (by name or path, `/bin/sh`). `-o name` takes an
+/// argument; anything else that is not a flag ends the options (a script
+/// file).
+fn shell_script_arg(command: &[String]) -> Option<usize> {
+    let shell = command.first()?.rsplit('/').next()?;
+    if !SHELLS.contains(&shell) {
+        return None;
+    }
+    let mut i = 1;
+    while i < command.len() {
+        let arg = command[i].as_str();
+        match arg {
+            "-o" | "+o" => i += 2,
+            "--" | "-" => return None,
+            _ if arg.starts_with("--") || arg.starts_with('+') => i += 1,
+            _ => match arg.strip_prefix('-') {
+                Some(flags) if flags.contains('c') => {
+                    return (i + 1 < command.len()).then_some(i + 1)
+                }
+                Some(_) => i += 1,
+                None => return None,
+            },
+        }
+    }
+    None
+}
+
+/// Each `${{ … }}` in a shell script of a Step (ADR-0076), with its
+/// severity: the rendered value is pasted into the script, so a value that
+/// holds `"; curl …` runs. One finding per script, at the severity of the
+/// value from furthest outside it reads.
+fn script_templates(ir: &PipelineIr) -> Vec<(Severity, String)> {
+    let mut out = Vec::new();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for step in &ir.steps {
+        let Some(at) = shell_script_arg(&step.command) else {
+            continue;
+        };
+        let script = step.command[at].as_str();
+        let (found, _) = cel::scan_interpolations(script);
+        if found.is_empty() || !seen.insert(script) {
+            continue;
+        }
+        // At the Pipeline level, `inputs` are the Run's launch parameters.
+        let run_inputs = step
+            .scope
+            .as_ref()
+            .is_none_or(|s| s.inputs == ScopeInputs::Run);
+        let source = found
+            .iter()
+            .flat_map(|i| cel::reads(script[i.inner.clone()].trim()).unwrap_or_default())
+            .map(|r| match r.var.as_str() {
+                "event" => ValueSource::Outside,
+                "inputs" if run_inputs => ValueSource::Outside,
+                _ => ValueSource::Pipeline,
+            })
+            .max()
+            .unwrap_or(ValueSource::Pipeline);
+        let first = &script[found[0].outer.clone()];
+        out.push((
+            script_template_severity(source),
+            format!(
+                "step `{}`: `command[{at}]` is a shell script with `{first}` in it, so the value \
+                 becomes part of the script; pass it in `env:` (`env: [[VALUE, \"{first}\"]]`) \
+                 and read it in the script as \"$VALUE\"",
+                step.id
+            ),
+        ));
+    }
+    out
 }
 
 /// Validate one step's [`CacheSpec`] (ADR-0065 s1). All diagnostics are
@@ -3396,6 +3527,13 @@ fn validate_output_reads(ir: &PipelineIr, diagnostics: &mut Vec<String>) {
 
 pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
     let mut diagnostics = Vec::new();
+
+    if ir.ir_version > IR_VERSION_MAX {
+        diagnostics.push(format!(
+            "`ir_version` {} is newer than this server understands ({IR_VERSION_MAX})",
+            ir.ir_version
+        ));
+    }
 
     // Run budget (ADR-0047): opt-in, active-time-only; zero is nonsense.
     if ir.budget == Some(0) {
@@ -3832,6 +3970,14 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
 
     // `${{ outputs.<step>.<name> }}` reads against declared `results:`.
     validate_output_reads(ir, &mut diagnostics);
+
+    // A `${{ … }}` in a shell script whose value the check refuses there.
+    diagnostics.extend(
+        script_templates(ir)
+            .into_iter()
+            .filter(|(severity, _)| *severity == Severity::Error)
+            .map(|(_, finding)| finding),
+    );
 
     // Cycle detection over needs edges (Kahn's algorithm). Only run when the
     // graph is well-formed enough to be meaningful (no dangling edges).
@@ -5785,6 +5931,87 @@ mod tests {
         assert_eq!(
             excluded_steps_with_params(&ir, &ctx, &params).unwrap(),
             ["c/s"]
+        );
+    }
+
+    #[test]
+    fn a_template_in_a_shell_script_is_a_lint_warning() {
+        let lint_of = |command: &str| {
+            lint(&compile(&format!(
+                "interface: {{ inputs: [{{ name: p, type: string }}] }}\n\
+                 steps: [{{ id: a, image: busybox, command: {command} }}]"
+            )))
+        };
+        for command in [
+            r#"[sh, -c, "echo ${{ inputs.p }}"]"#,
+            r#"[/bin/bash, -ec, "echo ${{ inputs.p }}"]"#,
+            r#"[bash, -o, pipefail, -xc, "echo ${{ matrix.x }}"]"#,
+            r#"[dash, --norc, +e, -c, "echo ${{ outputs.b.v }}"]"#,
+        ] {
+            let w = lint_of(command);
+            assert!(
+                w.iter().any(|w| w.contains("`command[")
+                    && w.contains("is a shell script with `${{")
+                    && w.contains("pass it in `env:`")
+                    && w.contains("\"$VALUE\"")),
+                "{command}: {w:?}"
+            );
+        }
+        for command in [
+            r#"[echo, "${{ inputs.p }}"]"#,
+            r#"[sh, script.sh, "${{ inputs.p }}"]"#,
+            r#"[sh, -c, "echo \"$VALUE\""]"#,
+            r#"[sh, -e]"#,
+            r#"[python, -c, "${{ inputs.p }}"]"#,
+        ] {
+            assert!(
+                !lint_of(command).iter().any(|w| w.contains("shell script")),
+                "{command}"
+            );
+        }
+        // The value's source is classified; both kinds warn for now.
+        assert_eq!(
+            script_template_severity(ValueSource::Outside),
+            Severity::Warning
+        );
+        assert_eq!(
+            script_template_severity(ValueSource::Pipeline),
+            Severity::Warning
+        );
+    }
+
+    #[test]
+    fn an_ir_version_newer_than_this_server_is_refused() {
+        let errs = errors(&format!(
+            "ir_version: {}\nsteps: [{{ id: a, image: busybox }}]",
+            IR_VERSION_MAX + 1
+        ));
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("newer than this server understands")),
+            "{errs:?}"
+        );
+        // A Pipeline without a scoped Step keeps the version it had.
+        assert_eq!(
+            compile("steps: [{ id: a, image: busybox }]").ir_version,
+            IR_VERSION
+        );
+    }
+
+    #[test]
+    fn a_rendered_image_must_be_an_image_reference() {
+        let mut step = compile("steps: [{ id: a, image: busybox }]")
+            .steps
+            .pop()
+            .unwrap();
+        step.image = "${{ inputs.img }}".into();
+        let e = launch(&step, json!({ "img": "busybox --privileged" }), json!({})).unwrap_err();
+        assert!(e.contains("is not an OCI image reference"), "{e}");
+        assert_eq!(
+            launch(&step, json!({ "img": "busybox:1.36" }), json!({}))
+                .unwrap()
+                .image,
+            "busybox:1.36"
         );
     }
 

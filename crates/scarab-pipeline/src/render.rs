@@ -74,6 +74,15 @@ pub fn render(
             let ctx = Value::Object(bound.ctx);
             let one = |t: &str| cel::interpolate(t, &ctx).map_err(|e| e.to_string());
             let image = one(templates.image)?;
+            // What the container runtime is handed must be an image
+            // reference; an empty image is a Step that runs none (clone,
+            // build).
+            if !image.is_empty() && !crate::oci::is_image_reference(&image) {
+                return Err(format!(
+                    "image `{}` is not an OCI image reference",
+                    image.escape_debug()
+                ));
+            }
             let command = templates
                 .command
                 .iter()
