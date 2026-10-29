@@ -250,19 +250,25 @@ fn is_public_v4(ip: Ipv4Addr) -> bool {
         || a >= 240)
 }
 
+/// Only global unicast, 2000::/3, minus the special-purpose blocks inside
+/// it (IANA IPv6 Special-Purpose Address Registry). Everything outside
+/// 2000::/3 is refused, which covers `::/96` (IPv4-compatible, so
+/// `::127.0.0.1`), `::1`, `100::/64` (discard), `64:ff9b::/96` and
+/// `64:ff9b:1::/48` (NAT64), `fc00::/7`, `fe80::/10`, `fec0::/10`
+/// (site-local) and `ff00::/8` (multicast). `::ffff:a.b.c.d` is unwrapped
+/// and checked as IPv4 before this.
 fn is_public_v6(ip: Ipv6Addr) -> bool {
     let s = ip.segments();
-    !(ip.is_unspecified()
-        || ip.is_loopback()
-        || ip.is_multicast()
-        // Unique local, fc00::/7.
-        || (s[0] & 0xfe00) == 0xfc00
-        // Link-local, fe80::/10.
-        || (s[0] & 0xffc0) == 0xfe80
+    (s[0] & 0xe000) == 0x2000
+        // IETF protocol assignments, 2001::/23: Teredo 2001::/32 carries
+        // an IPv4 address, plus benchmarking and ORCHID.
+        && !(s[0] == 0x2001 && s[1] < 0x0200)
         // Documentation, 2001:db8::/32.
-        || (s[0] == 0x2001 && s[1] == 0x0db8)
-        // NAT64, 64:ff9b::/96, can reach an IPv4 private address.
-        || (s[0] == 0x0064 && s[1] == 0xff9b))
+        && !(s[0] == 0x2001 && s[1] == 0x0db8)
+        // 6to4, 2002::/16, carries an IPv4 address that may be private.
+        && s[0] != 0x2002
+        // Documentation, 3fff::/20.
+        && !(s[0] == 0x3fff && s[1] < 0x1000)
 }
 
 /// Resolves names for [`HttpsFetcher`], keeping public addresses only.
@@ -481,6 +487,16 @@ mod tests {
             "::ffff:127.0.0.1",
             "::ffff:169.254.169.254",
             "64:ff9b::a00:1",
+            "64:ff9b:1::1",
+            "::127.0.0.1",
+            "fec0::1",
+            "ff02::1",
+            "100::1",
+            "2001::a00:1",
+            "2001:2::1",
+            "2001:db8::1",
+            "2002:a00:1::1",
+            "3fff::1",
         ] {
             assert!(!is_public_ip(ip.parse().unwrap()), "{ip}");
         }

@@ -110,7 +110,6 @@ async fn ssrf_the_real_fetcher_refuses_internal_literals_without_connecting() {
 /// networks) are not public addresses. `Ipv6Addr::to_ipv4_mapped` only
 /// unwraps `::ffff:a.b.c.d`, so `::127.0.0.1` reaches the v6 check, which
 /// knows only `::1`.
-#[ignore = "red: s2 r1"]
 #[test]
 fn ssrf_ipv4_compatible_and_site_local_ipv6_are_not_public() {
     for ip in ["::127.0.0.1", "::a9fe:a9fe", "::10.0.0.1", "fec0::1"] {
