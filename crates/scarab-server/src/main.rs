@@ -757,7 +757,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 // Build-step registry auth (ADR-0018): scoped REGISTRY_AUTH
                 // secret first, forge-derived credential as fallback.
-                .with_secrets(secrets.clone()),
+                .with_secrets(secrets.clone())
+                // A yanked library Step is refused before its checkout
+                // token or registry auth is asked for (ADR-0076 §6).
+                .with_libraries(db.clone(), pg.clone()),
             );
             // Local host processes finish instantly, so re-poll them quickly; k8s
             // Pods take time, so the default window avoids thundering re-claims.

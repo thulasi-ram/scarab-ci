@@ -9,8 +9,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use scarab_engine::ports::{ExecHandle, ExecState, LogChunks};
-use scarab_engine::{CloneCredential, ExecError, Executor, StepRun, StepSpec};
+use scarab_engine::{CloneCredential, Db, ExecError, Executor, StepRun, StepSpec};
 use scarab_forge::{ForgeConnectionStore, ForgeKind, ForgePort, RepoRef};
+use scarab_policy::library::LibraryStore;
 
 /// Derive the credential-free clone URL for a repo from its connection
 /// (ADR-0045 §Token delivery: the URL NEVER carries a credential).
@@ -44,6 +45,9 @@ pub struct CloneEnrichingExecutor {
     connections: Arc<dyn ForgeConnectionStore>,
     forge: Arc<dyn ForgePort>,
     secrets: Option<Arc<dyn scarab_secrets::SecretProvider>>,
+    /// The Run store and the library store for the yank check (ADR-0076
+    /// §6), so a yanked Step is refused before a credential is asked for.
+    yanks: Option<(Arc<dyn Db>, Arc<dyn LibraryStore>)>,
 }
 
 impl CloneEnrichingExecutor {
@@ -57,6 +61,34 @@ impl CloneEnrichingExecutor {
             connections,
             forge,
             secrets: None,
+            yanks: None,
+        }
+    }
+
+    /// Refuse a clone or build Step from a yanked library version (ADR-0076
+    /// §6) before its checkout token or registry auth is asked for. This
+    /// decorator runs before `SecretInjectingExecutor`, whose own yank check
+    /// would come after the credential was minted.
+    pub fn with_libraries(mut self, db: Arc<dyn Db>, libraries: Arc<dyn LibraryStore>) -> Self {
+        self.yanks = Some((db, libraries));
+        self
+    }
+
+    async fn ensure_not_yanked(&self, step: &StepRun) -> Result<(), ExecError> {
+        let Some((db, libraries)) = &self.yanks else {
+            return Ok(());
+        };
+        match crate::libraries::stored_step_yank_refusal(
+            db.as_ref(),
+            Some(libraries.as_ref()),
+            &step.run,
+            &step.step.0,
+        )
+        .await
+        {
+            Ok(None) => Ok(()),
+            Ok(Some(refusal)) => Err(ExecError::Refused(refusal)),
+            Err(e) => Err(ExecError::Other(e)),
         }
     }
 
@@ -145,6 +177,11 @@ impl Executor for CloneEnrichingExecutor {
     }
 
     async fn launch(&self, step: &StepRun, spec: &StepSpec) -> Result<ExecHandle, ExecError> {
+        // Only a clone or build Step asks for a credential here; the yank
+        // check for every other Step is SecretInjecting's.
+        if spec.build.is_some() || spec.clone.is_some() {
+            self.ensure_not_yanked(step).await?;
+        }
         // A build step (ADR-0018): resolve its registry auth in memory only —
         // the stored spec never carries a credential.
         if let Some(build) = &spec.build {

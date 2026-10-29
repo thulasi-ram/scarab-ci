@@ -2947,11 +2947,21 @@ pub struct FakeForge {
     /// = an adapter that cannot enumerate (`Unsupported`); `Err` = a listing
     /// that failed part-way, which an import must not prune on.
     collaborators: Mutex<Option<Result<Vec<scarab_forge::Collaborator>, String>>>,
+    /// How many times a credential was asked for: each
+    /// [`mint_checkout_credential`](ForgePort::mint_checkout_credential) and
+    /// [`registry_credential`](ForgePort::registry_credential) call. A test
+    /// asserts a refused launch reached neither.
+    credential_calls: Mutex<usize>,
 }
 
 impl FakeForge {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// How many checkout or registry credentials were asked for.
+    pub fn credential_calls(&self) -> usize {
+        *self.credential_calls.lock().unwrap()
     }
 
     /// Seed the repo's collaborators as `(numeric id, login, level)` with
@@ -3402,6 +3412,7 @@ impl ForgePort for FakeForge {
         &self,
         _repo: &RepoRef,
     ) -> Result<Option<scarab_forge::RegistryCredential>, ForgeError> {
+        *self.credential_calls.lock().unwrap() += 1;
         Ok(self.registry_credential.lock().unwrap().clone())
     }
 
@@ -3410,6 +3421,7 @@ impl ForgePort for FakeForge {
         repo: &RepoRef,
         read_only: bool,
     ) -> Result<CheckoutCredential, ForgeError> {
+        *self.credential_calls.lock().unwrap() += 1;
         // Deterministic fake credential: scoped to the repo, short TTL,
         // read-only honored verbatim (the contract forbids widening it).
         Ok(CheckoutCredential {

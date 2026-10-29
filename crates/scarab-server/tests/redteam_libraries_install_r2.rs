@@ -165,13 +165,15 @@ fn production_executor(
     db: &Arc<InMemoryDb>,
     libs: Arc<dyn LibraryStore>,
     inner: Arc<FakeExecutor>,
+    forge: Arc<FakeForge>,
 ) -> CloneEnrichingExecutor {
-    let secret: Arc<dyn Executor> = Arc::new(secret_executor(db, libs, inner));
+    let secret: Arc<dyn Executor> = Arc::new(secret_executor(db, libs.clone(), inner));
     CloneEnrichingExecutor::new(
         secret,
         db.clone() as Arc<dyn ForgeConnectionStore>,
-        Arc::new(FakeForge::new()) as Arc<dyn ForgePort>,
+        forge as Arc<dyn ForgePort>,
     )
+    .with_libraries(db.clone() as Arc<dyn Db>, libs)
 }
 
 async fn tick_prod(
@@ -182,7 +184,7 @@ async fn tick_prod(
 ) {
     let inner = Arc::new(FakeExecutor::new());
     inner.script_outcome(ExecState::Succeeded);
-    let exec = production_executor(db, libs, inner);
+    let exec = production_executor(db, libs, inner, Arc::new(FakeForge::new()));
     let sched = Scheduler::new(db.as_ref(), clock as &dyn Clock, &exec, "sched");
     for _ in 0..6 {
         sched.tick(run).await.unwrap();
@@ -369,7 +371,7 @@ async fn gate_refusal_a_store_error_holds_the_gate_and_blocks_no_other_run() {
     let inner = Arc::new(FakeExecutor::new());
     inner.script_outcome(ExecState::Succeeded);
     let down: Arc<dyn LibraryStore> = Arc::new(YankedDown(libs.clone()));
-    let exec = production_executor(&db, down, inner);
+    let exec = production_executor(&db, down, inner, Arc::new(FakeForge::new()));
     let sched = Scheduler::new(db.as_ref(), &clock as &dyn Clock, &exec, "sched");
     let mut isolated_a = 0;
     for _ in 0..8 {
@@ -1215,5 +1217,64 @@ async fn an_authored_origin_with_an_unknown_field_is_still_refused() {
             Err(e) => assert!(e.to_string().contains("origin"), "{e}"),
             Ok(o) => panic!("an authored origin was not refused at compile: {o:?}"),
         }
+    }
+}
+
+// ===========================================================================
+// 7. A yanked Step mints no credential
+// ===========================================================================
+
+/// A library with a clone Step and a build Step, both roots.
+const SOURCED: &str = "kind: library\nsteps:\n  - { id: checkout, clone: {} }\n  - { id: img, build: { image: \"ghcr.io/acme/web:1\" } }\n";
+
+/// Runs the production chain over `run` with a fresh fake forge, and
+/// returns how many credentials the forge was asked for.
+async fn credentials_asked(
+    db: &Arc<InMemoryDb>,
+    libs: Arc<dyn LibraryStore>,
+    run: &RunId,
+) -> usize {
+    let forge = Arc::new(FakeForge::new());
+    let inner = Arc::new(FakeExecutor::new());
+    inner.script_outcome(ExecState::Succeeded);
+    let exec = production_executor(db, libs, inner, forge.clone());
+    let clock = FakeClock::new(1_000);
+    let sched = Scheduler::new(db.as_ref(), &clock as &dyn Clock, &exec, "sched");
+    for _ in 0..6 {
+        sched.tick(run).await.unwrap();
+    }
+    forge.credential_calls()
+}
+
+/// In production CloneEnriching is outermost: it mints the checkout token
+/// and resolves registry auth before SecretInjecting's yank check refuses.
+/// A yanked clone or build Step must be refused before either is asked for.
+#[tokio::test]
+async fn a_yanked_clone_or_build_step_mints_no_credential() {
+    const CI: &str = "on:\n  push: {}\nsteps:\n  - { id: src, invoke: lib:acme/sourced }\n";
+    let libs = Arc::new(InMemoryLibraries::new());
+    seed(libs.as_ref(), "acme", "acme", "sourced", SOURCED).await;
+
+    // Both Runs are created before the yank; a Run created after it is
+    // refused at creation.
+    let control = Arc::new(InMemoryDb::new());
+    let control_run = create_run(&control, libs.as_ref(), CI, "web").await;
+    let db = Arc::new(InMemoryDb::new());
+    let run = create_run(&db, libs.as_ref(), CI, "web").await;
+
+    // Control: not yanked, both Steps ask the forge for a credential.
+    assert_eq!(
+        credentials_asked(&control, libs.clone(), &control_run).await,
+        2
+    );
+
+    yank(libs.as_ref(), SOURCED).await;
+    assert_eq!(
+        credentials_asked(&db, libs.clone(), &run).await,
+        0,
+        "a credential was asked for on behalf of a yanked Step"
+    );
+    for step in ["src/checkout", "src/img"] {
+        assert_eq!(step_status(&db, &run, step).await, StepStatus::Failed);
     }
 }
