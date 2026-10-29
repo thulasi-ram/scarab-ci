@@ -225,6 +225,26 @@ export default function Libraries(props: { org: string }) {
               </ul>
             </Show>
 
+            <Show when={(libs()?.trusted_sources ?? []).length > 0}>
+              <p class="subtle">
+                Trusted with forge credentials, besides the first-party clone library:
+              </p>
+              <ul class="tok-list">
+                <For each={libs()?.trusted_sources ?? []}>
+                  {(t) => (
+                    <li class="tok">
+                      <div class="tok-head">
+                        <span class="mono">{t.source}</span>
+                        <span class="subtle" title={absTime(t.trusted_at)}>
+                          by {t.trusted_by} · {relTime(t.trusted_at)}
+                        </span>
+                      </div>
+                    </li>
+                  )}
+                </For>
+              </ul>
+            </Show>
+
             <div class="secrets-actions">
               <button class="btn btn-primary btn-sm" onClick={() => setInstalling({})}>
                 <Icon icon="plus" size={14} /> Install library

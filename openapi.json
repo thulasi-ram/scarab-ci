@@ -2719,6 +2719,127 @@
         ]
       }
     },
+    "/v1/orgs/{org}/library-trust": {
+      "post": {
+        "tags": [
+          "Libraries"
+        ],
+        "summary": "Trust a library source with forge credentials (ADR-0076 §9)",
+        "operationId": "trust_library_source",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TrustSourceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TrustedSourceDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "not a library source"
+          },
+          "403": {
+            "description": "not an org admin, or no step-up — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "libraries not configured"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "Libraries"
+        ],
+        "summary": "Stop trusting a library source with forge credentials (ADR-0076 §9)",
+        "operationId": "untrust_library_source",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "source",
+            "in": "path",
+            "description": "The trusted source, `<host>/<owner>/<repo>//<path>`.",
+            "required": true,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "no longer trusted"
+          },
+          "400": {
+            "description": "no `source`, or not a library source"
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "not trusted, or libraries not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/orgs/{org}/library-yanks": {
       "post": {
         "tags": [
@@ -9345,7 +9466,8 @@
         "required": [
           "installations",
           "yanks",
-          "first_party"
+          "first_party",
+          "trusted_sources"
         ],
         "properties": {
           "defaults": {
@@ -9376,6 +9498,13 @@
               "null"
             ],
             "description": "Why the release manifest could not be read, if it could not."
+          },
+          "trusted_sources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TrustedSourceDto"
+            },
+            "description": "The library sources this org trusts with long-lived forge credentials\n(ADR-0076 §9), besides the first-party clone library, which it trusts\nby default."
           },
           "yanks": {
             "type": "array",
@@ -11829,6 +11958,40 @@
           "state": {
             "type": "string",
             "description": "`executed` (the operation answered 2xx) or `failed`."
+          }
+        }
+      },
+      "TrustSourceRequest": {
+        "type": "object",
+        "required": [
+          "source"
+        ],
+        "properties": {
+          "source": {
+            "type": "string",
+            "description": "`<host>/<owner>/<repo>//<path>`; an `@<commit>` is dropped, since\ntrust is for every version from the source."
+          }
+        }
+      },
+      "TrustedSourceDto": {
+        "type": "object",
+        "description": "A library source the org trusts with long-lived forge credentials\n(ADR-0076 §9). Trust holds across upgrades from the same source.",
+        "required": [
+          "source",
+          "trusted_by",
+          "trusted_at"
+        ],
+        "properties": {
+          "source": {
+            "type": "string",
+            "description": "`<host>/<owner>/<repo>//<path>`, without a commit."
+          },
+          "trusted_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "trusted_by": {
+            "type": "string"
           }
         }
       },

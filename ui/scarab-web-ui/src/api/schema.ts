@@ -833,6 +833,24 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/orgs/{org}/library-trust": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Trust a library source with forge credentials (ADR-0076 §9) */
+        post: operations["trust_library_source"];
+        /** Stop trusting a library source with forge credentials (ADR-0076 §9) */
+        delete: operations["untrust_library_source"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/orgs/{org}/library-yanks": {
         parameters: {
             query?: never;
@@ -3169,6 +3187,12 @@ export interface components {
             installations: components["schemas"]["LibraryInstallationDto"][];
             /** @description Why the release manifest could not be read, if it could not. */
             manifest_error?: string | null;
+            /**
+             * @description The library sources this org trusts with long-lived forge credentials
+             *     (ADR-0076 §9), besides the first-party clone library, which it trusts
+             *     by default.
+             */
+            trusted_sources: components["schemas"]["TrustedSourceDto"][];
             yanks: components["schemas"]["LibraryYankDto"][];
         };
         /** @description `GET /v1/orgs/{org}/security/summary`. */
@@ -4466,6 +4490,24 @@ export interface components {
             result_status?: number | null;
             /** @description `executed` (the operation answered 2xx) or `failed`. */
             state: string;
+        };
+        TrustSourceRequest: {
+            /**
+             * @description `<host>/<owner>/<repo>//<path>`; an `@<commit>` is dropped, since
+             *     trust is for every version from the source.
+             */
+            source: string;
+        };
+        /**
+         * @description A library source the org trusts with long-lived forge credentials
+         *     (ADR-0076 §9). Trust holds across upgrades from the same source.
+         */
+        TrustedSourceDto: {
+            /** @description `<host>/<owner>/<repo>//<path>`, without a commit. */
+            source: string;
+            /** Format: int64 */
+            trusted_at: number;
+            trusted_by: string;
         };
         /** @description What an uninstall removed. */
         UninstalledPluginDto: {
@@ -6773,6 +6815,106 @@ export interface operations {
             };
             /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    trust_library_source: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TrustSourceRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrustedSourceDto"];
+                };
+            };
+            /** @description not a library source */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin, or no step-up — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description libraries not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    untrust_library_source: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description The trusted source, `<host>/<owner>/<repo>//<path>`. */
+                source: string | null;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description no longer trusted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no `source`, or not a library source */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not trusted, or libraries not configured */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

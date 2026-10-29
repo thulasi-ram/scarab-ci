@@ -840,6 +840,7 @@ const orgLibraries: OrgLibrariesDto = {
   first_party: [],
   manifest_error: null,
   defaults: { state: "installed", missing: [], mirror: null, updated_at: Date.now() - 20 * 86_400_000 },
+  trusted_sources: [],
 };
 const plugins: PluginInstallationDto[] = [
   pluginInstallation("argocd", "4f2a1c9e7b3d", {
