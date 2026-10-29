@@ -102,6 +102,7 @@ fn spec_with_secret() -> StepSpec {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     }
 }
 fn logs(db: Arc<dyn Db>) -> Arc<LogService> {
@@ -315,6 +316,7 @@ fn plain_spec() -> StepSpec {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     }
 }
 

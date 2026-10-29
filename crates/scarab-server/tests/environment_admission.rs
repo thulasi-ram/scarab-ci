@@ -705,6 +705,7 @@ fn secret_step() -> (StepRun, StepSpec) {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
     (step, spec)
 }

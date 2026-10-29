@@ -5871,6 +5871,7 @@ mod tests {
             services: vec![],
             uses: vec![],
             matrix_values: Default::default(),
+            scope: None,
         }
     }
 
@@ -6088,6 +6089,7 @@ mod tests {
             services: vec![],
             uses: vec![],
             matrix_values: Default::default(),
+            scope: None,
         };
         let pod = build_pod(
             "scarab-x",

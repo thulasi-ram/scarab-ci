@@ -21,6 +21,11 @@
 
 pub mod cel;
 pub mod params;
+pub mod render;
+pub mod scope;
+
+pub use render::{preview_image, render, Facts, Rendered, Results, Templates};
+pub use scope::{Binding, BoundValue, OutputSource, Scope, ScopeInputs};
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -192,7 +197,7 @@ pub enum ParamType {
 /// bare-name inputs of ADR-0038: a YAML/JSON **string** deserializes to
 /// `ParamSpec { name, type: string, required: true, .. }`, while a **map**
 /// deserializes to the full form. Serialization always emits the map form.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ParamSpec {
     /// The parameter name — must be env-safe (`SCARAB_PARAM_<NAME>`).
     pub name: String,

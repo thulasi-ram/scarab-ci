@@ -622,6 +622,7 @@ async fn published_artifacts_are_durably_indexed_in_postgres() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
     pg.create_step_run(&run, &step, Some(&spec), &[], Timestamp(0))
         .await

@@ -35,6 +35,7 @@ fn spec() -> StepSpec {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     }
 }
 
@@ -186,6 +187,7 @@ async fn named_result_flows_into_a_downstream_interpolation() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
     db.create_step_run(
         &run,

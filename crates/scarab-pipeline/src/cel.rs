@@ -657,7 +657,124 @@ pub(crate) fn reads_variable(expr: &str, name: &str) -> Result<bool, PipelineErr
     })
 }
 
-fn render(v: &serde_json::Value) -> String {
+/// One read of a variable in a parsed CEL expression: the variable, then the
+/// members selected from it while each is a constant (`v.a.b`, `v["a"].b`,
+/// `has(v.a)`). Found from the parser's tree, never from the text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Read {
+    /// The variable, without the leading `.` of a root-qualified read.
+    pub var: String,
+    /// The first member, when it is a constant. `None` when the variable is
+    /// used whole (`size(v)`, `v` passed on) or with a computed key (`v[k]`).
+    pub first: Option<String>,
+    /// The member selected from `first`, when that is a constant too.
+    pub second: Option<String>,
+}
+
+/// Every read of a variable in `expr`, by the CEL parser (ADR-0076). A
+/// comprehension's own variables are reported like any other name, which
+/// only ever makes a caller treat the expression as reading more.
+pub(crate) fn reads(expr: &str) -> Result<Vec<Read>, PipelineError> {
+    with_program(expr, |program| {
+        let mut out = Vec::new();
+        read_walk(program.expression(), &mut out);
+        Ok(out)
+    })
+}
+
+/// One member step of a selection chain: the operand, the member when it is
+/// a constant, and the key expression when it is computed.
+fn member_of(e: &IdedExpr) -> Option<(&IdedExpr, Option<String>, Option<&IdedExpr>)> {
+    match &e.expr {
+        Expr::Select(s) => Some((&s.operand, Some(s.field.clone()), None)),
+        Expr::Call(c)
+            if c.func_name == operators::INDEX && c.target.is_none() && c.args.len() == 2 =>
+        {
+            match &c.args[1].expr {
+                Expr::Literal(LiteralValue::String(s)) => {
+                    Some((&c.args[0], Some(s.inner().to_string()), None))
+                }
+                _ => Some((&c.args[0], None, Some(&c.args[1]))),
+            }
+        }
+        _ => None,
+    }
+}
+
+fn read_walk(e: &IdedExpr, out: &mut Vec<Read>) {
+    // The longest selection chain starting here, innermost operand last.
+    let mut keys: Vec<Option<String>> = Vec::new();
+    let mut computed: Vec<&IdedExpr> = Vec::new();
+    let mut cur = e;
+    while let Some((operand, key, key_expr)) = member_of(cur) {
+        keys.push(key);
+        computed.extend(key_expr);
+        cur = operand;
+    }
+    if !keys.is_empty() {
+        keys.reverse();
+        match &cur.expr {
+            Expr::Ident(name) => {
+                let first = keys[0].clone();
+                let second = first.as_ref().and(keys.get(1).cloned().flatten());
+                out.push(Read {
+                    var: name.trim_start_matches('.').to_string(),
+                    first,
+                    second,
+                });
+            }
+            _ => read_walk(cur, out),
+        }
+        for k in computed {
+            read_walk(k, out);
+        }
+        return;
+    }
+    match &e.expr {
+        Expr::Ident(name) => out.push(Read {
+            var: name.trim_start_matches('.').to_string(),
+            first: None,
+            second: None,
+        }),
+        // A selection is always a chain, handled above.
+        Expr::Select(_) => {}
+        Expr::Call(c) => {
+            if let Some(t) = &c.target {
+                read_walk(t, out);
+            }
+            c.args.iter().for_each(|a| read_walk(a, out));
+        }
+        Expr::Comprehension(c) => {
+            for part in [
+                &c.iter_range,
+                &c.accu_init,
+                &c.loop_cond,
+                &c.loop_step,
+                &c.result,
+            ] {
+                read_walk(part, out);
+            }
+        }
+        Expr::List(l) => l.elements.iter().for_each(|x| read_walk(x, out)),
+        Expr::Map(m) => m.entries.iter().for_each(|x| entry_reads(&x.expr, out)),
+        Expr::Struct(s) => s.entries.iter().for_each(|x| entry_reads(&x.expr, out)),
+        Expr::Literal(_) | Expr::Unspecified => {}
+    }
+}
+
+fn entry_reads(e: &EntryExpr, out: &mut Vec<Read>) {
+    match e {
+        EntryExpr::StructField(f) => read_walk(&f.value, out),
+        EntryExpr::MapEntry(m) => {
+            read_walk(&m.key, out);
+            read_walk(&m.value, out);
+        }
+    }
+}
+
+/// A value as `${{ … }}` writes it into text: a string verbatim, anything
+/// else its compact JSON.
+pub(crate) fn render(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::String(s) => s.clone(),
         other => other.to_string(),

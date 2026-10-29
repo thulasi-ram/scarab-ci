@@ -3565,101 +3565,24 @@ impl<'a> Scheduler<'a> {
         }
     }
 
-    /// Resolve `${{ … }}` interpolations in a step's launch spec against its
-    /// upstream results (ADR-0041), returning the launchable spec — or the
-    /// interpolation error string (`Ok(Err(_))`) when a reference is bad, which
-    /// the caller turns into a *step* failure (fail-fast, not a scheduler error).
-    /// A `DbError` (infra) propagates as `Err(_)` so it retries.
+    /// Render a step's launch spec (ADR-0041, ADR-0076) with
+    /// [`render_launch_spec`](crate::render::render_launch_spec), returning
+    /// the launchable spec — or the render error (`Ok(Err(_))`) when a
+    /// reference is bad, which the caller turns into a *step* failure
+    /// (fail-fast, not a scheduler error). A `DbError` (infra) propagates as
+    /// `Err(_)` so it retries.
+    ///
+    /// Every launched step receives its inputs as `SCARAB_PARAM_<NAME>` env
+    /// (ADR-0008): a Step written in the Pipeline file gets the Run's launch
+    /// parameters, a library Step its own bound inputs. They are added after
+    /// rendering, so a value holding `${{` reaches the step as text.
     async fn interpolate_spec(
         &self,
         run: &RunId,
         step: &StepId,
         spec: StepSpec,
     ) -> Result<Result<StepSpec, String>, SchedulerError> {
-        // Launch parameters (ADR-0043) are frozen on the run at creation. Every
-        // launched step receives them as `SCARAB_PARAM_<NAME>` env (stringified),
-        // even one it never references — unreferenced params still reach the step
-        // (ADR-0008 param convention). Injected values are concrete (no `${{`), so
-        // they are unaffected by the interpolation pass below.
-        let params = self.db.run_params(run).await?;
-        let mut spec = spec;
-        if !params.is_empty() {
-            // Prepend so a step's own explicit env of the same name still wins.
-            let mut env: Vec<(String, String)> = params
-                .iter()
-                .map(|(k, v)| {
-                    (
-                        format!("SCARAB_PARAM_{}", k.to_uppercase()),
-                        scarab_pipeline::params::stringify(v),
-                    )
-                })
-                .collect();
-            env.append(&mut spec.env);
-            spec.env = env;
-        }
-
-        // Fast path: no interpolation → launch verbatim (the common case). Params
-        // env has already been injected above.
-        let has_interp = spec.image.contains("${{")
-            || spec.command.iter().any(|c| c.contains("${{"))
-            || spec.env.iter().any(|(_, v)| v.contains("${{"));
-        if !has_interp {
-            return Ok(Ok(spec));
-        }
-
-        // Build the `outputs` context from this step's upstream results, keyed by
-        // step id. Only `needs` are gathered — the compile-time check guarantees
-        // a reference names a step the caller `needs` (ADR-0041 §4).
-        let needs = self
-            .db
-            .steps_of_run(run)
-            .await?
-            .into_iter()
-            .find(|s| &s.step == step)
-            .map(|s| s.needs)
-            .unwrap_or_default();
-        let mut outputs = serde_json::Map::new();
-        for need in &needs {
-            let results = self.db.step_results(run, need).await?;
-            if !results.is_empty() {
-                outputs.insert(
-                    need.0.clone(),
-                    serde_json::Value::Object(results.into_iter().collect()),
-                );
-            }
-        }
-        // `inputs` exposes the resolved launch params (typed), so `${{ inputs.x }}`
-        // resolves and a numeric guard like `inputs.n > 80` compares numerically.
-        let inputs = serde_json::Value::Object(params.into_iter().collect());
-        // `matrix` exposes this instance's concrete coordinate (ADR-0023). A matrix
-        // leg is expanded with `${{ matrix.<dim> }}` left in its image/command/env
-        // and its coordinate carried on `spec.matrix_values`; without binding it a
-        // matrixed step's `${{ matrix.* }}` fails to resolve and the leg dies at
-        // launch before a Pod is ever created.
-        let matrix = serde_json::Value::Object(
-            spec.matrix_values
-                .iter()
-                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-                .collect(),
-        );
-        let ctx = serde_json::json!({ "outputs": outputs, "inputs": inputs, "matrix": matrix });
-
-        let interp =
-            |s: &str| scarab_pipeline::cel::interpolate(s, &ctx).map_err(|e| e.to_string());
-        let mut out = spec;
-        match (|| {
-            out.image = interp(&out.image)?;
-            for c in &mut out.command {
-                *c = interp(c)?;
-            }
-            for (_, v) in &mut out.env {
-                *v = interp(v)?;
-            }
-            Ok::<(), String>(())
-        })() {
-            Ok(()) => Ok(Ok(out)),
-            Err(reason) => Ok(Err(reason)),
-        }
+        Ok(crate::render::render_launch_spec(self.db, run, step, spec).await?)
     }
 
     /// Settle the run once every step is terminal, mapping the cause to the

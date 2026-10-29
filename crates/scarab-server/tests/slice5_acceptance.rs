@@ -151,6 +151,7 @@ async fn secret_used_not_logged_oidc_verifies_and_build_produces_digest() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
     let pod = build_pod(
         "scarab-image",

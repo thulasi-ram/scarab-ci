@@ -41,6 +41,7 @@ fn spec(uses: &[&str]) -> StepSpec {
         services: Vec::new(),
         uses: uses.iter().map(|s| s.to_string()).collect(),
         matrix_values: Default::default(),
+        scope: None,
     }
 }
 

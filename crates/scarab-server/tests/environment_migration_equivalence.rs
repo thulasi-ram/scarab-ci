@@ -601,6 +601,7 @@ async fn run_at_gate(pg: &Arc<PostgresDb>, run: &RunId, ctx: &DeployContext) {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
     pg.create_run(run, 1, 1, Timestamp(0)).await.unwrap();
     pg.create_step_run(run, &a, Some(&spec), &[], Timestamp(0))

@@ -60,6 +60,7 @@ fn clone_spec(read_only: bool) -> StepSpec {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     }
 }
 
@@ -200,6 +201,7 @@ fn build_spec(image: &str) -> StepSpec {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     }
 }
 

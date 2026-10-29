@@ -437,6 +437,7 @@ async fn busybox_runs_to_completion_and_relaunch_reattaches() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
 
     // launch, then launch again — the second call must re-attach, not relaunch.
@@ -504,6 +505,7 @@ async fn sleeping_step_is_killed_at_its_deadline() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
 
     let h = exec.launch(&step, &spec).await.expect("launch");
@@ -558,6 +560,7 @@ async fn log_stream_tails_pod_stdout() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
 
     let h = exec.launch(&step, &spec).await.expect("launch");
@@ -641,6 +644,7 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
     async fn settle(exec: &K8sExecutor, h: &ExecHandle) -> ExecState {
         poll_to_terminal(exec, h, 90)
@@ -853,6 +857,7 @@ async fn a_green_attempt_is_backed_by_a_durable_snapshot_at_the_instant_it_goes_
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
 
     let h = exec.launch(&step, &spec).await.expect("launch");
@@ -1031,6 +1036,7 @@ async fn a_missing_input_snapshot_fails_the_attempt_instead_of_hanging() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
 
     let h = exec.launch(&step, &spec).await.expect("launch");
@@ -1119,6 +1125,7 @@ async fn a_step_with_inputs_is_refused_when_no_workspace_service_is_configured()
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
     let pods: kube::Api<k8s_openapi::api::core::v1::Pod> = kube::Api::namespaced(
         kube_client().await,
@@ -1227,6 +1234,7 @@ async fn declared_outputs_publish_only_those_paths_through_the_cas() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
 
     // Producer writes a publishable dir AND junk; it declares only `dist`.
@@ -1381,6 +1389,7 @@ async fn clone_step_produces_a_source_workspace() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
 
     let h = exec.launch(&step, &spec).await.expect("launch clone");
@@ -1470,6 +1479,7 @@ async fn clone_step_produces_a_source_workspace() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
     let bh = exec
         .launch(&build, &build_spec)
@@ -1551,6 +1561,7 @@ async fn clone_depth_full_exposes_history() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
     let h = exec.launch(&step, &spec).await.expect("launch full clone");
     let terminal = poll_to_terminal(&exec, &h, 180).await;
@@ -1604,6 +1615,7 @@ async fn clone_depth_full_exposes_history() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
     let ch = exec
         .launch(&count, &count_spec)
@@ -1687,6 +1699,7 @@ async fn clone_vanished_sha_fails_fast_with_source_unavailable() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
 
     let started = std::time::Instant::now();
@@ -1797,6 +1810,7 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
     let h = exec.launch(&step, &spec).await.expect("launch build");
     let terminal = poll_to_terminal(&exec, &h, 300).await;
@@ -1848,6 +1862,7 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
     let vh = exec
         .launch(&verify, &verify_spec)
@@ -1957,6 +1972,7 @@ async fn results_sidecar_captures_a_named_result_end_to_end() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
     let h = exec.launch(&step, &spec).await.expect("launch");
     let terminal = poll_to_terminal(&exec, &h, 120).await;
@@ -2142,6 +2158,7 @@ async fn cancel_tears_down_a_running_pod() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
     let h = exec.launch(&step, &spec).await.expect("launch");
     // Wait until it is actually Running (the interesting teardown case).
@@ -2239,6 +2256,7 @@ async fn artifacts_are_harvested_post_step() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
     let h = exec.launch(&step, &spec).await.expect("launch");
     let terminal = poll_to_terminal(&exec, &h, 120).await;
@@ -2322,6 +2340,7 @@ async fn artifacts_are_harvested_from_a_failed_step() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
     let h = exec.launch(&step, &spec).await.expect("launch");
     let terminal = poll_to_terminal(&exec, &h, 120).await;
@@ -2388,6 +2407,7 @@ fn busybox_spec(cmd: &str, run_as_root: bool) -> StepSpec {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     }
 }
 
@@ -2676,6 +2696,7 @@ async fn fanin_collision_summary_survives_the_termination_log_as_uid_65532() {
         services: Vec::new(),
         uses: Vec::new(),
         matrix_values: Default::default(),
+        scope: None,
     };
     async fn settle(exec: &K8sExecutor, h: &ExecHandle) -> ExecState {
         poll_to_terminal(exec, h, 90)

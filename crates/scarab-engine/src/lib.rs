@@ -18,6 +18,7 @@
 //! Everything below is a compiling skeleton — method bodies are stubs.
 
 pub mod ports;
+pub mod render;
 pub mod scheduler;
 
 pub use ports::{Clock, Db, Executor, LogChunks, SnapshotRetention, WorkspaceSnapshots};
@@ -688,6 +689,15 @@ pub struct StepSpec {
     /// (absent in older stored specs → empty).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub matrix_values: std::collections::BTreeMap<String, String>,
+    /// What this Step's `${{ … }}` templates read (ADR-0076): set by the
+    /// compiler on a Step inlined from a library, whose `inputs` are its
+    /// invocation's bound inputs and whose `outputs` a view of the library's
+    /// own Steps. `None` (every Step written in the Pipeline file, and every
+    /// spec stored before scopes existed) renders as it always has: `inputs`
+    /// are the Run's launch parameters, `outputs` the results of its direct
+    /// needs, `matrix` its [`matrix_values`](Self::matrix_values).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<scarab_pipeline::Scope>,
 }
 
 /// The launch context of a step's keyed directory Cache (ADR-0065 s1).

@@ -1719,6 +1719,7 @@ async fn create_run(
             // The inline `POST /v1/runs` escape hatch takes steps directly (no
             // matrix expansion), so there is never a coordinate here.
             matrix_values: Default::default(),
+            scope: None,
         };
         let needs: Vec<StepId> = step.needs.iter().map(|n| StepId(n.clone())).collect();
         admitted_steps.push((StepId(step.id.clone()), spec, needs));
@@ -4006,20 +4007,7 @@ async fn debug_pod_step(
         .as_ref()
         .ok_or(ApiError::NotFound)?
         .clone();
-    let step_id = StepId(step);
-    let sr = st
-        .db
-        .steps_of_run(&run)
-        .await?
-        .into_iter()
-        .find(|s| s.step == step_id)
-        .ok_or(ApiError::NotFound)?;
-    // Its image is the durable step spec; its workspace is the output snapshot.
-    let spec =
-        st.db.step_spec(&run, &step_id).await?.ok_or_else(|| {
-            ApiError::BadRequest("no step spec — cannot reproduce this step".into())
-        })?;
-    let snapshot = st.db.step_output(&run, &step_id).await?;
+    let (sr, image, snapshot) = debug_pod_plan(st.db.as_ref(), &run, &StepId(step)).await?;
     Ok(ws.on_upgrade(move |mut socket| async move {
         let _ = socket
             .send(Message::Text(
@@ -4027,7 +4015,7 @@ async fn debug_pod_step(
             ))
             .await;
         match launcher
-            .launch_debug(&sr, &spec.image, snapshot.as_deref(), 3600)
+            .launch_debug(&sr, &image, snapshot.as_deref(), 3600)
             .await
         {
             Ok(dp) => {
@@ -4052,6 +4040,34 @@ async fn debug_pod_step(
             }
         }
     }))
+}
+
+/// What a debug Pod reproduces of a finished step: the step, the image it ran
+/// and its output snapshot. The image is the stored spec's, rendered the way
+/// its launch rendered it (ADR-0041, ADR-0076): a stored image may hold
+/// `${{ … }}`, which is a template, not an image.
+async fn debug_pod_plan(
+    db: &dyn Db,
+    run: &RunId,
+    step: &StepId,
+) -> Result<(scarab_engine::StepRun, String, Option<String>), ApiError> {
+    let sr = db
+        .steps_of_run(run)
+        .await?
+        .into_iter()
+        .find(|s| &s.step == step)
+        .ok_or(ApiError::NotFound)?;
+    let spec = db
+        .step_spec(run, step)
+        .await?
+        .ok_or_else(|| ApiError::BadRequest("no step spec — cannot reproduce this step".into()))?;
+    let spec = scarab_engine::render::render_launch_spec(db, run, step, spec)
+        .await?
+        .map_err(|reason| {
+            ApiError::BadRequest(format!("the step's image does not render: {reason}"))
+        })?;
+    let snapshot = db.step_output(run, step).await?;
+    Ok((sr, spec.image, snapshot))
 }
 
 /// In-repo directory holding pipeline definitions (ADR-0010). Every
@@ -5704,6 +5720,7 @@ async fn persist_run_from_ir(
                 uses: Vec::new(),
                 // Carried for uniformity; a clone step is never matrixed.
                 matrix_values: step.matrix_values.clone(),
+                scope: None,
             };
             db.create_step_run(run, &step_id, Some(&spec), &needs, now)
                 .await?;
@@ -5787,6 +5804,7 @@ async fn persist_run_from_ir(
                 // Matrix coordinate (ADR-0023): carried through so launch-time
                 // interpolation resolves this leg's `${{ matrix.<dim> }}`.
                 matrix_values: step.matrix_values.clone(),
+                scope: None,
             };
             db.create_step_run(run, &step_id, Some(&spec), &needs, now)
                 .await?;
@@ -11113,5 +11131,60 @@ mod canonicalize_ref_tests {
         assert_eq!(canonicalize_ref(upper), format!("refs/heads/{upper}"));
         // A short hex-ish name is a branch, not a SHA.
         assert_eq!(canonicalize_ref("abc123"), "refs/heads/abc123");
+    }
+}
+
+#[cfg(test)]
+mod debug_pod_tests {
+    use super::{debug_pod_plan, ApiError};
+    use scarab_engine::{Db, RunId, StepId, StepSpec, Timestamp};
+    use scarab_testkit::InMemoryDb;
+
+    /// The debug Pod starts the image the Step launched with: its stored
+    /// image is a template, rendered with the Run's parameters and the
+    /// Step's coordinate. Before, it started the template text as an image.
+    #[tokio::test]
+    async fn the_debug_pod_runs_the_rendered_image() {
+        let db = InMemoryDb::new();
+        let run = RunId("r".into());
+        let step = StepId("s".into());
+        db.create_run(&run, 2, 1, Timestamp(0)).await.unwrap();
+        db.set_run_params(
+            &run,
+            &std::collections::BTreeMap::from([("tag".to_string(), serde_json::json!("1.36"))]),
+        )
+        .await
+        .unwrap();
+        let spec: StepSpec = serde_json::from_value(serde_json::json!({
+            "image": "busybox:${{ inputs.tag }}-${{ matrix.os }}",
+            "command": [],
+            "env": [],
+            "matrix_values": { "os": "linux" }
+        }))
+        .unwrap();
+        db.create_step_run(&run, &step, Some(&spec), &[], Timestamp(0))
+            .await
+            .unwrap();
+        let Ok((_, image, _)) = debug_pod_plan(&db, &run, &step).await else {
+            panic!("the debug Pod plan failed");
+        };
+        assert_eq!(image, "busybox:1.36-linux");
+
+        // An image that does not render is refused, not started as text.
+        let bad = StepId("bad".into());
+        let spec: StepSpec = serde_json::from_value(serde_json::json!({
+            "image": "busybox:${{ inputs.missing }}",
+            "command": [],
+            "env": []
+        }))
+        .unwrap();
+        db.create_step_run(&run, &bad, Some(&spec), &[], Timestamp(0))
+            .await
+            .unwrap();
+        match debug_pod_plan(&db, &run, &bad).await {
+            Err(ApiError::BadRequest(m)) => assert!(m.contains("does not render"), "{m}"),
+            Err(_) => panic!("expected a bad request"),
+            Ok((_, image, _)) => panic!("expected a refusal, got image {image}"),
+        }
     }
 }
