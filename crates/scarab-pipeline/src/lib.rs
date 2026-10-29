@@ -1603,15 +1603,65 @@ fn too_many_steps(at: &str) -> String {
 /// Termination (ADR-0038): a direct or indirect invoke **cycle** is rejected
 /// with a diagnostic naming the offending path, and a hard **depth cap**
 /// ([`MAX_INVOKE_DEPTH`]) bounds nesting.
+///
+/// Work is bounded too (see [`Budget`]): every `invoke:` step expanded counts,
+/// failing ones included, and the compiler stops after
+/// [`MAX_INLINE_DIAGNOSTICS`] problems.
 fn inline_invokes(steps: &[StepSpec], libs: LibsRef<'_>) -> Result<Vec<StepSpec>, Vec<String>> {
     let mut diagnostics = Vec::new();
     let mut stack: Vec<Frame> = Vec::new();
-    let mut over_cap = false;
-    let out = inline_level(steps, libs, &mut stack, &mut over_cap, &mut diagnostics);
+    let mut budget = Budget::default();
+    let out = inline_level(steps, libs, &mut stack, &mut budget, &mut diagnostics);
     if diagnostics.is_empty() {
         Ok(out)
     } else {
         Err(diagnostics)
+    }
+}
+
+/// The most `invoke:` steps one compile expands, at every depth, counting a
+/// library each time it is invoked and counting invokes that fail or inline
+/// nothing (a matrix whose `exclude` removes every combination). A Pipeline
+/// under [`MAX_COMPILED_STEPS`] whose invokes each inline at least one Step
+/// expands fewer: each such invoke is an ancestor of a compiled Step, and a
+/// Step has at most [`MAX_INVOKE_DEPTH`] of them.
+const MAX_INVOKE_EXPANSIONS: usize = MAX_INVOKE_DEPTH * MAX_COMPILED_STEPS;
+
+/// The most problems `invoke:` inlining reports before the compiler stops.
+const MAX_INLINE_DIAGNOSTICS: usize = 100;
+
+/// What one compile may still spend on `invoke:` inlining.
+#[derive(Default)]
+struct Budget {
+    /// `invoke:` steps expanded so far, failing ones included.
+    expansions: usize,
+    /// Set, with one diagnostic, once a limit is passed; every level then
+    /// returns at once.
+    stopped: bool,
+}
+
+impl Budget {
+    /// Stop, saying why, unless already stopped.
+    fn stop(&mut self, why: String, diagnostics: &mut Vec<String>) {
+        if !self.stopped {
+            self.stopped = true;
+            diagnostics.push(why);
+        }
+    }
+
+    /// Whether to stop before the next step: already stopped, or
+    /// [`MAX_INLINE_DIAGNOSTICS`] problems found.
+    fn spent(&mut self, diagnostics: &mut Vec<String>) -> bool {
+        if diagnostics.len() >= MAX_INLINE_DIAGNOSTICS {
+            self.stop(
+                format!(
+                    "the compiler stopped after {MAX_INLINE_DIAGNOSTICS} problems; fix these and \
+                     compile again to see any others"
+                ),
+                diagnostics,
+            );
+        }
+        self.stopped
     }
 }
 
@@ -1662,15 +1712,15 @@ fn invoke_step_extra_fields(step: &StepSpec) -> Vec<&'static str> {
 /// level (an outer caller applies its own prefix). `stack` holds the libraries
 /// currently being expanded on this DFS path — used for cycle detection (a
 /// target already on the stack), the depth cap (its length) and the closed
-/// rule for installed libraries (its last frame). `over_cap` is set, with one
-/// diagnostic, once a level's list passes [`MAX_COMPILED_STEPS`]; every level
-/// then returns at once. A level's list is part of the final list at least
-/// once, so the check never refuses a Pipeline under the cap.
+/// rule for installed libraries (its last frame). `budget` stops the compile,
+/// with one diagnostic, once a level's list passes [`MAX_COMPILED_STEPS`];
+/// every level then returns at once. A level's list is part of the final list
+/// at least once, so the check never refuses a Pipeline under the cap.
 fn inline_level(
     steps: &[StepSpec],
     libs: LibsRef<'_>,
     stack: &mut Vec<Frame>,
-    over_cap: &mut bool,
+    budget: &mut Budget,
     diagnostics: &mut Vec<String>,
 ) -> Vec<StepSpec> {
     let mut out: Vec<StepSpec> = Vec::new();
@@ -1680,17 +1730,16 @@ fn inline_level(
     // rewrite (ADR-0041): `outputs.<id>.<name>` -> `outputs["<id>/<name>"].<name>`.
     let mut output_aliases: Vec<(String, Vec<String>)> = Vec::new();
 
-    // Stop when the list passes the cap: set `over_cap` and report once.
-    let capped = |len: usize, at: &str, over_cap: &mut bool, diagnostics: &mut Vec<String>| {
-        if len > MAX_COMPILED_STEPS && !*over_cap {
-            *over_cap = true;
-            diagnostics.push(too_many_steps(at));
+    // Stop when the list passes the cap.
+    let capped = |len: usize, at: &str, budget: &mut Budget, diagnostics: &mut Vec<String>| {
+        if len > MAX_COMPILED_STEPS {
+            budget.stop(too_many_steps(at), diagnostics);
         }
-        *over_cap
+        budget.stopped
     };
 
     for step in steps {
-        if *over_cap {
+        if budget.spent(diagnostics) {
             return out;
         }
         // `origin` is the compiler's record of where a Step came from
@@ -1719,13 +1768,28 @@ fn inline_level(
             if capped(
                 out.len(),
                 &format!("step `{}`", step.id),
-                over_cap,
+                budget,
                 diagnostics,
             ) {
                 return out;
             }
             continue;
         };
+        // Every expansion counts, so invokes that fail cannot fan out
+        // without a bound.
+        budget.expansions += 1;
+        if budget.expansions > MAX_INVOKE_EXPANSIONS {
+            budget.stop(
+                format!(
+                    "step `{}`: the pipeline expands more than {MAX_INVOKE_EXPANSIONS} `invoke:` \
+                     steps, counting a library each time it is invoked; the limit is \
+                     {MAX_INVOKE_EXPANSIONS}",
+                    step.id
+                ),
+                diagnostics,
+            );
+            return out;
+        }
 
         // An invoke step inlines a library and launches nothing itself: only
         // the fields that carry onto what it inlines are allowed (ADR-0076 §1).
@@ -1935,9 +1999,9 @@ fn inline_level(
             label: label.clone(),
             installed: kind == OriginKind::Library,
         });
-        let resolved = inline_level(&lib_steps, libs, stack, over_cap, diagnostics);
+        let resolved = inline_level(&lib_steps, libs, stack, budget, diagnostics);
         stack.pop();
-        if *over_cap {
+        if budget.stopped {
             return out;
         }
         // The fields an invoke step carries apply only to non-gate Steps; with
@@ -2103,7 +2167,7 @@ fn inline_level(
                 if capped(
                     out.len(),
                     &format!("step `{}`", step.id),
-                    over_cap,
+                    budget,
                     diagnostics,
                 ) {
                     return out;
@@ -7153,6 +7217,37 @@ mod tests {
         compile_with(
             caller,
             &libs(&[(".scarab/lib/deploy.yaml", &lib("images"))]),
+        );
+    }
+
+    /// Every `invoke:` expansion counts against a bound, including one whose
+    /// matrix `exclude` removes every combination, which adds no Step and no
+    /// problem.
+    #[test]
+    fn invoke_expansions_are_bounded_when_nothing_is_inlined() {
+        let fan = |target: &str| -> String {
+            (0..30)
+                .map(|k| {
+                    format!(
+                        "  - {{ id: k{k}, invoke: \"{target}\", matrix: {{ dimensions: {{ a: [x] }}, exclude: [\"true\"] }} }}\n"
+                    )
+                })
+                .collect()
+        };
+        let l1 = format!("steps:\n{}", fan("file:l2.yaml"));
+        let l2 = format!("steps:\n{}", fan("file:l3.yaml"));
+        let l3 = "steps: [{ id: s, image: busybox }]";
+        let ds = errors_with(
+            &format!("steps:\n{}", fan("file:l1.yaml")),
+            &libs(&[("l1.yaml", &l1), ("l2.yaml", &l2), ("l3.yaml", l3)]),
+        );
+        assert_eq!(
+            ds,
+            vec![format!(
+                "step `k29`: the pipeline expands more than {MAX_INVOKE_EXPANSIONS} `invoke:` \
+                 steps, counting a library each time it is invoked; the limit is \
+                 {MAX_INVOKE_EXPANSIONS}"
+            )]
         );
     }
 }
