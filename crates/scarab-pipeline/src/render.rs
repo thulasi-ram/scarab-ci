@@ -31,9 +31,10 @@ pub enum Facts<'a> {
     },
     /// The Run is being created and no Step has run. Only values known then
     /// render: the Run's launch parameters, literal `with:` values and
-    /// defaults, and `matrix`. A `${{ … }}` that reads anything else (an
-    /// output, an input bound to the caller's template) is left as its
-    /// template text, so a leftover `${{` means "not known yet".
+    /// defaults, `matrix`, and an input bound to a caller's template that
+    /// reads only these. A `${{ … }}` that reads anything else (an output,
+    /// an input bound to a template that reads one) is left as its template
+    /// text, so a leftover `${{` means "not known yet".
     Preview { params: &'a BTreeMap<String, Value> },
 }
 
@@ -134,8 +135,14 @@ pub fn render(
                 }
                 Err(_) => templates.command.to_vec(),
             };
+            // An image the launch refuses is not known: a policy must not
+            // read a digest from text that never runs.
+            let mut image = one(templates.image);
+            if !image.is_empty() && !crate::oci::is_image_reference(&image) {
+                image = templates.image.to_string();
+            }
             Ok(Rendered {
-                image: one(templates.image),
+                image,
                 command,
                 env: templates
                     .env
@@ -153,13 +160,22 @@ pub fn render(
 ///
 /// A value from outside the Pipeline ([`ValueSource::Outside`]: a Run
 /// parameter, a Step's results, a caller's `with:` that reads one) is data,
-/// but a program reads an argument that starts with `-` as an option: `git
-/// fetch origin ${{ inputs.ref }}` with `--upload-pack=…` runs a command. So
-/// such a value may not be the start of an argument. Text written before it
-/// (`--ref=${{ inputs.ref }}`) is the Pipeline's own, and an argument right
-/// after a `--` argument is an operand, so both are allowed. Which part of
-/// an argument is written and which is a value is known here, while the
-/// argument is built, so the check never reads the rendered text again.
+/// but where it sits in the command can make it more:
+///
+/// - A program reads an argument that starts with `-` as an option: `git
+///   fetch origin ${{ inputs.ref }}` with `--upload-pack=…` runs a command.
+///   So such a value may not start an argument with `-`. Text written
+///   before it (`--ref=${{ inputs.ref }}`) is the Pipeline's own. A `--` in
+///   front does not help: it ends the options of one program only, and the
+///   value may reach another (`sh -c '…' -- "$1"`, `npm run x -- …`).
+/// - The argument that names the program (`command[0]`, or the program a
+///   wrapper such as `env`, `sudo`, `timeout` or `xargs` runs, see
+///   [`crate::argv`]) decides what runs, so a value from outside may not be
+///   the first thing in it.
+///
+/// Which part of an argument is written and which is a value, and where
+/// each value came from, is recorded while the argument is built; the
+/// checks read that record, never the rendered text for `${{`.
 fn arguments(
     command: &[String],
     sources: &InputSources,
@@ -167,26 +183,29 @@ fn arguments(
     mut value: impl FnMut(&str) -> Result<Option<String>, String>,
 ) -> Result<Vec<String>, String> {
     let mut out = Vec::with_capacity(command.len());
+    // Per argument: the byte ranges of known values from outside, with the
+    // template each came from.
+    let mut outside: Vec<Vec<(std::ops::Range<usize>, &str)>> = Vec::with_capacity(command.len());
     for (index, template) in command.iter().enumerate() {
-        let operand = index > 0 && command[index - 1] == "--";
         let (found, unterminated) = cel::scan_interpolations(template);
         let mut arg = String::with_capacity(template.len());
+        let mut pieces = Vec::new();
         let mut at = 0;
         for i in found {
             arg.push_str(&template[at..i.outer.start]);
             let expr = template[i.inner.clone()].trim();
+            let shown = &template[i.outer.clone()];
             match value(expr)? {
                 Some(text) => {
-                    if arg.is_empty()
-                        && !operand
-                        && text.starts_with('-')
-                        && sources.of_expr(expr) == ValueSource::Outside
-                    {
-                        return Err(leading_dash(index, &template[i.outer.clone()]));
+                    if sources.of_expr(expr) == ValueSource::Outside {
+                        if arg.is_empty() && text.starts_with('-') {
+                            return Err(leading_dash(index, shown));
+                        }
+                        pieces.push((arg.len()..arg.len() + text.len(), shown));
                     }
                     arg.push_str(&text);
                 }
-                None => arg.push_str(&template[i.outer.clone()]),
+                None => arg.push_str(shown),
             }
             at = i.outer.end;
         }
@@ -199,17 +218,45 @@ fn arguments(
         }
         arg.push_str(&template[at..]);
         out.push(arg);
+        outside.push(pieces);
+    }
+    // The arguments that name a program, read as the wrappers will read
+    // them: whichever argument that turns out to be, the first thing in it
+    // may not be a value from outside.
+    for p in crate::argv::programs(&out) {
+        let arg = &out[p.index];
+        let Some(first) = arg[p.start.min(arg.len())..]
+            .find(|c: char| !c.is_whitespace())
+            .map(|o| p.start + o)
+        else {
+            continue;
+        };
+        if let Some((_, shown)) = outside[p.index].iter().find(|(r, _)| r.contains(&first)) {
+            return Err(names_program(p.index, shown));
+        }
     }
     Ok(out)
 }
 
-/// Why an argument is refused by [`arguments`].
+/// Why an argument is refused by [`arguments`]: an outside value would
+/// start it with `-`.
 fn leading_dash(index: usize, shown: &str) -> String {
     format!(
         "`command[{index}]`: `{shown}` starts the argument with `-`, and its value comes from \
          outside the Pipeline (a Run parameter, a Step's results or an event field), so the \
          program would read it as an option; write the option in front of it \
-         (`--name={shown}`), or put a `--` argument just before it"
+         (`--name={shown}`), or pass the value in `env:` and read it from the environment"
+    )
+}
+
+/// Why an argument is refused by [`arguments`]: an outside value would name
+/// the program.
+fn names_program(index: usize, shown: &str) -> String {
+    format!(
+        "`command[{index}]`: `{shown}` names the program the Step runs, and its value comes \
+         from outside the Pipeline (a Run parameter, a Step's results or an event field), so \
+         whoever supplies it chooses what runs; write the program in the Pipeline and pass the \
+         value to it as an argument or in `env:`"
     )
 }
 
@@ -261,7 +308,8 @@ enum Mode {
     /// Run creation, for a guard: a caller's template renders when every
     /// value it reads is known (it reads no `outputs`).
     Guard,
-    /// Run creation, for a preview: a caller's template is not rendered.
+    /// Run creation, for a preview: as for a guard, and a caller's template
+    /// that does not render (the launch will refuse it) is left unknown.
     Preview,
 }
 
@@ -360,13 +408,19 @@ fn bind(
             let any_template = bindings
                 .values()
                 .any(|b| matches!(b.value, BoundValue::Template(_)));
-            let caller = if any_template && mode != Mode::Preview {
+            let caller = if !any_template {
+                None
+            } else if mode == Mode::Preview {
+                // A preview renders what it can and leaves the rest.
+                scope
+                    .caller
+                    .as_deref()
+                    .and_then(|c| bind(Some(c), &BTreeMap::new(), params, results, mode).ok())
+            } else {
                 let caller = scope.caller.as_deref().ok_or_else(|| {
                     "a caller's `with:` value has no caller scope to render in".to_string()
                 })?;
                 Some(bind(Some(caller), &BTreeMap::new(), params, results, mode)?)
-            } else {
-                None
             };
             let mut values = BTreeMap::new();
             for (name, binding) in bindings {
@@ -378,21 +432,30 @@ fn bind(
                     BoundValue::Template(t) => t,
                 };
                 let Some(caller) = &caller else { continue };
-                if mode == Mode::Guard && !caller.known.covers_template(template) {
+                if mode != Mode::Launch && !caller.known.covers_template(template) {
                     continue;
                 }
                 let ctx = Value::Object(caller.ctx.clone());
-                let raw = match exact(template) {
-                    Some(expr) => cel::eval(expr, &ctx),
-                    None => cel::interpolate(template, &ctx).map(Value::String),
-                }
-                .map_err(|e| format!("input `{name}` (from the caller's `with:`): {e}"))?;
-                let param = binding.param.as_deref().ok_or_else(|| {
-                    format!("input `{name}` (from the caller's `with:`) has no declared type")
-                })?;
-                let value = params::resolve_one(param, &raw)
+                let value = (|| {
+                    let raw = match exact(template) {
+                        Some(expr) => cel::eval(expr, &ctx),
+                        None => cel::interpolate(template, &ctx).map(Value::String),
+                    }
                     .map_err(|e| format!("input `{name}` (from the caller's `with:`): {e}"))?;
-                values.insert(name.clone(), value);
+                    let param = binding.param.as_deref().ok_or_else(|| {
+                        format!("input `{name}` (from the caller's `with:`) has no declared type")
+                    })?;
+                    params::resolve_one(param, &raw)
+                        .map_err(|e| format!("input `{name}` (from the caller's `with:`): {e}"))
+                })();
+                match value {
+                    Ok(v) => {
+                        values.insert(name.clone(), v);
+                    }
+                    // What the launch will refuse, a preview leaves unknown.
+                    Err(_) if mode == Mode::Preview => {}
+                    Err(e) => return Err(e),
+                }
             }
             let known = values.keys().cloned().collect();
             (values, Some(known))
@@ -503,7 +566,30 @@ mod tests {
         serde_json::from_value(v).unwrap()
     }
 
+    /// Render `command` at launch. A probe whose first argument is a
+    /// template (a list of values, not a program) renders as the arguments
+    /// of `echo`, which the result leaves out: a value from outside may not
+    /// name the program.
     fn launch(
+        command: &[&str],
+        scope: Option<&Scope>,
+        matrix: &BTreeMap<String, String>,
+        params: &BTreeMap<String, Value>,
+        results: &Results,
+    ) -> Result<Rendered, String> {
+        let probe = command.first().is_some_and(|c| c.starts_with("${{"));
+        let mut argv: Vec<&str> = probe.then_some("echo").into_iter().collect();
+        argv.extend_from_slice(command);
+        launch_argv(&argv, scope, matrix, params, results).map(|mut r| {
+            if probe {
+                r.command.remove(0);
+            }
+            r
+        })
+    }
+
+    /// Render `command` at launch, as written.
+    fn launch_argv(
         command: &[&str],
         scope: Option<&Scope>,
         matrix: &BTreeMap<String, String>,
@@ -755,15 +841,32 @@ mod tests {
                 ParamType::String,
                 BoundValue::Template("${{ inputs.d }}".into()),
             ),
+            (
+                "out",
+                ParamType::String,
+                BoundValue::Template("${{ outputs.a.d }}".into()),
+            ),
+            (
+                "num",
+                ParamType::Number,
+                BoundValue::Template("${{ inputs.d }}".into()),
+            ),
         ]);
         let params = map(json!({ "d": "sha256:def" }));
         let p = |image: &str, scope: Option<&Scope>| {
             preview_image(image, scope, &BTreeMap::new(), &params)
         };
         assert_eq!(p("img@${{ inputs.lit }}", Some(&scope)), "img@sha256:abc");
+        // A caller's template that reads a launch parameter is known; one
+        // that reads an output, or that the launch will refuse, is not.
+        assert_eq!(p("img@${{ inputs.tpl }}", Some(&scope)), "img@sha256:def");
         assert_eq!(
-            p("img@${{ inputs.tpl }}", Some(&scope)),
-            "img@${{ inputs.tpl }}"
+            p("img@${{ inputs.out }}", Some(&scope)),
+            "img@${{ inputs.out }}"
+        );
+        assert_eq!(
+            p("img@${{ inputs.num }}", Some(&scope)),
+            "img@${{ inputs.num }}"
         );
         assert_eq!(
             p("img@${{ size(inputs) > 0 ? 'x' : 'y' }}", Some(&scope)),
@@ -801,14 +904,20 @@ mod tests {
         }
         let e = run(&["git", "${{ inputs.p }}"], None).unwrap_err();
         assert!(e.contains("`command[1]`: `${{ inputs.p }}`"), "{e}");
-        // Authored text in front, an operand after `--`, the Pipeline's own
-        // value, an env value: allowed.
+        // A `--` in front does not make it an operand: the value may reach
+        // another program that reads it as an option.
+        let e = run(
+            &["sh", "-c", "git fetch \"$1\"", "--", "${{ inputs.p }}"],
+            None,
+        )
+        .unwrap_err();
+        assert!(e.contains("`command[4]`") && e.contains("`env:`"), "{e}");
+        // Authored text in front, the Pipeline's own value, an env value:
+        // allowed.
         let r = run(
             &[
                 "--ref=${{ inputs.p }}",
                 "-${{ inputs.p }}",
-                "--",
-                "${{ inputs.p }}",
                 "${{ matrix.m }}",
                 "x${{ outputs.a.v }}",
             ],
@@ -816,8 +925,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.command[0], format!("--ref={evil}"));
-        assert_eq!(r.command[3], evil);
-        assert_eq!(r.command[4], "-m");
+        assert_eq!(r.command[1], format!("-{evil}"));
+        assert_eq!(r.command[2], "-m");
 
         // In a library: a literal binding is the Pipeline's own; a caller's
         // template is outside when it reads a Run parameter.
@@ -862,8 +971,64 @@ mod tests {
         };
         let e = preview(&["git", "${{ inputs.p }}"], None).unwrap_err();
         assert!(e.contains("starts the argument with `-`"), "{e}");
-        let r = preview(&["${{ inputs.tpl }}", "${{ inputs.p"], Some(&scope)).unwrap();
-        assert_eq!(r.command, ["${{ inputs.tpl }}", "${{ inputs.p"]);
+        let e = preview(&["git", "${{ inputs.tpl }}"], Some(&scope)).unwrap_err();
+        assert!(e.contains("starts the argument with `-`"), "{e}");
+        let r = preview(&["git", "${{ inputs.p"], Some(&scope)).unwrap();
+        assert_eq!(r.command, ["git", "${{ inputs.p"]);
+    }
+    /// A value from outside the Pipeline may not name the program: the
+    /// first thing in `command[0]`, or in the argument a wrapper runs, read
+    /// with the values the launch has.
+    #[test]
+    fn an_outside_value_may_not_name_the_program() {
+        let params = map(json!({ "p": "/bin/sh", "a": "A=1", "s": "sh -c id", "e": "" }));
+        let matrix = BTreeMap::from([("m".into(), "make".into())]);
+        let run = |command: &[&str]| {
+            launch_argv(command, None, &matrix, &params, &Results::new()).map(|r| r.command)
+        };
+        for (command, at) in [
+            (&["${{ inputs.p }}"][..], 0),
+            (&[" ${{ inputs.p }}"], 0),
+            (&["${{ inputs.e }}${{ inputs.p }}", "x"], 0),
+            (&["env", "-u", "X", "${{ inputs.p }}"], 3),
+            // The value decides that the argument is `NAME=value`, so the
+            // next one is the program.
+            (&["env", "${{ inputs.a }}", "${{ inputs.p }}"], 2),
+            (&["env", "-S", "${{ inputs.s }}"], 2),
+            (&["env", "-S${{ inputs.s }}"], 1),
+            (&["env", "--split-string=${{ inputs.s }}"], 1),
+            (&["nice", "nohup", "${{ inputs.p }}"], 2),
+        ] {
+            let e = run(command).unwrap_err();
+            assert!(
+                e.contains(&format!("`command[{at}]`")) && e.contains("names the program"),
+                "{command:?}: {e}"
+            );
+        }
+        // Written text first, the Pipeline's own program, an outside value
+        // as an argument or after `NAME=`: allowed.
+        for command in [
+            &["./bin/${{ inputs.p }}"][..],
+            &["${{ matrix.m }}", "${{ inputs.p }}"],
+            &["env", "A=${{ inputs.p }}", "make"],
+            &["env", "-S", "sh -c ${{ inputs.p }}"],
+            &["git", "${{ inputs.p }}"],
+        ] {
+            assert!(run(command).is_ok(), "{command:?}");
+        }
+        // A preview refuses what it knows.
+        let command = vec!["${{ inputs.p }}".to_string()];
+        let preview = render(
+            Templates {
+                image: "busybox",
+                command: &command,
+                env: &[],
+            },
+            None,
+            &matrix,
+            Facts::Preview { params: &params },
+        );
+        assert!(preview.unwrap_err().contains("names the program"));
     }
     /// A stored binding written before bindings were trimmed (with the
     /// input's whole declaration) still loads and checks its value; a

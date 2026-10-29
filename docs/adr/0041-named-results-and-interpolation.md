@@ -2,6 +2,9 @@
 
 - **Status:** Accepted
 - **Date:** 2026-07-14
+- **Amended:** 2026-10-30 by [0076](0076-libraries-and-plugins-through-invoke.md) (§2 and §4:
+  the compile-time rewrite of `outputs.<invoke>.<name>` is removed; an invoke's outputs are
+  read through a view at launch; see "Amendment (2026-10-30)")
 - **Deciders:** thulasi.ram (architect)
 - **Refines:** [0008](0008-step-contract.md) (makes the `results` emit channel real), [0009](0009-dsl-ir-yaml-cel.md) (the first `${{ … }}` interpolation pass), [0038](0038-invoke-and-local-reuse.md) (makes an invoked pipeline's `outputs` interface *live*, not only compile-checked)
 - **Relates:** [0029](0029-workspace-cas.md) (results are **not** the workspace snapshot), [0021](0021-double-effect-fencing.md) (capture under the fence), [0027](0027-restart-semantics.md) (deterministic re-derivation), [0031](0031-pure-computation-deps.md) (interpolation stays pure)
@@ -90,6 +93,12 @@ exposed-name → **concrete inlined step** (`deploy` exposing `url` → inlined 
 of step `deploy/url`. A decoupled `iface-name → step.result` mapping was
 considered and rejected for v1 (more syntax, no v1 payoff).
 
+> **Amended 2026-10-30, see [Amendment (2026-10-30)](#amendment-2026-10-30-an-invokes-outputs-are-read-through-a-view).**
+> The coupling stands: `outputs.deploy.url` is still the result `url` of step `deploy/url`. The
+> compiler no longer rewrites the reference's text to name `deploy/url`. It records the mapping
+> as a view in the reading Step's scope, and the reference resolves through that view when the
+> Step launches.
+
 ### 3. `${{ outputs.<id>.<name> }}` — one small top-level `outputs` namespace
 
 The reference binding is a single top-level `outputs` map, keyed by producer id
@@ -123,6 +132,11 @@ persisted results and constructs `ctx`; `scarab-pipeline` stays pure
   `Succeeded` before a step is ready, [0033](0033-transitive-skip.md)). For an
   `invoke` reference the required edge is `needs: [<invoke-id>]`, which inlining
   already rewrites onto the module's leaves.
+
+  > **Amended 2026-10-30.** `needs: [<invoke-id>]` is still required. Because it reaches only
+  > the library's leaves, the compiler also adds an edge to the backing Step the reference
+  > reads, which need not be a leaf. `interpolate_spec` is replaced by
+  > `scarab_pipeline::render`, which renders a Step in its scope (ADR-0076).
 - **Determinism:** the context is re-derived from persisted results on a
   re-launch, so interpolation yields the same bytes — restart-safe
   ([0027](0027-restart-semantics.md)).
@@ -193,3 +207,37 @@ continue with a wrong or empty value.
 - **Hidden data edges** (let a reference create the dependency implicitly) —
   rejected: a reference must be backed by an explicit `needs` edge, keeping the DAG the
   single source of ordering truth and guaranteeing availability.
+
+## Amendment (2026-10-30): an invoke's outputs are read through a view
+
+Decided with [0076](0076-libraries-and-plugins-through-invoke.md)'s 2026-10-30 amendment
+(scoped rendering) and built on the `feat/libraries` branch.
+
+**The rewrite is removed.** The compiler used to rewrite each read of
+`outputs.<invoke>.<name>` in the Pipeline file into `outputs["<invoke>/<name>"].<name>`, so
+the launch context could stay keyed by Step id. It no longer changes the text of a template.
+A Step that reads an invoke's exposed output gets a scope in which `outputs.<invoke>` is a
+view of the invoke's backing Steps (`<invoke>/<name>`). Inside a library, `outputs` is a view
+from the library's own Step ids to the inlined ids, plus the exposed outputs of the invokes
+inside it. The reference is kept as written and resolves through the view when the Step
+launches.
+
+Why: rewriting text at each level of inlining did not keep each level's outputs apart once
+invokes were nested, and pasting text into templates let a value become part of an
+expression. 0076's amendment has the details.
+
+**What stays.**
+
+- §2: an exposed output is still the result of the library Step with the same name.
+- §4: a reference is legal only to a Step you `needs`. The compiler adds an edge to the
+  backing Step a reference reads, so every Step a view points to is among the reader's
+  `needs` and no read creates a hidden edge.
+- §5: a missing result, a type mismatch in a guard and an undeclared reference fail as before.
+- A reference to an output of a matrixed invoke is still a compile error.
+
+**What changes.**
+
+- `interpolate_spec` is replaced by `scarab_pipeline::render`. Every Step's `${{ }}` text is
+  rendered once, at launch, in the Step's scope, and a rendered value is never rendered again.
+- The "exposed-name → inlined-step record in the IR" listed under Consequences is the view in
+  each reading Step's scope. A Pipeline with a scoped Step compiles to IR version 3.

@@ -4578,11 +4578,12 @@ async fn prefetch_libs_and_compile(
         files: libs,
         installed: installed.clone(),
     };
-    let ir = scarab_pipeline::compile_with_libraries(yaml, &libraries)
-        .map_err(|e| TriggerError::Pipeline(e.to_string()))?;
+    let (ir, warnings) = compile_bounded(yaml.to_string(), libraries)
+        .await
+        .map_err(TriggerError::Pipeline)?;
     // Non-fatal lint diagnostics (ADR-0045), surfaced on the compile path —
     // warnings only, never failures.
-    for warning in scarab_pipeline::lint(&ir) {
+    for warning in warnings {
         tracing::warn!(lint = %warning, "pipeline lint");
     }
     Ok(ir)
@@ -4601,6 +4602,49 @@ pub(crate) async fn installed_libraries(
             .await
             .map_err(|e| DbError::Other(format!("library store: {e}"))),
         None => Ok(Default::default()),
+    }
+}
+
+/// The longest the server waits for one Pipeline compile.
+pub(crate) const COMPILE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Compile `yaml` against `libraries` (the `file:` sources read at the
+/// caller's ref and the org's installed libraries) and lint it, on a
+/// blocking thread so a compile never holds an async worker, waiting at
+/// most [`COMPILE_TIMEOUT`]. Every compile the server runs goes through
+/// here. The compiler bounds its own work (source and IR size, matrix and
+/// invoke limits), so a compile that times out still ends; its thread is
+/// left to finish and its result dropped. A compile error, a timeout and a
+/// panic in the compiler are each an `Err` with the reason.
+pub(crate) async fn compile_bounded(
+    yaml: String,
+    libraries: scarab_pipeline::Libraries,
+) -> Result<(scarab_pipeline::PipelineIr, Vec<String>), String> {
+    let compiled = off_runtime(COMPILE_TIMEOUT, move || {
+        scarab_pipeline::compile_with_libraries(&yaml, &libraries).map(|ir| {
+            let warnings = scarab_pipeline::lint(&ir);
+            (ir, warnings)
+        })
+    })
+    .await
+    .map_err(|why| format!("the pipeline compiler {why}"))?;
+    compiled.map_err(|e| e.to_string())
+}
+
+/// Run `f` on a blocking thread, waiting at most `timeout`. `Err` says why
+/// there is no result: `f` panicked, or did not finish in time (its thread
+/// is left to finish).
+async fn off_runtime<T: Send + 'static>(
+    timeout: std::time::Duration,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    match tokio::time::timeout(timeout, tokio::task::spawn_blocking(f)).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(format!("stopped: {e}")),
+        Err(_) => Err(format!(
+            "did not finish within {} seconds",
+            timeout.as_secs_f64()
+        )),
     }
 }
 
@@ -11408,5 +11452,40 @@ mod debug_pod_tests {
             Err(_) => panic!("expected a bad request"),
             Ok((_, image, _)) => panic!("expected a refusal, got image {image}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod compile_tests {
+    use super::{compile_bounded, off_runtime};
+    use std::time::Duration;
+
+    /// A compile runs off the async workers: one that takes too long, or
+    /// panics, is an error with the reason, and the server keeps running.
+    #[tokio::test]
+    async fn work_off_the_runtime_is_bounded_in_time_and_contains_a_panic() {
+        let slow = off_runtime(Duration::from_millis(10), || {
+            std::thread::sleep(Duration::from_millis(100))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(slow, "did not finish within 0.01 seconds");
+        let panicked = off_runtime(Duration::from_secs(5), || -> u8 { panic!("boom") })
+            .await
+            .unwrap_err();
+        assert!(panicked.starts_with("stopped:"), "{panicked}");
+        assert_eq!(off_runtime(Duration::from_secs(5), || 7).await, Ok(7));
+
+        let (ir, _) = compile_bounded(
+            "steps: [{ id: a, image: busybox }]".into(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ir.steps.len(), 1);
+        let e = compile_bounded("steps: [{ id: a }]".into(), Default::default())
+            .await
+            .unwrap_err();
+        assert!(e.contains("step `a`"), "{e}");
     }
 }

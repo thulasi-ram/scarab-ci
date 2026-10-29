@@ -59,14 +59,19 @@ fn step<'a>(ir: &'a PipelineIr, id: &str) -> &'a StepSpec {
 /// The engine at launch: the one renderer, in the Step's scope, with the
 /// Run's launch parameters `run_params` (which a library Step must never
 /// read) and `outputs`, the results of Steps by id (the engine gives only
-/// the Step's needs: the callers below pass needs only).
+/// the Step's needs: the callers below pass needs only). A probe's
+/// `command` is a list of values, rendered as the arguments of `echo`: a
+/// value from outside may not name the program.
 fn launch(spec: &StepSpec, run_params: serde_json::Value, outputs: serde_json::Value) -> String {
     let params: BTreeMap<String, serde_json::Value> = serde_json::from_value(run_params).unwrap();
     let results: Results = serde_json::from_value(outputs).unwrap();
+    let command: Vec<String> = std::iter::once("echo".to_string())
+        .chain(spec.command.iter().cloned())
+        .collect();
     render(
         Templates {
             image: &spec.image,
-            command: &spec.command,
+            command: &command,
             env: &spec.env,
         },
         spec.scope.as_ref(),
@@ -76,7 +81,7 @@ fn launch(spec: &StepSpec, run_params: serde_json::Value, outputs: serde_json::V
             results: &results,
         },
     )
-    .map(|s| s.command.join(" | "))
+    .map(|s| s.command[1..].join(" | "))
     .unwrap_or_else(|e| format!("LAUNCH ERROR: {e}"))
 }
 

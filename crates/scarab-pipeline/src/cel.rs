@@ -13,6 +13,7 @@
 //! mid-run.
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use cel::common::ast::{operators, EntryExpr, Expr, IdedExpr, LiteralValue};
 use cel::{Context, Program};
@@ -232,32 +233,52 @@ pub fn eval_bool(expr: &str, ctx: &serde_json::Value) -> Result<bool, PipelineEr
     }
 }
 
-/// Evaluate the guard `expr` against each of `ctxs`, parsing it once: the
-/// result of [`eval_bool`] for each context, in order, or its first error.
-/// Every context must bind the same keys.
-pub(crate) fn eval_bool_each(
+/// One dimension of a product of string values, for [`eval_bool_product`].
+pub(crate) struct Dim<'a> {
+    pub name: &'a str,
+    pub values: &'a [Arc<String>],
+}
+
+/// Evaluate the guard `expr`, parsing it once, at each of `points` of the
+/// product of `dims`: point `p` binds each dimension to one of its values,
+/// numbered with the last dimension changing fastest. `fixed` names are
+/// bound once, to the same value at every point. The result of
+/// [`eval_bool`] at each point, in order, or the first error.
+pub(crate) fn eval_bool_product(
     expr: &str,
-    ctxs: &[&serde_json::Value],
+    fixed: &[(&str, Arc<String>)],
+    dims: &[Dim<'_>],
+    points: &[usize],
 ) -> Result<Vec<bool>, PipelineError> {
     with_program(expr, |program| {
         // One context: building one registers the standard functions, which
-        // costs more than the evaluation. Each binding replaces the last; the
-        // contexts given share their keys (a matrix coordinate's dimensions).
+        // costs more than the evaluation. Each binding replaces the last.
         let mut context = Context::default();
-        ctxs.iter()
-            .map(|ctx| {
-                bind(&mut context, ctx, expr)?;
+        for (name, value) in fixed {
+            context.add_variable_from_value(*name, cel::Value::String(value.clone()));
+        }
+        points
+            .iter()
+            .map(|&point| {
+                let mut rest = point;
+                for d in dims.iter().rev() {
+                    let n = d.values.len().max(1);
+                    let value = d.values[rest % n].clone();
+                    context.add_variable_from_value(d.name, cel::Value::String(value));
+                    rest /= n;
+                }
                 let value = program
                     .execute(&context)
                     .map_err(|e| PipelineError::Cel(format!("`{}`: {e}", shown(expr))))?;
-                match value
-                    .json()
-                    .map_err(|e| PipelineError::Cel(format!("`{}`: {e:?}", shown(expr))))?
-                {
-                    serde_json::Value::Bool(b) => Ok(b),
+                match value {
+                    cel::Value::Bool(b) => Ok(b),
                     other => Err(PipelineError::Cel(format!(
-                        "`{}`: expected a boolean, got `{other}`",
-                        shown(expr)
+                        "`{}`: expected a boolean, got `{}`",
+                        shown(expr),
+                        other
+                            .json()
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|_| format!("{other:?}"))
                     ))),
                 }
             })
@@ -752,16 +773,36 @@ mod tests {
     }
 
     #[test]
-    fn eval_bool_each_checks_each_context() {
-        let a = json!({ "a": "x" });
-        let b = json!({ "a": "y" });
+    fn eval_bool_product_checks_each_point() {
+        let a: Vec<Arc<String>> = ["x", "y"].map(|v| Arc::new(v.to_string())).to_vec();
+        let b: Vec<Arc<String>> = ["1", "2", "3"].map(|v| Arc::new(v.to_string())).to_vec();
+        let dims = [
+            Dim {
+                name: "a",
+                values: &a,
+            },
+            Dim {
+                name: "b",
+                values: &b,
+            },
+        ];
+        let fixed = [("c", Arc::new("z".to_string()))];
+        // Point 4 is (a = y, b = 2).
         assert_eq!(
-            eval_bool_each("a == 'x'", &[&a, &b]).unwrap(),
-            vec![true, false]
+            eval_bool_product(
+                "a == 'y' && b == '2' && c == 'z'",
+                &fixed,
+                &dims,
+                &[0, 4, 5]
+            )
+            .unwrap(),
+            vec![false, true, false]
         );
-        let err = eval_bool_each("a", &[&a]).unwrap_err().to_string();
+        let err = eval_bool_product("a", &[], &dims, &[0])
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("expected a boolean"), "{err}");
-        assert!(eval_bool_each("missing", &[&a]).is_err());
-        assert!(eval_bool_each("a", &[&json!(1)]).is_err());
+        assert!(eval_bool_product("missing", &[], &dims, &[0]).is_err());
+        assert!(eval_bool_product("1 +", &[], &dims, &[]).is_err());
     }
 }

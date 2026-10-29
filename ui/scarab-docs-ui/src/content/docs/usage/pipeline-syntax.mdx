@@ -235,6 +235,11 @@ CEL predicates (evaluated against each combination's own coordinate) drops combi
 Each instance gets a deterministic id like `test[arch=amd64,os=linux]`, and a downstream
 `needs: [test]` fans in over every surviving instance.
 
+A matrix can have at most 65,536 combinations before `exclude`, and 256 `exclude` predicates. All
+the matrices of one pipeline, counting a library's matrix each time the library is inlined, can
+have at most 1,048,576 combinations, and at most 262,144 `exclude` checks (combinations times
+predicates).
+
 ## Conditions: `when`
 
 A `when:` CEL guard skips a step whose predicate is false; expressions read the run's context
@@ -264,10 +269,13 @@ The CEL parser recurses once per nesting level and once per operator in a chain 
 
 ### Size limits
 
-A pipeline or library file can be at most **1 MiB**. The compiled pipeline can be at most
-**16 MiB** of JSON: each step a library inlines stores the library's inputs, and each matrix leg
-stores a copy of its step, so a small file can compile to a large pipeline. A pipeline over
-either limit is rejected at submit time, and the error names the file or step and the limit.
+A pipeline or library file can be at most **1 MiB**, and the libraries one pipeline invokes can
+hold at most **16 MiB** in all, each counted once however often it is invoked. The compiled
+pipeline can be at most **16 MiB** of JSON: each step a library inlines stores the library's
+inputs, and each matrix leg stores a copy of its step, so a small file can compile to a large
+pipeline. A pipeline over any of these limits is rejected at submit time, and the error names the
+file or step and the limit. The server also stops a compile that takes longer than 10 seconds,
+and the trigger fails with that reason.
 
 ## Reuse: `invoke`
 
@@ -423,15 +431,25 @@ Each `${{ … }}` is rendered once, when the step launches, and its value is dat
 reads a `${{` inside a value again. Where you put a value decides what it can do.
 
 **In a `command` argument or an `env` value**, the value is passed as it is, with no quoting
-needed. The one exception: a value from outside the pipeline may not start an argument with `-`.
-A program reads such an argument as an option, so `git fetch origin ${{ inputs.ref }}` with the
-value `--upload-pack=touch /tmp/x` would run a command. The step fails before it starts, and the
-error names the template. Write the option in front of the value, or put a `--` argument right
-before it:
+needed. A value from outside the pipeline has two exceptions, and a step that breaks either fails
+before it starts, with an error that names the template:
+
+- It may not start an argument with `-`. A program reads such an argument as an option, so
+  `git fetch origin ${{ inputs.ref }}` with the value `--upload-pack=touch /tmp/x` would run a
+  command. A `--` argument in front does not help: it ends the options of one program, and the
+  value can still reach another one (`sh -c 'git fetch "$1"' -- …`, `npm run lint -- …`). Write
+  the option in front of the value, or pass the value in `env:`.
+- It may not name the program. That is the first thing in `command[0]`, and the program that
+  `env`, `sudo`, `timeout`, `nice`, `nohup`, `stdbuf`, `setsid`, `exec`, `busybox` or `xargs`
+  runs when one of them comes first, including the command line of `env -S`. Write the program
+  in the pipeline and pass the value to it.
 
 ```yaml
-- { id: fetch, image: alpine/git, command: ["git", "fetch", "origin", "--", "${{ inputs.ref }}"] }
 - { id: ship, image: deployer, command: ["deploy", "--ref=${{ inputs.ref }}"] }
+- id: fetch
+  image: alpine/git
+  env: [[REF, "${{ inputs.ref }}"]]
+  command: ["sh", "-c", 'git fetch origin "refs/heads/$REF"']
 ```
 
 **In a script**, the value becomes part of the code. This covers the script of `sh -c` (and
