@@ -26,16 +26,30 @@ pub async fn render_launch_spec(
     // not know (a scope it cannot read, say): refuse it rather than render
     // it the old way. Every Run this server and its predecessors stored has
     // a version it knows.
+    // The version must be a whole number this server knows: `"4"`, `4.0`
+    // or `-1` is refused, not read as no version. A stored IR without the
+    // field predates it.
     let ir_version = db
         .run_ir(run)
         .await?
-        .and_then(|ir| ir.get("ir_version").and_then(|v| v.as_u64()));
-    if let Some(v) = ir_version.filter(|v| *v > u64::from(scarab_pipeline::IR_VERSION_MAX)) {
-        return Ok(Err(format!(
-            "this Run was compiled for IR version {v}; this server understands versions up to \
-             {}",
-            scarab_pipeline::IR_VERSION_MAX
-        )));
+        .and_then(|ir| ir.get("ir_version").cloned());
+    if let Some(v) = ir_version {
+        let max = scarab_pipeline::IR_VERSION_MAX;
+        match v.as_u64() {
+            Some(n) if n <= u64::from(max) => {}
+            Some(n) => {
+                return Ok(Err(format!(
+                    "this Run was compiled for IR version {n}; this server understands \
+                     versions up to {max}"
+                )))
+            }
+            None => {
+                return Ok(Err(format!(
+                    "this Run's IR version `{v}` is not a whole number; this server \
+                     understands versions up to {max}"
+                )))
+            }
+        }
     }
     let params = db.run_params(run).await?;
     let has_template = spec.image.contains("${{")

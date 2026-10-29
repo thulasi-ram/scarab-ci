@@ -337,39 +337,82 @@ async fn a_parameter_or_result_holding_a_template_stays_text() {
 
 /// A Run compiled by a newer server (a higher `ir_version` in its stored IR)
 /// may render in a way this server does not know: its Steps fail as config
-/// failures instead of being rendered the old way.
+/// failures instead of being rendered the old way. A version that is not a
+/// whole number (`"3"`, `3.0`, `-1`, `null`) is refused the same way, never
+/// read as no version.
 #[tokio::test]
-async fn a_run_from_a_newer_ir_version_is_not_launched() {
-    let db = InMemoryDb::new();
-    let run = RunId("run-new".into());
-    let step = StepId("s".into());
-    db.create_run(&run, 99, 1, Timestamp(0)).await.unwrap();
-    db.store_run_ir(
-        &run,
-        &serde_json::json!({ "ir_version": scarab_pipeline::IR_VERSION_MAX + 1, "steps": [] }),
-    )
-    .await
-    .unwrap();
-    db.create_step_run(&run, &step, Some(&spec(vec!["echo"])), &[], Timestamp(0))
+async fn a_run_from_a_newer_or_malformed_ir_version_is_not_launched() {
+    let max = scarab_pipeline::IR_VERSION_MAX;
+    for version in [
+        serde_json::json!(max + 1),
+        serde_json::json!(u64::MAX),
+        serde_json::json!(max.to_string()),
+        serde_json::json!(f64::from(max)),
+        serde_json::json!(-1),
+        serde_json::Value::Null,
+    ] {
+        let db = InMemoryDb::new();
+        let run = RunId("run-new".into());
+        let step = StepId("s".into());
+        db.create_run(&run, 99, 1, Timestamp(0)).await.unwrap();
+        db.store_run_ir(
+            &run,
+            &serde_json::json!({ "ir_version": version, "steps": [] }),
+        )
         .await
         .unwrap();
-    let clock = FakeClock::new(1_000);
-    let exec = FakeExecutor::new();
-    exec.script_outcome(ExecState::Succeeded);
-    let sched = Scheduler::new(&db, &clock, &exec, "scheduler-1");
-    for _ in 0..4 {
-        sched.tick(&run).await.expect("tick");
+        db.create_step_run(&run, &step, Some(&spec(vec!["echo"])), &[], Timestamp(0))
+            .await
+            .unwrap();
+        let clock = FakeClock::new(1_000);
+        let exec = FakeExecutor::new();
+        exec.script_outcome(ExecState::Succeeded);
+        let sched = Scheduler::new(&db, &clock, &exec, "scheduler-1");
+        for _ in 0..4 {
+            sched.tick(&run).await.expect("tick");
+        }
+        assert!(
+            exec.launched_spec(&ExecHandle("fake://run-new/s/a1".into()))
+                .is_none(),
+            "{version}"
+        );
+        let s = db.steps_of_run(&run).await.unwrap().remove(0);
+        assert_eq!(s.status, StepStatus::Failed, "{version}");
+        let last = s.attempts.last().unwrap();
+        assert_eq!(last.failure, Some(scarab_engine::FailureKind::Config));
+        assert!(
+            last.failure_detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("this server understands versions up to"),
+            "{version}: {:?}",
+            last.failure_detail
+        );
     }
-    assert!(exec
-        .launched_spec(&ExecHandle("fake://run-new/s/a1".into()))
-        .is_none());
-    let s = db.steps_of_run(&run).await.unwrap().remove(0);
-    assert_eq!(s.status, StepStatus::Failed);
-    let last = s.attempts.last().unwrap();
-    assert_eq!(last.failure, Some(scarab_engine::FailureKind::Config));
-    assert!(last
-        .failure_detail
-        .as_deref()
-        .unwrap_or_default()
-        .contains("this server understands versions up to"));
+    // The current version, and an IR without the field, launch.
+    for ir in [
+        serde_json::json!({ "ir_version": max, "steps": [] }),
+        serde_json::json!({ "steps": [] }),
+    ] {
+        let db = InMemoryDb::new();
+        let run = RunId("run-ok".into());
+        let step = StepId("s".into());
+        db.create_run(&run, 99, 1, Timestamp(0)).await.unwrap();
+        db.store_run_ir(&run, &ir).await.unwrap();
+        db.create_step_run(&run, &step, Some(&spec(vec!["echo"])), &[], Timestamp(0))
+            .await
+            .unwrap();
+        let clock = FakeClock::new(1_000);
+        let exec = FakeExecutor::new();
+        exec.script_outcome(ExecState::Succeeded);
+        let sched = Scheduler::new(&db, &clock, &exec, "scheduler-1");
+        for _ in 0..4 {
+            sched.tick(&run).await.expect("tick");
+        }
+        assert!(
+            exec.launched_spec(&ExecHandle("fake://run-ok/s/a1".into()))
+                .is_some(),
+            "{ir}"
+        );
+    }
 }
