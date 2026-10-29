@@ -183,19 +183,18 @@ pub fn trust_key(source: &str) -> &str {
     }
 }
 
+/// The release manifest's name for the first-party clone library.
+pub const FIRST_PARTY_CLONE: (&str, &str) = ("thulasi-ram", "clone");
+
 /// Whether a stored version is the first-party clone library (ADR-0076 §5,
-/// §9): content listed in a Scarab release manifest, read from a file named
-/// `clone.yaml` (a manifest names each library after its file). The org
-/// trusts it with long-lived forge credentials by default, wherever the copy
-/// was fetched from.
+/// §9): content listed in a Scarab release manifest under the clone
+/// library's name. A first-party version is stored under the name the
+/// manifest gives its content, never one the fetcher chose, so the stored
+/// `publisher` and `name` are the manifest's. The org trusts it with
+/// long-lived forge credentials by default, wherever the copy was fetched
+/// from; where it was fetched from says nothing about which library it is.
 pub fn is_first_party_clone(v: &LibraryVersion) -> bool {
-    v.first_party
-        && v.source
-            .split("//")
-            .nth(1)
-            .map(trust_key)
-            .and_then(|path| path.rsplit('/').next())
-            == Some("clone.yaml")
+    v.first_party && (v.publisher.as_str(), v.name.as_str()) == FIRST_PARTY_CLONE
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -446,29 +445,30 @@ mod tests {
     }
 
     #[test]
-    fn the_first_party_clone_is_first_party_content_from_clone_yaml() {
-        let v = |first_party: bool, source: &str| LibraryVersion {
+    fn the_first_party_clone_is_first_party_content_named_clone() {
+        let v = |first_party: bool, name: &str, source: &str| LibraryVersion {
             org: "acme".into(),
             content_hash: "a".repeat(64),
             content: String::new(),
             source: source.into(),
             publisher: "thulasi-ram".into(),
-            name: "clone".into(),
+            name: name.into(),
             first_party,
             fetched_by: "u".into(),
             fetched_at: 0,
         };
         let src = "github.com/thulasi-ram/scarab-ci//libs/clone.yaml@1111";
-        assert!(is_first_party_clone(&v(true, src)));
+        assert!(is_first_party_clone(&v(true, "clone", src)));
         assert!(is_first_party_clone(&v(
             true,
-            "git.example.com/mirrors/scarab-ci//libs/clone.yaml@1111"
+            "clone",
+            "git.example.com/mirrors/scarab-ci//libs/checkout.yaml@1111"
         )));
-        assert!(!is_first_party_clone(&v(false, src)), "not first-party");
-        assert!(!is_first_party_clone(&v(
-            true,
-            "github.com/thulasi-ram/scarab-ci//libs/deploy.yaml@1111"
-        )));
+        assert!(!is_first_party_clone(&v(false, "clone", src)), "not first-party");
+        assert!(
+            !is_first_party_clone(&v(true, "deploy", src)),
+            "another first-party library, fetched from a path named clone.yaml"
+        );
     }
 
     #[test]

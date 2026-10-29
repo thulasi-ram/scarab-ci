@@ -205,9 +205,15 @@ impl FirstParty {
         read.map(Some)
     }
 
-    /// Is `hash` in the manifest? `false` when it cannot be read.
-    pub async fn is_first_party(&self, hash: &str) -> bool {
-        matches!(self.manifest().await, Ok(Some(m)) if m.find(hash).is_some())
+    /// The `(publisher, name)` the manifest lists `hash` under; `None` when
+    /// it is not listed or the manifest cannot be read.
+    pub async fn name_of(&self, hash: &str) -> Option<(String, String)> {
+        match self.manifest().await {
+            Ok(Some(m)) => m
+                .find(hash)
+                .map(|(l, _)| (l.publisher.clone(), l.name.clone())),
+            _ => None,
+        }
     }
 }
 
@@ -966,12 +972,28 @@ pub(crate) async fn fetch_library(
     super::refuse_reserved_org(&org, "install a library")?;
     let store = store(&st)?;
     let src = LibrarySource::parse(&body.source).map_err(ApiError::BadRequest)?;
-    let publisher = body.publisher.unwrap_or_else(|| src.owner.clone());
-    let name = body.name.unwrap_or_else(|| src.default_name());
+    let mut publisher = body.publisher.clone().unwrap_or_else(|| src.owner.clone());
+    let mut name = body.name.clone().unwrap_or_else(|| src.default_name());
     check_names(&publisher, &name)?;
     let content = read_source(&st, &org, &src, body.connection.as_deref()).await?;
-    check_compiles(store, &org, &publisher, &name, &content).await?;
     let hash = content_hash(&content);
+    // First-party content is stored under the name the release manifest
+    // gives it, whatever the request or the source path says: trust in the
+    // first-party clone library is keyed by that name (ADR-0076 §9).
+    let first_party = st.first_party.name_of(&hash).await;
+    if let Some((p, n)) = &first_party {
+        let asked_other = body.publisher.as_deref().is_some_and(|b| b != p)
+            || body.name.as_deref().is_some_and(|b| b != n);
+        if asked_other {
+            return Err(ApiError::BadRequest(format!(
+                "this file is the first-party library `{p}/{n}` in the release manifest; fetch \
+                 it under that name"
+            )));
+        }
+        publisher = p.clone();
+        name = n.clone();
+    }
+    check_compiles(store, &org, &publisher, &name, &content).await?;
     let now = st.clock.now().await.0;
     let stored = store
         .put_version(&LibraryVersion {
@@ -981,7 +1003,7 @@ pub(crate) async fn fetch_library(
             source: src.to_string(),
             publisher: publisher.clone(),
             name: name.clone(),
-            first_party: st.first_party.is_first_party(&hash).await,
+            first_party: first_party.is_some(),
             fetched_by: by,
             fetched_at: now,
         })

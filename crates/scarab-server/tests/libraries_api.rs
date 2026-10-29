@@ -735,6 +735,28 @@ async fn an_older_first_party_version_shows_an_update_marked_as_a_security_fix()
     assert_eq!(list["first_party"][0]["installed"], true);
 }
 
+/// First-party content is stored under the manifest's name for it: a
+/// mirror path does not rename it, and a request for another name is
+/// refused (trust in the clone library is keyed by that name).
+#[tokio::test]
+async fn first_party_content_is_stored_under_the_manifest_name() {
+    let h = harness_with(
+        ManifestSource::Fixed(release_manifest()),
+        FakeForge::new(),
+        InMemoryLibraries::new(),
+    );
+    h.http.serve(&raw("mirrors", "copies", C1, "x/checkout.yaml"), CLONE_V1);
+    let source = format!("github.com/mirrors/copies//x/checkout.yaml@{C1}");
+    let (st, b) = fetch(&h, json!({ "source": source, "name": "deploy" })).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+    assert!(b.to_string().contains("thulasi-ram/clone"), "{b}");
+    let (st, b) = fetch(&h, json!({ "source": source })).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!((b["publisher"].as_str(), b["name"].as_str()), (Some("thulasi-ram"), Some("clone")));
+    let v = h.store.version("acme", &content_hash(CLONE_V1)).await.unwrap().unwrap();
+    assert!(scarab_policy::library::is_first_party_clone(&v), "{v:?}");
+}
+
 /// Through the real bind route: the first repo of an org binds whether or
 /// not the release source can be reached, and the org records what is
 /// missing.

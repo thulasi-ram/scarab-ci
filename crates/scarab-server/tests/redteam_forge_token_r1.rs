@@ -317,7 +317,6 @@ steps:
 /// the caller then picks the image of the Step that holds the long-lived
 /// token. The repository's own image must never hold it.
 #[tokio::test]
-#[ignore = "red: s3 r1"]
 async fn rt_a_caller_must_not_choose_the_image_of_a_trusted_token_step() {
     let db = InMemoryDb::new();
     let libs = InMemoryLibraries::new();
@@ -331,7 +330,22 @@ steps:
   - { id: g, invoke: lib:acme/git, with: { image: "ghcr.io/mallory/exfil:1" } }
 "#;
     let forge = Arc::new(long_lived(&[(".scarab/ci.yaml", yaml)]));
-    let out = trigger(&db, &forge, AdmissionPorts::default().with_libraries(&libs), &push()).await;
+    // A compile error refuses the Pipeline outright.
+    let out = match trigger_runs_from_event(
+        forge.as_ref(),
+        &db,
+        &FakeClock::new(1_000),
+        AdmissionPorts::default().with_libraries(&libs),
+        &push(),
+    )
+    .await
+    {
+        Ok(out) => out,
+        Err(e) => {
+            assert!(e.to_string().contains("`image`"), "refused for its image: {e}");
+            return;
+        }
+    };
     if out.runs.len() == 1 {
         let run = out.runs[0].clone();
         let inner = Arc::new(FakeExecutor::new());
@@ -454,7 +468,6 @@ steps:
 /// path that names it `clone.yaml`, must not inherit the clone library's
 /// default trust with a long-lived token.
 #[tokio::test]
-#[ignore = "red: s3 r1"]
 async fn rt_first_party_content_that_is_not_clone_is_not_trusted_by_its_file_name() {
     let db = InMemoryDb::new();
     let libs = InMemoryLibraries::new();
