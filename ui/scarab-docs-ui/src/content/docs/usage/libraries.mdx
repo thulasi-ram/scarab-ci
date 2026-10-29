@@ -59,8 +59,10 @@ came from: the installation records its source, and Policies match on the source
 **Where Scarab reads from.** A public repository on github.com, or on the host of a Forgejo
 connection, is read without credentials, over https only, from public addresses only, with no
 redirects and a 1 MiB limit. Any other host is refused. For a private repository, pick a
-connection: Scarab reads the file through it, but only from a repository owned by your org or bound
-to it through that connection.
+connection: Scarab reads the file through it, but only from a repository bound to your org through
+that connection, or from a repository whose owner has your org's name. The owner-name match counts
+only when your org has at least one repository bound through that connection: an account with your
+org's name on another forge is not your org.
 
 ## Upgrade
 

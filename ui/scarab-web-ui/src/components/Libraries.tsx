@@ -542,8 +542,9 @@ function InstallDialog(props: {
               </For>
             </select>
             <p class="fieldnote">
-              Through a connection, only a repository owned by {props.org}, or bound to it, can be
-              read.
+              Through a connection, only a repository bound to {props.org} through it can be
+              read, or one owned by {props.org} once {props.org} has a repository bound through
+              it.
             </p>
           </div>
           <div class="form-r">

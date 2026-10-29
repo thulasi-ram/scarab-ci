@@ -362,8 +362,9 @@ async fn github_connection(db: &InMemoryDb) {
 }
 
 /// The org rule for private installs: the source repository is the org's
-/// own, or bound to the org. Anything else is refused before the forge is
-/// asked.
+/// own, or bound to the org. An owner named like the org counts only once
+/// the org has a repository bound through the connection. Anything else is
+/// refused before the forge is asked.
 #[tokio::test]
 async fn a_private_source_must_belong_to_the_org() {
     let h = harness_with(
@@ -410,7 +411,28 @@ async fn a_private_source_must_belong_to_the_org() {
     .await;
     assert_eq!(st, StatusCode::FORBIDDEN);
 
-    // The org's own repository: read through the connection.
+    // The org's own repository, before the org has a repository bound
+    // through this connection: an owner named `acme` on this forge is not
+    // yet known to be the org.
+    let own = json!({
+        "source": format!("github.com/acme/private-libs//deploy.yaml@{C1}"),
+        "connection": "gh"
+    });
+    let (st, b) = fetch(&h, own).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{b}");
+
+    // Once the org has a repository bound through it: read.
+    h.db.bind_repo(
+        "gh",
+        &RepoRef {
+            owner: "acme".into(),
+            name: "web".into(),
+        },
+        "acme",
+        "web",
+    )
+    .await
+    .unwrap();
     let (st, b) = fetch(
         &h,
         json!({

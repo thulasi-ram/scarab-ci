@@ -549,7 +549,6 @@ async fn org_rule_a_shared_app_connection_does_not_open_another_orgs_bound_repo(
 /// repository; by the same reasoning the Forgejo owner `acme` is not org
 /// `acme`, and the Forgejo connection's credential must not read for it.
 #[tokio::test]
-#[ignore = "red: s2 r2"]
 async fn org_rule_an_owner_of_the_same_name_on_another_forge_is_not_the_org() {
     let a = api(FakeForge::new().with_file("deploy.yaml", DEPLOY), None);
     connect(&a.db, "gh", ForgeKind::GitHub, "https://api.github.com").await;
