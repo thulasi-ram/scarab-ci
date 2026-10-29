@@ -95,7 +95,6 @@ fn rt2_multi_byte_values_at_the_edge_are_refused_without_a_panic() {
 /// long-lived token. Such a binding on a `forge_token` Step must be a
 /// compile error, whatever the input's `validate:` says.
 #[test]
-#[ignore = "red: s3 r2"]
 fn rt2_a_caller_value_may_not_reach_a_code_loading_env_name_of_a_token_step() {
     let mut compiled = Vec::new();
     for name in [

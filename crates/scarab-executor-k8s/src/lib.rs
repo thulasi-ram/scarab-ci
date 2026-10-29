@@ -9778,6 +9778,59 @@ mod tests {
             .all(|v| v.name != FORGE_SECRETS_VOLUME));
     }
 
+    /// The Pipeline check refuses a templated value on a `forge_token` Step
+    /// under a name Scarab sets (`scarab_pipeline::scarab_sets_env`). That
+    /// list is only right while it holds every `SCARAB_*` name this executor
+    /// sets, in any container of the Pod.
+    #[test]
+    fn every_scarab_env_name_the_pod_sets_is_one_the_pipeline_check_knows() {
+        let step = step_with_attempt("run-1", "build", "a1");
+        let mut spec = busybox();
+        spec.env.clear();
+        spec.workspace_inputs = vec!["tree-a".into()];
+        spec.oidc_token = Some("jwt".into());
+        spec.artifacts = vec!["dist/*".into()];
+        spec.cache = Some(scarab_engine::CacheConfig {
+            dirs: vec!["target".into()],
+            key: Some("k".into()),
+            restore: vec![("target".into(), "tree-c".into())],
+            ..Default::default()
+        });
+        let egress = ResultsEgress {
+            base_url: "http://scarab-server".into(),
+            token_secret: b"secret".to_vec(),
+            sidecar_image: "ghcr.io/acme/scarab-sidecar:1".into(),
+        };
+        let fetch = sample_fetch();
+        let pod = build_pod(
+            "scarab-x",
+            "ns",
+            &step,
+            &spec,
+            Some(&egress),
+            DEFAULT_STEP_TIMEOUT_SECS,
+            true,
+            Some(&fetch),
+        );
+        let ps = pod.spec.as_ref().unwrap();
+        let names: Vec<String> = ps
+            .containers
+            .iter()
+            .chain(ps.init_containers.iter().flatten())
+            .flat_map(|c| c.env.iter().flatten())
+            .map(|e| e.name.clone())
+            .filter(|n| n.starts_with("SCARAB_"))
+            .collect();
+        for expected in ["SCARAB_RESULTS", "SCARAB_OIDC_TOKEN_FILE", "SCARAB_CACHE_ROOTS"] {
+            assert!(names.iter().any(|n| n == expected), "{expected} not set: {names:?}");
+        }
+        let unknown: Vec<_> = names
+            .iter()
+            .filter(|n| !scarab_pipeline::scarab_sets_env(n))
+            .collect();
+        assert!(unknown.is_empty(), "add these to scarab_pipeline::SCARAB_SET_ENV: {unknown:?}");
+    }
+
     #[test]
     fn build_pod_sets_the_step_deadline() {
         let step = step_with_attempt("run-1", "build", "a1");

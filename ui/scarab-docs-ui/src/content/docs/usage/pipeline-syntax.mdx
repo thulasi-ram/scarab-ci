@@ -237,7 +237,9 @@ minted.
   step's `needs`.
 - **The `image` and `command`** of a step with `forge_token` are written out in full: a
   `${{ … }}` in either is a compile error. An input, a result or an `event` value reaches the step
-  only through `env:`.
+  only through `env:`, and only under a name of the form `SCARAB_<NAME>` (upper-case letters,
+  digits and `_`) that Scarab does not set itself. Other names can make the value run as code:
+  git runs `GIT_SSH_COMMAND`, and the loader reads `LD_PRELOAD`. A literal value may use any name.
 - **A library input** that reaches a step with `forge_token` must be a `boolean`, a `number`, a
   `choice`, or a `string` with a `validate:` rule.
 - A step with `forge_token` may not have a `cache`.

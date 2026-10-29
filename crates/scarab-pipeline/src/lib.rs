@@ -354,6 +354,49 @@ pub const RETIRED_DEPLOYMENTS: &str = "deployments are no longer recorded by Sca
     (ADR-0074); mark the step `deploy: true` and wait for your CD tool in a step (for \
     example `argocd app wait`)";
 
+/// The env names Scarab itself sets in a Step's Pod or process: the
+/// executors' fence, results, artifacts, OIDC and workspace variables, and
+/// one `SCARAB_PARAM_<NAME>` per input (ADR-0008). A Step's own `env:`
+/// entry under one of these names would be overwritten or would overwrite
+/// Scarab's, so a templated value may not use one on a `forge_token` Step.
+/// `scarab-executor-k8s` checks that every `SCARAB_*` name it sets is here.
+pub const SCARAB_SET_ENV: [&str; 9] = [
+    "SCARAB_RUN",
+    "SCARAB_STEP",
+    "SCARAB_ATTEMPT",
+    "SCARAB_RESULTS",
+    "SCARAB_RESULTS_URL",
+    "SCARAB_RESULTS_TOKEN",
+    "SCARAB_ARTIFACTS",
+    "SCARAB_OIDC_TOKEN_FILE",
+    "SCARAB_CACHE_ROOTS",
+];
+
+/// Prefixes of env names Scarab sets: `SCARAB_PARAM_<NAME>` per input, and
+/// the workspace fetcher's `SCARAB_WORKSPACE_*` and `SCARAB_SNAPSHOT_*`.
+pub const SCARAB_SET_ENV_PREFIXES: [&str; 3] =
+    ["SCARAB_PARAM_", "SCARAB_WORKSPACE_", "SCARAB_SNAPSHOT_"];
+
+/// Whether Scarab sets the env name `name` itself ([`SCARAB_SET_ENV`],
+/// [`SCARAB_SET_ENV_PREFIXES`]).
+pub fn scarab_sets_env(name: &str) -> bool {
+    SCARAB_SET_ENV.contains(&name) || SCARAB_SET_ENV_PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+/// Whether `name` is one a `forge_token` Step may give a templated value:
+/// `SCARAB_` followed by upper-case letters, digits and `_`. No program
+/// other than the Step's own reads a name in that space, so the value
+/// stays data; `PATH`, `LD_PRELOAD`, `GIT_SSH_COMMAND` and the like make
+/// their value code.
+fn templated_env_name_ok(name: &str) -> bool {
+    name.strip_prefix("SCARAB_").is_some_and(|rest| {
+        !rest.is_empty()
+            && rest
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+    })
+}
+
 /// A pipeline's `on:` block: trigger kind (e.g. `push`, `pull_request`) → filter.
 /// Kinds are the canonical vocabulary of `scarab_forge::TriggerKind`, kept as
 /// strings so this pure crate need not depend on the forge domain.
@@ -4276,6 +4319,33 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                     step.id
                 ));
             }
+            // An env value is data only under a name no program treats as
+            // code: git runs `GIT_SSH_COMMAND`, the loader reads
+            // `LD_PRELOAD`, a shell sources `BASH_ENV`. A value from outside
+            // may therefore reach only a `SCARAB_*` name the Step's own
+            // program reads, and not one Scarab sets itself.
+            for (name, value) in &step.env {
+                if !value.contains("${{") {
+                    continue;
+                }
+                if !templated_env_name_ok(name) {
+                    diagnostics.push(format!(
+                        "step `{}`: env `{name}` holds `${{{{ … }}}}`, and the step has \
+                         `forge_token`; a value from an input, a result or the trigger may \
+                         reach only an env name of the form `SCARAB_<NAME>` (upper-case \
+                         letters, digits and `_`), because other names (`PATH`, \
+                         `LD_PRELOAD`, `GIT_SSH_COMMAND`, …) can make the value run as code",
+                        step.id
+                    ));
+                } else if scarab_sets_env(name) {
+                    diagnostics.push(format!(
+                        "step `{}`: env `{name}` holds `${{{{ … }}}}`, and the step has \
+                         `forge_token`; Scarab sets `{name}` itself, so pick another \
+                         `SCARAB_<NAME>`",
+                        step.id
+                    ));
+                }
+            }
             // A Cache restores files an earlier Run's Steps saved under the
             // same key, and those may be the repository's own Steps.
             if step.cache.is_some() {
@@ -7922,7 +7992,35 @@ mod tests {
         );
         assert!(errs.iter().any(|e| e.contains("`cache` is not allowed")), "{errs:?}");
         // The same values through `env:` compile.
-        compile(r#"steps: [{ id: g, image: alpine/git, env: [[S, "${{ event.sha }}"]], forge_token: read }]"#);
+        compile(
+            r#"steps: [{ id: g, image: alpine/git, env: [[SCARAB_S, "${{ event.sha }}"]], forge_token: read }]"#,
+        );
+    }
+
+    #[test]
+    fn a_templated_env_value_of_a_forge_token_step_reaches_only_a_scarab_name() {
+        for name in ["S", "PATH", "GIT_SSH_COMMAND", "scarab_x", "SCARAB_", "SCARAB_a"] {
+            let errs = errors(&format!(
+                r#"steps: [{{ id: g, image: alpine/git, env: [["{name}", "${{{{ event.sha }}}}"]], forge_token: read }}]"#
+            ));
+            assert!(
+                errs.iter().any(|e| e.contains(&format!("env `{name}` holds"))),
+                "{name}: {errs:?}"
+            );
+        }
+        for name in ["SCARAB_RUN", "SCARAB_PARAM_X", "SCARAB_WORKSPACE_URL"] {
+            let errs = errors(&format!(
+                r#"steps: [{{ id: g, image: alpine/git, env: [["{name}", "${{{{ event.sha }}}}"]], forge_token: read }}]"#
+            ));
+            assert!(
+                errs.iter().any(|e| e.contains(&format!("Scarab sets `{name}`"))),
+                "{name}: {errs:?}"
+            );
+        }
+        // A literal value on any name is the author's, and compiles.
+        compile(r#"steps: [{ id: g, image: alpine/git, env: [[GIT_TERMINAL_PROMPT, "0"]], forge_token: read }]"#);
+        // Without `forge_token` the rule does not apply.
+        compile(r#"steps: [{ id: g, image: alpine/git, env: [[S, "${{ event.sha }}"]] }]"#);
     }
 
     #[test]
@@ -7938,9 +8036,9 @@ mod tests {
                 image: "alpine/git@sha256:0000000000000000000000000000000000000000000000000000000000000000"
                 forge_token: read
                 env:
-                  - [U, "${{ inputs.url }}"]
-                  - [D, "${{ inputs.depth }}"]
-                  - [L, "${{ inputs.lfs }}"]
+                  - [SCARAB_U, "${{ inputs.url }}"]
+                  - [SCARAB_D, "${{ inputs.depth }}"]
+                  - [SCARAB_L, "${{ inputs.lfs }}"]
             "#;
         let libraries = Libraries {
             files: BTreeMap::new(),
