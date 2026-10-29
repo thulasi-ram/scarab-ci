@@ -383,6 +383,38 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     ("POST", "/v1/orgs/{org}/policy-test", "policy.test", "NG"),
     ("GET", "/v1/orgs/{org}/policy-decisions", "read", "READ"),
     ("GET", "/v1/runs/{id}/policy-decisions", "read", "READ"),
+    ("GET", "/v1/orgs/{org}/libraries", "read", "READ"),
+    (
+        "POST",
+        "/v1/orgs/{org}/libraries/fetch",
+        "library.fetch",
+        "NG",
+    ),
+    (
+        "PUT",
+        "/v1/orgs/{org}/libraries/{publisher}/{name}",
+        "library.install",
+        "CJ-W",
+    ),
+    (
+        "DELETE",
+        "/v1/orgs/{org}/libraries/{publisher}/{name}",
+        "library.remove",
+        "EX",
+    ),
+    ("POST", "/v1/orgs/{org}/library-yanks", "library.yank", "EX"),
+    (
+        "DELETE",
+        "/v1/orgs/{org}/library-yanks/{hash}",
+        "library.unyank",
+        "CJ-W",
+    ),
+    (
+        "POST",
+        "/v1/orgs/{org}/library-defaults/retry",
+        "library.defaults_retry",
+        "CJ-W",
+    ),
     ("GET", "/v1/orgs/{org}/plugin-catalog", "read", "READ"),
     ("GET", "/v1/orgs/{org}/plugins", "read", "READ"),
     ("POST", "/v1/orgs/{org}/plugins", "plugin.install", "CJ-A"),
@@ -850,6 +882,10 @@ fn well_formed(r: &scarab_server::RouteEntry) -> (String, Option<Value>) {
             Some(json!({"kind": "github", "base_url": "https://github.com", "credential": "c"}))
         }
         ("POST", "/v1/connections/{id}/repos") => Some(json!({"owner": "acme", "name": "web"})),
+        ("PUT", "/v1/orgs/{org}/libraries/{publisher}/{name}") => {
+            Some(json!({"content_hash": "a".repeat(64)}))
+        }
+        ("POST", "/v1/orgs/{org}/library-defaults/retry") => Some(json!({})),
         ("DELETE", _)
         | ("POST", "/v1/connections/{id}/resync")
         | ("POST", "/v1/orgs/{org}/plugins/{name}/enable")
@@ -926,7 +962,7 @@ async fn exempt_and_ungoverned_routes_never_ask_for_a_step_up() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 31, "the EX + NG mutating routes");
+    assert_eq!(checked, 34, "the EX + NG mutating routes");
     assert!(h.events_of("step_up.refused").is_empty());
 }
 

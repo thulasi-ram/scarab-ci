@@ -21,7 +21,7 @@ use axum::routing::MethodRouter;
 use axum::Router;
 
 use crate::step_up::ops::{self, Op};
-use crate::{org_environments as oe, policies as pol, AppState};
+use crate::{libraries as lib, org_environments as oe, policies as pol, AppState};
 
 /// One registered (method, path) and how it is governed.
 #[derive(Debug, Clone)]
@@ -435,6 +435,38 @@ pub(crate) fn governed_routes() -> Routes {
         .get(
             "/v1/runs/{id}/policy-decisions",
             pol::list_run_policy_decisions,
+        )
+        // ADR-0076: org-installed libraries, yanks, first-party defaults.
+        .get("/v1/orgs/{org}/libraries", lib::list_libraries)
+        .post(
+            "/v1/orgs/{org}/libraries/fetch",
+            &ops::LIBRARY_FETCH,
+            lib::fetch_library,
+        )
+        .put(
+            "/v1/orgs/{org}/libraries/{publisher}/{name}",
+            &ops::LIBRARY_INSTALL,
+            lib::install_library,
+        )
+        .delete(
+            "/v1/orgs/{org}/libraries/{publisher}/{name}",
+            &ops::LIBRARY_REMOVE,
+            lib::remove_library,
+        )
+        .post(
+            "/v1/orgs/{org}/library-yanks",
+            &ops::LIBRARY_YANK,
+            lib::yank_library,
+        )
+        .delete(
+            "/v1/orgs/{org}/library-yanks/{hash}",
+            &ops::LIBRARY_UNYANK,
+            lib::unyank_library,
+        )
+        .post(
+            "/v1/orgs/{org}/library-defaults/retry",
+            &ops::LIBRARY_DEFAULTS_RETRY,
+            lib::retry_library_defaults,
         )
         .get("/v1/orgs/{org}/plugin-catalog", plugins::plugin_catalog)
         .get("/v1/orgs/{org}/plugins", plugins::list_plugins)

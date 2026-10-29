@@ -764,6 +764,109 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/orgs/{org}/libraries": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** An org's installed libraries (ADR-0076 §4) */
+        get: operations["list_libraries"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/libraries/fetch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Fetch a library version to review before installing (ADR-0076 §4) */
+        post: operations["fetch_library"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/libraries/{publisher}/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Install or upgrade a library (ADR-0076 §4) */
+        put: operations["install_library"];
+        post?: never;
+        /** Remove an installed library (ADR-0076 §4) */
+        delete: operations["remove_library"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/library-defaults/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Retry installing the first-party libraries (ADR-0076 §5) */
+        post: operations["retry_library_defaults"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/library-yanks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Yank a library version (ADR-0076 §6) */
+        post: operations["yank_library"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/library-yanks/{hash}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Lift a library yank (ADR-0076 §6) */
+        delete: operations["unyank_library"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/orgs/{org}/members/{subject}/passkeys/reset": {
         parameters: {
             query?: never;
@@ -2722,6 +2825,44 @@ export interface components {
              */
             reason?: string | null;
         };
+        FetchLibraryRequest: {
+            /**
+             * @description A ForgeConnection id, for a private repository. Omitted: fetched
+             *     anonymously over https.
+             */
+            connection?: string | null;
+            /** @description Defaults to the file name without its extension. */
+            name?: string | null;
+            /** @description Defaults to the source's owner. */
+            publisher?: string | null;
+            /** @description `<host>/<owner>/<repo>//<path>@<commit>`. */
+            source: string;
+        };
+        FetchedLibraryDto: {
+            content: string;
+            content_hash: string;
+            current?: null | components["schemas"]["InstalledVersionDto"];
+            /**
+             * @description The change from `current`, one line per entry, each starting with
+             *     `+`, `-` or a space. Empty when nothing is installed.
+             */
+            diff: string;
+            first_party: boolean;
+            name: string;
+            publisher: string;
+            source: string;
+        };
+        /** @description A first-party library in the server's release manifest. */
+        FirstPartyLibraryDto: {
+            content_hash: string;
+            /** @description Installed in this org under its name, at any version. */
+            installed: boolean;
+            name: string;
+            publisher: string;
+            release: string;
+            security_fix: boolean;
+            source: string;
+        };
         /** @description How a gate's wait resolved: its `GateResolved` journal entry. */
         GateResolutionDto: {
             /**
@@ -2758,6 +2899,12 @@ export interface components {
             /** @description May run as a privileged container. */
             privileged?: boolean;
         };
+        InstallLibraryRequest: {
+            /** @description A version fetched into this org. */
+            content_hash: string;
+            /** @description The hash installed now (an upgrade), or omitted for a first install. */
+            replaces?: string | null;
+        };
         /** @description `POST /v1/orgs/{org}/plugins`. */
         InstallPluginRequest: {
             /** @description Values for the manifest's `config_keys`; omitted = none. */
@@ -2780,6 +2927,10 @@ export interface components {
          * @enum {string}
          */
         InstallationStateDto: "enabled" | "killed";
+        InstalledVersionDto: {
+            content_hash: string;
+            source: string;
+        };
         /**
          * @description A Project's ADR-0037 per-repo rules as the migration found them. The
          *     canonical `secret_scope` / `oidc_subject` are left out: the server always
@@ -2801,6 +2952,36 @@ export interface components {
              * @description Seconds.
              */
             wait_timer: number;
+        };
+        LibraryDefaultsDto: {
+            mirror?: string | null;
+            missing: components["schemas"]["MissingDefaultDto"][];
+            /**
+             * @description `offered` (an org from before libraries: nothing installed without an
+             *     admin), `pending`, `installed` or `missing`.
+             */
+            state: string;
+            /** Format: int64 */
+            updated_at: number;
+        };
+        LibraryInstallationDto: {
+            content_hash: string;
+            first_party: boolean;
+            /** Format: int64 */
+            installed_at: number;
+            installed_by: string;
+            name: string;
+            publisher: string;
+            source: string;
+            update?: null | components["schemas"]["UpdateNoticeDto"];
+            yanked?: null | components["schemas"]["LibraryYankDto"];
+        };
+        LibraryYankDto: {
+            content_hash: string;
+            reason: string;
+            /** Format: int64 */
+            yanked_at: number;
+            yanked_by: string;
         };
         /** @description `POST /v1/me/identities/link` body. */
         LinkIdentityRequest: {
@@ -2935,6 +3116,12 @@ export interface components {
              */
             token: string;
         };
+        MissingDefaultDto: {
+            error: string;
+            name: string;
+            /** @description Empty when the release manifest itself could not be read. */
+            publisher: string;
+        };
         /**
          * @description What a human is asked to confirm: the server-rendered, redacted
          *     description of one operation (shown in the 403, on the confirm page and
@@ -2975,6 +3162,14 @@ export interface components {
             updated_at: number;
             /** @description Who last wrote it (a Principal subject). */
             updated_by: string;
+        };
+        OrgLibrariesDto: {
+            defaults?: null | components["schemas"]["LibraryDefaultsDto"];
+            first_party: components["schemas"]["FirstPartyLibraryDto"][];
+            installations: components["schemas"]["LibraryInstallationDto"][];
+            /** @description Why the release manifest could not be read, if it could not. */
+            manifest_error?: string | null;
+            yanks: components["schemas"]["LibraryYankDto"][];
         };
         /** @description `GET /v1/orgs/{org}/security/summary`. */
         OrgSecuritySummary: {
@@ -3685,6 +3880,19 @@ export interface components {
              */
             confirmed: number;
         };
+        RetryDefaultsRequest: {
+            /** @description A ForgeConnection to read the mirror through. */
+            connection?: string | null;
+            /** @description Uploaded copies: `<publisher>/<name>` → the file's content. */
+            files?: {
+                [key: string]: string;
+            };
+            /**
+             * @description A mirror of Scarab's repository, `<host>/<owner>/<repo>`; each
+             *     library is read from the same path and commit there.
+             */
+            mirror?: string | null;
+        };
         RuleReadsDto: {
             /** @description The rule's index in `rules`; 0 for a typed setting. */
             index: number;
@@ -4263,6 +4471,14 @@ export interface components {
         UninstalledPluginDto: {
             name: string;
         };
+        /** @description A newer first-party version than the one installed. */
+        UpdateNoticeDto: {
+            content_hash: string;
+            release: string;
+            /** @description A version between the installed one and this one is a security fix. */
+            security_fix: boolean;
+            source: string;
+        };
         /** @description `PUT …/policies/{id}`: the whole Policy, replaced. */
         UpdatePolicyRequest: {
             /**
@@ -4330,6 +4546,11 @@ export interface components {
             entries: components["schemas"]["WorkspaceEntryDto"][];
             /** @description The path listed (empty string = snapshot root). */
             path: string;
+        };
+        YankLibraryRequest: {
+            content_hash: string;
+            /** @description Shown in every refusal. */
+            reason: string;
         };
     };
     responses: never;
@@ -6300,6 +6521,345 @@ export interface operations {
             };
             /** @description the governed state changed between this request's read and its write (reload and retry), or the request conflicts with the current state */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_libraries: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrgLibrariesDto"];
+                };
+            };
+            /** @description no read access to the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description libraries not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    fetch_library: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FetchLibraryRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FetchedLibraryDto"];
+                };
+            };
+            /** @description a bad source or name, a fetch that failed, or a file that does not compile as a closed library */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin, a host Scarab does not fetch from, or a private repository outside the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description libraries not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    install_library: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description publisher */
+                publisher: string;
+                /** @description library name */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InstallLibraryRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LibraryInstallationDto"];
+                };
+            };
+            /** @description a bad name or hash, a version not fetched into this org, or one that no longer compiles here */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin, or no step-up — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description libraries not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `replaces` is not what is installed now */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    remove_library: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description publisher */
+                publisher: string;
+                /** @description library name */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not installed, or libraries not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    retry_library_defaults: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RetryDefaultsRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LibraryDefaultsDto"];
+                };
+            };
+            /** @description a bad mirror, or an uploaded file for no first-party library */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin, or no step-up — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description libraries not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    yank_library: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["YankLibraryRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LibraryYankDto"];
+                };
+            };
+            /** @description a bad hash, an empty or long reason, or a version this org never fetched */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description libraries not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    unyank_library: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description content hash */
+                hash: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LibraryYankDto"];
+                };
+            };
+            /** @description not an org admin, or no step-up — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpRefusal"];
+                };
+            };
+            /** @description not yanked, or libraries not configured */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

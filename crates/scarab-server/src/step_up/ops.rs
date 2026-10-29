@@ -1292,6 +1292,72 @@ pub static POLICY_TEST: Op = op(
     &["path:org"],
 );
 
+pub static LIBRARY_FETCH: Op = op(
+    "library.fetch",
+    "Fetch a library version to review",
+    Class::NotGoverned("stores a version for review; installs nothing"),
+    "ADR-0076 §4",
+    ADMIN,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org", "body:/source"],
+);
+pub static LIBRARY_INSTALL: Op = op(
+    "library.install",
+    "Install or upgrade a library",
+    Class::CrownJewel(W),
+    "ADR-0076 §4: installing and upgrading loosen",
+    ADMIN,
+    OrgOf::Path("org"),
+    &[],
+    &[
+        "path:org",
+        "path:publisher",
+        "path:name",
+        "body:/content_hash",
+    ],
+);
+pub static LIBRARY_REMOVE: Op = op(
+    "library.remove",
+    "Remove a library",
+    Class::Exempt("removing a library tightens"),
+    "ADR-0076 §4",
+    ADMIN,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org", "path:publisher", "path:name"],
+);
+pub static LIBRARY_YANK: Op = op(
+    "library.yank",
+    "Yank a library version",
+    Class::Exempt("yanking tightens"),
+    "ADR-0076 §6",
+    ADMIN,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org", "body:/content_hash"],
+);
+pub static LIBRARY_UNYANK: Op = op(
+    "library.unyank",
+    "Lift a library yank",
+    Class::CrownJewel(W),
+    "ADR-0076 §6: un-yanking loosens",
+    ADMIN,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org", "path:hash"],
+);
+pub static LIBRARY_DEFAULTS_RETRY: Op = op(
+    "library.defaults_retry",
+    "Install the first-party libraries",
+    Class::CrownJewel(W),
+    "ADR-0076 §5: installing loosens",
+    ADMIN,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org", "body:/mirror"],
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -800,6 +800,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_environment_governance(pg.clone())
         // Stored Policies (ADR-0075), consulted at Run creation.
         .with_policies(pg.clone())
+        // Org-installed libraries and yanks (ADR-0076): compiling resolves
+        // `lib:` through them; the release manifest says which versions are
+        // first-party (`SCARAB_LIBS_MANIFEST`: unset, `off`, a URL or a file).
+        .with_libraries(pg.clone())
+        .with_first_party(scarab_server::libraries::ManifestSource::from_env(
+            std::env::var("SCARAB_LIBS_MANIFEST").ok().as_deref(),
+        ))
         // Org-level Environments (ADR-0071): their admin API.
         .with_org_environments(pg.clone())
         // The PluginInstallation registry (ADR-0072). Wired whatever
@@ -834,6 +841,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // (ADR-0060 part D), so the Settings health readout reports a
         // config-supplied credential as present rather than MISSING.
         .with_credential_overrides(credential_overrides.clone());
+    // Anonymous library fetches from public forges (ADR-0076 §4). A client
+    // that cannot be built leaves only installs through a connection.
+    match scarab_server::library_fetch::HttpsFetcher::new() {
+        Ok(f) => state = state.with_library_fetcher(Arc::new(f)),
+        Err(e) => tracing::warn!(error = %e, "anonymous library fetches are off"),
+    }
     // The rerun-widening oracle's strict handle (git-bug 4afaa3e amendment F1):
     // only exists when a Depot is configured — without one, `workspace_cas` IS
     // the cold store and there is no warm leg to launder an outage through.

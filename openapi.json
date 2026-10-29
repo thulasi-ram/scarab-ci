@@ -2400,6 +2400,449 @@
         ]
       }
     },
+    "/v1/orgs/{org}/libraries": {
+      "get": {
+        "tags": [
+          "libraries"
+        ],
+        "summary": "An org's installed libraries (ADR-0076 §4)",
+        "operationId": "list_libraries",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrgLibrariesDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "no read access to the org"
+          },
+          "404": {
+            "description": "libraries not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/libraries/fetch": {
+      "post": {
+        "tags": [
+          "libraries"
+        ],
+        "summary": "Fetch a library version to review before installing (ADR-0076 §4)",
+        "operationId": "fetch_library",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FetchLibraryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FetchedLibraryDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "a bad source or name, a fetch that failed, or a file that does not compile as a closed library"
+          },
+          "403": {
+            "description": "not an org admin, a host Scarab does not fetch from, or a private repository outside the org"
+          },
+          "404": {
+            "description": "libraries not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/libraries/{publisher}/{name}": {
+      "put": {
+        "tags": [
+          "libraries"
+        ],
+        "summary": "Install or upgrade a library (ADR-0076 §4)",
+        "operationId": "install_library",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "publisher",
+            "in": "path",
+            "description": "publisher",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "library name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InstallLibraryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LibraryInstallationDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "a bad name or hash, a version not fetched into this org, or one that no longer compiles here"
+          },
+          "403": {
+            "description": "not an org admin, or no step-up — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "libraries not configured"
+          },
+          "409": {
+            "description": "`replaces` is not what is installed now"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "libraries"
+        ],
+        "summary": "Remove an installed library (ADR-0076 §4)",
+        "operationId": "remove_library",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "publisher",
+            "in": "path",
+            "description": "publisher",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "library name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "removed"
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "not installed, or libraries not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/library-defaults/retry": {
+      "post": {
+        "tags": [
+          "libraries"
+        ],
+        "summary": "Retry installing the first-party libraries (ADR-0076 §5)",
+        "operationId": "retry_library_defaults",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RetryDefaultsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LibraryDefaultsDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "a bad mirror, or an uploaded file for no first-party library"
+          },
+          "403": {
+            "description": "not an org admin, or no step-up — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "libraries not configured"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/library-yanks": {
+      "post": {
+        "tags": [
+          "libraries"
+        ],
+        "summary": "Yank a library version (ADR-0076 §6)",
+        "operationId": "yank_library",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/YankLibraryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LibraryYankDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "a bad hash, an empty or long reason, or a version this org never fetched"
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "libraries not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/library-yanks/{hash}": {
+      "delete": {
+        "tags": [
+          "libraries"
+        ],
+        "summary": "Lift a library yank (ADR-0076 §6)",
+        "operationId": "unyank_library",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "hash",
+            "in": "path",
+            "description": "content hash",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LibraryYankDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not an org admin, or no step-up — or `step_up_required` (ADR-0073): a crown-jewel operation needs a fresh StepUpConfirmation — a passkey in the caller's own browser (`mode` `window` or `action`; `enroll` when there is no passkey yet). An API token or a Bearer session gets `confirmation_url` instead: a one-time StepUpConfirmationRequest its human confirms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepUpRefusal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not yanked, or libraries not configured"
+          },
+          "429": {
+            "description": "an API token or Bearer session already has 10 step-up confirmation requests waiting (ADR-0073 §6)"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/orgs/{org}/members/{subject}/passkeys/reset": {
       "post": {
         "tags": [
@@ -8143,6 +8586,123 @@
           }
         }
       },
+      "FetchLibraryRequest": {
+        "type": "object",
+        "required": [
+          "source"
+        ],
+        "properties": {
+          "connection": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A ForgeConnection id, for a private repository. Omitted: fetched\nanonymously over https."
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Defaults to the file name without its extension."
+          },
+          "publisher": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Defaults to the source's owner."
+          },
+          "source": {
+            "type": "string",
+            "description": "`<host>/<owner>/<repo>//<path>@<commit>`."
+          }
+        }
+      },
+      "FetchedLibraryDto": {
+        "type": "object",
+        "required": [
+          "publisher",
+          "name",
+          "content_hash",
+          "source",
+          "content",
+          "first_party",
+          "diff"
+        ],
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "content_hash": {
+            "type": "string"
+          },
+          "current": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/InstalledVersionDto",
+                "description": "What is installed under this name now, if anything: pass its hash as\n`replaces` to upgrade."
+              }
+            ]
+          },
+          "diff": {
+            "type": "string",
+            "description": "The change from `current`, one line per entry, each starting with\n`+`, `-` or a space. Empty when nothing is installed."
+          },
+          "first_party": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "publisher": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          }
+        }
+      },
+      "FirstPartyLibraryDto": {
+        "type": "object",
+        "description": "A first-party library in the server's release manifest.",
+        "required": [
+          "publisher",
+          "name",
+          "content_hash",
+          "source",
+          "release",
+          "security_fix",
+          "installed"
+        ],
+        "properties": {
+          "content_hash": {
+            "type": "string"
+          },
+          "installed": {
+            "type": "boolean",
+            "description": "Installed in this org under its name, at any version."
+          },
+          "name": {
+            "type": "string"
+          },
+          "publisher": {
+            "type": "string"
+          },
+          "release": {
+            "type": "string"
+          },
+          "security_fix": {
+            "type": "boolean"
+          },
+          "source": {
+            "type": "string"
+          }
+        }
+      },
       "GateResolutionDto": {
         "type": "object",
         "description": "How a gate's wait resolved: its `GateResolved` journal entry.",
@@ -8222,6 +8782,25 @@
         },
         "additionalProperties": false
       },
+      "InstallLibraryRequest": {
+        "type": "object",
+        "required": [
+          "content_hash"
+        ],
+        "properties": {
+          "content_hash": {
+            "type": "string",
+            "description": "A version fetched into this org."
+          },
+          "replaces": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The hash installed now (an upgrade), or omitted for a first install."
+          }
+        }
+      },
       "InstallPluginRequest": {
         "type": "object",
         "description": "`POST /v1/orgs/{org}/plugins`.",
@@ -8275,6 +8854,21 @@
           "killed"
         ]
       },
+      "InstalledVersionDto": {
+        "type": "object",
+        "required": [
+          "content_hash",
+          "source"
+        ],
+        "properties": {
+          "content_hash": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          }
+        }
+      },
       "LegacyProtectionRulesDto": {
         "type": "object",
         "description": "A Project's ADR-0037 per-repo rules as the migration found them. The\ncanonical `secret_scope` / `oidc_subject` are left out: the server always\nderived them from the coordinates, so they never differed by choice.",
@@ -8323,6 +8917,118 @@
             "format": "int32",
             "description": "Seconds.",
             "minimum": 0
+          }
+        }
+      },
+      "LibraryDefaultsDto": {
+        "type": "object",
+        "required": [
+          "state",
+          "missing",
+          "updated_at"
+        ],
+        "properties": {
+          "mirror": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "missing": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MissingDefaultDto"
+            }
+          },
+          "state": {
+            "type": "string",
+            "description": "`offered` (an org from before libraries: nothing installed without an\nadmin), `pending`, `installed` or `missing`."
+          },
+          "updated_at": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "LibraryInstallationDto": {
+        "type": "object",
+        "required": [
+          "publisher",
+          "name",
+          "content_hash",
+          "source",
+          "first_party",
+          "installed_by",
+          "installed_at"
+        ],
+        "properties": {
+          "content_hash": {
+            "type": "string"
+          },
+          "first_party": {
+            "type": "boolean"
+          },
+          "installed_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "installed_by": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "publisher": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "update": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/UpdateNoticeDto",
+                "description": "A newer first-party version exists."
+              }
+            ]
+          },
+          "yanked": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LibraryYankDto",
+                "description": "The installed version is yanked in this org."
+              }
+            ]
+          }
+        }
+      },
+      "LibraryYankDto": {
+        "type": "object",
+        "required": [
+          "content_hash",
+          "reason",
+          "yanked_by",
+          "yanked_at"
+        ],
+        "properties": {
+          "content_hash": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "yanked_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "yanked_by": {
+            "type": "string"
           }
         }
       },
@@ -8538,6 +9244,26 @@
           }
         }
       },
+      "MissingDefaultDto": {
+        "type": "object",
+        "required": [
+          "publisher",
+          "name",
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "publisher": {
+            "type": "string",
+            "description": "Empty when the release manifest itself could not be read."
+          }
+        }
+      },
       "OpSummary": {
         "type": "object",
         "description": "What a human is asked to confirm: the server-rendered, redacted\ndescription of one operation (shown in the 403, on the confirm page and\nin the event log).",
@@ -8608,6 +9334,51 @@
           "updated_by": {
             "type": "string",
             "description": "Who last wrote it (a Principal subject)."
+          }
+        }
+      },
+      "OrgLibrariesDto": {
+        "type": "object",
+        "required": [
+          "installations",
+          "yanks",
+          "first_party"
+        ],
+        "properties": {
+          "defaults": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LibraryDefaultsDto"
+              }
+            ]
+          },
+          "first_party": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FirstPartyLibraryDto"
+            }
+          },
+          "installations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LibraryInstallationDto"
+            }
+          },
+          "manifest_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the release manifest could not be read, if it could not."
+          },
+          "yanks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LibraryYankDto"
+            }
           }
         }
       },
@@ -10026,6 +10797,35 @@
           }
         }
       },
+      "RetryDefaultsRequest": {
+        "type": "object",
+        "properties": {
+          "connection": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A ForgeConnection to read the mirror through."
+          },
+          "files": {
+            "type": "object",
+            "description": "Uploaded copies: `<publisher>/<name>` → the file's content.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "mirror": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A mirror of Scarab's repository, `<host>/<owner>/<repo>`; each\nlibrary is read from the same path and commit there."
+          }
+        }
+      },
       "RuleReadsDto": {
         "type": "object",
         "required": [
@@ -11041,6 +11841,31 @@
           }
         }
       },
+      "UpdateNoticeDto": {
+        "type": "object",
+        "description": "A newer first-party version than the one installed.",
+        "required": [
+          "content_hash",
+          "source",
+          "release",
+          "security_fix"
+        ],
+        "properties": {
+          "content_hash": {
+            "type": "string"
+          },
+          "release": {
+            "type": "string"
+          },
+          "security_fix": {
+            "type": "boolean",
+            "description": "A version between the installed one and this one is a security fix."
+          },
+          "source": {
+            "type": "string"
+          }
+        }
+      },
       "UpdatePolicyRequest": {
         "type": "object",
         "description": "`PUT …/policies/{id}`: the whole Policy, replaced.",
@@ -11161,6 +11986,22 @@
           "path": {
             "type": "string",
             "description": "The path listed (empty string = snapshot root)."
+          }
+        }
+      },
+      "YankLibraryRequest": {
+        "type": "object",
+        "required": [
+          "content_hash",
+          "reason"
+        ],
+        "properties": {
+          "content_hash": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string",
+            "description": "Shown in every refusal."
           }
         }
       }

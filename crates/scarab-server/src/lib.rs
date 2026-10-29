@@ -62,6 +62,7 @@ pub mod converged;
 pub mod depot_expiry;
 pub mod forge_router;
 pub mod infra_observer;
+pub mod libraries;
 pub mod library_fetch;
 pub mod log_tail;
 pub mod logs;
@@ -170,6 +171,17 @@ pub struct AppState {
     /// the `run.create` Policies through it. `main.rs` always wires it; `None`
     /// (a hand-built state) consults no Policies, as before ADR-0075.
     pub policies: Option<Arc<dyn scarab_policy::store::PolicyStore>>,
+    /// Installed libraries, their versions and yanks (ADR-0076). Compiling
+    /// resolves `lib:` targets through it, and admission, launch and gate
+    /// release refuse yanked versions. `None` (a hand-built state) resolves
+    /// no `lib:` target and disables `/v1/orgs/{org}/libraries` (404).
+    pub libraries: Option<Arc<dyn scarab_policy::library::LibraryStore>>,
+    /// Reads a library from a public forge (ADR-0076 §4). `None`: only
+    /// installs through a ForgeConnection work.
+    pub library_fetcher: Option<Arc<dyn library_fetch::AnonymousFetcher>>,
+    /// The release manifest that says which library versions are
+    /// first-party (ADR-0076 §5). Off unless wired.
+    pub first_party: Arc<libraries::FirstParty>,
     /// Org-level Environments (ADR-0071, MMP step 1). `None` disables
     /// `/v1/orgs/{org}/environments[/{env}]` (404).
     pub org_environments: Option<Arc<dyn scarab_project::OrgEnvironmentStore>>,
@@ -299,6 +311,9 @@ impl AppState {
             environments: None,
             environment_governance: None,
             policies: None,
+            libraries: None,
+            library_fetcher: None,
+            first_party: Arc::new(libraries::FirstParty::new(libraries::ManifestSource::Off)),
             org_environments: None,
             plugins: None,
             broker_plugins: None,
@@ -400,6 +415,30 @@ impl AppState {
     /// Consult stored Policies at Run creation (ADR-0075).
     pub fn with_policies(mut self, policies: Arc<dyn scarab_policy::store::PolicyStore>) -> Self {
         self.policies = Some(policies);
+        self
+    }
+
+    /// Resolve `lib:` targets and refuse yanked versions (ADR-0076).
+    pub fn with_libraries(
+        mut self,
+        libraries: Arc<dyn scarab_policy::library::LibraryStore>,
+    ) -> Self {
+        self.libraries = Some(libraries);
+        self
+    }
+
+    /// Fetch libraries from public forges (ADR-0076 §4).
+    pub fn with_library_fetcher(
+        mut self,
+        fetcher: Arc<dyn library_fetch::AnonymousFetcher>,
+    ) -> Self {
+        self.library_fetcher = Some(fetcher);
+        self
+    }
+
+    /// Where the first-party release manifest is read from (ADR-0076 §5).
+    pub fn with_first_party(mut self, source: libraries::ManifestSource) -> Self {
+        self.first_party = Arc::new(libraries::FirstParty::new(source));
         self
     }
 
@@ -10681,6 +10720,13 @@ impl utoipa::Modify for StepUpResponses {
         org_environments::delete_environment_project_privilege_grant,
         org_environments::get_environment_migration_report,
         org_environments::acknowledge_environment_migration_report,
+        libraries::list_libraries,
+        libraries::fetch_library,
+        libraries::install_library,
+        libraries::remove_library,
+        libraries::yank_library,
+        libraries::unyank_library,
+        libraries::retry_library_defaults,
         policies::list_org_policies,
         policies::create_org_policy,
         policies::get_org_policy,
@@ -10844,6 +10890,19 @@ impl utoipa::Modify for StepUpResponses {
         org_environments::LegacyProtectionRulesDto,
         org_environments::EnvironmentMigrationReportProjectDto,
         org_environments::EnvironmentMigrationReportDto,
+        libraries::OrgLibrariesDto,
+        libraries::LibraryInstallationDto,
+        libraries::LibraryYankDto,
+        libraries::UpdateNoticeDto,
+        libraries::FirstPartyLibraryDto,
+        libraries::LibraryDefaultsDto,
+        libraries::MissingDefaultDto,
+        libraries::FetchLibraryRequest,
+        libraries::FetchedLibraryDto,
+        libraries::InstalledVersionDto,
+        libraries::InstallLibraryRequest,
+        libraries::YankLibraryRequest,
+        libraries::RetryDefaultsRequest,
         policies::PolicyDto,
         policies::PolicyVersionDto,
         policies::CreatePolicyRequest,
