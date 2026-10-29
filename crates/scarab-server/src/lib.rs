@@ -10568,6 +10568,11 @@ const TAG_GROUPS: &[(&str, &str)] = &[
          CredentialBroker proxies to.",
     ),
     (
+        "Libraries",
+        "Org-installed libraries (ADR-0076): fetch a version to review, \
+         install, upgrade and remove, yanks, and the first-party defaults.",
+    ),
+    (
         "Policies",
         "Policies (ADR-0075): org Policies and Project typed settings with \
          their version history, the PolicyDecision logs, and the policy test \
@@ -10630,6 +10635,8 @@ fn tag_for_path(path: &str) -> Option<&'static str> {
         "Policies"
     } else if path.contains("/plugins") || path.contains("/plugin-catalog") {
         "Plugins"
+    } else if path.contains("/libraries") || path.contains("/library-") {
+        "Libraries"
     } else if path.contains("/environments") || path.contains("/environment-migration-report") {
         "Environments"
     } else if path.contains("/secrets") {

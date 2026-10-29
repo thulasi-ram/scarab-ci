@@ -2403,7 +2403,7 @@
     "/v1/orgs/{org}/libraries": {
       "get": {
         "tags": [
-          "libraries"
+          "Libraries"
         ],
         "summary": "An org's installed libraries (ADR-0076 §4)",
         "operationId": "list_libraries",
@@ -2449,7 +2449,7 @@
     "/v1/orgs/{org}/libraries/fetch": {
       "post": {
         "tags": [
-          "libraries"
+          "Libraries"
         ],
         "summary": "Fetch a library version to review before installing (ADR-0076 §4)",
         "operationId": "fetch_library",
@@ -2508,7 +2508,7 @@
     "/v1/orgs/{org}/libraries/{publisher}/{name}": {
       "put": {
         "tags": [
-          "libraries"
+          "Libraries"
         ],
         "summary": "Install or upgrade a library (ADR-0076 §4)",
         "operationId": "install_library",
@@ -2596,7 +2596,7 @@
       },
       "delete": {
         "tags": [
-          "libraries"
+          "Libraries"
         ],
         "summary": "Remove an installed library (ADR-0076 §4)",
         "operationId": "remove_library",
@@ -2653,7 +2653,7 @@
     "/v1/orgs/{org}/library-defaults/retry": {
       "post": {
         "tags": [
-          "libraries"
+          "Libraries"
         ],
         "summary": "Retry installing the first-party libraries (ADR-0076 §5)",
         "operationId": "retry_library_defaults",
@@ -2722,7 +2722,7 @@
     "/v1/orgs/{org}/library-yanks": {
       "post": {
         "tags": [
-          "libraries"
+          "Libraries"
         ],
         "summary": "Yank a library version (ADR-0076 §6)",
         "operationId": "yank_library",
@@ -2781,7 +2781,7 @@
     "/v1/orgs/{org}/library-yanks/{hash}": {
       "delete": {
         "tags": [
-          "libraries"
+          "Libraries"
         ],
         "summary": "Lift a library yank (ADR-0076 §6)",
         "operationId": "unyank_library",
@@ -12037,6 +12037,10 @@
     {
       "name": "Plugins",
       "description": "PluginInstallations (ADR-0072): the first-party catalog, install and uninstall, the kill switch, and the PluginConnections the CredentialBroker proxies to."
+    },
+    {
+      "name": "Libraries",
+      "description": "Org-installed libraries (ADR-0076): fetch a version to review, install, upgrade and remove, yanks, and the first-party defaults."
     },
     {
       "name": "Policies",
