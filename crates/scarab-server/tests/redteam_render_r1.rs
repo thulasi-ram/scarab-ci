@@ -91,3 +91,82 @@ async fn a_dispatch_parameter_with_a_leading_dash_does_not_reach_argv() {
     }
     assert!(reached.is_empty(), "outside `-` value launched in argv: {reached:?}");
 }
+
+/// A commit SHA is a fixed shape (ADR-0076, 2026-10-30): `${{ event.sha }}`
+/// reaches a command, end to end through dispatch and the scheduler. A
+/// stored value that is not a lower-case hex SHA (a store written around
+/// Run creation's check) fails the Step at launch, before anything runs.
+#[tokio::test]
+async fn event_sha_reaches_a_command_and_a_stored_non_sha_fails_at_launch() {
+    let sha = "0123456789abcdef0123456789abcdef01234567";
+    let pipeline = "on: { manual: {} }\nsteps:\n  - { id: co, image: alpine/git, command: [git, checkout, \"${{ event.sha }}\"] }\n";
+    let forge = FakeForge::new()
+        .with_file(".scarab/ship.yaml", pipeline)
+        .with_commit("refs/heads/main", sha);
+    let db = InMemoryDb::new();
+    let clock = FakeClock::new(1_000);
+    let dispatch = || {
+        dispatch_run(
+            &forge,
+            &db,
+            &clock,
+            scarab_server::AdmissionPorts::governance(None),
+            "alice".into(),
+            repo(),
+            "refs/heads/main".into(),
+            "ship".into(),
+            BTreeMap::new(),
+            DispatchKind::Manual,
+            None,
+        )
+    };
+    let good = dispatch().await.expect("dispatch");
+    let bad = dispatch().await.expect("dispatch");
+    for value in [
+        json!("0123456789ABCDEF0123456789ABCDEF01234567"),
+        json!("--upload-pack=touch /tmp/pwned"),
+        json!(7),
+    ] {
+        let facts = json!({ "sha": value });
+        db.set_run_event_facts(&bad, facts.as_object().unwrap())
+            .await
+            .unwrap();
+        let step = StepId("co".into());
+        let spec = db.step_spec(&bad, &step).await.unwrap().unwrap();
+        let reason = scarab_engine::render::render_launch_spec(&db, &bad, &step, spec)
+            .await
+            .unwrap()
+            .expect_err("a stored non-SHA is refused");
+        assert!(
+            reason.starts_with("`command[2]`") && reason.contains("not a commit SHA"),
+            "{value}: {reason}"
+        );
+    }
+    let exec = FakeExecutor::new();
+    for _ in 0..4 {
+        exec.script_outcome(ExecState::Succeeded);
+    }
+    let sched = Scheduler::new(&db, &clock, &exec, "scheduler-1");
+    for run in [&good, &bad] {
+        for _ in 0..6 {
+            sched.tick(run).await.expect("tick");
+        }
+    }
+    let launched = exec
+        .launched_spec(&ExecHandle(format!("fake://{}/co/a1", good.0)))
+        .expect("the good Run launched");
+    assert_eq!(launched.command, ["git", "checkout", sha]);
+    assert!(
+        exec.launched_spec(&ExecHandle(format!("fake://{}/co/a1", bad.0)))
+            .is_none(),
+        "a stored non-SHA launched"
+    );
+    let co = db
+        .steps_of_run(&bad)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.step == StepId("co".into()))
+        .unwrap();
+    assert_eq!(co.status, scarab_engine::StepStatus::Failed);
+}

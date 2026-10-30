@@ -190,11 +190,32 @@ pub(crate) enum Source {
     /// default.
     Pipeline,
     /// From outside, of a fixed type: an input declared `choice`, `boolean`
-    /// or `number`. Its text may reach a command once checked at launch.
+    /// or `number`, or an `event` field of a fixed shape
+    /// ([`crate::event::FIXED`]: the commit SHA, a number, `fork`, the
+    /// trigger kind). Its text may reach a command once checked at launch.
     Fixed,
-    /// Any other value from outside: free text, a Step's results, an event
-    /// field. It reaches a Step only as an environment variable's value.
+    /// Any other value from outside: free text, a Step's results, any other
+    /// event field. It reaches a Step only as an environment variable's
+    /// value.
     Free,
+}
+
+/// The shape a fixed value from outside must have when the expression is
+/// one read and nothing else (`inputs.region`, `event.sha`), checked when it
+/// renders. Any other expression over fixed values is checked as a boolean
+/// or a non-negative decimal number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Shape<'a> {
+    /// A `choice` input: one of the values the Pipeline listed.
+    Choice(&'a [String]),
+    /// `event.sha`: `^[0-9a-f]{40}([0-9a-f]{24})?$`.
+    Sha,
+    /// `event.number`, `event.issue`: `^[0-9]+$`.
+    Whole,
+    /// `event.fork`: `true` or `false`.
+    Bool,
+    /// `event.kind`: one of [`crate::event::TRIGGER_KINDS`].
+    Kind,
 }
 
 impl Source {
@@ -318,9 +339,10 @@ impl InputSources {
     }
 
     /// Where the value of the expression `expr` comes from: as far outside
-    /// as its furthest read. `matrix` is the Pipeline's own; `outputs` (a
-    /// Step's results), `event` and any name not known here are free text
-    /// from outside, and so is an expression that does not parse.
+    /// as its furthest read. `matrix` is the Pipeline's own; an `event`
+    /// field of a fixed shape is fixed; `outputs` (a Step's results), any
+    /// other `event` read and any name not known here are free text from
+    /// outside, and so is an expression that does not parse.
     pub(crate) fn of_expr(&self, expr: &str) -> Source {
         let Ok(reads) = cel::reads(expr) else {
             return Source::Free;
@@ -332,6 +354,13 @@ impl InputSources {
                 "inputs" => match &r.first {
                     Some(name) => self.input(name),
                     None => self.whole,
+                },
+                // `event.sha`, not `event.sha.x`, `event[k]` or `event`.
+                "event" => match (&r.first, &r.second) {
+                    (Some(field), None) if crate::event::FIXED.contains(&field.as_str()) => {
+                        Source::Fixed
+                    }
+                    _ => Source::Free,
                 },
                 _ => Source::Free,
             })
@@ -354,12 +383,22 @@ impl InputSources {
             .unwrap_or(Source::Pipeline)
     }
 
-    /// The values the Pipeline listed for the `choice` input that `expr`
-    /// reads, when `expr` is that read and nothing else (`inputs.region`)
-    /// and the value comes from outside.
-    pub(crate) fn choice_options(&self, expr: &str) -> Option<&[String]> {
+    /// The shape of the fixed value `expr` reads, when `expr` is that read
+    /// and nothing else: a `choice` input from outside (`inputs.region`),
+    /// with the values the Pipeline listed, or an `event` field of a fixed
+    /// shape (`event.sha`).
+    pub(crate) fn shape(&self, expr: &str) -> Option<Shape<'_>> {
         match cel::path(expr)?.as_slice() {
-            [var, name] if var == "inputs" => self.inputs.get(name)?.options.as_deref(),
+            [var, name] if var == "inputs" => {
+                self.inputs.get(name)?.options.as_deref().map(Shape::Choice)
+            }
+            [var, field] if var == "event" => match field.as_str() {
+                "sha" => Some(Shape::Sha),
+                "number" | "issue" => Some(Shape::Whole),
+                "fork" => Some(Shape::Bool),
+                "kind" => Some(Shape::Kind),
+                _ => None,
+            },
             _ => None,
         }
     }

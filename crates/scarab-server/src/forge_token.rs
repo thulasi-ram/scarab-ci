@@ -821,6 +821,44 @@ mod tests {
     use scarab_engine::RunId;
     use scarab_testkit::{FakeExecutor, FakeForge};
 
+    /// `event.kind` reaches a command only as one of the pipeline crate's
+    /// trigger kinds (ADR-0076, 2026-10-30): every kind the forge crate can
+    /// store is one of them. A new `TriggerKind` fails to compile here until
+    /// it is listed.
+    #[test]
+    fn every_trigger_kind_is_a_command_kind() {
+        use scarab_forge::TriggerKind as K;
+        let all = |k: K| match k {
+            K::Push
+            | K::PullRequest
+            | K::Tag
+            | K::Release
+            | K::Comment
+            | K::Cron
+            | K::Manual
+            | K::Api
+            | K::Upstream => k,
+        };
+        for k in [
+            K::Push,
+            K::PullRequest,
+            K::Tag,
+            K::Release,
+            K::Comment,
+            K::Cron,
+            K::Manual,
+            K::Api,
+            K::Upstream,
+        ] {
+            let kind = all(k).as_str();
+            assert!(
+                scarab_pipeline::event::TRIGGER_KINDS.contains(&kind),
+                "`{kind}` is not in TRIGGER_KINDS"
+            );
+        }
+        assert_eq!(scarab_pipeline::event::TRIGGER_KINDS.len(), 9);
+    }
+
     // Regression: this decorator must FORWARD `launch_service` to its inner
     // executor. Without the explicit forward it inherits the trait's DEFAULT
     // impl, which REJECTS shared services — refusing every service on the k8s

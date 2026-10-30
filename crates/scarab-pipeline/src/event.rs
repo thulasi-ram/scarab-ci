@@ -40,6 +40,33 @@ pub const READABLE: [&str; 12] = [
     "tag",
 ];
 
+/// The fields whose values are of a fixed shape, and so may be written into
+/// a Step's `command` (ADR-0076, 2026-10-30): the commit SHA, the pull
+/// request or issue number, `fork` and the trigger kind. Each is checked
+/// against its shape again when the Step launches. Every other field is
+/// free text: it reaches a Step only as an environment variable's value.
+pub const FIXED: [&str; 5] = ["sha", "number", "issue", "fork", "kind"];
+
+/// The trigger kinds `event.kind` may hold: each `on:` key a trigger
+/// matches.
+pub const TRIGGER_KINDS: [&str; 9] = [
+    "push",
+    "pull_request",
+    "tag",
+    "release",
+    "comment",
+    "cron",
+    "manual",
+    "api",
+    "upstream",
+];
+
+/// Whether `s` is a commit SHA as a command takes it:
+/// `^[0-9a-f]{40}([0-9a-f]{24})?$` (SHA-1 or SHA-256, lower case).
+pub(crate) fn is_command_sha(s: &str) -> bool {
+    (s.len() == 40 || s.len() == 64) && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// Why a field a template may not read is left out.
 fn unreadable(field: &str) -> Option<&'static str> {
     Some(match field {

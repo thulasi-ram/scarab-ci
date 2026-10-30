@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Map, Value};
 
-use crate::scope::{BoundValue, InputSources, OutputSource, Scope, ScopeInputs, Source};
+use crate::scope::{BoundValue, InputSources, OutputSource, Scope, ScopeInputs, Shape, Source};
 use crate::{cel, params, ParamSpec};
 
 /// The results of a launching Step's `needs`, by Step id, then result name.
@@ -185,9 +185,11 @@ pub fn render(
 ///
 /// The command boundary (ADR-0076, 2026-10-30): Scarab never puts a value
 /// from outside the Pipeline into a Step's command, except a `choice` value
-/// the Pipeline listed, `true`/`false`, or a non-negative decimal number.
-/// Every other outside value (free text, a Step's results, a library input
-/// bound to one) reaches the Step only as an environment variable's value.
+/// the Pipeline listed, `true`/`false`, a non-negative decimal number, or a
+/// hex commit SHA (`event.sha`; `event.number`, `event.issue`, `event.fork`
+/// and `event.kind` are fixed shapes too). Every other outside value (free
+/// text, a Step's results, any other event field, a library input bound to
+/// one) reaches the Step only as an environment variable's value.
 /// Programs read their arguments as code in ways no list can cover (an
 /// option, `@file`, `+ref`, a word a shell re-joins), and the fixed shapes
 /// hold none of them.
@@ -195,8 +197,9 @@ pub fn render(
 /// Where each value comes from is decided by what the template reads
 /// ([`InputSources`]), never by the rendered text. A fixed-type value is
 /// checked against its shape once it renders: a choice is one of its listed
-/// values, a number matches `^[0-9]+(\.[0-9]+)?$`. The Pipeline's own values
-/// are not checked.
+/// values, a number matches `^[0-9]+(\.[0-9]+)?$`, `event.sha` matches
+/// `^[0-9a-f]{40}([0-9a-f]{24})?$` ([`Shape`]). The Pipeline's own values are
+/// not checked.
 fn arguments(
     command: &[String],
     sources: &InputSources,
@@ -218,7 +221,7 @@ fn arguments(
             }
             match value(expr)? {
                 Some(v) if source == Source::Fixed => {
-                    let text = fixed_text(&v, sources.choice_options(expr))
+                    let text = fixed_text(&v, sources.shape(expr))
                         .map_err(|what| not_fixed(index, shown, &what))?;
                     arg.push_str(&text);
                 }
@@ -240,14 +243,39 @@ fn arguments(
     Ok(out)
 }
 
-/// The text of a fixed-type value from outside, or what it is instead:
-/// `true`/`false`, a non-negative decimal number, or one of the values
-/// `options` lists (only for an expression that reads a `choice` input and
-/// nothing else).
-fn fixed_text(v: &Value, options: Option<&[String]>) -> Result<String, String> {
-    match v {
-        Value::Bool(b) => Ok(b.to_string()),
-        Value::Number(n) => {
+/// The text of a fixed-type value from outside, or what it is instead. An
+/// expression that is one read of a value with a [`Shape`] must have that
+/// shape: a commit SHA, a whole number, `true`/`false`, a trigger kind, or
+/// one of a `choice` input's listed values (for a `choice`, a boolean or a
+/// decimal number passes too). Any other expression over fixed values must
+/// render to `true`/`false` or a non-negative decimal number.
+fn fixed_text(v: &Value, shape: Option<Shape<'_>>) -> Result<String, String> {
+    let shown = |v: &Value| match v {
+        Value::String(s) => format!("the text `{}`", s.escape_debug()),
+        Value::Number(n) => format!("the number `{n}`"),
+        Value::Bool(b) => format!("`{b}`"),
+        Value::Null => "null".into(),
+        Value::Array(_) => "a list".into(),
+        Value::Object(_) => "a map".into(),
+    };
+    match (shape, v) {
+        (Some(Shape::Sha), Value::String(s)) if crate::event::is_command_sha(s) => Ok(s.clone()),
+        (Some(Shape::Sha), _) => Err(format!(
+            "{}, which is not a commit SHA (40 or 64 lower-case hex characters)",
+            shown(v)
+        )),
+        (Some(Shape::Whole), Value::Number(n)) if n.as_u64().is_some() => Ok(n.to_string()),
+        (Some(Shape::Whole), _) => Err(format!("{}, which is not a whole number", shown(v))),
+        (Some(Shape::Bool), Value::Bool(b)) => Ok(b.to_string()),
+        (Some(Shape::Bool), _) => Err(format!("{}, which is not true or false", shown(v))),
+        (Some(Shape::Kind), Value::String(s))
+            if crate::event::TRIGGER_KINDS.contains(&s.as_str()) =>
+        {
+            Ok(s.clone())
+        }
+        (Some(Shape::Kind), _) => Err(format!("{}, which is not a trigger kind", shown(v))),
+        (_, Value::Bool(b)) => Ok(b.to_string()),
+        (_, Value::Number(n)) => {
             let text = n.to_string();
             if is_decimal(&text) {
                 Ok(text)
@@ -257,11 +285,13 @@ fn fixed_text(v: &Value, options: Option<&[String]>) -> Result<String, String> {
                 ))
             }
         }
-        Value::String(s) if options.is_some_and(|o| o.iter().any(|x| x == s)) => Ok(s.clone()),
-        Value::String(_) => Err("text that is not one of a `choice` input's listed values".into()),
-        Value::Null => Err("null".into()),
-        Value::Array(_) => Err("a list".into()),
-        Value::Object(_) => Err("a map".into()),
+        (Some(Shape::Choice(o)), Value::String(s)) if o.iter().any(|x| x == s) => Ok(s.clone()),
+        (_, Value::String(_)) => {
+            Err("text that is not one of a `choice` input's listed values".into())
+        }
+        (_, Value::Null) => Err("null".into()),
+        (_, Value::Array(_)) => Err("a list".into()),
+        (_, Value::Object(_)) => Err("a map".into()),
     }
 }
 
@@ -280,9 +310,10 @@ fn free_text(index: usize, shown: &str) -> String {
     format!(
         "`command[{index}]`: `{shown}` reads a value from outside the Pipeline (a Run \
          parameter, a Step's results, an event field, or a library input bound to one) that is \
-         not a `choice`, boolean or number, and Scarab puts no such value into a command; pass \
-         it in `env:` (`env: [[VALUE, \"{shown}\"]]`) and read it from the environment \
-         (`\"$VALUE\"` in a shell script)"
+         not of a fixed shape (a `choice`, boolean or number input, or `event.sha`, \
+         `event.number`, `event.issue`, `event.fork` or `event.kind`), and Scarab puts no such \
+         value into a command; pass it in `env:` (`env: [[VALUE, \"{shown}\"]]`) and read it \
+         from the environment (`\"$VALUE\"` in a shell script)"
     )
 }
 
@@ -291,9 +322,9 @@ fn free_text(index: usize, shown: &str) -> String {
 fn not_fixed(index: usize, shown: &str, what: &str) -> String {
     format!(
         "`command[{index}]`: `{shown}` reads a value from outside the Pipeline and renders to \
-         {what}; a command takes only a listed `choice` value, `true`/`false` or a \
-         non-negative decimal number from outside; pass it in `env:` (`env: [[VALUE, \
-         \"{shown}\"]]`) and read it from the environment"
+         {what}; a command takes only a listed `choice` value, `true`/`false`, a \
+         non-negative decimal number, a commit SHA or a trigger kind from outside; pass it in \
+         `env:` (`env: [[VALUE, \"{shown}\"]]`) and read it from the environment"
     )
 }
 
@@ -1000,7 +1031,10 @@ mod tests {
             // Computed from free text, or from everything.
             (&["x", "${{ size(inputs.p) }}"], None, 1, "${{ size(inputs.p) }}"),
             (&["x", "${{ size(inputs) }}"], None, 1, "${{ size(inputs) }}"),
-            (&["x", "${{ event.sha }}"], None, 1, "${{ event.sha }}"),
+            // An event field that is not of a fixed shape (`event.sha` is,
+            // see `a_fixed_event_value_reaches_a_command_checked_at_launch` in lib.rs).
+            (&["x", "${{ event.branch }}"], None, 1, "${{ event.branch }}"),
+            (&["x", "${{ event.sha + event.ref }}"], None, 1, "${{ event.sha + event.ref }}"),
             // A library's string input bound to a caller's number: the
             // library declared free text.
             (&["x", "${{ inputs.s }}"], Some(&scope), 1, "${{ inputs.s }}"),

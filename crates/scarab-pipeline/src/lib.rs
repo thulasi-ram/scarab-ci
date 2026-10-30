@@ -4028,7 +4028,8 @@ fn script_templates(ir: &PipelineIr) -> Vec<(Severity, String)> {
 
 /// Each `${{ … }}` in a Step's `command` that reads free text from outside
 /// the Pipeline (ADR-0076, 2026-10-30): a value that is not a `choice`,
-/// boolean or number input. The launch refuses it (see [`render`]); this
+/// boolean or number input, nor an `event` field of a fixed shape
+/// ([`event::FIXED`]). The launch refuses it (see [`render`]); this
 /// says so when the Pipeline compiles, naming the Step and the argument, and
 /// for a library Step, the library and the caller's `with:` that binds the
 /// input. One finding per template and caller, however many matrix legs or
@@ -4082,8 +4083,10 @@ fn command_values(ir: &PipelineIr) -> Vec<String> {
                 }
                 found.push(format!(
                     "{at}: `command[{index}]` reads `{shown}`{caller}, a value from outside the \
-                     Pipeline that is not a `choice`, boolean or number; Scarab puts no such \
-                     value into a command. Pass it in `env:` (`env: [[VALUE, \"{shown}\"]]`) \
+                     Pipeline that is not of a fixed shape (a `choice`, boolean or number input, \
+                     or `event.sha`, `event.number`, `event.issue`, `event.fork` or \
+                     `event.kind`); Scarab puts no such value into a command. Pass it in `env:` \
+                     (`env: [[VALUE, \"{shown}\"]]`) \
                      and read it from the environment (`\"$VALUE\"` in a shell script)"
                 ));
             }
@@ -6828,9 +6831,10 @@ mod tests {
             errs.iter().filter(|e| e.contains("`command[")).collect::<Vec<_>>(),
             [&"library `l.yaml`, step `a`: `command[1]` reads `${{ inputs.v }}`, which step `c` \
                binds with `with.v: ${{ inputs.ref }}`, a value from outside the Pipeline that is \
-               not a `choice`, boolean or number; Scarab puts no such value into a command. Pass \
-               it in `env:` (`env: [[VALUE, \"${{ inputs.v }}\"]]`) and read it from the \
-               environment (`\"$VALUE\"` in a shell script)"
+               not of a fixed shape (a `choice`, boolean or number input, or `event.sha`, \
+               `event.number`, `event.issue`, `event.fork` or `event.kind`); Scarab puts no such \
+               value into a command. Pass it in `env:` (`env: [[VALUE, \"${{ inputs.v }}\"]]`) \
+               and read it from the environment (`\"$VALUE\"` in a shell script)"
                 .to_string()],
         );
         // A literal `with:`, or a caller's number: compiles.
@@ -8253,28 +8257,15 @@ mod tests {
         assert_eq!(env["SCARAB_CLONE_LFS"], "false");
     }
 
-    #[test]
-    fn a_free_text_event_value_reaches_a_command_only_through_env() {
-        let errs = errors(
-            r#"steps: [{ id: a, image: busybox, command: [git, fetch, origin, "${{ event.ref }}"] }]"#,
-        );
-        assert!(
-            errs.iter()
-                .any(|e| e.contains("step `a`") && e.contains("`command[3]` reads `${{ event.ref }}`")),
-            "{errs:?}"
-        );
-        // A command patched into a compiled IR is refused at launch, however
-        // plain the value.
-        let mut ir =
-            compile(r#"steps: [{ id: a, image: busybox, env: [[R, "${{ event.ref }}"]] }]"#);
-        ir.steps[0].command = vec!["git".into(), "fetch".into(), "${{ event.ref }}".into()];
-        let s = &ir.steps[0];
-        let event = json!({ "ref": "main" });
-        let err = render(
+    /// Render `command` of a Pipeline-file Step at launch, against stored
+    /// `event` values.
+    fn launch_with_event(command: &[&str], event: serde_json::Value) -> Result<Vec<String>, String> {
+        let command: Vec<String> = command.iter().map(|c| c.to_string()).collect();
+        render(
             Templates {
-                image: &s.image,
-                command: &s.command,
-                env: &s.env,
+                image: "alpine/git",
+                command: &command,
+                env: &[],
             },
             None,
             &BTreeMap::new(),
@@ -8285,8 +8276,173 @@ mod tests {
                 event: event.as_object().unwrap(),
             },
         )
+        .map(|r| r.command)
+    }
+
+    /// Free-text event fields (ADR-0076, 2026-10-30) reach a Step only
+    /// through `env:`: a compile error in a command, and a launch refusal
+    /// for a command patched into a compiled IR, however plain the value.
+    #[test]
+    fn a_free_text_event_value_reaches_a_command_only_through_env() {
+        for field in [
+            "ref",
+            "branch",
+            "tag",
+            "run",
+            "repo.owner",
+            "repo.name",
+            "repo.clone_url",
+        ] {
+            let errs = errors(&format!(
+                r#"steps: [{{ id: a, image: busybox, command: [git, fetch, origin, "${{{{ event.{field} }}}}"] }}]"#
+            ));
+            let want = format!("`command[3]` reads `${{{{ event.{field} }}}}`");
+            assert!(
+                errs.iter().any(|e| e.contains("step `a`") && e.contains(&want)),
+                "{field}: {errs:?}"
+            );
+        }
+        // Built into a larger argument, or read beside a fixed field.
+        for arg in [
+            "--branch=${{ event.branch }}",
+            "${{ event.sha + event.branch }}",
+            "${{ event.repo['name'] }}",
+        ] {
+            let errs = errors(&format!(
+                r#"steps: [{{ id: a, image: busybox, command: [git, "{arg}"] }}]"#
+            ));
+            assert!(
+                errs.iter().any(|e| e.contains("`command[1]` reads")),
+                "{arg}: {errs:?}"
+            );
+        }
+        // Through `env:` it compiles.
+        compile(r#"steps: [{ id: a, image: busybox, env: [[B, "${{ event.branch }}"]] }]"#);
+        // At launch: refused before the value is read.
+        for (template, event) in [
+            ("${{ event.branch }}", json!({ "branch": "main" })),
+            ("${{ event.ref }}", json!({ "ref": "refs/heads/main" })),
+            ("x-${{ event.repo.clone_url }}", json!({ "repo": { "clone_url": "https://h/a.git" } })),
+        ] {
+            let err = launch_with_event(&["git", "fetch", template], event).unwrap_err();
+            assert!(err.starts_with("`command[2]`"), "{template}: {err}");
+        }
+    }
+
+    /// `event.sha`, `event.number`, `event.issue`, `event.fork` and
+    /// `event.kind` are fixed shapes (ADR-0076, 2026-10-30): they reach a
+    /// command, each checked against its shape when the Step launches.
+    #[test]
+    fn a_fixed_event_value_reaches_a_command_checked_at_launch() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let ir = compile(
+            r#"steps: [{ id: a, image: alpine/git, command: [git, checkout, "${{ event.sha }}"] }]"#,
+        );
+        let s = &ir.steps[0];
+        let cmd: Vec<&str> = s.command.iter().map(String::as_str).collect();
+        assert_eq!(
+            launch_with_event(&cmd, json!({ "sha": sha })).unwrap(),
+            ["git", "checkout", sha]
+        );
+        let sha256 = "a".repeat(64);
+        assert_eq!(
+            launch_with_event(&cmd, json!({ "sha": sha256 })).unwrap(),
+            ["git", "checkout", sha256.as_str()]
+        );
+        compile(
+            r#"steps: [{ id: a, image: busybox, command: [x, "pr-${{ event.number }}", "${{ event.issue }}", "${{ event.fork }}", "${{ event.kind }}", "${{ event.number + 1 }}"] }]"#,
+        );
+        let all = [
+            "x",
+            "pr-${{ event.number }}",
+            "${{ event.issue }}",
+            "${{ event.fork }}",
+            "${{ event.kind }}",
+            "${{ event.number + 1 }}",
+        ];
+        assert_eq!(
+            launch_with_event(
+                &all,
+                json!({ "number": 7, "issue": 12, "fork": false, "kind": "pull_request" })
+            )
+            .unwrap(),
+            ["x", "pr-7", "12", "false", "pull_request", "8"]
+        );
+        // A stored value that is not of its shape (a store written around
+        // Run creation's check) fails the Step at launch, naming it.
+        let bad_sha = "the text `0123456789ABCDEF0123456789ABCDEF01234567`";
+        for (command, event, what) in [
+            (&cmd[..], json!({ "sha": sha.to_uppercase() }), bad_sha),
+            (&cmd[..], json!({ "sha": "--upload-pack=touch /tmp/x" }), "which is not a commit SHA"),
+            (&cmd[..], json!({ "sha": "main" }), "which is not a commit SHA"),
+            (&cmd[..], json!({ "sha": &sha[..39] }), "which is not a commit SHA"),
+            (&cmd[..], json!({ "sha": format!("{sha}0") }), "which is not a commit SHA"),
+            (&cmd[..], json!({ "sha": 12345 }), "the number `12345`, which is not a commit SHA"),
+            (&cmd[..], json!({ "sha": null }), "null, which is not a commit SHA"),
+            (&["x", "y", "${{ event.number }}"], json!({ "number": "7" }), "not a whole number"),
+            (&["x", "y", "${{ event.number }}"], json!({ "number": 1.5 }), "not a whole number"),
+            (&["x", "y", "${{ event.issue }}"], json!({ "issue": -1 }), "not a whole number"),
+            (&["x", "y", "${{ event.fork }}"], json!({ "fork": "true" }), "not true or false"),
+            (&["x", "y", "${{ event.kind }}"], json!({ "kind": "-x" }), "not a trigger kind"),
+            (&["x", "y", "${{ event.kind }}"], json!({ "kind": "nightly" }), "not a trigger kind"),
+            // Text built from a fixed field is not of a fixed shape.
+            (&["x", "y", "${{ event.sha + 'x' }}"], json!({ "sha": sha }), "text that is not"),
+            (&["x", "y", "${{ event.kind + '' }}"], json!({ "kind": "push" }), "text that is not"),
+        ] {
+            let err = launch_with_event(command, event).unwrap_err();
+            assert!(
+                err.starts_with("`command[2]`") && err.contains("renders to") && err.contains(what),
+                "{command:?}: {err}"
+            );
+        }
+        // The script check is unchanged: a fixed value is still from outside.
+        let errs = errors(
+            r#"steps: [{ id: a, image: alpine/git, command: [sh, -c, "git checkout ${{ event.sha }}"] }]"#,
+        );
+        assert!(errs.iter().any(|e| e.contains("step `a`")), "{errs:?}");
+    }
+
+    /// Run creation's preview applies the same check to the stored values.
+    #[test]
+    fn a_preview_checks_the_event_values_it_knows() {
+        let command = vec!["git".to_string(), "checkout".to_string(), "${{ event.sha }}".to_string()];
+        let preview = |event: serde_json::Value| {
+            render(
+                Templates {
+                    image: "",
+                    command: &command,
+                    env: &[],
+                },
+                None,
+                &BTreeMap::new(),
+                Facts::Preview {
+                    params: &BTreeMap::new(),
+                    declared: &[],
+                    event: event.as_object().unwrap(),
+                },
+            )
+        };
+        let sha = "f".repeat(40);
+        assert_eq!(preview(json!({ "sha": sha })).unwrap().command[2], sha);
+        let e = preview(json!({ "sha": "nothex" })).unwrap_err();
+        assert!(e.contains("not a commit SHA"), "{e}");
+        let branch = vec!["git".to_string(), "${{ event.branch }}".to_string()];
+        let e = render(
+            Templates {
+                image: "",
+                command: &branch,
+                env: &[],
+            },
+            None,
+            &BTreeMap::new(),
+            Facts::Preview {
+                params: &BTreeMap::new(),
+                declared: &[],
+                event: json!({ "branch": "main" }).as_object().unwrap(),
+            },
+        )
         .unwrap_err();
-        assert!(err.starts_with("`command[2]`"), "{err}");
+        assert!(e.starts_with("`command[1]`"), "{e}");
     }
 
     // --- build step kind (ADR-0018) -----------------------------------------
