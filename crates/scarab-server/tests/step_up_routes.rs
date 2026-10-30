@@ -419,6 +419,9 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     ("DELETE", "/v1/orgs/{org}/library-trust", "library.untrust", "EX"),
     ("GET", "/v1/orgs/{org}/plugin-catalog", "read", "READ"),
     ("GET", "/v1/orgs/{org}/plugins", "read", "READ"),
+    // ADR-0076 §7: a plugin's open gate waits; the handler takes only its
+    // scarab-api token, in its own org.
+    ("GET", "/v1/orgs/{org}/gates", "read", "READ"),
     ("POST", "/v1/orgs/{org}/plugins", "plugin.install", "CJ-A"),
     ("GET", "/v1/orgs/{org}/plugins/{name}", "read", "READ"),
     (
