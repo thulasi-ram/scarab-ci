@@ -532,7 +532,9 @@ a library. Only fields whose values Scarab can check are readable:
 
 `actor`, a comment's `body` and `schedule` are not readable, and neither is `${{ event }}` as a
 whole: each is a compile error. The same holds for a `concurrency.group`, which renders against the
-same checked values. A `when:` still sees the whole event.
+same checked values. A group reads only `inputs` and `event`: it is fixed when the Run is created,
+before any step has run, so reading `outputs` is a compile error. A `when:` still sees the whole
+event.
 
 The values are checked and stored when the Run is created, so a rerun reads the same ones. A
 pipeline that reads a field the trigger does not have, or one whose value fails its check, is
@@ -603,8 +605,11 @@ A pipeline waits on one with `invoke: plugin:<installation>/<gate>`:
 This inlines one gate, `gate: plugin`, with the invoke step's id. Only the installation it names
 can release it. `with:` is checked against the gate's declared inputs when the pipeline compiles,
 and a value that reads an upstream output is rendered once, when the gate is reached. A value that
-does not render fails the gate with the reason. `gate_expires_after` is required: a gate the plugin
-never answers fails when it expires. Anyone with write access to the project can reject it sooner.
+does not render fails the gate with the reason. The inputs are sent to the plugin, so `with:`
+cannot read `secrets` or `env`, and an upstream output it reads must be one that step declares;
+each is a compile error. `gate_expires_after` is required, at most 2592000 seconds (30 days): a
+gate the plugin never answers fails when it expires. Anyone with write access to the project can
+reject it sooner.
 
 The plugin releases the gate with the outputs it declares, each of its declared type, and a later
 step reads them as `${{ outputs.<gate>.<name> }}`. They are values from outside the pipeline, like

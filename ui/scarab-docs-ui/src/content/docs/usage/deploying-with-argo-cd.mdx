@@ -168,7 +168,8 @@ Application through Scarab's credential broker.
 The plugin passes the gate when Argo CD reports the Application synced and healthy, with no
 operation running, and its target manifests render `image`. It fails the gate with Argo's message
 when Argo gives up: a failed sync of the current revision, a failed hook, or a rollout past its
-progress deadline. The gate's output `revision` is the git revision Argo synced. The run fails when
+progress deadline. It fails the gate at once when `app` is `.` or `..` or holds a `/`, which no
+Application name does. The gate's output `revision` is the git revision Argo synced. The run fails when
 the gate expires. See [Plugin gates](/scarab-ci/usage/pipeline-syntax/#plugin-gates).
 
 ## What this doesn't cover
