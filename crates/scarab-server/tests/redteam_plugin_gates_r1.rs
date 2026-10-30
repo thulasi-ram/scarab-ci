@@ -866,7 +866,6 @@ async fn outputs_of_the_wrong_shape_are_a_400_and_take_nothing() {
 /// A NUL inside a string output: Postgres `jsonb` cannot store `\u0000`, so
 /// it must be refused as a bad output (4xx), not surface as a 500.
 #[tokio::test]
-#[ignore = "red: s4 r1"]
 async fn a_nul_in_an_output_is_a_client_error_not_a_server_error() {
     let Some(w) = world(PIPELINE, None, true).await else {
         return;
@@ -882,6 +881,17 @@ async fn a_nul_in_an_output_is_a_client_error_not_a_server_error() {
     )
     .await;
     assert!(status.is_client_error(), "got {status} {body}");
+    // Nor in a fail's reason, which is stored and journalled the same way.
+    let (status, body) = release(
+        &w.broker,
+        &w.run,
+        "live",
+        &w.prod,
+        json!({ "attempt": attempt, "passed": false, "reason": "a\u{0}b" }),
+    )
+    .await;
+    assert!(status.is_client_error(), "got {status} {body}");
+    assert_eq!(status_of(w.pg.as_ref(), &w.run, "live").await, StepStatus::Pending);
     w.tdb.cleanup().await;
 }
 

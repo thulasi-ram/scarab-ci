@@ -807,6 +807,14 @@ pub fn check_gate_outputs(
             "the outputs are {size} bytes; at most {MAX_GATE_OUTPUT_BYTES} are kept"
         ));
     }
+    // Postgres `jsonb` cannot hold U+0000; refuse it here as a bad output
+    // rather than fail the write.
+    if let Some(k) = got.keys().find(|k| k.contains('\0')) {
+        return Err(format!(
+            "output name `{}` contains a NUL character",
+            k.escape_debug()
+        ));
+    }
     let names = || {
         declared
             .iter()
@@ -844,6 +852,9 @@ pub fn check_gate_outputs(
                 param_type_name(o.r#type),
                 json_kind(v)
             ));
+        }
+        if v.as_str().is_some_and(|s| s.contains('\0')) {
+            return Err(format!("output `{}` contains a NUL character", o.name));
         }
         out.insert(o.name.clone(), v.clone());
     }

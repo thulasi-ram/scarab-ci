@@ -8380,13 +8380,19 @@ pub struct RejectGateRequest {
 /// The longest gate-reject reason accepted, in bytes (after trimming).
 const GATE_REJECT_REASON_MAX_BYTES: usize = 1024;
 
-/// A reject reason, trimmed and bounded (1..=1024 bytes), or a 400.
+/// A reject reason, trimmed and bounded (1..=1024 bytes), or a 400. A NUL
+/// is refused too: Postgres cannot store it, so it would fail the write.
 fn gate_reject_reason(reason: &str) -> Result<&str, ApiError> {
     let reason = reason.trim();
     if reason.is_empty() || reason.len() > GATE_REJECT_REASON_MAX_BYTES {
         return Err(ApiError::BadRequest(format!(
             "reason is required: 1 to {GATE_REJECT_REASON_MAX_BYTES} bytes"
         )));
+    }
+    if reason.contains('\0') {
+        return Err(ApiError::BadRequest(
+            "reason contains a NUL character".into(),
+        ));
     }
     Ok(reason)
 }
