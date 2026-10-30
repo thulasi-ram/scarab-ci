@@ -122,6 +122,10 @@ struct World {
 }
 
 async fn world() -> Option<World> {
+    world_with(PIPELINE).await
+}
+
+async fn world_with(pipeline: &str) -> Option<World> {
     let tdb = support::fresh_db().await?;
     let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
     pg.migrate().await.unwrap();
@@ -176,7 +180,7 @@ async fn world() -> Option<World> {
     std::fs::write(&token_file, format!("tok-{id}\n")).unwrap();
 
     let forge = FakeForge::new()
-        .with_file(".scarab/ci.yaml", PIPELINE)
+        .with_file(".scarab/ci.yaml", pipeline)
         .with_commit("refs/heads/main", SHA);
     let push = Event::Push {
         actor: "octocat".into(),
@@ -300,4 +304,23 @@ async fn wait_live_fails_the_gate_when_argo_gives_up() {
     let detail = attempts.last().unwrap().failure_detail.clone().unwrap_or_default();
     assert!(detail.starts_with("rejected by plugin:argocd-prod: sync failed"), "{detail}");
     w.finish().await;
+}
+
+/// An `app` of `.` or `..`, or one holding a `/`, would name another path
+/// once the URL is resolved: the gate fails with the reason, and nothing
+/// reaches Argo.
+#[tokio::test]
+async fn wait_live_fails_an_app_that_is_not_an_application_name() {
+    for app in ["..", ".", "a/b"] {
+        let pipeline = PIPELINE.replace("app: payments-api", &format!("app: \"{app}\""));
+        let Some(w) = world_with(&pipeline).await else { return };
+        let report = standby::gates_once(&w.broker, &w.api).await.unwrap();
+        assert_eq!(report.failed, [format!("{}/live", w.run.0)], "{app}: {report:?}");
+        assert_eq!(w.status("live").await, StepStatus::Failed, "{app}");
+        let attempts = w.pg.attempts_of_step(&w.run, &StepId("live".into())).await.unwrap();
+        let detail = attempts.last().unwrap().failure_detail.clone().unwrap_or_default();
+        assert!(detail.contains("is not an Argo CD Application name"), "{app}: {detail}");
+        assert!(w.fake.requests().is_empty(), "{app}: {:?}", w.fake.requests());
+        w.finish().await;
+    }
 }

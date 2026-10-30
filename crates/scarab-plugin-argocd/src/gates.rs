@@ -251,6 +251,19 @@ pub async fn resolve_pass(broker: &Broker, api: &GateApi, org: &str) -> Result<P
             report.errors.push(format!("{key}: no `app` or `image` input"));
             continue;
         };
+        // `.` and `..` survive percent-encoding and a URL resolves them, so
+        // the read would name another path; a `/` is not in an Application
+        // name. Neither becomes valid later: fail the gate now.
+        if app.is_empty() || app == "." || app == ".." || app.contains('/') {
+            let verdict = Judgement::Fail {
+                reason: format!("`app` {app:?} is not an Argo CD Application name"),
+            };
+            match api.answer(&gate, &verdict).await {
+                Ok(()) => report.failed.push(key),
+                Err(e) => report.errors.push(format!("{key}: answering: {e}")),
+            }
+            continue;
+        }
         let path = format!("/api/v1/applications/{}", encode_component(app));
         let read = async {
             let application: Application = broker.argocd_get(&path, &[]).await?;

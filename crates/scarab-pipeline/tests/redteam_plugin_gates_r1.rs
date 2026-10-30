@@ -154,11 +154,14 @@ fn a_plugin_invoke_carries_nothing_that_runs_or_changes_when_it_passes() {
 
 #[test]
 fn an_expiry_is_positive_and_fits() {
-    for v in ["0", "-1", "4294967296", "1e9", "\"600\"", "600.5"] {
+    for v in ["0", "-1", "4294967296", "4294967295", "2592001", "1e9", "\"600\"", "600.5"] {
         let yaml = pipeline("", "").replace("gate_expires_after: 600", &format!("gate_expires_after: {v}"));
         let errs = refused(&yaml);
         assert!(!errs.is_empty(), "{v}");
     }
+    // 30 days is the most.
+    let yaml = pipeline("", "").replace("gate_expires_after: 600", "gate_expires_after: 2592000");
+    compile(&yaml).expect("30 days compiles");
 }
 
 // ------------------------------------------------------- inputs at the wait

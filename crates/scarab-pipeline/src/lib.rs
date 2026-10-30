@@ -787,6 +787,11 @@ pub struct PluginGateDef {
     pub manifest_sha256: String,
 }
 
+/// The longest `gate_expires_after` a plugin gate may set: 30 days, in
+/// seconds. A plugin gate must end (ADR-0076 §7); without a cap, the largest
+/// value (about 136 years) would make its expiry optional in practice.
+pub const MAX_PLUGIN_GATE_EXPIRES_AFTER_SECS: u32 = 30 * 24 * 60 * 60;
+
 /// The most bytes of output one plugin gate release may carry, as JSON: the
 /// cap on a Step's results (ADR-0041).
 pub const MAX_GATE_OUTPUT_BYTES: usize = 64 * 1024;
@@ -5099,6 +5104,17 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                     ("plugin", Some(_)) if step.gate_expires_after.is_none() => {
                         diagnostics.push(format!(
                             "step `{}`: a plugin gate must set `gate_expires_after` (seconds)",
+                            step.id
+                        ))
+                    }
+                    ("plugin", Some(_))
+                        if step
+                            .gate_expires_after
+                            .is_some_and(|s| s > MAX_PLUGIN_GATE_EXPIRES_AFTER_SECS) =>
+                    {
+                        diagnostics.push(format!(
+                            "step `{}`: a plugin gate's `gate_expires_after` is at most \
+                             {MAX_PLUGIN_GATE_EXPIRES_AFTER_SECS} seconds (30 days)",
                             step.id
                         ))
                     }
