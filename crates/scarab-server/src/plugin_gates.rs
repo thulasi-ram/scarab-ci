@@ -284,9 +284,20 @@ pub(crate) async fn release(
     let installation = authenticate(st, headers).await?;
     let run = RunId(run.to_string());
     let step = StepId(step.to_string());
-    // Another org's Run is not there for this plugin.
+    // Ownership first, before anything that answers differently: another
+    // org's Run, a gate of another kind, or a plugin gate another
+    // installation releases is not there for this plugin. Only then the
+    // body, the Environment, the library yank and the wait, so a 400 or a
+    // 409 and its message only ever describe the caller's own gate.
     let tenant = st.db.run_tenant(&run).await.map_err(ApiError::Db)?;
     if tenant.map(|(org, _)| org) != Some(installation.org.clone()) {
+        return Err(ApiError::NotFound);
+    }
+    let releaser = installation.principal().subject().to_string();
+    if !scarab_engine::releases_plugin_gate(st.db.as_ref(), &run, &step, &releaser)
+        .await
+        .map_err(ApiError::Db)?
+    {
         return Err(ApiError::NotFound);
     }
     let req: PluginGateRelease = serde_json::from_slice(body)
@@ -304,7 +315,6 @@ pub(crate) async fn release(
         // ADR-0076 §6: never one inlined from a yanked library version.
         crate::refuse_yanked_step(st, &run, &step, "the gate cannot release").await?;
     }
-    let releaser = installation.principal().subject().to_string();
     let resolved = scarab_engine::resolve_plugin_gate(
         st.db.as_ref(),
         st.clock.as_ref(),

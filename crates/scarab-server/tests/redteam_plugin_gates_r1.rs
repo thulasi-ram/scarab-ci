@@ -568,7 +568,6 @@ async fn yanked_world() -> Option<World> {
 /// 404 whatever else is true of it (yanked, held), so a plugin cannot tell
 /// another installation's gate, or a manual gate, from no gate.
 #[tokio::test]
-#[ignore = "red: s4 r1"]
 async fn ownership_is_decided_before_yank_so_nothing_leaks_about_gates_not_yours() {
     let Some(w) = yanked_world().await else {
         return;
@@ -589,6 +588,41 @@ async fn ownership_is_decided_before_yank_so_nothing_leaks_about_gates_not_yours
             "{step}: a gate that is not the caller's must be a 404, like no gate: {body}"
         );
     }
+    w.tdb.cleanup().await;
+}
+
+/// The same order against an Environment hold: a Deploy Run whose
+/// Environment is gone holds the caller's own gate with a 409, and answers
+/// 404 for every gate that is not the caller's.
+#[tokio::test]
+async fn ownership_is_decided_before_the_environment_hold() {
+    let Some(w) = world(PIPELINE, None, true).await else {
+        return;
+    };
+    sqlx::query(
+        "UPDATE runs SET deploy_org = 'acme', deploy_project = 'web',
+         deploy_environment = 'SECRET-ENVIRONMENT', deploy_git_ref = 'refs/heads/main'
+         WHERE id = $1",
+    )
+    .bind(&w.run.0)
+    .execute(&w.tdb.pool)
+    .await
+    .unwrap();
+    let st = state(w.pg.clone(), w.clock.clone()).with_environment_governance(w.pg.clone());
+    let app = broker::router(st);
+    let (_, page) = pending(&app, "acme", &w.prod, "").await;
+    let attempt = attempt_of(&page, "live");
+    let (status, body) = release(&app, &w.run, "live", &w.prod, pass(&attempt)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "the caller's own gate is held: {body}");
+    for step in ["stage", "approve", "ext", "later", "bump", "nope"] {
+        let (status, body) = release(&app, &w.run, step, &w.prod, pass(&attempt)).await;
+        assert!(
+            !body.to_string().contains("SECRET-ENVIRONMENT"),
+            "{step}: leaks the Environment: {status} {body}"
+        );
+        assert_eq!(status, StatusCode::NOT_FOUND, "{step}: {body}");
+    }
+    assert_eq!(status_of(w.pg.as_ref(), &w.run, "live").await, StepStatus::Pending);
     w.tdb.cleanup().await;
 }
 

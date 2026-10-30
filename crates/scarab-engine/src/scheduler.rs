@@ -1199,6 +1199,26 @@ pub enum PluginGateError {
     Db(#[from] DbError),
 }
 
+/// Whether `step` of `run` is a gate of kind `plugin` that `releaser`
+/// (`plugin:<installation>`) releases (ADR-0076 §7). The caller decides
+/// this before any other check on the gate, and answers "no such gate" when
+/// it is false, so a plugin learns nothing about gates that are not its own:
+/// not their kind, state, expiry, library or Environment. The caller checks
+/// the Run's org.
+pub async fn releases_plugin_gate(
+    db: &dyn Db,
+    run: &RunId,
+    step: &StepId,
+    releaser: &str,
+) -> Result<bool, DbError> {
+    let is_plugin_gate = db
+        .steps_of_run(run)
+        .await?
+        .iter()
+        .any(|s| &s.step == step && s.gate_kind.as_deref() == Some("plugin"));
+    Ok(is_plugin_gate && db.gate_releaser(run, step).await?.as_deref() == Some(releaser))
+}
+
 /// Resolve plugin gate `step` of `run` as `releaser` (`plugin:<installation>`)
 /// answering its wait `attempt` (ADR-0076 §7). The machine path: no
 /// approval, no step-up. Taken only when the gate is of kind `plugin`, names
@@ -1224,7 +1244,7 @@ pub async fn resolve_plugin_gate(
     else {
         return Err(PluginGateError::NotFound);
     };
-    if db.gate_releaser(run, step).await?.as_deref() != Some(releaser) {
+    if !releases_plugin_gate(db, run, step, releaser).await? {
         return Err(PluginGateError::NotFound);
     }
     if gate.status != StepStatus::Pending {
