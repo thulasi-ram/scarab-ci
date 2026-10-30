@@ -36,7 +36,13 @@ fn spec(command: Vec<&str>) -> StepSpec {
     }
 }
 
-async fn seed_two_step(db: &InMemoryDb, consumer_cmd: Vec<&str>) -> (RunId, StepId, StepId) {
+/// A run with `producer` and `consumer` (which needs it). The consumer runs
+/// `echo` with `consumer_env`: a value from outside the Pipeline (a result,
+/// a Run parameter) reaches a Step as an env value (ADR-0076, 2026-10-30).
+async fn seed_two_step(
+    db: &InMemoryDb,
+    consumer_env: &[(&str, &str)],
+) -> (RunId, StepId, StepId) {
     let run = RunId("run-1".into());
     let producer = StepId("producer".into());
     let consumer = StepId("consumer".into());
@@ -50,10 +56,15 @@ async fn seed_two_step(db: &InMemoryDb, consumer_cmd: Vec<&str>) -> (RunId, Step
     )
     .await
     .unwrap();
+    let mut consumer_spec = spec(vec!["echo"]);
+    consumer_spec.env = consumer_env
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
     db.create_step_run(
         &run,
         &consumer,
-        Some(&spec(consumer_cmd)),
+        Some(&consumer_spec),
         std::slice::from_ref(&producer),
         Timestamp(0),
     )
@@ -66,7 +77,7 @@ async fn seed_two_step(db: &InMemoryDb, consumer_cmd: Vec<&str>) -> (RunId, Step
 async fn a_named_result_flows_into_a_downstream_interpolation() {
     let db = InMemoryDb::new();
     let (run, producer, consumer) =
-        seed_two_step(&db, vec!["echo", "${{ outputs.producer.url }}"]).await;
+        seed_two_step(&db, &[("URL", "${{ outputs.producer.url }}")]).await;
     let _ = &consumer;
 
     let clock = FakeClock::new(1_000);
@@ -96,12 +107,12 @@ async fn a_named_result_flows_into_a_downstream_interpolation() {
             .unwrap(),
         &serde_json::json!("https://svc.example")
     );
-    // The consumer launched with the resolved command — the value flowed.
+    // The consumer launched with the resolved env — the value flowed.
     let handle = ExecHandle("fake://run-1/consumer/a1".into());
     let launched = exec.launched_spec(&handle).expect("consumer launched");
     assert_eq!(
-        launched.command,
-        vec!["echo".to_string(), "https://svc.example".to_string()],
+        launched.env,
+        [("URL".to_string(), "https://svc.example".to_string())],
         "reference resolved at launch, not left literal"
     );
 }
@@ -158,7 +169,7 @@ async fn a_matrix_coordinate_resolves_at_launch() {
 async fn a_missing_result_fails_the_consumer_fast() {
     let db = InMemoryDb::new();
     let (run, _producer, consumer) =
-        seed_two_step(&db, vec!["echo", "${{ outputs.producer.url }}"]).await;
+        seed_two_step(&db, &[("URL", "${{ outputs.producer.url }}")]).await;
 
     let clock = FakeClock::new(1_000);
     let exec = FakeExecutor::new();
@@ -207,7 +218,8 @@ async fn a_missing_result_fails_the_consumer_fast() {
 /// loads with no scope and renders as it always did: `inputs` are the Run's
 /// launch parameters, `outputs` the results of its direct needs, `matrix` its
 /// coordinate, and every Run parameter reaches it as `SCARAB_PARAM_*`, before
-/// its own env.
+/// its own env. The Run's stored IR declares the parameters' types, which
+/// decide that a `choice` and a number may be in the command.
 #[tokio::test]
 async fn a_spec_stored_before_scopes_renders_as_before() {
     let db = InMemoryDb::new();
@@ -215,6 +227,19 @@ async fn a_spec_stored_before_scopes_renders_as_before() {
     let producer = StepId("producer".into());
     let consumer = StepId("consumer".into());
     db.create_run(&run, 2, 1, Timestamp(0)).await.unwrap();
+    db.store_run_ir(
+        &run,
+        &serde_json::json!({
+            "ir_version": 2,
+            "interface": { "inputs": [
+                { "name": "region", "type": "choice", "options": ["eu", "us"] },
+                { "name": "n", "type": "number" }
+            ] },
+            "steps": []
+        }),
+    )
+    .await
+    .unwrap();
     db.set_run_params(
         &run,
         &std::collections::BTreeMap::from([
@@ -227,8 +252,8 @@ async fn a_spec_stored_before_scopes_renders_as_before() {
     // The JSON a server before ADR-0076 stored for the consumer.
     let old: StepSpec = serde_json::from_value(serde_json::json!({
         "image": "busybox:${{ matrix.v }}",
-        "command": ["echo", "${{ inputs.region }}", "${{ outputs.producer.url }}", "${{ inputs.n > 80 }}"],
-        "env": [["OWN", "${{ inputs.region }}-x"]],
+        "command": ["echo", "${{ inputs.region }}", "${{ inputs.n > 80 }}"],
+        "env": [["OWN", "${{ inputs.region }}-x"], ["URL", "${{ outputs.producer.url }}"]],
         "matrix_values": { "v": "1.36" }
     }))
     .unwrap();
@@ -269,19 +294,82 @@ async fn a_spec_stored_before_scopes_renders_as_before() {
         .launched_spec(&ExecHandle("fake://run-old/consumer/a1".into()))
         .expect("consumer launched");
     assert_eq!(launched.image, "busybox:1.36");
-    assert_eq!(launched.command, ["echo", "eu", "https://u", "true"]);
+    assert_eq!(launched.command, ["echo", "eu", "true"]);
     assert_eq!(
         launched.env,
         [
             ("SCARAB_PARAM_N".to_string(), "90".to_string()),
             ("SCARAB_PARAM_REGION".to_string(), "eu".to_string()),
             ("OWN".to_string(), "eu-x".to_string()),
+            ("URL".to_string(), "https://u".to_string()),
         ]
     );
 }
 
+/// The command boundary at launch (ADR-0076, 2026-10-30), for a Step the
+/// compiler never checked (a raw IR, a spec stored earlier): free text from
+/// outside in its command fails the Step as a config failure and nothing
+/// launches. The type comes from the Run's stored IR; with no IR, no launch
+/// parameter is of a fixed type.
+#[tokio::test]
+async fn free_text_from_outside_in_a_command_fails_the_step_at_launch() {
+    for ir in [
+        Some(serde_json::json!({
+            "ir_version": 2,
+            "interface": { "inputs": [{ "name": "p", "type": "string" }] },
+            "steps": []
+        })),
+        None,
+    ] {
+        let db = InMemoryDb::new();
+        let run = RunId("run-raw".into());
+        let step = StepId("s".into());
+        db.create_run(&run, 2, 1, Timestamp(0)).await.unwrap();
+        if let Some(ir) = &ir {
+            db.store_run_ir(&run, ir).await.unwrap();
+        }
+        db.set_run_params(
+            &run,
+            &std::collections::BTreeMap::from([(
+                "p".to_string(),
+                serde_json::json!("--upload-pack=touch /tmp/pwned"),
+            )]),
+        )
+        .await
+        .unwrap();
+        let spec = spec(vec!["git", "fetch", "origin", "${{ inputs.p }}"]);
+        db.create_step_run(&run, &step, Some(&spec), &[], Timestamp(0))
+            .await
+            .unwrap();
+        let clock = FakeClock::new(1_000);
+        let exec = FakeExecutor::new();
+        exec.script_outcome(ExecState::Succeeded);
+        let sched = Scheduler::new(&db, &clock, &exec, "scheduler-1");
+        for _ in 0..4 {
+            sched.tick(&run).await.expect("tick");
+        }
+        assert!(
+            exec.launched_spec(&ExecHandle("fake://run-raw/s/a1".into()))
+                .is_none(),
+            "{ir:?}"
+        );
+        let s = db.steps_of_run(&run).await.unwrap().remove(0);
+        assert_eq!(s.status, StepStatus::Failed, "{ir:?}");
+        let last = s.attempts.last().unwrap();
+        assert_eq!(last.failure, Some(scarab_engine::FailureKind::Config));
+        assert!(
+            last.failure_detail
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("`command[3]`: `${{ inputs.p }}` reads a value from outside"),
+            "{ir:?}: {:?}",
+            last.failure_detail
+        );
+    }
+}
+
 /// Render once (ADR-0076): a Run parameter and an upstream result that hold
-/// `${{ … }}` reach the Step as text — in its command and in its
+/// `${{ … }}` reach the Step as text — in its env and in its
 /// `SCARAB_PARAM_*` — and are never rendered a second time. Before scopes,
 /// the parameters were added to env before rendering, so a parameter holding
 /// a template was rendered.
@@ -290,7 +378,7 @@ async fn a_parameter_or_result_holding_a_template_stays_text() {
     let db = InMemoryDb::new();
     let (run, _producer, consumer) = seed_two_step(
         &db,
-        vec!["echo", "${{ inputs.p }}", "${{ outputs.producer.v }}"],
+        &[("P", "${{ inputs.p }}"), ("V", "${{ outputs.producer.v }}")],
     )
     .await;
     db.set_run_params(
@@ -323,15 +411,15 @@ async fn a_parameter_or_result_holding_a_template_stays_text() {
         .launched_spec(&ExecHandle("fake://run-1/consumer/a1".into()))
         .expect("consumer launched");
     assert_eq!(
-        launched.command,
-        ["echo", "${{ outputs.producer.secret }}", "${{ inputs.p }}"]
-    );
-    assert_eq!(
         launched.env,
-        [(
-            "SCARAB_PARAM_P".to_string(),
-            "${{ outputs.producer.secret }}".to_string()
-        )]
+        [
+            (
+                "SCARAB_PARAM_P".to_string(),
+                "${{ outputs.producer.secret }}".to_string()
+            ),
+            ("P".to_string(), "${{ outputs.producer.secret }}".to_string()),
+            ("V".to_string(), "${{ inputs.p }}".to_string()),
+        ]
     );
 }
 

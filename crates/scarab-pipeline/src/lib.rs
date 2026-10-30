@@ -19,7 +19,6 @@
 //! `when:` guards are kept as raw CEL strings; binding/evaluation of CEL lives in
 //! the [`cel`] submodule and is wired up by a later slice.
 
-mod argv;
 pub mod cel;
 pub mod oci;
 pub mod params;
@@ -3776,12 +3775,14 @@ fn script_templates(ir: &PipelineIr) -> Vec<(Severity, String)> {
         if spans.is_empty() {
             continue;
         }
-        let sources = scope::InputSources::of(step.scope.as_ref());
+        let sources = scope::InputSources::of(step.scope.as_ref(), &ir.interface.inputs);
         let each: Vec<(ValueSource, &str)> = spans
             .iter()
             .map(|i| {
                 (
-                    sources.of_expr(script[i.inner.clone()].trim()),
+                    sources
+                        .of_expr(script[i.inner.clone()].trim())
+                        .value_source(),
                     &script[i.outer.clone()],
                 )
             })
@@ -3821,6 +3822,87 @@ fn script_templates(ir: &PipelineIr) -> Vec<(Severity, String)> {
         }
     }
     found
+}
+
+/// Each `${{ … }}` in a Step's `command` that reads free text from outside
+/// the Pipeline (ADR-0076, 2026-10-30): a value that is not a `choice`,
+/// boolean or number input. The launch refuses it (see [`render`]); this
+/// says so when the Pipeline compiles, naming the Step and the argument, and
+/// for a library Step, the library and the caller's `with:` that binds the
+/// input. One finding per template and caller, however many matrix legs or
+/// Steps share it.
+fn command_values(ir: &PipelineIr) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    let mut seen: BTreeSet<(String, usize, String)> = BTreeSet::new();
+    for step in &ir.steps {
+        if step.command.iter().all(|c| !c.contains("${{")) {
+            continue;
+        }
+        let sources = scope::InputSources::of(step.scope.as_ref(), &ir.interface.inputs);
+        for (index, arg) in step.command.iter().enumerate() {
+            let (spans, _) = cel::scan_interpolations(arg);
+            for i in spans {
+                let expr = arg[i.inner.clone()].trim();
+                if sources.of_expr(expr) != scope::Source::Free {
+                    continue;
+                }
+                let shown = &arg[i.outer.clone()];
+                // For a library Step: the input the caller binds to free text.
+                let bound = step.scope.as_ref().and_then(|sc| {
+                    let ScopeInputs::Bound(bindings) = &sc.inputs else {
+                        return None;
+                    };
+                    cel::reads(expr).ok()?.into_iter().find_map(|r| {
+                        let name = r.first.filter(|_| r.var == "inputs")?;
+                        match &bindings.get(&name)?.value {
+                            BoundValue::Template(t) if sources.input(&name) == scope::Source::Free => {
+                                Some((name, t.clone()))
+                            }
+                            _ => None,
+                        }
+                    })
+                });
+                let (at, caller) = match (&bound, step.origin.last()) {
+                    (Some((name, template)), Some(lib)) => {
+                        let (invoke, own) = step.id.rsplit_once('/').unwrap_or(("", &step.id));
+                        (
+                            format!("library `{}`, step `{own}`", lib.name),
+                            format!(
+                                ", which step `{invoke}` binds with `with.{name}: {template}`",
+                            ),
+                        )
+                    }
+                    _ => (format!("step `{}`", step.id), String::new()),
+                };
+                // Matrix legs share a finding: the key leaves out each `[…]`.
+                if !seen.insert((without_legs(&at) + &caller, index, shown.to_string())) {
+                    continue;
+                }
+                found.push(format!(
+                    "{at}: `command[{index}]` reads `{shown}`{caller}, a value from outside the \
+                     Pipeline that is not a `choice`, boolean or number; Scarab puts no such \
+                     value into a command. Pass it in `env:` (`env: [[VALUE, \"{shown}\"]]`) \
+                     and read it from the environment (`\"$VALUE\"` in a shell script)"
+                ));
+            }
+        }
+    }
+    found
+}
+
+/// `text` without its `[…]` parts: a matrix leg's id as its Step's.
+fn without_legs(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut depth = 0usize;
+    for c in text.chars() {
+        match c {
+            '[' => depth += 1,
+            ']' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Validate one step's [`CacheSpec`] (ADR-0065 s1). All diagnostics are
@@ -4478,6 +4560,8 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
             .filter(|(severity, _)| *severity == Severity::Error)
             .map(|(_, finding)| finding),
     );
+    // Free text from outside in a `command` (ADR-0076, 2026-10-30).
+    diagnostics.extend(command_values(ir));
 
     // Cycle detection over needs edges (Kahn's algorithm). Only run when the
     // graph is well-formed enough to be meaningful (no dangling edges).
@@ -6146,34 +6230,20 @@ mod tests {
     ) -> Result<Rendered, String> {
         let params: BTreeMap<String, serde_json::Value> = serde_json::from_value(params).unwrap();
         let results: Results = serde_json::from_value(results).unwrap();
-        // A probe whose `command` is a list of values renders them as the
-        // arguments of `echo`, left out of the result: a value from outside
-        // may not name the program.
-        let probe = step.command.first().is_some_and(|c| c.starts_with("${{"));
-        let command: Vec<String> = probe
-            .then(|| "echo".to_string())
-            .into_iter()
-            .chain(step.command.iter().cloned())
-            .collect();
         render(
             Templates {
                 image: &step.image,
-                command: &command,
+                command: &step.command,
                 env: &step.env,
             },
             step.scope.as_ref(),
             &step.matrix_values,
             Facts::Launch {
                 params: &params,
+                declared: &[],
                 results: &results,
             },
         )
-        .map(|mut r| {
-            if probe {
-                r.command.remove(0);
-            }
-            r
-        })
     }
 
     #[test]
@@ -6209,7 +6279,7 @@ mod tests {
             interface:
               inputs: [{ name: region, type: string }]
             steps:
-              - { id: top, image: busybox, command: ["${{ inputs.region }}"] }
+              - { id: top, image: busybox, env: [[R, "${{ inputs.region }}"]] }
               - { id: d, invoke: file:.scarab/lib/outer.yaml, with: { region: eu } }
             "#,
             &libs(&[
@@ -6225,8 +6295,8 @@ mod tests {
         assert_eq!(top.scope, None);
         let run = json!({ "region": "RUN" });
         assert_eq!(
-            launch(top, run.clone(), json!({})).unwrap().command,
-            ["RUN"]
+            launch(top, run.clone(), json!({})).unwrap().env.last(),
+            Some(&("R".to_string(), "RUN".to_string()))
         );
 
         // Nothing is pasted: the library's text is as written.
@@ -6303,7 +6373,7 @@ mod tests {
               inputs: [{ name: image, type: string }]
             steps:
               - { id: run, image: "${{ inputs.image }}" }
-              - { id: tag, image: "busybox", needs: [run], command: ["${{ inputs.image + ':1' }}"] }
+              - { id: tag, image: "busybox", needs: [run], env: [[T, "${{ inputs.image + ':1' }}"]] }
         "#;
         let ir = compile_with(
             r#"
@@ -6333,8 +6403,8 @@ mod tests {
         let tag = ir.steps.iter().find(|s| s.id == "deploy/tag").unwrap();
         assert!(tag.needs.0.contains(&"build".to_string()));
         assert_eq!(
-            launch(tag, json!({}), results).unwrap().command,
-            ["registry/app@sha256:1:1"]
+            launch(tag, json!({}), results).unwrap().env.last(),
+            Some(&("T".to_string(), "registry/app@sha256:1:1".to_string()))
         );
 
         // Reading the output of an invoke sibling through `with:` needs it.
@@ -6423,7 +6493,7 @@ mod tests {
                     r#"
                 interface: { inputs: [{ name: v, type: string }] }
                 steps:
-                  - { id: a, image: busybox, command: ["${{ inputs.v }}"] }
+                  - { id: a, image: busybox, env: [[V, "${{ inputs.v }}"]] }
                   - id: n
                     invoke: file:m.yaml
                     with: { w: "${{ inputs.v }}" }
@@ -6433,7 +6503,7 @@ mod tests {
                     "m.yaml",
                     r#"
                 interface: { inputs: [{ name: w, type: string }] }
-                steps: [{ id: b, image: busybox, command: ["${{ inputs.w }}"] }]
+                steps: [{ id: b, image: busybox, env: [[V, "${{ inputs.w }}"]] }]
                 "#,
                 ),
             ]),
@@ -6441,8 +6511,76 @@ mod tests {
         for id in ["c/a", "c/n/b"] {
             let s = ir.steps.iter().find(|s| s.id == id).unwrap();
             let r = launch(s, json!({ "p": "RUN-P", "v": "NO", "w": "NO" }), json!({}));
-            assert_eq!(r.unwrap().command, ["RUN-P"], "{id}");
+            assert_eq!(
+                r.unwrap().env.last(),
+                Some(&("V".to_string(), "RUN-P".to_string())),
+                "{id}"
+            );
         }
+    }
+
+    /// The command boundary at compile (ADR-0076, 2026-10-30): free text
+    /// from outside in a `command` is an error naming the Step and the
+    /// argument; for a library Step, the library and the caller's `with:`.
+    /// A listed `choice`, a boolean, a number and the Pipeline's own values
+    /// compile.
+    #[test]
+    fn free_text_from_outside_in_a_command_is_a_compile_error() {
+        let pipeline = |command: &str| {
+            format!(
+                "interface: {{ inputs: [{{ name: ref, type: string }}, {{ name: region, type: choice, options: [eu, us] }}, {{ name: n, type: number }}, {{ name: b, type: boolean }}] }}\n\
+                 steps:\n  - {{ id: build, image: busybox, results: [url] }}\n  \
+                 - {{ id: s, image: busybox, needs: [build], command: {command}, matrix: {{ dimensions: {{ x: [one, two] }} }} }}"
+            )
+        };
+        for (command, at, shown) in [
+            (r#"[git, checkout, "${{ inputs.ref }}"]"#, 2, "${{ inputs.ref }}"),
+            (r#"[deploy, "--ref=${{ inputs.ref }}"]"#, 1, "${{ inputs.ref }}"),
+            (r#"[echo, "${{ outputs.build.url }}"]"#, 1, "${{ outputs.build.url }}"),
+            (r#"[echo, "${{ size(inputs.ref) }}"]"#, 1, "${{ size(inputs.ref) }}"),
+        ] {
+            let errs = errors(&pipeline(command));
+            let found: Vec<&String> = errs.iter().filter(|e| e.contains("`command[")).collect();
+            // One finding for both matrix legs.
+            assert_eq!(found.len(), 1, "{command}: {errs:?}");
+            assert!(
+                found[0].starts_with("step `s[x=one]`: ")
+                    && found[0].contains(&format!(
+                        "`command[{at}]` reads `{shown}`, a value from outside"
+                    ))
+                    && found[0].contains("Pass it in `env:`"),
+                "{command}: {errs:?}"
+            );
+        }
+        compile(&pipeline(
+            r#"[deploy, "${{ inputs.region }}", "n=${{ inputs.n }}", "${{ inputs.b }}", "${{ inputs.n > 80 }}", "${{ matrix.x }}"], env: [[REF, "${{ inputs.ref }}"]]"#,
+        ));
+
+        // A library: whether it compiles depends on what its caller binds.
+        let lib = r#"
+            kind: library
+            interface: { inputs: [{ name: v, type: string }, { name: k, type: number }] }
+            steps: [{ id: a, image: busybox, command: [tool, "${{ inputs.v }}", "${{ inputs.k }}"] }]
+        "#;
+        let files = libs(&[("l.yaml", lib)]);
+        let caller = |with: &str| {
+            format!(
+                "interface: {{ inputs: [{{ name: ref, type: string }}, {{ name: n, type: number }}] }}\n\
+                 steps: [{{ id: c, invoke: file:l.yaml, with: {with} }}]"
+            )
+        };
+        let errs = errors_with(&caller(r#"{ v: "${{ inputs.ref }}", k: "${{ inputs.n }}" }"#), &files);
+        assert_eq!(
+            errs.iter().filter(|e| e.contains("`command[")).collect::<Vec<_>>(),
+            [&"library `l.yaml`, step `a`: `command[1]` reads `${{ inputs.v }}`, which step `c` \
+               binds with `with.v: ${{ inputs.ref }}`, a value from outside the Pipeline that is \
+               not a `choice`, boolean or number; Scarab puts no such value into a command. Pass \
+               it in `env:` (`env: [[VALUE, \"${{ inputs.v }}\"]]`) and read it from the \
+               environment (`\"$VALUE\"` in a shell script)"
+                .to_string()],
+        );
+        // A literal `with:`, or a caller's number: compiles.
+        compile_with(&caller(r#"{ v: main, k: "${{ inputs.n }}" }"#), &files);
     }
 
     #[test]
@@ -6589,16 +6727,16 @@ mod tests {
         }
         // Not a script, a script file, a script with no template, a module.
         for command in [
-            r#"[echo, "${{ inputs.p }}"]"#,
-            r#"[sh, script.sh, "${{ inputs.p }}"]"#,
-            r#"[sh, -c, "echo \"$VALUE\"", sh, "${{ inputs.p }}"]"#,
+            r#"[echo, "${{ matrix.x }}"]"#,
+            r#"[sh, script.sh, "${{ matrix.x }}"]"#,
+            r#"[sh, -c, "echo \"$VALUE\"", sh, "${{ matrix.x }}"]"#,
             r#"[sh, -e]"#,
             r#"[sh, -c]"#,
-            r#"[python, -m, "${{ inputs.p }}"]"#,
-            r#"[python, script.py, -c, "${{ inputs.p }}"]"#,
-            r#"[node, --, "${{ inputs.p }}"]"#,
-            r#"[perl, -pi, "${{ inputs.p }}"]"#,
-            r#"[env, "${{ inputs.p }}"]"#,
+            r#"[python, -m, "${{ matrix.x }}"]"#,
+            r#"[python, script.py, -c, "${{ matrix.x }}"]"#,
+            r#"[node, --, "${{ matrix.x }}"]"#,
+            r#"[perl, -pi, "${{ matrix.x }}"]"#,
+            r#"[env, "${{ matrix.x }}"]"#,
         ] {
             let ir = compile(&yaml(command));
             assert!(
@@ -7118,7 +7256,7 @@ mod tests {
               - id: deploy
                 invoke: file:.scarab/lib/deploy.yaml
                 with: { region: us-east-1, replicas: "3" }
-              - { id: notify, image: busybox, command: ["echo", "${{ outputs.deploy.url }}"], needs: [deploy] }
+              - { id: notify, image: busybox, env: [[URL, "${{ outputs.deploy.url }}"]], needs: [deploy] }
             "#,
             &libs(&[(".scarab/lib/deploy.yaml", IFACE_LIB)]),
         );
@@ -7135,7 +7273,7 @@ mod tests {
         // The output reference is kept as written (ADR-0076): the reading
         // Step's scope names the backing Step, which it needs.
         let notify = ir.steps.iter().find(|s| s.id == "notify").unwrap();
-        assert_eq!(notify.command[1], "${{ outputs.deploy.url }}");
+        assert_eq!(notify.env[0].1, "${{ outputs.deploy.url }}");
         assert!(notify.needs.0.contains(&"deploy/url".to_string()));
         let r = launch(
             notify,
@@ -7143,7 +7281,10 @@ mod tests {
             json!({ "deploy/url": { "url": "https://svc" }, "deploy/plan": { "url": "no" } }),
         )
         .unwrap();
-        assert_eq!(r.command, ["echo", "https://svc"]);
+        assert_eq!(
+            r.env.last(),
+            Some(&("URL".to_string(), "https://svc".to_string()))
+        );
     }
 
     #[test]
@@ -7244,8 +7385,11 @@ mod tests {
             .steps
             .pop()
             .unwrap();
-        spec.command = vec!["post".into(), r#"${{ outputs["deploy/url"].url }}"#.into()];
-        spec.env = vec![("TARGET".into(), "${{ matrix.region }}".into())];
+        spec.command = vec!["post".into(), "${{ matrix.region }}".into()];
+        spec.env = vec![
+            ("TARGET".into(), "${{ matrix.region }}".into()),
+            ("URL".into(), r#"${{ outputs["deploy/url"].url }}"#.into()),
+        ];
         spec.matrix_values = BTreeMap::from([("region".into(), "us-east-1".into())]);
 
         let out = launch(
@@ -7254,8 +7398,9 @@ mod tests {
             json!({ "deploy/url": { "url": "https://svc.example" } }),
         )
         .unwrap();
-        assert_eq!(out.command[1], "https://svc.example");
+        assert_eq!(out.command[1], "us-east-1");
         assert_eq!(out.env[0].1, "us-east-1");
+        assert_eq!(out.env[1].1, "https://svc.example");
 
         // Fail-fast: an unbound reference is a hard error, never empty.
         assert!(launch(&spec, json!({}), json!({})).is_err());
@@ -8502,8 +8647,8 @@ mod tests {
               - id: wait
                 image: argoproj/argocd
                 needs: [bump]
-                command: ["argocd", "app", "wait", "--image", "${{ outputs.bump.images }}"]
-                env: [[V, "${{ outputs.bump.version }}"]]
+                command: ["argocd", "app", "wait"]
+                env: [[I, "${{ outputs.bump.images }}"], [V, "${{ outputs.bump.version }}"]]
             "#,
         );
     }
@@ -8536,7 +8681,7 @@ mod tests {
             r#"
             steps:
               - { id: bump, image: busybox }
-              - { id: wait, image: busybox, needs: [bump], command: ["${{ outputs.bump.anything }}"] }
+              - { id: wait, image: busybox, needs: [bump], env: [[A, "${{ outputs.bump.anything }}"]] }
             "#,
         );
     }
@@ -8554,7 +8699,7 @@ mod tests {
         let caller = r#"
             steps:
               - { id: deploy, invoke: file:.scarab/lib/deploy.yaml }
-              - { id: wait, image: busybox, needs: [deploy], command: ["${{ outputs.deploy.images }}"] }
+              - { id: wait, image: busybox, needs: [deploy], env: [[I, "${{ outputs.deploy.images }}"]] }
             "#;
         let ds = errors_with(
             caller,
