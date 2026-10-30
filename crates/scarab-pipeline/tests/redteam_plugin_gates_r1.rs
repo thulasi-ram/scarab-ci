@@ -167,7 +167,6 @@ fn an_expiry_is_positive_and_fits() {
 /// gate itself is refused at compile, or fails the gate when it renders at
 /// the wait: it never renders to a value.
 #[test]
-#[ignore = "red: s4 r1"]
 fn inputs_cannot_read_secrets_or_a_downstream_step() {
     let mut compiled = Vec::new();
     let mut leaked = Vec::new();
@@ -210,6 +209,24 @@ steps:
     }
     eprintln!("compiled (refused only at the wait unless listed below): {compiled:?}");
     assert!(leaked.is_empty(), "compiled AND rendered: {leaked:?}");
+}
+
+/// The refusals above come at compile, each saying why.
+#[test]
+fn inputs_that_read_a_secret_env_or_an_undeclared_result_are_refused_at_compile() {
+    for (with, want) in [
+        (r#"{ app: "${{ secrets.ARGO_TOKEN }}", image: x }"#, "reads `secrets`"),
+        (r#"{ app: "x-${{ env.HOME }}", image: x }"#, "reads `env`"),
+        (r#"{ app: "${{ outputs.bump.nope }}", image: x }"#, "does not declare"),
+    ] {
+        let yaml = format!(
+            "steps:\n  - {{ id: bump, image: alpine, results: [image] }}\n  - id: live\n    \
+             needs: [bump]\n    invoke: plugin:argocd-prod/wait-live\n    with: {with}\n    \
+             gate_expires_after: 600\n"
+        );
+        let errs = refused(&yaml);
+        assert!(errs.iter().any(|e| e.contains(want)), "{with}: {errs:?}");
+    }
 }
 
 // ------------------------------------------------------ outputs downstream

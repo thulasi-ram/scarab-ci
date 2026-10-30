@@ -3033,6 +3033,25 @@ fn plugin_gate_nodes(
         before,
         diagnostics,
     );
+    // A plugin gate's inputs are sent to the plugin: a secret or the
+    // server's environment never renders into them. Refused here rather
+    // than when the gate is reached.
+    for (name, raw) in &step.with {
+        for i in cel::scan_interpolations(raw).0 {
+            let Ok(reads) = cel::reads(raw[i.inner].trim()) else {
+                continue;
+            };
+            for var in ["secrets", "env"] {
+                if reads.iter().any(|r| r.var == var) {
+                    diagnostics.push(format!(
+                        "step `{}`: `with.{name}` reads `{var}`; the inputs of {what} are sent \
+                         to the plugin, so they cannot read `{var}`",
+                        step.id
+                    ));
+                }
+            }
+        }
+    }
     if let (Some((l, _)), Some(When(w))) = (level.library, &step.when) {
         let mut errors = Vec::new();
         check_reads(
@@ -4782,7 +4801,29 @@ fn validate_output_reads(ir: &PipelineIr, diagnostics: &mut Vec<String>) {
         return;
     }
     for t in &ir.steps {
-        for text in interpolatable_strings(t) {
+        // The templates written on `t`, with the `outputs` view they read
+        // through (`None`: Step ids as written).
+        let mut written: Vec<(&str, Option<&BTreeMap<String, OutputSource>>)> =
+            interpolatable_strings(t)
+                .into_iter()
+                .map(|text| (text, t.scope.as_ref().map(|s| &s.outputs)))
+                .collect();
+        // A plugin gate's `with:` templates are kept as its input bindings
+        // and render in the invoke step's scope when the gate is reached.
+        if t.plugin_gate.is_some() {
+            if let Some(scope) = &t.scope {
+                if let (ScopeInputs::Bound(bindings), Some(caller)) =
+                    (&scope.inputs, &scope.caller)
+                {
+                    for b in bindings.values() {
+                        if let BoundValue::Template(text) = &b.value {
+                            written.push((text.as_str(), Some(&caller.outputs)));
+                        }
+                    }
+                }
+            }
+        }
+        for (text, view) in written {
             for i in cel::scan_interpolations(text).0 {
                 let Ok(reads) = cel::reads(text[i.inner].trim()) else {
                     continue;
@@ -4791,9 +4832,9 @@ fn validate_output_reads(ir: &PipelineIr, diagnostics: &mut Vec<String>) {
                     let (Some(name), Some(field)) = (r.first, r.second) else {
                         continue;
                     };
-                    let step = match &t.scope {
+                    let step = match view {
                         None => name.clone(),
-                        Some(scope) => match scope.outputs.get(&name) {
+                        Some(outputs) => match outputs.get(&name) {
                             Some(OutputSource::Step(id)) => id.clone(),
                             Some(OutputSource::Invoke(exposed)) => match exposed.get(&field) {
                                 Some(id) => id.clone(),
