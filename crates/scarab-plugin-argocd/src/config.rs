@@ -2,7 +2,9 @@
 //!
 //! Core sets two variables on a Plugin Pod (ADR-0072 §9, slice d2's
 //! `plugin_env`), last, so no config value can re-aim them:
-//! `SCARAB_BROKER_URL` and `SCARAB_BROKER_TOKEN_FILE`.
+//! `SCARAB_BROKER_URL` and `SCARAB_BROKER_TOKEN_FILE`. An installation
+//! approved to resolve gates also gets `SCARAB_API_TOKEN_FILE` (ADR-0076 §7):
+//! with it, the plugin answers its `wait-live` gates.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -18,6 +20,10 @@ pub struct Config {
     pub token_file: PathBuf,
     /// How often the plugin checks it can still reach the broker and Argo CD.
     pub check_interval: Duration,
+    /// The `scarab-api` token file, when the installation resolves gates.
+    pub api_token_file: Option<PathBuf>,
+    /// How often the plugin asks for its open gate waits.
+    pub gate_interval: Duration,
     /// Every request.
     pub request_timeout: Duration,
 }
@@ -29,6 +35,8 @@ impl Config {
             broker_url: broker_url.into(),
             token_file: token_file.into(),
             check_interval: Duration::from_secs(60),
+            api_token_file: None,
+            gate_interval: Duration::from_secs(15),
             request_timeout: Duration::from_secs(30),
         }
     }
@@ -52,7 +60,9 @@ impl Config {
         }
         let token_file =
             set("SCARAB_BROKER_TOKEN_FILE").unwrap_or_else(|| DEFAULT_TOKEN_FILE.into());
-        Ok(Self::new(broker_url, token_file))
+        let mut cfg = Self::new(broker_url, token_file);
+        cfg.api_token_file = set("SCARAB_API_TOKEN_FILE").map(PathBuf::from);
+        Ok(cfg)
     }
 }
 
@@ -75,5 +85,15 @@ mod tests {
         let cfg =
             Config::from_lookup(env(&[("SCARAB_BROKER_URL", "http://10.0.0.1:8090")])).unwrap();
         assert_eq!(cfg.token_file, PathBuf::from(DEFAULT_TOKEN_FILE));
+        assert_eq!(cfg.api_token_file, None);
+        let cfg = Config::from_lookup(env(&[
+            ("SCARAB_BROKER_URL", "http://10.0.0.1:8090"),
+            ("SCARAB_API_TOKEN_FILE", "/var/run/secrets/scarab/broker/api-token"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            cfg.api_token_file,
+            Some(PathBuf::from("/var/run/secrets/scarab/broker/api-token"))
+        );
     }
 }
