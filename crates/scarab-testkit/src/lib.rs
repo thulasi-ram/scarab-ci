@@ -2937,11 +2937,19 @@ pub struct FakeForge {
     /// = an adapter that cannot enumerate (`Unsupported`); `Err` = a listing
     /// that failed part-way, which an import must not prune on.
     collaborators: Mutex<Option<Result<Vec<scarab_forge::Collaborator>, String>>>,
+    /// How many checkout credentials [`mint_checkout_credential`](ForgePort::mint_checkout_credential)
+    /// has handed out — lets a test assert a refused launch minted nothing.
+    checkout_mints: Mutex<u32>,
 }
 
 impl FakeForge {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// How many checkout credentials this forge has minted.
+    pub fn checkout_credentials_minted(&self) -> u32 {
+        *self.checkout_mints.lock().unwrap()
     }
 
     /// Seed the repo's collaborators as `(numeric id, login, level)` with
@@ -3402,6 +3410,7 @@ impl ForgePort for FakeForge {
     ) -> Result<CheckoutCredential, ForgeError> {
         // Deterministic fake credential: scoped to the repo, short TTL,
         // read-only honored verbatim (the contract forbids widening it).
+        *self.checkout_mints.lock().unwrap() += 1;
         Ok(CheckoutCredential {
             username: "x-access-token".into(),
             token: format!("fake-token-{}-{}", repo.owner, repo.name),

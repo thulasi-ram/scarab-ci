@@ -154,7 +154,7 @@ async fn dispatch_manual_pins_resolved_sha_and_freezes_and_interpolates_params()
     let forge = scarab_testkit::FakeForge::new()
         .with_file(".scarab/ship.yaml", MANUAL_YAML)
         // The dispatch ref resolves to a distinct commit — the run must pin to it.
-        .with_commit("refs/heads/main", "sha-deadbeef");
+        .with_commit("refs/heads/main", "deadbeef");
     let db = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
 
@@ -206,7 +206,7 @@ async fn dispatch_manual_pins_resolved_sha_and_freezes_and_interpolates_params()
         .expect("a trigger event was recorded");
     assert_eq!(trigger["event"]["kind"], "manual");
     assert_eq!(
-        trigger["event"]["sha"], "sha-deadbeef",
+        trigger["event"]["sha"], "deadbeef",
         "pinned to the resolved sha"
     );
     assert_eq!(
@@ -852,7 +852,7 @@ steps:
 async fn dispatch_interpolates_concurrency_group_into_per_env_slots() {
     let forge = scarab_testkit::FakeForge::new()
         .with_file(".scarab/rollout.yaml", CONCURRENCY_YAML)
-        .with_commit("refs/heads/main", "sha-cafe");
+        .with_commit("refs/heads/main", "cafe0001");
     let db = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
 
@@ -939,7 +939,7 @@ steps:
 async fn governed_deploy_serializes_without_cancelling_the_holder() {
     let forge = scarab_testkit::FakeForge::new()
         .with_file(".scarab/deploy.yaml", GOVERNED_CONCURRENCY_YAML)
-        .with_commit("refs/heads/main", "sha-1");
+        .with_commit("refs/heads/main", "5ba1");
     let db = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
     let envs = Arc::new(migrated(prod_rules(&[], &["refs/heads/main"])));
@@ -1022,7 +1022,7 @@ steps:
 async fn concurrency_group_is_scoped_to_the_owning_project() {
     let forge = scarab_testkit::FakeForge::new()
         .with_file(".scarab/rollout.yaml", LITERAL_GROUP_YAML)
-        .with_commit("refs/heads/main", "sha-1");
+        .with_commit("refs/heads/main", "5ba1");
     let db = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
 
@@ -1083,4 +1083,47 @@ async fn concurrency_group_is_scoped_to_the_owning_project() {
         Some(RunStatus::Pending),
         "the same project's second run still queues behind its slot holder"
     );
+}
+
+/// A dispatch pins the commit the forge resolves the ref to, and that SHA
+/// later reaches `git fetch` in the clone container as an argument. A forge
+/// answer that is not a hex commit SHA (a compromised forge, or a proxy in
+/// front of it) is refused before any run exists.
+#[tokio::test]
+async fn dispatch_refuses_a_resolved_commit_that_is_not_a_hex_sha() {
+    for sha in [
+        "--upload-pack=touch /tmp/pwned;git-upload-pack",
+        "main; id",
+        "HEAD",
+        "",
+    ] {
+        let forge = scarab_testkit::FakeForge::new()
+            .with_file(".scarab/ship.yaml", MANUAL_YAML)
+            .with_commit("refs/heads/main", sha);
+        let db = Arc::new(InMemoryDb::new());
+        let clock = Arc::new(FakeClock::new(1_000));
+
+        let res = dispatch_run(
+            &forge,
+            db.as_ref(),
+            clock.as_ref(),
+            None,
+            "alice".into(),
+            repo(),
+            "refs/heads/main".into(),
+            "ship".into(),
+            std::collections::BTreeMap::from([("region".to_string(), json!("us-east-1"))]),
+            DispatchKind::Manual,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(res, Err(DispatchError::Forge(_))),
+            "a resolved commit of {sha:?} must be refused as a forge error, got {res:?}"
+        );
+        assert!(
+            db.list_runs(100).await.unwrap().is_empty(),
+            "no run created for the resolved commit {sha:?}"
+        );
+    }
 }
