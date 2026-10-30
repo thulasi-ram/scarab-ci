@@ -154,6 +154,34 @@ pub fn cap_trigger_title(raw: &str) -> Option<String> {
     Some(truncate_on_char_boundary(trimmed, TRIGGER_TITLE_MAX))
 }
 
+/// Whether `s` has the shape of a git commit SHA: 4 to 64 lower-case hex
+/// digits (4 is git's shortest abbreviation, 64 a SHA-256 object name).
+///
+/// A Run's pinned commit reaches `git fetch` in the clone container as an
+/// argument, where a value starting with `-` is read as an option
+/// (`--upload-pack=<program>` runs that program). The SHA comes from the
+/// forge, so every place it enters Scarab checks this: webhook
+/// normalization, the dispatch path, and the clone launch.
+pub fn is_commit_sha(s: &str) -> bool {
+    (4..=64).contains(&s.len()) && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Percent-encode `s` as one URL path segment or one query value: every byte
+/// except the RFC 3986 unreserved characters (`A-Z a-z 0-9 - . _ ~`) is
+/// written as `%XX`, `/` included. For a value a caller typed, such as a
+/// dispatch ref, that an adapter puts into a forge API URL.
+pub fn encode_url_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 /// A forge event, normalized across providers into Scarab's own vocabulary.
 ///
 /// Adapters parse a vendor payload into exactly one of these (see

@@ -13,7 +13,7 @@
 # Env contract (set by the engine from the run's trigger context):
 #   SCARAB_CLONE_URL         credential-free https clone URL      (required;
 #                            a non-https URL is cloned without the token)
-#   SCARAB_CLONE_SHA         the pinned commit                    (required)
+#   SCARAB_CLONE_SHA         the pinned commit, 4-64 lower-case hex (required)
 #   SCARAB_CLONE_DEPTH       "1" (default) | "full"
 #   SCARAB_CLONE_SUBMODULES  "true" to fetch submodules recursively
 #   SCARAB_CLONE_LFS         "true" to pull LFS objects
@@ -24,7 +24,21 @@
 set -eu
 
 : "${SCARAB_CLONE_URL:?SCARAB_CLONE_URL is required (a credential-free https URL)}"
-: "${SCARAB_CLONE_SHA:?SCARAB_CLONE_SHA is required (the run's pinned commit)}"
+: "${SCARAB_CLONE_SHA:?SCARAB_CLONE_SHA is required (the pinned commit of the Run)}"
+# The SHA is passed to git as an argument, where a value starting with `-`
+# is read as an option (`--upload-pack=<program>` runs the program). The
+# server checks its shape before the launch; check it again here, before any
+# git command, so the image is safe on its own.
+case "$SCARAB_CLONE_SHA" in
+  *[!0-9a-f]*)
+    echo "scarab-clone: SCARAB_CLONE_SHA is not a lower-case hex commit SHA" >&2
+    exit 2
+    ;;
+esac
+if [ "${#SCARAB_CLONE_SHA}" -lt 4 ] || [ "${#SCARAB_CLONE_SHA}" -gt 64 ]; then
+  echo "scarab-clone: SCARAB_CLONE_SHA is not 4 to 64 hex digits long" >&2
+  exit 2
+fi
 dest="${SCARAB_WORKSPACE:-/workspace}"
 depth="${SCARAB_CLONE_DEPTH:-1}"
 
@@ -61,9 +75,9 @@ if [ "$depth" = "full" ]; then
   # Complete history and all refs (the forensic / git-describe case), plus the
   # pinned SHA explicitly in case it is a detached head (e.g. a PR merge ref).
   git fetch -q origin '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*' || fetch_failed=1
-  git fetch -q origin "$SCARAB_CLONE_SHA" 2>/dev/null || true
+  git fetch -q origin -- "$SCARAB_CLONE_SHA" 2>/dev/null || true
 else
-  git fetch -q --depth 1 origin "$SCARAB_CLONE_SHA" || fetch_failed=1
+  git fetch -q --depth 1 origin -- "$SCARAB_CLONE_SHA" || fetch_failed=1
 fi
 
 if [ "$fetch_failed" -ne 0 ] || ! git cat-file -e "$SCARAB_CLONE_SHA^{commit}" 2>/dev/null; then

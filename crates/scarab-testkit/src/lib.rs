@@ -2902,8 +2902,9 @@ pub struct FakeForge {
     statuses: Mutex<Vec<Status>>,
     comments: Mutex<Vec<(u64, String)>>,
     /// Seeded `ref → resolved sha` mappings for [`latest_commit`](ForgePort::latest_commit).
-    /// A ref with no mapping resolves to itself (identity) — the default that
-    /// keeps ref-agnostic tests simple.
+    /// A ref with no mapping resolves through [`fake_commit_sha`]: itself when
+    /// it is already hex, else a stable SHA derived from it, which keeps
+    /// ref-agnostic tests simple.
     commits: Mutex<HashMap<String, String>>,
     /// A seeded derived registry credential (ADR-0018); `None` (default)
     /// mirrors a forge with no derivable registry.
@@ -3262,6 +3263,28 @@ impl scarab_forge::ForgeConnectionStore for InMemoryDb {
     }
 }
 
+/// What [`FakeForge::latest_commit`] resolves an unseeded ref to: the ref
+/// itself when it is already a commit SHA, else a stable 40-hex SHA derived
+/// from it. A real forge never answers with a branch name, and the dispatch
+/// path refuses a resolved commit that is not hex.
+pub fn fake_commit_sha(r#ref: &str) -> String {
+    if scarab_forge::is_commit_sha(r#ref) {
+        return r#ref.to_string();
+    }
+    // FNV-1a, twice with different offsets, padded to 40 hex digits.
+    let fnv = |seed: u64| {
+        r#ref.bytes().fold(seed, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    };
+    format!(
+        "{:016x}{:016x}{:08x}",
+        fnv(0xcbf2_9ce4_8422_2325),
+        fnv(0x8422_2325_cbf2_9ce4),
+        fnv(0x1234_5678_9abc_def0) as u32
+    )
+}
+
 #[async_trait]
 impl ForgePort for FakeForge {
     async fn latest_commit(&self, _repo: &RepoRef, r#ref: &str) -> Result<Commit, ForgeError> {
@@ -3271,7 +3294,7 @@ impl ForgePort for FakeForge {
             .unwrap()
             .get(r#ref)
             .cloned()
-            .unwrap_or_else(|| r#ref.to_string());
+            .unwrap_or_else(|| fake_commit_sha(r#ref));
         Ok(Commit {
             sha,
             message: String::new(),
