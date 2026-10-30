@@ -480,6 +480,7 @@ pub(crate) fn governed_routes() -> Routes {
         )
         .get("/v1/orgs/{org}/plugin-catalog", plugins::plugin_catalog)
         .get("/v1/orgs/{org}/plugins", plugins::list_plugins)
+        .get("/v1/orgs/{org}/gates", crate::plugin_gates::list_pending_gates)
         .post(
             "/v1/orgs/{org}/plugins",
             &ops::PLUGIN_INSTALL,

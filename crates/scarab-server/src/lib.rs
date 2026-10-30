@@ -76,6 +76,7 @@ pub mod org_environments;
 pub mod plugin_runtime;
 /// ADR-0072: PluginInstallations — the first-party catalog, install,
 /// uninstall and the kill switch.
+pub mod plugin_gates;
 pub mod plugins;
 /// ADR-0075: the Policy API — org Policies, Project typed settings, the
 /// decision logs and the policy test API.
@@ -202,6 +203,10 @@ pub struct AppState {
     /// (slice d2), static dev tokens under `SCARAB_DEV_INSECURE`. `None` makes
     /// every authenticated broker call a 401 — nothing proven, nothing taken.
     pub plugin_tokens: Option<Arc<dyn scarab_plugin::PluginTokenVerifier>>,
+    /// Proves which plugin calls the gate API (ADR-0076 §7): TokenReview for
+    /// the audience `scarab-api` in production, static dev tokens under
+    /// `SCARAB_DEV_INSECURE`. `None`: no plugin can list or resolve a gate.
+    pub plugin_api_tokens: Option<Arc<dyn scarab_plugin::PluginTokenVerifier>>,
     /// Whether installs are on, the plugin namespace, the first-party
     /// catalog's repository and the dev tag knob. Off by default.
     pub plugin_policy: Arc<plugins::PluginPolicy>,
@@ -319,6 +324,7 @@ impl AppState {
             broker_plugins: None,
             broker_journal_queue: broker_proxy::JOURNAL_QUEUE,
             plugin_tokens: None,
+            plugin_api_tokens: None,
             plugin_policy: Arc::new(plugins::PluginPolicy::off()),
             secret_coverage: None,
             oidc: None,
@@ -448,6 +454,7 @@ impl AppState {
             governance: self.environment_governance.as_deref(),
             policies: self.policies.as_deref(),
             libraries: self.libraries.as_deref(),
+            plugins: self.plugins.as_deref(),
             links: self.actor_links(),
             connections: self.connections.as_deref(),
         }
@@ -504,6 +511,15 @@ impl AppState {
         verifier: Arc<dyn scarab_plugin::PluginTokenVerifier>,
     ) -> Self {
         self.plugin_tokens = Some(verifier);
+        self
+    }
+
+    /// Set how plugins calling the gate API are verified (ADR-0076 §7).
+    pub fn with_plugin_api_tokens(
+        mut self,
+        verifier: Arc<dyn scarab_plugin::PluginTokenVerifier>,
+    ) -> Self {
+        self.plugin_api_tokens = Some(verifier);
         self
     }
 
@@ -2126,7 +2142,8 @@ async fn pipeline_interface(
             .map_err(DispatchError::Forge)?
             .sha;
         let (_, yaml) = read_named_pipeline(forge, &repo, &sha, &name).await?;
-        let installed = installed_libraries(st.libraries.as_deref(), &repo.owner)
+        let installed =
+            installed_libraries(st.libraries.as_deref(), st.plugins.as_deref(), &repo.owner)
             .await
             .map_err(DispatchError::Db)?;
         let ir = prefetch_libs_and_compile(forge, &repo, &sha, &yaml, &installed).await?;
@@ -4260,6 +4277,10 @@ pub struct AdmissionPorts<'a> {
     /// against them, and admission refuses a yanked version. `None`: no
     /// `lib:` target resolves, and nothing is checked for yanks.
     pub libraries: Option<&'a dyn scarab_policy::library::LibraryStore>,
+    /// The org's plugin installations (ADR-0076 §7): compiling resolves
+    /// `plugin:<installation>/<gate>` against the gates of those that may
+    /// resolve gates. `None`: no `plugin:` target resolves.
+    pub plugins: Option<&'a dyn scarab_plugin::PluginStore>,
     /// What links a webhook actor to a Principal (ADR-0069) for the
     /// `run.create` input. Unset: a webhook Run has no `principal`.
     pub links: ActorLinks<'a>,
@@ -4338,6 +4359,7 @@ impl<'a> AdmissionPorts<'a> {
             governance,
             policies: None,
             libraries: None,
+            plugins: None,
             links: ActorLinks::default(),
             connections: None,
         }
@@ -4425,7 +4447,7 @@ pub async fn trigger_runs_from_event(
     let kind = event.trigger_kind();
     let mut outcome = TriggerOutcome::default();
     // The org's installed libraries, read once for the whole delivery.
-    let installed = installed_libraries(ports.libraries, &repo.owner)
+    let installed = installed_libraries(ports.libraries, ports.plugins, &repo.owner)
         .await
         .map_err(TriggerError::Db)?;
     for path in &paths {
@@ -4588,7 +4610,7 @@ async fn prefetch_libs_and_compile(
     repo: &scarab_forge::RepoRef,
     read_ref: &str,
     yaml: &str,
-    installed: &std::collections::BTreeMap<String, scarab_pipeline::InstalledLibrary>,
+    installed: &scarab_pipeline::Libraries,
 ) -> Result<scarab_pipeline::PipelineIr, TriggerError> {
     let mut libs = std::collections::BTreeMap::new();
     let mut seen = std::collections::BTreeSet::new();
@@ -4609,8 +4631,7 @@ async fn prefetch_libs_and_compile(
     }
     let libraries = scarab_pipeline::Libraries {
         files: libs,
-        installed: installed.clone(),
-        plugin_gates: Default::default(),
+        ..installed.clone()
     };
     let (ir, warnings) = compile_bounded(yaml.to_string(), libraries)
         .await
@@ -4623,20 +4644,32 @@ async fn prefetch_libs_and_compile(
     Ok(ir)
 }
 
-/// What `lib:` resolves to in `org` (ADR-0076 §4): its installed libraries,
-/// or none when no library store is wired. A store failure is an error, so
-/// a Pipeline is never compiled as if a library were not installed.
+/// What `lib:` and `plugin:` resolve to in `org` (ADR-0076 §4, §7): its
+/// installed libraries, and the gates of its plugin installations that may
+/// resolve gates. `files` is left empty for the caller. A store failure is an
+/// error, so a Pipeline is never compiled as if something were not
+/// installed.
 pub(crate) async fn installed_libraries(
     libraries: Option<&dyn scarab_policy::library::LibraryStore>,
+    plugins: Option<&dyn scarab_plugin::PluginStore>,
     org: &str,
-) -> Result<std::collections::BTreeMap<String, scarab_pipeline::InstalledLibrary>, DbError> {
-    match libraries {
+) -> Result<scarab_pipeline::Libraries, DbError> {
+    let installed = match libraries {
         Some(l) => l
             .installed_for_compile(org)
             .await
-            .map_err(|e| DbError::Other(format!("library store: {e}"))),
-        None => Ok(Default::default()),
-    }
+            .map_err(|e| DbError::Other(format!("library store: {e}")))?,
+        None => Default::default(),
+    };
+    let plugin_gates = match plugins {
+        Some(p) => plugins::gates_for_compile(p, org).await?,
+        None => Default::default(),
+    };
+    Ok(scarab_pipeline::Libraries {
+        files: Default::default(),
+        installed,
+        plugin_gates,
+    })
 }
 
 /// The longest the server waits for one Pipeline compile.
@@ -5597,7 +5630,7 @@ pub async fn dispatch_run(
 
     // Compile at the resolved commit (transitive `invoke:` libraries pre-fetched
     // there) — the shared read-at-ref → compile primitive.
-    let installed = installed_libraries(ports.libraries, &repo.owner)
+    let installed = installed_libraries(ports.libraries, ports.plugins, &repo.owner)
         .await
         .map_err(DispatchError::Db)?;
     let ir = prefetch_libs_and_compile(forge, &repo, &sha, &yaml, &installed).await?;
@@ -5962,6 +5995,11 @@ async fn persist_run_from_ir(
             db.create_step_run(run, &step_id, None, &needs, now).await?;
             let timer = step.gate_after.map(|s| s as i64);
             db.set_step_gate(run, &step_id, kind, timer).await?;
+            // A plugin gate names the installation that releases it
+            // (ADR-0076 §7); nobody else can pass it.
+            if let Some(g) = &step.plugin_gate {
+                db.set_gate_releaser(run, &step_id, &g.releaser()).await?;
+            }
         } else {
             // ADR-0039: admit the step's privilege request against the
             // Project's privilege grant in the target Environment (ADR-0071
@@ -8507,7 +8545,7 @@ impl Default for ExternalGateVerdict {
         ("id" = String, Path, description = "run id"),
         ("step" = String, Path, description = "gate step id")
     ),
-    request_body(content = Option<ExternalGateVerdict>, description = "optional: `{\"passed\": false, \"reason\": \"…\"}` fails the gate instead of releasing it"),
+    request_body(content = Option<ExternalGateVerdict>, description = "external gate (`x-scarab-gate-token`): optional, `{\"passed\": false, \"reason\": \"…\"}` fails the gate instead of releasing it. Plugin gate (a plugin's `scarab-api` bearer token, ADR-0076 §7): a `PluginGateRelease`, `{\"attempt\", \"passed\": true, \"outputs\": {…}}` or `{\"attempt\", \"passed\": false, \"reason\": \"…\"}`"),
     responses(
         (status = 202, description = "gate released (or, with a fail body, failed)"),
         (status = 400, description = "malformed body, or a fail without a 1..1024-byte reason"),
@@ -8522,6 +8560,11 @@ async fn release_gate_external(
     Path((id, step)): Path<(String, String)>,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
+    // A plugin answering one of its own gates (ADR-0076 §7) presents its
+    // `scarab-api` token, never a gate token.
+    if plugin_gates::is_plugin_call(&headers) {
+        return plugin_gates::release(&st, &headers, &id, &step, &body).await;
+    }
     // Token release is opt-in: without a configured secret the endpoint 404s.
     let Some(secret) = st.gate_token_secret.as_ref() else {
         return Err(ApiError::NotFound);
@@ -10717,7 +10760,10 @@ fn tag_for_path(path: &str) -> Option<&'static str> {
     } else if path.contains("/policies") || path.contains("/policy-") {
         // Before Runs: `/v1/runs/{id}/policy-decisions` is a Policy read.
         "Policies"
-    } else if path.contains("/plugins") || path.contains("/plugin-catalog") {
+    } else if path.contains("/plugins")
+        || path.contains("/plugin-catalog")
+        || path == "/v1/orgs/{org}/gates"
+    {
         "Plugins"
     } else if path.contains("/libraries") || path.contains("/library-") {
         "Libraries"
@@ -11064,6 +11110,7 @@ impl utoipa::Modify for StepUpResponses {
         approve_gate,
         reject_gate,
         release_gate_external,
+        plugin_gates::list_pending_gates,
         put_secret,
         list_secrets,
         delete_secret,
@@ -11116,6 +11163,9 @@ impl utoipa::Modify for StepUpResponses {
         PutSecretRequest,
         RejectGateRequest,
         ExternalGateVerdict,
+        plugin_gates::PluginGateRelease,
+        plugin_gates::PendingGateDto,
+        plugin_gates::PendingGatesPage,
         SecretListResponse,
         SecretMatrix,
         SecretMatrixRow,

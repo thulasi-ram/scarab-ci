@@ -1050,7 +1050,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // which has no projected token. Otherwise TokenReview, below, once a
     // cluster is reachable. With neither, every broker call is a 401.
     if !config.plugins.dev_tokens.is_empty() {
-        state = state.with_plugin_tokens(Arc::new(scarab_server::broker::DevPluginTokens::new(
+        let dev = Arc::new(scarab_server::broker::DevPluginTokens::new(
             config.plugins.namespace.clone(),
             config
                 .plugins
@@ -1058,7 +1058,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .iter()
                 .map(|(id, token)| (id.clone(), token.expose().to_string()))
                 .collect(),
-        )));
+        ));
+        // A dev token stands for both audiences: a host-process plugin has
+        // no projected tokens to tell apart.
+        state = state.with_plugin_tokens(dev.clone()).with_plugin_api_tokens(dev);
     }
     // The plugin runtime (ADR-0072 §9): only with SCARAB_PLUGINS=on, in a
     // role that serves the broker, and with a cluster to run Plugins in. The
@@ -1068,9 +1071,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match scarab_plugin_k8s::default_client().await {
             Ok(client) => {
                 if config.plugins.dev_tokens.is_empty() {
-                    state = state.with_plugin_tokens(Arc::new(
-                        scarab_plugin_k8s::TokenReviewVerifier::new(client.clone()),
-                    ));
+                    state = state
+                        .with_plugin_tokens(Arc::new(scarab_plugin_k8s::TokenReviewVerifier::new(
+                            client.clone(),
+                        )))
+                        // The gate API's own verifier (ADR-0076 §7): a broker
+                        // token is not taken there, nor an api token here.
+                        .with_plugin_api_tokens(Arc::new(
+                            scarab_plugin_k8s::TokenReviewVerifier::for_audience(
+                                client.clone(),
+                                scarab_plugin::API_TOKEN_AUDIENCE,
+                            ),
+                        ));
                     tracing::info!(
                         "plugin broker tokens: TokenReview (audience {})",
                         scarab_plugin::BROKER_TOKEN_AUDIENCE

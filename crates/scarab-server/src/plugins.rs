@@ -103,8 +103,8 @@ fn first_party_catalog(policy: &PluginPolicy) -> Vec<CatalogEntry> {
     vec![CatalogEntry {
         manifest: argocd.clone(),
         repository: policy.argocd_repo.clone(),
-        description: "Reads Argo CD Applications through the CredentialBroker \
-                      (first-party).",
+        description: "Reads Argo CD Applications through the CredentialBroker and \
+                      resolves the `wait-live` gate (first-party).",
     }]
 }
 
@@ -163,6 +163,36 @@ fn manifest_sha256(manifest: &PluginManifest) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+/// The gates `plugin:<installation>/<gate>` resolves to in `org` (ADR-0076
+/// §7): each gate declared by an installation whose approved manifest asks
+/// for `resolve_gates`, keyed `<installation>/<gate>`. A killed installation's
+/// gates still resolve: its gates wait, and expire, as any other's do.
+pub(crate) async fn gates_for_compile(
+    store: &dyn scarab_plugin::PluginStore,
+    org: &str,
+) -> Result<std::collections::BTreeMap<String, scarab_pipeline::PluginGateDef>, DbError> {
+    let installations = store
+        .installations(org)
+        .await
+        .map_err(|e| DbError::Other(format!("plugin store: {e}")))?;
+    let mut out = std::collections::BTreeMap::new();
+    for i in installations
+        .iter()
+        .filter(|i| i.org == org && i.manifest.has(PluginCapability::ResolveGates))
+    {
+        for (gate, def) in &i.manifest.gates {
+            out.insert(
+                format!("{}/{gate}", i.name),
+                scarab_pipeline::PluginGateDef {
+                    interface: def.interface.clone(),
+                    manifest_sha256: i.manifest_sha256.clone(),
+                },
+            );
+        }
+    }
+    Ok(out)
 }
 
 /// A [`PluginStoreError`] as the API answers it.

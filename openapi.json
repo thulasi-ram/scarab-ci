@@ -2400,6 +2400,96 @@
         ]
       }
     },
+    "/v1/orgs/{org}/gates": {
+      "get": {
+        "tags": [
+          "Plugins"
+        ],
+        "summary": "List the open waits of the gates that name the calling plugin (ADR-0076\n§7). Only a plugin's `scarab-api` token is accepted; another org's list\nis a 404. The query reads current state, so a restarted plugin catches up\nwith nothing to replay.",
+        "operationId": "list_pending_gates",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "pending",
+            "in": "query",
+            "description": "Must be `true`: only open waits are listed.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "releaser",
+            "in": "query",
+            "description": "Must be `me`: the waits whose releaser is the calling plugin.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "description": "The `next` cursor of the previous page.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "At most this many waits (default 50, at most 200).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "a page of open waits naming the calling plugin",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PendingGatesPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`pending` is not `true`, `releaser` is not `me`, or a bad cursor"
+          },
+          "401": {
+            "description": "no plugin `scarab-api` token, or one that proves nothing"
+          },
+          "403": {
+            "description": "the installation is killed, or was not approved to resolve gates"
+          },
+          "404": {
+            "description": "another org"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/orgs/{org}/libraries": {
       "get": {
         "tags": [
@@ -6299,7 +6389,7 @@
           }
         ],
         "requestBody": {
-          "description": "optional: `{\"passed\": false, \"reason\": \"…\"}` fails the gate instead of releasing it",
+          "description": "external gate (`x-scarab-gate-token`): optional, `{\"passed\": false, \"reason\": \"…\"}` fails the gate instead of releasing it. Plugin gate (a plugin's `scarab-api` bearer token, ADR-0076 §7): a `PluginGateRelease`, `{\"attempt\", \"passed\": true, \"outputs\": {…}}` or `{\"attempt\", \"passed\": false, \"reason\": \"…\"}`",
           "content": {
             "application/json": {
               "schema": {
@@ -8827,6 +8917,60 @@
           }
         }
       },
+      "GateDefinitionDto": {
+        "type": "object",
+        "description": "A gate a plugin resolves: a Pipeline waits on it with `invoke:\nplugin:<installation>/<name>`.",
+        "required": [
+          "name",
+          "description",
+          "inputs",
+          "outputs"
+        ],
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "inputs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GateFieldDto"
+            },
+            "description": "What a Pipeline passes under `with:`."
+          },
+          "name": {
+            "type": "string"
+          },
+          "outputs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GateFieldDto"
+            },
+            "description": "What the plugin returns when it releases the gate."
+          }
+        }
+      },
+      "GateFieldDto": {
+        "type": "object",
+        "description": "One input or output of a gate definition, with its type.",
+        "required": [
+          "name",
+          "type",
+          "required"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "required": {
+            "type": "boolean",
+            "description": "Whether a Pipeline must pass it (always true for an output)."
+          },
+          "type": {
+            "type": "string",
+            "description": "`string`, `boolean`, `number` or `choice` (inputs only)."
+          }
+        }
+      },
       "GateResolutionDto": {
         "type": "object",
         "description": "How a gate's wait resolved: its `GateResolved` journal entry.",
@@ -9677,6 +9821,74 @@
           }
         }
       },
+      "PendingGateDto": {
+        "type": "object",
+        "description": "One open wait of a plugin gate.",
+        "required": [
+          "run",
+          "step",
+          "gate",
+          "attempt",
+          "waiting_since",
+          "inputs"
+        ],
+        "properties": {
+          "attempt": {
+            "type": "string",
+            "description": "The wait's Attempt: a release names it, and an answer to another wait\nis dropped."
+          },
+          "expires_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the wait expires and fails (Unix ms)."
+          },
+          "gate": {
+            "type": "string",
+            "description": "The gate's name in the plugin's manifest."
+          },
+          "inputs": {
+            "type": "object",
+            "description": "The gate's inputs, rendered when it was reached."
+          },
+          "run": {
+            "type": "string"
+          },
+          "step": {
+            "type": "string",
+            "description": "The gate's step id in the Run."
+          },
+          "waiting_since": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the wait began (Unix ms)."
+          }
+        }
+      },
+      "PendingGatesPage": {
+        "type": "object",
+        "description": "A page of open waits.",
+        "required": [
+          "gates"
+        ],
+        "properties": {
+          "gates": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PendingGateDto"
+            }
+          },
+          "next": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Pass as `after` for the next page; absent on the last."
+          }
+        }
+      },
       "PipelineCatalogResponse": {
         "type": "object",
         "description": "`GET /v1/repos/{org}/{repo}/pipelines?ref=` body: the manually-dispatchable\ncatalog at a ref (ADR-0043 §4). Lightweight — each entry is an `on:`-only\nread, not a full compile. `sha` is the ref resolved to a concrete commit.",
@@ -9813,7 +10025,8 @@
           "offer_actions",
           "use_connection",
           "contribute_ui",
-          "approve_gates"
+          "approve_gates",
+          "resolve_gates"
         ]
       },
       "PluginCatalogEntryDto": {
@@ -9924,6 +10137,36 @@
             ]
           }
         }
+      },
+      "PluginGateRelease": {
+        "type": "object",
+        "description": "A plugin's answer on `POST /v1/runs/{id}/gates/{step}/release`.",
+        "required": [
+          "attempt",
+          "passed"
+        ],
+        "properties": {
+          "attempt": {
+            "type": "string",
+            "description": "The wait being answered, as the pending-gates query listed it."
+          },
+          "outputs": {
+            "type": "object",
+            "description": "A release's outputs: exactly what the gate declares, each of its type."
+          },
+          "passed": {
+            "type": "boolean",
+            "description": "`true` releases the gate with `outputs`; `false` fails it with\n`reason`."
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the gate failed: 1 to 1024 bytes, required with `passed: false`."
+          }
+        },
+        "additionalProperties": false
       },
       "PluginInstallationDto": {
         "type": "object",
@@ -10041,7 +10284,8 @@
           "plugin",
           "capabilities",
           "connections",
-          "config_keys"
+          "config_keys",
+          "gates"
         ],
         "properties": {
           "capabilities": {
@@ -10061,6 +10305,13 @@
             "items": {
               "$ref": "#/components/schemas/ConnectionSlotDto"
             }
+          },
+          "gates": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GateDefinitionDto"
+            },
+            "description": "The gates the plugin resolves (ADR-0076 §7), by name; empty without\n`resolve_gates`."
           },
           "plugin": {
             "type": "string"

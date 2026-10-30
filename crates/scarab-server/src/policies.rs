@@ -1262,13 +1262,12 @@ async fn pipeline_input(
     };
     let event = test_event(p.trigger, repo.clone(), caller)?;
     // `lib:` resolves against the org's installations, as at admission.
-    let installed = crate::installed_libraries(st.libraries.as_deref(), org)
+    let installed = crate::installed_libraries(st.libraries.as_deref(), st.plugins.as_deref(), org)
         .await
         .map_err(ApiError::Db)?;
     let libraries = scarab_pipeline::Libraries {
         files: p.libs,
-        installed,
-        plugin_gates: Default::default(),
+        ..installed
     };
     let (ir, _) = crate::compile_bounded(p.yaml, libraries)
         .await

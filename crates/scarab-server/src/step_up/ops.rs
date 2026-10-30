@@ -625,9 +625,10 @@ pub static SNAPSHOTS_UNPIN: Op = op(
 );
 pub static GATE_RELEASE: Op = op(
     "gate.release_external",
-    "Release an external gate",
+    "Release an external or plugin gate",
     Class::NotGoverned(
-        "the external-gate HMAC token is the approval (ADR-0034); a machine, no session",
+        "the external-gate HMAC token is the approval (ADR-0034), or a plugin's scarab-api \
+         token answers a gate that names it (ADR-0076 §7); a machine, no session",
     ),
     "§5",
     ANYONE,

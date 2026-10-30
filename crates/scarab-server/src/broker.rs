@@ -6,7 +6,9 @@
 //!
 //! It serves identity (`whoami`) and the read proxy over PluginConnections
 //! ([`crate::broker_proxy`], slice d3). Report ingest went with the
-//! Deployment record (ADR-0074).
+//! Deployment record (ADR-0074). It also serves the two gate API routes a
+//! plugin that resolves gates calls ([`crate::plugin_gates`], ADR-0076 §7),
+//! at their public API paths.
 //!
 //! Every route but `healthz` goes through [`authenticate_plugin`]: the
 //! token is verified ([`PluginTokenVerifier`]), its ServiceAccount mapped to
@@ -94,12 +96,26 @@ pub fn router(state: AppState) -> Router {
                 )))
         })
         .unwrap_or_default();
+    // The gate API a plugin calls (ADR-0076 §7): the public API's own paths
+    // and handlers, served here too because a plugin's network reaches only
+    // this listener. Each authenticates a `scarab-api` token itself; an
+    // external gate's token is not taken here.
+    let gate_api = Router::new()
+        .route(
+            "/v1/orgs/{org}/gates",
+            get(crate::plugin_gates::list_pending_gates),
+        )
+        .route(
+            "/v1/runs/{id}/gates/{step}/release",
+            axum::routing::post(crate::plugin_gates::release_on_broker),
+        );
     Router::new()
         // Unauthenticated: the reachability probe (proc-mode discovery and
         // the isolation probe, slice d2) must not need a token.
         .route(&format!("{BROKER_PREFIX}/healthz"), get(healthz))
         .merge(reads)
         .merge(proxy)
+        .merge(gate_api)
         .layer(DefaultBodyLimit::max(BROKER_BODY_LIMIT_BYTES))
         .layer(axum::middleware::from_fn(super::request_id_middleware))
         // Outermost, so the response it rewrites already carries its

@@ -79,6 +79,18 @@ pub const RESERVED_CONFIG_KEY_PREFIX: &str = "SCARAB_";
 /// is useless against the broker, and a broker token is useless elsewhere.
 pub const BROKER_TOKEN_AUDIENCE: &str = "scarab-broker";
 
+/// The audience of the second projected token a Plugin that resolves gates
+/// gets (ADR-0076 §7): it calls the gate API with it. The broker's verifier
+/// refuses it and the gate API's refuses a broker token, so neither can
+/// stand in for the other.
+pub const API_TOKEN_AUDIENCE: &str = "scarab-api";
+
+/// Where a Plugin that resolves gates finds its `scarab-api` token, kept
+/// current by the kubelet. It calls the gate API at the broker's address
+/// (`SCARAB_BROKER_URL`), the one its network reaches, under the public
+/// API's paths.
+pub const PLUGIN_ENV_API_TOKEN_FILE: &str = "SCARAB_API_TOKEN_FILE";
+
 /// The Plugin contract's environment, as the runtime sets it: where the
 /// broker is, and the file the projected broker token is kept current in.
 /// The kubelet rotates the token in place before it expires, so a Plugin
