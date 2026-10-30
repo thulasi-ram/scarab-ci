@@ -749,7 +749,7 @@ const migrationReport: MigrationReportDto[] = [
 const ARGOCD_REPO = "ghcr.io/thulasi-ram/scarab-plugin-argocd";
 const argocdManifest: PluginCatalogEntryDto["manifest"] = {
   plugin: "argocd",
-  capabilities: ["use_connection"],
+  capabilities: ["use_connection", "resolve_gates"],
   connections: [
     {
       name: "argocd",
@@ -768,6 +768,18 @@ const argocdManifest: PluginCatalogEntryDto["manifest"] = {
     },
   ],
   config_keys: ["ARGOCD_UI_URL", "OWNER_ANNOTATION"],
+  gates: [
+    {
+      name: "wait-live",
+      description:
+        "Pass when Argo CD reports the Application synced, healthy and serving the given image; fail when Argo CD has given up on its sync.",
+      inputs: [
+        { name: "app", type: "string", required: true },
+        { name: "image", type: "string", required: true },
+      ],
+      outputs: [{ name: "revision", type: "string", required: true }],
+    },
+  ],
 };
 const pluginCatalog: PluginCatalogEntryDto[] = [
   {

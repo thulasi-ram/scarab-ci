@@ -171,7 +171,7 @@ describe("isRejectable", () => {
   const statusOf = (s: string) => statuses[s];
 
   it("covers every gate kind once its needs succeeded", () => {
-    for (const kind of ["manual", "timer", "external"]) {
+    for (const kind of ["manual", "timer", "external", "plugin"]) {
       expect(isRejectable(gate("g", "pending", kind, ["bump"]), statusOf)).toBe(true);
     }
   });
@@ -238,6 +238,11 @@ describe("gateWaitHint", () => {
 
   it("names unmet needs first", () => {
     expect(gateWaitHint(gate("live", "pending", "external", ["test"]), statusOf)).toBe("waiting on test");
+  });
+
+  it("says a plugin gate waits for its plugin, which no person can pass", () => {
+    expect(gateWaitHint(gate("live", "pending", "plugin", ["bump"]), statusOf)).toBe("waiting for its plugin");
+    expect(isApprovable(gate("live", "pending", "plugin"))).toBe(false);
   });
 });
 

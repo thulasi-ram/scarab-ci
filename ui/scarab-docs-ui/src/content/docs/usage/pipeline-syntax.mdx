@@ -337,7 +337,7 @@ The target always has a prefix that says where it comes from:
 |---|---|
 | `file:<path>` | a library file in the repository, read at the caller's ref |
 | `lib:<publisher>/<name>` | a library installed in your org |
-| `plugin:<installation>/<gate>` | a gate a plugin resolves (not available yet) |
+| `plugin:<installation>/<gate>` | a gate a plugin installed in your org resolves ([Plugin gates](#plugin-gates)) |
 
 A `file:` path is repo-relative: no leading `/`, no `..`, and no remote or cross-repo forms
 (cross-repo causation is `on: upstream`). A bare path is a compile error that tells you to add
@@ -579,6 +579,40 @@ manual gate is the approval mechanism for a governed environment:
 Any gate can fail with a reason: by expiry, by a human reject, or by an external gate released
 with `{"passed": false, "reason": "..."}`. A waiting gate holds only the steps that depend on it,
 and each gate has its own clock, measured from when its `needs` finished.
+
+### Plugin gates
+
+A plugin installed in your org with the `resolve_gates` capability declares gates in its manifest.
+A pipeline waits on one with `invoke: plugin:<installation>/<gate>`:
+
+```yaml
+- id: live
+  needs: [bump]
+  invoke: plugin:argocd-prod/wait-live
+  with:
+    app: payments-api
+    image: ${{ outputs.bump.image }}
+  gate_expires_after: 1800
+
+- id: smoke
+  image: curlimages/curl
+  needs: [live]
+  env: [[REVISION, "${{ outputs.live.revision }}"]]
+```
+
+This inlines one gate, `gate: plugin`, with the invoke step's id. Only the installation it names
+can release it. `with:` is checked against the gate's declared inputs when the pipeline compiles,
+and a value that reads an upstream output is rendered once, when the gate is reached. A value that
+does not render fails the gate with the reason. `gate_expires_after` is required: a gate the plugin
+never answers fails when it expires. Anyone with write access to the project can reject it sooner.
+
+The plugin releases the gate with the outputs it declares, each of its declared type, and a later
+step reads them as `${{ outputs.<gate>.<name> }}`. They are values from outside the pipeline, like
+a step's results: the same `command` and script rules apply to them. A plugin never approves a
+`gate: manual`, and it cannot see or release a gate in another org or one another installation
+releases.
+
+No plugin's gates run until an org admin lists the installation in the `plugins_allowed` setting.
 
 ## Deploys: `deploy: true`
 

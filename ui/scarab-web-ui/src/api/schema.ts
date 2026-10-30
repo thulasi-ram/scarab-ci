@@ -764,6 +764,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/orgs/{org}/gates": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List the open waits of the gates that name the calling plugin (ADR-0076
+         *     §7). Only a plugin's `scarab-api` token is accepted; another org's list
+         *     is a 404. The query reads current state, so a restarted plugin catches up
+         *     with nothing to replay.
+         */
+        get: operations["list_pending_gates"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/orgs/{org}/libraries": {
         parameters: {
             query?: never;
@@ -2881,6 +2903,26 @@ export interface components {
             security_fix: boolean;
             source: string;
         };
+        /**
+         * @description A gate a plugin resolves: a Pipeline waits on it with `invoke:
+         *     plugin:<installation>/<name>`.
+         */
+        GateDefinitionDto: {
+            description: string;
+            /** @description What a Pipeline passes under `with:`. */
+            inputs: components["schemas"]["GateFieldDto"][];
+            name: string;
+            /** @description What the plugin returns when it releases the gate. */
+            outputs: components["schemas"]["GateFieldDto"][];
+        };
+        /** @description One input or output of a gate definition, with its type. */
+        GateFieldDto: {
+            name: string;
+            /** @description Whether a Pipeline must pass it (always true for an output). */
+            required: boolean;
+            /** @description `string`, `boolean`, `number` or `choice` (inputs only). */
+            type: string;
+        };
         /** @description How a gate's wait resolved: its `GateResolved` journal entry. */
         GateResolutionDto: {
             /**
@@ -3267,6 +3309,37 @@ export interface components {
              */
             windows_revoked: number;
         };
+        /** @description One open wait of a plugin gate. */
+        PendingGateDto: {
+            /**
+             * @description The wait's Attempt: a release names it, and an answer to another wait
+             *     is dropped.
+             */
+            attempt: string;
+            /**
+             * Format: int64
+             * @description When the wait expires and fails (Unix ms).
+             */
+            expires_at?: number | null;
+            /** @description The gate's name in the plugin's manifest. */
+            gate: string;
+            /** @description The gate's inputs, rendered when it was reached. */
+            inputs: Record<string, never>;
+            run: string;
+            /** @description The gate's step id in the Run. */
+            step: string;
+            /**
+             * Format: int64
+             * @description When the wait began (Unix ms).
+             */
+            waiting_since: number;
+        };
+        /** @description A page of open waits. */
+        PendingGatesPage: {
+            gates: components["schemas"]["PendingGateDto"][];
+            /** @description Pass as `after` for the next page; absent on the last. */
+            next?: string | null;
+        };
         /**
          * @description `GET /v1/repos/{org}/{repo}/pipelines?ref=` body: the manually-dispatchable
          *     catalog at a ref (ADR-0043 §4). Lightweight — each entry is an `on:`-only
@@ -3355,7 +3428,7 @@ export interface components {
          * @description One entry of the closed PluginCapability vocabulary (ADR-0072 §2).
          * @enum {string}
          */
-        PluginCapabilityDto: "report_deployments" | "subscribe_events" | "offer_actions" | "use_connection" | "contribute_ui" | "approve_gates";
+        PluginCapabilityDto: "report_deployments" | "subscribe_events" | "offer_actions" | "use_connection" | "contribute_ui" | "approve_gates" | "resolve_gates";
         /** @description A plugin this Scarab can install. */
         PluginCatalogEntryDto: {
             description: string;
@@ -3408,6 +3481,20 @@ export interface components {
             updated_at?: number | null;
             updated_by?: string | null;
         };
+        /** @description A plugin's answer on `POST /v1/runs/{id}/gates/{step}/release`. */
+        PluginGateRelease: {
+            /** @description The wait being answered, as the pending-gates query listed it. */
+            attempt: string;
+            /** @description A release's outputs: exactly what the gate declares, each of its type. */
+            outputs?: Record<string, never>;
+            /**
+             * @description `true` releases the gate with `outputs`; `false` fails it with
+             *     `reason`.
+             */
+            passed: boolean;
+            /** @description Why the gate failed: 1 to 1024 bytes, required with `passed: false`. */
+            reason?: string | null;
+        };
         /** @description A PluginInstallation (ADR-0072 §10). */
         PluginInstallationDto: {
             /**
@@ -3455,6 +3542,11 @@ export interface components {
             capabilities: components["schemas"]["PluginCapabilityDto"][];
             config_keys: string[];
             connections: components["schemas"]["ConnectionSlotDto"][];
+            /**
+             * @description The gates the plugin resolves (ADR-0076 §7), by name; empty without
+             *     `resolve_gates`.
+             */
+            gates: components["schemas"]["GateDefinitionDto"][];
             plugin: string;
         };
         /**
@@ -6577,6 +6669,66 @@ export interface operations {
             };
         };
     };
+    list_pending_gates: {
+        parameters: {
+            query?: {
+                /** @description Must be `true`: only open waits are listed. */
+                pending?: boolean;
+                /** @description Must be `me`: the waits whose releaser is the calling plugin. */
+                releaser?: string;
+                /** @description The `next` cursor of the previous page. */
+                after?: string;
+                /** @description At most this many waits (default 50, at most 200). */
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description a page of open waits naming the calling plugin */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PendingGatesPage"];
+                };
+            };
+            /** @description `pending` is not `true`, `releaser` is not `me`, or a bad cursor */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no plugin `scarab-api` token, or one that proves nothing */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the installation is killed, or was not approved to resolve gates */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description another org */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     list_libraries: {
         parameters: {
             query?: never;
@@ -9313,7 +9465,7 @@ export interface operations {
             };
             cookie?: never;
         };
-        /** @description optional: `{"passed": false, "reason": "…"}` fails the gate instead of releasing it */
+        /** @description external gate (`x-scarab-gate-token`): optional, `{"passed": false, "reason": "…"}` fails the gate instead of releasing it. Plugin gate (a plugin's `scarab-api` bearer token, ADR-0076 §7): a `PluginGateRelease`, `{"attempt", "passed": true, "outputs": {…}}` or `{"attempt", "passed": false, "reason": "…"}` */
         requestBody?: {
             content: {
                 "application/json": null | components["schemas"]["ExternalGateVerdict"];
