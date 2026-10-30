@@ -376,6 +376,31 @@ pub(crate) fn reads(expr: &str) -> Result<Vec<Read>, PipelineError> {
     })
 }
 
+/// The variable and constant members of `expr` when it is nothing else
+/// (`inputs.region`, `inputs["region"]`): `["inputs", "region"]`. `None`
+/// for any other expression, or one that does not parse.
+pub(crate) fn path(expr: &str) -> Option<Vec<String>> {
+    with_program(expr, |program| {
+        let mut keys = Vec::new();
+        let mut cur = program.expression();
+        while let Some((operand, key, _)) = member_of(cur) {
+            keys.push(key);
+            cur = operand;
+        }
+        let Expr::Ident(name) = &cur.expr else {
+            return Ok(None);
+        };
+        let mut out = vec![name.trim_start_matches('.').to_string()];
+        for key in keys.into_iter().rev() {
+            let Some(key) = key else { return Ok(None) };
+            out.push(key);
+        }
+        Ok(Some(out))
+    })
+    .ok()
+    .flatten()
+}
+
 /// One member step of a selection chain: the operand, the member when it is
 /// a constant, and the key expression when it is computed.
 fn member_of(e: &IdedExpr) -> Option<(&IdedExpr, Option<String>, Option<&IdedExpr>)> {
@@ -525,6 +550,17 @@ fn bind(context: &mut Context, ctx: &serde_json::Value, expr: &str) -> Result<()
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_path_is_a_variable_and_constant_members_only() {
+        let p = |e: &str| path(e);
+        assert_eq!(p("inputs.region"), Some(vec!["inputs".into(), "region".into()]));
+        assert_eq!(p("inputs['region']"), Some(vec!["inputs".into(), "region".into()]));
+        assert_eq!(p(".inputs"), Some(vec!["inputs".into()]));
+        for e in ["inputs.region + ''", "inputs[k]", "size(inputs)", "'x'", "1 +"] {
+            assert_eq!(p(e), None, "{e}");
+        }
+    }
 
     #[test]
     fn eval_bool_reads_context_variables() {

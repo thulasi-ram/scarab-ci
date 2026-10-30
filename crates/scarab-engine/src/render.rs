@@ -29,10 +29,8 @@ pub async fn render_launch_spec(
     // The version must be a whole number this server knows: `"4"`, `4.0`
     // or `-1` is refused, not read as no version. A stored IR without the
     // field predates it.
-    let ir_version = db
-        .run_ir(run)
-        .await?
-        .and_then(|ir| ir.get("ir_version").cloned());
+    let ir = db.run_ir(run).await?;
+    let ir_version = ir.as_ref().and_then(|ir| ir.get("ir_version").cloned());
     if let Some(v) = ir_version {
         let max = scarab_pipeline::IR_VERSION_MAX;
         match v.as_u64() {
@@ -63,6 +61,14 @@ pub async fn render_launch_spec(
     }
     let params = db.run_params(run).await?;
     let event = db.run_event_facts(run).await?;
+    // The Run's declared inputs: their types decide which launch parameters
+    // may reach the command (ADR-0076, 2026-10-30). An IR whose interface
+    // does not read declares none, so no launch parameter reaches a command.
+    let declared: Vec<scarab_pipeline::ParamSpec> = ir
+        .as_ref()
+        .and_then(|ir| ir.get("interface")?.get("inputs").cloned())
+        .and_then(|inputs| serde_json::from_value(inputs).ok())
+        .unwrap_or_default();
     let has_template = spec.image.contains("${{")
         || spec.command.iter().any(|c| c.contains("${{"))
         || spec.env.iter().any(|(_, v)| v.contains("${{"));
@@ -93,6 +99,7 @@ pub async fn render_launch_spec(
         &spec.matrix_values,
         scarab_pipeline::Facts::Launch {
             params: &params,
+            declared: &declared,
             results: &results,
             event: &event,
         },

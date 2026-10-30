@@ -37,13 +37,14 @@ fn repo() -> RepoRef {
     }
 }
 
-// A single-step pipeline that opts into manual dispatch and interpolates a param.
+// A single-step pipeline that opts into manual dispatch and interpolates a
+// param. A `choice` and a number may be in a command (ADR-0076, 2026-10-30).
 const MANUAL_YAML: &str = r#"
 on:
   manual: {}
 interface:
   inputs:
-    - { name: region, type: string }
+    - { name: region, type: choice, options: [us-east-1, eu-west-1] }
     - { name: replicas, type: number, required: false, default: 2 }
 steps:
   - id: ship

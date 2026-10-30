@@ -65,6 +65,7 @@ fn launch(
         &spec.matrix_values,
         Facts::Launch {
             params: &params,
+            declared: &[],
             results: &results,
             event: &serde_json::Map::new(),
         },
@@ -83,9 +84,10 @@ fn preview(spec: &StepSpec, params: Value) -> Result<scarab_pipeline::Rendered, 
         spec.scope.as_ref(),
         &spec.matrix_values,
         Facts::Preview {
-                params: &params,
-                event: &serde_json::Map::new(),
-            },
+            params: &params,
+            declared: &[],
+            event: &serde_json::Map::new(),
+        },
     )
 }
 
@@ -95,14 +97,16 @@ fn q(s: &str) -> String {
 }
 
 /// A Pipeline-file Step (scope: the Run) with one string input `p`, a need
-/// `b` with result `v`, and `command`.
+/// `b` with result `v`, and `command`. The command that reads `p` or `v`
+/// does not compile (ADR-0076, 2026-10-30), so it is written into the
+/// compiled IR, the way a raw IR posted to `POST /v1/runs` can hold it: these
+/// attacks test the launch's own check.
 fn run_level(command: &[&str]) -> PipelineIr {
-    let cmd: Vec<String> = command.iter().map(|c| q(c)).collect();
-    let yaml = format!(
-        "interface: {{ inputs: [{{ name: p, type: string }}, {{ name: e, type: string, required: false, default: \"\" }}] }}\nsteps:\n  - {{ id: b, image: busybox, results: [v] }}\n  - {{ id: s, image: busybox, needs: [b], command: [{}] }}\n",
-        cmd.join(", ")
-    );
-    ok(&yaml, &Libraries::default())
+    let yaml = "interface: { inputs: [{ name: p, type: string }, { name: e, type: string, required: false, default: \"\" }] }\nsteps:\n  - { id: b, image: busybox, results: [v] }\n  - { id: s, image: busybox, needs: [b] }\n";
+    let mut ir = ok(yaml, &Libraries::default());
+    let s = ir.steps.iter_mut().find(|s| s.id == "s").unwrap();
+    s.command = command.iter().map(|c| c.to_string()).collect();
+    ir
 }
 
 const EVIL: &str = "--upload-pack=touch /tmp/pwned";
@@ -288,13 +292,20 @@ fn dash_dash_exemption_does_not_cover_forwarded_arguments() {
 }
 
 /// Preview and launch with the same Run parameters agree on whether the
-/// leading-`-` rule refuses a library Step's command: the value is a Run
-/// parameter, known at Run creation, reached through an exact `with:`.
+/// launch refuses a library Step's command: the value is a Run parameter,
+/// known at Run creation, reached through an exact `with:`. The command is
+/// written into the compiled IR (see [`run_level`]).
 #[test]
 fn preview_and_launch_agree_on_leading_dash_through_a_library() {
-    let lib = "kind: library\ninterface: { inputs: [{ name: r, type: string }] }\nsteps: [{ id: s, image: alpine/git, command: [git, fetch, origin, \"${{ inputs.r }}\"] }]\n";
+    let lib = "kind: library\ninterface: { inputs: [{ name: r, type: string }] }\nsteps: [{ id: s, image: alpine/git, command: [git, fetch, origin] }]\n";
     let yaml = "interface: { inputs: [{ name: ref, type: string }] }\nsteps: [{ id: c, invoke: file:l.yaml, with: { r: \"${{ inputs.ref }}\" } }]\n";
-    let ir = ok(yaml, &files(&[("l.yaml", lib)]));
+    let mut ir = ok(yaml, &files(&[("l.yaml", lib)]));
+    ir.steps
+        .iter_mut()
+        .find(|s| s.id == "c/s")
+        .unwrap()
+        .command
+        .push("${{ inputs.r }}".into());
     let s = step(&ir, "c/s");
     let at_launch = launch(s, json!({ "ref": EVIL }), json!({})).is_err();
     let at_preview = preview(s, json!({ "ref": EVIL })).is_err();
@@ -324,7 +335,6 @@ fn survived_preview_and_launch_agree_on_leading_dash_in_the_pipeline() {
 /// compiles and the launch hands the value to a parser that reads `-` or
 /// `;` as code.
 #[test]
-#[ignore = "held: owner decision on script scope"]
 fn an_outside_value_in_a_re_split_argument_is_refused() {
     let mut launched = Vec::new();
     for (cmd, value) in [
@@ -439,7 +449,6 @@ fn script_check_reads_node_pe() {
 /// Wrappers the check does not skip, and `env`'s `-S` (split string),
 /// whose argument is itself a command line.
 #[test]
-#[ignore = "held: owner decision on script scope"]
 fn script_check_sees_through_other_wrappers() {
     let m = missed(&[
         r#"[env, -S, "sh -c 'echo ${{ inputs.p }}'"]"#,
@@ -473,7 +482,6 @@ fn script_check_sees_through_other_wrappers() {
 /// Interpreters and programs that run a script from their arguments,
 /// which the check does not know.
 #[test]
-#[ignore = "held: owner decision on script scope"]
 fn script_check_sees_other_interpreters() {
     let m = missed(&[
         r#"[pwsh, -Command, "echo ${{ inputs.p }}"]"#,

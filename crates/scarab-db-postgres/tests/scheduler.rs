@@ -167,8 +167,9 @@ async fn named_result_flows_into_a_downstream_interpolation() {
     // keyed by step id.
     let consumer_spec = StepSpec {
         image: "busybox:latest".into(),
-        command: vec!["echo".into(), "${{ outputs.producer.url }}".into()],
-        env: vec![],
+        command: vec!["echo".into()],
+        // A result reaches a Step as an env value (ADR-0076, 2026-10-30).
+        env: vec![("URL".into(), "${{ outputs.producer.url }}".into())],
         secrets: vec![],
         run_as_root: false,
         add_capabilities: vec![],
@@ -224,12 +225,12 @@ async fn named_result_flows_into_a_downstream_interpolation() {
         captured.get("url").unwrap(),
         &serde_json::json!("https://svc.example")
     );
-    // The consumer launched with the *interpolated* command — the value flowed.
+    // The consumer launched with the *interpolated* env — the value flowed.
     let handle = ExecHandle("fake://run-1/consumer/a1".into());
     let launched = exec.launched_spec(&handle).expect("consumer launched");
     assert_eq!(
-        launched.command,
-        vec!["echo".to_string(), "https://svc.example".to_string()],
+        launched.env,
+        [("URL".to_string(), "https://svc.example".to_string())],
         "the reference was resolved at launch, not left literal"
     );
 

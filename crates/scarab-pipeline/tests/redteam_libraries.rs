@@ -77,6 +77,7 @@ fn launch(spec: &StepSpec, run_params: serde_json::Value) -> Result<Rendered, St
         &spec.matrix_values,
         Facts::Launch {
             params: &params,
+            declared: &[],
             results: &Results::new(),
             event: &serde_json::Map::new(),
         },
@@ -166,7 +167,7 @@ fn a_default_failing_its_own_validate_is_refused() {
 /// step (fanned over a matrix), and the invoke step must need it.
 #[test]
 fn a_caller_output_through_with_is_a_need_of_every_inlined_step() {
-    let lib = "kind: library\ninterface:\n  inputs: [{ name: v, type: string }]\nsteps:\n  - { id: a, image: busybox }\n  - { id: b, image: busybox, needs: [a], command: [\"${{ inputs.v }}\"] }\n";
+    let lib = "kind: library\ninterface:\n  inputs: [{ name: v, type: string }]\nsteps:\n  - { id: a, image: busybox }\n  - { id: b, image: busybox, needs: [a], env: [[V, \"${{ inputs.v }}\"]] }\n";
     let l = files(&[("l.yaml", lib)]);
     let yaml = "steps:\n  - { id: build, image: busybox, results: [v] }\n  - id: c\n    invoke: file:l.yaml\n    needs: [build]\n    with: { v: \"${{ outputs.build.v }}\" }\n";
     let ir = ok(yaml, &l);
@@ -809,12 +810,12 @@ fn carried_fields_onto_an_all_gate_library_are_refused() {
 #[test]
 fn a_reader_of_an_exposed_output_needs_its_backing_step() {
     let lib = "kind: library\ninterface: { outputs: [img] }\nsteps:\n  - { id: img, image: busybox, results: [img] }\n  - { id: post, image: busybox, needs: [img] }\n";
-    let user = "kind: library\ninterface: { inputs: [{ name: v, type: string }] }\nsteps:\n  - { id: a, image: busybox }\n  - { id: b, image: busybox, needs: [a], command: [\"${{ inputs.v }}\"] }\n";
-    let yaml = "steps:\n  - { id: c, invoke: file:l.yaml }\n  - { id: r, image: busybox, needs: [c], command: [\"${{ outputs.c.img }}\"] }\n  - { id: u, invoke: file:u.yaml, needs: [c], with: { v: \"${{ outputs.c.img }}\" } }\n";
+    let user = "kind: library\ninterface: { inputs: [{ name: v, type: string }] }\nsteps:\n  - { id: a, image: busybox }\n  - { id: b, image: busybox, needs: [a], env: [[V, \"${{ inputs.v }}\"]] }\n";
+    let yaml = "steps:\n  - { id: c, invoke: file:l.yaml }\n  - { id: r, image: busybox, needs: [c], env: [[I, \"${{ outputs.c.img }}\"]] }\n  - { id: u, invoke: file:u.yaml, needs: [c], with: { v: \"${{ outputs.c.img }}\" } }\n";
     let ir = ok(yaml, &files(&[("l.yaml", lib), ("u.yaml", user)]));
     let rd = step(&ir, "r");
     assert_eq!(rd.needs.0, vec!["c/post".to_string(), "c/img".into()]);
-    assert_eq!(rd.command[0], "${{ outputs.c.img }}");
+    assert_eq!(rd.env[0].1, "${{ outputs.c.img }}");
     for id in ["u/a", "u/b"] {
         let s = step(&ir, id);
         assert!(
