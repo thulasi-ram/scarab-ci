@@ -95,10 +95,30 @@ impl Executor for RecordingExec {
 }
 use scarab_engine::ExecError;
 
+/// Store the Run's IR with the interface `interp_spec` reads: the declared
+/// types decide which parameters may be in a command (ADR-0076, 2026-10-30).
+async fn declare(db: &InMemoryDb, run: &RunId) {
+    db.store_run_ir(
+        run,
+        &json!({
+            "ir_version": 2,
+            "interface": { "inputs": [
+                { "name": "region", "type": "choice", "options": ["us-east-1", "eu-west-1"] },
+                { "name": "n", "type": "number" },
+                { "name": "zone", "type": "string", "required": false, "default": "a" },
+                { "name": "note", "type": "string", "required": false, "default": "" }
+            ] },
+            "steps": []
+        }),
+    )
+    .await
+    .unwrap();
+}
+
 fn interp_spec() -> StepSpec {
     StepSpec {
         image: "busybox".into(),
-        // `region` is a string param; `inputs.n > 80` is a *numeric* guard — it
+        // `region` is a choice param; `inputs.n > 80` is a *numeric* guard — it
         // only evaluates because `n` is stored as a JSON number (a string would
         // make CEL error comparing string > number, failing the step).
         command: vec![
@@ -152,6 +172,7 @@ async fn params_interpolate_inputs_and_rerun_re_derives_identically() {
         ("zone".to_string(), json!("a")),
     ]);
     db.set_run_params(&run, &params).await.unwrap();
+    declare(&db, &run).await;
     db.create_step_run(&run, &step, Some(&interp_spec()), &[], Timestamp(1_000))
         .await
         .unwrap();
@@ -224,9 +245,11 @@ async fn a_param_holding_an_expression_reaches_the_step_as_text() {
         ("note".to_string(), json!("${{ inputs.region }}")),
     ]);
     db.set_run_params(&run, &params).await.unwrap();
-    // The step interpolates (so the slow path runs) and also reads `note`.
+    declare(&db, &run).await;
+    // The step interpolates (so the slow path runs) and also reads `note`,
+    // free text, in its env.
     let mut spec = interp_spec();
-    spec.command.push("${{ inputs.note }}".into());
+    spec.env.push(("NOTE".into(), "${{ inputs.note }}".into()));
     db.create_step_run(&run, &step, Some(&spec), &[], Timestamp(1_000))
         .await
         .unwrap();
@@ -239,7 +262,11 @@ async fn a_param_holding_an_expression_reaches_the_step_as_text() {
 
     let launches = exec.launches.lock().unwrap().clone();
     let (cmd, env) = &launches[0];
-    assert_eq!(cmd.last().unwrap(), "${{ inputs.region }}", "{cmd:?}");
+    assert_eq!(cmd[1], "us-east-1", "{cmd:?}");
+    assert!(
+        env.contains(&("NOTE".into(), "${{ inputs.region }}".into())),
+        "{env:?}"
+    );
     assert!(
         env.contains(&("SCARAB_PARAM_NOTE".into(), "${{ inputs.region }}".into())),
         "{env:?}"
@@ -287,7 +314,7 @@ async fn post_run_with_valid_params_persists_the_resolved_blob() {
                         { "name": "replicas", "type": "number", "required": false, "default": 2 }
                     ]
                 },
-                "steps": [{ "id": "build", "image": "busybox", "command": ["echo", "${{ inputs.region }}"] }]
+                "steps": [{ "id": "build", "image": "busybox", "env": { "REGION": "${{ inputs.region }}" } }]
             },
             "params": { "region": "us-east-1", "replicas": "5" }
         }),

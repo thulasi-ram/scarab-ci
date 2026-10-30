@@ -19,10 +19,11 @@ fn repo() -> RepoRef {
     }
 }
 
-/// The owner decision for this design (AFK run.md B9): leading `-` is
-/// refused for outside values in argv. Whoever dispatches a Run supplies
-/// its parameters; a `--upload-pack=` value rendered into `git fetch`
-/// runs a command in the Step, which holds the Step's secrets.
+/// Whoever dispatches a Run supplies its parameters; a `--upload-pack=`
+/// value rendered into `git fetch` runs a command in the Step, which holds
+/// the Step's secrets. A free-text parameter never reaches a command
+/// (ADR-0076, 2026-10-30): the dispatch is refused when the Pipeline
+/// compiles, so no Run exists to launch.
 #[tokio::test]
 async fn a_dispatch_parameter_with_a_leading_dash_does_not_reach_argv() {
     let lib = "kind: library\ninterface: { inputs: [{ name: r, type: string }] }\nsteps: [{ id: s, image: alpine/git, command: [git, fetch, origin, \"${{ inputs.r }}\"] }]\n";
@@ -36,7 +37,7 @@ async fn a_dispatch_parameter_with_a_leading_dash_does_not_reach_argv() {
     let evil = "--upload-pack=touch /tmp/pwned";
     let params: BTreeMap<String, serde_json::Value> =
         serde_json::from_value(json!({ "ref": evil })).unwrap();
-    let run: RunId = dispatch_run(
+    let dispatched = dispatch_run(
         &forge,
         &db,
         &clock,
@@ -49,8 +50,19 @@ async fn a_dispatch_parameter_with_a_leading_dash_does_not_reach_argv() {
         DispatchKind::Manual,
         None,
     )
-    .await
-    .unwrap_or_else(|e| panic!("dispatch: {e}"));
+    .await;
+    let run: RunId = match dispatched {
+        Err(e) => {
+            let e = e.to_string();
+            assert!(
+                e.contains("step `p`: `command[3]` reads `${{ inputs.ref }}`")
+                    && e.contains("library `.scarab/lib/fetch.yaml`, step `s`: `command[3]`"),
+                "{e}"
+            );
+            return;
+        }
+        Ok(run) => run,
+    };
     let exec = FakeExecutor::new();
     for _ in 0..8 {
         exec.script_outcome(ExecState::Succeeded);
