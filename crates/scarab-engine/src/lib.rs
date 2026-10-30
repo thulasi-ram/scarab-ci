@@ -24,9 +24,9 @@ pub mod scheduler;
 pub use ports::{Clock, Db, Executor, LogChunks, SnapshotRetention, WorkspaceSnapshots};
 pub use scheduler::{
     cancel_run_request, gate_approvers, pin_run_snapshots, plan_rerun, record_gate_approval,
-    reject_gate, release_gate, rerun_step, rerun_step_widened, retry_step, retry_step_widened,
+    reject_gate, release_gate, resolve_plugin_gate, rerun_step, rerun_step_widened, retry_step, retry_step_widened,
     run_status_post_key, unpin_run_snapshots, wait_began_at, AttemptTeardown, ExpiredInput,
-    PlanReason, PlannedStep, RerunError, RerunPlan, Scheduler, SchedulerError, Supervision,
+    PlanReason, PlannedStep, PluginGateError, PluginGateVerdict, RerunError, RerunPlan, Scheduler, SchedulerError, Supervision,
     TeardownAttempt, TickHealth, CANCEL_ATTEMPT, CANCEL_RUN, LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS,
     RUN_STATUS_CHANGED, SUPERSEDE_TEARDOWN,
 };
@@ -433,6 +433,44 @@ pub struct GateResolution {
     pub legacy_started_at: Timestamp,
     /// When the verdict lands — the `at` of every event it journals.
     pub at: Timestamp,
+    /// On a pass, the gate's outputs (ADR-0076 §7: a plugin gate's release),
+    /// already checked against what the gate declares. Stored as the closed
+    /// Attempt's results and the step's, in the same transaction, so a
+    /// dependent reads them as `${{ outputs.<gate>.<name> }}`. `None` for
+    /// every other resolution.
+    pub outputs: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+}
+
+/// One open wait of a plugin gate (ADR-0076 §7), as the pending-gates query
+/// lists it: the gate, its wait's Attempt (the fence a release names), when
+/// the wait began, and the inputs rendered when the gate was reached.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingGateWait {
+    pub run: RunId,
+    pub step: StepId,
+    pub attempt: AttemptId,
+    pub started_at: Timestamp,
+    pub inputs: serde_json::Value,
+}
+
+impl PendingGateWait {
+    /// Where the next page of the query starts: after this wait.
+    pub fn key(&self) -> PendingGateKey {
+        PendingGateKey {
+            run: self.run.0.clone(),
+            step: self.step.0.clone(),
+            attempt: self.attempt.0.clone(),
+        }
+    }
+}
+
+/// The order of the pending-gates query, and its cursor: waits are listed by
+/// (run id, step id, attempt id).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PendingGateKey {
+    pub run: String,
+    pub step: String,
+    pub attempt: String,
 }
 
 impl GateResolution {

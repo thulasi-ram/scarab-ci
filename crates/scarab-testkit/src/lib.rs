@@ -116,6 +116,8 @@ struct StepRec {
     gate_kind: Option<String>,
     /// For a `timer` gate, the wait (seconds) before auto-release.
     gate_timer_seconds: Option<i64>,
+    /// For a `plugin` gate, the Principal that releases it (ADR-0076 §7).
+    gate_releaser: Option<String>,
     /// Explicit input workspaces (subset of `needs`), or `None` = all needs.
     explicit_inputs: Option<Vec<StepId>>,
     /// Which attempt produced the denormalized `output`/`results` above —
@@ -245,6 +247,8 @@ struct InMemoryState {
     artifacts: HashMap<(RunId, String, StepId, AttemptId), scarab_engine::ArtifactRecord>,
     /// Per-attempt immutable evidence (ADR-0056).
     attempt_evidence: HashMap<(RunId, StepId, AttemptId), AttemptEvidenceRec>,
+    /// A plugin gate wait's rendered inputs (ADR-0076 §7), by its Attempt.
+    gate_inputs: HashMap<(RunId, StepId, AttemptId), serde_json::Value>,
     /// Run-scoped shared services (ADR-0058), keyed `{run, take, name}` —
     /// value is `(status, handle, created_at)`.
     #[allow(clippy::type_complexity)]
@@ -318,6 +322,7 @@ impl InMemoryDb {
                 gate_timer_seconds: None,
                 explicit_inputs: None,
                 evidence_attempt: None,
+                gate_releaser: None,
             },
         );
     }
@@ -341,6 +346,7 @@ impl InMemoryDb {
                     gate_timer_seconds: None,
                     explicit_inputs: None,
                     evidence_attempt: None,
+                    gate_releaser: None,
                 },
             );
         }
@@ -582,6 +588,14 @@ fn resolve_gate_wait_locked(
     } else {
         StepStatus::Failed
     });
+    if let (true, Some(outputs)) = (res.passed, &res.outputs) {
+        rec.results = outputs.clone();
+        rec.evidence_attempt = Some(attempt.clone());
+        st.attempt_evidence
+            .entry((run.clone(), step.clone(), attempt.clone()))
+            .or_default()
+            .results = outputs.clone();
+    }
     for kind in scarab_engine::gate_resolution_events(step, &attempt, minted, res) {
         st.events.push(EventKind {
             version: scarab_engine::EVENT_VERSION,
@@ -681,6 +695,7 @@ impl Db for InMemoryDb {
                 gate_timer_seconds: None,
                 explicit_inputs: None,
                 evidence_attempt: None,
+                gate_releaser: None,
             },
         );
         Ok(())
@@ -1252,6 +1267,110 @@ impl Db for InMemoryDb {
             .steps
             .get(&(run.clone(), step.clone()))
             .and_then(|r| r.gate_timer_seconds))
+    }
+
+    async fn set_gate_releaser(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        releaser: &str,
+    ) -> Result<(), DbError> {
+        let mut st = self.state.lock().unwrap();
+        if let Some(rec) = st.steps.get_mut(&(run.clone(), step.clone())) {
+            rec.gate_releaser = Some(releaser.to_string());
+        }
+        Ok(())
+    }
+
+    async fn gate_releaser(&self, run: &RunId, step: &StepId) -> Result<Option<String>, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .steps
+            .get(&(run.clone(), step.clone()))
+            .and_then(|r| r.gate_releaser.clone()))
+    }
+
+    async fn set_gate_wait_inputs(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        inputs: &serde_json::Value,
+    ) -> Result<bool, DbError> {
+        let mut st = self.state.lock().unwrap();
+        let running = st
+            .steps
+            .get(&(run.clone(), step.clone()))
+            .and_then(|r| r.attempts.iter().find(|a| &a.id == attempt))
+            .is_some_and(|a| a.outcome == AttemptOutcome::Running);
+        let key = (run.clone(), step.clone(), attempt.clone());
+        if !running || st.gate_inputs.contains_key(&key) {
+            return Ok(false);
+        }
+        st.gate_inputs.insert(key, inputs.clone());
+        Ok(true)
+    }
+
+    async fn gate_wait_inputs(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<Option<serde_json::Value>, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .gate_inputs
+            .get(&(run.clone(), step.clone(), attempt.clone()))
+            .cloned())
+    }
+
+    async fn pending_plugin_gates(
+        &self,
+        org: &str,
+        releaser: &str,
+        after: Option<&scarab_engine::PendingGateKey>,
+        limit: u32,
+    ) -> Result<Vec<scarab_engine::PendingGateWait>, DbError> {
+        let st = self.state.lock().unwrap();
+        let mut out: Vec<scarab_engine::PendingGateWait> = Vec::new();
+        for ((run, step), rec) in &st.steps {
+            if st.run_tenant.get(run).map(|(o, _)| o.as_str()) != Some(org)
+                || rec.gate_kind.as_deref() != Some("plugin")
+                || rec.gate_releaser.as_deref() != Some(releaser)
+                || rec.status != Some(StepStatus::Pending)
+            {
+                continue;
+            }
+            for a in rec
+                .attempts
+                .iter()
+                .filter(|a| a.outcome == AttemptOutcome::Running)
+            {
+                let Some(inputs) = st
+                    .gate_inputs
+                    .get(&(run.clone(), step.clone(), a.id.clone()))
+                else {
+                    continue;
+                };
+                out.push(scarab_engine::PendingGateWait {
+                    run: run.clone(),
+                    step: step.clone(),
+                    attempt: a.id.clone(),
+                    started_at: a.started_at,
+                    inputs: inputs.clone(),
+                });
+            }
+        }
+        out.sort_by_key(|w| w.key());
+        Ok(out
+            .into_iter()
+            .filter(|w| after.is_none_or(|k| &w.key() > k))
+            .take(limit as usize)
+            .collect())
     }
 
     async fn create_run_service(
@@ -1874,6 +1993,7 @@ impl Db for InMemoryDb {
                 fence: None,
                 legacy_started_at: at,
                 at,
+                outputs: None,
             };
             resolve_gate_wait_locked(&mut st, run, step, &release);
         }

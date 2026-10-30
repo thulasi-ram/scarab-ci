@@ -1137,7 +1137,7 @@ pub async fn reject_gate(
     };
     if !matches!(
         gate.gate_kind.as_deref(),
-        Some("manual") | Some("timer") | Some("external")
+        Some("manual") | Some("timer") | Some("external") | Some("plugin")
     ) {
         return Err(RerunError::NotARejectableGate(step.clone()));
     }
@@ -1158,6 +1158,138 @@ pub async fn reject_gate(
     let resolved = resolve_gate(db, clock, run, gate, &verdict, Some(by.to_string()), None).await?;
     if resolved {
         reopen_if_runnable(db, clock, run).await?;
+    }
+    Ok(resolved)
+}
+
+/// A plugin's answer to one of its gates (ADR-0076 §7).
+#[derive(Debug, Clone)]
+pub struct PluginGateVerdict {
+    /// `true` releases the gate with `outputs`; `false` fails it with
+    /// `reason`.
+    pub passed: bool,
+    /// Why the gate failed (required, already bounded, when `passed` is
+    /// false).
+    pub reason: Option<String>,
+    /// The outputs of a release, checked here against what the gate
+    /// declares.
+    pub outputs: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Why a plugin's answer to a gate was not taken (ADR-0076 §7).
+#[derive(Debug, thiserror::Error)]
+pub enum PluginGateError {
+    /// No such gate for this releaser: an unknown step, a gate of another
+    /// kind (a manual gate never takes a plugin's answer), or a plugin gate
+    /// another installation releases. One answer for all of them, so a
+    /// plugin learns nothing about gates that are not its own.
+    #[error("no such plugin gate")]
+    NotFound,
+    /// The gate is not waiting on this answer: not reached, already
+    /// resolved, or `attempt` is not its open wait (superseded or retried).
+    #[error("the gate is not waiting on this answer: {0}")]
+    NotWaiting(String),
+    /// The wait passed its `gate_expires_after`; the scheduler fails it.
+    #[error("the gate expired {0}s after its needs finished; it can no longer be released")]
+    Expired(i64),
+    /// The outputs do not match what the gate declares.
+    #[error("{0}")]
+    Invalid(String),
+    #[error(transparent)]
+    Db(#[from] DbError),
+}
+
+/// Resolve plugin gate `step` of `run` as `releaser` (`plugin:<installation>`)
+/// answering its wait `attempt` (ADR-0076 §7). The machine path: no
+/// approval, no step-up. Taken only when the gate is of kind `plugin`, names
+/// `releaser`, is reached and still waits on `attempt`, and has not passed
+/// its expiry; a release's outputs must be exactly what the gate declares,
+/// of their types. The verdict is journalled `by` the releaser and fenced on
+/// `attempt`, so an answer to a superseded or retried wait is dropped.
+/// Returns whether this call resolved the gate (`false`: a racing resolver
+/// got there first). The caller checks the Run's org.
+pub async fn resolve_plugin_gate(
+    db: &dyn Db,
+    clock: &dyn Clock,
+    run: &RunId,
+    step: &StepId,
+    releaser: &str,
+    attempt: &AttemptId,
+    verdict: PluginGateVerdict,
+) -> Result<bool, PluginGateError> {
+    let steps = db.steps_of_run(run).await?;
+    let Some(gate) = steps
+        .iter()
+        .find(|s| &s.step == step && s.gate_kind.as_deref() == Some("plugin"))
+    else {
+        return Err(PluginGateError::NotFound);
+    };
+    if db.gate_releaser(run, step).await?.as_deref() != Some(releaser) {
+        return Err(PluginGateError::NotFound);
+    }
+    if gate.status != StepStatus::Pending {
+        return Err(PluginGateError::NotWaiting(format!(
+            "it is {:?}",
+            gate.status
+        )));
+    }
+    if !gate_reached(gate, &steps) {
+        return Err(PluginGateError::NotWaiting("it is not reached yet".into()));
+    }
+    let open = open_gate_attempt(gate).ok_or_else(|| {
+        PluginGateError::NotWaiting("it has no open wait".into())
+    })?;
+    if &open.id != attempt {
+        return Err(PluginGateError::NotWaiting(format!(
+            "its open wait is `{}`, not `{}`",
+            open.id.0, attempt.0
+        )));
+    }
+    let now = clock.now().await;
+    let expiry = db
+        .run_ir(run)
+        .await?
+        .as_ref()
+        .and_then(|ir| crate::render::ir_step(ir, step))
+        .and_then(|s| s.get("gate_expires_after"))
+        .and_then(|t| t.as_i64());
+    if let Some(secs) = expiry {
+        if now.0 >= open.started_at.0.saturating_add(secs.saturating_mul(1000)) {
+            return Err(PluginGateError::Expired(secs));
+        }
+    }
+    let (reason, outputs) = if verdict.passed {
+        let declared = crate::render::gate_declared_outputs(db, run, step)
+            .await?
+            .ok_or(PluginGateError::NotFound)?;
+        let outputs = scarab_pipeline::check_gate_outputs(&declared, &verdict.outputs)
+            .map_err(PluginGateError::Invalid)?;
+        (format!("released by {releaser}"), Some(outputs))
+    } else {
+        let reason = verdict
+            .reason
+            .filter(|r| !r.trim().is_empty())
+            .ok_or_else(|| PluginGateError::Invalid("a fail needs a reason".into()))?;
+        (reason, None)
+    };
+    let res = GateResolution {
+        passed: verdict.passed,
+        reason,
+        expired: false,
+        by: Some(releaser.to_string()),
+        fence: Some(attempt.clone()),
+        legacy_started_at: now,
+        at: now,
+        outputs,
+    };
+    let resolved = db.resolve_gate_wait(run, step, &res).await?.is_some();
+    if resolved {
+        reopen_if_runnable(db, clock, run)
+            .await
+            .map_err(|e| match e {
+                RerunError::Db(e) => PluginGateError::Db(e),
+                other => PluginGateError::NotWaiting(other.to_string()),
+            })?;
     }
     Ok(resolved)
 }
@@ -1371,6 +1503,7 @@ async fn resolve_gate(
         fence,
         legacy_started_at,
         at: now,
+        outputs: None,
     };
     Ok(db.resolve_gate_wait(run, &gate.step, &res).await?.is_some())
 }
@@ -3790,6 +3923,45 @@ impl<'a> Scheduler<'a> {
                     }
                 }
             };
+            // A plugin gate's inputs render once, when it is reached
+            // (ADR-0076 §7), and are stored on this wait before the plugin
+            // can list it. One that does not render fails the gate with the
+            // reason.
+            if gate.gate_kind.as_deref() == Some("plugin")
+                && self
+                    .db
+                    .gate_wait_inputs(run, &gate.step, &attempt.id)
+                    .await?
+                    .is_none()
+            {
+                match crate::render::render_gate_inputs(self.db, run, &gate.step, &gate.needs)
+                    .await?
+                {
+                    Ok(inputs) => {
+                        self.db
+                            .set_gate_wait_inputs(run, &gate.step, &attempt.id, &inputs)
+                            .await?;
+                    }
+                    Err(reason) => {
+                        let verdict = GateVerdict {
+                            passed: false,
+                            reason: format!("its inputs do not render: {reason}"),
+                            expired: false,
+                        };
+                        resolve_gate(
+                            self.db,
+                            self.clock,
+                            run,
+                            gate,
+                            &verdict,
+                            None,
+                            Some(attempt.id.clone()),
+                        )
+                        .await?;
+                        continue;
+                    }
+                }
+            }
             if settings.is_none() {
                 settings = Some(self.gate_settings(run).await?);
             }

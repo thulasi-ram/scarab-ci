@@ -618,6 +618,51 @@ pub trait Db: Send + Sync {
     /// gate (or is unknown). Read at admission to decide auto-release.
     async fn gate_timer_seconds(&self, run: &RunId, step: &StepId) -> Result<Option<i64>, DbError>;
 
+    /// Name the Principal that may release gate `step` (ADR-0076 §7): for a
+    /// `plugin` gate, `plugin:<installation>`. Written at Run creation, once.
+    async fn set_gate_releaser(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        releaser: &str,
+    ) -> Result<(), DbError>;
+
+    /// The Principal that may release gate `step`, if one is named.
+    async fn gate_releaser(&self, run: &RunId, step: &StepId) -> Result<Option<String>, DbError>;
+
+    /// Store `inputs` on gate `step`'s wait `attempt` (ADR-0076 §7: a plugin
+    /// gate's inputs, rendered when it is reached). Only while `attempt` is
+    /// still `Running` and holds none: a wait's inputs are written once.
+    /// Returns whether they were stored.
+    async fn set_gate_wait_inputs(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        inputs: &serde_json::Value,
+    ) -> Result<bool, DbError>;
+
+    /// The inputs stored on gate `step`'s wait `attempt`, if any.
+    async fn gate_wait_inputs(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<Option<serde_json::Value>, DbError>;
+
+    /// The open waits of `plugin` gates released by `releaser` in Runs of org
+    /// `org` (ADR-0076 §7): the gate `Pending`, its last Attempt `Running`
+    /// with its inputs stored. Ordered by [`PendingGateKey`], those after
+    /// `after`, at most `limit`. The org is the Run's tenant org: a Run with
+    /// none is in no org's list.
+    async fn pending_plugin_gates(
+        &self,
+        org: &str,
+        releaser: &str,
+        after: Option<&crate::PendingGateKey>,
+        limit: u32,
+    ) -> Result<Vec<crate::PendingGateWait>, DbError>;
+
     /// Create the durable [`RunService`] row for a shared service (ADR-0058),
     /// born in [`ServiceStatus::Starting`]. Idempotent on `{run, take, name}` —
     /// a re-create (crash resume, re-tick) is a no-op, never a second instance.
