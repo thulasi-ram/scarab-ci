@@ -2868,6 +2868,7 @@ name = "scarab-plugin"
 version = "0.2.2"
 dependencies = [
  "async-trait",
+ "scarab-pipeline",
  "scarab-project",
  "serde",
  "serde_json",

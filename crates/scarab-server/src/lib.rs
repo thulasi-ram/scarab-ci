@@ -11187,6 +11187,8 @@ impl utoipa::Modify for StepUpResponses {
         plugins::RequestRuleDto,
         plugins::ConnectionSlotDto,
         plugins::PluginManifestDto,
+        plugins::GateDefinitionDto,
+        plugins::GateFieldDto,
         plugins::PluginCatalogEntryDto,
         plugins::InstallationStateDto,
         plugins::RuntimeStatusDto,

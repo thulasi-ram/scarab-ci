@@ -1,34 +1,84 @@
 {
   "plugin": "argocd",
-  "capabilities": ["use_connection"],
+  "capabilities": [
+    "use_connection",
+    "resolve_gates"
+  ],
   "connections": [
     {
       "name": "argocd",
-      "auth_schemes": ["bearer"],
+      "auth_schemes": [
+        "bearer"
+      ],
       "read_rules": [
-        { "method": "GET", "path": "/api/version" },
+        {
+          "method": "GET",
+          "path": "/api/version"
+        },
         {
           "method": "GET",
           "path": "/api/v1/applications",
-          "query": ["projects", "selector", "appNamespace"]
+          "query": [
+            "projects",
+            "selector",
+            "appNamespace"
+          ]
         },
         {
           "method": "GET",
           "path": "/api/v1/applications/*",
-          "query": ["appNamespace", "project"]
+          "query": [
+            "appNamespace",
+            "project"
+          ]
         },
         {
           "method": "GET",
           "path": "/api/v1/applications/*/managed-resources",
-          "query": ["appNamespace", "project"]
+          "query": [
+            "appNamespace",
+            "project"
+          ]
         },
         {
           "method": "GET",
           "path": "/api/v1/stream/applications",
-          "query": ["resourceVersion", "appNamespace", "projects", "name", "selector"]
+          "query": [
+            "resourceVersion",
+            "appNamespace",
+            "projects",
+            "name",
+            "selector"
+          ]
         }
       ]
     }
   ],
-  "config_keys": []
+  "config_keys": [],
+  "gates": {
+    "wait-live": {
+      "description": "Pass when Argo CD reports the Application synced, healthy and serving the given image; fail when Argo CD has given up on its sync.",
+      "interface": {
+        "inputs": [
+          {
+            "name": "app",
+            "type": "string",
+            "description": "The Argo CD Application name."
+          },
+          {
+            "name": "image",
+            "type": "string",
+            "description": "An image reference the Application must render, as written in its manifests."
+          }
+        ],
+        "outputs": [
+          {
+            "name": "revision",
+            "type": "string",
+            "description": "The git revision Argo CD synced."
+          }
+        ]
+      }
+    }
+  }
 }

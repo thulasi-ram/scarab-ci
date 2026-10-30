@@ -430,6 +430,7 @@ fn installation(image: &str) -> PluginInstallation {
                 }],
             }],
             config_keys: vec![],
+            gates: Default::default(),
         },
         manifest_sha256: "f".repeat(64),
         config: BTreeMap::new(),

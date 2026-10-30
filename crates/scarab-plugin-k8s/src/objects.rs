@@ -600,6 +600,7 @@ mod tests {
                 capabilities: vec![PluginCapability::UseConnection],
                 connections: vec![],
                 config_keys: vec!["ARGOCD_UI_URL".into()],
+                gates: Default::default(),
             },
             manifest_sha256: "f".repeat(64),
             config: BTreeMap::from([(
