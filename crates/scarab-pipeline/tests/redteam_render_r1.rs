@@ -18,6 +18,7 @@ fn files(entries: &[(&str, &str)]) -> Libraries {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
         installed: BTreeMap::new(),
+        plugin_gates: Default::default(),
     }
 }
 

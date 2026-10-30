@@ -30,6 +30,7 @@ fn installed(name: &str, content: &str) -> Libraries {
                 source: format!("github.com/acme/libs//x.yaml@{}", "1".repeat(40)),
             },
         )]),
+        plugin_gates: Default::default(),
     }
 }
 

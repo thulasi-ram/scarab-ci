@@ -175,9 +175,19 @@ pub fn compile(sources: &Sources) -> Result<scarab_pipeline::PipelineIr, ()> {
             "unresolved: `lib:{name}` is installed on the server, not on disk; its Steps were              not checked (use --server to check them)"
         );
     }
+    let all =
+        std::iter::once(sources.yaml.as_str()).chain(sources.libs.values().map(String::as_str));
+    let plugin_gates = scarab_pipeline::unresolved_plugin_gate_stubs(all);
+    for name in plugin_gates.keys() {
+        println!(
+            "unresolved: `plugin:{name}` is a gate of a plugin installed on the server; its \
+             inputs and output types were not checked (use --server to check them)"
+        );
+    }
     let libraries = scarab_pipeline::Libraries {
         files: sources.libs.clone(),
         installed,
+        plugin_gates,
     };
     match scarab_pipeline::compile_with_libraries(&sources.yaml, &libraries) {
         Ok(ir) => Ok(ir),

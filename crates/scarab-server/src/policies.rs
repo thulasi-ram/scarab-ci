@@ -1268,6 +1268,7 @@ async fn pipeline_input(
     let libraries = scarab_pipeline::Libraries {
         files: p.libs,
         installed,
+        plugin_gates: Default::default(),
     };
     let (ir, _) = crate::compile_bounded(p.yaml, libraries)
         .await

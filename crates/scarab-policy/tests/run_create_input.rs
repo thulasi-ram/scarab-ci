@@ -139,6 +139,7 @@ steps:
         &scarab_pipeline::Libraries {
             files: [("l.yaml".to_string(), lib.to_string())].into(),
             installed: Default::default(),
+            plugin_gates: Default::default(),
         },
     )
     .unwrap();

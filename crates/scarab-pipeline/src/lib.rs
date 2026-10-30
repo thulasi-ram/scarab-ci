@@ -27,7 +27,7 @@ pub mod params;
 pub mod render;
 pub mod scope;
 
-pub use render::{preview_image, render, Facts, Rendered, Results, Templates};
+pub use render::{preview_image, render, render_inputs, Facts, Rendered, Results, Templates};
 pub use scope::{Binding, BoundValue, Guard, OutputSource, Scope, ScopeInputs};
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -176,18 +176,103 @@ pub enum PipelineKind {
 /// manual dispatch). `inputs` are the **typed launch parameters** the caller
 /// supplies (via `with:` for an invoke, or a launch `params` map); `outputs` are
 /// the names the pipeline exposes, each of which must be one of its step ids.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Interface {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<ParamSpec>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub outputs: Vec<String>,
+    pub outputs: Vec<OutputSpec>,
 }
 
 impl Interface {
     pub fn is_empty(&self) -> bool {
         self.inputs.is_empty() && self.outputs.is_empty()
+    }
+
+    /// The declared output names, in order.
+    pub fn output_names(&self) -> Vec<String> {
+        self.outputs.iter().map(|o| o.name.clone()).collect()
+    }
+}
+
+/// One output an [`Interface`] declares (ADR-0076 §7). A library names one of
+/// its Step ids, whose results a caller reads; a plugin gate names a value
+/// its plugin returns when it releases the gate, of the declared `type`. A
+/// bare string is `{ name, type: string }`, and is written back as one, so a
+/// library's interface reads as it always did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputSpec {
+    pub name: String,
+    /// The type a plugin gate's value must have: `string`, `boolean` or
+    /// `number`. Only a plugin gate's outputs are typed; a library output
+    /// is a Step's results and is always `string`.
+    pub r#type: ParamType,
+    pub description: Option<String>,
+}
+
+impl OutputSpec {
+    /// A `string` output named `name`.
+    pub fn named(name: impl Into<String>) -> Self {
+        OutputSpec {
+            name: name.into(),
+            r#type: ParamType::String,
+            description: None,
+        }
+    }
+}
+
+impl Serialize for OutputSpec {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        if self.r#type == ParamType::String && self.description.is_none() {
+            return serializer.serialize_str(&self.name);
+        }
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("name", &self.name)?;
+        map.serialize_entry("type", &self.r#type)?;
+        if let Some(d) = &self.description {
+            map.serialize_entry("description", d)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for OutputSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Full {
+            name: String,
+            #[serde(rename = "type", default)]
+            r#type: ParamType,
+            #[serde(default)]
+            description: Option<String>,
+        }
+        /// Dispatched on the shape, like [`ParamSpec`], so a misspelled key
+        /// is named in the error.
+        struct FormVisitor;
+        impl<'de> serde::de::Visitor<'de> for FormVisitor {
+            type Value = OutputSpec;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an output name, or an output map with a `name`")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<OutputSpec, E> {
+                Ok(OutputSpec::named(v))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<OutputSpec, A::Error> {
+                let f = Full::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                Ok(OutputSpec {
+                    name: f.name,
+                    r#type: f.r#type,
+                    description: f.description,
+                })
+            }
+        }
+        deserializer.deserialize_any(FormVisitor)
     }
 }
 
@@ -340,7 +425,10 @@ const CONCURRENCY_POLICIES: [&str; 2] = ["queue", "cancel-in-progress"];
 /// and gates can fail with a reason (ADR-0070 §9). `deployment` was a fourth
 /// kind until ADR-0074 removed the Deployment record; the check refuses it
 /// with [`RETIRED_DEPLOYMENTS`].
-const GATE_KINDS: [&str; 3] = ["manual", "timer", "external"];
+///
+/// `plugin` (ADR-0076 §7) is released by a plugin installation and comes only
+/// from `invoke: plugin:<installation>/<gate>`.
+const GATE_KINDS: [&str; 4] = ["manual", "timer", "external", "plugin"];
 
 /// The Pipeline check's answer to a `clone:` Step, removed by ADR-0076 §9:
 /// it names the library that replaces it.
@@ -654,6 +742,180 @@ pub struct StepSpec {
     /// Written only by the compiler, like [`scope`](Self::scope).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub guards: Vec<Guard>,
+    /// For a `gate: plugin` node, the plugin gate it waits on (ADR-0076 §7):
+    /// the installation that releases it, the gate's name in that plugin's
+    /// manifest, and the outputs the plugin must return. Written only by the
+    /// compiler from `invoke: plugin:<installation>/<gate>`, like
+    /// [`origin`](Self::origin): an authored one is a compile error. The
+    /// gate's inputs are its [`scope`](Self::scope)'s bindings, rendered when
+    /// the gate is reached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_gate: Option<PluginGateSpec>,
+}
+
+/// What a `gate: plugin` node waits on (ADR-0076 §7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginGateSpec {
+    /// The installation, in the Run's org, whose plugin releases the gate.
+    pub installation: String,
+    /// The gate's name in the plugin's manifest.
+    pub gate: String,
+    /// What the plugin returns on a release, each value of its type. A
+    /// release must hold exactly these ([`check_gate_outputs`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outputs: Vec<OutputSpec>,
+}
+
+impl PluginGateSpec {
+    /// The Principal that may release the gate: `plugin:<installation>`.
+    pub fn releaser(&self) -> String {
+        format!("plugin:{}", self.installation)
+    }
+}
+
+/// A gate a plugin installed in the caller's org declares (ADR-0076 §7), as
+/// the caller hands it to the compiler: its interface, and the approved
+/// manifest it comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginGateDef {
+    /// `inputs` are checked against the caller's `with:`; `outputs` are what
+    /// the plugin returns.
+    pub interface: Interface,
+    /// SHA-256 of the installation's approved manifest, recorded as the
+    /// gate's `origin` content hash.
+    pub manifest_sha256: String,
+}
+
+/// The most bytes of output one plugin gate release may carry, as JSON: the
+/// cap on a Step's results (ADR-0041).
+pub const MAX_GATE_OUTPUT_BYTES: usize = 64 * 1024;
+
+/// Check a plugin's outputs against what its gate declares (ADR-0076 §7):
+/// exactly the declared names, each of its declared type (`string`,
+/// `boolean` or `number`; nothing is converted), at most
+/// [`MAX_GATE_OUTPUT_BYTES`] in all. What is returned is stored as the
+/// gate's results; a downstream Step reads it as `${{ outputs.<gate>.<name>
+/// }}`, a value from outside the Pipeline ([`ValueSource::Outside`]).
+pub fn check_gate_outputs(
+    declared: &[OutputSpec],
+    got: &serde_json::Map<String, serde_json::Value>,
+) -> Result<BTreeMap<String, serde_json::Value>, String> {
+    let size = serde_json::to_vec(got).map(|v| v.len()).unwrap_or(usize::MAX);
+    if size > MAX_GATE_OUTPUT_BYTES {
+        return Err(format!(
+            "the outputs are {size} bytes; at most {MAX_GATE_OUTPUT_BYTES} are kept"
+        ));
+    }
+    let names = || {
+        declared
+            .iter()
+            .map(|o| o.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if let Some(extra) = got.keys().find(|k| !declared.iter().any(|o| &o.name == *k)) {
+        return Err(format!(
+            "output `{}` is not one the gate declares (it declares: [{}])",
+            extra.escape_debug(),
+            names()
+        ));
+    }
+    let mut out = BTreeMap::new();
+    for o in declared {
+        let Some(v) = got.get(&o.name) else {
+            return Err(format!(
+                "output `{}` is missing; a release returns every output the gate declares \
+                 ([{}])",
+                o.name,
+                names()
+            ));
+        };
+        let ok = match o.r#type {
+            ParamType::String => v.is_string(),
+            ParamType::Boolean => v.is_boolean(),
+            ParamType::Number => v.is_number(),
+            ParamType::Choice => false,
+        };
+        if !ok {
+            return Err(format!(
+                "output `{}` must be a {}, got `{}`",
+                o.name,
+                param_type_name(o.r#type),
+                json_kind(v)
+            ));
+        }
+        out.insert(o.name.clone(), v.clone());
+    }
+    Ok(out)
+}
+
+/// The wire name of a [`ParamType`].
+fn param_type_name(t: ParamType) -> &'static str {
+    match t {
+        ParamType::String => "string",
+        ParamType::Boolean => "boolean",
+        ParamType::Number => "number",
+        ParamType::Choice => "choice",
+    }
+}
+
+/// The JSON kind of `v`, for a message.
+fn json_kind(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// Check a plugin gate's declared [`Interface`] (ADR-0076 §7): its inputs as
+/// any launch parameter's ([`params::validate_param_specs`]); its outputs
+/// named as a result is (`[A-Za-z0-9_-]`, 1-64), distinct, and of a type
+/// a release can be checked against (`string`, `boolean`, `number`).
+/// Each problem is pushed onto `diagnostics`, prefixed with `what`.
+pub fn validate_gate_interface(iface: &Interface, what: &str, diagnostics: &mut Vec<String>) {
+    params::validate_param_specs(&iface.inputs, what, diagnostics);
+    for p in &iface.inputs {
+        if p.default
+            .as_ref()
+            .is_some_and(|d| d.to_string().contains("${{"))
+        {
+            diagnostics.push(format!(
+                "{what}: input `{}` has a default holding `${{{{ … }}}}`; a default is a plain \
+                 value",
+                p.name
+            ));
+        }
+    }
+    let mut seen = BTreeSet::new();
+    for o in &iface.outputs {
+        let name_ok = !o.name.is_empty()
+            && o.name.len() <= 64
+            && o
+                .name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+        if !name_ok {
+            diagnostics.push(format!(
+                "{what}: output `{}` must be 1-64 of `A-Z`, `a-z`, `0-9`, `_`, `-`",
+                o.name.escape_debug()
+            ));
+        }
+        if !seen.insert(o.name.as_str()) {
+            diagnostics.push(format!("{what}: output `{}` is declared twice", o.name));
+        }
+        if o.r#type == ParamType::Choice {
+            diagnostics.push(format!(
+                "{what}: output `{}` is a `choice`; an output is a `string`, `boolean` or \
+                 `number`",
+                o.name
+            ));
+        }
+    }
 }
 
 /// The kind of one link in an invoke chain (ADR-0076). The compiler writes
@@ -1229,6 +1491,11 @@ pub struct Libraries {
     /// `lib:` targets: `<publisher>/<name>` → the library installed in the
     /// caller's org. A name missing here is "not installed in this org".
     pub installed: BTreeMap<String, InstalledLibrary>,
+    /// `plugin:` targets: `<installation>/<gate>` → a gate a plugin
+    /// installed in the caller's org declares, for an installation that may
+    /// resolve gates (ADR-0076 §7). A name missing here is "not a gate of a
+    /// plugin installed in this org".
+    pub plugin_gates: BTreeMap<String, PluginGateDef>,
 }
 
 /// Compile authored YAML into a validated [`PipelineIr`], resolving `invoke:
@@ -1244,6 +1511,7 @@ pub fn compile_yaml_with_libs(
         LibsRef {
             files: libs,
             installed: &BTreeMap::new(),
+            plugin_gates: &BTreeMap::new(),
             work: &Default::default(),
         },
     )
@@ -1275,6 +1543,7 @@ pub fn compile_with_libraries(
         LibsRef {
             files: &libraries.files,
             installed: &libraries.installed,
+            plugin_gates: &libraries.plugin_gates,
             work: &Default::default(),
         },
     )
@@ -1286,6 +1555,7 @@ pub fn compile_with_libraries(
 struct LibsRef<'a> {
     files: &'a BTreeMap<String, String>,
     installed: &'a BTreeMap<String, InstalledLibrary>,
+    plugin_gates: &'a BTreeMap<String, PluginGateDef>,
     work: &'a std::cell::RefCell<Work>,
 }
 
@@ -1364,7 +1634,7 @@ impl LibsRef<'_> {
             .admit(written, src)
             .then(|| serde_yaml::from_str::<Shallow>(src).ok())
             .flatten()
-            .map(|l| l.interface.outputs);
+            .map(|l| l.interface.output_names());
         parsed.exposed.insert(written.to_string(), done.clone());
         done
     }
@@ -1629,6 +1899,68 @@ pub fn unresolved_library_stubs<'a>(
         .collect()
 }
 
+/// For a check with no server (`scarab validate` offline): a stand-in for
+/// each `plugin:` target that `sources` invoke, like
+/// [`unresolved_library_stubs`]. A stand-in declares the inputs the callers
+/// pass, as optional strings, and a `string` output for each output they
+/// read, so the rest of the Pipeline can be checked; the gate's own types are
+/// not. The names of the targets stood in for are the keys.
+pub fn unresolved_plugin_gate_stubs<'a>(
+    sources: impl IntoIterator<Item = &'a str>,
+) -> BTreeMap<String, PluginGateDef> {
+    let mut wanted: BTreeMap<String, (BTreeSet<String>, BTreeSet<String>)> = BTreeMap::new();
+    for src in sources {
+        let Ok(authored) = serde_yaml::from_str::<PipelineIr>(src) else {
+            continue;
+        };
+        for step in &authored.steps {
+            let Some(Ok(InvokeTarget::Plugin(name))) =
+                step.invoke.as_deref().map(parse_invoke_target)
+            else {
+                continue;
+            };
+            let entry = wanted.entry(name).or_default();
+            entry.0.extend(step.with.keys().cloned());
+            let needle = format!("outputs.{}.", step.id);
+            let mut rest = src;
+            while let Some(at) = rest.find(&needle) {
+                rest = &rest[at + needle.len()..];
+                let out: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                    .collect();
+                if !out.is_empty() {
+                    entry.1.insert(out);
+                }
+            }
+        }
+    }
+    wanted
+        .into_iter()
+        .map(|(name, (inputs, outputs))| {
+            let def = PluginGateDef {
+                interface: Interface {
+                    inputs: inputs
+                        .into_iter()
+                        .map(|i| ParamSpec {
+                            name: i,
+                            r#type: ParamType::String,
+                            required: false,
+                            default: Some(serde_json::Value::String(String::new())),
+                            options: None,
+                            validate: None,
+                            description: None,
+                        })
+                        .collect(),
+                    outputs: outputs.into_iter().map(OutputSpec::named).collect(),
+                },
+                manifest_sha256: "0".repeat(64),
+            };
+            (name, def)
+        })
+        .collect()
+}
+
 /// Check that `content` can be installed as `lib:<qualified>` (ADR-0076 §4):
 /// it is a library (`kind: library`, no `on:`), it is closed (it invokes only
 /// `lib:` and `plugin:` targets), every `lib:` it invokes is in `installed`,
@@ -1683,6 +2015,7 @@ pub fn check_installed_library(
         &Libraries {
             files: BTreeMap::new(),
             installed: all,
+            plugin_gates: Default::default(),
         },
     ) {
         Ok(_) => Ok(()),
@@ -1735,6 +2068,12 @@ impl InvokeTarget {
             InvokeTarget::Plugin(n) => format!("plugin:{n}"),
         }
     }
+}
+
+/// Whether `raw` is an `invoke: plugin:…` target, which inlines one gate node
+/// with the invoke step's own id.
+fn is_plugin_invoke(raw: &str) -> bool {
+    matches!(parse_invoke_target(raw), Ok(InvokeTarget::Plugin(_)))
 }
 
 /// Parse an `invoke:` value into its [`InvokeTarget`] (ADR-0076 §1). Every
@@ -2168,6 +2507,7 @@ fn inline_level(
         for (field, set) in [
             ("scope", step.scope.is_some()),
             ("guards", !step.guards.is_empty()),
+            ("plugin_gate", step.plugin_gate.is_some()),
         ] {
             if set {
                 let place = match stack.last() {
@@ -2292,11 +2632,38 @@ fn inline_level(
                     continue;
                 }
             },
-            InvokeTarget::Plugin(_) => {
-                diagnostics.push(format!(
-                    "step `{}`: plugin gates are not available yet (`invoke: {written}`)",
-                    step.id
-                ));
+            InvokeTarget::Plugin(target) => {
+                let Some(def) = libs.plugin_gates.get(target) else {
+                    diagnostics.push(format!(
+                        "step `{}`: `{written}` is not a gate of a plugin installed in this org \
+                         (an org admin installs the plugin, with the `resolve_gates` \
+                         capability, under the installation name before the `/`)",
+                        step.id
+                    ));
+                    continue;
+                };
+                let gates = plugin_gate_nodes(
+                    step,
+                    target,
+                    def,
+                    level,
+                    steps,
+                    &exposed,
+                    &mut libs.work.borrow_mut().matrix,
+                    diagnostics,
+                );
+                if step.matrix.is_some() {
+                    seam.insert(
+                        step.id.clone(),
+                        gates.iter().map(|g| g.id.clone()).collect(),
+                    );
+                }
+                for gate in gates {
+                    out.push(gate);
+                    if capped(&out, &format!("step `{}`", step.id), budget, diagnostics) {
+                        return out;
+                    }
+                }
                 continue;
             }
         };
@@ -2386,89 +2753,20 @@ fn inline_level(
         // kept as written, rendered in this level's scope when a Step of the
         // library launches. A `with:` template is checked like any template
         // written here.
-        let at = match level.library {
-            Some((l, _)) => format!("library `{l}`, step `{}`:", step.id),
-            None => format!("step `{}`:", step.id),
-        };
-        let who = format!("{at} `with:`");
-        let mut bindings: BTreeMap<String, Binding> = BTreeMap::new();
-        let mut late: BTreeSet<String> = BTreeSet::new();
-        let mut with_reads: OutputNames = Vec::new();
-        let mut unresolved: Vec<String> = Vec::new();
-        for p in &lib.interface.inputs {
-            let value = match step.with.get(&p.name) {
-                Some(raw) if raw.contains("${{") => {
-                    if let Err(e) = cel::check_interpolation(raw) {
-                        diagnostics.push(format!("{at} `with.{}` {e}", p.name));
-                        continue;
-                    }
-                    let mut reads = Vec::new();
-                    let mut errors = Vec::new();
-                    check_reads(
-                        raw,
-                        Written::Template,
-                        level,
-                        &format!("with.{}", p.name),
-                        &mut reads,
-                        &mut errors,
-                    );
-                    diagnostics.extend(errors.into_iter().map(|e| format!("{at} {e}")));
-                    if !reads.is_empty() || reads_late_inputs(raw, level.late) {
-                        late.insert(p.name.clone());
-                    }
-                    with_reads.extend(reads);
-                    BoundValue::Template(raw.clone())
-                }
-                Some(raw) => {
-                    match params::resolve_one(p, &serde_json::Value::String(raw.clone())) {
-                        Ok(v) => BoundValue::Literal(v),
-                        Err(e) => {
-                            unresolved.push(format!("`{}`: {e}", p.name));
-                            continue;
-                        }
-                    }
-                }
-                None => match &p.default {
-                    Some(d) => match params::resolve_one(p, d) {
-                        Ok(v) => BoundValue::Literal(v),
-                        Err(e) => {
-                            unresolved.push(format!("`{}` (default): {e}", p.name));
-                            continue;
-                        }
-                    },
-                    // A missing required input, reported by validate_interface.
-                    None => continue,
-                },
-            };
-            let binding = match value {
-                BoundValue::Literal(v) => Binding::literal(v),
-                BoundValue::Template(t) => Binding::template(t, p),
-            };
-            bindings.insert(p.name.clone(), binding);
-        }
-        // `validate_interface` usually said why an input does not resolve;
-        // when it did not, the resolve error is the diagnostic.
-        if !unresolved.is_empty() && diagnostics.len() == before_interface {
-            diagnostics.push(format!(
-                "step `{}`: inputs for library `{label}` do not resolve: {}",
-                step.id,
-                unresolved.join("; ")
-            ));
-        }
-        // The Steps the `with:` templates read: every Step the library
-        // inlines renders them, so each needs them (the engine gives a Step
-        // the results of its own needs only). A library root already needs
-        // what the invoke Step needs, so the schedule does not change.
-        let mut with_needs: Vec<String> = Vec::new();
-        let caller_view = output_view(
-            &with_reads,
+        let BoundWith {
+            bindings,
+            late,
+            caller_view,
+            with_needs,
+        } = bind_with(
+            step,
+            &lib.interface.inputs,
+            &format!("library `{label}`"),
+            level,
             steps,
             &exposed,
-            &step.needs.0,
-            &who,
-            level,
+            before_interface,
             diagnostics,
-            &mut with_needs,
         );
         // A library's invoke `when` is decided at Run creation, in this
         // level's scope (the Pipeline file's is unchanged).
@@ -2667,6 +2965,256 @@ fn inline_level(
     out
 }
 
+/// The gate nodes `invoke: plugin:<installation>/<gate>` inlines (ADR-0076
+/// §7): one `gate: plugin` node with the invoke step's id, or one per
+/// coordinate of its `matrix`. Its releaser is the installation; its inputs
+/// are bound from `with:` like a library's ([`bind_with`]) and render in
+/// the invoke step's scope when the gate is reached; its `gate_expires_after`
+/// is required, since a gate otherwise waits forever.
+#[allow(clippy::too_many_arguments)]
+fn plugin_gate_nodes(
+    step: &StepSpec,
+    target: &str,
+    def: &PluginGateDef,
+    level: &Level<'_>,
+    siblings: &[StepSpec],
+    exposed: &BTreeMap<String, Option<Vec<String>>>,
+    matrix_work: &mut MatrixWork,
+    diagnostics: &mut Vec<String>,
+) -> Vec<StepSpec> {
+    let (installation, gate) = target.split_once('/').unwrap_or((target, ""));
+    let what = format!("plugin gate `plugin:{target}`");
+    if step.gate_expires_after.is_none() {
+        diagnostics.push(format!(
+            "step `{}`: a plugin gate must set `gate_expires_after` (seconds): nothing else \
+             ends the wait when the plugin does not answer",
+            step.id
+        ));
+    }
+    // What an invoke step carries applies to the Steps it inlines; a plugin
+    // gate is a gate, and a gate runs nothing.
+    for (field, set) in [
+        ("timeout", step.timeout.is_some()),
+        (
+            "resources",
+            step.resources.cpu_millis.is_some() || step.resources.memory_mib.is_some(),
+        ),
+        ("placement_profiles", !step.placement_profiles.is_empty()),
+        ("deploy", step.deploy),
+    ] {
+        if set {
+            diagnostics.push(format!(
+                "step `{}`: `{field}` cannot be set on a plugin gate, which runs nothing",
+                step.id
+            ));
+        }
+    }
+    let before = diagnostics.len();
+    params::validate_param_specs(&def.interface.inputs, &what, diagnostics);
+    check_with(step, &what, &def.interface.inputs, diagnostics);
+    let bound = bind_with(
+        step,
+        &def.interface.inputs,
+        &what,
+        level,
+        siblings,
+        exposed,
+        before,
+        diagnostics,
+    );
+    if let (Some((l, _)), Some(When(w))) = (level.library, &step.when) {
+        let mut errors = Vec::new();
+        check_reads(
+            w,
+            Written::Guard,
+            level,
+            "when",
+            &mut Vec::new(),
+            &mut errors,
+        );
+        diagnostics.extend(
+            errors
+                .into_iter()
+                .map(|e| format!("library `{l}`, step `{}`: {e}", step.id)),
+        );
+    }
+    let instances = match expand_step(step, matrix_work) {
+        Ok(v) => v,
+        Err(msg) => {
+            diagnostics.push(msg);
+            return Vec::new();
+        }
+    };
+    let link = OriginEntry {
+        kind: OriginKind::Plugin,
+        name: installation.to_string(),
+        source: None,
+        content_hash: def.manifest_sha256.clone(),
+    };
+    instances
+        .into_iter()
+        .map(|inv| {
+            let mut node = inv.clone();
+            node.invoke = None;
+            node.with = BTreeMap::new();
+            node.when = None;
+            node.gate = Some("plugin".to_string());
+            node.plugin_gate = Some(PluginGateSpec {
+                installation: installation.to_string(),
+                gate: gate.to_string(),
+                outputs: def.interface.outputs.clone(),
+            });
+            for n in &bound.with_needs {
+                if !node.needs.0.contains(n) {
+                    node.needs.0.push(n.clone());
+                }
+            }
+            // The `with:` templates render in the invoke step's scope: this
+            // level's, with the outputs they read and this copy's
+            // coordinate.
+            let mut caller = level.scope.clone();
+            caller.outputs = bound.caller_view.clone();
+            caller.matrix = inv.matrix_values.clone();
+            node.scope = Some(Scope {
+                inputs: ScopeInputs::Bound(bound.bindings.clone()),
+                outputs: BTreeMap::new(),
+                matrix: BTreeMap::new(),
+                caller: Some(Box::new(caller)),
+            });
+            node.origin = vec![link.clone()];
+            if let Some(When(w)) = &inv.when {
+                node.guards.push(Guard {
+                    caller_hops: 1,
+                    when: w.clone(),
+                });
+            }
+            node
+        })
+        .collect()
+}
+
+/// A library's or a plugin gate's inputs, bound by an invoke step's `with:`
+/// (ADR-0076): see [`bind_with`].
+struct BoundWith {
+    bindings: BTreeMap<String, Binding>,
+    /// The inputs bound to a template that reads `outputs`.
+    late: BTreeSet<String>,
+    /// The `outputs` view of the caller scope the templates render in.
+    caller_view: BTreeMap<String, OutputSource>,
+    /// The Steps the templates read, which every inlined node needs.
+    with_needs: Vec<String>,
+}
+
+/// Bind the inputs `inputs` (declared by `what`) from `step`'s `with:`: a
+/// literal `with:` value or a default, converted to the declared type now;
+/// a caller's template, kept as written, rendered in this level's scope
+/// when a Step of the library launches, or when a plugin gate is reached. A
+/// `with:` template is checked like any template written here.
+/// `before_interface` is the diagnostics count before the target's
+/// interface was checked.
+#[allow(clippy::too_many_arguments)]
+fn bind_with(
+    step: &StepSpec,
+    inputs: &[ParamSpec],
+    what: &str,
+    level: &Level<'_>,
+    siblings: &[StepSpec],
+    exposed: &BTreeMap<String, Option<Vec<String>>>,
+    before_interface: usize,
+    diagnostics: &mut Vec<String>,
+) -> BoundWith {
+    let at = match level.library {
+        Some((l, _)) => format!("library `{l}`, step `{}`:", step.id),
+        None => format!("step `{}`:", step.id),
+    };
+    let who = format!("{at} `with:`");
+    let mut bindings: BTreeMap<String, Binding> = BTreeMap::new();
+    let mut late: BTreeSet<String> = BTreeSet::new();
+    let mut with_reads: OutputNames = Vec::new();
+    let mut unresolved: Vec<String> = Vec::new();
+    for p in inputs {
+        let value = match step.with.get(&p.name) {
+            Some(raw) if raw.contains("${{") => {
+                if let Err(e) = cel::check_interpolation(raw) {
+                    diagnostics.push(format!("{at} `with.{}` {e}", p.name));
+                    continue;
+                }
+                let mut reads = Vec::new();
+                let mut errors = Vec::new();
+                check_reads(
+                    raw,
+                    Written::Template,
+                    level,
+                    &format!("with.{}", p.name),
+                    &mut reads,
+                    &mut errors,
+                );
+                diagnostics.extend(errors.into_iter().map(|e| format!("{at} {e}")));
+                if !reads.is_empty() || reads_late_inputs(raw, level.late) {
+                    late.insert(p.name.clone());
+                }
+                with_reads.extend(reads);
+                BoundValue::Template(raw.clone())
+            }
+            Some(raw) => {
+                match params::resolve_one(p, &serde_json::Value::String(raw.clone())) {
+                    Ok(v) => BoundValue::Literal(v),
+                    Err(e) => {
+                        unresolved.push(format!("`{}`: {e}", p.name));
+                        continue;
+                    }
+                }
+            }
+            None => match &p.default {
+                Some(d) => match params::resolve_one(p, d) {
+                    Ok(v) => BoundValue::Literal(v),
+                    Err(e) => {
+                        unresolved.push(format!("`{}` (default): {e}", p.name));
+                        continue;
+                    }
+                },
+                // A missing required input, reported by validate_interface.
+                None => continue,
+            },
+        };
+        let binding = match value {
+            BoundValue::Literal(v) => Binding::literal(v),
+            BoundValue::Template(t) => Binding::template(t, p),
+        };
+        bindings.insert(p.name.clone(), binding);
+    }
+    // `validate_interface` usually said why an input does not resolve;
+    // when it did not, the resolve error is the diagnostic.
+    if !unresolved.is_empty() && diagnostics.len() == before_interface {
+        diagnostics.push(format!(
+            "step `{}`: inputs for {what} do not resolve: {}",
+            step.id,
+            unresolved.join("; ")
+        ));
+    }
+    // The Steps the `with:` templates read: every Step the library
+    // inlines renders them, so each needs them (the engine gives a Step
+    // the results of its own needs only). A library root already needs
+    // what the invoke Step needs, so the schedule does not change.
+    let mut with_needs: Vec<String> = Vec::new();
+    let caller_view = output_view(
+        &with_reads,
+        siblings,
+        exposed,
+        &step.needs.0,
+        &who,
+        level,
+        diagnostics,
+        &mut with_needs,
+    );
+    BoundWith {
+        bindings,
+        late,
+        caller_view,
+        with_needs,
+    }
+}
+
 /// The scope that the templates written at one level of `invoke:` nesting
 /// read (ADR-0076).
 struct Level<'a> {
@@ -2800,6 +3348,11 @@ fn exposed_outputs(steps: &[StepSpec], libs: LibsRef<'_>) -> BTreeMap<String, Op
         .iter()
         .filter_map(|s| {
             let raw = s.invoke.as_ref()?;
+            // A plugin gate is one node with the invoke's id: it is read as
+            // a Step, not through a view.
+            if is_plugin_invoke(raw) {
+                return None;
+            }
             let outputs = (s.matrix.is_none())
                 .then(|| {
                     let target = parse_invoke_target(raw).ok()?;
@@ -2866,7 +3419,7 @@ fn output_view(
         // A Step here, by its id or, for a matrixed Step, one instance's id
         // (`build[os=linux]`), which its authored id fans onto.
         let sibling = siblings.iter().find(|s| {
-            s.invoke.is_none()
+            s.invoke.as_deref().is_none_or(is_plugin_invoke)
                 && (*name == s.id
                     || name
                         .strip_prefix(s.id.as_str())
@@ -3215,50 +3768,24 @@ fn validate_interface(
         }
     }
 
-    // Every required input must be supplied; a literal value must coerce to
-    // the declared type (and be a valid choice / pass `validate:`); no unknown
-    // extras. A template is converted and checked when a Step launches.
-    // Optional inputs (a `default`) may be omitted — the default is bound.
-    for p in &iface.inputs {
-        match step.with.get(&p.name) {
-            None => {
-                if p.required {
-                    diagnostics.push(format!(
-                        "step `{}`: missing required input `{}` for library `{key}`",
-                        step.id, p.name
-                    ));
-                }
-            }
-            Some(raw) if raw.contains("${{") => {}
-            Some(raw) => {
-                // `with:` values are authored as strings; coerce to the type.
-                let supplied = serde_json::Value::String(raw.clone());
-                if let Err(e) = params::resolve_one(p, &supplied) {
-                    diagnostics.push(format!(
-                        "step `{}`: input `{}` for library `{key}`: {e}",
-                        step.id, p.name
-                    ));
-                }
-            }
-        }
-    }
-    for k in step.with.keys() {
-        if !iface.inputs.iter().any(|p| &p.name == k) {
-            diagnostics.push(format!(
-                "step `{}`: unknown input `{k}` (library `{key}` declares inputs: [{}])",
-                step.id,
-                iface
-                    .inputs
-                    .iter()
-                    .map(|p| p.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-    }
+    check_with(step, &format!("library `{key}`"), &iface.inputs, diagnostics);
     // Each exposed output must name a real library step.
     let lib_ids: BTreeSet<&str> = lib.steps.iter().map(|s| s.id.as_str()).collect();
-    for name in &iface.outputs {
+    for out in &iface.outputs {
+        let name = &out.name;
+        // A library output is a Step's results: nothing checks a type on
+        // it, so declaring one would promise what is not kept.
+        if out.r#type != ParamType::String {
+            diagnostics.push(format!(
+                "step `{}`: library `{key}` declares output `{name}` as `{}`; a library \
+                 output names a Step and is not typed (only a plugin gate's outputs are)",
+                step.id,
+                serde_json::to_value(out.r#type)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_default()
+            ));
+        }
         if !lib_ids.contains(name.as_str()) {
             diagnostics.push(format!(
                 "step `{}`: library `{key}` exposes output `{name}` but has no step `{name}`",
@@ -3270,7 +3797,7 @@ fn validate_interface(
     // `${{ outputs.<invoke-id>.<name> }}`. Validate each reference — undeclared
     // output, referencing without `needs`, or referencing a matrixed invoke
     // (ambiguous per-coordinate) — at compile.
-    let exposed: BTreeSet<&str> = iface.outputs.iter().map(String::as_str).collect();
+    let exposed: BTreeSet<&str> = iface.outputs.iter().map(|o| o.name.as_str()).collect();
     let matrixed = step.matrix.is_some();
     for t in siblings {
         if t.id == step.id {
@@ -3296,7 +3823,7 @@ fn validate_interface(
                             "step `{}`: references undeclared output `outputs.{}.{field}` (library `{key}` exposes: [{}])",
                             t.id,
                             step.id,
-                            iface.outputs.join(", ")
+                            iface.output_names().join(", ")
                         ));
                     } else if !t.needs.0.contains(&step.id) {
                         // The value is only guaranteed to exist at launch if `t`
@@ -3308,6 +3835,52 @@ fn validate_interface(
                     }
                 }
             }
+        }
+    }
+}
+
+/// Check an invoke step's `with:` against the inputs its target declares
+/// (`what` names the target in messages): every required input present, a
+/// literal that converts to its type, and no unknown extras.
+fn check_with(step: &StepSpec, what: &str, inputs: &[ParamSpec], diagnostics: &mut Vec<String>) {
+    // Every required input must be supplied; a literal value must coerce to
+    // the declared type (and be a valid choice / pass `validate:`); no unknown
+    // extras. A template is converted and checked when a Step launches.
+    // Optional inputs (a `default`) may be omitted — the default is bound.
+    for p in inputs {
+        match step.with.get(&p.name) {
+            None => {
+                if p.required {
+                    diagnostics.push(format!(
+                        "step `{}`: missing required input `{}` for {what}",
+                        step.id, p.name
+                    ));
+                }
+            }
+            Some(raw) if raw.contains("${{") => {}
+            Some(raw) => {
+                // `with:` values are authored as strings; coerce to the type.
+                let supplied = serde_json::Value::String(raw.clone());
+                if let Err(e) = params::resolve_one(p, &supplied) {
+                    diagnostics.push(format!(
+                        "step `{}`: input `{}` for {what}: {e}",
+                        step.id, p.name
+                    ));
+                }
+            }
+        }
+    }
+    for k in step.with.keys() {
+        if !inputs.iter().any(|p| &p.name == k) {
+            diagnostics.push(format!(
+                "step `{}`: unknown input `{k}` ({what} declares inputs: [{}])",
+                step.id,
+                inputs
+                    .iter()
+                    .map(|p| p.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
         }
     }
 }
@@ -4181,11 +4754,18 @@ fn validate_results(step: &StepSpec, diagnostics: &mut Vec<String>) {
 /// library Step's `outputs.b` is its own library's `b`, never a Step of the
 /// same name elsewhere.
 fn validate_output_reads(ir: &PipelineIr, diagnostics: &mut Vec<String>) {
-    let declared: BTreeMap<&str, &[String]> = ir
+    // A plugin gate's results are its declared outputs (ADR-0076 §7), even
+    // when it declares none.
+    let declared: BTreeMap<&str, Vec<String>> = ir
         .steps
         .iter()
-        .filter(|s| !s.results.is_empty())
-        .map(|s| (s.id.as_str(), s.results.as_slice()))
+        .filter_map(|s| match &s.plugin_gate {
+            Some(g) => Some((
+                s.id.as_str(),
+                g.outputs.iter().map(|o| o.name.clone()).collect(),
+            )),
+            None => (!s.results.is_empty()).then(|| (s.id.as_str(), s.results.clone())),
+        })
         .collect();
     if declared.is_empty() {
         return;
@@ -4455,6 +5035,27 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                         GATE_KINDS.join(", ")
                     ));
                 }
+                // A plugin gate names its releaser, which only the compiler
+                // writes (ADR-0076 §7), and must end: nothing else answers
+                // for a plugin that does not.
+                match (kind.as_str(), &step.plugin_gate) {
+                    ("plugin", None) => diagnostics.push(format!(
+                        "step `{}`: a plugin gate comes only from `invoke: \
+                         plugin:<installation>/<gate>`",
+                        step.id
+                    )),
+                    ("plugin", Some(_)) if step.gate_expires_after.is_none() => {
+                        diagnostics.push(format!(
+                            "step `{}`: a plugin gate must set `gate_expires_after` (seconds)",
+                            step.id
+                        ))
+                    }
+                    (other, Some(_)) if other != "plugin" => diagnostics.push(format!(
+                        "step `{}`: `plugin_gate` belongs to a `gate: plugin` node only",
+                        step.id
+                    )),
+                    _ => {}
+                }
                 if !step.image.is_empty() || !step.command.is_empty() {
                     diagnostics.push(format!(
                         "step `{}`: a gate step launches nothing — it must not set an image or command",
@@ -4517,6 +5118,12 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                 }
             }
             None => {
+                if step.plugin_gate.is_some() {
+                    diagnostics.push(format!(
+                        "step `{}`: `plugin_gate` belongs to a `gate: plugin` node only",
+                        step.id
+                    ));
+                }
                 if step.image.is_empty() && !step.is_build() && step.clone.is_none() {
                     diagnostics.push(format!("step `{}`: missing image", step.id));
                 }
@@ -6258,6 +6865,7 @@ mod tests {
         let libraries = Libraries {
             files: libs(&[(".scarab/lib/a.yaml", "steps: [{ id: a, image: busybox }]")]),
             installed: BTreeMap::new(),
+            plugin_gates: Default::default(),
         };
         for (target, needle) in [
             (
@@ -6277,7 +6885,7 @@ mod tests {
             ("lib:ac me/x", "must be `lib:<publisher>/<name>`"),
             ("lib:acme/missing", "`lib:acme/missing` is not installed in this org"),
             ("plugin:argocd", "must be `plugin:<installation>/<gate>`"),
-            ("plugin:argocd/wait-live", "plugin gates are not available yet"),
+            ("plugin:argocd/wait-live", "is not a gate of a plugin installed in this org"),
         ] {
             let errs = library_errors(
                 &format!("steps: [{{ id: s, invoke: \"{target}\" }}]"),
@@ -7149,6 +7757,7 @@ mod tests {
                 ("acme/deploy", outer_src, outer),
                 ("acme/helm", inner_src, inner),
             ]),
+            plugin_gates: Default::default(),
         };
         let ir = compile_with_libraries(
             "steps: [{ id: d, invoke: file:.scarab/lib/local.yaml }]",
@@ -7189,6 +7798,7 @@ mod tests {
                 outer_src,
                 "steps: [{ id: inner, invoke: file:.scarab/lib/x.yaml }]",
             )]),
+            plugin_gates: Default::default(),
         };
         let errs = library_errors("steps: [{ id: d, invoke: \"lib:acme/open\" }]", &libraries);
         assert!(
@@ -7563,7 +8173,7 @@ mod tests {
         assert_eq!(ir.interface.inputs[0].name, "region");
         assert_eq!(ir.interface.inputs[0].r#type, ParamType::String);
         assert!(ir.interface.inputs[0].required);
-        assert_eq!(ir.interface.outputs, vec!["url".to_string()]);
+        assert_eq!(ir.interface.outputs, vec![OutputSpec::named("url")]);
         let back: PipelineIr = serde_json::from_str(&serde_json::to_string(&ir).unwrap()).unwrap();
         assert_eq!(ir, back);
     }
@@ -7906,6 +8516,7 @@ mod tests {
                 "github.com/thulasi-ram/scarab-ci//libs/clone.yaml@1111111111111111111111111111111111111111",
                 CLONE_LIBRARY,
             )]),
+            plugin_gates: Default::default(),
         }
     }
 
@@ -8043,6 +8654,7 @@ mod tests {
         let libraries = Libraries {
             files: BTreeMap::new(),
             installed: installed(&[("acme/git", "github.com/acme/l//git.yaml@1", lib)]),
+            plugin_gates: Default::default(),
         };
         let errs = library_errors(
             "steps: [{ id: c, invoke: lib:acme/git, with: { url: x, depth: '1' } }]",

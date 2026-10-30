@@ -4610,6 +4610,7 @@ async fn prefetch_libs_and_compile(
     let libraries = scarab_pipeline::Libraries {
         files: libs,
         installed: installed.clone(),
+        plugin_gates: Default::default(),
     };
     let (ir, warnings) = compile_bounded(yaml.to_string(), libraries)
         .await

@@ -301,6 +301,31 @@ pub fn preview_image(
     .unwrap_or_else(|_| image.to_string())
 }
 
+/// The inputs of a plugin gate (ADR-0076 §7), rendered once, when the gate
+/// is reached, by the same renderer a Step's launch uses: each literal as
+/// bound at compile time, each caller's template in the caller's scope with
+/// the Run's stored facts (`params`, the `results` of the gate's `needs`,
+/// `event`), converted to the input's type and checked against its
+/// `validate:`. An `Err` is the reason the gate fails. The values are data:
+/// they are stored on the wait's Attempt and handed to the plugin as JSON,
+/// never rendered again.
+pub fn render_inputs(
+    scope: &Scope,
+    params: &BTreeMap<String, Value>,
+    results: &Results,
+    event: &Map<String, Value>,
+) -> Result<BTreeMap<String, Value>, String> {
+    let bound = bind(
+        Some(scope),
+        &BTreeMap::new(),
+        params,
+        event,
+        Some(results),
+        Mode::Launch,
+    )?;
+    Ok(bound.inputs)
+}
+
 /// Evaluate a guard (`when:`) of a library Step or gate at Run creation, in
 /// `scope` (ADR-0076): `inputs` are the scope's bound inputs, `matrix` its
 /// coordinate. No Step has run, so `outputs` is not readable, and an input
