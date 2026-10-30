@@ -5325,6 +5325,33 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
             diagnostics.push("concurrency: group must not be empty".to_string());
         } else if let Err(e) = cel::check_interpolation(&c.group) {
             diagnostics.push(format!("concurrency: group {e}"));
+        } else {
+            // The group is fixed when the Run is created, from its launch
+            // inputs and its `event` values: no Step has run, so there are
+            // no `outputs`, and nothing else is there to read.
+            let mut seen = BTreeSet::new();
+            for i in cel::scan_interpolations(&c.group).0 {
+                let Ok(reads) = cel::reads(c.group[i.inner].trim()) else {
+                    continue;
+                };
+                for r in reads {
+                    if matches!(r.var.as_str(), "inputs" | "event") || !seen.insert(r.var.clone())
+                    {
+                        continue;
+                    }
+                    diagnostics.push(if r.var == "outputs" {
+                        "concurrency: group reads `outputs`; the group is fixed when the Run \
+                         is created, before any Step has run"
+                            .to_string()
+                    } else {
+                        format!(
+                            "concurrency: group reads `{}`; a group reads only `inputs` and \
+                             `event`",
+                            r.var
+                        )
+                    });
+                }
+            }
         }
         if !CONCURRENCY_POLICIES.contains(&c.policy.as_str()) {
             diagnostics.push(format!(
@@ -6225,6 +6252,26 @@ mod tests {
             diags.iter().any(|d| d.contains("concurrency: group")),
             "got {diags:?}"
         );
+    }
+
+    #[test]
+    fn a_concurrency_group_reads_only_inputs_and_event() {
+        compile(
+            r#"
+            concurrency: { group: "deploy-${{ inputs.env }}-${{ event.branch }}" }
+            steps: [{ id: a, image: busybox }]
+            "#,
+        );
+        for (group, want) in [
+            ("deploy-${{ outputs.a.x }}", "reads `outputs`"),
+            ("deploy-${{ secrets.X }}", "reads `secrets`"),
+            ("deploy-${{ matrix.os }}", "reads `matrix`"),
+        ] {
+            let diags = errors(&format!(
+                "concurrency: {{ group: \"{group}\" }}\nsteps: [{{ id: a, image: busybox }}]\n"
+            ));
+            assert!(diags.iter().any(|d| d.contains(want)), "{group}: {diags:?}");
+        }
     }
 
     #[test]

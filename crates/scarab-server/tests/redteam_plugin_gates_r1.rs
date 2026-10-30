@@ -999,7 +999,6 @@ fn a_manifest_capability_is_spelled_one_way_and_approve_gates_is_refused() {
 /// interpolated at admission, before any output exists, and fails closed —
 /// no Run, and no half-written one.
 #[tokio::test]
-#[ignore = "red: s4 r1"]
 async fn a_gate_output_in_the_concurrency_group_admits_no_run() {
     let Some(tdb) = fresh_db().await else {
         return;
@@ -1026,6 +1025,43 @@ steps:
         ..Default::default()
     };
     let out = trigger_runs_from_event(&forge, pg.as_ref(), clock.as_ref(), ports, &push()).await;
+    if let Ok(out) = &out {
+        assert!(out.runs.is_empty(), "a Run was created: {:?}", out.runs);
+    }
+    let (runs,): (i64,) = sqlx::query_as("SELECT count(*) FROM runs")
+        .fetch_one(&tdb.pool)
+        .await
+        .unwrap();
+    assert_eq!(runs, 0, "a half-written Run was left behind ({out:?})");
+    tdb.cleanup().await;
+}
+
+/// A group that compiles but does not render at Run creation (it reads an
+/// input a push does not carry) fails closed before anything is written.
+#[tokio::test]
+async fn an_unresolvable_concurrency_group_leaves_no_run_behind() {
+    let Some(tdb) = fresh_db().await else {
+        return;
+    };
+    let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
+    pg.migrate().await.unwrap();
+    let clock = Arc::new(FakeClock::new(CLOCK_START_MS));
+    let pipeline = r#"
+on: { push: {} }
+concurrency: { group: "deploy-${{ inputs.nope }}" }
+steps: [{ id: a, image: alpine }]
+"#;
+    let forge = FakeForge::new()
+        .with_file(".scarab/ci.yaml", pipeline)
+        .with_commit("refs/heads/main", SHA);
+    let out = trigger_runs_from_event(
+        &forge,
+        pg.as_ref(),
+        clock.as_ref(),
+        AdmissionPorts::default(),
+        &push(),
+    )
+    .await;
     if let Ok(out) = &out {
         assert!(out.runs.is_empty(), "a Run was created: {:?}", out.runs);
     }

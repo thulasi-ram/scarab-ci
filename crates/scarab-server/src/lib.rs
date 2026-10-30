@@ -5829,6 +5829,42 @@ async fn persist_run_from_ir(
     let locked_out = gov.locked_out();
     let no_params = std::collections::BTreeMap::new();
     let params_or_none = params.unwrap_or(&no_params);
+    // The concurrency group's key, rendered before anything is written: the
+    // group is interpolated against the run's launch inputs and its checked
+    // `event` values (ADR-0076 §9: the fields a template may read, each
+    // passing its check — never the raw trigger event, whose free text
+    // anyone who can comment writes), so `deploy-${{ inputs.deploy_env }}`
+    // resolves to a *distinct* key per environment (`deploy-staging` vs
+    // `deploy-production`) rather than colliding on the literal template. A
+    // `${{ … }}` that cannot be resolved fails closed — never store a literal
+    // template as the slot key — and leaves no Run behind.
+    let concurrency_group = match &ir.concurrency {
+        Some(c) => {
+            let inputs = params
+                .map(|p| serde_json::Value::Object(p.clone().into_iter().collect()))
+                .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+            let interp_ctx = serde_json::json!({ "inputs": inputs, "event": admitted.event });
+            let group = scarab_pipeline::cel::interpolate(&c.group, &interp_ctx).map_err(|e| {
+                TriggerError::Pipeline(format!("concurrency group `{}`: {e}", c.group))
+            })?;
+            // Tenancy scope (QA finding; git-bug 5120335): the author's group name is
+            // an arbitrary string, so it is scoped to the owning repo here — at
+            // construction, exactly like `supersede_key` below — as
+            // `{owner}/{name}:{group}`. Without the prefix, two unrelated tenants
+            // both naming their group `deploy` would share one global slot
+            // (`concurrency_slots.group_key` is a global PRIMARY KEY), serializing
+            // across the tenant boundary — and under `cancel-in-progress` one
+            // tenant's run would cancel the other's. Untenanted runs (no repo —
+            // inline dev submissions) take an `inline:` namespace instead; it can
+            // never collide with a repo-scoped key because a repo prefix always
+            // carries a `/` before its first `:`.
+            Some(match event.repo() {
+                Some(repo) => format!("{}/{}:{group}", repo.owner, repo.name),
+                None => format!("inline:{group}"),
+            })
+        }
+        None => None,
+    };
     db.create_run(run, ir.ir_version, EVENT_VERSION, now)
         .await?;
     // Tenancy (ADR-0049): stamp the owning (org, project) from the trigger's
@@ -5917,36 +5953,9 @@ async fn persist_run_from_ir(
     // in-flight Environment run nor an in-flight deploy is disposable.
     let cancellable = matches!(gov, RunGovernance::Ungoverned) && !is_deploy_run;
     // Concurrency group (ADR-0011, 0032): serialize this run against others in the
-    // same group under its policy. The `group` is interpolated here against the
-    // run's launch inputs and its checked `event` values (ADR-0076 §9: the
-    // fields a template may read, each passing its check — never the raw
-    // trigger event, whose free text anyone who can comment writes), so
-    // `deploy-${{ inputs.deploy_env }}` resolves to
-    // a *distinct* key per environment (`deploy-staging` vs `deploy-production`)
-    // rather than colliding on the literal template. A `${{ … }}` that cannot be
-    // resolved fails closed — never store a literal template as the slot key.
-    if let Some(c) = &ir.concurrency {
-        let inputs = params
-            .map(|p| serde_json::Value::Object(p.clone().into_iter().collect()))
-            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
-        let interp_ctx = serde_json::json!({ "inputs": inputs, "event": admitted.event });
-        let group = scarab_pipeline::cel::interpolate(&c.group, &interp_ctx)
-            .map_err(|e| TriggerError::Pipeline(format!("concurrency group `{}`: {e}", c.group)))?;
-        // Tenancy scope (QA finding; git-bug 5120335): the author's group name is
-        // an arbitrary string, so it is scoped to the owning repo here — at
-        // construction, exactly like `supersede_key` above — as
-        // `{owner}/{name}:{group}`. Without the prefix, two unrelated tenants
-        // both naming their group `deploy` would share one global slot
-        // (`concurrency_slots.group_key` is a global PRIMARY KEY), serializing
-        // across the tenant boundary — and under `cancel-in-progress` one
-        // tenant's run would cancel the other's. Untenanted runs (no repo —
-        // inline dev submissions) take an `inline:` namespace instead; it can
-        // never collide with a repo-scoped key because a repo prefix always
-        // carries a `/` before its first `:`.
-        let group = match event.repo() {
-            Some(repo) => format!("{}/{}:{group}", repo.owner, repo.name),
-            None => format!("inline:{group}"),
-        };
+    // same group under its policy; the key was rendered before the Run was
+    // created (above).
+    if let (Some(c), Some(group)) = (&ir.concurrency, &concurrency_group) {
         // ADR-0032: a governed (environment-targeting) deploy still SERIALIZES
         // against its group, but must never silently cancel the current slot
         // holder — an in-flight production deploy is not disposable. So a governed
@@ -5959,7 +5968,7 @@ async fn persist_run_from_ir(
         } else {
             ConcurrencyPolicy::Queue
         };
-        db.set_run_concurrency(run, &group, policy).await?;
+        db.set_run_concurrency(run, group, policy).await?;
     }
     // Newest-wins auto-cancel (ADR-0032): key non-deploy runs by (repo, ref,
     // pipeline) so a newer run supersedes older in-flight ones. A pipeline that
