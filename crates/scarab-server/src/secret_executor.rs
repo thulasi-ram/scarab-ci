@@ -53,6 +53,42 @@ pub struct SecretInjectingExecutor {
     libraries: Option<Arc<dyn scarab_policy::library::LibraryStore>>,
 }
 
+/// Refuse when `run` is a deploy whose Environment is gone or no longer admits
+/// its Project (ADR-0071 §2); `Ok(())` for a run with no deploy context. Shared
+/// by the launch decorators, so each makes the check before it uses a
+/// credential.
+pub(crate) async fn ensure_deploy_still_admitted(
+    db: &dyn Db,
+    governance: &dyn scarab_project::EnvironmentGovernanceStore,
+    run: &scarab_engine::RunId,
+) -> Result<(), ExecError> {
+    let Some(ctx) = db
+        .run_deploy_context(run)
+        .await
+        .map_err(|e| ExecError::Other(e.to_string()))?
+    else {
+        return Ok(());
+    };
+    let refusal = match governance
+        .deploy_governance(&ctx.org, &ctx.project, &ctx.environment)
+        .await
+        .map_err(|e| ExecError::Other(format!("environment governance store: {e}")))?
+    {
+        Some(g) if g.eligible => return Ok(()),
+        Some(_) => format!(
+            "project `{}` is no longer eligible to deploy to environment `{}` in org `{}`; \
+             its credentials are not released (ADR-0071)",
+            ctx.project, ctx.environment, ctx.org
+        ),
+        None => format!(
+            "environment `{}` no longer exists in org `{}`; its credentials are not \
+             released (ADR-0071)",
+            ctx.environment, ctx.org
+        ),
+    };
+    Err(ExecError::Refused(refusal))
+}
+
 /// Per-attempt OIDC token TTL (ADR-0015: short-lived by design — long enough
 /// for the cloud exchange at step start, not the step's whole runtime).
 const OIDC_TOKEN_TTL_SECS: i64 = 15 * 60;
@@ -120,35 +156,12 @@ impl SecretInjectingExecutor {
     /// scheduler fails the step (`Config`, with this reason) and nothing —
     /// credential, privilege grant, Pod — is used.
     async fn ensure_still_admitted(&self, step: &StepRun) -> Result<(), ExecError> {
-        let Some(governance) = &self.governance else {
-            return Ok(());
-        };
-        let Some(ctx) = self
-            .db
-            .run_deploy_context(&step.run)
-            .await
-            .map_err(|e| ExecError::Other(e.to_string()))?
-        else {
-            return Ok(());
-        };
-        let refusal = match governance
-            .deploy_governance(&ctx.org, &ctx.project, &ctx.environment)
-            .await
-            .map_err(|e| ExecError::Other(format!("environment governance store: {e}")))?
-        {
-            Some(g) if g.eligible => return Ok(()),
-            Some(_) => format!(
-                "project `{}` is no longer eligible to deploy to environment `{}` in org `{}`; \
-                 its credentials are not released (ADR-0071)",
-                ctx.project, ctx.environment, ctx.org
-            ),
-            None => format!(
-                "environment `{}` no longer exists in org `{}`; its credentials are not \
-                 released (ADR-0071)",
-                ctx.environment, ctx.org
-            ),
-        };
-        Err(ExecError::Refused(refusal))
+        match &self.governance {
+            Some(governance) => {
+                ensure_deploy_still_admitted(self.db.as_ref(), governance.as_ref(), &step.run).await
+            }
+            None => Ok(()),
+        }
     }
 
     /// Enable per-attempt OIDC token minting (ADR-0015): every launched step

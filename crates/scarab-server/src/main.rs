@@ -754,7 +754,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .with_secrets(secrets.clone())
                 // A yanked library Step is refused before its forge
                 // credential or registry auth is asked for (ADR-0076 §6).
-                .with_libraries(db.clone(), pg.clone()),
+                .with_libraries(db.clone(), pg.clone())
+                // So is a deploy Step whose Environment no longer admits
+                // its Project (ADR-0071 §2).
+                .with_environment_governance(db.clone(), pg.clone()),
             );
             // Local host processes finish instantly, so re-poll them quickly; k8s
             // Pods take time, so the default window avoids thundering re-claims.
