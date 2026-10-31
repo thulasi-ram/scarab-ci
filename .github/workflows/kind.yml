@@ -39,6 +39,7 @@ on:
     branches: [main]
     paths:
       - 'crates/scarab-executor-k8s/**'
+      - 'crates/scarab-k8s-expansion/**'
       - 'crates/scarab-engine/**'
       - 'crates/scarab-server/**'
       - 'crates/scarab-storage*/**'
@@ -54,6 +55,7 @@ on:
     types: [opened, synchronize, reopened, labeled, unlabeled]
     paths:
       - 'crates/scarab-executor-k8s/**'
+      - 'crates/scarab-k8s-expansion/**'
       - 'crates/scarab-engine/**'
       - 'crates/scarab-server/**'
       - 'crates/scarab-storage*/**'

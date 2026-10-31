@@ -9,8 +9,8 @@
 //!      outputs.
 //!   4. Rerun C: C and its descendant D re-run; its sibling B does not.
 //!
-//! The live-kind variant (real Pods doing the workspace I/O via the dev harness)
-//! is `#[ignore]`-gated at the bottom. Skips cleanly when
+//! Real Pods doing the workspace I/O are the k8s executor's live tier
+//! (`crates/scarab-executor-k8s/tests/cluster.rs`). Skips cleanly when
 //! `SCARAB_TEST_DATABASE_URL` is unset.
 
 mod common;
@@ -271,16 +271,4 @@ async fn diamond_workspace_flows_to_d_which_sees_both() {
 
     let _ = std::fs::remove_dir_all(&d_in);
     tdb.cleanup().await;
-}
-
-/// The live-kind variant: drive the same diamond on a real kind cluster from the
-/// dev harness, where Pods do the workspace I/O end-to-end (init-container fetch
-/// + post-step upload). Needs a cluster + object store, so it is opt-in only.
-/// TODO(slice-2): wire once build_pod gains init-container/post-step workspace.
-#[tokio::test]
-#[ignore = "requires the dev kind cluster + object store; opt in with SCARAB_TEST_KUBE=1"]
-async fn diamond_on_live_kind() {
-    if std::env::var("SCARAB_TEST_KUBE").is_err() {
-        return;
-    }
 }

@@ -24,11 +24,22 @@ mod common;
 
 const SECRET: &[u8] = b"fetch-retry-acceptance-secret";
 
+/// One request the router answered: its path and status.
+#[derive(Debug, Clone)]
+struct Seen {
+    path: String,
+    status: u16,
+}
+
 /// A running service plus the tempdirs behind it (the `service_roundtrip.rs`
 /// harness, minus the pieces this suite does not touch).
 struct Harness {
     base: String,
     addr: std::net::SocketAddr,
+    /// Every request the router answered, in order. The no-retry tests assert
+    /// on this, not on wall time: how many times the fetcher asked is the
+    /// same under any machine load (git-bug 1bc7d3b).
+    seen: Arc<std::sync::Mutex<Vec<Seen>>>,
     #[allow(dead_code)]
     warm: tempfile::TempDir,
     #[allow(dead_code)]
@@ -51,6 +62,22 @@ impl Harness {
             pg.pool.clone(),
         )
         .expect("router");
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = app.layer(axum::middleware::from_fn({
+            let seen = seen.clone();
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let seen = seen.clone();
+                async move {
+                    let path = req.uri().path().to_string();
+                    let resp = next.run(req).await;
+                    seen.lock().unwrap().push(Seen {
+                        path,
+                        status: resp.status().as_u16(),
+                    });
+                    resp
+                }
+            }
+        }));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -63,10 +90,22 @@ impl Harness {
         Some(Self {
             base: format!("http://{addr}"),
             addr,
+            seen,
             warm,
             cold,
             pg,
         })
+    }
+
+    /// The requests the router answered whose path names `root`.
+    fn seen_for(&self, root: &str) -> Vec<Seen> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.path.contains(root))
+            .cloned()
+            .collect()
     }
 
     fn browse_client(&self) -> WorkspaceClient {
@@ -328,8 +367,9 @@ async fn a_mid_fetch_403_exits_denied_without_consuming_the_retry_window() {
     // The claim names ONLY root A; the fetch is asked for both.
     std::fs::write(&token_file, h.step_token(&[&root_a])).unwrap();
     let target = tempfile::tempdir().unwrap();
+    // From here on, `seen` holds the fetcher's requests only, not the seeding.
+    h.seen.lock().unwrap().clear();
 
-    let started = std::time::Instant::now();
     let out = tokio::task::spawn_blocking({
         let base = h.base.clone();
         let token_file = token_file.clone();
@@ -366,11 +406,17 @@ async fn a_mid_fetch_403_exits_denied_without_consuming_the_retry_window() {
     );
     // And the retry window (30s at timeout 300) was NOT consumed: a denial
     // is terminal for this token, so waiting could only delay the fresh
-    // attempt that can actually heal it.
+    // attempt that can actually heal it. The Depot was asked for root B once,
+    // and refused it once; the fetcher logged no retry.
+    let asked_b = h.seen_for(&root_b);
+    assert_eq!(
+        asked_b.iter().map(|s| s.status).collect::<Vec<_>>(),
+        vec![403],
+        "a 403 must not be retried against the window; the Depot saw {asked_b:?}"
+    );
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(5),
-        "a 403 must not be retried against the window, took {:?}",
-        started.elapsed()
+        !stderr.contains("transient, retrying"),
+        "a 403 must not be retried against the window, stderr:\n{stderr}"
     );
     assert!(
         stderr.contains("DENIED"),
@@ -392,7 +438,6 @@ async fn a_live_depot_404_exits_missing_inputs_without_burning_the_window() {
     std::fs::write(&token_file, h.step_token(&[&absent_root])).unwrap();
     let target = tempfile::tempdir().unwrap();
 
-    let started = std::time::Instant::now();
     let out = tokio::task::spawn_blocking({
         let base = h.base.clone();
         let token_file = token_file.clone();
@@ -409,13 +454,22 @@ async fn a_live_depot_404_exits_missing_inputs_without_burning_the_window() {
         "a live Depot's 404 is permanent absence, stderr:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    // Permanent means NOW: no 30s window ground down first.
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(5),
-        "a 404 must not be retried against the window"
+    // Permanent means NOW: no 30s window ground down first. The Depot was
+    // asked for the root once and answered 404 once; the fetcher logged no
+    // retry.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let asked = h.seen_for(&absent_root);
+    assert_eq!(
+        asked.iter().map(|s| s.status).collect::<Vec<_>>(),
+        vec![404],
+        "a 404 must not be retried against the window; the Depot saw {asked:?}"
     );
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("Rerun/Retry"),
+        !stderr.contains("transient, retrying"),
+        "a 404 must not be retried against the window, stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Rerun/Retry"),
         "the message must name the recovery"
     );
 }

@@ -384,7 +384,9 @@ forgejo-verify keep="0":
     # payload spelling), then the whole onboarding flow through the server.
     # Captured real payloads land in target/forgejo-capture/.
     cargo nextest run -p scarab-forge-forgejo --test live --no-fail-fast
-    cargo nextest run -p scarab-e2e --test forgejo_onboarding --no-fail-fast
+    # `forgejo_onboarding` is #[ignore]d so `just e2e`, which has no Forgejo,
+    # reports it skipped rather than passed; asking for it here is the opt-in.
+    cargo nextest run -p scarab-e2e --test forgejo_onboarding --run-ignored all --no-fail-fast
 
 # LIVE k8s executor tier (`crates/scarab-executor-k8s/tests/cluster.rs`) — the
 # same tier `.github/workflows/kind.yml` runs, against the proc-mode kind cluster.

@@ -3,8 +3,10 @@
 //! shape, that Pod Security admits the workload, and that TokenReview vouches
 //! for a projected broker token and for nothing else.
 //!
-//! `#[ignore]`d and gated on `SCARAB_TEST_KUBE`, so `cargo test` never runs it
-//! and never touches an ambient kubeconfig. Run it with `just
+//! `#[ignore]`d, so `cargo test` never runs it and never touches an ambient
+//! kubeconfig. Asking for the ignored set is the opt-in, and a case then needs
+//! `SCARAB_TEST_KUBE` as well: without it, it panics ([`enter_tier`]) rather
+//! than passing having done nothing (git-bug dcc4ca9). Run it with `just
 //! plugin-kube-tests` (or the whole tier with `just kube-tests`), which points
 //! `KUBECONFIG` at the isolated proc-mode kind cluster.
 //!
@@ -65,12 +67,19 @@ use scarab_plugin_k8s::{
 const BROKER_PORT: u16 = 8090;
 const INSTALLATION_ID: &str = "0123456789";
 
-fn opted_in() -> bool {
+/// The gate every case passes first. The case is `#[ignore]`d, so reaching
+/// this means someone asked for the ignored set: that is the opt-in. Without
+/// `SCARAB_TEST_KUBE` as well, the case panics; it used to return and report
+/// PASS (git-bug dcc4ca9).
+fn enter_tier() {
     if std::env::var("SCARAB_TEST_KUBE").is_err() {
-        eprintln!("skipping: set SCARAB_TEST_KUBE=1 (use `just plugin-kube-tests`)");
-        return false;
+        panic!(
+            "this live case was asked to run (`--ignored` is the opt-in) but \
+             SCARAB_TEST_KUBE is not set, and it will not pass by doing nothing. Run \
+             `just plugin-kube-tests`, which sets it and points KUBECONFIG at the \
+             isolated proc-mode kind cluster."
+        );
     }
-    true
 }
 
 /// Install `ring` as the process-level rustls CryptoProvider. This crate's
@@ -301,9 +310,7 @@ async fn wait_running(pods: &Api<Pod>, name: &str) {
 #[tokio::test]
 #[ignore]
 async fn the_isolation_probe_passes_on_this_cluster() {
-    if !opted_in() {
-        return;
-    }
+    enter_tier();
     with_fixture(|f| async move {
         let (runtime, pod_broker_url) = f.ready_runtime().await;
         let report = runtime.probe_isolation(&pod_broker_url).await;
@@ -330,9 +337,7 @@ async fn the_isolation_probe_passes_on_this_cluster() {
 #[tokio::test]
 #[ignore]
 async fn without_the_egress_policies_the_canary_is_reachable_and_the_probe_fails() {
-    if !opted_in() {
-        return;
-    }
+    enter_tier();
     with_fixture(|f| async move {
         let (runtime, pod_broker_url) = f.ready_runtime().await;
         remove_plugin_policies(&f).await;
@@ -354,9 +359,7 @@ async fn without_the_egress_policies_the_canary_is_reachable_and_the_probe_fails
 #[tokio::test]
 #[ignore]
 async fn the_baseline_refuses_a_namespace_it_cannot_vouch_for() {
-    if !opted_in() {
-        return;
-    }
+    enter_tier();
     with_fixture(|f| async move {
         // A stray allow-all egress policy in the plugin namespace.
         let stray = NetworkPolicy {
@@ -456,9 +459,7 @@ fn installation(image: &str) -> PluginInstallation {
 #[tokio::test]
 #[ignore]
 async fn a_workload_is_admitted_stopped_and_uninstalled() {
-    if !opted_in() {
-        return;
-    }
+    enter_tier();
     with_fixture(|f| async move {
         let (runtime, pod_broker_url) = f.ready_runtime().await;
         runtime
@@ -581,9 +582,7 @@ async fn wait_self_check_exit(pods: &Api<Pod>, pod_name: &str) -> Option<i32> {
 #[tokio::test]
 #[ignore]
 async fn in_an_open_namespace_the_self_check_keeps_the_plugin_from_starting() {
-    if !opted_in() {
-        return;
-    }
+    enter_tier();
     with_fixture(|f| async move {
         let (runtime, pod_broker_url) = f.ready_runtime().await;
         remove_plugin_policies(&f).await;
@@ -768,9 +767,7 @@ async fn verdict_once_revoked(
 #[tokio::test]
 #[ignore]
 async fn token_review_accepts_only_a_live_pods_broker_token() {
-    if !opted_in() {
-        return;
-    }
+    enter_tier();
     with_fixture(|f| async move {
         // The installation's ServiceAccount, by the runtime's own naming.
         let sa_name = "plugin-0123456789";
@@ -887,9 +884,7 @@ async fn token_review_accepts_only_a_live_pods_broker_token() {
 #[tokio::test]
 #[ignore]
 async fn a_plugin_pod_mounts_its_annotated_claim_and_can_write_to_it() {
-    if !opted_in() {
-        return;
-    }
+    enter_tier();
     with_fixture(|f| async move {
         let (runtime, pod_broker_url) = f.ready_runtime().await;
         let mut inst = installation(&probe_image());

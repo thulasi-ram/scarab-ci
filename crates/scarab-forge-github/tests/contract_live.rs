@@ -25,10 +25,13 @@ fn env(k: &str) -> Option<String> {
 #[tokio::test]
 #[ignore = "requires live GitHub credentials; opt in with SCARAB_TEST_GITHUB=1"]
 async fn github_adapter_passes_the_port_contract() {
-    if env("SCARAB_TEST_GITHUB").is_none() {
-        eprintln!("skipping: set SCARAB_TEST_GITHUB=1 (+ creds) to run");
-        return;
-    }
+    // `#[ignore]`d: asking for the ignored set is the opt-in, so a missing
+    // switch is a panic, not a PASS that ran nothing (git-bug dcc4ca9).
+    assert!(
+        env("SCARAB_TEST_GITHUB").is_some(),
+        "this live case was asked to run (`--ignored` is the opt-in) but \
+         SCARAB_TEST_GITHUB is not set: set SCARAB_TEST_GITHUB=1 (+ creds)"
+    );
     let forge = match (
         env("SCARAB_TEST_GITHUB_APP_ID"),
         env("SCARAB_TEST_GITHUB_PEM_FILE"),

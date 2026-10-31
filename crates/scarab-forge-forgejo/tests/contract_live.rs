@@ -22,10 +22,13 @@ fn env(k: &str) -> Option<String> {
 #[tokio::test]
 #[ignore = "requires a live Forgejo instance; opt in with SCARAB_TEST_FORGEJO=1"]
 async fn forgejo_adapter_passes_the_port_contract() {
-    if env("SCARAB_TEST_FORGEJO").is_none() {
-        eprintln!("skipping: set SCARAB_TEST_FORGEJO=1 (+ URL/TOKEN/REPO) to run");
-        return;
-    }
+    // `#[ignore]`d: asking for the ignored set is the opt-in, so a missing
+    // switch is a panic, not a PASS that ran nothing (git-bug dcc4ca9).
+    assert!(
+        env("SCARAB_TEST_FORGEJO").is_some(),
+        "this live case was asked to run (`--ignored` is the opt-in) but \
+         SCARAB_TEST_FORGEJO is not set: set SCARAB_TEST_FORGEJO=1 (+ URL/TOKEN/REPO)"
+    );
     let base_url = env("SCARAB_TEST_FORGEJO_URL").expect("SCARAB_TEST_FORGEJO_URL");
     let token = env("SCARAB_TEST_FORGEJO_TOKEN").expect("SCARAB_TEST_FORGEJO_TOKEN");
     let full = env("SCARAB_TEST_FORGEJO_REPO").expect("SCARAB_TEST_FORGEJO_REPO");
