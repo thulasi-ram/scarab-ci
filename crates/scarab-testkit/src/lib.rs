@@ -194,6 +194,9 @@ struct InMemoryState {
     slots: HashMap<String, RunId>,
     /// Per-run creation time (for supersede ordering).
     run_created: HashMap<RunId, Timestamp>,
+    /// Runs from `begin_run_creation` whose creation has not finished —
+    /// left out of `active_runs`.
+    creating: std::collections::HashSet<RunId>,
     /// Per-run Workspace-Snapshot **pin** (ADR-0061 s5): `(by, at)` while pinned,
     /// absent otherwise — mirrors `runs.snapshots_pinned_{at,by}`.
     snapshot_pins: HashMap<RunId, (Option<String>, Timestamp)>,
@@ -281,12 +284,55 @@ struct InMemoryState {
 /// fake for driving the pure engine.
 pub struct InMemoryDb {
     state: Mutex<InMemoryState>,
+    /// A one-shot hook the next call of the named method awaits before it
+    /// does anything — see [`interleave_before_next`](Self::interleave_before_next).
+    /// Kept outside `state` so the hook can call back into this store.
+    interleave: Mutex<Option<(&'static str, DbHook)>>,
 }
+
+/// Work a test runs at a chosen point inside a sequence of [`Db`] calls.
+pub type DbHook =
+    Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
 
 impl InMemoryDb {
     pub fn new() -> Self {
         Self {
             state: Mutex::new(InMemoryState::default()),
+            interleave: Mutex::new(None),
+        }
+    }
+
+    /// Run `hook` to completion at the start of the next call of `method`
+    /// (test seam): models another task — a scheduler tick on this replica or
+    /// another — that commits between two of a caller's separate writes.
+    /// Constructs the interleaving instead of scheduling it. Supported
+    /// methods: `set_run_params`, `set_run_concurrency`,
+    /// `commit_step_transition`.
+    pub fn interleave_before_next(&self, method: &'static str, hook: DbHook) {
+        *self.interleave.lock().unwrap() = Some((method, hook));
+    }
+
+    /// Whether an [`interleave_before_next`](Self::interleave_before_next)
+    /// hook is still armed — `false` once it ran.
+    pub fn interleave_armed(&self) -> bool {
+        self.interleave.lock().unwrap().is_some()
+    }
+
+    /// Fire the armed hook if it names `method`. The hook is taken before it
+    /// runs, so the calls it makes do not fire it again.
+    async fn interleave_point(&self, method: &'static str) {
+        let hook = {
+            let mut slot = self.interleave.lock().unwrap();
+            match slot.take() {
+                Some((m, hook)) if m == method => Some(hook),
+                other => {
+                    *slot = other;
+                    None
+                }
+            }
+        };
+        if let Some(hook) = hook {
+            hook().await;
         }
     }
 
@@ -658,6 +704,30 @@ impl Db for InMemoryDb {
         Ok(())
     }
 
+    async fn begin_run_creation(
+        &self,
+        run: &RunId,
+        _ir_version: u32,
+        _event_schema_version: u32,
+        at: Timestamp,
+    ) -> Result<(), DbError> {
+        // One lock: the run is never visible without its `creating` mark.
+        let mut st = self.state.lock().unwrap();
+        st.runs.insert(run.clone(), RunStatus::Pending);
+        st.run_created.insert(run.clone(), at);
+        st.creating.insert(run.clone());
+        Ok(())
+    }
+
+    async fn finish_run_creation(&self, run: &RunId) -> Result<(), DbError> {
+        self.state.lock().unwrap().creating.remove(run);
+        Ok(())
+    }
+
+    async fn run_creation_unfinished(&self, run: &RunId) -> Result<bool, DbError> {
+        Ok(self.state.lock().unwrap().creating.contains(run))
+    }
+
     async fn create_step_run(
         &self,
         run: &RunId,
@@ -964,6 +1034,7 @@ impl Db for InMemoryDb {
         group: &str,
         policy: ConcurrencyPolicy,
     ) -> Result<(), DbError> {
+        self.interleave_point("set_run_concurrency").await;
         self.state
             .lock()
             .unwrap()
@@ -1357,6 +1428,7 @@ impl Db for InMemoryDb {
         run: &RunId,
         params: &std::collections::BTreeMap<String, serde_json::Value>,
     ) -> Result<(), DbError> {
+        self.interleave_point("set_run_params").await;
         self.state
             .lock()
             .unwrap()
@@ -1427,7 +1499,7 @@ impl Db for InMemoryDb {
         let mut out: Vec<RunId> = st
             .runs
             .iter()
-            .filter(|(_, s)| !s.is_terminal())
+            .filter(|(r, s)| !s.is_terminal() && !st.creating.contains(*r))
             .map(|(r, _)| r.clone())
             .collect();
         // Priority desc, then creation order, then id — matches the adapter so
@@ -1609,6 +1681,7 @@ impl Db for InMemoryDb {
         events: &[EventKind],
         outbox: &[OutboxMessage],
     ) -> Result<(), DbError> {
+        self.interleave_point("commit_step_transition").await;
         // One lock = the Postgres transaction: every check (including the
         // crash injector) runs before the first mutation, so a failure leaves
         // nothing behind.
@@ -2970,8 +3043,9 @@ pub struct FakeForge {
     statuses: Mutex<Vec<Status>>,
     comments: Mutex<Vec<(u64, String)>>,
     /// Seeded `ref → resolved sha` mappings for [`latest_commit`](ForgePort::latest_commit).
-    /// A ref with no mapping resolves to itself (identity) — the default that
-    /// keeps ref-agnostic tests simple.
+    /// A ref with no mapping resolves through [`fake_commit_sha`]: itself when
+    /// it is already hex, else a stable SHA derived from it, which keeps
+    /// ref-agnostic tests simple.
     commits: Mutex<HashMap<String, String>>,
     /// A seeded derived registry credential (ADR-0018); `None` (default)
     /// mirrors a forge with no derivable registry.
@@ -3016,6 +3090,9 @@ pub struct FakeForge {
     mints: Mutex<bool>,
     /// The tokens [`revoke_credential`](ForgePort::revoke_credential) ended.
     revoked: Mutex<Vec<String>>,
+    /// How many checkout credentials [`mint_checkout_credential`](ForgePort::mint_checkout_credential)
+    /// has handed out — lets a test assert a refused launch minted nothing.
+    checkout_mints: Mutex<u32>,
 }
 
 impl FakeForge {
@@ -3039,6 +3116,11 @@ impl FakeForge {
     /// How many checkout or registry credentials were asked for.
     pub fn credential_calls(&self) -> usize {
         *self.credential_calls.lock().unwrap()
+    }
+
+    /// How many checkout credentials this forge has minted.
+    pub fn checkout_credentials_minted(&self) -> u32 {
+        *self.checkout_mints.lock().unwrap()
     }
 
     /// Seed the repo's collaborators as `(numeric id, login, level)` with
@@ -3351,6 +3433,28 @@ impl scarab_forge::ForgeConnectionStore for InMemoryDb {
     }
 }
 
+/// What [`FakeForge::latest_commit`] resolves an unseeded ref to: the ref
+/// itself when it is already a commit SHA, else a stable 40-hex SHA derived
+/// from it. A real forge never answers with a branch name, and the dispatch
+/// path refuses a resolved commit that is not hex.
+pub fn fake_commit_sha(r#ref: &str) -> String {
+    if scarab_forge::is_commit_sha(r#ref) {
+        return r#ref.to_string();
+    }
+    // FNV-1a, twice with different offsets, padded to 40 hex digits.
+    let fnv = |seed: u64| {
+        r#ref.bytes().fold(seed, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    };
+    format!(
+        "{:016x}{:016x}{:08x}",
+        fnv(0xcbf2_9ce4_8422_2325),
+        fnv(0x8422_2325_cbf2_9ce4),
+        fnv(0x1234_5678_9abc_def0) as u32
+    )
+}
+
 #[async_trait]
 impl ForgePort for FakeForge {
     async fn latest_commit(&self, _repo: &RepoRef, r#ref: &str) -> Result<Commit, ForgeError> {
@@ -3360,7 +3464,7 @@ impl ForgePort for FakeForge {
             .unwrap()
             .get(r#ref)
             .cloned()
-            .unwrap_or_else(|| r#ref.to_string());
+            .unwrap_or_else(|| fake_commit_sha(r#ref));
         Ok(Commit {
             sha,
             message: String::new(),
@@ -3513,6 +3617,7 @@ impl ForgePort for FakeForge {
         } else {
             format!("fake-token-{}-{}", repo.owner, repo.name)
         };
+        *self.checkout_mints.lock().unwrap() += 1;
         Ok(CheckoutCredential {
             username: "x-access-token".into(),
             token,

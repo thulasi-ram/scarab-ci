@@ -29,15 +29,21 @@ on:
   # — and it was already out of step (it never listed `rust-toolchain.toml`,
   # which both cargo-built images read). A docs-only PR now runs one ~15s
   # `changes` job that selects `[]` and builds nothing.
+  #
+  # `labeled` / `unlabeled` (see ci.yml's trigger note): ci:skip skips every
+  # job on the PR and removing it starts a run; ci:full builds all four images
+  # and checks the chart whatever the path filters say.
   pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
 
-# One build per ref; a newer push supersedes an in-flight one.
+# One build per ref; a newer push supersedes an in-flight one. A run started by
+# a change to any other label gets a group of its own and cancels nothing.
 concurrency:
-  group: image-${{ github.ref }}
+  group: image-${{ github.ref }}${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ci:skip' && github.event.label.name != 'ci:full' && format('-label-{0}', github.run_id) || '' }}
   cancel-in-progress: true
 
 jobs:
@@ -65,7 +71,17 @@ jobs:
   # `cancel-in-progress`, or failed — everything is built, so a skipped change
   # can never be papered over by a stale image. Tags and dispatches always
   # build all four.
+  #
+  # On a PR with the ci:skip label, or one started by another label's change,
+  # this job skips with no runner started, and every job below skips with it.
   changes:
+    if: >-
+      github.event_name != 'pull_request' || (
+        !contains(github.event.pull_request.labels.*.name, 'ci:skip') && !(
+          (github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
+          github.event.label.name != 'ci:skip' && github.event.label.name != 'ci:full'
+        )
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -77,7 +93,7 @@ jobs:
       # Unchanged images to re-tag from `retag_from` instead of building.
       retag: ${{ steps.select.outputs.retag }}
       retag_from: ${{ steps.select.outputs.retag_from }}
-      chart: ${{ steps.filter.outputs.chart == 'true' }}
+      chart: ${{ steps.filter.outputs.chart == 'true' || contains(github.event.pull_request.labels.*.name, 'ci:full') }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -154,6 +170,8 @@ jobs:
         env:
           ALL: '["scarab-server","scarab-clone","scarab-results-sidecar","scarab-wsfetch"]'
           IS_PR: ${{ github.event_name == 'pull_request' }}
+          # ci:full on a PR: build all four, as an unfiltered run would.
+          FULL: ${{ contains(github.event.pull_request.labels.*.name, 'ci:full') }}
           PREV_OK: ${{ steps.prev.outputs.ok == 'true' }}
           BEFORE: ${{ github.event.before }}
           SERVER: ${{ steps.filter.outputs.image_server }}
@@ -163,7 +181,7 @@ jobs:
         run: |
           set -euo pipefail
           retag='[]'
-          if [ "$IS_PR" != "true" ] && [ "$PREV_OK" != "true" ]; then
+          if { [ "$IS_PR" != "true" ] && [ "$PREV_OK" != "true" ]; } || [ "$FULL" = "true" ]; then
             images="$ALL"
           else
             images=$(jq -cn \
