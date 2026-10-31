@@ -264,11 +264,11 @@ pub fn check_value(field: &str, value: &Value) -> Result<(), String> {
             _ => Err(format!("the trigger kind {}", shown(value))),
         },
         "sha" => match text(value) {
-            Some(s) if (s.len() == 40 || s.len() == 64) && s.chars().all(|c| c.is_ascii_hexdigit()) => {
-                Ok(())
-            }
+            // Lower case only, as the clone script and the fixed-shape
+            // command rule take it.
+            Some(s) if is_command_sha(&s) => Ok(()),
             _ => Err(format!(
-                "the commit {}, which is not 40 or 64 hex characters",
+                "the commit {}, which is not 40 or 64 lower-case hex characters",
                 shown(value)
             )),
         },
@@ -440,6 +440,9 @@ mod tests {
             ("kind", json!("Push;")),
             ("sha", json!("abc123")),
             ("sha", json!("g".repeat(40))),
+            // Upper case: the clone script and the fixed-shape command rule
+            // take lower case only (forges send lower case).
+            ("sha", json!("A".repeat(40))),
             ("number", json!("7")),
             ("number", json!(-1)),
             ("issue", json!(1.5)),
