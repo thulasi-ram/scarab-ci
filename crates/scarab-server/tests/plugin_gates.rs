@@ -406,6 +406,29 @@ async fn a_plugin_releases_its_own_gate_with_typed_outputs() {
     assert_eq!(status, StatusCode::CONFLICT);
     let (_, page) = pending(&w.broker, "acme", &w.prod, "").await;
     assert_eq!(page["gates"], json!([]));
+    // The Run page's view of the gate: who released it, its expiry, the
+    // inputs rendered when it was reached, and its typed output's value.
+    let (status, run) = call(&w.public, "GET", &format!("/v1/runs/{}", w.run.0), None, None).await;
+    assert_eq!(status, StatusCode::OK, "{run}");
+    let live = run["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == "live")
+        .cloned()
+        .unwrap();
+    let g = &live["plugin_gate"];
+    assert_eq!(g["releaser"], "plugin:argocd-prod");
+    assert_eq!(g["gate"], "wait-live");
+    assert_eq!(g["plugin_state"], "enabled");
+    assert_eq!(g["expires_after"], 600);
+    assert_eq!(
+        g["expires_at"].as_i64().unwrap() - g["waiting_since"].as_i64().unwrap(),
+        600_000
+    );
+    assert_eq!(g["inputs"]["app"], "web");
+    assert_eq!(g["outputs"], json!([{ "name": "revision", "type": "string", "value": "abc123" }]));
+    assert_eq!(live["origin"][0]["kind"], "plugin");
     w.tdb.cleanup().await;
 }
 
@@ -533,6 +556,17 @@ async fn a_killed_installation_lists_and_resolves_nothing() {
     assert!(status.is_success(), "{status}");
     let (status, _) = pending(&w.broker, "acme", &w.prod, "").await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+    // The Run page says the gate's plugin is killed.
+    let (_, run) = call(&w.public, "GET", &format!("/v1/runs/{}", w.run.0), None, None).await;
+    let live = run["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == "live")
+        .cloned()
+        .unwrap();
+    assert_eq!(live["plugin_gate"]["plugin_state"], "killed", "{live}");
+    assert!(live["plugin_gate"]["killed_by"].is_string(), "{live}");
     w.tdb.cleanup().await;
 }
 

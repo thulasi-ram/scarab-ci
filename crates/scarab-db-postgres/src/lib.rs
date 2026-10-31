@@ -1611,6 +1611,70 @@ impl Db for PostgresDb {
         rows.into_iter().map(run_summary_from_row).collect()
     }
 
+    async fn record_refused_run(&self, r: &scarab_engine::RefusedRun) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO refused_runs (org, project, pipeline, trigger_kind, actor, git_ref, sha,
+                                       title, reason_kind, message, errors, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+        )
+        .bind(&r.org)
+        .bind(&r.project)
+        .bind(&r.pipeline)
+        .bind(&r.trigger_kind)
+        .bind(r.actor.as_deref())
+        .bind(r.git_ref.as_deref())
+        .bind(r.sha.as_deref())
+        .bind(r.title.as_deref())
+        .bind(&r.reason_kind)
+        .bind(&r.message)
+        .bind(&r.errors)
+        .bind(r.created_at.0)
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn refused_runs_for_tenant(
+        &self,
+        org: &str,
+        project: &str,
+        limit: u32,
+    ) -> Result<Vec<scarab_engine::RefusedRun>, DbError> {
+        let rows = sqlx::query(
+            "SELECT id, org, project, pipeline, trigger_kind, actor, git_ref, sha, title,
+                    reason_kind, message, errors, created_at
+             FROM refused_runs
+             WHERE org = $1 AND project = $2
+             ORDER BY created_at DESC, id DESC
+             LIMIT $3",
+        )
+        .bind(org)
+        .bind(project)
+        .bind(limit as i64)
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| scarab_engine::RefusedRun {
+                id: r.get("id"),
+                org: r.get("org"),
+                project: r.get("project"),
+                pipeline: r.get("pipeline"),
+                trigger_kind: r.get("trigger_kind"),
+                actor: r.get("actor"),
+                git_ref: r.get("git_ref"),
+                sha: r.get("sha"),
+                title: r.get("title"),
+                reason_kind: r.get("reason_kind"),
+                message: r.get("message"),
+                errors: r.get("errors"),
+                created_at: Timestamp(r.get("created_at")),
+            })
+            .collect())
+    }
+
     async fn events(&self, run: &RunId) -> Result<Vec<EventKind>, DbError> {
         let rows =
             sqlx::query("SELECT version, at, payload FROM events WHERE run_id = $1 ORDER BY seq")

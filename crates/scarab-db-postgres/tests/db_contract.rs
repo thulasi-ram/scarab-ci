@@ -765,3 +765,42 @@ contract_test!(
     outbox_key_pending_contract,
     outbox_key_pending_is_neither_dispatched_nor_dead
 );
+
+/// Refused Run creations (ADR-0076): kept per Project, listed newest first,
+/// read back with every field.
+async fn refused_runs_list_per_project_newest_first(db: &dyn Db) {
+    let refused = |project: &str, at: i64, kind: &str| scarab_engine::RefusedRun {
+        id: 0,
+        org: "acme".into(),
+        project: project.into(),
+        pipeline: ".scarab/ci.yaml".into(),
+        trigger_kind: "push".into(),
+        actor: Some("octocat".into()),
+        git_ref: Some("refs/heads/main".into()),
+        sha: Some("1234567890abcdef1234567890abcdef12345678".into()),
+        title: Some("Bump chart".into()),
+        reason_kind: kind.into(),
+        message: format!("refused: {kind}"),
+        errors: serde_json::json!([{ "kind": "other", "message": kind }]),
+        created_at: Timestamp(at),
+    };
+    db.record_refused_run(&refused("web", 10, "compile")).await.unwrap();
+    db.record_refused_run(&refused("web", 20, "yanked")).await.unwrap();
+    db.record_refused_run(&refused("api", 30, "policy")).await.unwrap();
+    let web = db.refused_runs_for_tenant("acme", "web", 10).await.unwrap();
+    assert_eq!(
+        web.iter().map(|r| r.reason_kind.as_str()).collect::<Vec<_>>(),
+        vec!["yanked", "compile"]
+    );
+    let first = &web[0];
+    assert!(first.id > 0);
+    assert_eq!(first.actor.as_deref(), Some("octocat"));
+    assert_eq!(first.git_ref.as_deref(), Some("refs/heads/main"));
+    assert_eq!(first.title.as_deref(), Some("Bump chart"));
+    assert_eq!(first.errors[0]["message"], "yanked");
+    assert_eq!(first.created_at, Timestamp(20));
+    assert_eq!(db.refused_runs_for_tenant("acme", "web", 1).await.unwrap().len(), 1);
+    assert!(db.refused_runs_for_tenant("globex", "web", 10).await.unwrap().is_empty());
+}
+
+contract_test!(refused_runs_contract, refused_runs_list_per_project_newest_first);

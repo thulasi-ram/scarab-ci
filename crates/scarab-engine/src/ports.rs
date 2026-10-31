@@ -759,6 +759,17 @@ pub trait Db: Send + Sync {
         limit: u32,
     ) -> Result<Vec<RunSummary>, DbError>;
 
+    /// Record a refused Run creation (ADR-0076).
+    async fn record_refused_run(&self, refused: &crate::RefusedRun) -> Result<(), DbError>;
+
+    /// A Project's refused Run creations, newest first, at most `limit`.
+    async fn refused_runs_for_tenant(
+        &self,
+        org: &str,
+        project: &str,
+        limit: u32,
+    ) -> Result<Vec<crate::RefusedRun>, DbError>;
+
     /// The run's append-only event log, in append order (the SSE tail source).
     async fn events(&self, run: &RunId) -> Result<Vec<EventKind>, DbError>;
 
