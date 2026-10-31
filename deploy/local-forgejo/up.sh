@@ -85,11 +85,11 @@ if [ "$tunnel" = 1 ]; then
   # Wait for a registered connection before anything resolves the name: a
   # lookup that runs first can be cached as NXDOMAIN.
   for _ in $(seq 1 60); do
-    tunnel_url="$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$here/.tunnel.log" | head -n 1 || true)"
-    if [ -n "$tunnel_url" ] && grep -q "Registered tunnel connection" "$here/.tunnel.log"; then break; fi
+    tunnel_url="$(grep -ao 'https://[a-z0-9-]*\.trycloudflare\.com' "$here/.tunnel.log" | head -n 1 || true)"
+    if [ -n "$tunnel_url" ] && grep -aq "Registered tunnel connection" "$here/.tunnel.log"; then break; fi
     sleep 1
   done
-  if [ -z "$tunnel_url" ] || ! grep -q "Registered tunnel connection" "$here/.tunnel.log"; then
+  if [ -z "$tunnel_url" ] || ! grep -aq "Registered tunnel connection" "$here/.tunnel.log"; then
     echo "error: cloudflared did not register a tunnel; log:" >&2
     tail -n 20 "$here/.tunnel.log" >&2
     exit 1
@@ -106,11 +106,18 @@ echo "==> starting Forgejo ($FORGEJO_IMAGE) on $base"
 $compose up -d
 
 echo "==> waiting for the Forgejo API"
+# Any answer below 500 means Forgejo is serving: in tunnel mode sign-in is
+# required to view, and an anonymous /api/v1/version gets 401 or 403.
+forgejo_up() {
+  local code
+  code="$(curl -s -o /dev/null -w '%{http_code}' "$base/api/v1/version" 2>/dev/null || true)"
+  [ -n "$code" ] && [ "$code" != 000 ] && [ "$code" -lt 500 ]
+}
 for _ in $(seq 1 90); do
-  if curl -sf "$base/api/v1/version" >/dev/null 2>&1; then break; fi
+  if forgejo_up; then break; fi
   sleep 1
 done
-curl -sf "$base/api/v1/version" >/dev/null || {
+forgejo_up || {
   echo "error: Forgejo did not come up; logs:" >&2
   $compose logs --tail 50 forgejo >&2
   exit 1
