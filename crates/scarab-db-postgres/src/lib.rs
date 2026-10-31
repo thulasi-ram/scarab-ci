@@ -241,6 +241,24 @@ impl Db for PostgresDb {
         Ok(row.is_some_and(|r| r.get::<bool, _>("creating")))
     }
 
+    async fn unfinished_creations_before(
+        &self,
+        created_before: Timestamp,
+    ) -> Result<Vec<RunId>, DbError> {
+        let rows = sqlx::query(
+            "SELECT id FROM runs WHERE creating AND status = 'pending' AND created_at < $1
+             ORDER BY created_at",
+        )
+        .bind(created_before.0)
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| RunId(r.get::<String, _>("id")))
+            .collect())
+    }
+
     async fn create_step_run(
         &self,
         run: &RunId,
