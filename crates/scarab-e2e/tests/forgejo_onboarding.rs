@@ -153,7 +153,7 @@ async fn a_real_forgejo_repo_onboards_and_its_push_becomes_a_run() {
     let expected_repos: usize = std::env::var("SCARAB_TEST_FORGEJO_REPO_TOTAL")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(57);
+        .unwrap_or(59);
 
     // --- 0. the tier is re-runnable: the Postgres outlives the Forgejo -------
     reclaim_connections_for(&http, &base, &forgejo).await;
@@ -323,4 +323,342 @@ async fn a_real_forgejo_repo_onboards_and_its_push_becomes_a_run() {
             "the forge credential leaked into the {what} response"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0076 on a real push: an installed library runs, a branch named with `;`
+// refuses only the Pipeline that reads it, and a yank refuses a Rerun.
+// ---------------------------------------------------------------------------
+
+/// The library this case installs: `.scarab/lib/notify.yaml` of this
+/// repository at the commit that gave it a numeric non-root user (edd63788),
+/// fetched anonymously from github.com. It asks for no forge token, so it
+/// runs against a plain-HTTP Forgejo.
+const NOTIFY_SOURCE: &str =
+    "github.com/thulasi-ram/scarab-ci//.scarab/lib/notify.yaml@edd63788668ca551d4871f2a0856c0dc56783493";
+
+/// Creates the connection and binds `owner/name`; returns (org, project).
+async fn connect_and_bind(
+    http: &reqwest::Client,
+    base: &str,
+    forgejo: &str,
+    token: &str,
+    owner: &str,
+    name: &str,
+) -> (String, String) {
+    reclaim_connections_for(http, base, forgejo).await;
+    let created = json_ok(
+        http.post(format!("{base}/v1/connections"))
+            .json(&serde_json::json!({ "kind": "forgejo", "base_url": forgejo, "credential": token }))
+            .send()
+            .await
+            .expect("POST /v1/connections"),
+        "create connection",
+    )
+    .await;
+    let conn_id = created["id"].as_str().expect("connection id").to_string();
+    let bound = json_ok(
+        http.post(format!("{base}/v1/connections/{conn_id}/repos"))
+            .json(&serde_json::json!({ "owner": owner, "name": name }))
+            .send()
+            .await
+            .expect("POST bind"),
+        "bind",
+    )
+    .await;
+    assert_eq!(bound["webhook_registered"], true, "bind: {bound:#}");
+    (
+        bound["org"].as_str().expect("org").to_string(),
+        bound["project"].as_str().expect("project").to_string(),
+    )
+}
+
+/// Commits a file through the contents API, on `branch` or on a new branch
+/// cut from main: a real commit, so a real signed delivery.
+async fn push_file(
+    http: &reqwest::Client,
+    forgejo: &str,
+    token: &str,
+    repo: &str,
+    branch: Option<&str>,
+) {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let mut body = serde_json::json!({
+        "content": "c2NhcmFiIGUyZSBwdXNoCg==",
+        "message": "chore: live library case",
+        "branch": "main",
+    });
+    if let Some(b) = branch {
+        body["new_branch"] = serde_json::Value::String(b.to_string());
+    }
+    let resp = http
+        .post(format!("{forgejo}/api/v1/repos/{repo}/contents/pushes/{stamp}.txt"))
+        .header("authorization", format!("token {token}"))
+        .json(&body)
+        .send()
+        .await
+        .expect("POST contents");
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    assert!(status.is_success(), "the push failed ({status}): {text}");
+}
+
+/// Waits for Runs that were not in `before`, until `want` of them exist with
+/// `git_ref`; returns them keyed by pipeline.
+async fn new_runs_on(
+    http: &reqwest::Client,
+    base: &str,
+    org: &str,
+    project: &str,
+    before: &std::collections::BTreeSet<String>,
+    git_ref: &str,
+    want: usize,
+) -> std::collections::BTreeMap<String, String> {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let listed = json_ok(
+            http.get(format!("{base}/v1/repos/{org}/{project}/runs"))
+                .send()
+                .await
+                .expect("GET project runs"),
+            "project runs",
+        )
+        .await;
+        let fresh: std::collections::BTreeMap<String, String> = listed["runs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|r| r["id"].as_str().is_some_and(|id| !before.contains(id)))
+            .filter(|r| r["git_ref"] == git_ref)
+            .map(|r| {
+                (
+                    r["pipeline"].as_str().unwrap_or_default().to_string(),
+                    r["id"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        if fresh.len() >= want {
+            return fresh;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected {want} new Run(s) on {git_ref}, have {fresh:?}"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the proc-mode stack and a seeded Forgejo; run `just forgejo-verify`"]
+async fn an_installed_library_runs_and_a_yank_refuses_its_rerun() {
+    enter_tier();
+    let base = base_url();
+    let http = client();
+    let forgejo = env("SCARAB_TEST_FORGEJO_URL");
+    let token = env("SCARAB_TEST_FORGEJO_TOKEN");
+    let owner = env("SCARAB_TEST_FORGEJO_OWNER");
+    let name = env("SCARAB_TEST_FORGEJO_LIBRARY_REPO");
+    let repo = format!("{owner}/{name}");
+
+    let (org, project) = connect_and_bind(&http, &base, &forgejo, &token, &owner, &name).await;
+
+    // --- 1. fetch and install lib:thulasi-ram/notify ------------------------
+    let fetched = json_ok(
+        http.post(format!("{base}/v1/orgs/{org}/libraries/fetch"))
+            .json(&serde_json::json!({ "source": NOTIFY_SOURCE }))
+            .send()
+            .await
+            .expect("POST libraries/fetch"),
+        "fetch library",
+    )
+    .await;
+    assert_eq!(fetched["publisher"], "thulasi-ram", "{fetched:#}");
+    assert_eq!(fetched["name"], "notify", "{fetched:#}");
+    let hash = fetched["content_hash"].as_str().expect("hash").to_string();
+    let current = fetched["current"]["content_hash"].as_str().map(str::to_string);
+    if current.as_deref() != Some(hash.as_str()) {
+        json_ok(
+            http.put(format!("{base}/v1/orgs/{org}/libraries/thulasi-ram/notify"))
+                .json(&serde_json::json!({ "content_hash": hash, "replaces": current }))
+                .send()
+                .await
+                .expect("PUT library"),
+            "install library",
+        )
+        .await;
+    }
+    // The Postgres outlives the tier: lift a yank an earlier run left.
+    let libs = json_ok(
+        http.get(format!("{base}/v1/orgs/{org}/libraries"))
+            .send()
+            .await
+            .expect("GET libraries"),
+        "list libraries",
+    )
+    .await;
+    if libs["yanks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|y| y["content_hash"] == hash.as_str())
+    {
+        json_ok(
+            http.delete(format!("{base}/v1/orgs/{org}/library-yanks/{hash}"))
+                .send()
+                .await
+                .expect("DELETE yank"),
+            "lift an earlier yank",
+        )
+        .await;
+    }
+
+    // --- 2. a push to main runs both Pipelines, the library's Step included -
+    let before = run_ids(&http, &base, &org, &project).await;
+    push_file(&http, &forgejo, &token, &repo, None).await;
+    let on_main = new_runs_on(&http, &base, &org, &project, &before, "refs/heads/main", 2).await;
+    let ci_run = on_main.get("ci").unwrap_or_else(|| panic!("no `ci` Run: {on_main:?}")).clone();
+    for (pipeline, id) in &on_main {
+        let rs = wait_for_terminal(&http, &base, id, Duration::from_secs(240)).await;
+        assert_eq!(rs.status, "succeeded", "pipeline `{pipeline}` run {id}");
+    }
+    let text = logs(&http, &base, &ci_run).await;
+    assert!(
+        text.contains("posting deploy notification to #verify"),
+        "the library's Step did not run with the caller's input; logs: {text}"
+    );
+
+    // --- 3. a branch named with `;` refuses only the Pipeline that reads it -
+    let before = run_ids(&http, &base, &org, &project).await;
+    // Refused-Run ids are numbers.
+    let refused_before: std::collections::BTreeSet<i64> = json_ok(
+        http.get(format!("{base}/v1/repos/{org}/{project}/refused-runs"))
+            .send()
+            .await
+            .expect("GET refused-runs"),
+        "refused runs",
+    )
+    .await["refused"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| r["id"].as_i64())
+        .collect();
+    // Unique per run: a kept Forgejo (`just forgejo-verify keep`) still has
+    // the branch an earlier run created.
+    let branch = format!(
+        "feat;{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs()
+    );
+    let branch_ref = format!("refs/heads/{branch}");
+    push_file(&http, &forgejo, &token, &repo, Some(&branch)).await;
+    let on_branch = new_runs_on(&http, &base, &org, &project, &before, &branch_ref, 1).await;
+    assert!(
+        on_branch.contains_key("ci") && !on_branch.contains_key("branch"),
+        "only `ci` (which does not read event.branch) may run: {on_branch:?}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let refused = loop {
+        let listed = json_ok(
+            http.get(format!("{base}/v1/repos/{org}/{project}/refused-runs"))
+                .send()
+                .await
+                .expect("GET refused-runs"),
+            "refused runs",
+        )
+        .await;
+        let hit = listed["refused"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|r| r["id"].as_i64().is_some_and(|id| !refused_before.contains(&id)))
+            .cloned();
+        if let Some(r) = hit {
+            break r;
+        }
+        assert!(Instant::now() < deadline, "no refused-Run record for `branch`");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    };
+    // A refused-Run record names the Pipeline by its file, not its name.
+    assert_eq!(refused["pipeline"], ".scarab/branch.yaml", "{refused:#}");
+    assert_eq!(refused["git_ref"], branch_ref.as_str(), "{refused:#}");
+    assert_eq!(refused["reason_kind"], "event_field", "{refused:#}");
+    assert!(
+        refused["message"].as_str().unwrap_or_default().contains(';'),
+        "the refusal names the character: {refused:#}"
+    );
+    let rs = wait_for_terminal(&http, &base, &on_branch["ci"], Duration::from_secs(240)).await;
+    assert_eq!(rs.status, "succeeded", "`ci` on {branch}");
+
+    // --- 4. yank the version; a Rerun of its Step is refused at launch ------
+    let reason = "live tier: yanked on purpose";
+    json_ok(
+        http.post(format!("{base}/v1/orgs/{org}/library-yanks"))
+            .json(&serde_json::json!({ "content_hash": hash, "reason": reason }))
+            .send()
+            .await
+            .expect("POST yank"),
+        "yank",
+    )
+    .await;
+    let resp = http
+        .post(format!("{base}/v1/runs/{ci_run}/steps/say%2Fpost/rerun"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .expect("POST rerun");
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert!(status.is_success(), "the Rerun is accepted ({status}): {body}");
+    let rs = wait_for_run(
+        &http,
+        &base,
+        &ci_run,
+        Duration::from_secs(120),
+        "the rerun of `say/post` to end",
+        |rs| {
+            let s = rs.step("say/post");
+            s.attempts >= 2 && is_terminal(&s.status)
+        },
+    )
+    .await;
+    assert_eq!(rs.step("say/post").status, "failed");
+    let raw = json_ok(
+        http.get(format!("{base}/v1/runs/{ci_run}"))
+            .send()
+            .await
+            .expect("GET run"),
+        "run",
+    )
+    .await;
+    let step = raw["steps"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|s| s["id"] == "say/post")
+        .expect("step say/post");
+    let last = step["attempt_list"]
+        .as_array()
+        .and_then(|a| a.last())
+        .expect("an attempt");
+    let detail = last["failure_detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains(reason),
+        "the refusal shows the yank reason: {last:#}"
+    );
+
+    // --- 5. lift the yank so the tier can run again -------------------------
+    json_ok(
+        http.delete(format!("{base}/v1/orgs/{org}/library-yanks/{hash}"))
+            .send()
+            .await
+            .expect("DELETE yank"),
+        "lift the yank",
+    )
+    .await;
 }

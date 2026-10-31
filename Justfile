@@ -387,7 +387,8 @@ forgejo-verify keep="0":
     cargo nextest run -p scarab-forge-forgejo --test live --no-fail-fast
     # `forgejo_onboarding` is #[ignore]d so `just e2e`, which has no Forgejo,
     # reports it skipped rather than passed; asking for it here is the opt-in.
-    cargo nextest run -p scarab-e2e --test forgejo_onboarding --run-ignored all --no-fail-fast
+    # One test at a time: each one reclaims the Forgejo connection first.
+    cargo nextest run -p scarab-e2e --test forgejo_onboarding --run-ignored all --no-fail-fast --test-threads 1
 
 # LIVE k8s executor tier (`crates/scarab-executor-k8s/tests/cluster.rs`) — the
 # same tier `.github/workflows/kind.yml` runs, against the proc-mode kind cluster.
