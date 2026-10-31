@@ -3597,49 +3597,15 @@ impl DebugLauncher for K8sExecutor {
             ));
             volumes.push(workspace_token_volume(&name));
         }
-        let shell = Container {
-            name: STEP_CONTAINER.to_string(),
-            image: Some(image.to_string()),
-            // Keep the Pod alive so it can be shelled into; TTL-bounded.
-            command: Some(vec!["sleep".into(), ttl_secs.to_string()]),
-            working_dir: Some(WORKSPACE_MOUNT_PATH.to_string()),
-            volume_mounts: Some(vec![ws_mount]),
-            ..Default::default()
-        };
-        let mut pod = Pod {
-            metadata: ObjectMeta {
-                name: Some(name.clone()),
-                namespace: Some(self.namespace.clone()),
-                labels: Some(std::collections::BTreeMap::from([
-                    (
-                        "app.kubernetes.io/managed-by".to_string(),
-                        "scarab".to_string(),
-                    ),
-                    ("scarab.io/debug".to_string(), "true".to_string()),
-                    ("scarab.io/run".to_string(), sanitize_label(&step.run.0)),
-                    ("scarab.io/step".to_string(), sanitize_label(&step.step.0)),
-                ])),
-                ..Default::default()
-            },
-            spec: Some(PodSpec {
-                restart_policy: Some("Never".to_string()),
-                init_containers: (!init_containers.is_empty()).then_some(init_containers),
-                containers: vec![shell],
-                // Same workspace-ownership contract as a real step Pod: the
-                // re-materialized snapshot is owned by `WORKSPACE_GID` and only
-                // group-writable, so the debug shell must be in that group or the
-                // workspace it was opened to poke at is read-only (b04697f).
-                security_context: Some(k8s_openapi::api::core::v1::PodSecurityContext {
-                    fs_group: Some(WORKSPACE_GID),
-                    supplemental_groups: Some(vec![WORKSPACE_GID]),
-                    ..Default::default()
-                }),
-                volumes: Some(volumes),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        pass_through_k8s_expansion(&mut pod);
+        let pod = build_debug_pod(
+            &name,
+            &self.namespace,
+            step,
+            image,
+            ttl_secs,
+            init_containers,
+            volumes,
+        );
         pods.create(&PostParams::default(), &pod)
             .await
             .map_err(|e| ExecError::Other(format!("create debug pod: {e}")))?;
@@ -3683,6 +3649,72 @@ impl DebugLauncher for K8sExecutor {
             .map_err(|e| ExecError::Other(format!("delete debug pod {pod}: {e}")))?;
         Ok(())
     }
+}
+
+/// The debug Pod (see [`DebugLauncher`]): `image` running `sleep ttl_secs` at
+/// `/workspace`, fed by `init_containers` (the workspace fetcher, when there is
+/// a snapshot to re-materialise) over `volumes`.
+fn build_debug_pod(
+    name: &str,
+    namespace: &str,
+    step: &StepRun,
+    image: &str,
+    ttl_secs: u64,
+    init_containers: Vec<Container>,
+    volumes: Vec<Volume>,
+) -> Pod {
+    let shell = Container {
+        name: STEP_CONTAINER.to_string(),
+        image: Some(image.to_string()),
+        // Keep the Pod alive so it can be shelled into; TTL-bounded.
+        command: Some(vec!["sleep".into(), ttl_secs.to_string()]),
+        working_dir: Some(WORKSPACE_MOUNT_PATH.to_string()),
+        volume_mounts: Some(vec![VolumeMount {
+            name: WORKSPACE_VOLUME.to_string(),
+            mount_path: WORKSPACE_MOUNT_PATH.to_string(),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    };
+    let mut pod = Pod {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some(namespace.to_string()),
+            labels: Some(std::collections::BTreeMap::from([
+                (
+                    "app.kubernetes.io/managed-by".to_string(),
+                    "scarab".to_string(),
+                ),
+                ("scarab.io/debug".to_string(), "true".to_string()),
+                ("scarab.io/run".to_string(), sanitize_label(&step.run.0)),
+                ("scarab.io/step".to_string(), sanitize_label(&step.step.0)),
+            ])),
+            ..Default::default()
+        },
+        spec: Some(PodSpec {
+            restart_policy: Some("Never".to_string()),
+            init_containers: (!init_containers.is_empty()).then_some(init_containers),
+            containers: vec![shell],
+            // No container here calls the Kubernetes API (see
+            // [`build_pod`]), so the shell does not get the namespace
+            // ServiceAccount's token (git-bug b29cb9b).
+            automount_service_account_token: Some(false),
+            // Same workspace-ownership contract as a real step Pod: the
+            // re-materialized snapshot is owned by `WORKSPACE_GID` and only
+            // group-writable, so the debug shell must be in that group or the
+            // workspace it was opened to poke at is read-only (b04697f).
+            security_context: Some(k8s_openapi::api::core::v1::PodSecurityContext {
+                fs_group: Some(WORKSPACE_GID),
+                supplemental_groups: Some(vec![WORKSPACE_GID]),
+                ..Default::default()
+            }),
+            volumes: Some(volumes),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    pass_through_k8s_expansion(&mut pod);
+    pod
 }
 
 pub fn pod_name(step: &StepRun) -> String {
@@ -4544,6 +4576,17 @@ pub fn build_pod(
             init_containers,
             volumes,
             restart_policy: Some("Never".to_string()),
+            // The Step runs author and PR code, so it must not get the
+            // namespace ServiceAccount's API token: with it mounted, anything
+            // that can read a file could send the token out (git-bug b29cb9b).
+            // No container Scarab adds needs it: the results sidecar
+            // authenticates with its fence-scoped results token, the workspace
+            // fetcher and drain with a minted token from a Secret volume, the
+            // forge credential is a Secret volume too. A Step that needs the
+            // API gets a ServiceAccount through a placement profile, which
+            // sets `serviceAccountName` and `automountServiceAccountToken:
+            // true` and is merged after this (ADR-0055).
+            automount_service_account_token: Some(false),
             // Step deadline (ADR-0047): enforced by the kubelet, so a hung Pod
             // dies even if the control plane is down. Exceeding it surfaces as
             // `DeadlineExceeded` → the `Timeout` failure class.
@@ -4789,7 +4832,7 @@ fn egress_sidecar(
 /// Not touched, because Kubernetes does not expand them: `env[].valueFrom`,
 /// `workingDir`, `image`, HTTP-probe paths and headers, lifecycle hooks (Scarab
 /// sets none). Applied once to each Pod Scarab builds: [`build_pod`],
-/// [`build_service_pod`] and the debug Pod. The operator's placement overlay
+/// [`build_service_pod`] and [`build_debug_pod`]. The operator's placement overlay
 /// (ADR-0055) is merged after this and keeps Kubernetes' own rules.
 fn pass_through_k8s_expansion(pod: &mut Pod) {
     fn escape(s: &mut String) {
@@ -5110,6 +5153,8 @@ pub fn build_service_pod(
             // A standalone backing service is long-lived within the run; keep it
             // up on crash (teardown, not exit, ends it).
             restart_policy: Some("Always".to_string()),
+            // Runs an author's image; it gets no API token (git-bug b29cb9b).
+            automount_service_account_token: Some(false),
             // Non-root default (ADR-0058): a pinned uid keeps a matching
             // Pod-level fsGroup so any future fsGroup-supporting volume would
             // land group-writable. Today this Pod mounts no volumes at all —
@@ -6851,6 +6896,64 @@ mod tests {
             assert_eq!(
                 exec.command.as_ref().unwrap(),
                 &vec!["check".to_string(), "$$(SECRET)".to_string()]
+            );
+        }
+    }
+
+    /// No Pod Scarab builds mounts the namespace ServiceAccount's API token
+    /// (git-bug b29cb9b). The Step runs author and PR code; with the token
+    /// mounted it could read `/var/run/secrets/kubernetes.io/serviceaccount/token`
+    /// and send it out. None of Scarab's own containers in these Pods calls the
+    /// Kubernetes API: the results sidecar carries a fence-scoped results token,
+    /// the workspace fetcher and drain read a minted token from a Secret volume.
+    /// Checked on the fullest Step Pod (results sidecar, workspace fetcher and
+    /// drain, a sidecar service), a shared service Pod and a debug Pod.
+    #[test]
+    fn no_pod_scarab_builds_mounts_the_service_account_token() {
+        let egress = ResultsEgress {
+            base_url: "http://scarab-server".into(),
+            token_secret: b"secret".to_vec(),
+            sidecar_image: "ghcr.io/acme/scarab-sidecar:1".into(),
+        };
+        let svc = scarab_pipeline::ServiceSpec {
+            image: "postgres:16".into(),
+            ..Default::default()
+        };
+        let mut spec = busybox();
+        spec.workspace_inputs = vec!["tree-a".into()];
+        spec.services = vec![svc.clone()];
+        let step = step_with_attempt("run-1", "build", "a1");
+        let fetch = sample_fetch();
+        let step_pod = build_pod(
+            "scarab-x",
+            "ns",
+            &step,
+            &spec,
+            Some(&egress),
+            DEFAULT_STEP_TIMEOUT_SECS,
+            true,
+            Some(&fetch),
+        );
+        let service_pod = build_service_pod("run-1", "db", 1, "ns", &svc);
+        let debug_pod = build_debug_pod(
+            "scarab-debug-x",
+            "ns",
+            &step,
+            "busybox",
+            300,
+            vec![],
+            vec![workspace_token_volume("scarab-debug-x")],
+        );
+        for (what, pod) in [
+            ("step", &step_pod),
+            ("service", &service_pod),
+            ("debug", &debug_pod),
+        ] {
+            let ps = pod.spec.as_ref().unwrap();
+            assert_eq!(
+                ps.automount_service_account_token,
+                Some(false),
+                "{what} Pod mounts the ServiceAccount token"
             );
         }
     }

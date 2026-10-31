@@ -748,6 +748,11 @@ profile for anything static.
       schedulerName: my-scheduler
 ```
 
+Step Pods, service Pods and debug Pods do not mount a Kubernetes ServiceAccount token
+(`automountServiceAccountToken: false`), so code in a step cannot call the Kubernetes API with the
+namespace's default ServiceAccount. A step that needs the API names a placement profile that sets
+both `serviceAccountName` and `automountServiceAccountToken: true`.
+
 ## Retries, timeouts & reruns
 
 A step may set a `timeout:` (seconds) and an opt-in `retry:` policy. Retry is
