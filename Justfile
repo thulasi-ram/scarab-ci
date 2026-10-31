@@ -323,7 +323,8 @@ coverage:
 # crash/resume scenario additionally spawns its OWN server from
 # SCARAB_E2E_SERVER_BIN so its SIGKILLs never poison the shared stack.
 # Zero auto-retries: a red run is a real bug, not flake to mask.
-e2e:
+# Usage: `just e2e` | `just e2e crash_resume` (nextest filter).
+e2e filter="":
     #!/usr/bin/env bash
     set -euo pipefail
     bash deploy/local-proc/up.sh
@@ -341,7 +342,7 @@ e2e:
     export SCARAB_E2E_SERVER_BIN="$PWD/target/debug/scarab-server"
     export SCARAB_E2E_CLI_BIN="$PWD/target/debug/scarab"
     export SCARAB_E2E_KUBECONFIG="$PWD/deploy/local-proc/.kubeconfig"
-    cargo nextest run -p scarab-e2e --no-fail-fast
+    cargo nextest run -p scarab-e2e --no-fail-fast {{filter}}
 
 # LIVE Forgejo verification (git-bug 3863d5e). Everything in the Forgejo path was
 # asserted against unit tests of the shapes we BELIEVED Forgejo uses, and one of

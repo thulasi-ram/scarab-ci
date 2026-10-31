@@ -290,15 +290,22 @@ kubectl run "$ws_probe_pod" -n scarab \
   --image=busybox:1.36 --restart=Never \
   --command -- sh -c "$ws_probe_script" >/dev/null 2>&1 || true
 ws_host=""
-for _ in $(seq 1 30); do
+# 180s, not 60: on a cluster kind just created, the node pulls busybox from
+# Docker Hub first, and that pull alone has taken over a minute here.
+for _ in $(seq 1 90); do
   phase="$(kubectl get pod "$ws_probe_pod" -n scarab -o jsonpath='{.status.phase}' 2>/dev/null || true)"
   case "$phase" in
     Succeeded|Failed) break ;;
   esac
   sleep 2
 done
+# `|| true`: a Pod that never ran has no logs, `kubectl logs` exits non-zero,
+# and under `pipefail` that ended this script with no message at all instead of
+# the error below.
 ws_host="$(kubectl logs "$ws_probe_pod" -n scarab 2>/dev/null \
-           | sed -n 's/^SCARAB_WS_HOST=//p' | tr -d '\r' | head -n 1)"
+           | sed -n 's/^SCARAB_WS_HOST=//p' | tr -d '\r' | head -n 1 || true)"
+ws_probe_state="$(kubectl get pod "$ws_probe_pod" -n scarab \
+  -o jsonpath='{.status.phase} {.status.containerStatuses[0].state}' 2>/dev/null || true)"
 kubectl delete pod "$ws_probe_pod" -n scarab --ignore-not-found --wait=false >/dev/null 2>&1 || true
 if [ -z "$ws_host" ] || [ "$ws_host" = none ]; then
   # A HARD GATE, not a warning — and this is the promotion the previous version's
@@ -312,6 +319,7 @@ if [ -z "$ws_host" ] || [ "$ws_host" = none ]; then
   {
     echo "error: no Pod-reachable address for the workspace service was found."
     echo "  Tried: $ws_candidates (port $ws_port)"
+    echo "  Probe Pod state: ${ws_probe_state:-unknown}"
     echo "  Since ADR-0061 s3-feed this is FATAL: a Step that inherits a workspace"
     echo "  is provisioned by an init container that dials this URL, and the old"
     echo "  control-plane 'kubectl exec' feed is deleted, not kept as a fallback."
