@@ -1,0 +1,11 @@
+[package]
+name = "scarab-k8s-expansion"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+# One rule shared by every crate that builds Pods (the k8s executor and the
+# plugin runtime): turn off the kubelet's `$(VAR)` expansion. Pure: it edits a
+# PodSpec value and does no I/O.
+[dependencies]
+k8s-openapi = { workspace = true }

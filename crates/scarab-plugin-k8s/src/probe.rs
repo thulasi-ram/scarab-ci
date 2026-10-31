@@ -311,7 +311,7 @@ fn env(name: &str, value: &str) -> EnvVar {
 
 /// One probe Pod: restricted, read-only root with a scratch `/tmp`, no
 /// ServiceAccount token, no service links, never restarted, bounded by a
-/// deadline.
+/// deadline, and no `$(VAR)` expansion by the kubelet.
 fn probe_pod(
     namespace: &str,
     nonce: &str,
@@ -320,7 +320,7 @@ fn probe_pod(
     labels: BTreeMap<String, String>,
     container: Container,
 ) -> Pod {
-    Pod {
+    let mut pod = Pod {
         metadata: ObjectMeta {
             name: Some(probe_pod_name(nonce, role)),
             namespace: Some(namespace.to_string()),
@@ -354,7 +354,12 @@ fn probe_pod(
             ..Default::default()
         }),
         ..Default::default()
+    };
+    // The scripts' `$` are for `sh`, not the kubelet (git-bug 4b6cb01).
+    if let Some(spec) = pod.spec.as_mut() {
+        scarab_k8s_expansion::pass_through_k8s_expansion(spec);
     }
+    pod
 }
 
 /// The canary: an HTTP listener on 8080, Ready once it accepts.
@@ -600,12 +605,34 @@ mod tests {
         SCARAB_PROBE apiserver unreached\nSCARAB_PROBE internet unreached\n\
         SCARAB_PROBE metadata unreached\nSCARAB_PROBE canary unreached\n";
 
+    /// The script as `sh` receives it: the Pod carries every `$` as `$$`
+    /// (git-bug 4b6cb01), and the kubelet reduces each pair to one.
     fn script_of(pod: &Pod) -> String {
-        pod.spec.as_ref().unwrap().containers[0]
+        let written = pod.spec.as_ref().unwrap().containers[0]
             .command
             .clone()
             .unwrap()[2]
-            .clone()
+            .clone();
+        written.replace("$$", "$")
+    }
+
+    /// No probe Pod relies on the kubelet's `$(VAR)` expansion: every `$` in a
+    /// command or env value is written `$$` (git-bug 4b6cb01), so the script
+    /// reaches `sh` as written.
+    #[test]
+    fn probe_pods_pass_dollar_signs_through_the_kubelet() {
+        let control = control_pod("ns", "n1", "img", "10.0.0.9");
+        let plugin = plugin_probe_pod("ns", "n1", "img", "10.0.0.9", "http://10.96.0.20:8090");
+        for pod in [&control, &plugin] {
+            let written = &pod.spec.as_ref().unwrap().containers[0]
+                .command
+                .as_ref()
+                .unwrap()[2];
+            assert!(
+                written.contains("$$KUBERNETES_SERVICE_HOST") || written.contains("$$CANARY_IP")
+            );
+            assert!(!written.replace("$$", "").contains('$'), "{written}");
+        }
     }
 
     #[test]

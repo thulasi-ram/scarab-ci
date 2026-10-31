@@ -469,6 +469,43 @@ pub fn deployment(
             ..Default::default()
         });
     }
+    let mut pod_spec = PodSpec {
+        service_account_name: Some(name.clone()),
+        automount_service_account_token: Some(false),
+        enable_service_links: Some(false),
+        security_context: Some(restricted_pod_security_context()),
+        init_containers: Some(vec![crate::probe::self_check_container(
+            probe_image,
+            broker_url,
+        )]),
+        containers: vec![Container {
+            name: "plugin".to_string(),
+            image: Some(installation.image.clone()),
+            image_pull_policy: Some("IfNotPresent".to_string()),
+            env: Some(plugin_env(installation, broker_url)),
+            security_context: Some(restricted_container_security_context()),
+            resources: Some(ResourceRequirements {
+                requests: Some(BTreeMap::from([
+                    ("cpu".to_string(), quantity("50m")),
+                    ("memory".to_string(), quantity("64Mi")),
+                ])),
+                // CPU too: a spinning Plugin gets half a core,
+                // never the node.
+                limits: Some(BTreeMap::from([
+                    ("cpu".to_string(), quantity(PLUGIN_CPU_LIMIT)),
+                    ("memory".to_string(), quantity("256Mi")),
+                ])),
+                ..Default::default()
+            }),
+            volume_mounts: Some(volume_mounts),
+            ..Default::default()
+        }],
+        volumes: Some(volumes),
+        ..Default::default()
+    };
+    // The kubelet must not expand `$(VAR)` in a config value or the
+    // self-check script (git-bug 4b6cb01).
+    scarab_k8s_expansion::pass_through_k8s_expansion(&mut pod_spec);
     Deployment {
         metadata: ObjectMeta {
             annotations: Some(annotations),
@@ -494,40 +531,7 @@ pub fn deployment(
                     annotations: Some(template_annotations),
                     ..Default::default()
                 }),
-                spec: Some(PodSpec {
-                    service_account_name: Some(name.clone()),
-                    automount_service_account_token: Some(false),
-                    enable_service_links: Some(false),
-                    security_context: Some(restricted_pod_security_context()),
-                    init_containers: Some(vec![crate::probe::self_check_container(
-                        probe_image,
-                        broker_url,
-                    )]),
-                    containers: vec![Container {
-                        name: "plugin".to_string(),
-                        image: Some(installation.image.clone()),
-                        image_pull_policy: Some("IfNotPresent".to_string()),
-                        env: Some(plugin_env(installation, broker_url)),
-                        security_context: Some(restricted_container_security_context()),
-                        resources: Some(ResourceRequirements {
-                            requests: Some(BTreeMap::from([
-                                ("cpu".to_string(), quantity("50m")),
-                                ("memory".to_string(), quantity("64Mi")),
-                            ])),
-                            // CPU too: a spinning Plugin gets half a core,
-                            // never the node.
-                            limits: Some(BTreeMap::from([
-                                ("cpu".to_string(), quantity(PLUGIN_CPU_LIMIT)),
-                                ("memory".to_string(), quantity("256Mi")),
-                            ])),
-                            ..Default::default()
-                        }),
-                        volume_mounts: Some(volume_mounts),
-                        ..Default::default()
-                    }],
-                    volumes: Some(volumes),
-                    ..Default::default()
-                }),
+                spec: Some(pod_spec),
             },
             ..Default::default()
         }),
@@ -655,6 +659,28 @@ mod tests {
             .iter()
             .map(|e| (e.name.clone(), e.value.clone().unwrap()))
             .collect()
+    }
+
+    /// The kubelet expands `$(VAR)` in a container's command, args and env
+    /// values, and reduces `$$` to `$` (git-bug 4b6cb01). An installation's
+    /// config is an org admin's text, not the operator's: a value must reach
+    /// the Plugin as written, never expanded from another config key, and the
+    /// self-check script must reach `sh` as written.
+    #[test]
+    fn config_values_and_the_self_check_reach_the_pod_as_written() {
+        let mut inst = installation();
+        inst.config = BTreeMap::from([
+            ("A_TOKEN".to_string(), "secret".to_string()),
+            ("B_PASSWORD".to_string(), "pa$$word$(A_TOKEN)".to_string()),
+        ]);
+        let d = deployment("scarab-plugins", &inst, BROKER_URL, PROBE_IMAGE);
+        // Each `$` is written `$$`, which the kubelet reduces back to one.
+        assert_eq!(env_of(&d)["B_PASSWORD"], "pa$$$$word$$(A_TOKEN)");
+        let init = &pod_spec(&d).init_containers.as_ref().unwrap()[0];
+        assert_eq!(
+            init.command.as_ref().unwrap()[2],
+            crate::probe::self_check_script().replace('$', "$$")
+        );
     }
 
     #[test]

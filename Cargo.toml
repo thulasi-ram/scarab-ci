@@ -77,6 +77,9 @@ scarab-storage-s3 = { path = "crates/scarab-storage-s3" }
 # `ContentSource`. An adapter over reqwest — no kube, so the node driver can use
 # it without linking the kubernetes executor.
 scarab-workspace-client = { path = "crates/scarab-workspace-client" }
+# The rule that turns off the kubelet's `$(VAR)` expansion, shared by every
+# crate that builds Pods (the k8s executor and the plugin runtime).
+scarab-k8s-expansion = { path = "crates/scarab-k8s-expansion" }
 scarab-executor-k8s = { path = "crates/scarab-executor-k8s" }
 scarab-executor-local = { path = "crates/scarab-executor-local" }
 scarab-testkit = { path = "crates/scarab-testkit" }

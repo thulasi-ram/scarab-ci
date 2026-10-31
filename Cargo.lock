@@ -2774,6 +2774,7 @@ dependencies = [
  "rustls",
  "scarab-engine",
  "scarab-forge-github",
+ "scarab-k8s-expansion",
  "scarab-pipeline",
  "scarab-storage",
  "scarab-storage-s3",
@@ -2852,6 +2853,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "scarab-k8s-expansion"
+version = "0.2.2"
+dependencies = [
+ "k8s-openapi",
+]
+
+[[package]]
 name = "scarab-pipeline"
 version = "0.2.2"
 dependencies = [
@@ -2908,6 +2916,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "rustls",
+ "scarab-k8s-expansion",
  "scarab-plugin",
  "serde_json",
  "sha2",

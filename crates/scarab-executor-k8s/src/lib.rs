@@ -4811,65 +4811,15 @@ fn egress_sidecar(
     }
 }
 
-/// Make Kubernetes pass every string Scarab put in the Pod through unchanged.
-///
-/// The kubelet expands `$(VAR)` in a container's `command`, `args` and
-/// `env[].value` from that container's environment, and reduces `$$` to `$`
-/// (see the `Container` and `EnvVar` API docs). It does the same to an exec
-/// probe's command (`ExpandContainerCommandOnlyStatic` in the kubelet's
-/// prober), though the API docs do not say so. Scarab renders `${{ }}` once at
-/// launch, and Step secrets are plain env vars, so without this a rendered
-/// value from outside the Pipeline (a dispatch parameter, a webhook field, a
-/// Step output) holding `$(DEPLOY_TOKEN)` would become the secret before the
-/// program ran, with no shell involved. It also made `sh -c 'echo $$'` run as
-/// `echo $` here while the local executor runs it as written.
-///
-/// Writing every `$` as `$$` turns expansion off: Kubernetes reduces each pair
-/// back to one `$`, and an escaped `$$(VAR)` is never expanded. Nothing Scarab
-/// generates relies on `$(VAR)` expansion; a string that ever needs it must be
-/// added after this pass, and say so.
-///
-/// Not touched, because Kubernetes does not expand them: `env[].valueFrom`,
-/// `workingDir`, `image`, HTTP-probe paths and headers, lifecycle hooks (Scarab
-/// sets none). Applied once to each Pod Scarab builds: [`build_pod`],
-/// [`build_service_pod`] and [`build_debug_pod`]. The operator's placement overlay
-/// (ADR-0055) is merged after this and keeps Kubernetes' own rules.
+/// Turn off the kubelet's `$(VAR)` expansion on a Pod Scarab built, so every
+/// string reaches the container as rendered (see
+/// [`scarab_k8s_expansion::pass_through_k8s_expansion`]). Applied once to each
+/// Pod: [`build_pod`], [`build_service_pod`] and [`build_debug_pod`]. The
+/// operator's placement overlay (ADR-0055) is merged after this and keeps
+/// Kubernetes' own rules.
 fn pass_through_k8s_expansion(pod: &mut Pod) {
-    fn escape(s: &mut String) {
-        if s.contains('$') {
-            *s = s.replace('$', "$$");
-        }
-    }
-    fn escape_all(v: &mut Option<Vec<String>>) {
-        v.iter_mut().flatten().for_each(escape);
-    }
-    let Some(spec) = pod.spec.as_mut() else {
-        return;
-    };
-    let containers = spec
-        .containers
-        .iter_mut()
-        .chain(spec.init_containers.iter_mut().flatten());
-    for c in containers {
-        escape_all(&mut c.command);
-        escape_all(&mut c.args);
-        for e in c.env.iter_mut().flatten() {
-            if let Some(v) = e.value.as_mut() {
-                escape(v);
-            }
-        }
-        for probe in [
-            &mut c.startup_probe,
-            &mut c.readiness_probe,
-            &mut c.liveness_probe,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if let Some(exec) = probe.exec.as_mut() {
-                escape_all(&mut exec.command);
-            }
-        }
+    if let Some(spec) = pod.spec.as_mut() {
+        scarab_k8s_expansion::pass_through_k8s_expansion(spec);
     }
 }
 
