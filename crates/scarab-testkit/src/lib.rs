@@ -744,6 +744,24 @@ impl Db for InMemoryDb {
         Ok(self.state.lock().unwrap().creating.contains(run))
     }
 
+    async fn unfinished_creations_before(
+        &self,
+        created_before: Timestamp,
+    ) -> Result<Vec<RunId>, DbError> {
+        let st = self.state.lock().unwrap();
+        let mut stale: Vec<(Timestamp, RunId)> = st
+            .creating
+            .iter()
+            .filter(|r| st.runs.get(*r) == Some(&RunStatus::Pending))
+            .filter_map(|r| {
+                let at = *st.run_created.get(r)?;
+                (at < created_before).then(|| (at, r.clone()))
+            })
+            .collect();
+        stale.sort_by(|a, b| (a.0, &a.1 .0).cmp(&(b.0, &b.1 .0)));
+        Ok(stale.into_iter().map(|(_, r)| r).collect())
+    }
+
     async fn create_step_run(
         &self,
         run: &RunId,

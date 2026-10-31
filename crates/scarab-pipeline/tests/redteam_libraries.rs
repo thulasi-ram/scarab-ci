@@ -921,3 +921,29 @@ fn a_library_default_holding_an_expression_is_refused() {
         );
     }
 }
+
+/// Was: a library invoke's `with:` reading `outputs.<step>.<name>` that
+/// `<step>` does not declare compiled, and failed the library Step when it
+/// launched (git-bug 6adf89a). A plugin gate's `with:` is checked at compile
+/// since e6b9d618; a library's now is too, once for the invoke however many
+/// Steps the library has.
+#[test]
+fn a_library_with_reading_an_undeclared_result_is_refused() {
+    let lib = "kind: library\ninterface:\n  inputs:\n    - { name: x, type: string }\nsteps:\n  - { id: s, image: busybox, env: [[X, \"${{ inputs.x }}\"]] }\n  - { id: t, image: busybox, env: [[X, \"${{ inputs.x }}\"]] }\n";
+    let pipeline = |read: &str| {
+        format!(
+            "steps:\n  - {{ id: bump, image: alpine, results: [image] }}\n  - id: c\n    \
+             needs: [bump]\n    invoke: file:l.yaml\n    with: {{ x: \"${{{{ {read} }}}}\" }}\n"
+        )
+    };
+    let libs = files(&[("l.yaml", lib)]);
+    let e = errs(&pipeline("outputs.bump.nope"), &libs);
+    let hits: Vec<&String> = e
+        .iter()
+        .filter(|e| e.contains("outputs.bump.nope") && e.contains("does not declare"))
+        .collect();
+    assert_eq!(hits.len(), 1, "{e:?}");
+    assert!(hits[0].contains("step `c`"), "{e:?}");
+    // A declared result compiles.
+    ok(&pipeline("outputs.bump.image"), &libs);
+}

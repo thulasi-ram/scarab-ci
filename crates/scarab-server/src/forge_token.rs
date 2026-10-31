@@ -316,6 +316,12 @@ pub struct ForgeCredentialExecutor {
     /// §6), so a yanked Step is refused before a credential is asked for,
     /// and to check at launch that the org still trusts a Step's library.
     libraries: Option<(Arc<dyn Db>, Arc<dyn LibraryStore>)>,
+    /// The Run store and the org Environment governance store: to re-admit a
+    /// deploy Run's Step (ADR-0071 §2) before its credential is asked for.
+    governance: Option<(
+        Arc<dyn Db>,
+        Arc<dyn scarab_project::EnvironmentGovernanceStore>,
+    )>,
     /// The tokens this process minted for each launched unit, so a re-drive
     /// that replaces one can revoke it. When the Attempt ends the token is
     /// also read back from the unit itself
@@ -331,6 +337,7 @@ impl ForgeCredentialExecutor {
             forge,
             secrets: None,
             libraries: None,
+            governance: None,
             minted: Mutex::new(HashMap::new()),
         }
     }
@@ -478,6 +485,19 @@ impl ForgeCredentialExecutor {
         }
     }
 
+    /// Re-admit a forge-token or build Step of a deploy Run (ADR-0071 §2)
+    /// before its checkout token or registry auth is asked for. This decorator
+    /// runs before `SecretInjectingExecutor`, whose own re-admission would
+    /// come after the credential was minted (git-bug 66c0368).
+    pub fn with_environment_governance(
+        mut self,
+        db: Arc<dyn Db>,
+        governance: Arc<dyn scarab_project::EnvironmentGovernanceStore>,
+    ) -> Self {
+        self.governance = Some((db, governance));
+        self
+    }
+
     /// Enable scoped `REGISTRY_AUTH` resolution for build steps (ADR-0018).
     pub fn with_secrets(mut self, secrets: Arc<dyn scarab_secrets::SecretProvider>) -> Self {
         self.secrets = Some(secrets);
@@ -574,8 +594,18 @@ impl Executor for ForgeCredentialExecutor {
     async fn launch(&self, step: &StepRun, spec: &StepSpec) -> Result<ExecHandle, ExecError> {
         // Only a forge-token or build Step asks for a credential here; the
         // yank check for every other Step is SecretInjecting's.
+        // Environment re-admission (ADR-0071 §2) likewise comes before the
+        // credential here, not only in SecretInjecting.
         if spec.build.is_some() || spec.forge_token.is_some() {
             self.ensure_not_yanked(step).await?;
+            if let Some((db, governance)) = &self.governance {
+                crate::secret_executor::ensure_deploy_still_admitted(
+                    db.as_ref(),
+                    governance.as_ref(),
+                    &step.run,
+                )
+                .await?;
+            }
         }
         // A build step (ADR-0018): resolve its registry auth in memory only —
         // the stored spec never carries a credential.

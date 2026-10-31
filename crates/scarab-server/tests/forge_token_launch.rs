@@ -430,3 +430,68 @@ async fn inline_dev_builds_get_no_auth() {
     assert_eq!(enriched.registry_auth_json, None);
     assert_eq!(enriched.derived_auth, None);
 }
+
+// ---------------------------------------------------------------------------
+// Environment re-admission before any credential (git-bug 66c0368).
+// ---------------------------------------------------------------------------
+
+/// A forge-token Step and a build Step of a deploy Run whose Project the
+/// Environment no longer admits: in the production decorator order
+/// (ForgeCredential outermost, SecretInjecting inside), re-admission refuses
+/// the launch before a checkout token is minted or registry auth is fetched.
+#[tokio::test]
+async fn a_refused_readmission_mints_no_credential() {
+    use scarab_project::EnvironmentProjectEligibility;
+    use scarab_server::{LogService, SecretInjectingExecutor};
+    use scarab_testkit::{InMemoryEnvironmentGovernance, InMemoryObjectStore};
+
+    for spec in [
+        token_spec(ForgeToken::Read),
+        build_spec("ghcr.io/acme/web:latest"),
+    ] {
+        let db = Arc::new(InMemoryDb::new());
+        let run = RunId("r1".into());
+        db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+        db.set_run_deploy_context(
+            &run,
+            &scarab_engine::DeployContext {
+                org: "acme".into(),
+                project: "web".into(),
+                environment: "prod".into(),
+                git_ref: "refs/heads/main".into(),
+                locked_out: false,
+            },
+        )
+        .await
+        .unwrap();
+        // `prod` admits only `checkout`, never `web`.
+        let governance = Arc::new(InMemoryEnvironmentGovernance::new().with_environment(
+            "acme",
+            "prod",
+            EnvironmentProjectEligibility::Projects(vec!["checkout".into()]),
+        ));
+        let forge = Arc::new(FakeForge::new().with_minted_tokens());
+        let inner = Arc::new(FakeExecutor::new());
+        let logs = Arc::new(LogService::new(
+            Arc::new(InMemoryObjectStore::new()),
+            db.clone(),
+        ));
+        let secret_exec = SecretInjectingExecutor::new(
+            inner.clone(),
+            db.clone() as Arc<dyn Db>,
+            Arc::new(FakeSecrets::new()),
+            logs,
+        )
+        .with_environment_governance(governance.clone());
+        let exec = ForgeCredentialExecutor::new(Arc::new(secret_exec), forge.clone())
+            .with_environment_governance(db.clone(), governance);
+
+        let launched = exec.launch(&step_run("checkout/git"), &spec).await;
+        assert!(
+            matches!(&launched, Err(scarab_engine::ExecError::Refused(r)) if r.contains("no longer eligible")),
+            "{launched:?}"
+        );
+        assert_eq!(forge.credential_calls(), 0, "a credential was asked for");
+        assert_eq!(forge.checkout_credentials_minted(), 0);
+    }
+}

@@ -2093,7 +2093,15 @@ struct Config {
     /// blip or a since-fixed control-plane bug self-heals on a later tick,
     /// short enough that a poison run does not hot-loop forever.
     tick_failure_deadline_ms: i64,
+    /// How long after its creation began a run may stay mid-creation before
+    /// the leader ends it `Failed` (git-bug ccbf7fe). Default 10 min: run
+    /// creation is a handful of db writes, so a run this old is not being
+    /// written by any live request — the server that began it stopped.
+    unfinished_creation_bound_ms: i64,
 }
+
+/// The reason a run left mid-creation by a stopped server is failed with.
+pub const UNFINISHED_CREATION_REASON: &str = "the server stopped while creating this Run";
 
 /// One control-plane instance's supervision memory (ADR-0056): the attempts
 /// (keyed `{run}:{step}:{attempt}`) this PROCESS has launched or polled.
@@ -2225,6 +2233,7 @@ impl<'a> Scheduler<'a> {
                 default_step_timeout_ms: 3_600_000,
                 service_ready_timeout_ms: 300_000,
                 tick_failure_deadline_ms: 300_000,
+                unfinished_creation_bound_ms: 600_000,
             },
         }
     }
@@ -2269,6 +2278,13 @@ impl<'a> Scheduler<'a> {
     /// the run dead-letters (ADR-0059).
     pub fn with_tick_failure_deadline_ms(mut self, ms: i64) -> Self {
         self.cfg.tick_failure_deadline_ms = ms;
+        self
+    }
+
+    /// Override how long a run may stay mid-creation before the leader ends
+    /// it `Failed` (git-bug ccbf7fe).
+    pub fn with_unfinished_creation_bound_ms(mut self, ms: i64) -> Self {
+        self.cfg.unfinished_creation_bound_ms = ms;
         self
     }
 
@@ -2330,11 +2346,11 @@ impl<'a> Scheduler<'a> {
     /// (see [`TickHealth`]), restoring "forward progress **or** explicit
     /// dead-letter" (CONTEXT §7.1) at the per-run grain.
     pub async fn tick_all(&self) -> Result<Vec<(RunId, SchedulerError)>, SchedulerError> {
+        let mut isolated = self.sweep_unfinished_creations().await?;
         let runs = self.db.active_runs().await?;
         // Runs that finished (or dead-lettered) must not keep a failure streak
         // alive in the process-lifetime map.
         self.health.retain_active(&runs);
-        let mut isolated: Vec<(RunId, SchedulerError)> = Vec::new();
         let mut stuck: std::collections::HashSet<&RunId> = std::collections::HashSet::new();
         for run in &runs {
             // Shared services (ADR-0058) before admit, so the readiness gate sees
@@ -2408,6 +2424,33 @@ impl<'a> Scheduler<'a> {
             }
             Err(dl) => Some(dl),
         }
+    }
+
+    /// End `Failed` every run left mid-creation longer than the bound
+    /// (git-bug ccbf7fe). A server that stops between
+    /// [`Db::begin_run_creation`] and its finish or fail leaves the run
+    /// `Pending` and out of [`Db::active_runs`]: nothing schedules it, and its
+    /// rerun and gate actions refuse it. Leader-only, so replicas do not race
+    /// on the same run; idempotent, because a failed run is no longer
+    /// `Pending` and a lost CAS ([`DbError::Conflict`]) means a peer — or the
+    /// creating request itself — already ended it. A failure to end one run is
+    /// returned as that run's isolated error, never aborting the tick.
+    pub async fn sweep_unfinished_creations(
+        &self,
+    ) -> Result<Vec<(RunId, SchedulerError)>, SchedulerError> {
+        if !self.is_leader().await? {
+            return Ok(Vec::new());
+        }
+        let now = self.clock.now().await;
+        let cutoff = Timestamp(now.0 - self.cfg.unfinished_creation_bound_ms);
+        let mut isolated = Vec::new();
+        for run in self.db.unfinished_creations_before(cutoff).await? {
+            match fail_run_creation(self.db, &run, UNFINISHED_CREATION_REASON.into(), now).await {
+                Ok(()) | Err(DbError::Conflict) => {}
+                Err(e) => isolated.push((run, e.into())),
+            }
+        }
+        Ok(isolated)
     }
 
     /// Are we the admission leader right now?

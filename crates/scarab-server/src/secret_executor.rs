@@ -21,8 +21,9 @@
 //! and no OIDC token can still carry admitted `privileged` /
 //! `add_capabilities` / `k8s_overlay` grants, which are Environment authority
 //! too. A refusal is [`ExecError::Refused`], which the scheduler turns into a
-//! `Config` step failure carrying the reason. Timer and external gates rely on
-//! this check: whatever releases the gate, the next launch fails closed.
+//! `Config` step failure carrying the reason. The same check holds a gate the
+//! scheduler would release on its own verdict (a timer that passed): the gate
+//! fails with the reason ([`Executor::gate_refusal`]).
 
 use std::sync::Arc;
 
@@ -50,6 +51,42 @@ pub struct SecretInjectingExecutor {
     /// Installed libraries and yanks (ADR-0076 §6). `None` = no launch-time
     /// yank check (a hand-built executor; `main.rs` wires it).
     libraries: Option<Arc<dyn scarab_policy::library::LibraryStore>>,
+}
+
+/// Refuse when `run` is a deploy whose Environment is gone or no longer admits
+/// its Project (ADR-0071 §2); `Ok(())` for a run with no deploy context. Shared
+/// by the launch decorators, so each makes the check before it uses a
+/// credential.
+pub(crate) async fn ensure_deploy_still_admitted(
+    db: &dyn Db,
+    governance: &dyn scarab_project::EnvironmentGovernanceStore,
+    run: &scarab_engine::RunId,
+) -> Result<(), ExecError> {
+    let Some(ctx) = db
+        .run_deploy_context(run)
+        .await
+        .map_err(|e| ExecError::Other(e.to_string()))?
+    else {
+        return Ok(());
+    };
+    let refusal = match governance
+        .deploy_governance(&ctx.org, &ctx.project, &ctx.environment)
+        .await
+        .map_err(|e| ExecError::Other(format!("environment governance store: {e}")))?
+    {
+        Some(g) if g.eligible => return Ok(()),
+        Some(_) => format!(
+            "project `{}` is no longer eligible to deploy to environment `{}` in org `{}`; \
+             its credentials are not released (ADR-0071)",
+            ctx.project, ctx.environment, ctx.org
+        ),
+        None => format!(
+            "environment `{}` no longer exists in org `{}`; its credentials are not \
+             released (ADR-0071)",
+            ctx.environment, ctx.org
+        ),
+    };
+    Err(ExecError::Refused(refusal))
 }
 
 /// Per-attempt OIDC token TTL (ADR-0015: short-lived by design — long enough
@@ -119,35 +156,12 @@ impl SecretInjectingExecutor {
     /// scheduler fails the step (`Config`, with this reason) and nothing —
     /// credential, privilege grant, Pod — is used.
     async fn ensure_still_admitted(&self, step: &StepRun) -> Result<(), ExecError> {
-        let Some(governance) = &self.governance else {
-            return Ok(());
-        };
-        let Some(ctx) = self
-            .db
-            .run_deploy_context(&step.run)
-            .await
-            .map_err(|e| ExecError::Other(e.to_string()))?
-        else {
-            return Ok(());
-        };
-        let refusal = match governance
-            .deploy_governance(&ctx.org, &ctx.project, &ctx.environment)
-            .await
-            .map_err(|e| ExecError::Other(format!("environment governance store: {e}")))?
-        {
-            Some(g) if g.eligible => return Ok(()),
-            Some(_) => format!(
-                "project `{}` is no longer eligible to deploy to environment `{}` in org `{}`; \
-                 its credentials are not released (ADR-0071)",
-                ctx.project, ctx.environment, ctx.org
-            ),
-            None => format!(
-                "environment `{}` no longer exists in org `{}`; its credentials are not \
-                 released (ADR-0071)",
-                ctx.environment, ctx.org
-            ),
-        };
-        Err(ExecError::Refused(refusal))
+        match &self.governance {
+            Some(governance) => {
+                ensure_deploy_still_admitted(self.db.as_ref(), governance.as_ref(), &step.run).await
+            }
+            None => Ok(()),
+        }
     }
 
     /// Enable per-attempt OIDC token minting (ADR-0015): every launched step
@@ -322,9 +336,15 @@ impl Executor for SecretInjectingExecutor {
         gate: &scarab_engine::StepRun,
     ) -> Result<Option<String>, ExecError> {
         // ADR-0076 §6: a gate inlined from a yanked library version does not
-        // pass, as a step from one does not launch. Then whatever the wrapped
-        // executor says.
-        match self.ensure_not_yanked(gate).await {
+        // pass, as a step from one does not launch. ADR-0071 §2: a gate in a
+        // deploy Run does not pass once its Environment is gone or no longer
+        // admits the Project — the check the API's release and approve routes
+        // make (git-bug 492a603). Then whatever the wrapped executor says.
+        let refused = match self.ensure_not_yanked(gate).await {
+            Ok(()) => self.ensure_still_admitted(gate).await,
+            Err(e) => Err(e),
+        };
+        match refused {
             Ok(()) => self.inner.gate_refusal(gate).await,
             Err(ExecError::Refused(refusal)) => Ok(Some(refusal)),
             Err(e) => Err(e),

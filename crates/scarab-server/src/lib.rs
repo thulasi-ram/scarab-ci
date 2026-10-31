@@ -1705,6 +1705,7 @@ async fn create_run(
 ) -> Result<(StatusCode, Json<CreateRunResponse>), ApiError> {
     authorize(&st, &headers, Action::Write).await?;
     // No `run.create` Policy is consulted (ADR-0075): an inline Run names no org or Project.
+    refuse_nul_reason(req.reason.as_deref())?;
 
     // Resolve launch parameters against the declared interface BEFORE creating
     // the run (ADR-0043): coerce to declared types, apply defaults, validate
@@ -1902,6 +1903,7 @@ async fn dispatch(
         name: repo.clone(),
     };
     let principal = authorize_scoped(&st, &headers, Action::Write, Some(&scope)).await?;
+    refuse_nul_reason(req.reason.as_deref())?;
 
     // Dispatch rides the read-at-ref machinery, so a forge must be wired.
     let forge = st
@@ -8832,9 +8834,10 @@ fn gate_reject_outcome(res: Result<bool, RerunError>) -> Result<(), ApiError> {
 /// (no deploy context) or a hand-built state with no governance store, which
 /// releases as it always did.
 ///
-/// Timer gates release inside the engine with no request to hold; they are
-/// covered by the launch re-check instead (`SecretInjectingExecutor`): the
-/// first step after the gate is refused at launch and fails `Config`.
+/// Timer gates release inside the engine with no request to hold; the engine
+/// asks [`Executor::gate_refusal`](scarab_engine::ports::Executor::gate_refusal)
+/// first, and `SecretInjectingExecutor` answers it with the same Environment
+/// check, so the gate fails with the reason.
 async fn gate_release_governance(
     st: &AppState,
     ctx: Option<&scarab_engine::DeployContext>,
@@ -9062,6 +9065,9 @@ async fn ingest_step_results(
     Path((id, step)): Path<(String, String)>,
     Json(results): Json<std::collections::BTreeMap<String, serde_json::Value>>,
 ) -> Result<StatusCode, ApiError> {
+    // A Step's results are its own output: a NUL in one is replaced, not
+    // refused, so the rest of its results still arrive.
+    let results = replace_nul_in_results(results);
     // Ingest is opt-in: without a configured secret the endpoint 404s.
     let Some(secret) = st.results_token_secret.as_ref() else {
         return Err(ApiError::NotFound);
@@ -9121,6 +9127,52 @@ async fn ingest_step_results(
         ))),
         Err(e) => Err(e.into()),
     }
+}
+
+/// `results` with every NUL (U+0000), in a name or anywhere in a value,
+/// replaced by U+FFFD. Postgres `jsonb` cannot hold U+0000, so a result
+/// carrying one failed the write with a 500 (git-bug 10584e2); U+FFFD shows the
+/// reader where the text was changed.
+fn replace_nul_in_results(
+    results: std::collections::BTreeMap<String, serde_json::Value>,
+) -> std::collections::BTreeMap<String, serde_json::Value> {
+    fn text(s: String) -> String {
+        if s.contains('\0') {
+            s.replace('\0', "\u{FFFD}")
+        } else {
+            s
+        }
+    }
+    fn value(v: serde_json::Value) -> serde_json::Value {
+        use serde_json::Value;
+        match v {
+            Value::String(s) => Value::String(text(s)),
+            Value::Array(items) => Value::Array(items.into_iter().map(value).collect()),
+            Value::Object(fields) => Value::Object(
+                fields
+                    .into_iter()
+                    .map(|(k, v)| (text(k), value(v)))
+                    .collect(),
+            ),
+            other => other,
+        }
+    }
+    results
+        .into_iter()
+        .map(|(k, v)| (text(k), value(v)))
+        .collect()
+}
+
+/// A 400 when a dispatch `reason` holds a NUL (U+0000): Postgres cannot store
+/// it as the Run's Headline, so it failed the write with a 500 (git-bug
+/// 10584e2).
+fn refuse_nul_reason(reason: Option<&str>) -> Result<(), ApiError> {
+    if reason.is_some_and(|r| r.contains('\0')) {
+        return Err(ApiError::BadRequest(
+            "reason contains a NUL character".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Build a [`SecretScope`] from the flat org/repo/environment selector,

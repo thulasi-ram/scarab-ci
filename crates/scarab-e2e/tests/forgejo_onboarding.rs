@@ -8,9 +8,13 @@
 //!
 //!   add connection → pick-list → bind → hook registered → real push → Run.
 //!
-//! Doubly gated: `SCARAB_E2E=1` (a running proc-mode stack) **and**
+//! `#[ignore]`d, and needs both `SCARAB_E2E=1` (a running proc-mode stack) and
 //! `SCARAB_TEST_FORGEJO=1` (a seeded Forgejo). `just forgejo-verify` owns both
-//! lifecycles; CI runs neither.
+//! lifecycles and asks for the ignored set; CI runs neither. It is ignored
+//! rather than env-skipped because `just e2e` (and the e2e workflow) sets
+//! `SCARAB_E2E=1` with no Forgejo: the old second gate returned early there,
+//! and the run reported this case PASS in 8 ms (git-bug dcc4ca9). Ignored, it
+//! reports as skipped; asked for, it panics on a missing switch.
 //!
 //! What is deliberately NOT asserted: that the Run *succeeds*. The step Pods live
 //! in the kind cluster, which cannot reach a Forgejo published on the docker
@@ -23,17 +27,17 @@ use std::time::{Duration, Instant};
 
 use support::*;
 
-/// The second gate, on top of `require_e2e!`. Same shape, same loud skip.
-macro_rules! require_forgejo {
-    () => {
-        if std::env::var("SCARAB_TEST_FORGEJO").ok().as_deref() != Some("1") {
-            eprintln!(
-                "SKIPPED (live Forgejo): set SCARAB_TEST_FORGEJO=1 against a seeded instance — \
-                 `just forgejo-verify` owns the lifecycle (deploy/local-forgejo/)"
-            );
-            return;
-        }
-    };
+/// The gate this case passes first. It is `#[ignore]`d, so reaching this
+/// means someone asked for it: a missing switch is a panic, never a PASS that
+/// ran nothing.
+fn enter_tier() {
+    for switch in ["SCARAB_E2E", "SCARAB_TEST_FORGEJO"] {
+        assert!(
+            std::env::var(switch).ok().as_deref() == Some("1"),
+            "this live case was asked to run (`--ignored` is the opt-in) but {switch} is not \
+             1. Run `just forgejo-verify`, which stands up the stack and a seeded Forgejo."
+        );
+    }
 }
 
 fn env(key: &str) -> String {
@@ -135,9 +139,9 @@ async fn reclaim_connections_for(client: &reqwest::Client, base: &str, forgejo: 
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the proc-mode stack and a seeded Forgejo; run `just forgejo-verify`"]
 async fn a_real_forgejo_repo_onboards_and_its_push_becomes_a_run() {
-    require_e2e!();
-    require_forgejo!();
+    enter_tier();
 
     let base = base_url();
     let http = client();

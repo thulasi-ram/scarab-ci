@@ -146,7 +146,18 @@ fn truncate_on_char_boundary(s: &str, max: usize) -> String {
 /// on a char boundary (stored clean, no ellipsis). Shared by
 /// [`Event::trigger_title`] and the inline `POST /v1/runs` dispatch path, which
 /// stamps a reason directly without a full [`Event`].
+///
+/// A NUL (U+0000) is removed: Postgres cannot store it in `text`, and a forge's
+/// commit subject or pull request title is not the Run's to refuse. The API
+/// refuses a dispatch reason holding one before it gets here.
 pub fn cap_trigger_title(raw: &str) -> Option<String> {
+    let cleaned;
+    let raw = if raw.contains('\0') {
+        cleaned = raw.replace('\0', "");
+        cleaned.as_str()
+    } else {
+        raw
+    };
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
@@ -1630,6 +1641,24 @@ mod tests {
             !flat.contains("release/injected"),
             "no part of the base may leak"
         );
+    }
+
+    #[test]
+    fn trigger_title_drops_a_nul() {
+        // Postgres cannot store U+0000 in `text` (git-bug 10584e2).
+        let title = Event::PullRequest {
+            actor: "octocat".into(),
+            actor_id: String::new(),
+            repo: repo(),
+            number: 7,
+            head: "cafe".into(),
+            title: "feat:\u{0} add\u{0} the widget".into(),
+            base: "main".into(),
+            fork: false,
+        }
+        .trigger_title();
+        assert_eq!(title.as_deref(), Some("feat: add the widget"));
+        assert_eq!(cap_trigger_title("\u{0} \u{0}"), None);
     }
 
     #[test]

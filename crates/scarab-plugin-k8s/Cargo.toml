@@ -13,6 +13,7 @@ license.workspace = true
 scarab-plugin = { workspace = true }
 kube = { workspace = true }
 k8s-openapi = { workspace = true }
+scarab-k8s-expansion = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 serde_json = { workspace = true }

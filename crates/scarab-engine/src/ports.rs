@@ -196,6 +196,16 @@ pub trait Db: Send + Sync {
     /// run.
     async fn run_creation_unfinished(&self, run: &RunId) -> Result<bool, DbError>;
 
+    /// Runs still `Pending` whose creation never finished
+    /// ([`run_creation_unfinished`](Db::run_creation_unfinished)) and that were
+    /// created before `created_before`. The leader's sweep ends them `Failed`:
+    /// the server stopped between [`begin_run_creation`](Db::begin_run_creation)
+    /// and its finish or fail, and nothing else would.
+    async fn unfinished_creations_before(
+        &self,
+        created_before: Timestamp,
+    ) -> Result<Vec<RunId>, DbError>;
+
     /// Create a step projection in `Pending`, storing its durable launch `spec`
     /// and its `needs` (dependency in-edges) for dependency-aware admission.
     async fn create_step_run(
