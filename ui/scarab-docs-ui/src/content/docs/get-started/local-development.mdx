@@ -1,16 +1,18 @@
 ---
 title: Local Development
-description: 'Run scarab-server from the tree in proc-mode: the .env setup and the just up → serve → demo → down loop.'
+description: 'Run scarab-server from the tree in a local kind cluster: the .env setup and the just up → reload → demo → down loop.'
 ---
 
 import Doodle from '../../../components/Doodle.astro';
 
 <Doodle icon="wrench" size={200} rotate={8} opacity={0.18} top="7rem" right="-2rem" />
 
-This page covers the day-to-day development loop, **proc-mode**, and the `.env` file it reads.
-In proc-mode `scarab-server` runs straight from the working tree as a host process, backed by a
-compose Postgres + MinIO and a local kind cluster for step Pods, so you rebuild and rerun without
-publishing an image. `Justfile` recipes over `deploy/local-proc/` drive all of it. Use them rather
+This page covers the day-to-day development loop and the `.env` file it reads. `just up` runs
+Scarab in a local kind cluster from the Helm chart, with a `scarab-server` built from the working
+tree and mounted into the server Pods, so you rebuild and rerun without building an image
+(`deploy/kind/README.md`). **Proc-mode**, where the server runs as a host process against a compose
+Postgres + MinIO, still backs `just serve` and the test recipes. `Justfile` recipes over `deploy/`
+drive all of it. Use them rather
 than typing docker/kind/kubectl commands yourself: they set the right env, an isolated kubeconfig,
 and the colima safety guards.
 
@@ -75,38 +77,40 @@ Key settings for development only:
 `deploy/local-proc/.kubeconfig`. For the main `SCARAB_*` variables and what each does,
 see [Environment Variables](/scarab-ci/usage/environment-variables/).
 
-## The proc-mode workflow
+## The workflow
 
 ```sh
-just up      # bring the whole stack up (server in the background)
-just serve   # OR run the server in the foreground while iterating
+just up      # bring the whole stack up in kind
+just reload  # after a code change: rebuild and roll the server Pods
 just ui      # start the web UI dev server
 just demo    # submit a pipeline and watch it complete
-just logs    # tail the background server log
+just logs    # follow the server's log
 just down    # tear it all down
 ```
 
-- **`just up`** starts Postgres + MinIO via `deploy/local-proc/compose.yaml`, creates the
-  `scarab-dev` kind cluster (`kind.yaml`, isolated kubeconfig at `deploy/local-proc/.kubeconfig`),
-  ensures the `scarab` namespace, builds `scarab-server`, and runs it `--role converged --serve` in
-  the background, waiting on `/healthz`.
-- **`just serve`** runs `scarab-server --role converged --serve` in the **foreground** (Ctrl-C to
-  stop) against an already-up stack, the loop to use while editing server code. It sources
-  `deploy/local-proc/.env` and sets `KUBECONFIG` for you.
+- **`just up`** builds `scarab-server` for Linux (cargo-zigbuild on macOS), creates the
+  `scarab-dev` kind cluster (isolated kubeconfig at `deploy/kind/.kubeconfig`), runs Postgres and
+  MinIO in it, and installs the Helm chart with the server and the workspace service running that
+  binary. It reads only `SCARAB_ADDR` from `deploy/local-proc/.env`: the host port of the API.
+- **`just reload`** rebuilds and restarts the server and workspace Pods on the new binary, about
+  40 s after a one-line change.
+- **`just serve`** (proc-mode) runs `scarab-server --role converged --serve` in the **foreground**
+  against the compose Postgres + MinIO from `deploy/local-proc/`. It sources
+  `deploy/local-proc/.env` and sets `KUBECONFIG` for you. Run `just down` first.
 - **`just ui`** runs the SolidJS web UI on Vite (`http://localhost:5173`), which proxies `/v1` to
   the running server using `SCARAB_API_URL` from the env file.
-- **`just demo`** POSTs a one-step `busybox` pipeline to the running server and polls it to a
+- **`just demo`** POSTs a one-step pipeline to the running server and polls it to a
   terminal state, the smallest end-to-end run.
-- **`just logs`** tails `deploy/local-proc/server.log` (the background server from `just up`).
-- **`just down`** stops the server, runs `docker compose down -v`, and deletes the kind cluster,
-  best effort and safe to run again.
+- **`just logs`** follows the server Pod's log.
+- **`just down`** deletes the kind cluster and its data; `just down keep` uninstalls the release and
+  keeps the cluster, Postgres, MinIO and their data.
 
 Also handy: **`just docs`** serves this documentation site locally.
 
-:::note[The other mode: Helm inside the cluster]
-Proc-mode runs the server as a host process. To run everything inside the cluster (`scarab-server`
-deployed via the Helm chart on colima with Postgres and MinIO inside the cluster), use `just local-helm`. See
-[Installation](/scarab-ci/get-started/deploy-helm/).
+:::note[Dogfood and Helm]
+`just dogfood` is `just up` in GitHub App mode, with its own database and bucket, behind a
+Cloudflare tunnel; it reads `~/.config/scarab/dogfood.env`. To install the published chart on a
+cluster of your own, see [Installation](/scarab-ci/get-started/deploy-helm/).
 :::
 
 ## References

@@ -17,28 +17,30 @@ colima safety guards; a bare command skips those and drifts from what CI does.
 |------|--------|-----------|
 | Compile / test the workspace | `just check`, `just test` | `cargo check` / nextest against the compose Postgres (PG tests run for real) |
 | UI / server from source | `just ui`, `just serve` | dev loop against the proc stack; env from `deploy/local-proc/.env` |
-| **Full local stack** (proc mode) | `just up` → `just demo` → `just down` | Postgres+MinIO (compose) + kind + `scarab-server` as a host process; `just logs` tails it |
-| **Workspace service** (ADR-0061) | `just workspace-logs`, `just workspace-status` | `just up` also starts a SECOND `scarab-server --role workspace` (warm CAS on disk, cold = MinIO); it has its own log and its own `/readyz` |
-| **Helm dogfood** (helm mode) | `just local-helm` | in-cluster on colima via the real chart + published image; `just local-helm local` builds from the tree, `just local-helm sha-<sha>` pins a build |
+| **Full local stack** (kind) | `just up` → `just demo` → `just down` | one kind cluster `scarab-dev`: Postgres + MinIO + the real chart in it; server and Depot run a host-built binary (cargo-zigbuild on macOS) mounted into a thin runtime image; `just reload` rolls a rebuild, `just logs` follows the server. See `deploy/kind/README.md` |
+| **Workspace service** (ADR-0061) | `just workspace-logs`, `just workspace-status` | the Depot, StatefulSet `scarab-workspace` in the release, with its own log and its own `/readyz` |
+| **Dogfood** | `just dogfood` | `just up` in GitHub App mode with its own database + bucket, behind a named Cloudflare tunnel; reads `~/.config/scarab/dogfood.env` |
+| Helm on colima (retired) | `just local-helm` | the old dogfood on colima's k3s, which is off; `just dogfood` replaces it |
 | **Live Forgejo verification** | `just forgejo-verify` | a REAL Forgejo container + the proc stack; drives add-connection → bind → hook → push → Run. Env-gated (`SCARAB_TEST_FORGEJO`), never in CI |
 
-Both local modes run the **workspace service** (ADR-0061) by default — it is in
-the standard path, not an optional accelerator. In proc mode it is a second host
-process on `:8081`; in helm mode it is a StatefulSet with a PVC. In proc mode the
-URL a *Pod* uses is **discovered by probing from an actual Pod** at `just up`
-time, because the obvious derivation (the kind docker network gateway) is wrong
-on darwin — see the comment at the top of `deploy/local-proc/up.sh`.
+`just up` runs the **workspace service** (ADR-0061) as the release's
+StatefulSet, and Step Pods reach it and the server through Services. `just e2e`,
+`just forgejo-verify`, `just kube-tests` and `just serve` still use **proc mode**
+(`deploy/local-proc/`: compose Postgres + MinIO, the server and the Depot as
+host processes, kind for steps), where the URL a *Pod* uses is **discovered by
+probing from an actual Pod**, because the kind docker network gateway is wrong
+on darwin (see `deploy/local-proc/up.sh`). Run `just down` before a proc-mode
+recipe: both use `SCARAB_ADDR`'s port.
 
-The deployment modes live under `deploy/`: `local-proc/` (server = host
-process, kind for steps) and `local-helm/` (server = Helm-deployed image on
-colima), plus `local-forgejo/` — not a way to run Scarab but the throwaway
-Forgejo the verification tier drives. Image build contexts live under `docker/`
-(`server/`, `clone/`, `sidecar/`). `deploy/helm/` is the distribution chart.
+The deployment modes live under `deploy/`: `kind/` (the dev and dogfood stack),
+`local-proc/` (proc mode) and `local-helm/` (retired: colima's k3s is off),
+plus `local-forgejo/`, the throwaway Forgejo the verification tier drives.
+Image build contexts live under `docker/` (`server/`, `runtime/`, `clone/`,
+`sidecar/`, `wsfetch/`). `deploy/helm/` is the distribution chart.
 
 If a recipe is missing for something you need to test, **add/extend a recipe**
 rather than running the raw commands ad hoc — that keeps the next run
-reproducible. `just local-helm` needs `deploy/local-helm/.env` and kube context
-`colima`; see `deploy/local-helm/README.md`.
+reproducible.
 
 ## Writing docs
 

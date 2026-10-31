@@ -1,0 +1,152 @@
+# The kind dev stack
+
+`just up` runs Scarab on one local kind cluster, `scarab-dev`, from the real
+Helm chart. Postgres and MinIO run in the cluster too. The server and the
+Depot run a `scarab-server` binary built on your machine, so a code change
+needs a compile and a Pod restart, not an image build. This is the setup
+described in the ADR-0077 Amendment (2026-11-01).
+
+```sh
+just up          # build, create the cluster if needed, install the release
+just demo        # one-step pipeline, polled to success
+just demo-chain  # produce -> consume, checks the workspace crossed a Step boundary
+just reload      # rebuild and roll the server and Depot onto the new binary
+just logs        # follow the server's log
+just down        # delete the cluster and its data
+just down keep   # uninstall the release; keep the cluster, Postgres, MinIO and their data
+```
+
+The API and the web UI answer on the host at `SCARAB_ADDR` from
+`deploy/local-proc/.env` (`127.0.0.1:8080` in `.env.example`). `just ui` (Vite)
+proxies to the same address, so it works against this stack unchanged.
+
+Requires docker, kind, kubectl, helm, cargo, python3 and curl, plus zig and
+`cargo-zigbuild` on macOS. npm is optional: without it the server runs API-only.
+
+## How the binary gets into the Pod
+
+1. `cargo zigbuild -p scarab-server --target aarch64-unknown-linux-gnu.2.36`
+   (on macOS; `x86_64-...` on an amd64 docker) builds a Linux binary against
+   bookworm's glibc, the glibc of the runtime image. It also builds
+   `scarab-wsfetch`. On Linux, cargo-zigbuild is used when installed and a
+   plain `cargo build` otherwise.
+2. The binaries are copied into `deploy/kind/.mount/bin/` (copy, then rename,
+   so the directory never holds a half-written file), and the web UI's `dist`
+   into `deploy/kind/.mount/ui/`. The UI is rebuilt when its sources are newer
+   than its `dist`.
+3. The kind node mounts `deploy/kind/.mount` at `/scarab` (`extraMounts`).
+   colima shares `$HOME` with its VM, so a path under the worktree reaches the
+   node.
+4. The chart mounts `/scarab` from the node into the server and Depot Pods at
+   `/opt/scarab` (`extraVolumes`, `hostPath`) and runs
+   `/opt/scarab/bin/scarab-server` (`command`). The image,
+   `scarab-runtime:dev` (`docker/runtime/Dockerfile`), is `debian:bookworm-slim`
+   with CA roots and the `scarab` user, and holds no Scarab binary.
+
+A directory is mounted, not the file. Cargo writes a new file on each build,
+and a file mount keeps showing the old one.
+
+The release's Pod template carries the binary's SHA-256 as an annotation, so a
+`just up` or `just reload` after a change rolls both Pods, and one with no
+change rolls nothing.
+
+Measured on 2026-11-01 (M-series Mac, colima 2 vCPU / 4 GiB): `just up` from no
+cluster took 2m07s with a warm `target/`; a rerun with no change 16 s; `just
+reload` after a one-line change in `scarab-server` 40 s, 9 s of it compiling.
+A cold zigbuild of the server took 2m05s in the spike.
+
+## Step images
+
+Step Pods are created by the server, so their helper images cannot come from
+the mount. `just up` builds them locally and loads them into the node:
+
+| Image | Built from | Used as |
+|---|---|---|
+| `scarab-wsfetch:dev` | `docker/runtime/wsfetch.Dockerfile`: the runtime image plus the zigbuilt `scarab-wsfetch` | the fetch init container and the drain helper (`workspace.fetcherImage`) |
+| `scarab-results-sidecar:dev` | `docker/sidecar` | the results sidecar (`scarab.sidecarImage`) |
+| `scarab-clone:dev` | `docker/clone` | the clone library's image, and the image `just demo` runs |
+
+Local builds keep these helpers in step with the tree. A published `edge` tag
+is built from `main`, and a `scarab-wsfetch` older than the server fails every
+drain. The release gets a library manifest whose copy of `libs/clone.yaml`
+pins `scarab-clone:dev` (the approach `just local-helm local` used).
+
+Images are loaded as a one-platform archive (`docker save --platform` and
+`kind load image-archive`). `kind load docker-image` imports every platform
+and fails on a multi-arch image under the containerd image store. A load is
+skipped when the node already has the same image.
+
+## Postgres, MinIO and modes
+
+`postgres.yaml` and `minio.yaml` run one Postgres (with
+`track_commit_timestamp=on`, which `just chaos` needs) and one MinIO, each on a
+PVC. A mode is a set of Helm values, and each mode has its own database and
+bucket on those two servers:
+
+| Mode | Recipe | Database | Bucket | Auth |
+|---|---|---|---|---|
+| dev | `just up` | `scarab` | `scarab-logs` | dev-insecure |
+| dogfood | `just dogfood` | `scarab_dogfood` | `scarab-dogfood` | dev-insecure, GitHub App |
+
+Switching modes deletes the Depot's warm PVC. The warm tier caches blobs of
+one bucket, and would otherwise serve the new mode reads its bucket cannot
+back. The Depot is a cache (ADR-0066), so it refills from the bucket.
+
+Dev secrets (master key, workspace token secret, results token secret) are
+generated once into `deploy/kind/.state/` (gitignored, mode 600) and kept
+across `just down`, so a kept database still decrypts.
+
+## `just dogfood`
+
+This repository's own CI on Scarab, through the GitHub App, reached from
+GitHub through a named Cloudflare tunnel. It reads
+`~/.config/scarab/dogfood.env` key by key and never prints a value:
+
+| Key | Use |
+|---|---|
+| `SCARAB_GITHUB_APP_ID`, `SCARAB_APP_PEM` | App mode; the PEM is mounted from a Secret |
+| `SCARAB_GITHUB_WEBHOOK_SECRET` | `/webhooks/github` signatures |
+| `SCARAB_MASTER_KEY`, `SCARAB_RESULTS_TOKEN_SECRET`, `SCARAB_WORKSPACE_TOKEN_SECRET` | release secrets |
+| `SCARAB_ORG`, `SCARAB_REPO`, `SCARAB_INSTALL_ID` | the installation registered on a fresh database |
+| `SCARAB_STEP_TIMEOUT_SECS` | default step deadline |
+| `CLOUDFLARE_TUNNEL_TOKEN`, `DOGFOOD_HOSTNAME` | the tunnel; `just dogfood` refuses without them |
+
+`cloudflared.yaml` runs cloudflared in token mode, so the route lives in the
+Cloudflare Zero Trust dashboard: the tunnel's public hostname must point at
+`http://scarab.scarab.svc.cluster.local:80`. `publicUrl` is
+`https://$DOGFOOD_HOSTNAME`. After the roll-out, `up.sh` seeds the
+`production` Environment, installs the clone library into `SCARAB_ORG` and
+registers the installation with a signed `installation:created`, as
+`deploy/local-helm/reseed.sh` did.
+
+The dogfood runs dev-insecure, as it did on colima: there is no login, and
+anyone who can reach the hostname is an Owner. Put a Cloudflare Access policy
+on the hostname, or add OAuth values and set `SCARAB_DOGFOOD_DEV_INSECURE=false`.
+`just up` switches back to dev and removes the tunnel.
+
+## Kube safety
+
+Every kubectl and helm call uses `deploy/kind/.kubeconfig` and checks first
+that its server is the API port docker publishes for `scarab-dev-control-plane`
+(`lib.sh`). The ambient `~/.kube/config` is never read.
+`deploy/kind/kubectl.sh <args>` runs kubectl the same way.
+
+A `scarab-dev` cluster without this worktree's mount or the host port (one
+proc mode created, or one from another worktree) is deleted and recreated.
+
+## Proc mode
+
+`just e2e`, `just forgejo-verify`, `just kube-tests` and `just serve` still
+run the server as a host process (`deploy/local-proc/`) until they move onto
+the release. Run `just down` before them: both setups use the `SCARAB_ADDR`
+port, and proc mode's teardown deletes the `scarab-dev` cluster.
+
+## Settings
+
+| Variable | Default | Effect |
+|---|---|---|
+| `SCARAB_KIND_PROFILE` | `dev` | cargo profile for the binaries (`release` for a faster drain, slower build) |
+| `SCARAB_KIND_SKIP_BUILD` | `0` | `1` uses the binaries already in `.mount/bin` |
+| `SCARAB_DEV_ORG` | `thulasi-ram` | org whose `production` Environment dev mode seeds |
+| `SCARAB_DOGFOOD_ENV` | `~/.config/scarab/dogfood.env` | the dogfood env file |
+| `SCARAB_DOGFOOD_DEV_INSECURE` | `true` | dogfood's `scarab.devInsecure` |

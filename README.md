@@ -218,22 +218,28 @@ Every setting (`SCARAB_ADDR`, `SCARAB_DATABASE_URL`, `SCARAB_S3_*`, `SCARAB_API_
 
 ## Full dev stack (k8s)
 
-One command brings up the two stateful dependencies (Postgres + MinIO), a
-[kind](https://kind.sigs.k8s.io/) cluster for step Pods, and `scarab-server` in
-converged mode, then submits a pipeline and watches it complete:
+One command builds `scarab-server` on your machine, creates a
+[kind](https://kind.sigs.k8s.io/) cluster with Postgres and MinIO in it, and
+installs the Helm chart with the server and the Depot running that binary:
 
 ```sh
-just up      # Postgres + MinIO (docker compose) + kind + scarab-server (background)
+just up      # kind + Postgres + MinIO + the chart; the server binary is built on the host
 just demo    # POST a one-step pipeline, poll until it succeeds, print logs
-just down    # tear it all down
+just reload  # rebuild and roll the server onto the new binary (no image build)
+just down    # delete the cluster (`just down keep` keeps its data)
 ```
 
-Requires `docker`, `kind`, `kubectl`, `cargo`, and `python3`. The kind cluster's
-kubeconfig is written to `deploy/local-proc/.kubeconfig` and used only via
-`KUBECONFIG`, so Scarab never touches an ambient (e.g. production) context.
-Postgres is published on **55432** to avoid clashing with a host Postgres on
-5432. All config comes from environment variables (`SCARAB_DATABASE_URL`, `SCARAB_S3_*`,
-`KUBECONFIG`, `SCARAB_NAMESPACE`) — see `Justfile` and `deploy/local-proc/`.
+Requires `docker`, `kind`, `kubectl`, `helm`, `cargo`, and `python3`, plus
+`zig` and `cargo-zigbuild` on macOS (the binary is cross-built for Linux). The
+API and UI answer on `SCARAB_ADDR` from `deploy/local-proc/.env`. The cluster's
+kubeconfig is `deploy/kind/.kubeconfig`, checked against the cluster before
+every call, so the recipes never touch an ambient (e.g. production) context.
+`just dogfood` is the same stack in GitHub App mode behind a Cloudflare tunnel.
+See `deploy/kind/README.md`.
+
+`just e2e`, `just forgejo-verify`, `just kube-tests` and `just serve` still run
+the server as a host process against compose Postgres + MinIO
+(`deploy/local-proc/`); run `just down` before them.
 
 Without Docker/kind, the server still runs API-only against a local Postgres and
 a filesystem object store (`--object-dir`); the background driver is skipped
@@ -254,7 +260,7 @@ Needs `deploy/local-helm/.env` and kube context `colima`; see
 `deploy/local-helm/README.md`.
 
 > **Running or testing Scarab locally: use the `just` recipes as the canonical
-> entrypoints** (`just up`/`demo`/`down`, `just local-helm`, `just test`) rather
+> entrypoints** (`just up`/`demo`/`down`, `just dogfood`, `just test`) rather
 > than hand-rolled `docker`/`kubectl`/`helm` commands — they carry the right
 > env, isolated kubeconfig, image source, and colima guards. Missing something?
 > Add a recipe. (Agents: this is also in `CLAUDE.md`.)
