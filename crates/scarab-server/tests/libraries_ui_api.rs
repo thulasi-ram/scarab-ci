@@ -10,10 +10,8 @@ use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-use scarab_engine::{
-    Clock, Db, EventPayload, RunId, RunStatus, Scheduler, StepStatus,
-};
 use scarab_engine::ports::ExecState;
+use scarab_engine::{Clock, Db, EventPayload, RunId, RunStatus, Scheduler, StepStatus};
 use scarab_forge::{Event, RepoRef};
 use scarab_policy::library::{
     content_hash, LibraryStore, LibraryVersion, LibraryYank, NewInstallation, Replaces,
@@ -159,7 +157,12 @@ async fn push_run(h: &H) -> scarab_server::TriggerOutcome {
     .unwrap()
 }
 
-async fn call(app: &axum::Router, method: &str, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
+async fn call(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
     let mut req = Request::builder().method(method).uri(uri);
     let body = match body {
         Some(b) => {
@@ -194,14 +197,13 @@ async fn the_impact_counts_runs_in_progress_and_a_yank_can_cancel_them() {
     let h = harness(CI_YAML).await;
     let run = push_run(&h).await.runs[0].clone();
     start(&h.db, &run).await;
-    let helm = h
-        .db
-        .steps_of_run(&run)
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|s| s.step.0 == "ship/helm")
-        .unwrap();
+    let helm =
+        h.db.steps_of_run(&run)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.step.0 == "ship/helm")
+            .unwrap();
     assert_eq!(helm.status, StepStatus::Running, "{helm:?}");
 
     let hash = content_hash(DEPLOY);
@@ -244,17 +246,16 @@ async fn the_impact_counts_runs_in_progress_and_a_yank_can_cancel_them() {
         Some(RunStatus::Cancelled)
     );
     // Cancelled as an operator cancel is: journalled with who asked.
-    let by: Vec<Option<String>> = h
-        .db
-        .events(&run)
-        .await
-        .unwrap()
-        .into_iter()
-        .filter_map(|e| match e.kind {
-            EventPayload::RunCancelRequested { by } => Some(by),
-            _ => None,
-        })
-        .collect();
+    let by: Vec<Option<String>> =
+        h.db.events(&run)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                EventPayload::RunCancelRequested { by } => Some(by),
+                _ => None,
+            })
+            .collect();
     assert_eq!(by.len(), 1, "{by:?}");
     assert!(by[0].is_some());
 
@@ -283,8 +284,17 @@ async fn a_yank_without_cancel_leaves_runs_running() {
     .await;
     assert_eq!(st, StatusCode::OK, "{y}");
     assert!(y.get("cancelled_runs").is_none(), "{y}");
-    assert_eq!(h.db.run_status(&run).await.unwrap(), Some(RunStatus::Running));
-    let (st, bad) = call(&h.app, "GET", "/v1/orgs/acme/library-yanks/nothex/impact", None).await;
+    assert_eq!(
+        h.db.run_status(&run).await.unwrap(),
+        Some(RunStatus::Running)
+    );
+    let (st, bad) = call(
+        &h.app,
+        "GET",
+        "/v1/orgs/acme/library-yanks/nothex/impact",
+        None,
+    )
+    .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{bad}");
 }
 
@@ -337,7 +347,10 @@ async fn the_run_api_shows_each_steps_origin_and_the_runs_yanked_versions() {
     assert_eq!(input("release")["kind"], "template");
     assert_eq!(input("release")["bound"], "${{ event.sha }}");
     assert!(o.get("rendered").is_none());
-    assert!(o["render_note"].as_str().unwrap().contains("launches"), "{o}");
+    assert!(
+        o["render_note"].as_str().unwrap().contains("launches"),
+        "{o}"
+    );
 
     let (st, _) = call(
         &h.app,
@@ -432,7 +445,10 @@ async fn a_compile_failure_has_each_errors_fields_and_is_kept_on_push() {
     assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
     assert_eq!(v["code"], "compile_failed");
     assert_eq!(v["sha"], SHA);
-    assert!(v["message"].as_str().unwrap().starts_with("pipeline: "), "{v}");
+    assert!(
+        v["message"].as_str().unwrap().starts_with("pipeline: "),
+        "{v}"
+    );
     let e = &v["errors"][0];
     assert_eq!(e["kind"], "command_value");
     assert_eq!(e["step"], "tag");
@@ -455,7 +471,10 @@ async fn a_compile_failure_has_each_errors_fields_and_is_kept_on_push() {
     .await
     .unwrap_err();
     assert!(err.to_string().contains("command[3]"), "{err}");
-    let kept = h.db.refused_runs_for_tenant("acme", "web", 10).await.unwrap();
+    let kept =
+        h.db.refused_runs_for_tenant("acme", "web", 10)
+            .await
+            .unwrap();
     assert_eq!(kept.len(), 1);
     assert_eq!(kept[0].reason_kind, "compile");
     assert_eq!(kept[0].errors[0]["kind"], "command_value");

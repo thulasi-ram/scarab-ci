@@ -253,7 +253,10 @@ async fn yanks_of(
         .collect())
 }
 
-fn link(o: &IrOrigin, yanks: &BTreeMap<String, scarab_policy::library::LibraryYank>) -> OriginLinkDto {
+fn link(
+    o: &IrOrigin,
+    yanks: &BTreeMap<String, scarab_policy::library::LibraryYank>,
+) -> OriginLinkDto {
     OriginLinkDto {
         kind: o.kind.clone(),
         name: o.name.clone(),
@@ -294,11 +297,19 @@ pub(crate) async fn step_views(
             }
         }
         let plugin_gate = match &s.plugin_gate {
-            Some(g) => Some(plugin_gate_view(st, run, s, g, attempts.get(s.id.as_str()).copied()).await?),
+            Some(g) => {
+                Some(plugin_gate_view(st, run, s, g, attempts.get(s.id.as_str()).copied()).await?)
+            }
             None => None,
         };
         if !origin.is_empty() || plugin_gate.is_some() {
-            views.insert(s.id.clone(), StepOriginView { origin, plugin_gate });
+            views.insert(
+                s.id.clone(),
+                StepOriginView {
+                    origin,
+                    plugin_gate,
+                },
+            );
         }
     }
     Ok((views, yanked.into_values().collect()))
@@ -333,9 +344,7 @@ async fn plugin_gate_view(
         expires_after: s.gate_expires_after,
         waiting_since,
         expires_at: match (waiting_since, s.gate_expires_after) {
-            (Some(at), Some(secs)) => {
-                Some(at.saturating_add((secs as i64).saturating_mul(1000)))
-            }
+            (Some(at), Some(secs)) => Some(at.saturating_add((secs as i64).saturating_mul(1000))),
             _ => None,
         },
         inputs,
@@ -419,10 +428,7 @@ pub(crate) async fn get_step_origin(
     let (rendered, render_note) = match st.db.step_spec(&run, &step_id).await? {
         _ if s.plugin_gate.is_some() => (None, None),
         None => (None, None),
-        Some(_) if !launched => (
-            None,
-            Some("the Step renders when it launches".to_string()),
-        ),
+        Some(_) if !launched => (None, Some("the Step renders when it launches".to_string())),
         Some(spec) => {
             match scarab_engine::render::render_launch_spec(st.db.as_ref(), &run, &step_id, spec)
                 .await?

@@ -174,7 +174,9 @@ steps:
         assert_eq!(e[0].command_index, Some(3));
         assert_eq!(e[0].read.as_deref(), Some("${{ inputs.version }}"));
         assert_eq!(e[0].library, None);
-        assert!(e[0].message.contains("Scarab puts no such value into a command"));
+        assert!(e[0]
+            .message
+            .contains("Scarab puts no such value into a command"));
     }
 
     #[test]
