@@ -93,9 +93,11 @@ fn prod_rules(approvers: &[&str], allowed_refs: &[&str]) -> ProtectionRules {
 type Launch = (Vec<String>, Vec<(String, String)>);
 
 /// An executor recording the (already-interpolated) command + env of each launch.
+/// Its units succeed on the first poll unless `keep_running` is set.
 #[derive(Default)]
 struct RecordingExec {
     launches: Mutex<Vec<Launch>>,
+    keep_running: bool,
 }
 #[async_trait]
 impl Executor for RecordingExec {
@@ -138,7 +140,11 @@ impl Executor for RecordingExec {
         Ok(ExecHandle("h".into()))
     }
     async fn poll(&self, _h: &ExecHandle) -> Result<ExecState, ExecError> {
-        Ok(ExecState::Succeeded)
+        Ok(if self.keep_running {
+            ExecState::Running
+        } else {
+            ExecState::Succeeded
+        })
     }
     async fn cancel(&self, _h: &ExecHandle) -> Result<(), ExecError> {
         Ok(())
@@ -162,7 +168,7 @@ async fn dispatch_manual_pins_resolved_sha_and_freezes_and_interpolates_params()
     let forge = scarab_testkit::FakeForge::new()
         .with_file(".scarab/ship.yaml", MANUAL_YAML)
         // The dispatch ref resolves to a distinct commit — the run must pin to it.
-        .with_commit("refs/heads/main", "sha-deadbeef");
+        .with_commit("refs/heads/main", "deadbeef");
     let db = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
 
@@ -214,7 +220,7 @@ async fn dispatch_manual_pins_resolved_sha_and_freezes_and_interpolates_params()
         .expect("a trigger event was recorded");
     assert_eq!(trigger["event"]["kind"], "manual");
     assert_eq!(
-        trigger["event"]["sha"], "sha-deadbeef",
+        trigger["event"]["sha"], "deadbeef",
         "pinned to the resolved sha"
     );
     assert_eq!(
@@ -860,7 +866,7 @@ steps:
 async fn dispatch_interpolates_concurrency_group_into_per_env_slots() {
     let forge = scarab_testkit::FakeForge::new()
         .with_file(".scarab/rollout.yaml", CONCURRENCY_YAML)
-        .with_commit("refs/heads/main", "sha-cafe");
+        .with_commit("refs/heads/main", "cafe0001");
     let db = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
 
@@ -947,7 +953,7 @@ steps:
 async fn governed_deploy_serializes_without_cancelling_the_holder() {
     let forge = scarab_testkit::FakeForge::new()
         .with_file(".scarab/deploy.yaml", GOVERNED_CONCURRENCY_YAML)
-        .with_commit("refs/heads/main", "sha-1");
+        .with_commit("refs/heads/main", "5ba1");
     let db = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
     let envs = Arc::new(migrated(prod_rules(&[], &["refs/heads/main"])));
@@ -1030,7 +1036,7 @@ steps:
 async fn concurrency_group_is_scoped_to_the_owning_project() {
     let forge = scarab_testkit::FakeForge::new()
         .with_file(".scarab/rollout.yaml", LITERAL_GROUP_YAML)
-        .with_commit("refs/heads/main", "sha-1");
+        .with_commit("refs/heads/main", "5ba1");
     let db = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
 
@@ -1094,4 +1100,395 @@ async fn concurrency_group_is_scoped_to_the_owning_project() {
         Some(RunStatus::Pending),
         "the same project's second run still queues behind its slot holder"
     );
+}
+
+// --- a scheduler tick during run creation --------------------------------------
+//
+// Run creation is a sequence of separate writes. Another task — this replica's
+// scheduler loop, or another replica's — can tick between any two of them. A
+// Run must not be schedulable until every one of those writes has landed.
+
+/// Arm `db` so a full scheduler tick (`tick_all`, the production loop) runs at
+/// the start of the next call of `method`, launching through `exec`.
+fn tick_before_next(
+    db: &Arc<InMemoryDb>,
+    clock: &Arc<FakeClock>,
+    exec: &Arc<RecordingExec>,
+    method: &'static str,
+) {
+    let (db2, clock, exec) = (db.clone(), clock.clone(), exec.clone());
+    db.interleave_before_next(
+        method,
+        Box::new(move || {
+            Box::pin(async move {
+                // The same owner as the tests' own scheduler: the leader's
+                // loop, which may run on the replica creating the run or not.
+                let sched =
+                    Scheduler::new(&*db2 as &dyn Db, &*clock as &dyn Clock, &*exec, "sched");
+                sched.tick_all().await.expect("tick");
+            })
+        }),
+    );
+}
+
+/// A tick that lands before the dispatch's launch parameters are written must
+/// not launch a step without them: every launch carries `SCARAB_PARAM_*`.
+#[tokio::test]
+async fn a_tick_during_creation_never_launches_a_step_without_its_params() {
+    let forge = scarab_testkit::FakeForge::new()
+        .with_file(".scarab/ship.yaml", MANUAL_YAML)
+        .with_commit("refs/heads/main", "deadbeef");
+    let db = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+    let exec = Arc::new(RecordingExec::default());
+    tick_before_next(&db, &clock, &exec, "set_run_params");
+
+    let run = dispatch_run(
+        &forge,
+        db.as_ref(),
+        clock.as_ref(),
+        scarab_server::AdmissionPorts::governance(None),
+        "alice".into(),
+        repo(),
+        "refs/heads/main".into(),
+        "ship".into(),
+        std::collections::BTreeMap::from([("region".to_string(), json!("us-east-1"))]),
+        DispatchKind::Manual,
+        None,
+    )
+    .await
+    .expect("dispatch");
+    assert!(!db.interleave_armed(), "the tick ran inside run creation");
+
+    Scheduler::new(&*db as &dyn Db, &*clock as &dyn Clock, &*exec, "sched")
+        .tick(&run)
+        .await
+        .unwrap();
+    let launches = exec.launches.lock().unwrap().clone();
+    assert_eq!(
+        launches.len(),
+        1,
+        "the step launches once; steps: {:?}",
+        db.steps_of_run(&run).await.unwrap()
+    );
+    for (_, env) in &launches {
+        assert!(
+            env.contains(&("SCARAB_PARAM_REGION".into(), "us-east-1".into())),
+            "a step launched without the run's frozen params: {env:?}"
+        );
+    }
+}
+
+// `deploy` is `when:`-excluded on a manual dispatch; `build` always runs.
+const EXCLUDED_DEPLOY_YAML: &str = r#"
+on:
+  manual: {}
+steps:
+  - { id: deploy, image: busybox, command: ["deploy"], when: "event.kind == 'push'" }
+  - { id: build, image: busybox, command: ["build"] }
+"#;
+
+/// A tick that lands between creating a `when:`-excluded step and marking it
+/// Skipped must not launch that step.
+#[tokio::test]
+async fn a_tick_during_creation_never_launches_a_when_excluded_step() {
+    let forge = scarab_testkit::FakeForge::new()
+        .with_file(".scarab/ci.yaml", EXCLUDED_DEPLOY_YAML)
+        .with_commit("refs/heads/main", "5ba1");
+    let db = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+    let exec = Arc::new(RecordingExec::default());
+    tick_before_next(&db, &clock, &exec, "commit_step_transition");
+
+    let created = dispatch_run(
+        &forge,
+        db.as_ref(),
+        clock.as_ref(),
+        scarab_server::AdmissionPorts::governance(None),
+        "alice".into(),
+        repo(),
+        "refs/heads/main".into(),
+        "ci".into(),
+        std::collections::BTreeMap::new(),
+        DispatchKind::Manual,
+        None,
+    )
+    .await;
+    assert!(!db.interleave_armed(), "the tick ran inside run creation");
+    let launched: Vec<Vec<String>> = exec
+        .launches
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(cmd, _)| cmd.clone())
+        .collect();
+    assert!(
+        !launched.contains(&vec!["deploy".to_string()]),
+        "a `when:`-excluded step was launched: {launched:?}"
+    );
+    let run = created.expect("dispatch");
+
+    Scheduler::new(&*db as &dyn Db, &*clock as &dyn Clock, &*exec, "sched")
+        .tick(&run)
+        .await
+        .unwrap();
+    let steps = db.steps_of_run(&run).await.unwrap();
+    let status = |id: &str| steps.iter().find(|s| s.step.0 == id).unwrap().status;
+    assert_eq!(status("deploy"), scarab_engine::StepStatus::Skipped);
+    let launched: Vec<Vec<String>> = exec
+        .launches
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(cmd, _)| cmd.clone())
+        .collect();
+    assert_eq!(launched, vec![vec!["build".to_string()]]);
+}
+
+/// A tick that lands before the run's concurrency group is written must not
+/// start the run past a slot another run holds.
+#[tokio::test]
+async fn a_tick_during_creation_never_starts_a_run_past_its_concurrency_slot() {
+    let forge = scarab_testkit::FakeForge::new()
+        .with_file(".scarab/deploy.yaml", LITERAL_GROUP_YAML)
+        .with_commit("refs/heads/main", "5ba1");
+    let db = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+    let exec = Arc::new(RecordingExec {
+        keep_running: true,
+        ..Default::default()
+    });
+    let dispatch = || {
+        dispatch_run(
+            &forge,
+            db.as_ref(),
+            clock.as_ref(),
+            scarab_server::AdmissionPorts::governance(None),
+            "alice".into(),
+            repo(),
+            "refs/heads/main".into(),
+            "deploy".into(),
+            std::collections::BTreeMap::new(),
+            DispatchKind::Manual,
+            None,
+        )
+    };
+    let sched = Scheduler::new(&*db as &dyn Db, &*clock as &dyn Clock, &*exec, "sched");
+
+    // The holder takes the `deploy` slot.
+    let holder = dispatch().await.expect("dispatch the holder");
+    sched.tick(&holder).await.unwrap();
+    assert_eq!(
+        db.run_status(&holder).await.unwrap(),
+        Some(RunStatus::Running)
+    );
+
+    tick_before_next(&db, &clock, &exec, "set_run_concurrency");
+    let next = dispatch().await.expect("dispatch the next run");
+    assert!(!db.interleave_armed(), "the tick ran inside run creation");
+    sched.tick(&next).await.unwrap();
+    assert_eq!(
+        db.run_status(&next).await.unwrap(),
+        Some(RunStatus::Pending),
+        "the next run queues behind the slot holder"
+    );
+    assert_eq!(
+        exec.launches.lock().unwrap().len(),
+        1,
+        "only the holder launched"
+    );
+}
+
+// `build` is persisted before `escalate`, whose privilege request an inline
+// (no-Environment) run can never be granted.
+const REFUSED_SECOND_STEP_YAML: &str = r#"
+on:
+  manual: {}
+steps:
+  - { id: build, image: busybox, command: ["build"] }
+  - { id: escalate, image: busybox, command: ["x"], security: { privileged: true } }
+"#;
+
+/// A creation that fails after some steps exist ends the Run Failed, with the
+/// creation error on its event log — never Pending, and never schedulable.
+#[tokio::test]
+async fn a_creation_that_fails_partway_ends_the_run_failed_and_launches_nothing() {
+    let forge = scarab_testkit::FakeForge::new()
+        .with_file(".scarab/ci.yaml", REFUSED_SECOND_STEP_YAML)
+        .with_commit("refs/heads/main", "5ba1");
+    let db = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+
+    let err = dispatch_run(
+        &forge,
+        db.as_ref(),
+        clock.as_ref(),
+        scarab_server::AdmissionPorts::governance(None),
+        "alice".into(),
+        repo(),
+        "refs/heads/main".into(),
+        "ci".into(),
+        std::collections::BTreeMap::new(),
+        DispatchKind::Manual,
+        None,
+    )
+    .await
+    .expect_err("the privileged step is refused");
+    assert!(
+        err.to_string().contains("privilege request rejected"),
+        "{err}"
+    );
+
+    let runs = db.list_runs(10).await.unwrap();
+    assert_eq!(runs.len(), 1, "the run row existed before the refusal");
+    let run = runs[0].run.clone();
+    assert!(
+        db.steps_of_run(&run)
+            .await
+            .unwrap()
+            .iter()
+            .any(|s| s.step.0 == "build"),
+        "the refusal came after a step was written"
+    );
+    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Failed));
+    let reason = db
+        .events(&run)
+        .await
+        .unwrap()
+        .into_iter()
+        .find_map(|e| match e.kind {
+            EventPayload::RunCreationFailed { reason } => Some(reason),
+            _ => None,
+        })
+        .expect("the creation error is on the event log");
+    assert!(reason.contains("privilege request rejected"), "{reason}");
+
+    let exec = Arc::new(RecordingExec::default());
+    let sched = Scheduler::new(&*db as &dyn Db, &*clock as &dyn Clock, &*exec, "sched");
+    assert!(db.active_runs().await.unwrap().is_empty());
+    sched.tick_all().await.unwrap();
+    sched.tick(&run).await.unwrap();
+    assert!(exec.launches.lock().unwrap().is_empty(), "nothing launched");
+    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Failed));
+}
+
+/// A Run whose creation failed cannot be reopened: rerun and retry of a step
+/// it left behind are refused 409, the Run stays Failed, and nothing launches.
+/// (Reopened, it would sit Running forever: its creation never finished, so
+/// the scheduler never sees it.)
+#[tokio::test]
+async fn rerun_and_retry_of_a_creation_failed_run_are_refused() {
+    let forge: Arc<dyn scarab_forge::ForgePort> = Arc::new(
+        scarab_testkit::FakeForge::new()
+            .with_file(".scarab/ci.yaml", REFUSED_SECOND_STEP_YAML)
+            .with_commit("refs/heads/main", "5ba1"),
+    );
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        db.clone(),
+    ));
+    let app = router(AppState::new(db.clone(), clock.clone(), logs).with_forge(forge));
+    let post = |uri: String, body: serde_json::Value| {
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+    };
+
+    let (status, body) = post(
+        "/v1/repos/acme/web/dispatch".into(),
+        json!({ "ref": "refs/heads/main", "pipeline": "ci" }),
+    )
+    .await;
+    assert!(
+        status.is_client_error() || status.is_server_error(),
+        "{status}: {body}"
+    );
+    let runs = db.list_runs(10).await.unwrap();
+    assert_eq!(runs.len(), 1);
+    let run = runs[0].run.clone();
+    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Failed));
+
+    for action in ["rerun", "retry"] {
+        let (status, body) = post(
+            format!("/v1/runs/{}/steps/build/{action}", run.0),
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{action}: {body}");
+        assert!(body.contains("creation failed"), "{action}: {body}");
+        assert_eq!(
+            db.run_status(&run).await.unwrap(),
+            Some(RunStatus::Failed),
+            "{action} left the run Failed"
+        );
+    }
+
+    let exec = RecordingExec::default();
+    let sched = Scheduler::new(&*db as &dyn Db, &*clock as &dyn Clock, &exec, "sched");
+    sched.tick_all().await.unwrap();
+    sched.tick(&run).await.unwrap();
+    assert!(exec.launches.lock().unwrap().is_empty(), "nothing launched");
+    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Failed));
+}
+
+
+/// A dispatch pins the commit the forge resolves the ref to, and that SHA
+/// later reaches `git fetch` in the clone container as an argument. A forge
+/// answer that is not a hex commit SHA (a compromised forge, or a proxy in
+/// front of it) is refused before any run exists.
+#[tokio::test]
+async fn dispatch_refuses_a_resolved_commit_that_is_not_a_hex_sha() {
+    for sha in [
+        "--upload-pack=touch /tmp/pwned;git-upload-pack",
+        "main; id",
+        "HEAD",
+        "",
+    ] {
+        let forge = scarab_testkit::FakeForge::new()
+            .with_file(".scarab/ship.yaml", MANUAL_YAML)
+            .with_commit("refs/heads/main", sha);
+        let db = Arc::new(InMemoryDb::new());
+        let clock = Arc::new(FakeClock::new(1_000));
+
+        let res = dispatch_run(
+            &forge,
+            db.as_ref(),
+            clock.as_ref(),
+            scarab_server::AdmissionPorts::governance(None),
+            "alice".into(),
+            repo(),
+            "refs/heads/main".into(),
+            "ship".into(),
+            std::collections::BTreeMap::from([("region".to_string(), json!("us-east-1"))]),
+            DispatchKind::Manual,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(res, Err(DispatchError::Forge(_))),
+            "a resolved commit of {sha:?} must be refused as a forge error, got {res:?}"
+        );
+        assert!(
+            db.list_runs(100).await.unwrap().is_empty(),
+            "no run created for the resolved commit {sha:?}"
+        );
+    }
 }

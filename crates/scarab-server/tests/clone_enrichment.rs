@@ -295,3 +295,68 @@ async fn inline_dev_builds_get_no_auth() {
     assert_eq!(enriched.registry_auth_json, None);
     assert_eq!(enriched.derived_auth, None);
 }
+
+// ---------------------------------------------------------------------------
+// The clone SHA's shape (red team 2026-10-30).
+// ---------------------------------------------------------------------------
+
+/// A clone SHA that is not hex never reaches the clone container. The clone
+/// image runs `git fetch … origin "$SCARAB_CLONE_SHA"`, and git reads a
+/// leading `--upload-pack=…` there as an option and runs the program it
+/// names. The SHA comes from the forge, so a compromised forge or a leaked
+/// webhook secret could choose it. The launch is refused before any
+/// credential is minted, and the executor that builds the Pod never sees it.
+#[tokio::test]
+async fn a_clone_sha_that_is_not_hex_never_reaches_git() {
+    for sha in [
+        "--upload-pack=touch /tmp/pwned;git-upload-pack",
+        "-c core.sshCommand=id",
+        "main; id",
+        "HEAD",
+        "CAFE1234",
+        "cafe 1234",
+        "cafe1234\n",
+        "",
+    ] {
+        let inner = Arc::new(FakeExecutor::new());
+        let forge = Arc::new(FakeForge::new());
+        let exec =
+            CloneEnrichingExecutor::new(inner.clone(), Arc::new(InMemoryDb::new()), forge.clone());
+        let step = step_run("checkout");
+        let mut spec = clone_spec(true);
+        spec.clone.as_mut().unwrap().sha = sha.into();
+
+        let launched = exec.launch(&step, &spec).await;
+        assert!(
+            launched.is_err(),
+            "a clone SHA of {sha:?} was launched: {launched:?}"
+        );
+        assert_eq!(
+            inner.launched_spec(&FakeExecutor::handle_for(&step)),
+            None,
+            "the clone SHA {sha:?} reached the executor that builds the Pod"
+        );
+        assert_eq!(
+            forge.checkout_credentials_minted(),
+            0,
+            "a credential was minted for the clone SHA {sha:?}"
+        );
+    }
+
+    // The control: a hex SHA, short or full length, launches.
+    for sha in ["cafe1234", "0123456789abcdef0123456789abcdef01234567"] {
+        let inner = Arc::new(FakeExecutor::new());
+        let exec = CloneEnrichingExecutor::new(
+            inner.clone(),
+            Arc::new(InMemoryDb::new()),
+            Arc::new(FakeForge::new()),
+        );
+        let mut spec = clone_spec(true);
+        spec.clone.as_mut().unwrap().sha = sha.into();
+        let handle = exec.launch(&step_run("checkout"), &spec).await.unwrap();
+        assert_eq!(
+            inner.launched_spec(&handle).unwrap().clone.unwrap().sha,
+            sha
+        );
+    }
+}

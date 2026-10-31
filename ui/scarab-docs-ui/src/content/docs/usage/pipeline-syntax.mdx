@@ -206,6 +206,11 @@ case. Downstream steps inherit the cloned workspace through ordinary `needs`.
 GitHub and Forgejo both have supported adapters, and the `clone` step is identical for
 either.
 
+The clone uses the forge connection's token only for the repository being cloned, and
+only over https. Submodules are fetched without it, so a private submodule fails the
+step; make it public or vendor it. LFS objects come from the repository's own LFS
+endpoint, and an `lfs.url` in `.lfsconfig` is ignored.
+
 ## Ordering: `needs`
 
 `needs:` declares the DAG edges. A step runs once all of its needs succeed and inherits their

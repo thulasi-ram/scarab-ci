@@ -576,6 +576,7 @@ openapi-drift:
 # Branch protection and rulesets are both unavailable on this repo (private,
 # free plan → 403), so this is the enforcement, not a convenience: the required
 # set lives in .github/required-checks.txt. Exits 8 while checks still run.
+# Fails while the PR has the ci:skip label (README: "CI labels on pull requests").
 pr-gate n:
     python3 scripts/pr_gate.py {{n}}
 

@@ -59,6 +59,9 @@ ui: &ui
 # though no job is gated on it directly any more.
 test_and_coverage:
   - *rust
+  # crates/scarab-executor-k8s/tests/clone_image_credential.rs runs the clone
+  # image's scripts with the real git.
+  - "docker/clone/**"
   - "scripts/coverage_ratchet.py"
   - "docs/audits/coverage-baseline.toml"
 
