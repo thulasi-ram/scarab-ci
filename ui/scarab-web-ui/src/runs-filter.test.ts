@@ -41,3 +41,34 @@ describe("runListFilter", () => {
     expect(runListFilter("production", true)).toEqual({ environment: "production", deploy: true });
   });
 });
+
+import { barePipeline, mergeRefused } from "./runs-filter";
+
+describe("refused rows in the Runs list", () => {
+  const runs = [
+    { id: "r2", created_at: 200 },
+    { id: "r1", created_at: 100 },
+  ];
+  const refused = [
+    { id: 3, created_at: 300, actor: "j.lee", pipeline: ".scarab/release.yaml" },
+    { id: 2, created_at: 150, actor: "a.kim", pipeline: ".scarab/ci.yml" },
+    { id: 1, created_at: 50, actor: "a.kim", pipeline: ".scarab/ci.yaml" },
+  ];
+  const ids = (rows: ReturnType<typeof mergeRefused>) =>
+    rows.map((r) => (r.kind === "run" ? (r.run as { id: string }).id : `x${(r.refused as { id: number }).id}`));
+  const base = { status: "all", author: "", pipeline: "", runOnly: false };
+
+  it("interleaves refusals newest first, within the loaded window", () => {
+    expect(ids(mergeRefused(runs, refused, base))).toEqual(["x3", "r2", "x2", "r1"]);
+    expect(ids(mergeRefused(runs, refused, { ...base, status: "refused" }))).toEqual(["x3", "x2", "x1"]);
+    expect(ids(mergeRefused(runs, refused, { ...base, status: "failed" }))).toEqual(["r2", "r1"]);
+    expect(ids(mergeRefused([], refused, base))).toEqual(["x3", "x2", "x1"]);
+  });
+
+  it("applies the author and pipeline filters, and leaves refusals out for a Run-only filter", () => {
+    expect(ids(mergeRefused(runs, refused, { ...base, author: "a.kim" }))).toEqual(["r2", "x2", "r1"]);
+    expect(ids(mergeRefused(runs, refused, { ...base, pipeline: "release" }))).toEqual(["x3", "r2", "r1"]);
+    expect(ids(mergeRefused(runs, refused, { ...base, runOnly: true }))).toEqual(["r2", "r1"]);
+    expect(barePipeline(".scarab/ci.yml")).toBe("ci");
+  });
+});
