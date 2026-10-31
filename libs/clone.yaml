@@ -16,7 +16,11 @@
 # to docker/clone ships in the release after the one that builds it:
 # `scripts/pin_clone_image.sh <tag>` writes the digest of a published tag here.
 # SCARAB_CLONE_TOKEN_FILE points images built before the forge-token file
-# existed at it; newer images read it by default.
+# existed at it; newer images read it by default. The pinned image is the main
+# build after the clone credential was scoped to the cloned repository. It
+# predates the forge-username file and numeric depths: it answers git with
+# the username x-access-token (GitHub and Forgejo accept a token under any
+# username), and it fetches one commit for any depth but "full".
 kind: library
 interface:
   inputs:
@@ -38,7 +42,7 @@ interface:
       description: pull Git LFS objects
 steps:
   - id: git
-    image: ghcr.io/thulasi-ram/scarab-clone:0.2.2@sha256:76124c722f664a3f295fa5ce6b0ec1750bae6bd8edbe79e5333944b5c60a5636
+    image: ghcr.io/thulasi-ram/scarab-clone:sha-0d4ec26809c5f52b235f365e356a91cf9bc6942d@sha256:ca5b539ea2cb2dc590390ed4e8a339e4bcbf6255cd38f627de861c44c7961928
     forge_token: read
     env:
       - [SCARAB_CLONE_URL, "${{ event.repo.clone_url }}"]
