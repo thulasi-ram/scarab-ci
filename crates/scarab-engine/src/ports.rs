@@ -169,6 +169,33 @@ pub trait Db: Send + Sync {
         at: Timestamp,
     ) -> Result<(), DbError>;
 
+    /// Create a new run in `Pending`, as [`create_run`](Db::create_run) does,
+    /// but left out of [`active_runs`](Db::active_runs) until
+    /// [`finish_run_creation`](Db::finish_run_creation). For a caller that
+    /// writes the run's params, policy and steps in separate calls: a
+    /// scheduler tick between two of them would otherwise admit the run half
+    /// written — launch a step without its params, launch a step `when:`
+    /// excludes before it is Skipped, or start the run before its
+    /// concurrency group exists. A run whose creation never finishes is
+    /// never scheduled.
+    async fn begin_run_creation(
+        &self,
+        run: &RunId,
+        ir_version: u32,
+        event_schema_version: u32,
+        at: Timestamp,
+    ) -> Result<(), DbError>;
+
+    /// Make a run from [`begin_run_creation`](Db::begin_run_creation) visible
+    /// to [`active_runs`](Db::active_runs).
+    async fn finish_run_creation(&self, run: &RunId) -> Result<(), DbError>;
+
+    /// Whether `run` came from [`begin_run_creation`](Db::begin_run_creation)
+    /// and its creation never finished — still being written, or failed
+    /// partway. `false` for a run created any other way, and for an unknown
+    /// run.
+    async fn run_creation_unfinished(&self, run: &RunId) -> Result<bool, DbError>;
+
     /// Create a step projection in `Pending`, storing its durable launch `spec`
     /// and its `needs` (dependency in-edges) for dependency-aware admission.
     async fn create_step_run(
@@ -648,7 +675,9 @@ pub trait Db: Send + Sync {
     /// so the generation a post names is the one its transition happened in.
     async fn run_reopen_generation(&self, run: &RunId) -> Result<u64, DbError>;
 
-    /// Ids of all non-terminal runs — the work list a converged scheduler drives.
+    /// Ids of all non-terminal runs — the work list a converged scheduler
+    /// drives. A run still being created
+    /// ([`begin_run_creation`](Db::begin_run_creation)) is not in it.
     async fn active_runs(&self) -> Result<Vec<RunId>, DbError>;
 
     /// The most recent runs (any status), newest first, capped at `limit` — the

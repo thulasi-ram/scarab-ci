@@ -71,6 +71,9 @@ pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
+                if !scarab_forge::is_commit_sha(&after) {
+                    return Err(ForgeError::Malformed("after is not a commit SHA".into()));
+                }
                 Ok(Event::Push {
                     actor,
                     actor_id,
@@ -90,6 +93,7 @@ pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
             let head = p
                 .pointer("/pull_request/head/sha")
                 .and_then(Value::as_str)
+                .filter(|sha| scarab_forge::is_commit_sha(sha))
                 .ok_or_else(|| ForgeError::Malformed("pull_request.head.sha".into()))?
                 .to_string();
             // Fork PR: the head repo differs from the base (this) repo.
@@ -748,9 +752,13 @@ fn permissions_from_str(p: &str) -> Permissions {
 impl ForgePort for GithubForge {
     async fn latest_commit(&self, repo: &RepoRef, r#ref: &str) -> Result<Commit, ForgeError> {
         let token = self.auth_token_for(repo).await?;
+        // The ref is one path segment: a `/`, `?` or `#` in it must not
+        // reach another endpoint or add query parameters.
         let url = self.url(&format!(
             "/repos/{}/{}/commits/{}",
-            repo.owner, repo.name, r#ref
+            repo.owner,
+            repo.name,
+            scarab_forge::encode_url_component(r#ref)
         ));
         let resp = self.send(|| self.client.get(&url), &token).await?;
         let body = ok_json(resp).await?;
@@ -1332,7 +1340,7 @@ mod tests {
         let fork = json!({
             "pull_request": {
                 "number": 7,
-                "head": { "sha": "abc", "repo": { "full_name": "contributor/app" } }
+                "head": { "sha": "abc1234", "repo": { "full_name": "contributor/app" } }
             },
             "repository": { "name": "app", "owner": { "login": "acme" }, "full_name": "acme/app" }
         });
@@ -1519,6 +1527,47 @@ mod tests {
         }));
         assert_eq!(odd.permissions.len(), 1, "the non-string level is skipped");
         assert_eq!(odd.events.len(), 1, "the non-string event is skipped");
+    }
+
+    /// The push `after` and the pull request head SHA become the Run's pinned
+    /// commit, which the clone container hands to `git fetch` as an argument.
+    /// One that is not a hex SHA is malformed (red team 2026-10-30).
+    #[test]
+    fn a_commit_sha_that_is_not_hex_is_malformed() {
+        for sha in [
+            "--upload-pack=touch /tmp/pwned;git-upload-pack",
+            "-c core.sshCommand=id",
+            "main; id",
+            "HEAD",
+            "",
+        ] {
+            let push = json!({
+                "ref": "refs/heads/main",
+                "after": sha,
+                "repository": { "name": "app", "owner": { "login": "acme" } }
+            });
+            assert!(
+                matches!(
+                    normalize(&delivery("push", push)),
+                    Err(ForgeError::Malformed(_))
+                ),
+                "push after {sha:?} was accepted"
+            );
+            let pr = json!({
+                "pull_request": {
+                    "number": 7,
+                    "head": { "sha": sha, "repo": { "full_name": "acme/app" } }
+                },
+                "repository": { "name": "app", "owner": { "login": "acme" }, "full_name": "acme/app" }
+            });
+            assert!(
+                matches!(
+                    normalize(&delivery("pull_request", pr)),
+                    Err(ForgeError::Malformed(_))
+                ),
+                "pull request head {sha:?} was accepted"
+            );
+        }
     }
 
     #[test]

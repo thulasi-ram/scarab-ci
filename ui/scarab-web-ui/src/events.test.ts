@@ -216,6 +216,19 @@ describe("RunDeadLettered", () => {
   });
 });
 
+describe("RunCreationFailed", () => {
+  const failed = ev(10, {
+    RunCreationFailed: { reason: "pipeline error: step `checkout`: a clone step needs a sha" },
+  });
+
+  it("renders the creation error as an error", () => {
+    expect(describeEvent(failed)).toBe(
+      "Run creation failed — pipeline error: step `checkout`: a clone step needs a sha",
+    );
+    expect(eventCategory(failed)).toBe("err");
+  });
+});
+
 describe("GateResolved (slice b: gates fail with a reason)", () => {
   const passed = ev(1, {
     GateResolved: { step: "approve", attempt: "a1", passed: true, reason: "released" },

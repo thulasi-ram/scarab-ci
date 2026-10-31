@@ -6305,7 +6305,7 @@
             "description": "no such run or step"
           },
           "409": {
-            "description": "target's dependencies have not succeeded"
+            "description": "target's dependencies have not succeeded, or the run's creation failed"
           }
         },
         "security": [
@@ -6525,7 +6525,7 @@
             "description": "no such run or step"
           },
           "409": {
-            "description": "step is not failed"
+            "description": "step is not failed, or the run's creation failed"
           }
         },
         "security": [

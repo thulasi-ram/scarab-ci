@@ -23,12 +23,12 @@ pub mod scheduler;
 
 pub use ports::{Clock, Db, Executor, LogChunks, SnapshotRetention, WorkspaceSnapshots};
 pub use scheduler::{
-    cancel_run_request, gate_approvers, pin_run_snapshots, plan_rerun, record_gate_approval,
-    reject_gate, release_gate, rerun_step, rerun_step_widened, retry_step, retry_step_widened,
-    run_status_post_key, unpin_run_snapshots, wait_began_at, AttemptTeardown, ExpiredInput,
-    PlanReason, PlannedStep, RerunError, RerunPlan, Scheduler, SchedulerError, Supervision,
-    TeardownAttempt, TickHealth, CANCEL_ATTEMPT, CANCEL_RUN, LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS,
-    RUN_STATUS_CHANGED, SUPERSEDE_TEARDOWN,
+    cancel_run_request, fail_run_creation, gate_approvers, pin_run_snapshots, plan_rerun,
+    record_gate_approval, reject_gate, release_gate, rerun_step, rerun_step_widened, retry_step,
+    retry_step_widened, run_status_post_key, unpin_run_snapshots, wait_began_at, AttemptTeardown,
+    ExpiredInput, PlanReason, PlannedStep, RerunError, RerunPlan, Scheduler, SchedulerError,
+    Supervision, TeardownAttempt, TickHealth, CANCEL_ATTEMPT, CANCEL_RUN, LAUNCH_STEP,
+    MAX_DELIVERY_ATTEMPTS, RUN_STATUS_CHANGED, SUPERSEDE_TEARDOWN,
 };
 
 use serde::{Deserialize, Serialize};
@@ -1071,6 +1071,16 @@ pub enum EventPayload {
     /// verdict (infra retries exhausted / a lost execution / poison). The
     /// **operator** signal — `reason` carries the diagnostics.
     RunDeadLettered {
+        reason: String,
+    },
+    /// The run's creation failed after its row existed
+    /// ([`Db::begin_run_creation`]): a step the trigger cannot run, a rejected
+    /// privilege request, a store error. `reason` is that error. The run goes
+    /// `Pending → Failed` in the same commit and is never scheduled.
+    ///
+    /// **Forward-only**: a binary from before this variant cannot replay a
+    /// log that carries it.
+    RunCreationFailed {
         reason: String,
     },
     /// An operator requested a run cancel via the API (ADR-0054). Emitted

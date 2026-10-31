@@ -8999,7 +8999,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description target's dependencies have not succeeded */
+            /** @description target's dependencies have not succeeded, or the run's creation failed */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -9146,7 +9146,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description step is not failed */
+            /** @description step is not failed, or the run's creation failed */
             409: {
                 headers: {
                     [name: string]: unknown;

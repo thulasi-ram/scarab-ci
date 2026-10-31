@@ -6,10 +6,21 @@ name: ci
 on:
   push:
     branches: [main]
+  # `labeled` / `unlabeled` are for the two CI labels (git-bug ba1cab5):
+  #   ci:skip  every job below skips, with no runner started. Removing the label
+  #            starts a run. `just pr-gate` refuses a PR that has it.
+  #   ci:full  the path filters are ignored and every job runs.
+  # ci:skip wins when both are set. A change to any other label also starts a
+  # run (GitHub cannot filter triggers by label name); in that run every job
+  # skips, and the concurrency group below keeps it from cancelling a real run.
   pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
+# A newer run on the same ref cancels the one in flight, so adding ci:skip also
+# stops a run already in progress. A run started by another label's change gets
+# a group of its own and cancels nothing.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.ref }}${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ci:skip' && github.event.label.name != 'ci:full' && format('-label-{0}', github.run_id) || '' }}
   cancel-in-progress: true
 
 jobs:
@@ -42,10 +53,23 @@ jobs:
   # buys nothing (Actions minutes are limited), so they skip. A tree that differs
   # by one byte gets the full run, exactly as before.
   #
-  # This job is `required` in `.github/required-checks.txt` precisely because it
-  # always runs: it is the anchor that stops a PR whose every other check is
+  # This job is `required` in `.github/required-checks.txt` because it runs on
+  # every PR push: it is the anchor that stops a PR whose every other check is
   # correctly skipped from passing the gate having validated nothing.
+  #
+  # The ci:skip label skips THIS job (a job-level `if:` is evaluated without a
+  # runner), and every job below skips with it. So under ci:skip the anchor
+  # itself reports skipped, and `just pr-gate` fails the PR until the label is
+  # removed and a run passes. A run started by another label's change skips the
+  # same way; the gate ignores a skipped run when the commit has a real one.
   changes:
+    if: >-
+      github.event_name != 'pull_request' || (
+        !contains(github.event.pull_request.labels.*.name, 'ci:skip') && !(
+          (github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
+          github.event.label.name != 'ci:skip' && github.event.label.name != 'ci:full'
+        )
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -55,11 +79,11 @@ jobs:
     # One output per GATED JOB, named after it — not one per filter. The filter
     # file also defines `cargo` / `rust` / `ui_src`, which exist only as shared
     # anchors the others build on; emitting an output nothing reads is how a
-    # dead gate goes unnoticed.
+    # dead gate goes unnoticed. The ci:full label turns every output on.
     outputs:
-      test_and_coverage: ${{ (github.event_name != 'pull_request' && steps.validated.outputs.hit != 'true') || steps.filter.outputs.test_and_coverage == 'true' }}
-      ui: ${{ (github.event_name != 'pull_request' && steps.validated.outputs.hit != 'true') || steps.filter.outputs.ui == 'true' }}
-      contracts: ${{ (github.event_name != 'pull_request' && steps.validated.outputs.hit != 'true') || steps.filter.outputs.contracts == 'true' }}
+      test_and_coverage: ${{ (github.event_name != 'pull_request' && steps.validated.outputs.hit != 'true') || contains(github.event.pull_request.labels.*.name, 'ci:full') || steps.filter.outputs.test_and_coverage == 'true' }}
+      ui: ${{ (github.event_name != 'pull_request' && steps.validated.outputs.hit != 'true') || contains(github.event.pull_request.labels.*.name, 'ci:full') || steps.filter.outputs.ui == 'true' }}
+      contracts: ${{ (github.event_name != 'pull_request' && steps.validated.outputs.hit != 'true') || contains(github.event.pull_request.labels.*.name, 'ci:full') || steps.filter.outputs.contracts == 'true' }}
     steps:
       - uses: actions/checkout@v4
       # Non-PR only: has a passing PR run already validated this exact tree?
@@ -323,10 +347,15 @@ jobs:
   # gates all passed — or were correctly skipped by the path filter — records
   # the exact tree it tested. Expires in 7 days; a merge older than that just
   # gets the full run. `ui-e2e` is advisory and not waited on, as in the gate.
+  #
+  # `changes` must have SUCCEEDED: under ci:skip (or a run started by another
+  # label's change) every need is `skipped`, which is neither a failure nor a
+  # cancel, and a tree nothing tested must never be recorded as validated.
   record-validated-tree:
     needs: [changes, test-and-coverage, ui-tests, openapi-drift]
     if: >-
       always() && github.event_name == 'pull_request' &&
+      needs.changes.result == 'success' &&
       !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
     runs-on: ubuntu-latest
     timeout-minutes: 5

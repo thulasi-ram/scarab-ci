@@ -53,6 +53,9 @@ export function describeEvent(e: RunEvent): string {
     // needed explaining was the one that explained nothing.
     case "RunDeadLettered":
       return `Run dead-lettered — ${s(v.reason)}`;
+    // The run's creation failed partway; the reason is the creation error.
+    case "RunCreationFailed":
+      return `Run creation failed — ${s(v.reason)}`;
     default:
       return tag;
   }
@@ -183,6 +186,7 @@ export function eventCategory(e: RunEvent): EventCat {
     // an error. It previously fell through to `info`, rendering the most serious
     // outcome a run has as the quietest thing on the rail.
     case "RunDeadLettered":
+    case "RunCreationFailed":
       return "err";
     // Everything else — including the ADR-0061 s5 snapshot pin/unpin — is `info`.
     // Those two used to have their own arms returning `info`, which was dead code
