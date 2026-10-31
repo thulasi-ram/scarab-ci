@@ -1693,55 +1693,61 @@ async fn create_run(
     let now = st.clock.now().await;
     let run = new_run_id();
 
+    // Out of the scheduler's work list until its steps and their `inputs:`
+    // are all written (`end_run_creation` below), as in `persist_run_from_ir`.
     st.db
-        .create_run(&run, req.pipeline.ir_version, EVENT_VERSION, now)
+        .begin_run_creation(&run, req.pipeline.ir_version, EVENT_VERSION, now)
         .await?;
-    // Store the compiled IR on the run — self-describing (ADR-0022).
-    let ir = serde_json::to_value(&req.pipeline)
-        .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;
-    st.db.store_run_ir(&run, &ir).await?;
-    // Freeze the resolved params on the run so every step's interpolation
-    // (`${{ inputs.… }}`) and `SCARAB_PARAM_*` env re-derive deterministically.
-    st.db.set_run_params(&run, &resolved).await?;
-    // The Headline (ADR-0057 §3): an optional dispatch reason for this inline
-    // `api`-style run. This path builds no forge `Event`, so the reason is capped
-    // + stamped directly (the same cap `Event::trigger_title` applies). Stamped
-    // only when supplied; no requiredness check here (thread D). Display/audit
-    // only — never in the CEL/interpolation context.
-    if let Some(title) = req
-        .reason
-        .as_deref()
-        .and_then(scarab_forge::cap_trigger_title)
-    {
-        st.db.set_run_trigger_title(&run, &title).await?;
-    }
-    st.db
-        .append_event(&EventKind {
-            version: EVENT_VERSION,
-            run: run.clone(),
-            kind: EventPayload::RunCreated,
-            at: now,
-        })
-        .await?;
-
-    for (id, spec, needs) in &admitted_steps {
+    let written: Result<(), DbError> = async {
+        // Store the compiled IR on the run — self-describing (ADR-0022).
+        let ir = serde_json::to_value(&req.pipeline).map_err(|e| DbError::Other(e.to_string()))?;
+        st.db.store_run_ir(&run, &ir).await?;
+        // Freeze the resolved params on the run so every step's interpolation
+        // (`${{ inputs.… }}`) and `SCARAB_PARAM_*` env re-derive deterministically.
+        st.db.set_run_params(&run, &resolved).await?;
+        // The Headline (ADR-0057 §3): an optional dispatch reason for this inline
+        // `api`-style run. This path builds no forge `Event`, so the reason is capped
+        // + stamped directly (the same cap `Event::trigger_title` applies). Stamped
+        // only when supplied; no requiredness check here (thread D). Display/audit
+        // only — never in the CEL/interpolation context.
+        if let Some(title) = req
+            .reason
+            .as_deref()
+            .and_then(scarab_forge::cap_trigger_title)
+        {
+            st.db.set_run_trigger_title(&run, &title).await?;
+        }
         st.db
-            .create_step_run(&run, id, Some(spec), needs, now)
+            .append_event(&EventKind {
+                version: EVENT_VERSION,
+                run: run.clone(),
+                kind: EventPayload::RunCreated,
+                at: now,
+            })
             .await?;
-    }
-    // Explicit input workspaces (ADR-0007): thread the authored `inputs:` subset
-    // so the scheduler honors it at launch (workspace materialization) and in the
-    // skip-if-unchanged signature — the same threading the trigger path does in
-    // `persist_run_from_ir`. Absent = implicit-by-default (all needs). Without
-    // this the inline `POST /v1/runs` path silently dropped the selection.
-    for step in &req.pipeline.steps {
-        if let Some(inputs) = &step.inputs {
-            let inputs: Vec<StepId> = inputs.iter().map(|i| StepId(i.clone())).collect();
+
+        for (id, spec, needs) in &admitted_steps {
             st.db
-                .set_step_inputs(&run, &StepId(step.id.clone()), &inputs)
+                .create_step_run(&run, id, Some(spec), needs, now)
                 .await?;
         }
+        // Explicit input workspaces (ADR-0007): thread the authored `inputs:` subset
+        // so the scheduler honors it at launch (workspace materialization) and in the
+        // skip-if-unchanged signature — the same threading the trigger path does in
+        // `persist_run_from_ir`. Absent = implicit-by-default (all needs). Without
+        // this the inline `POST /v1/runs` path silently dropped the selection.
+        for step in &req.pipeline.steps {
+            if let Some(inputs) = &step.inputs {
+                let inputs: Vec<StepId> = inputs.iter().map(|i| StepId(i.clone())).collect();
+                st.db
+                    .set_step_inputs(&run, &StepId(step.id.clone()), &inputs)
+                    .await?;
+            }
+        }
+        Ok(())
     }
+    .await;
+    end_run_creation(st.db.as_ref(), &run, now, written).await?;
 
     Ok((
         StatusCode::CREATED,
@@ -2655,6 +2661,7 @@ fn rerun_outcome<T>(res: Result<T, RerunError>) -> Result<T, ApiError> {
             Err(ApiError::Conflict(e.to_string()))
         }
         Err(e @ RerunError::NotFailed { .. }) => Err(ApiError::Conflict(e.to_string())),
+        Err(e @ RerunError::CreationUnfinished) => Err(ApiError::Conflict(e.to_string())),
         // Gate-approval-only variants (never produced by rerun/retry); mapped to
         // 409 for exhaustiveness.
         Err(
@@ -2682,7 +2689,7 @@ fn rerun_outcome<T>(res: Result<T, RerunError>) -> Result<T, ApiError> {
     responses(
         (status = 202, description = "rerun accepted — the body is the EXECUTED plan", body = RerunPlanResponse),
         (status = 404, description = "no such run or step"),
-        (status = 409, description = "target's dependencies have not succeeded")
+        (status = 409, description = "target's dependencies have not succeeded, or the run's creation failed")
     )
 )]
 async fn rerun_step(
@@ -2746,7 +2753,7 @@ fn snapshot_oracle(st: &AppState) -> Option<Box<dyn scarab_engine::WorkspaceSnap
     responses(
         (status = 202, description = "retry accepted — the body is the EXECUTED plan", body = RerunPlanResponse),
         (status = 404, description = "no such run or step"),
-        (status = 409, description = "step is not failed")
+        (status = 409, description = "step is not failed, or the run's creation failed")
     )
 )]
 async fn retry_step(
@@ -4556,12 +4563,6 @@ async fn admit_and_create_run(
     let now = clock.now().await;
     let run = new_run_id();
     persist_run_from_ir(db, &run, ir, event, path, &gov, excluded, params, now).await?;
-    // Freeze the resolved launch parameters on the run so every step's
-    // interpolation (`${{ inputs.… }}`) and `SCARAB_PARAM_*` env re-derive
-    // deterministically (ADR-0043 §5).
-    if let Some(params) = params {
-        db.set_run_params(&run, params).await?;
-    }
     Ok(Admission::Created(run))
 }
 
@@ -5012,7 +5013,14 @@ fn clone_context(event: &scarab_forge::Event) -> Option<(scarab_forge::RepoRef, 
     }
 }
 
-/// on the event log, and create each step with its `needs`.
+/// Durably create `run` from a compiled pipeline: the run, its trigger facts
+/// on the event log, and each step with its `needs`.
+///
+/// The run stays out of the scheduler's work list until every write has
+/// landed ([`end_run_creation`]): a tick between two of them would launch a
+/// step without its params, launch a `when:`-excluded step before it is
+/// Skipped, or start the run before its concurrency group exists. A creation
+/// that fails partway ends the run Failed, never schedulable.
 #[allow(clippy::too_many_arguments)] // a cohesive persist routine; splitting hides the flow
 async fn persist_run_from_ir(
     db: &dyn Db,
@@ -5025,9 +5033,66 @@ async fn persist_run_from_ir(
     params: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
     now: Timestamp,
 ) -> Result<(), TriggerError> {
-    let locked_out = gov.locked_out();
-    db.create_run(run, ir.ir_version, EVENT_VERSION, now)
+    db.begin_run_creation(run, ir.ir_version, EVENT_VERSION, now)
         .await?;
+    let written = write_run_from_ir(db, run, ir, event, pipeline, gov, excluded, params, now).await;
+    end_run_creation(db, run, now, written).await
+}
+
+/// End a run creation begun with [`Db::begin_run_creation`]. When every write
+/// landed (`written` is `Ok`), make the run schedulable. Otherwise — or when
+/// that last write fails — end the run `Failed` with the error as its reason
+/// ([`scarab_engine::fail_run_creation`]), so a half-written run is never
+/// scheduled and never sits `Pending` for good. The creation error is
+/// returned either way.
+async fn end_run_creation<E>(
+    db: &dyn Db,
+    run: &RunId,
+    now: Timestamp,
+    written: Result<(), E>,
+) -> Result<(), E>
+where
+    E: std::fmt::Display + From<DbError>,
+{
+    let ended = match written {
+        Ok(()) => db.finish_run_creation(run).await.map_err(E::from),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = &ended {
+        if let Err(failed) = scarab_engine::fail_run_creation(db, run, e.to_string(), now).await {
+            // The run stays Pending and out of the work list: never scheduled,
+            // but shown Pending until someone clears it.
+            tracing::warn!(
+                run = %run.0,
+                creation_error = %e,
+                error = %failed,
+                "run creation failed and the run could not be marked Failed"
+            );
+        }
+    }
+    ended
+}
+
+/// Every write of [`persist_run_from_ir`] after the run row exists.
+#[allow(clippy::too_many_arguments)] // a cohesive persist routine; splitting hides the flow
+async fn write_run_from_ir(
+    db: &dyn Db,
+    run: &RunId,
+    ir: &scarab_pipeline::PipelineIr,
+    event: &scarab_forge::Event,
+    pipeline: &str,
+    gov: &RunGovernance,
+    excluded: &[String],
+    params: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
+    now: Timestamp,
+) -> Result<(), TriggerError> {
+    let locked_out = gov.locked_out();
+    // Freeze the resolved launch parameters on the run so every step's
+    // interpolation (`${{ inputs.… }}`) and `SCARAB_PARAM_*` env re-derive
+    // deterministically (ADR-0043 §5).
+    if let Some(params) = params {
+        db.set_run_params(run, params).await?;
+    }
     // Tenancy (ADR-0049): stamp the owning (org, project) from the trigger's
     // repo, so run reads/lists can be scoped by the caller's bindings.
     // Untenanted runs (no repo — inline dev submissions) stay global-only.
@@ -7452,7 +7517,8 @@ async fn approve_gate(
             | RerunError::NotAManualGate(_)
             | RerunError::GateNotPending { .. }
             | RerunError::GateNotReached { .. }
-            | RerunError::NotARejectableGate(_)),
+            | RerunError::NotARejectableGate(_)
+            | RerunError::CreationUnfinished),
         ) => return Err(ApiError::Conflict(e.to_string())),
         Err(RerunError::Db(e)) => return Err(ApiError::Db(e)),
     }
@@ -7506,7 +7572,8 @@ async fn approve_gate(
             | RerunError::NotAManualGate(_)
             | RerunError::GateNotPending { .. }
             | RerunError::GateNotReached { .. }
-            | RerunError::NotARejectableGate(_)),
+            | RerunError::NotARejectableGate(_)
+            | RerunError::CreationUnfinished),
         ) => return Err(ApiError::Conflict(e.to_string())),
         Err(RerunError::Db(e)) => return Err(ApiError::Db(e)),
     }
@@ -7807,7 +7874,8 @@ async fn release_gate_external(
             | RerunError::NotAManualGate(_)
             | RerunError::GateNotPending { .. }
             | RerunError::GateNotReached { .. }
-            | RerunError::NotARejectableGate(_)),
+            | RerunError::NotARejectableGate(_)
+            | RerunError::CreationUnfinished),
         ) => Err(ApiError::Conflict(e.to_string())),
         Err(RerunError::Db(e)) => Err(ApiError::Db(e)),
     }
