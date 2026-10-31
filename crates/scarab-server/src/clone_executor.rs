@@ -152,6 +152,14 @@ impl Executor for CloneEnrichingExecutor {
         let Some(clone) = &spec.clone else {
             return self.inner.launch(step, spec).await;
         };
+        // The SHA becomes `SCARAB_CLONE_SHA`, which the clone image passes to
+        // `git fetch` as an argument. One that is not hex could be read as an
+        // option, so the Step fails here, before a credential is minted.
+        if !scarab_forge::is_commit_sha(&clone.sha) {
+            return Err(ExecError::Refused(
+                "the clone Step's commit is not a hex commit SHA".into(),
+            ));
+        }
         let repo = RepoRef {
             owner: clone.owner.clone(),
             name: clone.name.clone(),

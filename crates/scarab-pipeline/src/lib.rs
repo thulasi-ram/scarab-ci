@@ -770,8 +770,8 @@ pub struct CloneSpec {
     /// is a compile error.
     #[serde(default)]
     pub depth: CloneDepth,
-    /// Recursive submodule fetch with the run's token. Cross-installation
-    /// private submodules are a documented limitation (ADR-0045).
+    /// Recursive submodule fetch, without the run's token: the token covers
+    /// only the cloned repository, so private submodules are not supported.
     #[serde(default, skip_serializing_if = "is_false")]
     pub submodules: bool,
     /// git-lfs fetch (served by the canonical `scarab-clone` image).
