@@ -219,6 +219,9 @@ kept set is more useful than one pass.
 
 ### 4. Where `just chaos` runs
 
+Replaced by the [Amendment (2026-11-01)](#amendment-2026-11-01-one-kind-cluster-one-release):
+`just chaos` switches the one release on the shared kind cluster instead of creating a cluster.
+
 `just chaos` creates a throwaway kind cluster, `scarab-chaos`, with its own kubeconfig file
 (the pattern of `deploy/local-proc/up.sh` and `deploy/local-proc/plugin-verify.sh:45-55`).
 It installs the real chart with `replicaCount: 2` and `workspace.replicaCount: 2`, plus
@@ -459,6 +462,95 @@ clone library, `forge_token` and I8's forge-token Secret, yank), and step 4 adds
    accepted slow path that the checker allows, or a blocker for the 2+2 topology?
 5. **Where fault runs happen:** a throwaway kind cluster (proposed) or colima's k3s, and may
    colima be resized to 6 vCPU and 10 GiB for them?
+   Answered in part by the Amendment (2026-11-01): the shared kind cluster. The size is
+   still open.
 6. **Agent budget:** a monthly cap, and does the agentic layer start with `security`
    (proposed) rather than `chaos`?
 7. **The SIGSTOP pause scenario:** in scope? It was not in the original proposal.
+
+## Amendment (2026-11-01): one kind cluster, one release
+
+Decided by the owner on 2026-11-01, after the live test in #63. It replaces §4, changes where
+`just e2e` and `just chaos` run in §1's table, and replaces the proc-mode note on scenarios 0
+and 4 in §3. It answers open question 5 in part.
+
+### Why
+
+There are two local setups today, on two kinds of cluster:
+
+- Proc mode (`just up`, `just e2e`, `just forgejo-verify`, `just kube-tests`) runs Postgres
+  and MinIO in compose, the server and the Depot as macOS host processes, and step Pods in
+  kind.
+- Helm mode (`just local-helm`) docker-builds the images and installs the chart into colima's
+  k3s.
+
+CI uses kind with host processes. §4 would have added a third setup: a new kind cluster per
+chaos run.
+
+Each setup has its own networking. Proc mode finds how a Pod reaches the host by probing from
+a Pod (`deploy/local-proc/up.sh`), and a host process needs a second URL for the same Depot
+(`SCARAB_WORKSPACE_CONTROL_URL`). The e2e harness missed the second URL, and that kept
+`crash_resume` red until #63.
+
+### Decision
+
+1. **One kind cluster for every local tier.** `just up`, `just e2e`, `just forgejo-verify`,
+   `just kube-tests`, `just local-helm` and `just chaos` use the same kind cluster and the real
+   chart. No recipe uses colima's k3s. Test binaries still run on the host and drive the
+   cluster.
+2. **One release, and a mode is a set of Helm values:** the database URL, the bucket, replica
+   counts, and an image or a mounted binary. Scarab does not know which mode it runs in.
+   Isolation comes from the infrastructure, through a different database URL and bucket.
+   Whether the URL names another database or another schema is the recipe's choice.
+3. **The server runs in the cluster in every mode, from a binary built on the host.**
+   - On macOS, `cargo zigbuild -p scarab-server --target aarch64-unknown-linux-gnu.2.36` builds
+     a Linux binary against bookworm's glibc.
+   - A thin runtime image (`debian:bookworm-slim` with `ca-certificates` and a non-root user)
+     runs it from a mounted directory: kind `extraMounts` to the node, then `hostPath` to the
+     Pod. The UI's `dist` is mounted at `SCARAB_UI_DIR`. A new build takes effect on
+     `kubectl rollout restart`.
+   - Measured on 2026-11-01: a cold dev build took 2m05s and an incremental one 28 s, against
+     24 s for a native `cargo build`. The binary migrated Postgres and answered `/readyz`.
+   - The directory is mounted, not the file. Cargo writes a new file, and a file mount keeps
+     the old one.
+   - A Linux CI runner builds natively.
+   - Step images (clone, sidecar, wsfetch) stay images: published tags, or built and loaded
+     into kind when they change.
+4. **`just chaos` switches the release instead of creating a cluster.**
+   - It refuses to start while the dev database has Runs in progress.
+   - It deletes the Depot's PVCs. The warm cache holds blobs from the dev bucket. It would
+     serve reads the chaos bucket cannot, and hide the faults rank 1 looks for. The Depot is a
+     cache ([0066](0066-the-depot-is-a-cache.md)), so dev's refills from object storage later.
+   - It upgrades the release to chaos values: `replicaCount: 2`, `workspace.replicaCount: 2`,
+     and a chaos database and bucket reached through toxiproxy. Plugins are off unless a
+     scenario needs them. The plugin runtime removes plugin Deployments its database does not
+     know (`crates/scarab-server/src/plugin_runtime.rs:409`), so dev's would be removed and
+     then recreated when dev returns.
+   - It runs the scenarios, then upgrades the release back to dev values. Dev's data stays in
+     its own database and bucket.
+5. **Signals come from the kind node.** In the cluster the server is PID 1 with no init
+   (`docker/server/Dockerfile:92`). It ignores SIGSTOP sent from inside its PID namespace. The
+   harness sends SIGKILL and SIGSTOP from the node's PID namespace instead, which the kernel
+   delivers. So scenarios 0 and 4 run in the cluster with the others. This is not verified yet;
+   the first scenario built checks it. A Pod delete with grace 0 is a different fault: it
+   creates a new Pod instead of restarting the container.
+
+### Consequences
+
+- Pods reach the server and the Depot through Services in every mode. The Pod probe in
+  `up.sh` goes away, and so does the host-facing Depot URL in the e2e harness.
+- `just chaos` and dev cannot run at the same time. A chaos run takes minutes.
+- There is no native debugger on the server. Logs come from `kubectl logs`.
+- The Linux target adds about 1.6 GB under each worktree's `target/`.
+- Postgres and MinIO are shared, and chaos uses its own database and bucket on them. The
+  ranked scenarios fault them only through toxiproxy. A scenario that restarts the Postgres or
+  MinIO process would also hit dev's data.
+
+### Still open
+
+- **colima's size.** Two servers and two Depots request about 1.5 GiB (`values.yaml`). Measure
+  before resizing past 2 vCPU and 4 GiB.
+- **Two converged replicas.** `values.yaml` advises one converged replica unless roles are
+  split; rank 2 wants two.
+- **The dogfood stack** on colima's k3s, stopped since 2026-10-28: move it to the kind cluster
+  or retire it.
