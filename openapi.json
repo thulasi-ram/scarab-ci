@@ -3054,6 +3054,61 @@
         ]
       }
     },
+    "/v1/orgs/{org}/library-yanks/{hash}/impact": {
+      "get": {
+        "tags": [
+          "Libraries"
+        ],
+        "summary": "The Runs in progress that use a library version (ADR-0076 §6)",
+        "operationId": "get_yank_impact",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "hash",
+            "in": "path",
+            "description": "content hash",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/YankImpactDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "not a content hash"
+          },
+          "403": {
+            "description": "not an org admin"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/orgs/{org}/members/{subject}/passkeys/reset": {
       "post": {
         "tags": [
@@ -5673,7 +5728,14 @@
             }
           },
           "400": {
-            "description": "the pipeline failed to compile (structured diagnostic)"
+            "description": "the pipeline failed to compile: each error with its fields",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CompileErrorResponse"
+                }
+              }
+            }
           },
           "404": {
             "description": "no pipeline by that name at the ref"
@@ -5732,6 +5794,66 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RefsResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/repos/{org}/{repo}/refused-runs": {
+      "get": {
+        "tags": [
+          "Repositories"
+        ],
+        "summary": "Triggers that did not become a Run (ADR-0076)",
+        "operationId": "list_refused_runs",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "project (repo) name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "at most this many (default 50, capped 200)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RefusedRunListResponse"
                 }
               }
             }
@@ -6920,6 +7042,58 @@
         ]
       }
     },
+    "/v1/runs/{id}/steps/{step}/origin": {
+      "get": {
+        "tags": [
+          "Runs"
+        ],
+        "summary": "Where a Step comes from (ADR-0076)",
+        "operationId": "get_step_origin",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "run id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "step",
+            "in": "path",
+            "description": "step id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepOriginDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such run or step"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/runs/{id}/steps/{step}/rerun": {
       "post": {
         "tags": [
@@ -8057,6 +8231,28 @@
           }
         }
       },
+      "BoundInputDto": {
+        "type": "object",
+        "description": "One input in the scope of a Step's invocation.",
+        "required": [
+          "name",
+          "kind",
+          "bound"
+        ],
+        "properties": {
+          "bound": {
+            "type": "object",
+            "description": "The literal value, or the template text."
+          },
+          "kind": {
+            "type": "string",
+            "description": "`literal` (a value known at compile: the caller's literal or the\ninput's default) or `template` (the caller's `${{ … }}`, rendered at\nlaunch)."
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
       "CapabilityRequirementDto": {
         "type": "object",
         "description": "One capability Scarab needs of a forge app, as the preflight reports it\n(`scarab_forge::preflight::ForgeRequirement` on the wire).",
@@ -8119,6 +8315,104 @@
           "name": {
             "type": "string",
             "description": "The bare selection name (e.g. `deploy`) — what a describe/dispatch call\npasses as `pipeline`."
+          }
+        }
+      },
+      "CompileErrorDto": {
+        "type": "object",
+        "description": "One compile error with the fields a reader acts on (ADR-0076): the Step,\nthe command index and the template it reads, and for a library Step the\nlibrary and the caller's binding. `message` is the compiler's text.",
+        "required": [
+          "kind",
+          "message"
+        ],
+        "properties": {
+          "bound": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For a library Step: the caller's `with:` value for `input`."
+          },
+          "command_index": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "input": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For a library Step: the library input the caller binds."
+          },
+          "kind": {
+            "type": "string",
+            "description": "`command_value` (a `command` argument reads free text from outside\nthe Pipeline), `script_template` (a `${{ … }}` in a script) or\n`other`."
+          },
+          "library": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For a library Step: the library (`<publisher>/<name>` or a path)."
+          },
+          "library_step": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For a library Step: its id inside the library."
+          },
+          "message": {
+            "type": "string"
+          },
+          "read": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The `${{ … }}` the argument reads."
+          },
+          "step": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Step in the Pipeline file; for a library Step, the invoke Step."
+          }
+        }
+      },
+      "CompileErrorResponse": {
+        "type": "object",
+        "description": "`400` body for a Pipeline that does not compile: the whole text, as a\nplain-text 400 carried it before, and each error with its fields.",
+        "required": [
+          "code",
+          "message",
+          "errors"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Always `compile_failed`."
+          },
+          "errors": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CompileErrorDto"
+            }
+          },
+          "message": {
+            "type": "string"
+          },
+          "sha": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The commit the Pipeline was read at."
           }
         }
       },
@@ -8971,6 +9265,30 @@
           }
         }
       },
+      "GateOutputDto": {
+        "type": "object",
+        "description": "One output a plugin gate returns on release.",
+        "required": [
+          "name",
+          "type"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "description": "`string`, `boolean` or `number`."
+          },
+          "value": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "The value the plugin released the gate with; absent until then."
+          }
+        }
+      },
       "GateResolutionDto": {
         "type": "object",
         "description": "How a gate's wait resolved: its `GateResolved` journal entry.",
@@ -9285,6 +9603,13 @@
           "yanked_at"
         ],
         "properties": {
+          "cancelled_runs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The Runs a yank with `cancel_runs` cancelled. Omitted otherwise."
+          },
           "content_hash": {
             "type": "string"
           },
@@ -9711,6 +10036,40 @@
             "format": "int64",
             "description": "Bootstrap owners entries that match only a verified email at login\nand name no Principal: not counted above, since no passkey is ever\nstored under one (a global administrator's view; 0 otherwise).",
             "minimum": 0
+          }
+        }
+      },
+      "OriginLinkDto": {
+        "type": "object",
+        "description": "One link of a Step's invoke chain, outermost first.",
+        "required": [
+          "kind",
+          "name",
+          "content_hash"
+        ],
+        "properties": {
+          "content_hash": {
+            "type": "string",
+            "description": "SHA-256 of the library source (or of the plugin's approved manifest)."
+          },
+          "kind": {
+            "type": "string",
+            "description": "`file`, `library` or `plugin`."
+          },
+          "name": {
+            "type": "string",
+            "description": "A repo-relative path (`file`), `<publisher>/<name>` (`library`) or the\nplugin installation and gate (`plugin`)."
+          },
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where an installed library comes from, at its commit."
+          },
+          "yanked": {
+            "type": "boolean",
+            "description": "The version is yanked in the Run's org now."
           }
         }
       },
@@ -10167,6 +10526,87 @@
           }
         },
         "additionalProperties": false
+      },
+      "PluginGateViewDto": {
+        "type": "object",
+        "description": "What a `gate: plugin` node waits on, and where its wait stands.",
+        "required": [
+          "releaser",
+          "installation",
+          "gate",
+          "outputs"
+        ],
+        "properties": {
+          "expires_after": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "`gate_expires_after`, seconds.",
+            "minimum": 0
+          },
+          "expires_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the latest wait expires (Unix ms)."
+          },
+          "gate": {
+            "type": "string",
+            "description": "The gate's name in the plugin's manifest."
+          },
+          "inputs": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "The inputs rendered when the gate was reached; absent before."
+          },
+          "installation": {
+            "type": "string"
+          },
+          "killed_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "killed_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "outputs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GateOutputDto"
+            }
+          },
+          "plugin_state": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`enabled` or `killed`; absent when the installation is gone."
+          },
+          "releaser": {
+            "type": "string",
+            "description": "The Principal that may release it: `plugin:<installation>`."
+          },
+          "waiting_since": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the latest wait began (Unix ms)."
+          }
+        }
       },
       "PluginInstallationDto": {
         "type": "object",
@@ -11068,6 +11508,90 @@
           }
         }
       },
+      "RefusedRunDto": {
+        "type": "object",
+        "description": "A trigger that did not become a Run.",
+        "required": [
+          "id",
+          "pipeline",
+          "trigger_kind",
+          "reason_kind",
+          "message",
+          "errors",
+          "created_at"
+        ],
+        "properties": {
+          "actor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "errors": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CompileErrorDto"
+            },
+            "description": "Each error: for `compile` with its fields, otherwise its message."
+          },
+          "git_ref": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "message": {
+            "type": "string"
+          },
+          "pipeline": {
+            "type": "string",
+            "description": "The pipeline file, `.scarab/<name>.yaml`."
+          },
+          "reason_kind": {
+            "type": "string",
+            "description": "`compile`, `yanked`, `policy`, `environment`, `event_field` or\n`forge_token`."
+          },
+          "sha": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The trigger's headline: a push's commit subject, a dispatch reason."
+          },
+          "trigger_kind": {
+            "type": "string"
+          }
+        }
+      },
+      "RefusedRunListResponse": {
+        "type": "object",
+        "description": "`GET /v1/repos/{org}/{repo}/refused-runs` body.",
+        "required": [
+          "refused"
+        ],
+        "properties": {
+          "refused": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RefusedRunDto"
+            }
+          }
+        }
+      },
       "RejectGateRequest": {
         "type": "object",
         "description": "`POST /v1/runs/{id}/gates/{step}/reject` body: why the gate is failed.",
@@ -11078,6 +11602,42 @@
           "reason": {
             "type": "string",
             "description": "The human reason, journalled on the gate's verdict and its Attempt.\nRequired: 1 to 1024 bytes once trimmed."
+          }
+        }
+      },
+      "RenderedSpecDto": {
+        "type": "object",
+        "description": "A Step's image, command and env as its launch renders them.",
+        "required": [
+          "image",
+          "command",
+          "env"
+        ],
+        "properties": {
+          "command": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "env": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": false,
+              "prefixItems": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "string"
+                }
+              ]
+            },
+            "description": "`[name, value]` pairs."
+          },
+          "image": {
+            "type": "string"
           }
         }
       },
@@ -11307,6 +11867,13 @@
               "null"
             ],
             "description": "The run **Headline** (ADR-0057) — the one human line saying what this run\nis about (a push's commit subject; later a PR title / dispatch reason),\ndisambiguated by the trigger kind. Display/audit only; absent when the\ntrigger carried no headline and on runs created before headline-stamping."
+          },
+          "yanked_libraries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RunYankDto"
+            },
+            "description": "The library versions this Run uses that are yanked in its org now\n(ADR-0076 §6). A Rerun or Retry of a Step from one is refused at\nlaunch: it reuses the Steps the Run was compiled with. Empty when none."
           }
         }
       },
@@ -11432,6 +11999,44 @@
               "$ref": "#/components/schemas/WaitingGateDto"
             },
             "description": "The run's **waiting gates** (git-bug `c489346`): gate steps that are\n`Pending`, reached (every need `Succeeded`) and have an open Attempt —\nthe engine's \"waiting gate\". Since a waiting gate holds only its\ndependents (ADR-0070 §9), a Run with one can still be `running` while\nindependent steps run, so this — not `status == suspended` — is what\nsays a Run waits on a gate. Omitted when empty (and always for a\nterminal or queued Run)."
+          }
+        }
+      },
+      "RunYankDto": {
+        "type": "object",
+        "description": "A library version a Run uses that is yanked in its org.",
+        "required": [
+          "name",
+          "content_hash",
+          "reason",
+          "yanked_by",
+          "yanked_at",
+          "steps"
+        ],
+        "properties": {
+          "content_hash": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string",
+            "description": "`<publisher>/<name>`."
+          },
+          "reason": {
+            "type": "string"
+          },
+          "steps": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The Steps of the Run inlined from it."
+          },
+          "yanked_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "yanked_by": {
+            "type": "string"
           }
         }
       },
@@ -11841,6 +12446,59 @@
           }
         }
       },
+      "StepOriginDto": {
+        "type": "object",
+        "description": "`GET /v1/runs/{id}/steps/{step}/origin`.",
+        "required": [
+          "step",
+          "chain",
+          "inputs"
+        ],
+        "properties": {
+          "chain": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OriginLinkDto"
+            },
+            "description": "The invoke chain, outermost first. Empty for a Step written in the\nPipeline file itself."
+          },
+          "inputs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BoundInputDto"
+            },
+            "description": "The inputs bound in the Step's own invocation. Empty for a Step\nwritten in the Pipeline file."
+          },
+          "pipeline": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Pipeline the Run was created from, by name."
+          },
+          "render_note": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why `rendered` is absent, when it is not simply a gate."
+          },
+          "rendered": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RenderedSpecDto",
+                "description": "The Step rendered as its launch renders it; absent before its first\nlaunch, for a gate, or when it does not render."
+              }
+            ]
+          },
+          "step": {
+            "type": "string"
+          }
+        }
+      },
       "StepResultDto": {
         "type": "object",
         "description": "One named result a step published (ADR-0041) — the `${{ outputs.<step>.<name> }}`\nvalues, exposed read-only for the run detail Inspector. `type_name` is a\ncoarse JSON kind (string/number/bool/object/array/null) so the UI can badge it\nwithout re-deriving.",
@@ -11939,6 +12597,24 @@
               "type": "string"
             },
             "description": "Upstream step ids this step depends on — the DAG in-edges (ADR-0006). The\nUI folds these into the run's graph view."
+          },
+          "origin": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OriginLinkDto"
+            },
+            "description": "The invoke chain this Step was inlined through, outermost first\n(ADR-0076): the `origin` the compiler recorded, each library version\nmarked when it is yanked in the Run's org. Empty for a Step written in\nthe Pipeline file itself."
+          },
+          "plugin_gate": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PluginGateViewDto",
+                "description": "For a `gate: plugin` node (ADR-0076 §7): who releases it, its expiry,\nits rendered inputs and its typed outputs."
+              }
+            ]
           },
           "services": {
             "type": "array",
@@ -12406,6 +13082,74 @@
           }
         }
       },
+      "YankImpactDto": {
+        "type": "object",
+        "description": "What a yank of one version would stop in its org: the Runs in progress\nthat use it.",
+        "required": [
+          "content_hash",
+          "runs",
+          "running_steps"
+        ],
+        "properties": {
+          "content_hash": {
+            "type": "string"
+          },
+          "running_steps": {
+            "type": "integer",
+            "description": "How many of the Runs' Steps from the version are running now.",
+            "minimum": 0
+          },
+          "runs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/YankImpactRunDto"
+            }
+          }
+        }
+      },
+      "YankImpactRunDto": {
+        "type": "object",
+        "description": "A Run in progress that uses a library version.",
+        "required": [
+          "id",
+          "project",
+          "status",
+          "steps",
+          "running_steps"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "project": {
+            "type": "string"
+          },
+          "run_number": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "running_steps": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Of those, the ones running now."
+          },
+          "status": {
+            "type": "string"
+          },
+          "steps": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The Run's Steps inlined from the version."
+          }
+        }
+      },
       "YankLibraryRequest": {
         "type": "object",
         "required": [
@@ -12413,6 +13157,10 @@
           "reason"
         ],
         "properties": {
+          "cancel_runs": {
+            "type": "boolean",
+            "description": "Also cancel the Runs in progress that use the version, as\n`POST /v1/runs/{id}/cancel` does: their running Steps stop. Default\n`false`: a Step that is running finishes."
+          },
           "content_hash": {
             "type": "string"
           },
