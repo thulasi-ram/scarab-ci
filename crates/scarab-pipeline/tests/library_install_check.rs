@@ -19,7 +19,8 @@ interface:
 steps:
   - id: upgrade
     image: alpine/helm:3.16.2
-    command: [helm, upgrade, --install, "${{ inputs.release }}", ./chart]
+    env: [[RELEASE, "${{ inputs.release }}"]]
+    command: [sh, -c, 'helm upgrade --install "$RELEASE" ./chart']
 "#;
     check_installed_library("acme/deploy-helm", lib, &none()).unwrap();
 }

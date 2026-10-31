@@ -47,10 +47,7 @@ fn map(v: Value) -> BTreeMap<String, Value> {
     serde_json::from_value(v).unwrap()
 }
 
-/// The engine at launch: the one renderer, in the Step's scope. A probe
-/// whose `command` is a list of values (its first is not a program) renders
-/// them as the arguments of `echo`, which the result leaves out: a value
-/// from outside may not name the program.
+/// The engine at launch: the one renderer, in the Step's scope.
 fn launch(
     spec: &StepSpec,
     params: Value,
@@ -58,32 +55,40 @@ fn launch(
 ) -> Result<scarab_pipeline::Rendered, String> {
     let params = map(params);
     let results: Results = serde_json::from_value(outputs).unwrap();
-    let probe = spec.command.first().is_some_and(|c| c.starts_with("${{"));
-    let command: Vec<String> = probe
-        .then(|| "echo".to_string())
-        .into_iter()
-        .chain(spec.command.iter().cloned())
-        .collect();
     render(
         Templates {
             image: &spec.image,
-            command: &command,
+            command: &spec.command,
             env: &spec.env,
         },
         spec.scope.as_ref(),
         &spec.matrix_values,
         Facts::Launch {
             params: &params,
+            declared: &[],
             results: &results,
             event: &serde_json::Map::new(),
         },
     )
-    .map(|mut r| {
-        if probe {
-            r.command.remove(0);
-        }
-        r
-    })
+}
+
+/// The rendered value of env variable `key`.
+fn env<'a>(r: &'a scarab_pipeline::Rendered, key: &str) -> &'a str {
+    r.env
+        .iter()
+        .rev()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
+        .unwrap_or_else(|| panic!("no env `{key}` in {:?}", r.env))
+}
+
+/// `ir` with `arg` appended to Step `id`'s command, the way a raw IR posted
+/// to `POST /v1/runs` can hold it without the compiler's check: what the
+/// launch must refuse on its own.
+fn raw(mut ir: PipelineIr, id: &str, arg: &str) -> PipelineIr {
+    let s = ir.steps.iter_mut().find(|s| s.id == id).unwrap();
+    s.command.push(arg.to_string());
+    ir
 }
 
 fn all_text(r: &scarab_pipeline::Rendered) -> String {
@@ -109,7 +114,7 @@ fn all_text(r: &scarab_pipeline::Rendered) -> String {
 /// Whatever text the halves build is data at every hop.
 #[test]
 fn survived_split_template_halves_assembled_across_two_levels_stay_text() {
-    let l2 = "kind: library\ninterface: { inputs: [{ name: v, type: string }] }\nsteps:\n  - id: s\n    image: busybox\n    command: [\"${{ inputs.v }}\", \"x${{ inputs.v }}x\"]\n    env: [[E, \"${{ inputs.v }}\"]]\n";
+    let l2 = "kind: library\ninterface: { inputs: [{ name: v, type: string }] }\nsteps:\n  - id: s\n    image: busybox\n    env: [[C0, \"${{ inputs.v }}\"], [C1, \"x${{ inputs.v }}x\"], [E, \"${{ inputs.v }}\"]]\n";
     let l1 = "kind: library\ninterface: { inputs: [{ name: a, type: string }, { name: b, type: string }] }\nsteps:\n  - { id: n, invoke: file:l2.yaml, with: { v: \"${{ inputs.a }}${{ inputs.b }}\" } }\n  - id: m\n    invoke: file:l2.yaml\n    with: { v: \"${{ inputs.a + inputs.b }}\" }\n";
     let libs = files(&[("l1.yaml", l1), ("l2.yaml", l2)]);
     for (a, b) in [
@@ -131,8 +136,8 @@ fn survived_split_template_halves_assembled_across_two_levels_stay_text() {
             )
             .unwrap_or_else(|e| panic!("{id}: {e}"));
             assert!(!all_text(&r).contains("LEAKED"), "{id}: {r:?}");
-            assert_eq!(r.command[0], want, "{id}");
-            assert_eq!(r.command[1], format!("x{want}x"), "{id}");
+            assert_eq!(env(&r, "C0"), want, "{id}");
+            assert_eq!(env(&r, "C1"), format!("x{want}x"), "{id}");
         }
     }
 }
@@ -144,15 +149,15 @@ fn survived_split_template_halves_assembled_across_two_levels_stay_text() {
 #[test]
 fn survived_values_holding_templates_reach_every_rendered_field_as_text() {
     let evil = "${{ inputs.secret }}";
-    let lib = "kind: library\ninterface:\n  inputs:\n    - { name: lit, type: string }\n    - { name: def, type: string, required: false, default: \"x\" }\n    - { name: out, type: string }\nsteps:\n  - id: s\n    image: busybox\n    command: [\"${{ inputs.lit }}\", \"${{ inputs.def }}\", \"${{ inputs.out }}\"]\n    env: [[A, \"${{ inputs.out }}\"]]\n";
+    let lib = "kind: library\ninterface:\n  inputs:\n    - { name: lit, type: string }\n    - { name: def, type: string, required: false, default: \"x\" }\n    - { name: out, type: string }\nsteps:\n  - id: s\n    image: busybox\n    env: [[C0, \"${{ inputs.lit }}\"], [C1, \"${{ inputs.def }}\"], [C2, \"${{ inputs.out }}\"], [A, \"${{ inputs.out }}\"]]\n";
     // A literal `with:` holding `$${{` is a template (it holds `${{`).
-    let yaml = "interface: { inputs: [{ name: secret, type: string }, { name: p, type: string }] }\nsteps:\n  - { id: b, image: busybox, results: [v] }\n  - id: c\n    invoke: file:l.yaml\n    needs: [b]\n    with: { lit: \"${{ inputs.p }}\", out: \"${{ outputs.b.v }}\" }\n  - id: d\n    image: busybox\n    needs: [b]\n    command: [\"${{ inputs.p }}\", \"${{ outputs.b.v }}\", \"${{ matrix.m }}\"]\n    matrix: { dimensions: { m: [\"${{ inputs.secret }}\"] } }\n";
+    let yaml = "interface: { inputs: [{ name: secret, type: string }, { name: p, type: string }] }\nsteps:\n  - { id: b, image: busybox, results: [v] }\n  - id: c\n    invoke: file:l.yaml\n    needs: [b]\n    with: { lit: \"${{ inputs.p }}\", out: \"${{ outputs.b.v }}\" }\n  - id: d\n    image: busybox\n    needs: [b]\n    command: [echo, \"${{ matrix.m }}\"]\n    env: [[C0, \"${{ inputs.p }}\"], [C1, \"${{ outputs.b.v }}\"], [C2, \"${{ matrix.m }}\"]]\n    matrix: { dimensions: { m: [\"${{ inputs.secret }}\"] } }\n";
     let ir = ok(yaml, &files(&[("l.yaml", lib)]));
     let params = json!({ "secret": "LEAKED", "p": evil });
     let outs = json!({ "b": { "v": evil } });
     let r = launch(step(&ir, "c/s"), params.clone(), outs.clone()).unwrap();
     assert!(!all_text(&r).contains("LEAKED"), "{r:?}");
-    assert_eq!(r.command, [evil, "x", evil]);
+    assert_eq!([env(&r, "C0"), env(&r, "C1"), env(&r, "C2")], [evil, "x", evil]);
     let d = ir
         .steps
         .iter()
@@ -162,7 +167,8 @@ fn survived_values_holding_templates_reach_every_rendered_field_as_text() {
     // design), so only its rendered fields are checked.
     let r = launch(d, params.clone(), outs.clone()).unwrap();
     assert!(!r.command.concat().contains("LEAKED"), "{r:?}");
-    assert_eq!(r.command, [evil, evil, evil]);
+    assert_eq!(r.command, ["echo", evil]);
+    assert_eq!([env(&r, "C0"), env(&r, "C1"), env(&r, "C2")], [evil, evil, evil]);
     // The same value as an image is refused, never rendered again.
     let mut spec = d.clone();
     spec.image = "${{ inputs.p }}".into();
@@ -244,7 +250,7 @@ fn survived_template_bindings_are_typed_and_validated_at_launch() {
     ];
     for (spec, value) in cases {
         let lib = format!(
-            "kind: library\ninterface: {{ inputs: [{spec}] }}\nsteps: [{{ id: s, image: busybox, command: [\"${{{{ inputs.n }}}}\"] }}]\n"
+            "kind: library\ninterface: {{ inputs: [{spec}] }}\nsteps: [{{ id: s, image: busybox, env: [[N, \"${{{{ inputs.n }}}}\"]] }}]\n"
         );
         let yaml = "steps:\n  - { id: b, image: busybox, results: [v] }\n  - { id: c, invoke: file:l.yaml, needs: [b], with: { n: \"${{ outputs.b.v }}\" } }\n";
         let ir = ok(yaml, &files(&[("l.yaml", &lib)]));
@@ -352,8 +358,14 @@ fn survived_preview_and_launch_agree_on_known_values() {
 /// command.
 #[test]
 fn a_run_parameter_with_a_leading_dash_is_refused_in_argv() {
-    let yaml = "interface: { inputs: [{ name: ref, type: string }] }\non: { manual: {} }\nsteps:\n  - { id: s, image: alpine/git, command: [git, fetch, origin, \"${{ inputs.ref }}\"] }\n";
-    let ir = ok(yaml, &Libraries::default());
+    let yaml = |arg: &str| {
+        format!("interface: {{ inputs: [{{ name: ref, type: string }}] }}\non: {{ manual: {{}} }}\nsteps:\n  - {{ id: s, image: alpine/git, command: [git, fetch, origin{arg}] }}\n")
+    };
+    // Refused when the Pipeline compiles...
+    let e = compile(&yaml(r#", "${{ inputs.ref }}""#), &Libraries::default()).unwrap_err();
+    assert!(e.iter().any(|e| e.contains("`command[3]` reads `${{ inputs.ref }}`")), "{e:?}");
+    // ...and at launch, for an IR that skipped the compiler.
+    let ir = raw(ok(&yaml(""), &Libraries::default()), "s", "${{ inputs.ref }}");
     let r = launch(
         step(&ir, "s"),
         json!({ "ref": "--upload-pack=touch /tmp/pwned" }),
@@ -372,7 +384,14 @@ fn a_run_parameter_with_a_leading_dash_is_refused_in_argv() {
 fn a_run_parameter_with_a_leading_dash_is_refused_through_a_library() {
     let lib = "kind: library\ninterface: { inputs: [{ name: r, type: string }] }\nsteps: [{ id: s, image: alpine/git, command: [git, fetch, origin, \"${{ inputs.r }}\"] }]\n";
     let yaml = "interface: { inputs: [{ name: ref, type: string }] }\nsteps: [{ id: c, invoke: file:l.yaml, with: { r: \"${{ inputs.ref }}\" } }]\n";
-    let ir = ok(yaml, &files(&[("l.yaml", lib)]));
+    let e = compile(yaml, &files(&[("l.yaml", lib)])).unwrap_err();
+    assert!(
+        e.iter().any(|e| e.contains("`command[3]` reads `${{ inputs.r }}`, which step `c` binds")),
+        "{e:?}"
+    );
+    // An IR that skipped the compiler.
+    let lib = "kind: library\ninterface: { inputs: [{ name: r, type: string }] }\nsteps: [{ id: s, image: alpine/git, command: [git, fetch, origin] }]\n";
+    let ir = raw(ok(yaml, &files(&[("l.yaml", lib)])), "c/s", "${{ inputs.r }}");
     let r = launch(
         step(&ir, "c/s"),
         json!({ "ref": "--upload-pack=touch /tmp/pwned" }),
@@ -504,7 +523,7 @@ fn survived_deep_stored_caller_chains() {
     }
     let mut deepest_ok = 0;
     for depth in [8, 16, 32, 60, 100, 1000] {
-        let spec = json!({ "id": "s", "image": "busybox", "command": ["${{ inputs.v }}"], "scope": chain(depth) });
+        let spec = json!({ "id": "s", "image": "busybox", "env": [["V", "${{ inputs.v }}"]], "scope": chain(depth) });
         // Postgres hands the jsonb back as text that serde_json parses with
         // its recursion limit (sqlx `Value` decode), then `from_value`.
         let text = serde_json::to_string(&spec).unwrap();
@@ -519,7 +538,7 @@ fn survived_deep_stored_caller_chains() {
         deepest_ok = depth;
         // The innermost Run scope gives v; every level renders it.
         let r = launch(&spec, json!({ "v": "ok" }), json!({})).unwrap();
-        assert_eq!(r.command, ["ok"]);
+        assert_eq!(env(&r, "V"), "ok");
     }
     assert!((8..1000).contains(&deepest_ok), "{deepest_ok}");
 }

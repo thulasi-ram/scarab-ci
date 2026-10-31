@@ -275,6 +275,34 @@ Full-route coverage is enforced by the test
 a registered route missing from the spec (no `#[utoipa::path]` annotation),
 or a spec operation with no route, fails the suite.
 
+## CI labels on pull requests
+
+Actions minutes are limited, so two PR labels control what CI runs on a PR.
+Pushes to `main` and `v*` tags ignore both.
+
+| Label | Effect |
+|---|---|
+| `ci:skip` | Every job in `ci`, `kind` and `image` skips without starting a runner. Adding it cancels a run in progress. Removing it starts a run. |
+| `ci:full` | `ci` and `image` ignore the path filters and run every job. `kind` still runs only when the PR touches its paths. |
+
+`ci:skip` wins when both are set. A PR with `ci:skip` never passes
+`just pr-gate <n>`: remove the label, wait for the run, then run the gate.
+
+For a stack of PRs, where only the tip's run matters:
+
+1. Label every PR except the tip `ci:skip`.
+2. Label the tip `ci:full`. Its path filters compare it with the PR below it,
+   not with `main`, so without the label they would skip jobs that the lower
+   PRs' changes need.
+3. To merge, take the PRs bottom-up: remove `ci:skip` from the bottom PR, wait
+   for its run, check it with `just pr-gate`, merge, and repeat. To spend one
+   run instead of one per PR, merge the stack down into the bottom PR's branch
+   once the tip is green, then remove `ci:skip` from the bottom PR and merge it.
+
+A change to any other label also starts a run, because GitHub cannot filter
+triggers by label name. In that run every job skips, it does not cancel a run
+in progress, and `just pr-gate` ignores it when the commit has a real run.
+
 ## License
 
 [GNU Affero General Public License v3.0](LICENSE) (`AGPL-3.0-only`). Running a

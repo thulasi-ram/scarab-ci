@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{cel, ParamSpec, ValueSource};
+use crate::{cel, ParamSpec, ParamType, ValueSource};
 
 /// The names a Step's templates read, and where each value comes from.
 ///
@@ -181,91 +181,225 @@ impl Scope {
     }
 }
 
-/// Where each value a scope's templates read through `inputs` comes from
-/// ([`ValueSource`]), for the checks that treat an outside value differently
-/// from the Pipeline's own: the script check at compile and the leading-`-`
-/// check when an argument renders.
+/// Where a value a template reads comes from, as the command boundary sees
+/// it (ADR-0076, 2026-10-30). Ordered: an expression is as far outside as
+/// the furthest of its reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Source {
+    /// The Pipeline's own: a literal, `matrix`, a literal `with:` or a
+    /// default.
+    Pipeline,
+    /// From outside, of a fixed type: an input declared `choice`, `boolean`
+    /// or `number`, or an `event` field of a fixed shape
+    /// ([`crate::event::FIXED`]: the commit SHA, a number, `fork`, the
+    /// trigger kind). Its text may reach a command once checked at launch.
+    Fixed,
+    /// Any other value from outside: free text, a Step's results, any other
+    /// event field. It reaches a Step only as an environment variable's
+    /// value.
+    Free,
+}
+
+/// The shape a fixed value from outside must have when the expression is
+/// one read and nothing else (`inputs.region`, `event.sha`), checked when it
+/// renders. Any other expression over fixed values is checked as a boolean
+/// or a non-negative decimal number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Shape<'a> {
+    /// A `choice` input: one of the values the Pipeline listed.
+    Choice(&'a [String]),
+    /// `event.sha`: `^[0-9a-f]{40}([0-9a-f]{24})?$`.
+    Sha,
+    /// `event.number`, `event.issue`: `^[0-9]+$`.
+    Whole,
+    /// `event.fork`: `true` or `false`.
+    Bool,
+    /// `event.kind`: one of [`crate::event::TRIGGER_KINDS`].
+    Kind,
+}
+
+impl Source {
+    /// The two-way view the script check uses.
+    pub(crate) fn value_source(self) -> ValueSource {
+        match self {
+            Source::Pipeline => ValueSource::Pipeline,
+            Source::Fixed | Source::Free => ValueSource::Outside,
+        }
+    }
+}
+
+/// One input of a scope: where its value comes from and, for a `choice`
+/// from outside, the values the Pipeline listed.
 #[derive(Debug, Clone)]
-pub(crate) enum InputSources {
-    /// `inputs` are the Run's launch parameters: every one is from outside.
-    Run,
-    /// A library invocation's inputs, each by name. A literal `with:` value
-    /// or a default is the Pipeline's own; a caller's template is from
-    /// outside when what it reads, in its caller's scope, is.
-    Bound(BTreeMap<String, ValueSource>),
+struct Input {
+    source: Source,
+    options: Option<Vec<String>>,
+}
+
+impl Input {
+    /// An input from outside, by its declared type.
+    fn outside(param: &ParamSpec) -> Self {
+        match param.r#type {
+            ParamType::Choice => Input {
+                source: Source::Fixed,
+                options: Some(param.options.clone().unwrap_or_default()),
+            },
+            ParamType::Boolean | ParamType::Number => Input {
+                source: Source::Fixed,
+                options: None,
+            },
+            ParamType::String => Input {
+                source: Source::Free,
+                options: None,
+            },
+        }
+    }
+}
+
+/// Where each value a scope's templates read through `inputs` comes from
+/// ([`Source`]), for the checks that treat an outside value differently
+/// from the Pipeline's own: the command boundary at launch and at compile,
+/// and the script check.
+#[derive(Debug, Clone)]
+pub(crate) struct InputSources {
+    inputs: BTreeMap<String, Input>,
+    /// The source of `inputs` read whole (`size(inputs)`).
+    whole: Source,
 }
 
 impl InputSources {
     /// The sources of `scope`'s inputs (`None`: a Step written in the
-    /// Pipeline file). Built from the outermost caller in, once per scope, so
-    /// the work is the size of the chain's bindings, however the templates
+    /// Pipeline file). `declared` is the Run's declared inputs
+    /// (`interface.inputs`), whose types decide which launch parameters are
+    /// of a fixed type. Built from the outermost caller in, once per scope,
+    /// so the work is the size of the chain's bindings, however the templates
     /// read each other.
-    pub(crate) fn of(scope: Option<&Scope>) -> Self {
+    pub(crate) fn of(scope: Option<&Scope>, declared: &[ParamSpec]) -> Self {
+        let run = || InputSources {
+            inputs: declared
+                .iter()
+                .map(|p| (p.name.clone(), Input::outside(p)))
+                .collect(),
+            whole: Source::Free,
+        };
         let Some(scope) = scope else {
-            return InputSources::Run;
+            return run();
         };
         let chain: Vec<&Scope> = scope.chain().collect();
         let mut caller: Option<InputSources> = None;
         for s in chain.into_iter().rev() {
             let here = match &s.inputs {
-                ScopeInputs::Run => InputSources::Run,
-                ScopeInputs::Bound(bindings) => InputSources::Bound(
-                    bindings
+                ScopeInputs::Run => run(),
+                ScopeInputs::Bound(bindings) => {
+                    let inputs: BTreeMap<String, Input> = bindings
                         .iter()
                         .map(|(name, b)| {
-                            let source = match &b.value {
-                                BoundValue::Literal(_) => ValueSource::Pipeline,
+                            let read = match &b.value {
+                                BoundValue::Literal(_) => Source::Pipeline,
                                 // A template with no caller scope fails at
                                 // launch; until then it is from outside.
                                 BoundValue::Template(t) => match &caller {
                                     Some(c) => c.of_template(t),
-                                    None => ValueSource::Outside,
+                                    None => Source::Free,
                                 },
                             };
-                            (name.clone(), source)
+                            let input = match (read, b.param.as_deref()) {
+                                (Source::Pipeline, _) => Input {
+                                    source: Source::Pipeline,
+                                    options: None,
+                                },
+                                // Converted to its declared type and checked
+                                // when it renders.
+                                (_, Some(param)) => Input::outside(param),
+                                (_, None) => Input {
+                                    source: Source::Free,
+                                    options: None,
+                                },
+                            };
+                            (name.clone(), input)
                         })
-                        .collect(),
-                ),
+                        .collect();
+                    let whole = inputs
+                        .values()
+                        .map(|i| i.source)
+                        .max()
+                        .unwrap_or(Source::Pipeline);
+                    InputSources { inputs, whole }
+                }
             };
             caller = Some(here);
         }
-        caller.unwrap_or(InputSources::Run)
+        caller.unwrap_or_else(run)
     }
 
-    /// Where the value of the expression `expr` comes from: from outside
-    /// when any read is. `matrix` is the Pipeline's own; `outputs` (a Step's
-    /// results), `event` and any name not known here are from outside, and
-    /// so is an expression that does not parse.
-    pub(crate) fn of_expr(&self, expr: &str) -> ValueSource {
+    /// Where the input `name` comes from: from outside, as free text, when
+    /// the scope does not have it.
+    pub(crate) fn input(&self, name: &str) -> Source {
+        self.inputs.get(name).map_or(Source::Free, |i| i.source)
+    }
+
+    /// Where the value of the expression `expr` comes from: as far outside
+    /// as its furthest read. `matrix` is the Pipeline's own; an `event`
+    /// field of a fixed shape is fixed; `outputs` (a Step's results), any
+    /// other `event` read and any name not known here are free text from
+    /// outside, and so is an expression that does not parse.
+    pub(crate) fn of_expr(&self, expr: &str) -> Source {
         let Ok(reads) = cel::reads(expr) else {
-            return ValueSource::Outside;
+            return Source::Free;
         };
         reads
             .iter()
-            .map(|r| match (r.var.as_str(), self) {
-                ("matrix", _) => ValueSource::Pipeline,
-                ("inputs", InputSources::Run) => ValueSource::Outside,
-                ("inputs", InputSources::Bound(m)) => match &r.first {
-                    Some(name) => m.get(name).copied().unwrap_or(ValueSource::Outside),
-                    None => m.values().copied().max().unwrap_or(ValueSource::Pipeline),
+            .map(|r| match r.var.as_str() {
+                "matrix" => Source::Pipeline,
+                "inputs" => match &r.first {
+                    Some(name) => self.input(name),
+                    None => self.whole,
                 },
-                _ => ValueSource::Outside,
+                // `event.sha`, not `event.sha.x`, `event[k]` or `event`.
+                "event" => match (&r.first, &r.second) {
+                    (Some(field), None) if crate::event::FIXED.contains(&field.as_str()) => {
+                        Source::Fixed
+                    }
+                    _ => Source::Free,
+                },
+                _ => Source::Free,
             })
             .max()
-            .unwrap_or(ValueSource::Pipeline)
+            .unwrap_or(Source::Pipeline)
     }
 
-    /// Where the text a template renders to comes from: from outside when
-    /// any of its `${{ … }}` is. An unterminated `${{` is from outside.
-    pub(crate) fn of_template(&self, template: &str) -> ValueSource {
+    /// Where the text a template renders to comes from: as far outside as
+    /// its furthest `${{ … }}`. An unterminated `${{` is free text from
+    /// outside.
+    pub(crate) fn of_template(&self, template: &str) -> Source {
         let (found, unterminated) = cel::scan_interpolations(template);
         if unterminated.is_some() {
-            return ValueSource::Outside;
+            return Source::Free;
         }
         found
             .iter()
             .map(|i| self.of_expr(template[i.inner.clone()].trim()))
             .max()
-            .unwrap_or(ValueSource::Pipeline)
+            .unwrap_or(Source::Pipeline)
+    }
+
+    /// The shape of the fixed value `expr` reads, when `expr` is that read
+    /// and nothing else: a `choice` input from outside (`inputs.region`),
+    /// with the values the Pipeline listed, or an `event` field of a fixed
+    /// shape (`event.sha`).
+    pub(crate) fn shape(&self, expr: &str) -> Option<Shape<'_>> {
+        match cel::path(expr)?.as_slice() {
+            [var, name] if var == "inputs" => {
+                self.inputs.get(name)?.options.as_deref().map(Shape::Choice)
+            }
+            [var, field] if var == "event" => match field.as_str() {
+                "sha" => Some(Shape::Sha),
+                "number" | "issue" => Some(Shape::Whole),
+                "fork" => Some(Shape::Bool),
+                "kind" => Some(Shape::Kind),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 }

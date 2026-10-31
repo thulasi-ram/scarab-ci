@@ -16,6 +16,14 @@ fullnameOverride: ""
 # deployment keep this at 1 unless you split roles.
 replicaCount: 1
 
+# How the server Deployment is updated. `Recreate` stops every old server Pod
+# before a new one starts, so two server versions never schedule the same Runs.
+# A release whose stored data an older server reads wrongly (v0.3.0: library
+# Step scopes) needs this. `RollingUpdate` keeps the API up during an upgrade;
+# use it only between releases whose notes say a mixed-version window is safe.
+strategy:
+  type: Recreate
+
 scarab:
   # api | scheduler | executor | webhook | converged (ADR-0016).
   role: converged

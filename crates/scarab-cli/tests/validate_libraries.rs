@@ -23,7 +23,8 @@ steps:
   - id: notify
     image: busybox
     needs: [ship]
-    command: [echo, "${{ outputs.ship.helm }}"]
+    env: [[HELM, "${{ outputs.ship.helm }}"]]
+    command: [sh, -c, 'echo "$HELM"']
 "#;
 
 /// The same, with an error outside the library: an unknown need.

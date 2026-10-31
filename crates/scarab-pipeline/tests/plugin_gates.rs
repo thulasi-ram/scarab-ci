@@ -189,13 +189,17 @@ fn a_gate_output_in_a_script_is_an_outside_value_and_refused() {
     );
 }
 
+/// A gate's outputs are free text from outside the Pipeline (ADR-0076): a
+/// command that reads one is refused at launch, whatever the output holds and
+/// wherever in the argument it sits (a raw IR can carry such a command past
+/// the compile check). The same output reaches the Step through `env:`.
 #[test]
-fn a_gate_output_cannot_start_an_argument_or_name_the_program() {
+fn a_gate_output_is_refused_in_a_command_at_launch() {
     let ir = compile(PIPELINE).unwrap();
     let after = ir.steps.iter().find(|s| s.id == "after").unwrap();
     let params = BTreeMap::new();
     let event = Map::new();
-    let launch = |revision: &str, command: &[String]| {
+    let launch = |revision: &str, command: &[String], env: &[(String, String)]| {
         let results = BTreeMap::from([(
             "live".to_string(),
             BTreeMap::from([("revision".to_string(), json!(revision))]),
@@ -204,29 +208,46 @@ fn a_gate_output_cannot_start_an_argument_or_name_the_program() {
             Templates {
                 image: "alpine",
                 command,
-                env: &[],
+                env,
             },
             after.scope.as_ref(),
             &after.matrix_values,
             Facts::Launch {
                 params: &params,
+                declared: &[],
                 results: &results,
                 event: &event,
             },
         )
     };
-    let dash = "--upload-pack=touch /x";
-    let err = launch(dash, &["git".into(), "${{ outputs.live.revision }}".into()]).unwrap_err();
-    assert!(err.contains("starts the argument with `-`"), "{err}");
-    let err = launch("/bin/sh", &["${{ outputs.live.revision }}".into()]).unwrap_err();
-    assert!(err.contains("names the program"), "{err}");
-    // The same value written after an option is data.
-    let ok = launch(
-        dash,
-        &["git".into(), "--rev=${{ outputs.live.revision }}".into()],
-    )
-    .unwrap();
-    assert_eq!(ok.command[1], "--rev=--upload-pack=touch /x");
+    let reference = "${{ outputs.live.revision }}";
+    for revision in ["--upload-pack=touch /x", "/bin/sh", "abc123", "0"] {
+        for command in [
+            vec!["git".to_string(), reference.to_string()],
+            vec![reference.to_string()],
+            vec!["git".to_string(), format!("--rev={reference}")],
+            vec!["sh".to_string(), "-c".to_string(), format!("echo {reference}")],
+        ] {
+            let err = launch(revision, &command, &[]).unwrap_err();
+            assert!(
+                err.contains("reads a value from outside the Pipeline")
+                    && err.contains("pass it in `env:`"),
+                "{revision:?} in {command:?}: {err}"
+            );
+        }
+        // Through `env:` the output is data, passed as it is.
+        let ok = launch(
+            revision,
+            &["sh".into(), "-c".into(), "echo \"$REV\"".into()],
+            &[("REV".to_string(), reference.to_string())],
+        )
+        .unwrap();
+        assert!(
+            ok.env.iter().any(|(k, v)| k == "REV" && v == revision),
+            "{:?}",
+            ok.env
+        );
+    }
 }
 
 #[test]

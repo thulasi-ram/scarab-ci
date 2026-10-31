@@ -629,11 +629,16 @@ never creates a hidden edge.
 after rendering.
 
 - A `command` argument or an `env` value receives the value as it is, with no escaping.
-- A value from outside the Pipeline may not start a `command` argument with `-`. A value is
-  from outside when it comes from a Run parameter, a Step's results, an `event` field, or a
-  `with:` template that reads one of these through any number of callers. The Step fails as
-  a config error. Writing `--name=${{ … }}`, or a literal `--` argument before the value,
-  avoids it.
+- **The command boundary (2026-10-30).** Scarab never puts a value from outside the Pipeline
+  into a Step's command, except a `choice` value the Pipeline listed, `true`/`false`, a
+  non-negative decimal number, or a hex commit SHA; every other outside value reaches the Step
+  only as the value of an environment variable the Pipeline named, passed byte for byte. A
+  value is from outside when it comes from a Run parameter, a Step's results, an `event` field,
+  or a `with:` template that reads one of these through any number of callers; a library input
+  counts by its declared type. The compiler refuses a free-text value in `command`, and the
+  launch renderer checks every argument again (each fixed value against its shape), so an IR
+  that skipped the compiler is covered. This replaces the leading-`-` rule, which depended on
+  knowing how each program reads its arguments.
 - A rendered `image` must parse as an OCI reference, or the Step fails as a config error
   before launch.
 - `${{ }}` inside a script that a shell or interpreter runs (`sh -c`, `python -c`, `node -e`,

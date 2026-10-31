@@ -3606,7 +3606,7 @@ impl DebugLauncher for K8sExecutor {
             volume_mounts: Some(vec![ws_mount]),
             ..Default::default()
         };
-        let pod = Pod {
+        let mut pod = Pod {
             metadata: ObjectMeta {
                 name: Some(name.clone()),
                 namespace: Some(self.namespace.clone()),
@@ -3639,6 +3639,7 @@ impl DebugLauncher for K8sExecutor {
             }),
             ..Default::default()
         };
+        pass_through_k8s_expansion(&mut pod);
         pods.create(&PostParams::default(), &pod)
             .await
             .map_err(|e| ExecError::Other(format!("create debug pod: {e}")))?;
@@ -4530,7 +4531,7 @@ pub fn build_pod(
     let volumes = (!volumes.is_empty()).then_some(volumes);
     let init_containers = (!init_containers.is_empty()).then_some(init_containers);
 
-    Pod {
+    let mut pod = Pod {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
             namespace: Some(namespace.to_string()),
@@ -4598,7 +4599,9 @@ pub fn build_pod(
             ..Default::default()
         }),
         ..Default::default()
-    }
+    };
+    pass_through_k8s_expansion(&mut pod);
+    pod
 }
 
 /// Apply the operator placement config + the step's requested placement to a
@@ -4762,6 +4765,68 @@ fn egress_sidecar(
         // The sidecar image's entrypoint (the `scarab` CLI) performs the drain +
         // confirmed POST on shutdown; the command is left to the image.
         ..Default::default()
+    }
+}
+
+/// Make Kubernetes pass every string Scarab put in the Pod through unchanged.
+///
+/// The kubelet expands `$(VAR)` in a container's `command`, `args` and
+/// `env[].value` from that container's environment, and reduces `$$` to `$`
+/// (see the `Container` and `EnvVar` API docs). It does the same to an exec
+/// probe's command (`ExpandContainerCommandOnlyStatic` in the kubelet's
+/// prober), though the API docs do not say so. Scarab renders `${{ }}` once at
+/// launch, and Step secrets are plain env vars, so without this a rendered
+/// value from outside the Pipeline (a dispatch parameter, a webhook field, a
+/// Step output) holding `$(DEPLOY_TOKEN)` would become the secret before the
+/// program ran, with no shell involved. It also made `sh -c 'echo $$'` run as
+/// `echo $` here while the local executor runs it as written.
+///
+/// Writing every `$` as `$$` turns expansion off: Kubernetes reduces each pair
+/// back to one `$`, and an escaped `$$(VAR)` is never expanded. Nothing Scarab
+/// generates relies on `$(VAR)` expansion; a string that ever needs it must be
+/// added after this pass, and say so.
+///
+/// Not touched, because Kubernetes does not expand them: `env[].valueFrom`,
+/// `workingDir`, `image`, HTTP-probe paths and headers, lifecycle hooks (Scarab
+/// sets none). Applied once to each Pod Scarab builds: [`build_pod`],
+/// [`build_service_pod`] and the debug Pod. The operator's placement overlay
+/// (ADR-0055) is merged after this and keeps Kubernetes' own rules.
+fn pass_through_k8s_expansion(pod: &mut Pod) {
+    fn escape(s: &mut String) {
+        if s.contains('$') {
+            *s = s.replace('$', "$$");
+        }
+    }
+    fn escape_all(v: &mut Option<Vec<String>>) {
+        v.iter_mut().flatten().for_each(escape);
+    }
+    let Some(spec) = pod.spec.as_mut() else {
+        return;
+    };
+    let containers = spec
+        .containers
+        .iter_mut()
+        .chain(spec.init_containers.iter_mut().flatten());
+    for c in containers {
+        escape_all(&mut c.command);
+        escape_all(&mut c.args);
+        for e in c.env.iter_mut().flatten() {
+            if let Some(v) = e.value.as_mut() {
+                escape(v);
+            }
+        }
+        for probe in [
+            &mut c.startup_probe,
+            &mut c.readiness_probe,
+            &mut c.liveness_probe,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(exec) = probe.exec.as_mut() {
+                escape_all(&mut exec.command);
+            }
+        }
     }
 }
 
@@ -5033,7 +5098,7 @@ pub fn build_service_pod(
         security_context: Some(service_security_context(svc.run_as_user, svc.run_as_root)),
         ..Default::default()
     };
-    Pod {
+    let mut pod = Pod {
         metadata: ObjectMeta {
             name: Some(service_resource_name(run, name, take)),
             namespace: Some(namespace.to_string()),
@@ -5060,7 +5125,9 @@ pub fn build_service_pod(
             ..Default::default()
         }),
         ..Default::default()
-    }
+    };
+    pass_through_k8s_expansion(&mut pod);
+    pod
 }
 
 /// Build the **k8s Service** for a shared service (ADR-0058): a stable cluster
@@ -6716,6 +6783,76 @@ mod tests {
             Some(true),
             "sidecar reads results read-only"
         );
+    }
+
+    /// Kubernetes rewrites `$(VAR)` and `$$` in a container's `command`,
+    /// `args`, `env[].value` and exec-probe command before the program runs.
+    /// Scarab renders `${{ }}` once at launch, so whatever reaches the Pod must
+    /// arrive as rendered: a `$(DEPLOY_TOKEN)` in a dispatch parameter must not
+    /// become the secret, and an author's `$$` must not become `$`. Every `$`
+    /// is written as `$$`, which Kubernetes reduces back to one.
+    #[test]
+    fn dollar_signs_reach_every_container_as_rendered() {
+        let svc = scarab_pipeline::ServiceSpec {
+            image: "postgres:16".into(),
+            command: vec!["run$(SECRET)".into()],
+            args: vec!["--x=$$".into()],
+            env: [("PGPASS".to_string(), "$(SECRET)".to_string())].into(),
+            ready: Some(scarab_pipeline::ReadyProbe {
+                exec: vec!["check".into(), "$(SECRET)".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut spec = busybox();
+        spec.command = vec!["sh".into(), "x$(SECRET)y$$z".into()];
+        spec.env = vec![("PLAIN".into(), "$(SECRET)".into())];
+        spec.services = vec![svc.clone()];
+        let step = step_with_attempt("run-1", "s", "a1");
+        let pod = build_pod(
+            "scarab-x",
+            "ns",
+            &step,
+            &spec,
+            None,
+            DEFAULT_STEP_TIMEOUT_SECS,
+            false,
+            None,
+        );
+        let ps = pod.spec.as_ref().unwrap();
+        let main = &ps.containers[0];
+        assert_eq!(
+            main.command.as_ref().unwrap(),
+            &vec!["sh".to_string(), "x$$(SECRET)y$$$$z".to_string()]
+        );
+        let env = main.env.as_ref().unwrap();
+        let plain = env.iter().find(|e| e.name == "PLAIN").unwrap();
+        assert_eq!(plain.value.as_deref(), Some("$$(SECRET)"));
+
+        // The service sidecar (an init container) and the standalone service
+        // Pod are built from the same author text and get the same treatment.
+        let sidecar = &ps.init_containers.as_ref().unwrap()[0];
+        let service_pod = build_service_pod("run-1", "db", 1, "ns", &svc);
+        let standalone = &service_pod.spec.as_ref().unwrap().containers[0];
+        for (c, probe) in [
+            (sidecar, sidecar.startup_probe.as_ref()),
+            (standalone, standalone.readiness_probe.as_ref()),
+        ] {
+            assert_eq!(
+                c.command.as_ref().unwrap(),
+                &vec!["run$$(SECRET)".to_string()]
+            );
+            assert_eq!(c.args.as_ref().unwrap(), &vec!["--x=$$$$".to_string()]);
+            assert_eq!(
+                c.env.as_ref().unwrap()[0].value.as_deref(),
+                Some("$$(SECRET)")
+            );
+            let exec = probe.unwrap().exec.as_ref().unwrap();
+            assert_eq!(
+                exec.command.as_ref().unwrap(),
+                &vec!["check".to_string(), "$$(SECRET)".to_string()]
+            );
+        }
     }
 
     /// The ADR-0061 workspace service, as a Step Pod is told about it.

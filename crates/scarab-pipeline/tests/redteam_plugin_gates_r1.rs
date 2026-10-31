@@ -249,19 +249,25 @@ fn a_gate_output_is_refused_where_it_would_decide_what_runs() {
         r#"  - { id: after, image: alpine, needs: [live], forge_token: read, env: [[SCARAB_PARAM_X, "${{ outputs.live.revision }}"]] }"#,
         r#"  - { id: after, image: "${{ outputs.live.revision }}", needs: [live], forge_token: read }"#,
         r#"  - { id: after, image: alpine, needs: [live], forge_token: read, command: [git, "${{ outputs.live.revision }}"] }"#,
+        // Any command: a gate output is free text from outside (ADR-0076).
+        r#"  - { id: after, image: alpine, needs: [live], command: [deploy, "${{ outputs.live.revision }}"] }"#,
+        r#"  - { id: after, image: alpine, needs: [live], command: ["${{ outputs.live.revision }}"] }"#,
+        r#"  - { id: after, image: alpine, needs: [live], command: [git, "--rev=${{ outputs.live.revision }}"] }"#,
     ] {
         let yaml = pipeline("", after);
         assert!(compile(&yaml).is_err(), "compiled: {after}");
     }
 }
 
-/// What reaches argv today: a gate output in a non-script argument of a
-/// Step with no `forge_token`, after `needs`. It must still never start an
-/// argument with `-` or name the program, however it is wrapped.
+/// No gate output reaches argv (ADR-0076: free text from outside is refused
+/// in `command`). A raw IR can carry such a command past the compile check,
+/// so the launch refuses it too, whatever the output holds: an option, a
+/// program, a Unicode minus or a plain word. Through `env:` it is data, and a
+/// value that holds a template is not rendered again.
 #[test]
-fn a_gate_output_in_argv_is_data_and_never_an_option_or_a_program() {
-    let after = r#"  - { id: after, image: alpine, needs: [live], command: [deploy, "${{ outputs.live.revision }}"] }"#;
-    let ir = compile(&pipeline("", after)).expect("a plain argument compiles today");
+fn a_gate_output_never_reaches_argv() {
+    let after = r#"  - { id: after, image: alpine, needs: [live], env: [[REV, "${{ outputs.live.revision }}"]] }"#;
+    let ir = compile(&pipeline("", after)).expect("an env value compiles");
     let step = ir.steps.iter().find(|s| s.id == "after").unwrap();
     let params = BTreeMap::new();
     let event = Map::new();
@@ -275,18 +281,20 @@ fn a_gate_output_in_argv_is_data_and_never_an_option_or_a_program() {
             Templates {
                 image: "alpine",
                 command: &command,
-                env: &[],
+                env: &step.env,
             },
             step.scope.as_ref(),
             &step.matrix_values,
             Facts::Launch {
                 params: &params,
+                declared: &[],
                 results: &results,
                 event: &event,
             },
         )
     };
     let o = "${{ outputs.live.revision }}";
+    let wrapped = format!("--rev={o}");
     for (rev, cmd) in [
         (json!("-rf"), vec!["rm", o]),
         (json!("--exec=sh"), vec!["find", ".", o]),
@@ -298,19 +306,24 @@ fn a_gate_output_in_argv_is_data_and_never_an_option_or_a_program() {
         (json!("sh"), vec!["xargs", o]),
         (json!("sh"), vec!["nice", "-n", "5", o]),
         (json!("sh"), vec!["busybox", o]),
+        (json!("v1"), vec!["deploy", o]),
+        (json!("v1"), vec!["git", wrapped.as_str()]),
     ] {
-        let out = launch(rev.clone(), &cmd);
-        if let Ok(r) = &out {
-            // A Unicode minus is not an ASCII option dash: allowed, as data.
-            if rev == json!("\u{2212}-x") {
-                continue;
-            }
-            panic!("{rev} in {cmd:?} rendered: {:?}", r.command);
-        }
+        let err = launch(rev.clone(), &cmd).unwrap_err();
+        assert!(
+            err.contains("reads a value from outside the Pipeline"),
+            "{rev} in {cmd:?}: {err}"
+        );
     }
     // A value that holds a template is not rendered again.
-    let ok = launch(json!("${{ secrets.X }}"), &["deploy", o]).unwrap();
-    assert_eq!(ok.command[1], "${{ secrets.X }}");
+    let ok = launch(json!("${{ secrets.X }}"), &["deploy"]).unwrap();
+    assert!(
+        ok.env
+            .iter()
+            .any(|(k, v)| k == "REV" && v == "${{ secrets.X }}"),
+        "{:?}",
+        ok.env
+    );
 }
 
 // --------------------------------------------------------- output checking

@@ -48,6 +48,15 @@ fn errs(yaml: &str, libs: &Libraries) -> Vec<String> {
     }
 }
 
+/// A probe's values as stored: its `C0`, `C1`, ... env templates.
+fn probes(spec: &StepSpec) -> Vec<&str> {
+    spec.env
+        .iter()
+        .filter(|(k, _)| k.starts_with('C'))
+        .map(|(_, v)| v.as_str())
+        .collect()
+}
+
 fn step<'a>(ir: &'a PipelineIr, id: &str) -> &'a StepSpec {
     ir.steps.iter().find(|s| s.id == id).unwrap_or_else(|| {
         panic!(
@@ -60,30 +69,35 @@ fn step<'a>(ir: &'a PipelineIr, id: &str) -> &'a StepSpec {
 /// The engine at launch: the one renderer, in the Step's scope, with the
 /// Run's launch parameters `run_params` (which a library Step must never
 /// read) and `outputs`, the results of Steps by id (the engine gives only
-/// the Step's needs: the callers below pass needs only). A probe's
-/// `command` is a list of values, rendered as the arguments of `echo`: a
-/// value from outside may not name the program.
+/// the Step's needs: the callers below pass needs only). A probe holds its
+/// values in env variables `C0`, `C1`, ..., where a value from outside may
+/// be (ADR-0076, 2026-10-30); the rendered values, joined by ` | `.
 fn launch(spec: &StepSpec, run_params: serde_json::Value, outputs: serde_json::Value) -> String {
     let params: BTreeMap<String, serde_json::Value> = serde_json::from_value(run_params).unwrap();
     let results: Results = serde_json::from_value(outputs).unwrap();
-    let command: Vec<String> = std::iter::once("echo".to_string())
-        .chain(spec.command.iter().cloned())
-        .collect();
     render(
         Templates {
             image: &spec.image,
-            command: &command,
+            command: &spec.command,
             env: &spec.env,
         },
         spec.scope.as_ref(),
         &spec.matrix_values,
         Facts::Launch {
             params: &params,
+            declared: &[],
             results: &results,
             event: &serde_json::Map::new(),
         },
     )
-    .map(|s| s.command[1..].join(" | "))
+    .map(|s| {
+        s.env
+            .iter()
+            .filter(|(k, _)| k.starts_with('C'))
+            .map(|(_, v)| v.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    })
     .unwrap_or_else(|e| format!("LAUNCH ERROR: {e}"))
 }
 
@@ -96,11 +110,11 @@ fn launch(spec: &StepSpec, run_params: serde_json::Value, outputs: serde_json::V
 /// rendered command holds that text and nothing reads `p`.
 #[test]
 fn a_caller_value_ending_in_dollar_cannot_join_a_library_read() {
-    let lib = "kind: library\ninterface: { inputs: [{ name: pat, type: string }] }\nsteps:\n  - id: s\n    image: busybox\n    command: [\"${{ inputs.pat }}{{ inputs.p }}\"]\n";
+    let lib = "kind: library\ninterface: { inputs: [{ name: pat, type: string }] }\nsteps:\n  - id: s\n    image: busybox\n    env: [[C0, \"${{ inputs.pat }}{{ inputs.p }}\"]]\n";
     let yaml = "interface: { inputs: [{ name: p, type: string, required: false, default: secret }] }\nsteps:\n  - { id: b, image: busybox, results: [name] }\n  - id: c\n    invoke: file:l.yaml\n    needs: [b]\n    with: { pat: \"^${{ outputs.b.name }}$\" }\n";
     let ir = ok(yaml, &files(&[("l.yaml", lib)]));
     let s = step(&ir, "c/s");
-    assert_eq!(s.command, ["${{ inputs.pat }}{{ inputs.p }}"]);
+    assert_eq!(probes(s), ["${{ inputs.pat }}{{ inputs.p }}"]);
     assert_eq!(
         launch(
             s,
@@ -117,7 +131,7 @@ fn a_caller_value_ending_in_dollar_cannot_join_a_library_read() {
 #[test]
 fn a_join_through_a_nested_with_is_refused() {
     let a = "kind: library\ninterface: { inputs: [{ name: pat, type: string }] }\nsteps:\n  - id: n\n    invoke: file:b.yaml\n    with: { x: \"${{ inputs.pat }}{{ inputs.p }}\" }\n";
-    let b = "kind: library\ninterface: { inputs: [{ name: x, type: string }] }\nsteps: [{ id: s, image: busybox, command: [\"${{ inputs.x }}\"] }]\n";
+    let b = "kind: library\ninterface: { inputs: [{ name: x, type: string }] }\nsteps: [{ id: s, image: busybox, env: [[C0, \"${{ inputs.x }}\"]] }]\n";
     let yaml = "interface: { inputs: [{ name: p, type: string, required: false, default: d }] }\nsteps:\n  - { id: b, image: busybox, results: [name] }\n  - { id: c, invoke: file:a.yaml, needs: [b], with: { pat: \"^${{ outputs.b.name }}$\" } }\n";
     let ir = ok(yaml, &files(&[("a.yaml", a), ("b.yaml", b)]));
     let s = step(&ir, "c/n/s");
@@ -136,7 +150,7 @@ fn a_join_through_a_nested_with_is_refused() {
 /// text.
 #[test]
 fn survived_library_text_and_plain_values_cannot_assemble_a_read() {
-    let lib = "kind: library\ninterface:\n  inputs:\n    - { name: d, type: string, required: false, default: \"$\" }\n    - { name: v, type: string }\n    - { name: e, type: string }\nsteps:\n  - id: s\n    image: busybox\n    command: [\"${{ inputs.d }}{{ ${{ inputs.v }}.p }}\", \"${{ inputs.e }}\"]\n";
+    let lib = "kind: library\ninterface:\n  inputs:\n    - { name: d, type: string, required: false, default: \"$\" }\n    - { name: v, type: string }\n    - { name: e, type: string }\nsteps:\n  - id: s\n    image: busybox\n    env: [[C0, \"${{ inputs.d }}{{ ${{ inputs.v }}.p }}\"], [C1, \"${{ inputs.e }}\"]]\n";
     for v in ["inputs", ".inputs", " inputs"] {
         let yaml = format!(
             "interface: {{ inputs: [{{ name: q, type: string }}] }}\nsteps:\n  - {{ id: c, invoke: file:l.yaml, with: {{ v: \"{v}\", e: \"${{{{ inputs.q }}}}\" }} }}\n"
@@ -159,7 +173,7 @@ fn survived_library_text_and_plain_values_cannot_assemble_a_read() {
 #[test]
 fn survived_values_bind_correctly_through_two_levels() {
     let a = "kind: library\ninterface: { inputs: [{ name: a, type: string }, { name: n, type: number }] }\nsteps:\n  - id: k\n    invoke: file:b.yaml\n    with: { x: \"${{ inputs.a }}\", m: \"${{ inputs.n }}\" }\n";
-    let b = "kind: library\ninterface: { inputs: [{ name: x, type: string }, { name: m, type: number }] }\nsteps:\n  - { id: s, image: busybox, when: \"inputs.m > 4\", command: [\"${{ inputs.x }}\", \"${{ inputs.m + 1 }}\"] }\n";
+    let b = "kind: library\ninterface: { inputs: [{ name: x, type: string }, { name: m, type: number }] }\nsteps:\n  - { id: s, image: busybox, when: \"inputs.m > 4\", env: [[C0, \"${{ inputs.x }}\"], [C1, \"${{ inputs.m + 1 }}\"]] }\n";
     let l = files(&[("a.yaml", a), ("b.yaml", b)]);
     // A plain value and a number.
     let ir = ok(
@@ -180,7 +194,7 @@ fn survived_values_bind_correctly_through_two_levels() {
         &l,
     );
     let s = step(&ir, "c/k/s");
-    assert_eq!(s.command[0], "${{ inputs.x }}");
+    assert_eq!(probes(s)[0], "${{ inputs.x }}");
     assert_eq!(launch(s, json!({ "p": "RUN-P" }), json!({})), "RUN-P | 6");
 }
 
@@ -191,7 +205,7 @@ fn survived_values_bind_correctly_through_two_levels() {
 #[test]
 fn bracket_read_of_an_invoke_output_through_with() {
     let lib = "kind: library\ninterface: { outputs: [img] }\nsteps:\n  - { id: img, image: busybox, results: [img] }\n  - { id: post, image: busybox, needs: [img] }\n";
-    let user = "kind: library\ninterface: { inputs: [{ name: v, type: string }] }\nsteps: [{ id: a, image: busybox, command: [\"${{ inputs.v }}\"] }]\n";
+    let user = "kind: library\ninterface: { inputs: [{ name: v, type: string }] }\nsteps: [{ id: a, image: busybox, env: [[C0, \"${{ inputs.v }}\"]] }]\n";
     let yaml = "steps:\n  - { id: x, invoke: file:l.yaml }\n  - { id: u, invoke: file:u.yaml, needs: [x], with: { v: \"${{ outputs['x'].img }}\" } }\n";
     {
         let ir = ok(yaml, &files(&[("l.yaml", lib), ("u.yaml", user)]));
@@ -207,7 +221,7 @@ fn bracket_read_of_an_invoke_output_through_with() {
         assert_eq!(
             launched, "IMG-of-x/img",
             "u/a command {:?} needs {:?}",
-            a.command, a.needs.0
+            probes(a), a.needs.0
         );
     }
 }
@@ -217,7 +231,7 @@ fn bracket_read_of_an_invoke_output_through_with() {
 #[test]
 fn library_internal_output_read_through_nested_with() {
     let a = "kind: library\nsteps:\n  - { id: b, image: busybox, results: [tag] }\n  - id: n\n    invoke: file:b.yaml\n    needs: [b]\n    with: { x: \"${{ outputs.b.tag }}\" }\n";
-    let b = "kind: library\ninterface: { inputs: [{ name: x, type: string }] }\nsteps: [{ id: s, image: busybox, command: [\"${{ inputs.x }}\"] }]\n";
+    let b = "kind: library\ninterface: { inputs: [{ name: x, type: string }] }\nsteps: [{ id: s, image: busybox, env: [[C0, \"${{ inputs.x }}\"]] }]\n";
     let ir = ok(
         "steps: [{ id: c, invoke: file:a.yaml }]",
         &files(&[("a.yaml", a), ("b.yaml", b)]),
@@ -233,7 +247,7 @@ fn library_internal_output_read_through_nested_with() {
         launch(s, json!({}), serde_json::Value::Object(outs)),
         "TAG-of-c/b",
         "command {:?} needs {:?}",
-        s.command,
+        probes(s),
         s.needs.0
     );
 }
@@ -245,12 +259,12 @@ fn library_internal_output_read_through_nested_with() {
 #[test]
 fn caller_output_name_colliding_with_a_library_step_compiles() {
     let a = "kind: library\ninterface: { inputs: [{ name: v, type: string }] }\nsteps:\n  - { id: b, image: busybox }\n  - { id: n, invoke: file:b.yaml, with: { x: \"${{ inputs.v }}\" } }\n";
-    let b = "kind: library\ninterface: { inputs: [{ name: x, type: string }] }\nsteps: [{ id: s, image: busybox, command: [\"${{ inputs.x }}\"] }]\n";
+    let b = "kind: library\ninterface: { inputs: [{ name: x, type: string }] }\nsteps: [{ id: s, image: busybox, env: [[C0, \"${{ inputs.x }}\"]] }]\n";
     let yaml = "steps:\n  - { id: b, image: busybox, results: [tag] }\n  - { id: c, invoke: file:a.yaml, needs: [b], with: { v: \"${{ outputs.b.tag }}\" } }\n";
     let ir = ok(yaml, &files(&[("a.yaml", a), ("b.yaml", b)]));
     let s = step(&ir, "c/n/s");
     assert!(s.needs.0.contains(&"b".to_string()));
-    assert_eq!(s.command, vec!["${{ inputs.x }}"]);
+    assert_eq!(probes(s), vec!["${{ inputs.x }}"]);
     assert_eq!(
         launch(
             s,
@@ -263,7 +277,7 @@ fn caller_output_name_colliding_with_a_library_step_compiles() {
 
 #[test]
 fn survived_with_output_reads_matrix_invoke_and_forms() {
-    let lib = "kind: library\ninterface: { inputs: [{ name: v, type: string }] }\nsteps:\n  - { id: a, image: busybox }\n  - { id: z, image: busybox, needs: [a], command: [\"${{ inputs.v }}\"] }\n";
+    let lib = "kind: library\ninterface: { inputs: [{ name: v, type: string }] }\nsteps:\n  - { id: a, image: busybox }\n  - { id: z, image: busybox, needs: [a], env: [[C0, \"${{ inputs.v }}\"]] }\n";
     let l = files(&[("l.yaml", lib)]);
     // Matrixed X by its authored id; and `outputs.X["y"]`.
     for v in ["${{ outputs.build.v }}", "${{ outputs.build[\\\"v\\\"] }}"] {
@@ -296,7 +310,7 @@ fn survived_with_output_reads_matrix_invoke_and_forms() {
 /// like `outputs.build.v`, so the missing need is refused.
 #[test]
 fn spaced_select_on_outputs_in_with_is_wired_or_refused() {
-    let lib = "kind: library\ninterface: { inputs: [{ name: v, type: string }] }\nsteps:\n  - { id: a, image: busybox }\n  - { id: z, image: busybox, needs: [a], command: [\"${{ inputs.v }}\"] }\n";
+    let lib = "kind: library\ninterface: { inputs: [{ name: v, type: string }] }\nsteps:\n  - { id: a, image: busybox }\n  - { id: z, image: busybox, needs: [a], env: [[C0, \"${{ inputs.v }}\"]] }\n";
     let yaml = "steps:\n  - { id: build, image: busybox, results: [v] }\n  - { id: c, invoke: file:l.yaml, with: { v: \"${{ outputs .build.v }}\" } }\n";
     match compile(yaml, &files(&[("l.yaml", lib)])) {
         Err(e) => assert!(
@@ -468,13 +482,13 @@ fn survived_library_level_fields() {
 
 #[test]
 fn survived_plain_pipeline_text_is_unchanged() {
-    let yaml = "interface: { inputs: [{ name: p, type: string }] }\nsteps:\n  - { id: a, image: busybox, results: [v] }\n  - id: b\n    image: \"${{ .inputs.p }}\"\n    needs: [a]\n    when: \"inputs.p == 'x' // c.\"\n    command: [\"${{ inputs.p }}\", \"${{ outputs.a.v + inputs.p }}\"]\n";
+    let yaml = "interface: { inputs: [{ name: p, type: string }] }\nsteps:\n  - { id: a, image: busybox, results: [v] }\n  - id: b\n    image: \"${{ .inputs.p }}\"\n    needs: [a]\n    when: \"inputs.p == 'x' // c.\"\n    env: [[C0, \"${{ inputs.p }}\"], [C1, \"${{ outputs.a.v + inputs.p }}\"]]\n";
     let ir = ok(yaml, &Libraries::default());
     let b = step(&ir, "b");
     assert_eq!(b.image, "${{ .inputs.p }}");
     assert_eq!(b.when.as_ref().unwrap().0, "inputs.p == 'x' // c.");
     assert_eq!(
-        b.command,
+        probes(b),
         vec!["${{ inputs.p }}", "${{ outputs.a.v + inputs.p }}"]
     );
     assert_eq!(b.needs.0, vec!["a".to_string()]);
@@ -486,7 +500,7 @@ fn survived_plain_pipeline_text_is_unchanged() {
 /// the round-1 `with:` wiring.
 #[test]
 fn library_internal_output_read_direct() {
-    let a = "kind: library\nsteps:\n  - { id: b, image: busybox, results: [tag] }\n  - { id: s, image: busybox, needs: [b], command: [\"${{ outputs.b.tag }}\"] }\n";
+    let a = "kind: library\nsteps:\n  - { id: b, image: busybox, results: [tag] }\n  - { id: s, image: busybox, needs: [b], env: [[C0, \"${{ outputs.b.tag }}\"]] }\n";
     let ir = ok(
         "steps: [{ id: c, invoke: file:a.yaml }]",
         &files(&[("a.yaml", a)]),
@@ -502,7 +516,7 @@ fn library_internal_output_read_direct() {
         launch(s, json!({}), serde_json::Value::Object(outs)),
         "TAG-of-c/b",
         "command {:?} needs {:?}",
-        s.command,
+        probes(s),
         s.needs.0
     );
 }

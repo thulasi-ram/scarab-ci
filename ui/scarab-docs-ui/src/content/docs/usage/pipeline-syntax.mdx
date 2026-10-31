@@ -136,7 +136,9 @@ steps:
   with a bad value (fail-closed).
 
 Resolved parameters are read in steps as `${{ inputs.<name> }}` and are also injected into the
-step environment as `SCARAB_PARAM_<NAME>`. A **library** additionally declares the `outputs` it
+step environment as `SCARAB_PARAM_<NAME>`. A `choice`, `boolean` or `number` parameter may be
+written into a `command`, as above; a `string` parameter reaches a step only through `env:` (see
+[Values in commands and scripts](#values-in-commands-and-scripts)). A **library** additionally declares the `outputs` it
 exposes to its caller, and inside a library `${{ inputs.<name> }}` reads the caller's `with:`, not
 the Run's launch parameters (see [Reuse: `invoke`](#reuse-invoke)).
 
@@ -252,6 +254,11 @@ minted.
 
 The local executor refuses a step with `forge_token`; it needs the Kubernetes executor.
 
+The clone uses the forge connection's token only for the repository being cloned, and
+only over https. Submodules are fetched without it, so a private submodule fails the
+step; make it public or vendor it. LFS objects come from the repository's own LFS
+endpoint, and an `lfs.url` in `.lfsconfig` is ignored.
+
 ## Ordering: `needs`
 
 `needs:` declares the DAG edges. A step runs once all of its needs succeed and inherits their
@@ -355,7 +362,7 @@ caller supplies inputs with `with:`:
 kind: library
 interface:
   inputs:
-    - { name: region, type: string }
+    - { name: region, type: choice, options: [us-east-1, eu-west-1] }
     - { name: replicas, type: number, required: false, default: 2 }
   outputs: [url]
 steps:
@@ -374,7 +381,8 @@ steps:
   - id: notify
     image: busybox
     needs: [deploy]
-    command: ["echo", "${{ outputs.deploy.url }}"]
+    env: [[URL, "${{ outputs.deploy.url }}"]]
+    command: ["sh", "-c", 'echo "$URL"']
 ```
 
 The interface is checked at compile time: every required input present, no unknown extras, each
@@ -412,7 +420,7 @@ Interpolation is resolved at launch time against the upstream step's captured re
 consumer must `needs:` the producer.
 
 **Results are not artifacts.** A result is a small typed value the DAG interpolates into a later
-step's command or environment; an [artifact](#steps-the-step-shape) is a file published from
+step's environment; an [artifact](#steps-the-step-shape) is a file published from
 `/scarab/artifacts/` that you download after the run.
 
 ### Publishing a result
@@ -436,7 +444,8 @@ result's name is the filename minus `.json`, and the file must hold **valid JSON
 - id: notify
   image: busybox
   needs: [version]
-  command: ["echo", "release ${{ outputs.version.tag }}"]
+  env: [[TAG, "${{ outputs.version.tag }}"]]
+  command: ["sh", "-c", 'echo "release $TAG"']
 ```
 
 A step can also list the results it writes, with `results: [tag, build]`. The list is a
@@ -475,58 +484,95 @@ failure where the value is used. The value goes in through `env:`, not into the 
 
 ### Values in commands and scripts
 
-Each `${{ … }}` is rendered once, when the step launches, and its value is data: Scarab never
-reads a `${{` inside a value again. Where you put a value decides what it can do.
-
-**In a `command` argument or an `env` value**, the value is passed as it is, with no quoting
-needed. A value from outside the pipeline has two exceptions, and a step that breaks either fails
-before it starts, with an error that names the template:
-
-- It may not start an argument with `-`. A program reads such an argument as an option, so
-  `git fetch origin ${{ inputs.ref }}` with the value `--upload-pack=touch /tmp/x` would run a
-  command. A `--` argument in front does not help: it ends the options of one program, and the
-  value can still reach another one (`sh -c 'git fetch "$1"' -- …`, `npm run lint -- …`). Write
-  the option in front of the value, or pass the value in `env:`.
-- It may not name the program. That is the first thing in `command[0]`, and the program that
-  `env`, `sudo`, `timeout`, `nice`, `nohup`, `stdbuf`, `setsid`, `exec`, `busybox` or `xargs`
-  runs when one of them comes first, including the command line of `env -S`. Write the program
-  in the pipeline and pass the value to it.
-
-```yaml
-- { id: ship, image: deployer, command: ["deploy", "--ref=${{ inputs.ref }}"] }
-- id: fetch
-  image: alpine/git
-  env: [[REF, "${{ inputs.ref }}"]]
-  command: ["sh", "-c", 'git fetch origin "refs/heads/$REF"']
-```
-
-**In a script**, the value becomes part of the code. This covers the script of `sh -c` (and
-`bash`, `dash`, `zsh`, `ash`, `ksh`), `python -c`, `node -e`, `perl -e` and `ruby -e`, also behind
-`env`, `busybox`, `timeout`, `nice`, `nohup`, `stdbuf`, `setsid`, `sudo` and `exec`. A value from
-outside the pipeline in a script is a compile error; a value written in the pipeline is a lint
-warning. Pass the value in `env:` and read it from the environment, as in the `notify` example
-above.
+Scarab never puts a value from outside the pipeline into a step's command, except a `choice`
+value the pipeline listed, `true`/`false`, a non-negative decimal number, a hex commit SHA, or the
+trigger kind; every other outside value reaches the step only as the value of an environment
+variable the pipeline named, passed byte for byte.
 
 A value is **from outside the pipeline** when it comes from a launch parameter (`inputs` in a
-pipeline file), a step's results (`outputs`), an `event` field, or a library input whose caller's
-`with:` reads one of these, through any number of callers. Literals, `matrix` values, a literal `with:` value and an
-input's `default` are the pipeline's own.
+pipeline file), a step's results (`outputs`), a trigger event's fields, or a library input whose
+caller's `with:` reads one of these, through any number of callers. Literals, `matrix` values, a
+literal `with:` value and an input's `default` are the pipeline's own, and may go anywhere.
+
+To use a free-text value (a branch, a ref, a URL, a result) in a command, name an environment
+variable in `env:` and read it from the environment. In a shell, quote it:
+
+```yaml
+- id: checkout
+  image: alpine/git
+  env: [[REF, "${{ inputs.ref }}"]]
+  command: ["sh", "-c", 'git checkout -- "$REF"']
+```
+
+The fixed shapes may be written into a command, whole or inside an argument:
+
+| Value | Where it comes from | What Scarab checks when the step launches |
+|---|---|---|
+| a `choice` value | an input declared `type: choice` | the value is one of its `options` |
+| `true` or `false` | an input declared `type: boolean`, or an expression over fixed values (`${{ inputs.replicas > 3 }}`) | it is a boolean |
+| a number | an input declared `type: number`, or an expression over fixed values (`${{ inputs.replicas + 1 }}`) | it matches `^[0-9]+(\.[0-9]+)?$`: no sign, no exponent |
+| a commit SHA | `${{ event.sha }}` | it matches `^[0-9a-f]{40}([0-9a-f]{24})?$`: 40 or 64 lower-case hex characters |
+| a pull request or issue number | `${{ event.number }}`, `${{ event.issue }}` | it matches `^[0-9]+$` |
+| `true` or `false` | `${{ event.fork }}` | it is a boolean |
+| the trigger kind | `${{ event.kind }}` | it is one of `push`, `pull_request`, `tag`, `release`, `comment`, `cron`, `manual`, `api`, `upstream` |
+
+The other event fields (`ref`, `branch`, `tag`, `repo.owner`, `repo.name`, `repo.clone_url` and
+`run`) are free text and reach a step only through `env:`.
+
+```yaml
+- id: ship
+  image: deployer
+  command: ["deploy", "${{ inputs.region }}", "n=${{ inputs.replicas }}"]
+
+- id: checkout
+  image: alpine/git
+  command: ["git", "checkout", "${{ event.sha }}"]
+```
+
+A library input counts by the type the library declares, so a library that takes a `string`
+input can use it in a command only through `env:`. A free-text value in a command is a compile
+error that names the step and the argument; for a library step it also names the library and the
+caller's `with:` that binds the input. The step launch checks the same rule again, so a pipeline
+posted to the API without compiling cannot skip it. A value that does not fit its shape when the
+step launches (a number that turns negative, a choice value the pipeline did not list) fails the
+step before it starts.
+
+Why so strict: many programs read some of their arguments as code or as instructions. An argument
+that starts with `-` is an option (`git fetch origin --upload-pack=…` runs a command), `@file`
+reads a file, `+ref` force-pushes, and `ssh`, `su -c` and `env -S` join their arguments back into
+a shell command. A `--` in front does not help either: it ends the options of one program, and the
+value can reach another one (`sh -c '…' -- "$1"`, `npm run lint -- …`). No list of such programs
+can be complete, so Scarab does not keep one. The fixed shapes contain none of these forms. An
+environment variable's value is not parsed by anything until your step reads it.
+
+**In a script**, any `${{ … }}` becomes part of the code. This covers the script of `sh -c` (and
+`bash`, `dash`, `zsh`, `ash`, `ksh`), `python -c`, `node -e`, `perl -e` and `ruby -e`, also behind
+`env`, `busybox`, `timeout`, `nice`, `nohup`, `stdbuf`, `setsid`, `sudo` and `exec`. A value from
+outside the pipeline in a script is a compile error, fixed shapes included; a value written in the
+pipeline is a lint warning. Pass the value in `env:` and read it as `"$VALUE"`.
+
+What stays your responsibility: once a step reads an environment variable, Scarab no longer sees
+it. An unquoted `$REF`, `eval "$REF"` or `ssh host "git checkout $REF"` turns it back into code.
+Quote it, and pass it to programs as one argument.
 
 ### Trigger values: `event`
 
 A template can read the trigger's values through `${{ event.<field> }}`, in a pipeline file and in
 a library. Only fields whose values Scarab can check are readable:
 
-| Field | Value |
-|---|---|
-| `kind` | the trigger kind |
-| `sha` | the commit, 40 or 64 hex characters, where the trigger has one |
-| `number`, `issue` | a pull request or issue number |
-| `fork` | `true` for a pull request from a fork |
-| `run` | the upstream Run's id |
-| `repo.clone_url` | the repository's clone URL, from its forge connection |
-| `repo.owner`, `repo.name` | letters, digits, `.`, `_` and `-`; no leading `-`, not `.` or `..`; at most 100 bytes |
-| `ref`, `branch`, `tag` | letters, digits, `.`, `_`, `/`, `@` and `-`; no leading `-`, no `..` or `//`; at most 255 bytes |
+| Field | Value | In a `command` |
+|---|---|---|
+| `kind` | the trigger kind | yes |
+| `sha` | the commit, 40 or 64 hex characters, where the trigger has one | yes, lower-case hex only |
+| `number`, `issue` | a pull request or issue number | yes |
+| `fork` | `true` for a pull request from a fork | yes |
+| `run` | the upstream Run's id | no, `env:` only |
+| `repo.clone_url` | the repository's clone URL, from its forge connection | no, `env:` only |
+| `repo.owner`, `repo.name` | letters, digits, `.`, `_` and `-`; no leading `-`, not `.` or `..`; at most 100 bytes | no, `env:` only |
+| `ref`, `branch`, `tag` | letters, digits, `.`, `_`, `/`, `@` and `-`; no leading `-`, no `..` or `//`; at most 255 bytes | no, `env:` only |
+
+The last column is the [command rule](#values-in-commands-and-scripts): a field marked yes may be
+written into a command and is checked against its shape again when the step launches.
 
 `repo.clone_url` is at most 2048 bytes, `run` 64 and `kind` 32.
 
