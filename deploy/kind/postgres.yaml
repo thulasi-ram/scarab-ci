@@ -1,7 +1,12 @@
-# Dev-only in-cluster Postgres for the local Helm dogfood (NOT for production —
-# use a managed Postgres there). One replica, a PVC via k3s local-path so the
-# durable state (incl. the stored GitHub App PEM) survives pod restarts. Wipe a
-# clean slate by deleting the PVC (see deploy/local-helm/README.md).
+# Dev-only in-cluster Postgres for the kind dev stack (`just up`, `just
+# dogfood`). Not for production: use a managed Postgres there. One replica on a
+# PVC (kind's local-path provisioner), so the data survives Pod restarts and
+# `just down keep`; `just down` deletes the cluster and the data with it.
+#
+# Each mode has its own database on this one server: `scarab` for `just up`,
+# `scarab_dogfood` for `just dogfood`. deploy/kind/up.sh creates the database a
+# mode needs (ADR-0077 Amendment: a mode is a set of values, isolated by
+# database URL and bucket).
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -29,6 +34,10 @@ spec:
       containers:
         - name: postgres
           image: postgres:16-alpine   # official image is multi-arch (runs on arm64)
+          # On from the start: `just chaos` (ADR-0077) checks commit order on
+          # its own database on this server, and the setting needs a restart,
+          # which would also hit dev's data.
+          args: ["-c", "track_commit_timestamp=on"]
           env:
             - { name: POSTGRES_USER, value: scarab }
             - { name: POSTGRES_PASSWORD, value: scarab }
@@ -37,6 +46,10 @@ spec:
             - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
           ports:
             - { name: postgres, containerPort: 5432 }
+          # Requests near measured use (~70 MiB idle, 2026-11-01): the whole
+          # stack shares a 4 GiB colima VM.
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
           readinessProbe:
             exec: { command: ["pg_isready", "-U", "scarab", "-d", "scarab"] }
             initialDelaySeconds: 3

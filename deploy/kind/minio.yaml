@@ -1,10 +1,10 @@
-# Dev-only in-cluster MinIO for the local Helm dogfood (NOT for production — use
-# a managed S3 there). It backs the object store (CAS: logs, artifacts, and the
-# per-step workspace snapshots reruns restore). One replica, a PVC via k3s
-# local-path so the durable state survives pod restarts — WITHOUT this the CAS
-# would live on the server's `scratch` emptyDir and every server restart would
-# wipe all workspaces, hanging any rerun of a prior run. Wipe a clean slate by
-# deleting the PVC (see deploy/local-helm/README.md).
+# Dev-only in-cluster MinIO for the kind dev stack (`just up`, `just dogfood`).
+# Not for production: use a managed S3 there. It is the object store (logs,
+# artifacts, the Depot's packs). One replica on a PVC (kind's local-path
+# provisioner), so the data survives Pod restarts and `just down keep`.
+#
+# Each mode has its own bucket: `scarab-logs` for `just up`, `scarab-dogfood`
+# for `just dogfood`. The Job below creates both.
 #
 # `pgsty/minio` + `pgsty/mc` (multi-arch, run on arm64) — we deliberately avoid
 # the Bitnami images, matching the Postgres setup.
@@ -47,6 +47,9 @@ spec:
           ports:
             - { name: s3, containerPort: 9000 }
             - { name: console, containerPort: 9001 }
+          # Requests near measured use (~85 MiB idle, 2026-11-01).
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
           readinessProbe:
             httpGet: { path: /minio/health/ready, port: 9000 }
             initialDelaySeconds: 3
@@ -69,8 +72,8 @@ spec:
     - { name: s3, port: 9000, targetPort: 9000 }
     - { name: console, port: 9001, targetPort: 9001 }
 ---
-# One-shot: create the logs/artifacts bucket, then exit (mirrors the proc-mode
-# compose `createbuckets`). Self-waits for MinIO via the `mc alias set` retry
+# One-shot: create the buckets, then exit (mirrors the proc-mode compose
+# `createbuckets`). Self-waits for MinIO via the `mc alias set` retry
 # loop, so apply order doesn't matter. Idempotent (`--ignore-existing`); the
 # bucket persists in the PVC, so a completed Job need not re-run.
 apiVersion: batch/v1
@@ -93,6 +96,7 @@ spec:
             - |
               until mc alias set local http://scarab-minio:9000 scarab scarabsecret; do sleep 1; done
               mc mb --ignore-existing local/scarab-logs
+              mc mb --ignore-existing local/scarab-dogfood
               # Incomplete-multipart hygiene (git-bug ad79c90): nothing to
               # configure HERE — MinIO expires stale multipart uploads
               # natively (api: stale_uploads_expiry=24h, swept every
@@ -102,4 +106,4 @@ spec:
               # lists none). On real S3 the equivalent is a REQUIRED bucket
               # lifecycle rule — see the scarab.s3 comment in
               # deploy/helm/scarab/values.yaml.
-              echo 'bucket scarab-logs ready'
+              echo 'buckets scarab-logs and scarab-dogfood ready'

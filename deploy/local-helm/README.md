@@ -213,8 +213,8 @@ registration**, which is durable state, not a credential. Rotating the key is
 ## Clean slate
 ```sh
 helm uninstall scarab -n scarab
-kubectl delete -n scarab -f deploy/local-helm/postgres.yaml   # drops the PVC => wipes the DB
-kubectl delete -n scarab -f deploy/local-helm/minio.yaml      # drops the PVC => wipes the CAS
+kubectl delete -n scarab -f deploy/kind/postgres.yaml   # drops the PVC => wipes the DB
+kubectl delete -n scarab -f deploy/kind/minio.yaml      # drops the PVC => wipes the CAS
 # next deploy.sh + reseed.sh starts fresh (deploy.sh recreates the bucket)
 ```
 Wiping the DB PVC means re-running `reseed.sh` to re-register the installation. The App

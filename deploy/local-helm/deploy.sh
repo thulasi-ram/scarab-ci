@@ -343,7 +343,7 @@ if [ -n "${SCARAB_APP_PEM:-}" ]; then
 fi
 
 echo "==> in-cluster Postgres"
-kubectl apply -n "$NS" -f "$ROOT/deploy/local-helm/postgres.yaml"
+kubectl apply -n "$NS" -f "$ROOT/deploy/kind/postgres.yaml"
 kubectl rollout status -n "$NS" deploy/scarab-postgres --timeout=120s
 
 # In-cluster MinIO only when the server points at the in-cluster service. A
@@ -358,7 +358,7 @@ if [ "$S3_ENDPOINT" = "http://scarab-minio:9000" ]; then
   # just succeeded goes nowhere. The job is one-shot and idempotent
   # (`mc mb --ignore-existing`), so recreate it every time.
   kubectl delete job scarab-minio-mkbucket -n "$NS" --ignore-not-found
-  kubectl apply -n "$NS" -f "$ROOT/deploy/local-helm/minio.yaml"
+  kubectl apply -n "$NS" -f "$ROOT/deploy/kind/minio.yaml"
   kubectl rollout status -n "$NS" deploy/scarab-minio --timeout=120s
   kubectl wait -n "$NS" --for=condition=complete job/scarab-minio-mkbucket --timeout=90s
 fi

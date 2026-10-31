@@ -93,3 +93,9 @@ __pycache__/
 # just forgejo-verify tunnel mode (deploy/local-forgejo/up.sh)
 deploy/local-forgejo/.tunnel.*
 deploy/local-forgejo/.libs-manifest.json
+
+# The kind dev stack (deploy/kind/up.sh): its kubeconfig, generated config and
+# dev secrets (.state), and the staged binaries + UI mounted on the node (.mount).
+/deploy/kind/.kubeconfig
+/deploy/kind/.state/
+/deploy/kind/.mount/

@@ -1,10 +1,11 @@
-# Scarab dev harness. One-command local environment for the slice-1 skeleton.
+# Scarab dev harness. One-command local environment.
 #
-#   just up      # Postgres + MinIO + kind + scarab-server (background)
+#   just up      # kind + Postgres + MinIO + the chart, server built on the host
 #   just demo    # submit a pipeline and watch it complete
 #   just down    # tear it all down
 #
-# Requires: docker, kind, kubectl, cargo (and python3 for the demo).
+# Requires: docker, kind, kubectl, helm, cargo (+ cargo-zigbuild and zig on
+# macOS), and python3 for the demo.
 
 # List recipes by default.
 default:
@@ -39,13 +40,45 @@ docs-build:
     npm --prefix ui/scarab-docs-ui ci
     npm --prefix ui/scarab-docs-ui run build
 
-# Bring up the full dev stack and start scarab-server against it.
+# The kind dev stack (ADR-0077 Amendment, deploy/kind/README.md): one kind
+# cluster `scarab-dev`, Postgres + MinIO in it, and the real chart with the
+# server and the Depot running a binary built on the host (cargo-zigbuild on
+# macOS), mounted into a thin runtime image. The API and UI answer on the host
+# at SCARAB_ADDR from deploy/local-proc/.env, so `just ui` works against it.
+# Kube calls use deploy/kind/.kubeconfig only, checked before every call.
+#
+# `just e2e`, `just forgejo-verify` and `just kube-tests` still run proc mode
+# (deploy/local-proc/up.sh, a host server) until they move onto the release;
+# run `just down` before them, since both use SCARAB_ADDR's port.
+
+# Bring up the kind dev stack (build, cluster, Postgres, MinIO, the release).
 up:
-    bash deploy/local-proc/up.sh
+    bash deploy/kind/up.sh dev
+
+# The dogfood stack: `just up` in GitHub App mode with its own database and
+# bucket, plus a named Cloudflare tunnel. Reads ~/.config/scarab/dogfood.env
+# (CLOUDFLARE_TUNNEL_TOKEN and DOGFOOD_HOSTNAME are required; values are never
+# printed). The tunnel's public hostname must route to
+# http://scarab.scarab.svc.cluster.local:80 (set in the Cloudflare dashboard).
+
+# Bring up the dogfood stack behind its Cloudflare tunnel.
+dogfood:
+    bash deploy/kind/up.sh dogfood
+
+# Rebuild the binary and roll the server and Depot Pods onto it, in the mode the
+# stack was last brought up in. No image is built for the server.
+reload:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    bash deploy/kind/up.sh "$(cat deploy/kind/.state/mode 2>/dev/null || echo dev)"
 
 # Submit a one-step pipeline to the running server and watch it complete.
 demo:
-    bash deploy/local-proc/demo.sh
+    #!/usr/bin/env bash
+    set -euo pipefail
+    addr="$(sed -n 's/^SCARAB_ADDR=//p' deploy/local-proc/.env 2>/dev/null | tail -n 1)"
+    addr="${addr:-127.0.0.1:8080}"
+    SCARAB_BASE="${SCARAB_BASE:-http://${addr/0.0.0.0/127.0.0.1}}"     SCARAB_DEMO_IMAGE="${SCARAB_DEMO_IMAGE:-scarab-clone:dev}"       bash deploy/local-proc/demo.sh
 
 # `just demo` is ONE step with no `needs:`, so it never crosses a Step boundary and
 # exercises the workspace drain and none of the feed. Since ADR-0061 s3-feed the
@@ -55,36 +88,40 @@ demo:
 
 # Submit a CHAINED pipeline (produce → consume) — proves the workspace feed leg.
 demo-chain:
-    bash deploy/local-proc/demo-chain.sh
-
-# Tear down the whole stack.
-down:
-    bash deploy/local-proc/down.sh
-
-# Tail the background server log.
-logs:
-    tail -f deploy/local-proc/server.log
-
-# The workspace service (ADR-0061) is a SECOND process of the same binary, run by
-# `just up` with --role workspace, so its output never appears in `just logs`. A
-# warm-tier warning ("warm tier full — serving from cold") or a 401 from a Step
-# lands in its log, not the server's.
-
-# Tail the workspace service's log (ADR-0061).
-workspace-logs:
-    tail -f deploy/local-proc/workspace.log
-
-# `warm_used_bytes` is the gauge that matters: LRU eviction is NOT implemented
-# yet, so that number against the volume size is the entire budget. Readiness
-# here means warm writable + cold reachable — deliberately not the control
-# plane's database check.
-
-# Readiness + gauges of the local workspace service (ADR-0061).
-workspace-status port="8081":
     #!/usr/bin/env bash
     set -euo pipefail
-    echo "== /readyz =="; curl -sf "http://127.0.0.1:{{port}}/readyz" || echo "NOT READY"
-    echo; echo "== /metrics =="; curl -sf "http://127.0.0.1:{{port}}/metrics"
+    addr="$(sed -n 's/^SCARAB_ADDR=//p' deploy/local-proc/.env 2>/dev/null | tail -n 1)"
+    addr="${addr:-127.0.0.1:8080}"
+    SCARAB_BASE="${SCARAB_BASE:-http://${addr/0.0.0.0/127.0.0.1}}"     SCARAB_DEMO_IMAGE="${SCARAB_DEMO_IMAGE:-scarab-clone:dev}"       bash deploy/local-proc/demo-chain.sh
+
+# Tear down the kind dev stack. `just down keep` uninstalls the release only and
+# keeps the cluster, Postgres, MinIO and their data.
+down what="all":
+    bash deploy/kind/down.sh {{what}}
+
+# Follow the server's log (the converged control plane in the cluster).
+logs:
+    bash deploy/kind/kubectl.sh logs -n scarab -f deploy/scarab
+
+# The Depot (ADR-0061 workspace service) is the StatefulSet `scarab-workspace`,
+# the same binary with SCARAB_ROLE=workspace, so its output never appears in
+# `just logs`. A warm-tier warning or a 401 from a Step lands in its log.
+
+# Follow the Depot's log.
+workspace-logs:
+    bash deploy/kind/kubectl.sh logs -n scarab -f statefulset/scarab-workspace
+
+# Readiness here means warm writable + cold reachable, not the control plane's
+# database check. Read through the API server's Service proxy, so no port is
+# opened on the host.
+
+# Readiness and gauges of the Depot.
+workspace-status:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    svc=/api/v1/namespaces/scarab/services/scarab-workspace:80/proxy
+    echo "== /readyz =="; bash deploy/kind/kubectl.sh get --raw "$svc/readyz" || echo "NOT READY"
+    echo; echo "== /metrics =="; bash deploy/kind/kubectl.sh get --raw "$svc/metrics"
 
 # Requires deploy/local-helm/.env and kube context `colima`. Usage:
 #   just local-helm             # pull + deploy the latest ghcr `edge`
