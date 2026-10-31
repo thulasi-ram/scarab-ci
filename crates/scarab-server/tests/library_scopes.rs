@@ -44,7 +44,7 @@ async fn drive(
 ) -> Driven {
     let mut forge = FakeForge::new()
         .with_file(".scarab/ship.yaml", pipeline)
-        .with_commit("refs/heads/main", "sha-1");
+        .with_commit("refs/heads/main", "5ba1");
     for (path, src) in libs {
         forge = forge.with_file(*path, *src);
     }

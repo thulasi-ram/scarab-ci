@@ -31,7 +31,7 @@ async fn a_dispatch_parameter_with_a_leading_dash_does_not_reach_argv() {
     let forge = FakeForge::new()
         .with_file(".scarab/ship.yaml", pipeline)
         .with_file(".scarab/lib/fetch.yaml", lib)
-        .with_commit("refs/heads/main", "sha-1");
+        .with_commit("refs/heads/main", "5ba1");
     let db = InMemoryDb::new();
     let clock = FakeClock::new(1_000);
     let evil = "--upload-pack=touch /tmp/pwned";
