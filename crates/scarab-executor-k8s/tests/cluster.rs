@@ -1,8 +1,10 @@
 //! Real-cluster round-trip for `K8sExecutor` (ADR-0004 acceptance).
 //!
-//! This test is `#[ignore]`d and additionally gated on the `SCARAB_TEST_KUBE`
-//! env var, so `cargo test` NEVER runs it and it never touches an ambient
-//! kubeconfig by accident.
+//! This test is `#[ignore]`d, so `cargo test` NEVER runs it and it never
+//! touches an ambient kubeconfig by accident. Asking for the ignored set
+//! (`--run-ignored`, `-- --ignored`) is the opt-in, and the case then needs
+//! `SCARAB_TEST_KUBE` as well: without it, it panics ([`enter_tier`]) rather
+//! than passing having done nothing (git-bug dcc4ca9).
 //!
 //! # How to run it — one recipe, both audiences
 //!
@@ -109,17 +111,30 @@ async fn poll_until_running(exec: &K8sExecutor, h: &ExecHandle, ticks: u32) -> E
     last
 }
 
-fn opted_in() -> Option<String> {
+/// The gate every case passes first. The case is `#[ignore]`d, so reaching
+/// this means someone asked for the ignored set: that is the opt-in. Without
+/// `SCARAB_TEST_KUBE` as well, the case panics. It used to return, and a
+/// `--run-ignored` sweep reported all 23 cases PASS in 50 ms having run
+/// nothing (git-bug dcc4ca9).
+///
+/// `SCARAB_TEST_KUBE` stays required on top of `--ignored` so that an
+/// accidental ignored sweep is a loud refusal, never a run against whatever
+/// cluster the ambient kubeconfig names.
+fn enter_tier() -> String {
     if std::env::var("SCARAB_TEST_KUBE").is_err() {
-        eprintln!("skipping: set SCARAB_TEST_KUBE=1 to run against a dev cluster");
-        return None;
+        panic!(
+            "this live case was asked to run (`--ignored` is the opt-in) but \
+             SCARAB_TEST_KUBE is not set, and it will not pass by doing nothing. Run \
+             `just kube-tests` (local) or the kind workflow (CI), which set it and \
+             everything else the tier needs."
+        );
     }
     // Every case passes this gate FIRST — before `workspace_fixture` builds
     // its Depot and cold-store clients and before `kube_client` dials the API
     // server — so this one call is where the process-level CryptoProvider
     // goes in (git-bug 2852828).
     install_crypto_provider();
-    Some(std::env::var("SCARAB_TEST_KUBE_NS").unwrap_or_else(|_| "default".to_string()))
+    std::env::var("SCARAB_TEST_KUBE_NS").unwrap_or_else(|_| "default".to_string())
 }
 
 /// Install `ring` as the process-level rustls CryptoProvider (git-bug
@@ -135,14 +150,14 @@ fn install_crypto_provider() {
 }
 
 /// The kube client every case uses: the ambient-config client. Only ever
-/// called after [`opted_in`], which installed the CryptoProvider.
+/// called after [`enter_tier`], which installed the CryptoProvider.
 async fn kube_client() -> kube::Client {
     kube::Client::try_default().await.expect("kube client")
 }
 
 /// Read a `SCARAB_TEST_*` var the tier's runner is expected to provide.
 ///
-/// **Only ever called after [`opted_in`]**, so reaching it means the tier is
+/// **Only ever called after [`enter_tier`]**, so reaching it means the tier is
 /// running — and an absent var is therefore a wiring bug, not a reason to skip.
 /// It panics.
 ///
@@ -217,11 +232,11 @@ fn tier_var(name: &str) -> String {
 /// asks for. `kind/cluster-tests` is `required-if-run`, so the merge gate saw
 /// green for a tier that had gone silent.
 ///
-/// So: once the tier is opted in ([`opted_in`]), absent workspace configuration
+/// So: once the tier is opted in ([`enter_tier`]), absent workspace configuration
 /// **panics**. Mirrors `SCARAB_TEST_REQUIRE_PG` in
 /// `crates/scarab-server/tests/common/mod.rs` — with one deliberate difference:
-/// the panic is keyed on the SAME condition as `opted_in` rather than on a second
-/// opt-out var, because a second var is how this failed the first time.
+/// there is no second opt-out var, because a second var is how this failed the
+/// first time.
 struct WorkspaceFixture {
     /// The tiered READ handle (warm = the service, cold = the object store,
     /// fall-through) — `with_workspace_cas`, and the test's ordinary readback.
@@ -284,7 +299,8 @@ fn depot_cold_store() -> std::sync::Arc<scarab_storage_s3::S3Storage> {
     }
 }
 
-fn workspace_fixture() -> Option<WorkspaceFixture> {
+/// Only ever called after [`enter_tier`], so absent configuration panics.
+fn workspace_fixture() -> WorkspaceFixture {
     let vars = [
         "SCARAB_TEST_WORKSPACE_URL",
         "SCARAB_TEST_WORKSPACE_SECRET",
@@ -296,25 +312,18 @@ fn workspace_fixture() -> Option<WorkspaceFixture> {
         .filter(|v| std::env::var(v).map(|s| s.is_empty()).unwrap_or(true))
         .collect();
     if !missing.is_empty() {
-        // Deliberately the same predicate `opted_in` uses. One var opts the tier
-        // in; nothing else may opt a case out of it.
-        if std::env::var("SCARAB_TEST_KUBE").is_ok() {
-            panic!(
-                "live workspace test skipped but SCARAB_TEST_KUBE is set — missing: {}.\n\
-                 Since ADR-0061 s3-feed a Step with `needs:` is provisioned by an init \
-                 container that dials the workspace service, so a green run without these \
-                 proves nothing. Wire them up:\n\
-                 \x20 CI:    .github/workflows/kind.yml (workspace service + kind-loaded fetcher)\n\
-                 \x20 local: `just up` writes deploy/local-proc/.env.generated; \
-                 `just kube-tests` sources it",
-                missing.join(", ")
-            );
-        }
-        eprintln!(
-            "SKIPPED (live workspace test): set {} — `just kube-tests` wires them up",
-            vars.join(", ")
+        // The tier is opted in (`enter_tier` ran first), and nothing may opt a
+        // case out of it.
+        panic!(
+            "live workspace case cannot run, but SCARAB_TEST_KUBE is set — missing: {}.\n\
+             Since ADR-0061 s3-feed a Step with `needs:` is provisioned by an init \
+             container that dials the workspace service, so a green run without these \
+             proves nothing. Wire them up:\n\
+             \x20 CI:    .github/workflows/kind.yml (workspace service + kind-loaded fetcher)\n\
+             \x20 local: `just up` writes deploy/local-proc/.env.generated; \
+             `just kube-tests` sources it",
+            missing.join(", ")
         );
-        return None;
     }
     let url = std::env::var("SCARAB_TEST_WORKSPACE_URL").expect("checked above");
     let secret = std::env::var("SCARAB_TEST_WORKSPACE_SECRET").expect("checked above");
@@ -346,7 +355,7 @@ fn workspace_fixture() -> Option<WorkspaceFixture> {
         scarab_storage::tiered::TieredCas::new(depot.clone(), cold.clone() as _)
             .fall_through_on_warm_error(),
     );
-    Some(WorkspaceFixture {
+    WorkspaceFixture {
         cas,
         depot,
         cold,
@@ -356,7 +365,7 @@ fn workspace_fixture() -> Option<WorkspaceFixture> {
             fetcher_image: image,
             helper_resources: scarab_pipeline::Resources::default(),
         },
-    })
+    }
 }
 
 /// A per-invocation unique run id: live tests re-launch by fence, so a fixed
@@ -436,7 +445,7 @@ fn step(run_prefix: &str) -> StepRun {
 #[tokio::test]
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn busybox_runs_to_completion_and_relaunch_reattaches() {
-    let Some(ns) = opted_in() else { return };
+    let ns = enter_tier();
 
     let client = kube_client().await;
     let exec = K8sExecutor::with_client(ns, client);
@@ -490,7 +499,7 @@ async fn busybox_runs_to_completion_and_relaunch_reattaches() {
 #[tokio::test]
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn sleeping_step_is_killed_at_its_deadline() {
-    let Some(ns) = opted_in() else { return };
+    let ns = enter_tier();
 
     let client = kube_client().await;
     let exec = K8sExecutor::with_client(ns, client);
@@ -560,7 +569,7 @@ async fn sleeping_step_is_killed_at_its_deadline() {
 #[tokio::test]
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn log_stream_tails_pod_stdout() {
-    let Some(ns) = opted_in() else { return };
+    let ns = enter_tier();
 
     let client = kube_client().await;
     let exec = K8sExecutor::with_client(ns, client);
@@ -627,8 +636,8 @@ async fn log_stream_tails_pod_stdout() {
 #[tokio::test]
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn workspace_flows_from_a_to_b_through_the_cas() {
-    let Some(ns) = opted_in() else { return };
-    let Some(ws) = workspace_fixture() else { return };
+    let ns = enter_tier();
+    let ws = workspace_fixture();
 
     let client = kube_client().await;
     let exec = K8sExecutor::with_client(ns, client)
@@ -836,8 +845,8 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
 #[tokio::test]
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn a_green_attempt_is_backed_by_a_durable_snapshot_at_the_instant_it_goes_green() {
-    let Some(ns) = opted_in() else { return };
-    let Some(ws) = workspace_fixture() else { return };
+    let ns = enter_tier();
+    let ws = workspace_fixture();
 
     let client = kube_client().await;
     let exec = K8sExecutor::with_client(ns, client)
@@ -1017,8 +1026,8 @@ async fn a_green_attempt_is_backed_by_a_durable_snapshot_at_the_instant_it_goes_
 #[tokio::test]
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn a_missing_input_snapshot_fails_the_attempt_instead_of_hanging() {
-    let Some(ns) = opted_in() else { return };
-    let Some(ws) = workspace_fixture() else { return };
+    let ns = enter_tier();
+    let ws = workspace_fixture();
 
     let client = kube_client().await;
     let exec = K8sExecutor::with_client(ns, client)
@@ -1108,7 +1117,7 @@ async fn a_missing_input_snapshot_fails_the_attempt_instead_of_hanging() {
 #[tokio::test]
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn a_step_with_inputs_is_refused_when_no_workspace_service_is_configured() {
-    let Some(ns) = opted_in() else { return };
+    let ns = enter_tier();
     let client = kube_client().await;
     let tmp = tempfile::tempdir().expect("cas dir");
     let cas: std::sync::Arc<dyn scarab_storage::Cas> = std::sync::Arc::new(
@@ -1185,7 +1194,7 @@ async fn a_step_with_inputs_is_refused_when_no_workspace_service_is_configured()
 
     // The control: the SAME step and spec, on an executor that differs only by
     // having the service, launches.
-    let ws = workspace_fixture().expect("the tier is opted in, so the fixture is wired");
+    let ws = workspace_fixture();
     let configured = K8sExecutor::with_client(
         std::env::var("SCARAB_TEST_KUBE_NS").unwrap_or_else(|_| "default".to_string()),
         kube_client().await,
@@ -1213,8 +1222,8 @@ async fn a_step_with_inputs_is_refused_when_no_workspace_service_is_configured()
 #[tokio::test]
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn declared_outputs_publish_only_those_paths_through_the_cas() {
-    let Some(ns) = opted_in() else { return };
-    let Some(ws) = workspace_fixture() else { return };
+    let ns = enter_tier();
+    let ws = workspace_fixture();
     let run_id = unique_run("run-ws-out");
 
     let client = kube_client().await;
@@ -1359,12 +1368,12 @@ async fn declared_outputs_publish_only_those_paths_through_the_cas() {
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn clone_step_produces_a_source_workspace() {
     let run_id = unique_run("run-clone");
-    let Some(ns) = opted_in() else { return };
+    let ns = enter_tier();
     let clone_image = tier_var("SCARAB_TEST_CLONE_IMAGE");
     let sha = tier_var("SCARAB_TEST_CLONE_SHA");
     // The downstream `needs: [checkout]` step at the bottom of this test is fed by
     // the fetcher, so this test needs the service too.
-    let Some(ws) = workspace_fixture() else { return };
+    let ws = workspace_fixture();
     let cas = ws.cas.clone();
 
     let client = kube_client().await;
@@ -1523,12 +1532,12 @@ async fn clone_step_produces_a_source_workspace() {
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn clone_depth_full_exposes_history() {
     let run_id = unique_run("run-clone-full");
-    let Some(ns) = opted_in() else { return };
+    let ns = enter_tier();
     let clone_image = tier_var("SCARAB_TEST_CLONE_IMAGE");
     let sha = tier_var("SCARAB_TEST_CLONE_SHA");
     // The history check downstream inherits the checkout, so it is fed by the
     // fetcher (ADR-0061 s3-feed).
-    let Some(ws) = workspace_fixture() else { return };
+    let ws = workspace_fixture();
 
     let client = kube_client().await;
     let exec = K8sExecutor::with_client(ns, client)
@@ -1649,12 +1658,12 @@ async fn clone_depth_full_exposes_history() {
 #[tokio::test]
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn clone_vanished_sha_fails_fast_with_source_unavailable() {
-    let Some(ns) = opted_in() else { return };
+    let ns = enter_tier();
     let clone_image = tier_var("SCARAB_TEST_CLONE_IMAGE");
 
     // A clone step is a workspace Step (it publishes the checkout), so since
     // ADR-0061 s3-drain it launches only with a workspace service configured.
-    let ws = workspace_fixture().expect("the tier is opted in, so the fixture is wired");
+    let ws = workspace_fixture();
 
     let client = kube_client().await;
     let exec = K8sExecutor::with_client(ns, client)
@@ -1732,11 +1741,11 @@ async fn clone_vanished_sha_fails_fast_with_source_unavailable() {
 #[tokio::test]
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn build_step_builds_and_pushes_to_a_local_registry() {
-    let Some(ns) = opted_in() else { return };
+    let ns = enter_tier();
     let registry = tier_var("SCARAB_TEST_REGISTRY");
     // The build step inherits its context as a workspace input, so the fetcher
     // provisions it (ADR-0061 s3-feed).
-    let Some(ws) = workspace_fixture() else { return };
+    let ws = workspace_fixture();
     let run_id = unique_run("run-build");
 
     let client = kube_client().await;
@@ -1888,7 +1897,7 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
 #[tokio::test]
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn results_sidecar_captures_a_named_result_end_to_end() {
-    let Some(ns) = opted_in() else { return };
+    let ns = enter_tier();
     let sidecar_image = tier_var("SCARAB_TEST_SIDECAR_IMAGE");
     let host_ip = tier_var("SCARAB_TEST_HOST_IP");
     let run_id = unique_run("run-results");
@@ -2015,7 +2024,7 @@ async fn a_plain_step_is_not_succeeded_until_its_results_drain_committed() {
     use k8s_openapi::api::core::v1::Pod;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    let Some(ns) = opted_in() else { return };
+    let ns = enter_tier();
     let sidecar_image = tier_var("SCARAB_TEST_SIDECAR_IMAGE");
     let host_ip = tier_var("SCARAB_TEST_HOST_IP");
     let run_id = unique_run("run-results-hold");
@@ -2116,7 +2125,7 @@ async fn a_plain_step_is_not_succeeded_until_its_results_drain_committed() {
 #[tokio::test]
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn cancel_tears_down_a_running_pod() {
-    let Some(ns) = opted_in() else { return };
+    let ns = enter_tier();
     let run_id = unique_run("run-cancel");
 
     let client = kube_client().await;
@@ -2191,7 +2200,7 @@ async fn cancel_tears_down_a_running_pod() {
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn artifacts_are_harvested_post_step() {
     use scarab_storage::ObjectStore;
-    let Some(ns) = opted_in() else { return };
+    let ns = enter_tier();
     let run_id = unique_run("run-artifacts");
 
     let client = kube_client().await;
@@ -2205,7 +2214,7 @@ async fn artifacts_are_harvested_post_step() {
     // So the flow is wired exactly as production wires it; the ARTIFACT store
     // stays a separate local store, as ADR-0052 makes it (an independent
     // lifecycle, not the CAS).
-    let ws = workspace_fixture().expect("the tier is opted in, so the fixture is wired");
+    let ws = workspace_fixture();
     let exec = K8sExecutor::with_client(ns, client)
         .with_workspace_cas(ws.cas.clone())
         .with_workspace_depot(ws.depot.clone())
@@ -2287,7 +2296,7 @@ async fn artifacts_are_harvested_post_step() {
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn artifacts_are_harvested_from_a_failed_step() {
     use scarab_storage::ObjectStore;
-    let Some(ns) = opted_in() else { return };
+    let ns = enter_tier();
     let run_id = unique_run("run-artifacts-failed");
 
     let client = kube_client().await;
@@ -2301,7 +2310,7 @@ async fn artifacts_are_harvested_from_a_failed_step() {
     // So the flow is wired exactly as production wires it; the ARTIFACT store
     // stays a separate local store, as ADR-0052 makes it (an independent
     // lifecycle, not the CAS).
-    let ws = workspace_fixture().expect("the tier is opted in, so the fixture is wired");
+    let ws = workspace_fixture();
     let exec = K8sExecutor::with_client(ns, client)
         .with_workspace_cas(ws.cas.clone())
         .with_workspace_depot(ws.depot.clone())
@@ -2418,7 +2427,7 @@ fn busybox_spec(cmd: &str, run_as_root: bool) -> StepSpec {
 #[tokio::test]
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn run_as_root_is_reflected_on_the_admitted_pod() {
-    let Some(ns) = opted_in() else { return };
+    let ns = enter_tier();
 
     let client = kube_client().await;
     let exec = K8sExecutor::with_client(ns.clone(), client.clone());
@@ -2475,7 +2484,7 @@ async fn run_as_root_is_reflected_on_the_admitted_pod() {
 #[tokio::test]
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn image_pull_failure_fails_the_attempt_fast() {
-    let Some(ns) = opted_in() else { return };
+    let ns = enter_tier();
 
     let client = kube_client().await;
     let exec = K8sExecutor::with_client(ns, client);
@@ -2531,7 +2540,7 @@ async fn rerun_supersede_tears_down_the_in_flight_descendant_pod() {
     use scarab_engine::{rerun_step, Db, RunStatus, Scheduler};
     use scarab_testkit::{FakeClock, InMemoryDb};
 
-    let Some(ns) = opted_in() else { return };
+    let ns = enter_tier();
     let run = RunId(unique_run("run-orphan"));
     let b = StepId("b".into());
     let c = StepId("c".into());
@@ -2649,8 +2658,8 @@ async fn rerun_supersede_tears_down_the_in_flight_descendant_pod() {
 #[tokio::test]
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn fanin_collision_summary_survives_the_termination_log_as_uid_65532() {
-    let Some(ns) = opted_in() else { return };
-    let Some(ws) = workspace_fixture() else { return };
+    let ns = enter_tier();
+    let ws = workspace_fixture();
 
     let client = kube_client().await;
     let exec = K8sExecutor::with_client(ns, client)
@@ -2783,8 +2792,8 @@ async fn a_debug_pod_rematerialises_a_finished_steps_snapshot() {
     use scarab_executor_k8s::DebugLauncher;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let Some(ns) = opted_in() else { return };
-    let Some(ws) = workspace_fixture() else { return };
+    let ns = enter_tier();
+    let ws = workspace_fixture();
 
     let client = kube_client().await;
     let exec = K8sExecutor::with_client(ns, client)
@@ -2879,8 +2888,8 @@ async fn a_debug_pod_rematerialises_a_finished_steps_snapshot() {
 #[tokio::test]
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn a_needs_step_with_a_uid_pinned_service_can_write_its_workspace() {
-    let Some(ns) = opted_in() else { return };
-    let Some(ws) = workspace_fixture() else { return };
+    let ns = enter_tier();
+    let ws = workspace_fixture();
 
     let client = kube_client().await;
     let exec = K8sExecutor::with_client(ns, client)

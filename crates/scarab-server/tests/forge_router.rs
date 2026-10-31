@@ -121,10 +121,13 @@ async fn a_connection_with_no_bound_repos_still_yields_an_adapter() {
 #[ignore = "requires live GitHub credentials; opt in with SCARAB_TEST_GITHUB=1"]
 async fn production_path_posts_a_status_with_run_deep_link_live() {
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
-    if env("SCARAB_TEST_GITHUB").is_none() {
-        eprintln!("skipping: set SCARAB_TEST_GITHUB=1 (+ TOKEN/REPO) to run");
-        return;
-    }
+    // `#[ignore]`d: asking for the ignored set is the opt-in, so a missing
+    // switch is a panic, not a PASS that ran nothing (git-bug dcc4ca9).
+    assert!(
+        env("SCARAB_TEST_GITHUB").is_some(),
+        "this live case was asked to run (`--ignored` is the opt-in) but \
+         SCARAB_TEST_GITHUB is not set: set SCARAB_TEST_GITHUB=1 (+ TOKEN/REPO)"
+    );
     let token = env("SCARAB_TEST_GITHUB_TOKEN").expect("SCARAB_TEST_GITHUB_TOKEN");
     let full = env("SCARAB_TEST_GITHUB_REPO").expect("SCARAB_TEST_GITHUB_REPO");
     let (owner, name) = full.split_once('/').expect("owner/name");
