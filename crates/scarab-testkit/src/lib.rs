@@ -28,6 +28,11 @@ use scarab_storage::{ObjectStore, StorageError};
 mod environment_governance;
 pub use environment_governance::InMemoryEnvironmentGovernance;
 
+/// An in-memory `PolicyStore` (ADR-0075) with the Postgres adapter's
+/// versioning, name and concurrency rules.
+mod policies;
+pub use policies::InMemoryPolicies;
+
 /// In-memory step-up stores (ADR-0073) and a real-AEAD test `Sealer`, with
 /// the Postgres adapter's single-use, expiry and compare-and-swap semantics.
 mod step_up;
@@ -3781,6 +3786,18 @@ impl InMemoryIdentities {
 
 #[async_trait]
 impl scarab_identity::IdentityStore for InMemoryIdentities {
+    async fn pinned(
+        &self,
+        provider: &str,
+        external_id: &str,
+    ) -> Result<Option<String>, IdentityError> {
+        let st = self.inner.lock().unwrap();
+        Ok(st
+            .identities
+            .get(&(provider.to_string(), external_id.to_string()))
+            .map(|(id, _)| id.clone()))
+    }
+
     async fn sign_in(
         &self,
         identity: &scarab_identity::ProviderIdentity,

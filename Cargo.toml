@@ -4,7 +4,8 @@
 #   * Pure domain crates depend ONLY on serde / serde_json / thiserror /
 #     async-trait and on each other. They list NO infra crate (sqlx, kube,
 #     reqwest, object_store, axum, tokio-runtime, aws) in their Cargo.toml.
-#     A further I/O-free library (`cel`, `sha2`, `tracing`) may be
+#     A further I/O-free library (`cel`, `sha2`, `tracing`, `regex`,
+#     `chrono`) may be
 #     admitted per ADR-0031 when the capability is part of the domain rather
 #     than of a backend — see the `allowed inside pure domain crates` block
 #     below, and the justification each admitting crate carries next to its own
@@ -51,6 +52,13 @@ sha2 = "0.10"
 # a log line (e.g. `TieredCas`'s loud-but-non-fatal warm-write failure) can be
 # loud instead of silently swallowing.
 tracing = "0.1"
+# `regex` and `chrono`: already in the tree as dependencies of `cel`, at these
+# versions, so naming them adds no crate. `scarab-policy` compiles a CEL
+# `matches()` pattern with the engine `cel` evaluates it with, and builds the
+# `cel::Value::Timestamp` a checkpoint's `time` is bound as. Neither reads the
+# clock there: the time is an input, from the composition root's `Clock`.
+regex = "1"
+chrono = { version = "0.4", default-features = false, features = ["alloc", "serde"] }
 
 # --- internal crates (path deps) -------------------------------------------
 scarab-engine = { path = "crates/scarab-engine" }
@@ -78,6 +86,8 @@ scarab-plugin = { path = "crates/scarab-plugin" }
 # ADR-0072 §9/§11: the plugin runtime's Kubernetes adapter (namespace
 # baseline, workloads, isolation probe, TokenReview).
 scarab-plugin-k8s = { path = "crates/scarab-plugin-k8s" }
+# ADR-0075: the policy engine (Policy IR, evaluator, `PolicyStore` port).
+scarab-policy = { path = "crates/scarab-policy" }
 
 # --- test-only ---------------------------------------------------------------
 # Property testing for pure domain folds (invariant suites). Dev-dependency

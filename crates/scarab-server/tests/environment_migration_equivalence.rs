@@ -200,6 +200,7 @@ fn webhook_events(project: &str) -> Vec<(&'static str, Event)> {
             "push main",
             Event::Push {
                 actor: "octocat".into(),
+                actor_id: String::new(),
                 repo: repo.clone(),
                 r#ref: "refs/heads/main".into(),
                 after: SHA.into(),
@@ -210,6 +211,7 @@ fn webhook_events(project: &str) -> Vec<(&'static str, Event)> {
             "push feature",
             Event::Push {
                 actor: "octocat".into(),
+                actor_id: String::new(),
                 repo: repo.clone(),
                 r#ref: "refs/heads/feature".into(),
                 after: SHA.into(),
@@ -220,6 +222,7 @@ fn webhook_events(project: &str) -> Vec<(&'static str, Event)> {
             "pull request",
             Event::PullRequest {
                 actor: "octocat".into(),
+                actor_id: String::new(),
                 repo: repo.clone(),
                 number: 7,
                 head: SHA.into(),
@@ -232,6 +235,7 @@ fn webhook_events(project: &str) -> Vec<(&'static str, Event)> {
             "tag",
             Event::Tag {
                 actor: "octocat".into(),
+                actor_id: String::new(),
                 repo: repo.clone(),
                 tag: "v1".into(),
             },
@@ -240,6 +244,7 @@ fn webhook_events(project: &str) -> Vec<(&'static str, Event)> {
             "comment (no symbolic ref)",
             Event::Comment {
                 actor: "octocat".into(),
+                actor_id: String::new(),
                 repo,
                 issue: 7,
                 body: "deploy".into(),
@@ -282,9 +287,15 @@ async fn assert_decides_as_legacy(
     // Webhook events: created iff the old ref check admitted it.
     for (label, event) in webhook_events(project) {
         let before = legacy_admits_ref(old, event.protection_ref().as_deref());
-        let runs = trigger_run_from_event(&forge, pg.as_ref(), clock, Some(pg.as_ref()), &event)
-            .await
-            .unwrap_or_else(|e| panic!("{project}/{environment} {label}: {e}"));
+        let runs = trigger_run_from_event(
+            &forge,
+            pg.as_ref(),
+            clock,
+            scarab_server::AdmissionPorts::governance(Some(pg.as_ref())),
+            &event,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{project}/{environment} {label}: {e}"));
         assert_eq!(
             runs.len(),
             usize::from(before),
@@ -296,12 +307,16 @@ async fn assert_decides_as_legacy(
     let cron = Event::Cron {
         schedule: "0 * * * *".into(),
     };
-    assert!(
-        trigger_run_from_event(&forge, pg.as_ref(), clock, Some(pg.as_ref()), &cron)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert!(trigger_run_from_event(
+        &forge,
+        pg.as_ref(),
+        clock,
+        scarab_server::AdmissionPorts::governance(Some(pg.as_ref())),
+        &cron
+    )
+    .await
+    .unwrap()
+    .is_empty());
 
     // Manual dispatch ± reason, on a branch, a tag and a PR ref.
     for (dispatch_ref, sym_ref) in [
@@ -350,7 +365,7 @@ async fn dispatch(
         &forge,
         pg.as_ref(),
         clock,
-        Some(pg.as_ref()),
+        scarab_server::AdmissionPorts::governance(Some(pg.as_ref())),
         "bob".into(),
         repo(project),
         dispatch_ref.into(),
@@ -409,9 +424,15 @@ async fn a_run_referencer_keeps_its_permissive_deploy_and_never_seen_cases_are_r
             .with_file(".scarab/deploy.yaml", deploy_yaml(environment).as_str())
             .with_commit("refs/heads/main", SHA);
         let (_, push) = webhook_events(project).swap_remove(0);
-        let runs = trigger_run_from_event(&forge, pg.as_ref(), &clock, Some(pg.as_ref()), &push)
-            .await
-            .unwrap();
+        let runs = trigger_run_from_event(
+            &forge,
+            pg.as_ref(),
+            &clock,
+            scarab_server::AdmissionPorts::governance(Some(pg.as_ref())),
+            &push,
+        )
+        .await
+        .unwrap();
         assert!(runs.is_empty(), "{project}/{environment}: refused, no Run");
     }
 
@@ -495,7 +516,7 @@ async fn migrated_privilege_grants_decide_every_request_as_the_legacy_whitelist(
                     &forge,
                     pg.as_ref(),
                     clock,
-                    Some(pg.as_ref()),
+                    scarab_server::AdmissionPorts::governance(Some(pg.as_ref())),
                     "bob".into(),
                     repo(project),
                     dispatch_ref.into(),

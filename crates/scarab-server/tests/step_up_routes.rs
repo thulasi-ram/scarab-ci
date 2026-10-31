@@ -321,6 +321,68 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
         "environment.migration_report_ack",
         "NG",
     ),
+    // ADR-0075 §10: adding tightens; an edit or delete of an enforced Policy
+    // loosens (the handler decides from the stored mode).
+    ("GET", "/v1/orgs/{org}/policies", "read", "READ"),
+    ("POST", "/v1/orgs/{org}/policies", "policy.create", "EX"),
+    ("GET", "/v1/orgs/{org}/policies/{id}", "read", "READ"),
+    (
+        "PUT",
+        "/v1/orgs/{org}/policies/{id}",
+        "policy.update",
+        "COND-W",
+    ),
+    (
+        "DELETE",
+        "/v1/orgs/{org}/policies/{id}",
+        "policy.delete",
+        "COND-W",
+    ),
+    (
+        "GET",
+        "/v1/orgs/{org}/policies/{id}/versions",
+        "read",
+        "READ",
+    ),
+    (
+        "GET",
+        "/v1/orgs/{org}/projects/{project}/policies",
+        "read",
+        "READ",
+    ),
+    (
+        "POST",
+        "/v1/orgs/{org}/projects/{project}/policies",
+        "project_policy.create",
+        "EX",
+    ),
+    (
+        "GET",
+        "/v1/orgs/{org}/projects/{project}/policies/{id}",
+        "read",
+        "READ",
+    ),
+    (
+        "PUT",
+        "/v1/orgs/{org}/projects/{project}/policies/{id}",
+        "project_policy.update",
+        "COND-W",
+    ),
+    (
+        "DELETE",
+        "/v1/orgs/{org}/projects/{project}/policies/{id}",
+        "project_policy.delete",
+        "COND-W",
+    ),
+    (
+        "GET",
+        "/v1/orgs/{org}/projects/{project}/policies/{id}/versions",
+        "read",
+        "READ",
+    ),
+    ("POST", "/v1/orgs/{org}/policy-test", "policy.test", "NG"),
+    ("GET", "/v1/orgs/{org}/policy-decisions", "read", "READ"),
+    ("GET", "/v1/runs/{id}/policy-decisions", "read", "READ"),
     ("GET", "/v1/orgs/{org}/plugin-catalog", "read", "READ"),
     ("GET", "/v1/orgs/{org}/plugins", "read", "READ"),
     ("POST", "/v1/orgs/{org}/plugins", "plugin.install", "CJ-A"),
@@ -864,7 +926,7 @@ async fn exempt_and_ungoverned_routes_never_ask_for_a_step_up() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 28, "the EX + NG mutating routes");
+    assert_eq!(checked, 31, "the EX + NG mutating routes");
     assert!(h.events_of("step_up.refused").is_empty());
 }
 

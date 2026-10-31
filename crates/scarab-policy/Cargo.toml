@@ -4,16 +4,28 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
-# ADR-0075 spike: the CEL subset type checker for Policy rules. A pure crate:
-# no I/O, no clock, no RNG.
+# ADR-0075: the policy engine (Policy IR, the CEL subset type checker, the
+# evaluator and the PolicyStore port). A pure crate: no I/O, no clock, no RNG.
 [dependencies]
 cel = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# Admitted per ADR-0031 (I/O-free library). Both are already in the tree as
-# dependencies of `cel` itself, at these versions, so naming them adds no crate:
-# `regex` compiles a `matches()` pattern when the rule is checked, with the same
-# engine `cel` evaluates it with; `chrono` builds the `cel::Value::Timestamp`
-# a checkpoint's `time` is bound as. Neither reads the clock here.
-regex = "1"
-chrono = { version = "0.4", default-features = false, features = ["alloc", "serde"] }
+thiserror = { workspace = true }
+# The `PolicyStore` port is an async trait, as every store port is.
+async-trait = { workspace = true }
+# The bracket-depth pre-check and the CEL thread's stack size are the
+# pipeline's (`scarab_pipeline::cel`), so a `when:` and a Policy rule are
+# held to one measured limit. A pure crate.
+scarab-pipeline = { workspace = true }
+# Admitted per ADR-0031 (I/O-free library, listed for pure crates in the
+# root manifest): a Policy's content hash and the PolicySetDigest (ADR-0075
+# §9, §11) are SHA-256 over canonical JSON, domain facts a decision records.
+sha2 = { workspace = true }
+# Admitted per ADR-0031 (I/O-free library, listed for pure crates in the
+# root manifest). Both are already in the tree as dependencies of `cel`
+# itself, so naming them adds no crate: `regex` compiles a `matches()`
+# pattern, at check time and once per evaluation, with the engine `cel`
+# evaluates it with; `chrono` builds the `cel::Value::Timestamp` a
+# checkpoint's `time` is bound as. Neither reads the clock here.
+regex = { workspace = true }
+chrono = { workspace = true }

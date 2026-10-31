@@ -114,6 +114,36 @@ impl Api {
         })
     }
 
+    /// POST `body` to `path` and parse the JSON answer. Any failure is
+    /// printed (see [`print_failure`]) and comes back as the exit code 1.
+    pub async fn post_json(&self, path: &str, body: &Value) -> Result<Value, i32> {
+        let url = self.url(path);
+        let mut req = self.client.post(&url).json(body);
+        if let Some(t) = &self.token {
+            req = req.bearer_auth(t);
+        }
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!(
+                    "error: {}",
+                    sanitize(&format!("request to {url} failed: {e}"))
+                );
+                return Err(1);
+            }
+        };
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        if !(200..300).contains(&status) {
+            print_failure(&format!("POST {path}"), &self.base, status, &text);
+            return Err(1);
+        }
+        serde_json::from_str(&text).map_err(|e| {
+            eprintln!("error: POST {path}: not JSON: {e}");
+            1
+        })
+    }
+
     /// GET `path` and parse the JSON answer; a failure comes back unprinted,
     /// so a caller that retries can decide what is worth giving up on.
     async fn try_get_json(&self, path: &str) -> Result<Value, GetFailure> {

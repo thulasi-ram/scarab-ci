@@ -31,3 +31,5 @@ axum = { workspace = true }
 # pure computation over a lazy pool that never connects.
 scarab-secrets-postgres = { workspace = true }
 sqlx = { workspace = true }
+# `tests/validate.rs`: an org Policy stored in the in-memory PolicyStore.
+scarab-policy = { workspace = true }

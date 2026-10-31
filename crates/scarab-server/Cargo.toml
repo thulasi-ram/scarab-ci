@@ -56,6 +56,8 @@ scarab-identity = { workspace = true }
 scarab-secrets = { workspace = true }
 scarab-storage = { workspace = true }
 scarab-project = { workspace = true }
+# ADR-0075: the policy engine and its PolicyStore port, consulted at run.create.
+scarab-policy = { workspace = true }
 # ADR-0072: PluginInstallations, the report wire shape and its rules, and the
 # PluginStore / PluginTokenVerifier ports the broker and admin API speak.
 scarab-plugin = { workspace = true }

@@ -604,6 +604,14 @@ pub trait IdentityStore: Send + Sync {
         base_id: &str,
         now_ms: i64,
     ) -> Result<String, IdentityError>;
+    /// The Principal pinned to `(provider, external_id)`, if any. A lookup
+    /// only: it never mints, claims or refreshes. Merges are not followed;
+    /// pass the id to [`resolve_principal`].
+    async fn pinned(
+        &self,
+        provider: &str,
+        external_id: &str,
+    ) -> Result<Option<String>, IdentityError>;
     /// The Principal record for `id`, if one was ever minted.
     async fn principal(&self, id: &str) -> Result<Option<PrincipalRecord>, IdentityError>;
     /// Every identity pinned to Principal `id`, ordered by provider.

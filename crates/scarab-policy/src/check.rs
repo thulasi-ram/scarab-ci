@@ -9,7 +9,10 @@
 //! list's element type.
 //!
 //! The subset: field access, `has()`, literals (scalars, lists, maps),
-//! `==` `!=` `<` `<=` `>` `>=`, `&&` `||` `!` `?:`, `in` on lists and maps,
+//! `==` `!=` `<` `<=` `>` `>=` on scalars, enums, timestamps and durations
+//! (comparing lists, maps or structs is refused: one comparison would walk
+//! the whole value), `&&` `||` `!` `?:`, `in` on lists and maps with a
+//! scalar on the left,
 //! `startsWith` `endsWith` `contains` `matches` (literal pattern, compiled
 //! here), `size`, `timestamp('<literal>')` and `duration('<literal>')`, and
 //! `exists` `all` `exists_one` over lists. Anything else, `+` on strings
@@ -19,10 +22,27 @@
 //! `cap × (predicate + 1)`, where `cap` is the list's declared size cap (a
 //! literal list's length); `x in list` adds the list's cap. Nested macros
 //! multiply. The bound is the worst case: every macro iterating every element,
-//! short-circuits ignored. String functions cost 1 regardless of string length;
-//! that is sound only while checkpoint inputs bound their strings, which this
-//! spike does not enforce.
+//! short-circuits ignored. Costs saturate at `u64::MAX` rather than wrap. String
+//! functions cost 1: every string of a checkpoint input is capped (at most
+//! [`MAX_STRING_LEN`](crate::schema::MAX_STRING_LEN) or
+//! [`MAX_FREE_TEXT_LEN`](crate::schema::MAX_FREE_TEXT_LEN) bytes, refused
+//! when an input is bound), and a literal is at most the rule's length, so one
+//! call scans a bounded string. `matches()` costs 2 because its pattern is
+//! compiled once per evaluation, not once per call (`eval::evaluate_when`);
+//! `cel`'s own `matches` compiles on every call and is never the one
+//! evaluated. A rule uses at most [`MAX_PATTERNS`] distinct patterns and a
+//! Policy at most [`MAX_POLICY_PATTERNS`](crate::ir::MAX_POLICY_PATTERNS),
+//! each compiled once per Policy check ([`PolicyPatterns`]) under
+//! [`MAX_PATTERN_BYTES`], so compiling them is bounded too.
+//!
+//! **Stack.** Parsing, checking and evaluating run on a thread with a large
+//! stack ([`on_cel_stack`]), after a length and bracket-depth pre-check: a
+//! stack overflow aborts the process and `catch_unwind` cannot stop it, and a
+//! Policy save runs this checker on user input inside the server. Nothing that
+//! holds a parsed AST leaves that thread, since dropping the tree recurses
+//! too: [`Checked`] keeps the source, and evaluation parses it again.
 
+use std::collections::BTreeSet;
 use std::fmt;
 
 use cel::common::ast::{
@@ -64,9 +84,14 @@ const TYPE_NAMES: &[&str] = &[
 ];
 
 /// A rule's checked expression, or a finding about it.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Diagnostic {
-    /// 1-based line and column of the node, when the parser recorded one.
+    /// Where in the Policy the finding is, e.g. `rules[0].when` or `match`.
+    /// Empty for a finding of [`check`] alone, which sees one rule.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub at: String,
+    /// 1-based line and column of the node, when the parser recorded one; 0
+    /// for a finding that is not about CEL.
     pub line: u32,
     pub column: u32,
     /// The sub-expression the finding is about, as the checker renders it.
@@ -74,8 +99,27 @@ pub struct Diagnostic {
     pub message: String,
 }
 
+impl Diagnostic {
+    /// A finding about the Policy's structure, not about a CEL expression.
+    pub fn at(at: impl Into<String>, message: impl Into<String>) -> Diagnostic {
+        Diagnostic {
+            at: at.into(),
+            line: 0,
+            column: 0,
+            expr: String::new(),
+            message: message.into(),
+        }
+    }
+}
+
 impl fmt::Display for Diagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if !self.at.is_empty() {
+            write!(f, "{}: ", self.at)?;
+        }
+        if self.line == 0 {
+            return f.write_str(&self.message);
+        }
         write!(
             f,
             "{}:{}: `{}`: {}",
@@ -84,25 +128,86 @@ impl fmt::Display for Diagnostic {
     }
 }
 
-/// A rule that type-checked.
-#[derive(Debug)]
+/// A rule that type-checked. It keeps the source, not the parsed program:
+/// evaluation parses it again on the large-stack thread (see the module
+/// documentation).
+#[derive(Clone, Debug, PartialEq)]
 pub struct Checked {
-    pub program: cel::Program,
+    pub source: String,
     pub result: Type,
     pub cost: u64,
     pub warnings: Vec<Diagnostic>,
+    /// The checkpoint fields the rule reads: each top-level variable, and
+    /// `variable.field` for a field selected from it directly (`trigger`,
+    /// `trigger.ref`). Fields read through an iteration variable count
+    /// towards the list variable (`steps`).
+    pub reads: BTreeSet<String>,
+    /// The distinct `matches()` patterns the rule uses.
+    pub patterns: BTreeSet<String>,
+}
+
+/// Runs `f` on a thread whose stack holds the deepest rule the limits allow
+/// (`scarab_pipeline::cel::CEL_STACK_BYTES`: 256 MiB reserved in a debug
+/// build, 64 MiB in release; only touched pages are committed). A panic on
+/// that thread, or failing to start it, is an `Err` with a short reason.
+pub fn on_cel_stack<T: Send>(f: impl FnOnce() -> T + Send) -> Result<T, String> {
+    std::thread::scope(|scope| {
+        let handle = std::thread::Builder::new()
+            .name("scarab-policy-cel".into())
+            .stack_size(scarab_pipeline::cel::CEL_STACK_BYTES)
+            .spawn_scoped(scope, f)
+            .map_err(|e| format!("cannot start the policy thread: {e}"))?;
+        handle
+            .join()
+            .map_err(|_| "the policy thread panicked".to_string())
+    })
 }
 
 /// Parses `source` and checks it against `schema`, expecting `expected` (bool
 /// for a `when`; [`Type::Dyn`] accepts any result type).
 pub fn check(schema: &Schema, source: &str, expected: &Type) -> Result<Checked, Vec<Diagnostic>> {
+    check_in(schema, source, expected, &mut PolicyPatterns::default())
+}
+
+/// The `matches()` patterns one Policy's rules have used so far, each with
+/// its compile error if it has one. A pattern is compiled the first time any
+/// rule of the Policy uses it, and the Policy's cap
+/// ([`MAX_POLICY_PATTERNS`](crate::ir::MAX_POLICY_PATTERNS)) is applied
+/// before compiling one more, so checking a Policy compiles at most that
+/// many patterns whatever its rules repeat.
+#[derive(Debug, Default)]
+pub struct PolicyPatterns {
+    seen: std::collections::BTreeMap<String, Option<String>>,
+}
+
+/// [`check`], as one rule of a Policy whose earlier rules used `patterns`.
+pub fn check_in(
+    schema: &Schema,
+    source: &str,
+    expected: &Type,
+    patterns: &mut PolicyPatterns,
+) -> Result<Checked, Vec<Diagnostic>> {
+    check_limits(source)?;
+    on_cel_stack(|| check_on_this_thread(schema, source, expected, patterns))
+        .unwrap_or_else(|e| Err(vec![at_start(source, format!("does not parse: {e}"))]))
+}
+
+fn check_on_this_thread(
+    schema: &Schema,
+    source: &str,
+    expected: &Type,
+    policy_patterns: &mut PolicyPatterns,
+) -> Result<Checked, Vec<Diagnostic>> {
     let program = parse(source)?;
     let mut checker = Checker {
         schema,
+        policy_patterns,
         info: program.source_info(),
         scopes: Vec::new(),
         guards: Vec::new(),
         warnings: Vec::new(),
+        reads: BTreeSet::new(),
+        patterns: BTreeSet::new(),
         depth: 0,
     };
     let root = program.expression();
@@ -122,41 +227,99 @@ pub fn check(schema: &Schema, source: &str, expected: &Type) -> Result<Checked, 
             ),
         )]);
     }
-    let warnings = checker.warnings;
+    let Checker {
+        warnings,
+        reads,
+        patterns,
+        ..
+    } = checker;
     Ok(Checked {
-        program,
+        source: source.to_string(),
         result,
         cost,
         warnings,
+        reads,
+        patterns,
     })
 }
 
-/// Parses with the standard macros, containing a parser panic as a parse error.
-///
-/// A stack overflow is not a panic: it aborts the process. `cel` 0.15 stops
-/// nesting such as `((((…` at a depth of 96, but a left-recursive chain
-/// (`a.b.b.b…`, `x + x + x…`) of about 5,000 links overflows a 2 MiB thread
-/// in a release build, in the parser or in dropping the AST. The length cap
-/// keeps a rule well under that.
-pub(crate) fn parse(source: &str) -> Result<cel::Program, Vec<Diagnostic>> {
-    let at_start = |message: String| Diagnostic {
+fn at_start(source: &str, message: String) -> Diagnostic {
+    Diagnostic {
+        at: String::new(),
         line: 1,
         column: 1,
         expr: source.chars().take(60).collect(),
         message,
-    };
-    if source.len() > MAX_SOURCE_LEN {
-        return Err(vec![at_start(format!(
-            "a rule is at most {MAX_SOURCE_LEN} bytes; this one is {}",
-            source.len()
-        ))]);
     }
+}
+
+/// Refuses, before parsing, a rule the parser could not handle safely: longer
+/// than [`MAX_SOURCE_LEN`], or with brackets nested deeper than
+/// [`MAX_DEPTH`] (counted as `scarab-pipeline` counts them, outside string
+/// literals and comments).
+pub(crate) fn check_limits(source: &str) -> Result<(), Vec<Diagnostic>> {
+    if source.len() > MAX_SOURCE_LEN {
+        return Err(vec![at_start(
+            source,
+            format!(
+                "a rule is at most {MAX_SOURCE_LEN} bytes; this one is {}",
+                source.len()
+            ),
+        )]);
+    }
+    let depth = scarab_pipeline::cel::max_nesting(source);
+    if depth > MAX_DEPTH as usize {
+        return Err(vec![at_start(
+            source,
+            format!("brackets nest {depth} deep; the limit is {MAX_DEPTH}"),
+        )]);
+    }
+    Ok(())
+}
+
+/// Parses with the standard macros, containing a parser panic as a parse
+/// error. Call it only on the [`on_cel_stack`] thread, after
+/// [`check_limits`].
+///
+/// A stack overflow is not a panic: it aborts the process. In a debug build
+/// `cel` 0.15's parser overflows a 2 MiB thread at about 12 nested
+/// parentheses; in release a left-recursive chain (`a.b.b.b…`, `x + x + x…`)
+/// of about 5,000 links does, in the parser or in dropping the AST.
+pub(crate) fn parse(source: &str) -> Result<cel::Program, Vec<Diagnostic>> {
     let parsed = std::panic::catch_unwind(|| cel::Program::compile(source));
     match parsed {
         Ok(Ok(program)) => Ok(program),
-        Ok(Err(errors)) => Err(vec![at_start(format!("does not parse: {errors}"))]),
-        Err(_) => Err(vec![at_start("does not parse".to_string())]),
+        Ok(Err(errors)) => Err(vec![at_start(source, format!("does not parse: {errors}"))]),
+        Err(_) => Err(vec![at_start(source, "does not parse".to_string())]),
     }
+}
+
+/// The most memory a `matches()` pattern may compile to.
+pub const MAX_PATTERN_BYTES: usize = 1 << 20;
+
+/// The most distinct `matches()` patterns one rule may use. Each is compiled
+/// when the rule is checked and again once per evaluation, and a pattern
+/// under [`MAX_PATTERN_BYTES`] can take milliseconds to compile.
+pub const MAX_PATTERNS: usize = 8;
+
+/// How many `matches()` patterns this process has compiled, at check time
+/// and at evaluation: what the regression tests for one compile per pattern
+/// count.
+static REGEX_COMPILES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[doc(hidden)]
+pub fn regex_compiles() -> u64 {
+    REGEX_COMPILES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Compiles a `matches()` pattern, under [`MAX_PATTERN_BYTES`]: at check
+/// time to validate it, and at evaluation once per pattern
+/// (`eval::evaluate_when`).
+pub(crate) fn pattern(p: &str) -> Result<regex::Regex, regex::Error> {
+    REGEX_COMPILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    regex::RegexBuilder::new(p)
+        .size_limit(MAX_PATTERN_BYTES)
+        .build()
 }
 
 /// Which standard macro a comprehension was expanded from.
@@ -205,12 +368,18 @@ impl MacroKind {
 
 struct Checker<'a> {
     schema: &'a Schema,
+    /// The patterns the Policy's rules have used, this one included.
+    policy_patterns: &'a mut PolicyPatterns,
     info: &'a SourceInfo,
     /// Iteration variables in scope, innermost last.
     scopes: Vec<(String, Type)>,
     /// Paths known present here: `has(a.b)` or `a != null` held on the way in.
     guards: Vec<String>,
     warnings: Vec<Diagnostic>,
+    /// See [`Checked::reads`].
+    reads: BTreeSet<String>,
+    /// See [`Checked::patterns`].
+    patterns: BTreeSet<String>,
     depth: u32,
 }
 
@@ -224,6 +393,7 @@ impl Checker<'_> {
             .map(|(start, _)| line_col(&self.info.source, start as usize))
             .unwrap_or((1, 1));
         Diagnostic {
+            at: String::new(),
             line,
             column,
             expr: render(e),
@@ -259,13 +429,13 @@ impl Checker<'_> {
                     return Err(self.unsupported(e, "an optional list element"));
                 }
                 let mut elem = Type::Dyn;
-                let mut cost = 1;
+                let mut cost: u64 = 1;
                 for item in &list.elements {
                     let (t, c) = self.expr(item)?;
                     elem = unify(&elem, &t).ok_or_else(|| {
                         self.unsupported(item, &format!("a list mixing {elem} and {t}"))
                     })?;
-                    cost += c;
+                    cost = cost.saturating_add(c);
                 }
                 let cap = list.elements.len() as u64;
                 Ok((
@@ -299,7 +469,7 @@ impl Checker<'_> {
                             &format!("a map mixing {value} and {v} values"),
                         )
                     })?;
-                    cost += kc + vc;
+                    cost = add(&[cost, kc, vc]);
                 }
                 let cap = map.entries.len() as u64;
                 Ok((
@@ -337,12 +507,15 @@ impl Checker<'_> {
         self.ident_type(e, name)
     }
 
-    fn ident_type(&self, e: &IdedExpr, name: &str) -> Checked1 {
+    fn ident_type(&mut self, e: &IdedExpr, name: &str) -> Checked1 {
         if let Some((_, t)) = self.scopes.iter().rev().find(|(n, _)| n == name) {
             return Ok((t.clone(), 1));
         }
         match self.schema.variable(name) {
-            Some(var) => Ok((var.ty.clone(), 1)),
+            Some(var) => {
+                self.reads.insert(name.to_string());
+                Ok((var.ty.clone(), 1))
+            }
             None if TYPE_NAMES.contains(&name) => {
                 Err(self.unsupported(e, &format!("the type name `{name}`")))
             }
@@ -366,8 +539,19 @@ impl Checker<'_> {
         }
     }
 
+    /// Records `variable.field` when `sel` selects from a top-level variable.
+    fn read_field(&mut self, sel: &SelectExpr) {
+        if let Expr::Ident(name) = &sel.operand.expr {
+            let shadowed = self.scopes.iter().any(|(n, _)| n == name);
+            if !shadowed && self.schema.variable(name).is_some() {
+                self.reads.insert(format!("{name}.{}", sel.field));
+            }
+        }
+    }
+
     fn select(&mut self, e: &IdedExpr, sel: &SelectExpr) -> Checked1 {
         let (t, cost) = self.expr(&sel.operand)?;
+        self.read_field(sel);
         match &t {
             Type::Struct(name) => {
                 let decl = self.schema.struct_decl(name);
@@ -399,10 +583,10 @@ impl Checker<'_> {
                         self.warnings.push(w);
                     }
                 }
-                Ok((field.ty, cost + 1))
+                Ok((field.ty, add(&[cost, 1])))
             }
             Type::Map { key, value, .. } if matches!(**key, Type::String | Type::Dyn) => {
-                Ok(((**value).clone(), cost + 1))
+                Ok(((**value).clone(), add(&[cost, 1])))
             }
             other => Err(self.diag(e, format!("cannot select a field from {other}"))),
         }
@@ -410,6 +594,7 @@ impl Checker<'_> {
 
     fn has(&mut self, e: &IdedExpr, sel: &SelectExpr) -> Checked1 {
         let (t, cost) = self.expr(&sel.operand)?;
+        self.read_field(sel);
         match &t {
             Type::Struct(name) => {
                 let decl = self.schema.struct_decl(name);
@@ -425,10 +610,10 @@ impl Checker<'_> {
                         ),
                     ));
                 }
-                Ok((Type::Bool, cost + 1))
+                Ok((Type::Bool, add(&[cost, 1])))
             }
             Type::Map { key, .. } if matches!(**key, Type::String | Type::Dyn) => {
-                Ok((Type::Bool, cost + 1))
+                Ok((Type::Bool, add(&[cost, 1])))
             }
             other => Err(self.diag(e, format!("has() needs a struct or map field, not {other}"))),
         }
@@ -472,12 +657,12 @@ impl Checker<'_> {
                 };
                 let (tb, cb) = self.with_guards(facts, b)?;
                 self.expect(b, &tb, &Type::Bool)?;
-                Ok((Type::Bool, ca + cb + 1))
+                Ok((Type::Bool, add(&[ca, cb, 1])))
             }
             (operators::LOGICAL_NOT, None, [a]) => {
                 let (t, c) = self.expr(a)?;
                 self.expect(a, &t, &Type::Bool)?;
-                Ok((Type::Bool, c + 1))
+                Ok((Type::Bool, add(&[c, 1])))
             }
             (operators::CONDITIONAL, None, [cond, then, otherwise]) => {
                 let (tc, cc) = self.expr(cond)?;
@@ -490,13 +675,13 @@ impl Checker<'_> {
                         format!("both branches must have one type: {tt} and {te}"),
                     )
                 })?;
-                Ok((t, cc + ct.max(ce) + 1))
+                Ok((t, add(&[cc, ct.max(ce), 1])))
             }
             (operators::EQUALS, None, [a, b]) | (operators::NOT_EQUALS, None, [a, b]) => {
                 let (ta, ca) = self.equality_side(a)?;
                 let (tb, cb) = self.equality_side(b)?;
                 self.equatable(e, a, &ta, b, &tb)?;
-                Ok((Type::Bool, ca + cb + 1))
+                Ok((Type::Bool, add(&[ca, cb, 1])))
             }
             (
                 operators::LESS
@@ -526,7 +711,7 @@ impl Checker<'_> {
                 if !ordered(&ta) || !ordered(&tb) || !same {
                     return Err(self.diag(e, format!("cannot order {ta} against {tb}")));
                 }
-                Ok((Type::Bool, ca + cb + 1))
+                Ok((Type::Bool, add(&[ca, cb, 1])))
             }
             (operators::IN, None, [needle, haystack]) => {
                 let (tn, cn) = self.expr(needle)?;
@@ -540,6 +725,9 @@ impl Checker<'_> {
                         )
                     }
                 };
+                if let Some(what) = composite(&tn) {
+                    return Err(self.unsupported(e, &format!("comparing {what} (with `in`)")));
+                }
                 if !equatable(&tn, &elem) {
                     return Err(self.diag(e, format!("cannot look for {tn} in {th}")));
                 }
@@ -548,7 +736,7 @@ impl Checker<'_> {
                         self.enum_literal(item, name)?;
                     }
                 }
-                Ok((Type::Bool, cn + ch + cap + 1))
+                Ok((Type::Bool, add(&[cn, ch, cap, 1])))
             }
             ("size", None, [x]) | ("size", Some(x), []) => {
                 let (t, c) = self.expr(x)?;
@@ -557,7 +745,7 @@ impl Checker<'_> {
                     | Type::Enum(_)
                     | Type::Bytes
                     | Type::List { .. }
-                    | Type::Map { .. } => Ok((Type::Int, c + 1)),
+                    | Type::Map { .. } => Ok((Type::Int, add(&[c, 1]))),
                     other => Err(self.diag(
                         e,
                         format!("size() needs a string, bytes, list or map, not {other}"),
@@ -573,7 +761,7 @@ impl Checker<'_> {
                         format!("{f}() is a string function: called on {tr} with {ta}"),
                     ));
                 }
-                Ok((Type::Bool, cr + ca + 1))
+                Ok((Type::Bool, add(&[cr, ca, 1])))
             }
             ("matches", Some(recv), [pattern]) => {
                 let (tr, cr) = self.expr(recv)?;
@@ -586,11 +774,47 @@ impl Checker<'_> {
                         "matches() takes a string literal pattern in policies".to_string(),
                     ));
                 };
-                regex::RegexBuilder::new(p.inner())
-                    .size_limit(1 << 20)
-                    .build()
-                    .map_err(|err| self.diag(pattern, format!("invalid pattern: {err}")))?;
-                Ok((Type::Bool, cr + 2))
+                let p: &str = p.inner();
+                if !self.patterns.contains(p) {
+                    // Counted before compiling, so a rule over the cap
+                    // compiles no more than the cap.
+                    if self.patterns.len() >= MAX_PATTERNS {
+                        return Err(self.diag(
+                            pattern,
+                            format!(
+                                "a rule uses at most {MAX_PATTERNS} distinct matches() \
+                                 patterns"
+                            ),
+                        ));
+                    }
+                    let compiled = match self.policy_patterns.seen.get(p) {
+                        Some(compiled) => compiled.clone(),
+                        None => {
+                            // Also counted before compiling: a Policy over
+                            // its cap compiles no more than the cap.
+                            let cap = crate::ir::MAX_POLICY_PATTERNS;
+                            if self.policy_patterns.seen.len() >= cap {
+                                return Err(self.diag(
+                                    pattern,
+                                    format!(
+                                        "a Policy uses at most {cap} distinct matches() \
+                                         patterns across its rules"
+                                    ),
+                                ));
+                            }
+                            let compiled = self::pattern(p).err().map(|e| e.to_string());
+                            self.policy_patterns
+                                .seen
+                                .insert(p.to_string(), compiled.clone());
+                            compiled
+                        }
+                    };
+                    if let Some(err) = compiled {
+                        return Err(self.diag(pattern, format!("invalid pattern: {err}")));
+                    }
+                    self.patterns.insert(p.to_string());
+                }
+                Ok((Type::Bool, add(&[cr, 2])))
             }
             (conv @ ("timestamp" | "duration"), None, [arg]) => {
                 let Expr::Literal(LiteralValue::String(s)) = &arg.expr else {
@@ -659,8 +883,7 @@ impl Checker<'_> {
         self.guards = saved;
         let (tp, cp) = r?;
         self.expect(predicate, &tp, &Type::Bool)?;
-        let cost = rc.saturating_add(cap.saturating_mul(cp.saturating_add(1)));
-        Ok((Type::Bool, cost))
+        Ok((Type::Bool, add(&[rc, cap.saturating_mul(add(&[cp, 1]))])))
     }
 
     fn expect(&self, e: &IdedExpr, actual: &Type, expected: &Type) -> Result<(), Diagnostic> {
@@ -700,6 +923,11 @@ impl Checker<'_> {
                 return Ok(());
             }
         }
+        // One comparison of two lists, maps or structs walks both values to
+        // their leaves, while the cost bound counts it as one node.
+        if let Some(what) = composite(ta).or_else(|| composite(tb)) {
+            return Err(self.unsupported(e, &format!("comparing {what}")));
+        }
         if !equatable(ta, tb) {
             return Err(self.diag(e, format!("cannot compare {ta} with {tb}")));
         }
@@ -733,6 +961,13 @@ impl Checker<'_> {
     }
 }
 
+/// The sum of cost parts, saturating at `u64::MAX`: a release build does not
+/// check overflow, and a wrapped sum would let an unbounded rule under
+/// [`MAX_COST`].
+fn add(parts: &[u64]) -> u64 {
+    parts.iter().fold(0, |sum, c| sum.saturating_add(*c))
+}
+
 fn literal_type(lit: &LiteralValue) -> Type {
     match lit {
         LiteralValue::Boolean(_) => Type::Bool,
@@ -742,6 +977,16 @@ fn literal_type(lit: &LiteralValue) -> Type {
         LiteralValue::Null => Type::Null,
         LiteralValue::String(_) => Type::String,
         LiteralValue::UInt(_) => Type::Uint,
+    }
+}
+
+/// What `==`, `!=` and `in` refuse to compare, named for the message.
+fn composite(t: &Type) -> Option<&'static str> {
+    match t {
+        Type::List { .. } => Some("lists"),
+        Type::Map { .. } => Some("maps"),
+        Type::Struct(_) => Some("structs"),
+        _ => None,
     }
 }
 

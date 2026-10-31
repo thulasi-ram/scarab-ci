@@ -30,6 +30,7 @@ use scarab_testkit::{FakeClock, FakeForge, InMemoryObjectStore};
 fn push() -> Event {
     Event::Push {
         actor: "octocat".into(),
+        actor_id: String::new(),
         repo: RepoRef {
             owner: "acme".into(),
             name: "web".into(),
@@ -113,9 +114,15 @@ async fn runs_list_filters_by_the_deploy_marker() {
             "on: { push: {} }\nenvironment: production\nsteps: [{ id: curl, image: curl }]",
         );
     let clock = FakeClock::new(1_000);
-    let runs = trigger_run_from_event(&forge, pg.as_ref(), &clock, None, &push())
-        .await
-        .expect("trigger");
+    let runs = trigger_run_from_event(
+        &forge,
+        pg.as_ref(),
+        &clock,
+        scarab_server::AdmissionPorts::governance(None),
+        &push(),
+    )
+    .await
+    .expect("trigger");
     assert_eq!(runs.len(), 5, "every pipeline matched");
     let app = app(pg);
 
@@ -192,11 +199,17 @@ async fn a_deploy_run_is_exempt_from_newest_wins_cancel() {
     );
     let clock = FakeClock::new(1_000);
     let trigger = || async {
-        trigger_run_from_event(&forge, pg.as_ref(), &clock, None, &push())
-            .await
-            .expect("trigger")
-            .pop()
-            .expect("one run")
+        trigger_run_from_event(
+            &forge,
+            pg.as_ref(),
+            &clock,
+            scarab_server::AdmissionPorts::governance(None),
+            &push(),
+        )
+        .await
+        .expect("trigger")
+        .pop()
+        .expect("one run")
     };
     let first: RunId = trigger().await;
     clock.advance(1_000);
@@ -225,17 +238,29 @@ async fn a_deploy_run_is_exempt_from_newest_wins_cancel() {
          steps:\n  - { id: build, image: rust }\n  - { id: push, image: crane, needs: [build] }",
     );
     clock.advance(1_000);
-    let older = trigger_run_from_event(&ci, pg.as_ref(), &clock, None, &push())
-        .await
-        .unwrap()
-        .pop()
-        .unwrap();
+    let older = trigger_run_from_event(
+        &ci,
+        pg.as_ref(),
+        &clock,
+        scarab_server::AdmissionPorts::governance(None),
+        &push(),
+    )
+    .await
+    .unwrap()
+    .pop()
+    .unwrap();
     clock.advance(1_000);
-    let newer = trigger_run_from_event(&ci, pg.as_ref(), &clock, None, &push())
-        .await
-        .unwrap()
-        .pop()
-        .unwrap();
+    let newer = trigger_run_from_event(
+        &ci,
+        pg.as_ref(),
+        &clock,
+        scarab_server::AdmissionPorts::governance(None),
+        &push(),
+    )
+    .await
+    .unwrap()
+    .pop()
+    .unwrap();
     assert_eq!(pg.superseded_by(&newer).await.unwrap(), vec![older.clone()]);
     assert_eq!(
         pg.run_concurrency(&older).await.unwrap().unwrap().1,

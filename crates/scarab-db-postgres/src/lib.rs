@@ -37,6 +37,8 @@ mod org_environments;
 /// `PluginStore` (ADR-0072): PluginInstallations, the kill switch, their
 /// PluginConnections and the broker journal.
 mod plugins;
+/// `PolicyStore` (ADR-0075): Policies, their versions, and PolicyDecisions.
+mod policies;
 /// Step-up confirmation (ADR-0073): `PasskeyStore`, `ChallengeStore`,
 /// `StepUpStore` and the append-only `SecurityEventLog`.
 mod step_up;
@@ -4045,6 +4047,22 @@ impl PostgresDb {
 
 #[async_trait]
 impl scarab_identity::IdentityStore for PostgresDb {
+    async fn pinned(
+        &self,
+        provider: &str,
+        external_id: &str,
+    ) -> Result<Option<String>, scarab_identity::IdentityError> {
+        sqlx::query_scalar(
+            "SELECT principal_id FROM principal_identities
+             WHERE provider = $1 AND external_id = $2",
+        )
+        .bind(provider)
+        .bind(external_id)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(identity_err)
+    }
+
     async fn sign_in(
         &self,
         identity: &scarab_identity::ProviderIdentity,

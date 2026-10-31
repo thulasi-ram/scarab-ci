@@ -21,7 +21,7 @@ use axum::routing::MethodRouter;
 use axum::Router;
 
 use crate::step_up::ops::{self, Op};
-use crate::{org_environments as oe, AppState};
+use crate::{org_environments as oe, policies as pol, AppState};
 
 /// One registered (method, path) and how it is governed.
 #[derive(Debug, Clone)]
@@ -373,6 +373,68 @@ pub(crate) fn governed_routes() -> Routes {
             "/v1/orgs/{org}/environment-migration-report/{env}/acknowledge",
             &ops::MIGRATION_ACK,
             oe::acknowledge_environment_migration_report,
+        )
+        // ADR-0075: org Policies, Project typed settings, decisions, the test API.
+        .get("/v1/orgs/{org}/policies", pol::list_org_policies)
+        .post(
+            "/v1/orgs/{org}/policies",
+            &ops::POLICY_CREATE,
+            pol::create_org_policy,
+        )
+        .get("/v1/orgs/{org}/policies/{id}", pol::get_org_policy)
+        .put(
+            "/v1/orgs/{org}/policies/{id}",
+            &ops::POLICY_UPDATE,
+            pol::update_org_policy,
+        )
+        .delete(
+            "/v1/orgs/{org}/policies/{id}",
+            &ops::POLICY_DELETE,
+            pol::delete_org_policy,
+        )
+        .get(
+            "/v1/orgs/{org}/policies/{id}/versions",
+            pol::list_org_policy_versions,
+        )
+        .get(
+            "/v1/orgs/{org}/projects/{project}/policies",
+            pol::list_project_policies,
+        )
+        .post(
+            "/v1/orgs/{org}/projects/{project}/policies",
+            &ops::PROJECT_POLICY_CREATE,
+            pol::create_project_policy,
+        )
+        .get(
+            "/v1/orgs/{org}/projects/{project}/policies/{id}",
+            pol::get_project_policy,
+        )
+        .put(
+            "/v1/orgs/{org}/projects/{project}/policies/{id}",
+            &ops::PROJECT_POLICY_UPDATE,
+            pol::update_project_policy,
+        )
+        .delete(
+            "/v1/orgs/{org}/projects/{project}/policies/{id}",
+            &ops::PROJECT_POLICY_DELETE,
+            pol::delete_project_policy,
+        )
+        .get(
+            "/v1/orgs/{org}/projects/{project}/policies/{id}/versions",
+            pol::list_project_policy_versions,
+        )
+        .post(
+            "/v1/orgs/{org}/policy-test",
+            &ops::POLICY_TEST,
+            pol::policy_test,
+        )
+        .get(
+            "/v1/orgs/{org}/policy-decisions",
+            pol::list_org_policy_decisions,
+        )
+        .get(
+            "/v1/runs/{id}/policy-decisions",
+            pol::list_run_policy_decisions,
         )
         .get("/v1/orgs/{org}/plugin-catalog", plugins::plugin_catalog)
         .get("/v1/orgs/{org}/plugins", plugins::list_plugins)

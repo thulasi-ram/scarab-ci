@@ -1201,6 +1201,97 @@ pub static STEP_UP_REQUEST_CONFIRM: Op = op(
     &[],
 );
 
+// --- Policies (ADR-0075 §10) ------------------------------------------------
+//
+// Op ids say `policy.*`, never a checkpoint name: `run.create` is already the
+// id of POST /v1/runs.
+
+pub static POLICY_CREATE: Op = op(
+    "policy.create",
+    "Add an org Policy",
+    Class::Exempt("adding a Policy tightens"),
+    "ADR-0075 §10",
+    ADMIN,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org", "body:/policy/name"],
+);
+pub static POLICY_UPDATE: Op = op(
+    "policy.update",
+    "Change an org Policy",
+    Class::Conditional {
+        mode: W,
+        rule: "ADR-0075 §10: any change to an enforced Policy; none to an audit-mode one",
+    },
+    "ADR-0075 §10",
+    ADMIN,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org", "path:id"],
+);
+pub static POLICY_DELETE: Op = op(
+    "policy.delete",
+    "Delete an org Policy",
+    Class::Conditional {
+        mode: W,
+        rule: "ADR-0075 §10: deleting an enforced Policy; not an audit-mode one",
+    },
+    "ADR-0075 §10",
+    ADMIN,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org", "path:id"],
+);
+pub static PROJECT_POLICY_CREATE: Op = op(
+    "project_policy.create",
+    "Add a Project typed setting",
+    Class::Exempt("adding a Policy tightens"),
+    "ADR-0075 §10",
+    ADMIN,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org", "path:project", "body:/policy/name"],
+)
+.in_project(ProjectOf::Path("project"));
+pub static PROJECT_POLICY_UPDATE: Op = op(
+    "project_policy.update",
+    "Change a Project typed setting",
+    Class::Conditional {
+        mode: W,
+        rule: "ADR-0075 §10: any change to an enforced Policy; none to an audit-mode one",
+    },
+    "ADR-0075 §10",
+    ADMIN,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org", "path:project", "path:id"],
+)
+.in_project(ProjectOf::Path("project"));
+pub static PROJECT_POLICY_DELETE: Op = op(
+    "project_policy.delete",
+    "Delete a Project typed setting",
+    Class::Conditional {
+        mode: W,
+        rule: "ADR-0075 §10: deleting an enforced Policy; not an audit-mode one",
+    },
+    "ADR-0075 §10",
+    ADMIN,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org", "path:project", "path:id"],
+)
+.in_project(ProjectOf::Path("project"));
+pub static POLICY_TEST: Op = op(
+    "policy.test",
+    "Test Policies",
+    Class::NotGoverned("evaluates without enforcing or recording"),
+    "ADR-0075 §9",
+    ANYONE,
+    OrgOf::Path("org"),
+    &[],
+    &["path:org"],
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;

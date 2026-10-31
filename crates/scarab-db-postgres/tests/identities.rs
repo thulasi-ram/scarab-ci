@@ -157,6 +157,14 @@ async fn pin_mints_unclaimed_and_sign_in_claims_it() {
     let held = db.identities_of(&carol).await.unwrap();
     assert_eq!(held[0].handle, "carol-renamed");
     assert_eq!(held[0].email.as_deref(), Some("carol@example.com"));
+
+    // `pinned` finds the Principal by the immutable id alone (a webhook
+    // actor's lookup, ADR-0075 §2) and never mints: an unknown account, or
+    // a known id on another provider, is none.
+    assert_eq!(db.pinned("github", "3003").await.unwrap(), Some(carol));
+    assert_eq!(db.pinned("github", "9999").await.unwrap(), None);
+    assert_eq!(db.pinned("okta", "3003").await.unwrap(), None);
+    assert!(db.principal("github:9999").await.unwrap().is_none());
     tdb.cleanup().await;
 }
 

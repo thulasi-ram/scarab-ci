@@ -74,6 +74,7 @@ async fn env_store(allowed_refs: &[&str]) -> InMemoryEnvironmentGovernance {
 fn push(branch: &str) -> Event {
     Event::Push {
         actor: "octocat".into(),
+        actor_id: String::new(),
         repo: repo(),
         r#ref: format!("refs/heads/{branch}"),
         // A REAL commit SHA — the value pre-fix wrongly matched against allowed_refs.
@@ -98,9 +99,15 @@ async fn push_on_allowed_branch_is_admitted_matching_the_branch_not_the_sha() {
     let (forge, db, clock) = setup();
     let envs = env_store(&["refs/heads/main"]).await;
 
-    let runs = trigger_run_from_event(&forge, &db, &clock, Some(&envs), &push("main"))
-        .await
-        .expect("trigger");
+    let runs = trigger_run_from_event(
+        &forge,
+        &db,
+        &clock,
+        scarab_server::AdmissionPorts::governance(Some(&envs)),
+        &push("main"),
+    )
+    .await
+    .expect("trigger");
     assert_eq!(
         runs.len(),
         1,
@@ -128,9 +135,15 @@ async fn push_on_disallowed_branch_is_denied() {
     let (forge, db, clock) = setup();
     let envs = env_store(&["refs/heads/main"]).await;
 
-    let runs = trigger_run_from_event(&forge, &db, &clock, Some(&envs), &push("feature"))
-        .await
-        .expect("trigger");
+    let runs = trigger_run_from_event(
+        &forge,
+        &db,
+        &clock,
+        scarab_server::AdmissionPorts::governance(Some(&envs)),
+        &push("feature"),
+    )
+    .await
+    .expect("trigger");
     assert!(
         runs.is_empty(),
         "a push on refs/heads/feature is denied a main-scoped env"
@@ -143,9 +156,15 @@ async fn empty_allowed_refs_admits_any_push() {
     let (forge, db, clock) = setup();
     let envs = env_store(&[]).await;
 
-    let runs = trigger_run_from_event(&forge, &db, &clock, Some(&envs), &push("anything"))
-        .await
-        .expect("trigger");
+    let runs = trigger_run_from_event(
+        &forge,
+        &db,
+        &clock,
+        scarab_server::AdmissionPorts::governance(Some(&envs)),
+        &push("anything"),
+    )
+    .await
+    .expect("trigger");
     assert_eq!(runs.len(), 1, "an unrestricted env admits any branch");
 }
 
@@ -159,6 +178,7 @@ async fn pull_request_is_denied_a_branch_scoped_environment() {
 
     let pr = Event::PullRequest {
         actor: "octocat".into(),
+        actor_id: String::new(),
         repo: repo(),
         number: 7,
         head: "1234567890abcdef1234567890abcdef12345678".into(),
@@ -166,9 +186,15 @@ async fn pull_request_is_denied_a_branch_scoped_environment() {
         base: "main".into(),
         fork: false,
     };
-    let runs = trigger_run_from_event(&forge, &db, &clock, Some(&envs), &pr)
-        .await
-        .expect("trigger");
+    let runs = trigger_run_from_event(
+        &forge,
+        &db,
+        &clock,
+        scarab_server::AdmissionPorts::governance(Some(&envs)),
+        &pr,
+    )
+    .await
+    .expect("trigger");
     assert!(
         runs.is_empty(),
         "a PR's refs/pull/7/head doesn't match refs/heads/main"
@@ -183,6 +209,7 @@ async fn pull_request_admitted_when_env_opts_in_via_pull_glob() {
 
     let pr = Event::PullRequest {
         actor: "octocat".into(),
+        actor_id: String::new(),
         repo: repo(),
         number: 7,
         head: "1234567890abcdef1234567890abcdef12345678".into(),
@@ -190,9 +217,15 @@ async fn pull_request_admitted_when_env_opts_in_via_pull_glob() {
         base: "main".into(),
         fork: false,
     };
-    let runs = trigger_run_from_event(&forge, &db, &clock, Some(&envs), &pr)
-        .await
-        .expect("trigger");
+    let runs = trigger_run_from_event(
+        &forge,
+        &db,
+        &clock,
+        scarab_server::AdmissionPorts::governance(Some(&envs)),
+        &pr,
+    )
+    .await
+    .expect("trigger");
     assert_eq!(runs.len(), 1, "refs/pull/* opts PRs into the env");
 }
 
@@ -206,9 +239,15 @@ async fn push_into_a_require_reason_env_is_exempt() {
     protection.require_reason = true;
     let envs = migrated(protection);
 
-    let runs = trigger_run_from_event(&forge, &db, &clock, Some(&envs), &push("main"))
-        .await
-        .expect("trigger");
+    let runs = trigger_run_from_event(
+        &forge,
+        &db,
+        &clock,
+        scarab_server::AdmissionPorts::governance(Some(&envs)),
+        &push("main"),
+    )
+    .await
+    .expect("trigger");
     assert_eq!(
         runs.len(),
         1,

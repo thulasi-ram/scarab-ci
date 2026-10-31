@@ -2703,6 +2703,7 @@ dependencies = [
  "scarab-forge",
  "scarab-identity",
  "scarab-pipeline",
+ "scarab-policy",
  "scarab-secrets-postgres",
  "scarab-server",
  "scarab-testkit",
@@ -2722,6 +2723,7 @@ dependencies = [
  "scarab-identity",
  "scarab-pipeline",
  "scarab-plugin",
+ "scarab-policy",
  "scarab-project",
  "scarab-storage",
  "scarab-storage-s3",
@@ -2857,6 +2859,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "thiserror",
 ]
 
@@ -2915,11 +2918,15 @@ dependencies = [
 name = "scarab-policy"
 version = "0.2.2"
 dependencies = [
+ "async-trait",
  "cel",
  "chrono",
  "regex",
+ "scarab-pipeline",
  "serde",
  "serde_json",
+ "sha2",
+ "thiserror",
 ]
 
 [[package]]
@@ -2990,6 +2997,7 @@ dependencies = [
  "scarab-pipeline",
  "scarab-plugin",
  "scarab-plugin-k8s",
+ "scarab-policy",
  "scarab-project",
  "scarab-secrets",
  "scarab-secrets-postgres",
@@ -3054,6 +3062,7 @@ dependencies = [
  "scarab-forge",
  "scarab-identity",
  "scarab-pipeline",
+ "scarab-policy",
  "scarab-project",
  "scarab-secrets",
  "scarab-storage",

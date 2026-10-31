@@ -29,6 +29,7 @@ fn repo() -> RepoRef {
 fn push(branch: &str) -> Event {
     Event::Push {
         actor: "octocat".into(),
+        actor_id: String::new(),
         repo: repo(),
         r#ref: format!("refs/heads/{branch}"),
         after: "sha123".into(),
@@ -50,9 +51,15 @@ async fn setup() -> (FakeForge, Arc<InMemoryDb>, Arc<FakeClock>) {
 async fn push_matching_on_push_starts_a_run() {
     let (forge, db, clock) = setup().await;
 
-    let runs = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &push("main"))
-        .await
-        .expect("trigger");
+    let runs = trigger_run_from_event(
+        &forge,
+        db.as_ref(),
+        clock.as_ref(),
+        scarab_server::AdmissionPorts::governance(None),
+        &push("main"),
+    )
+    .await
+    .expect("trigger");
     assert_eq!(runs.len(), 1, "one pipeline matched");
     let run = runs.into_iter().next().unwrap();
 
@@ -80,18 +87,30 @@ async fn run_number_is_per_repo_sequential() {
     let (forge, db, clock) = setup().await;
 
     // Two matching pushes to acme/app → #1 then #2 (per-repo, monotonic).
-    let r1 = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &push("main"))
-        .await
-        .unwrap()
-        .into_iter()
-        .next()
-        .unwrap();
-    let r2 = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &push("main"))
-        .await
-        .unwrap()
-        .into_iter()
-        .next()
-        .unwrap();
+    let r1 = trigger_run_from_event(
+        &forge,
+        db.as_ref(),
+        clock.as_ref(),
+        scarab_server::AdmissionPorts::governance(None),
+        &push("main"),
+    )
+    .await
+    .unwrap()
+    .into_iter()
+    .next()
+    .unwrap();
+    let r2 = trigger_run_from_event(
+        &forge,
+        db.as_ref(),
+        clock.as_ref(),
+        scarab_server::AdmissionPorts::governance(None),
+        &push("main"),
+    )
+    .await
+    .unwrap()
+    .into_iter()
+    .next()
+    .unwrap();
     assert_eq!(db.run_number(&r1).await.unwrap(), Some(1));
     assert_eq!(
         db.run_number(&r2).await.unwrap(),
@@ -103,6 +122,7 @@ async fn run_number_is_per_repo_sequential() {
     // global — no cross-tenant volume leak).
     let other = Event::Push {
         actor: "octocat".into(),
+        actor_id: String::new(),
         repo: RepoRef {
             owner: "acme".into(),
             name: "other".into(),
@@ -111,12 +131,18 @@ async fn run_number_is_per_repo_sequential() {
         after: "sha999".into(),
         message: "init".into(),
     };
-    let r3 = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &other)
-        .await
-        .unwrap()
-        .into_iter()
-        .next()
-        .unwrap();
+    let r3 = trigger_run_from_event(
+        &forge,
+        db.as_ref(),
+        clock.as_ref(),
+        scarab_server::AdmissionPorts::governance(None),
+        &other,
+    )
+    .await
+    .unwrap()
+    .into_iter()
+    .next()
+    .unwrap();
     assert_eq!(
         db.run_number(&r3).await.unwrap(),
         Some(1),
@@ -146,6 +172,7 @@ steps:
 fn pr() -> Event {
     Event::PullRequest {
         actor: "octocat".into(),
+        actor_id: String::new(),
         repo: repo(),
         number: 42,
         head: "prsha456".into(),
@@ -161,9 +188,15 @@ async fn pull_request_run_stamps_pr_title_headline_and_base() {
     let db = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
 
-    let runs = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &pr())
-        .await
-        .expect("trigger");
+    let runs = trigger_run_from_event(
+        &forge,
+        db.as_ref(),
+        clock.as_ref(),
+        scarab_server::AdmissionPorts::governance(None),
+        &pr(),
+    )
+    .await
+    .expect("trigger");
     assert_eq!(runs.len(), 1, "the pull_request trigger matched");
     let run = runs.into_iter().next().unwrap();
 
@@ -202,9 +235,15 @@ async fn committed_scarab_authors_concurrency_and_gate() {
     let db = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
 
-    let runs = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &push("main"))
-        .await
-        .expect("trigger");
+    let runs = trigger_run_from_event(
+        &forge,
+        db.as_ref(),
+        clock.as_ref(),
+        scarab_server::AdmissionPorts::governance(None),
+        &push("main"),
+    )
+    .await
+    .expect("trigger");
     assert_eq!(runs.len(), 1, "one pipeline matched");
     let run = runs.into_iter().next().unwrap();
 
@@ -252,7 +291,7 @@ async fn deploy_pipeline_opts_out_of_supersede() {
         &deploy_forge,
         db.as_ref(),
         clock.as_ref(),
-        None,
+        scarab_server::AdmissionPorts::governance(None),
         &push("main"),
     )
     .await
@@ -264,7 +303,7 @@ async fn deploy_pipeline_opts_out_of_supersede() {
         &deploy_forge,
         db.as_ref(),
         clock.as_ref(),
-        None,
+        scarab_server::AdmissionPorts::governance(None),
         &push("main"),
     )
     .await
@@ -288,7 +327,7 @@ async fn deploy_pipeline_opts_out_of_supersede() {
         &ci_forge,
         cdb.as_ref(),
         cclock.as_ref(),
-        None,
+        scarab_server::AdmissionPorts::governance(None),
         &push("main"),
     )
     .await
@@ -300,7 +339,7 @@ async fn deploy_pipeline_opts_out_of_supersede() {
         &ci_forge,
         cdb.as_ref(),
         cclock.as_ref(),
-        None,
+        scarab_server::AdmissionPorts::governance(None),
         &push("main"),
     )
     .await
@@ -332,11 +371,17 @@ steps:
     let clock = Arc::new(FakeClock::new(1_000));
 
     // Push to main: the guarded deploy step is included and Pending.
-    let run = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &push("main"))
-        .await
-        .expect("trigger")
-        .pop()
-        .unwrap();
+    let run = trigger_run_from_event(
+        &forge,
+        db.as_ref(),
+        clock.as_ref(),
+        scarab_server::AdmissionPorts::governance(None),
+        &push("main"),
+    )
+    .await
+    .expect("trigger")
+    .pop()
+    .unwrap();
     let deploy = db
         .steps_of_run(&run)
         .await
@@ -350,11 +395,17 @@ steps:
     );
 
     // Push to a feature branch: the guard fails, so deploy is present but Skipped.
-    let run = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &push("feature"))
-        .await
-        .expect("trigger")
-        .pop()
-        .unwrap();
+    let run = trigger_run_from_event(
+        &forge,
+        db.as_ref(),
+        clock.as_ref(),
+        scarab_server::AdmissionPorts::governance(None),
+        &push("feature"),
+    )
+    .await
+    .expect("trigger")
+    .pop()
+    .unwrap();
     let deploy = db
         .steps_of_run(&run)
         .await
@@ -395,8 +446,14 @@ steps:
             }
         )
     });
-    let created =
-        trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &push("feature")).await;
+    let created = trigger_run_from_event(
+        &forge,
+        db.as_ref(),
+        clock.as_ref(),
+        scarab_server::AdmissionPorts::governance(None),
+        &push("feature"),
+    )
+    .await;
     assert!(created.is_err(), "the crash was injected");
     assert!(!db.event_append_failure_armed());
     for run in db.list_runs(100).await.unwrap() {
@@ -434,11 +491,17 @@ steps:
     let db = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
 
-    let run = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &push("feature"))
-        .await
-        .expect("trigger")
-        .pop()
-        .unwrap();
+    let run = trigger_run_from_event(
+        &forge,
+        db.as_ref(),
+        clock.as_ref(),
+        scarab_server::AdmissionPorts::governance(None),
+        &push("feature"),
+    )
+    .await
+    .expect("trigger")
+    .pop()
+    .unwrap();
 
     // Drive to terminal.
     let exec = FakeExecutor::new();
@@ -493,9 +556,15 @@ async fn db_steps_status(
 async fn push_to_non_matching_ref_starts_no_run() {
     let (forge, db, clock) = setup().await;
 
-    let runs = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &push("dev"))
-        .await
-        .expect("trigger");
+    let runs = trigger_run_from_event(
+        &forge,
+        db.as_ref(),
+        clock.as_ref(),
+        scarab_server::AdmissionPorts::governance(None),
+        &push("dev"),
+    )
+    .await
+    .expect("trigger");
     assert!(
         runs.is_empty(),
         "push to dev is filtered out by the on:push when"
@@ -510,9 +579,15 @@ async fn no_in_repo_config_starts_no_run() {
     let db = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
 
-    let runs = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &push("main"))
-        .await
-        .expect("trigger");
+    let runs = trigger_run_from_event(
+        &forge,
+        db.as_ref(),
+        clock.as_ref(),
+        scarab_server::AdmissionPorts::governance(None),
+        &push("main"),
+    )
+    .await
+    .expect("trigger");
     assert!(runs.is_empty(), "no .scarab config → nothing to run");
 }
 
@@ -539,9 +614,15 @@ async fn multiple_pipelines_each_start_a_run() {
     let db = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
 
-    let runs = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &push("main"))
-        .await
-        .expect("trigger");
+    let runs = trigger_run_from_event(
+        &forge,
+        db.as_ref(),
+        clock.as_ref(),
+        scarab_server::AdmissionPorts::governance(None),
+        &push("main"),
+    )
+    .await
+    .expect("trigger");
     assert_eq!(
         runs.len(),
         2,
@@ -582,9 +663,15 @@ steps:
     let db = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
 
-    let runs = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &push("main"))
-        .await
-        .expect("trigger");
+    let runs = trigger_run_from_event(
+        &forge,
+        db.as_ref(),
+        clock.as_ref(),
+        scarab_server::AdmissionPorts::governance(None),
+        &push("main"),
+    )
+    .await
+    .expect("trigger");
     assert_eq!(runs.len(), 1, "only the top-level pipeline is triggered");
     let run = runs.into_iter().next().unwrap();
 
@@ -633,9 +720,15 @@ steps:
     let db = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
 
-    let runs = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &push("main"))
-        .await
-        .expect("trigger");
+    let runs = trigger_run_from_event(
+        &forge,
+        db.as_ref(),
+        clock.as_ref(),
+        scarab_server::AdmissionPorts::governance(None),
+        &push("main"),
+    )
+    .await
+    .expect("trigger");
     assert_eq!(
         runs.len(),
         1,
@@ -676,9 +769,15 @@ steps:
     let db = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
 
-    let runs = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &push("main"))
-        .await
-        .expect("trigger");
+    let runs = trigger_run_from_event(
+        &forge,
+        db.as_ref(),
+        clock.as_ref(),
+        scarab_server::AdmissionPorts::governance(None),
+        &push("main"),
+    )
+    .await
+    .expect("trigger");
     assert_eq!(runs.len(), 1);
     let run = runs.into_iter().next().unwrap();
 

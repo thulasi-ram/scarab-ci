@@ -10,3 +10,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 thiserror = { workspace = true }
+# Admitted per ADR-0031 (I/O-free library, listed for pure crates in the root
+# manifest): an inlined Step's `origin` records the SHA-256 of the library
+# source it came from (ADR-0075 §2, ADR-0076 §1), a domain fact a Policy reads.
+sha2 = { workspace = true }

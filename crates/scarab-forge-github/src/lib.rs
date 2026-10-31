@@ -49,6 +49,7 @@ pub fn sign_hex(secret: &[u8], body: &[u8]) -> String {
 pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
     let p = &delivery.payload;
     let actor = actor_of(p);
+    let actor_id = actor_id_of(p);
     match delivery.event.as_str() {
         "push" => {
             let repo = repo_of(p)?;
@@ -57,6 +58,7 @@ pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
             if let Some(tag) = r#ref.strip_prefix("refs/tags/") {
                 Ok(Event::Tag {
                     actor,
+                    actor_id,
                     repo,
                     tag: tag.to_string(),
                 })
@@ -74,6 +76,7 @@ pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
                 }
                 Ok(Event::Push {
                     actor,
+                    actor_id,
                     repo,
                     r#ref,
                     after,
@@ -118,6 +121,7 @@ pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
                 .to_string();
             Ok(Event::PullRequest {
                 actor,
+                actor_id,
                 repo,
                 number,
                 head,
@@ -133,7 +137,12 @@ pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
                 .and_then(Value::as_str)
                 .ok_or_else(|| ForgeError::Malformed("release.tag_name".into()))?
                 .to_string();
-            Ok(Event::Release { actor, repo, tag })
+            Ok(Event::Release {
+                actor,
+                actor_id,
+                repo,
+                tag,
+            })
         }
         "issue_comment" => {
             let repo = repo_of(p)?;
@@ -148,6 +157,7 @@ pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
                 .to_string();
             Ok(Event::Comment {
                 actor,
+                actor_id,
                 repo,
                 issue,
                 body,
@@ -167,6 +177,16 @@ fn actor_of(payload: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string()
+}
+
+/// The sender's immutable account id (`sender.id`), the key identity links
+/// resolve the Actor by (ADR-0069). Empty when the payload carried none.
+fn actor_id_of(payload: &Value) -> String {
+    match payload.pointer("/sender/id") {
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::String(s)) => s.clone(),
+        _ => String::new(),
+    }
 }
 
 /// Extract the `repository` coordinate (`owner.login` / `name`) from a payload.
@@ -1223,6 +1243,25 @@ mod tests {
         assert!(verify_signature(SECRET, body, Some("sha256=zz")).is_err());
     }
 
+    /// The sender's immutable account id is what identity links resolve the
+    /// Actor by (ADR-0069); a payload without one leaves it unset.
+    #[test]
+    fn the_actor_id_is_the_sender_id() {
+        let push = |sender: Value| {
+            json!({
+                "ref": "refs/heads/main",
+                "after": "abc123",
+                "repository": { "name": "app", "owner": { "login": "acme" } },
+                "sender": sender
+            })
+        };
+        let linked = json!({ "login": "octocat", "id": 583231 });
+        let event = normalize(&delivery("push", push(linked))).unwrap();
+        assert_eq!(event.actor_id(), Some("583231"));
+        let event = normalize(&delivery("push", push(json!({ "login": "octocat" })))).unwrap();
+        assert_eq!(event.actor_id(), None);
+    }
+
     #[test]
     fn normalizes_push_and_tag() {
         let base = |r#ref: &str| {
@@ -1238,6 +1277,7 @@ mod tests {
             normalize(&delivery("push", base("refs/heads/main"))).unwrap(),
             Event::Push {
                 actor: "octocat".into(),
+                actor_id: String::new(),
                 repo: RepoRef {
                     owner: "acme".into(),
                     name: "app".into()
@@ -1254,6 +1294,7 @@ mod tests {
             normalize(&delivery("push", base("refs/tags/v1.2.3"))).unwrap(),
             Event::Tag {
                 actor: "octocat".into(),
+                actor_id: String::new(),
                 repo: RepoRef {
                     owner: "acme".into(),
                     name: "app".into()
@@ -1280,6 +1321,7 @@ mod tests {
             normalize(&delivery("pull_request", internal)).unwrap(),
             Event::PullRequest {
                 actor: "octocat".into(),
+                actor_id: String::new(),
                 repo: RepoRef {
                     owner: "acme".into(),
                     name: "app".into()

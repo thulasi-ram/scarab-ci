@@ -44,7 +44,8 @@ pub const MAX_EXPRESSION_NESTING: usize = 64;
 /// guard), which is small next to the Postgres writes around each caller.
 /// These figures were measured on `cel-interpreter` 0.10; the limit tests
 /// below run every worst-case shape on `cel` 0.15 under this stack.
-const CEL_STACK_BYTES: usize = if cfg!(debug_assertions) {
+/// `scarab-policy` parses and evaluates Policy rules under the same stack.
+pub const CEL_STACK_BYTES: usize = if cfg!(debug_assertions) {
     256 << 20
 } else {
     64 << 20
@@ -87,7 +88,8 @@ fn check_limits(expr: &str) -> Result<(), PipelineError> {
 /// The deepest `(` / `[` / `{` nesting in `expr`, skipping string and bytes
 /// literals (CEL's `'…'`, `"…"`, triple-quoted, and `r`/`b`-prefixed forms)
 /// and `//` comments, which is where the parser does not see brackets either.
-fn max_nesting(expr: &str) -> usize {
+/// `scarab-policy` applies the same pre-check to Policy rules.
+pub fn max_nesting(expr: &str) -> usize {
     let b = expr.as_bytes();
     let (mut i, mut depth, mut max) = (0, 0usize, 0usize);
     while i < b.len() {
