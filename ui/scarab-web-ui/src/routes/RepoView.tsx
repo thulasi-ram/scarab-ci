@@ -23,6 +23,8 @@ import {
   deleteEnvironmentOverlay,
   type RunSummary,
   type ProjectEnvironment,
+  listRefusedRuns,
+  type RefusedRun,
 } from "../api/client";
 import {
   isPermissive,
@@ -44,11 +46,12 @@ import ScopedSecrets from "../components/ScopedSecrets";
 import SecretMatrixEditor from "../components/SecretMatrixEditor";
 import Doodle from "../components/Doodle";
 import AsciiScene from "../components/AsciiScene";
-import { runEnvironmentOptions, runListFilter } from "../runs-filter";
+import { mergeRefused, runEnvironmentOptions, runListFilter } from "../runs-filter";
+import { refusalSummary } from "../compile-errors";
 import ponderIdle from "../../../brand/ascii/generated/ponder-ponder.json";
 
 type Tab = "runs" | "environments" | "secrets" | "settings";
-type StatusFilter = "all" | "running" | "failed";
+type StatusFilter = "all" | "running" | "failed" | "refused";
 
 const TABS: [Tab, string][] = [
   ["runs", "Runs"],
@@ -140,7 +143,7 @@ export default function RepoView() {
   const filterSetter = (key: string) => (v: string) => setSearch({ [key]: v }, { replace: true });
   const statusFilter = (): StatusFilter => {
     const v = one(search.status);
-    return v === "running" || v === "failed" ? v : "all";
+    return v === "running" || v === "failed" || v === "refused" ? v : "all";
   };
   const setStatusFilter = (f: StatusFilter) => filterSetter("status")(f === "all" ? "" : f);
   // Origin filters, client-side over the already-fetched rows (the Environment
@@ -169,6 +172,12 @@ export default function RepoView() {
     () => ({ org: org(), repo: repo(), env: envFilter(), deploys: deploysOnly() }),
     (k): Promise<RunSummary[]> =>
       listRepoRuns(k.org, k.repo, 50, runListFilter(k.env, k.deploys)),
+  );
+  // Triggers that did not become a Run (ADR-0076): a compile error, a yanked
+  // library, a Policy. Shown between the Runs; an older server has none.
+  const [refused, { refetch: refetchRefused }] = createResource(
+    () => ({ org: org(), repo: repo() }),
+    (k) => listRefusedRuns(k.org, k.repo).catch(() => [] as RefusedRun[]),
   );
   // The Project's Environments, for the Environment picker's options — the
   // loaded rows are already one Environment's once the filter is on. A caller
@@ -248,6 +257,15 @@ export default function RepoView() {
     });
   };
 
+  // The rows on screen: the filtered Runs with refused triggers between them.
+  const listRows = () =>
+    mergeRefused(filtered(), refused() ?? [], {
+      status: statusFilter(),
+      author: authorFilter(),
+      pipeline: pipelineFilter(),
+      runOnly: !!branchFilter() || !!prFilter() || !!envFilter() || deploysOnly(),
+    });
+
   // The header CTA follows the tab: what you'd create in this context.
   const cta = () => {
     switch (tab()) {
@@ -308,7 +326,7 @@ export default function RepoView() {
       {/* ---- Runs ---- */}
       <Show when={tab() === "runs"}>
         <div class="filters">
-          <For each={["all", "running", "failed"] as const}>
+          <For each={["all", "running", "failed", "refused"] as const}>
             {(f) => (
               <button
                 class={`fpill ${statusFilter() === f ? "on" : ""}`}
@@ -394,7 +412,13 @@ export default function RepoView() {
             <button class="fpill" onClick={clearFilters}>clear</button>
           </Show>
 
-          <button class="btn btn-ghost btn-sm filters-refresh" onClick={() => refetch()}>
+          <button
+            class="btn btn-ghost btn-sm filters-refresh"
+            onClick={() => {
+              refetch();
+              refetchRefused();
+            }}
+          >
             <Icon icon="rotate-cw" size={13} /> Refresh
           </button>
         </div>
@@ -402,7 +426,7 @@ export default function RepoView() {
         <Show when={!rows.loading} fallback={<p class="empty">loading…</p>}>
           <Show when={!rows.error} fallback={<p class="error">Could not load runs.</p>}>
             <Show
-              when={filtered().length > 0}
+              when={listRows().length > 0}
               fallback={
                 (rows() ?? []).length === 0 && !envFilter() ? (
                   <div class="empty-scene">
@@ -421,8 +445,10 @@ export default function RepoView() {
               }
             >
               <div class="runlist">
-                <For each={filtered()}>
-                  {(r) => {
+                <For each={listRows()}>
+                  {(row) => {
+                    if (row.kind === "refused") return <RefusedRow r={row.refused} />;
+                    const r = row.run;
                     const commitUrl = () => forgeCommitUrl(repoUrl(), r.sha);
                     const prUrl = () => forgePrUrl(repoUrl(), r.pr_number);
                     const stop = (e: MouseEvent) => e.stopPropagation();
@@ -949,6 +975,107 @@ function EnvDialog(props: {
             Requires the Administer capability on this repo (ADR-0071).
           </p>
         </div>
+      </div>
+    </div>
+  );
+}
+
+/** A trigger that did not become a Run (ADR-0076): where a Run would be,
+ *  with the compact reason and its fix. */
+function RefusedRow(props: { r: RefusedRun }) {
+  const r = () => props.r;
+  const sum = () => refusalSummary(r().errors, r().message);
+  const [all, setAll] = createSignal(false);
+  const branch = () => r().git_ref?.replace(/^refs\/(heads|tags)\//, "");
+  return (
+    <div class="runrow refused">
+      <div class="rr-gutter">
+        <span class="runnum none">
+          <span class="n">no run</span>
+        </span>
+      </div>
+      <div class="rr-body">
+        <div class="rr-head">
+          <TriggerCell kind={r().trigger_kind} title={r().title} />
+        </div>
+        <div class="rr-facts">
+          <span class="pfact strong" title="pipeline">
+            <Icon icon="workflow" size={12} />
+            <span class="mono">{r().pipeline.replace(/^\.scarab\//, "").replace(/\.ya?ml$/, "")}</span>
+          </span>
+          <Show when={r().sha}>
+            {(sha) => (
+              <span class="pfact" title="commit">
+                <Icon icon="git-commit-horizontal" size={12} />
+                <span class="mono sha">{sha().slice(0, 7)}</span>
+              </span>
+            )}
+          </Show>
+          <Show when={branch()}>
+            {(b) => (
+              <span class="pfact" title="branch / ref">
+                <Icon icon="git-branch" size={12} />
+                <span class="mono">{b()}</span>
+              </span>
+            )}
+          </Show>
+          <Show when={r().actor}>
+            {(a) => (
+              <span class="pfact" title="triggered by">
+                <Icon icon="user" size={12} />
+                <span>{a()}</span>
+              </span>
+            )}
+          </Show>
+          <span class="pfact subtle" title={absTime(r().created_at)}>
+            {relTime(r().created_at)}
+          </span>
+        </div>
+        <div class="rf">
+          <div class="rf-what">
+            <Icon icon={r().reason_kind === "compile" ? "circle-x" : "ban"} size={13} />
+            <span>{sum().what}</span>
+            <Show when={sum().more > 0 && !all()}>
+              <span class="why">
+                · {sum().more} more {sum().more === 1 ? "error" : "errors"}
+              </span>
+            </Show>
+          </div>
+          <Show when={sum().fix}>
+            {(fix) => (
+              <div class="rf-fix">
+                <span class="lbl">fix</span>
+                <span>{fix()}</span>
+              </div>
+            )}
+          </Show>
+          <Show when={r().reason_kind === "yanked"}>
+            <div class="rf-fix">
+              <span class="lbl">fix</span>
+              <span>an org admin upgrades the installation, then push again</span>
+            </div>
+          </Show>
+          <Show when={sum().more > 0}>
+            <div class="rf-fix">
+              <button class="xs-link" onClick={() => setAll((v) => !v)}>
+                {all() ? "Hide the other errors" : `Show all ${r().errors.length} errors`}
+              </button>
+            </div>
+            <Show when={all()}>
+              <For each={r().errors.slice(1)}>
+                {(e) => (
+                  <div class="rf-what">
+                    <Icon icon="circle-x" size={13} />
+                    <span>{refusalSummary([e], e.message).what}</span>
+                  </div>
+                )}
+              </For>
+            </Show>
+          </Show>
+        </div>
+      </div>
+      <div class="rr-right">
+        <span class="rr-status refused">refused</span>
       </div>
     </div>
   );

@@ -67,6 +67,7 @@ import {
   widenedNote,
 } from "../snapshot-retention";
 import { planDivergence, type ConfirmKind } from "../rerun-confirm";
+import { clock, clockLow, rerunYank, yankNote } from "../run-origin";
 import { relTime, absTime, duration } from "../fmt";
 import { forgeCommitUrl, forgePrUrl } from "../forge";
 import StatusBadge from "../components/StatusBadge";
@@ -98,6 +99,15 @@ export default function RunDetail() {
   const repo = () => params.repo!;
 
   const [run, setRun] = createSignal<RunStatus | null>(null);
+  // A 1s tick for plugin gate expiry clocks (ADR-0076 §7).
+  const [nowTick, setNowTick] = createSignal(Date.now());
+  const clockTimer = setInterval(() => setNowTick(Date.now()), 1000);
+  onCleanup(() => clearInterval(clockTimer));
+  /** Time left on an open plugin gate's wait, in ms, or null. */
+  const gateLeft = (s: StepStatus): number | null => {
+    const at = s.plugin_gate?.expires_at;
+    return at != null ? at - nowTick() : null;
+  };
   const [events, setEvents] = createSignal<RunEvent[]>([]);
   const [live, setLive] = createSignal(true);
   const [sel, setSel] = createSignal<string | null>(null);
@@ -294,7 +304,12 @@ export default function RunDetail() {
         // The gate verdict line. It
         // describes the run NOW, so it is dropped while viewing an older
         // version (the statuses there are a replay; this is not).
-        note: tv ? null : gateStatus(s),
+        note: tv
+          ? null
+          : (gateStatus(s) ??
+            (s.plugin_gate && gateLeft(s) != null && ["pending", "ready"].includes(s.status)
+              ? { tone: "waiting" as const, text: `${clock(gateLeft(s)!)} left` }
+              : null)),
         runningSince:
           !tv && s.status === "running"
             ? s.attempt_list?.[s.attempt_list.length - 1]?.started_at ?? null
@@ -304,9 +319,16 @@ export default function RunDetail() {
         // (ADR-0058). Both come straight off the step's live status projection.
         services: s.services,
         uses: s.uses,
+        origin: s.origin,
       };
     });
   };
+
+  // A library version this Run uses that is yanked now (ADR-0076 §6): a
+  // Rerun or Retry that would launch a Step from it is refused every time.
+  const yanks = () => run()?.yanked_libraries ?? [];
+  const rerunBlockedByYank = () =>
+    rerunYank(sel(), stepList().map((s) => ({ id: s.id, needs: s.needs ?? [] })), yanks());
 
   // The selected step's tries, resolved from the event log — the markers the
   // attempts filmstrip renders in the evidence-pane header (ADR-0056 amendment).
@@ -741,6 +763,26 @@ export default function RunDetail() {
                           <span class="gate-hint" title={gateWaitHint(g(), statusOf)}>
                             {gateWaitHint(g(), statusOf)}
                           </span>
+                          <Show when={g().plugin_gate}>
+                            {(pg) => (
+                              <>
+                                <span class="gate-who">
+                                  {pg().releaser}/{pg().gate}
+                                </span>
+                                <Show when={gateLeft(g()) != null}>
+                                  <span class="gate-clock" classList={{ low: clockLow(gateLeft(g())!) }}>
+                                    expires in <b class="mono">{clock(gateLeft(g())!)}</b>
+                                  </span>
+                                </Show>
+                                <Show when={pg().plugin_state === "killed"}>
+                                  <span class="gate-note" style={{ color: "var(--danger)" }}>
+                                    {pg().installation} is killed: this gate waits for its expiry or a
+                                    reject
+                                  </span>
+                                </Show>
+                              </>
+                            )}
+                          </Show>
                           <Show when={gateNotes()[g().id]}>
                             {(note) => <span class="gate-note">{note()}</span>}
                           </Show>
@@ -834,7 +876,12 @@ export default function RunDetail() {
                 <button
                   class="btn btn-ghost btn-sm"
                   onClick={(e) => sel() && openConfirm("retry", sel()!, e)}
-                  disabled={retrying() !== null || rerunning() !== null || !!prereqBlocker(sel())}
+                  disabled={
+                    retrying() !== null ||
+                    rerunning() !== null ||
+                    !!prereqBlocker(sel()) ||
+                    !!rerunBlockedByYank()
+                  }
                   title={
                     prereqBlocker(sel())
                       ? `blocked — prerequisite ${prereqBlocker(sel())} failed; retry that first`
@@ -860,10 +907,13 @@ export default function RunDetail() {
                   !sel() ||
                   isServiceSel() ||
                   timeTraveling() ||
-                  !!prereqBlocker(sel())
+                  !!prereqBlocker(sel()) ||
+                  !!rerunBlockedByYank()
                 }
                 title={
-                  timeTraveling()
+                  rerunBlockedByYank()
+                    ? `refused: it would launch a Step from lib:${rerunBlockedByYank()!.name}, which is yanked; start a new run`
+                    : timeTraveling()
                     ? "read-only — back to latest to rerun"
                     : !sel()
                       ? "select a step"
@@ -942,6 +992,26 @@ export default function RunDetail() {
                 )}
               </Show>
             </div>
+            {/* A version this Run uses was yanked (ADR-0076 §6): say what ran,
+                what was refused, and offer a new run, which compiles against the
+                installed version. */}
+            <Show when={!timeTraveling() && yankNote(yanks(), stepList(), (ms) => new Date(ms).toLocaleTimeString())}>
+              {(note) => (
+                <div class="rd-toast rd-yank" role="status">
+                  <Icon icon="ban" size={13} /> <span>{note()}</span>
+                  <button
+                    class="btn btn-primary btn-sm"
+                    onClick={() =>
+                      nav(`/${org()}/${repo()}/run`, {
+                        state: { prefillParams: runParams(r()) },
+                      })
+                    }
+                  >
+                    <Icon icon="rotate-cw" size={13} /> New run
+                  </button>
+                </div>
+              )}
+            </Show>
             {/* The confirm popover (git-bug 4afaa3e): the whole cascade, named
                 before the POST fires. Portalled; anchored under whichever button
                 opened it. */}
@@ -1231,6 +1301,8 @@ export default function RunDetail() {
                       gateStatus={
                         !timeTraveling() && selectedStep() ? gateStatus(selectedStep()!) : null
                       }
+                      pipeline={r().pipeline ?? null}
+                      now={nowTick()}
                     />
                   }
                 >

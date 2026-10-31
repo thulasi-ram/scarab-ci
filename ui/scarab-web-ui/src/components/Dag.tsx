@@ -11,7 +11,8 @@
 // Clicking a node selects it.
 import { createSignal, onMount, onCleanup, createEffect, createMemo, For, Show } from "solid-js";
 import { isGateOpen, type GateStatus } from "../gates";
-import { layerSteps } from "../dag-layout";
+import { layoutGroups, type DagCell, type OriginLink } from "../dag-layout";
+import { shortHash } from "../libraries";
 import Icon from "./Icon";
 
 export type DagStep = {
@@ -39,6 +40,9 @@ export type DagStep = {
   /** Names of pipeline-level SHARED services this step opts into via `uses:`
    * (ADR-0058) — the source of the dotted service→step edges. */
   uses?: string[];
+  /** The invoke chain this Step was inlined through (ADR-0076): a Step from
+   * a library is drawn inside a box per invocation. */
+  origin?: OriginLink[] | null;
 };
 
 /** A pipeline-level SHARED service (ADR-0058) — a PEER node in the services lane
@@ -156,9 +160,10 @@ export default function Dag(props: {
     return { x, y };
   };
 
-  // Dependency layers: a step sits one column right of its deepest dependency.
-  // Pure longest-path layering, extracted to dag-layout.ts.
-  const layers = () => layerSteps(props.steps);
+  // Dependency layers: a step sits one column right of its deepest dependency,
+  // and a library invocation's Steps sit in one box that is a unit of its
+  // parent's layering (ADR-0076). Pure, in dag-layout.ts.
+  const layers = () => layoutGroups(props.steps);
 
   // A node's UNSCALED box in graph space (transform-invariant — see `offsetIn`).
   const boxOf = (el: HTMLElement) => {
@@ -398,6 +403,122 @@ export default function Dag(props: {
     return colon >= 0 ? seg.slice(0, colon) : seg;
   };
 
+  // One Step node. A plugin gate (ADR-0076 §7) is dashed and names its
+  // plugin under its id.
+  const StepNode = (p: { s: DagStep }) => {
+    const s = p.s;
+    const sel = () => props.selected === s.id;
+    const plugin = () => s.origin?.find((o) => o.kind === "plugin");
+    return (
+      <button
+        class={`dnode ${s.status} ${sel() ? "sel" : ""}`}
+        classList={{ reused: !!s.reused, plugin: !!plugin(), waiting: !!plugin() && isGateOpen(s) }}
+        ref={(el) => nodes.set(s.id, el)}
+        onClick={() => props.onSelect(s.id)}
+      >
+        <span class={`dring ${s.status}`}>
+          <span class="dring-core" />
+        </span>
+        <span class="dnode-main" title={s.id}>
+          <span class="dnode-id">{s.id}</span>
+          <span class={`dnode-meta ${s.note ? `gnote ${s.note.tone}` : ""}`} title={s.note?.text}>
+            {meta(s)}
+          </span>
+          <Show when={plugin()}>
+            {(o) => <span class="dnode-origin">plugin:{o().name.split("/")[0]}</span>}
+          </Show>
+        </span>
+        <Show when={s.attempts > 1}>
+          <span class="dnode-count" title={`${s.attempts} tries`}>
+            ×{s.attempts}
+          </span>
+        </Show>
+        <Show when={s.gate}>
+          <Icon icon="timer" size={12} class="dnode-gate" />
+        </Show>
+        <Show when={s.deploy}>
+          <span class="dnode-gate" title="deploy step (`deploy: true`)">
+            <Icon icon="rocket" size={12} />
+          </span>
+        </Show>
+        <Show when={s.status === "running"}>
+          <span class="dnode-prog" />
+        </Show>
+        {/* Docked SIDECARS (ADR-0058): each of the step's own `services:` as a
+            small copper chip INSIDE the node — they die with the step, so
+            never a floated peer with an edge. A chip is its own clickable
+            target (stopPropagation); a `<span role=button>` because it nests
+            inside the step's own `<button>`. */}
+        <Show when={s.services && s.services.length > 0}>
+          <span class="dnode-sidecars">
+            <For each={s.services}>
+              {(svc) => {
+                const scSel = () => props.selected === s.id && props.sidecarFocus === svc.index;
+                const pick = (e: Event) => {
+                  e.stopPropagation();
+                  props.onSelectSidecar?.(s.id, svc.index);
+                };
+                return (
+                  <span
+                    class={`dnode-sidecar ${scSel() ? "sel" : ""}`}
+                    role="button"
+                    tabindex="0"
+                    title={`sidecar · ${svc.image} (service-${svc.index}) — logs inside ${s.id}`}
+                    onClick={pick}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        pick(e);
+                      }
+                    }}
+                  >
+                    <span class="sc-hex">⬡</span>
+                    <span class="sc-name">{shortImage(svc.image)}</span>
+                  </span>
+                );
+              }}
+            </For>
+          </span>
+        </Show>
+      </button>
+    );
+  };
+
+  // Dependency columns; a library invocation is a box holding its own
+  // columns, nested for an inner invocation (ADR-0076).
+  const Cols = (p: { cols: DagCell<DagStep>[][] }) => (
+    <div class="dag-cols">
+      <For each={p.cols}>
+        {(col) => (
+          <div class="dag-col">
+            <For each={col}>
+              {(cell) =>
+                cell.kind === "step" ? (
+                  <StepNode s={cell.step} />
+                ) : (
+                  <div class="dgroup" title={`${cell.group.key}: ${cell.group.kind === "library" ? "lib:" : ""}${cell.group.name} ${cell.group.content_hash}`}>
+                    <div class="dgroup-h">
+                      <span class="gi">{cell.group.label}</span>
+                      <span>
+                        {cell.group.kind === "library" ? "lib:" : ""}
+                        {cell.group.name}
+                      </span>
+                      <span class="gh">{shortHash(cell.group.content_hash)}</span>
+                      <Show when={cell.group.yanked}>
+                        <span class="gy">yanked</span>
+                      </Show>
+                    </div>
+                    <Cols cols={cell.cols} />
+                  </div>
+                )
+              }
+            </For>
+          </div>
+        )}
+      </For>
+    </div>
+  );
+
   return (
     <div
       class="dag"
@@ -490,95 +611,7 @@ export default function Dag(props: {
             </div>
           </div>
         </Show>
-        <div class="dag-cols">
-        <For each={layers()}>
-          {(col) => (
-            <div class="dag-col">
-              <For each={col}>
-                {(s) => {
-                  const sel = () => props.selected === s.id;
-                  return (
-                    <button
-                      class={`dnode ${s.status} ${sel() ? "sel" : ""}`}
-                      classList={{ reused: !!s.reused }}
-                      ref={(el) => nodes.set(s.id, el)}
-                      onClick={() => props.onSelect(s.id)}
-                    >
-                      <span class={`dring ${s.status}`}>
-                        <span class="dring-core" />
-                      </span>
-                      <span class="dnode-main" title={s.id}>
-                        <span class="dnode-id">{s.id}</span>
-                        <span
-                          class={`dnode-meta ${s.note ? `gnote ${s.note.tone}` : ""}`}
-                          title={s.note?.text}
-                        >
-                          {meta(s)}
-                        </span>
-                      </span>
-                      <Show when={s.attempts > 1}>
-                        <span class="dnode-count" title={`${s.attempts} tries`}>
-                          ×{s.attempts}
-                        </span>
-                      </Show>
-                      <Show when={s.gate}>
-                        <Icon icon="timer" size={12} class="dnode-gate" />
-                      </Show>
-                      <Show when={s.deploy}>
-                        <span class="dnode-gate" title="deploy step (`deploy: true`)">
-                          <Icon icon="rocket" size={12} />
-                        </span>
-                      </Show>
-                      <Show when={s.status === "running"}>
-                        <span class="dnode-prog" />
-                      </Show>
-                      {/* Docked SIDECARS (ADR-0058): each of the step's own
-                          `services:` as a small copper chip INSIDE the node —
-                          honest to Pod containment (they die with the step), so
-                          never a floated peer with an edge. A chip is its own
-                          clickable target (stopPropagation, so it doesn't just
-                          select the step); a `<span role=button>` because it
-                          nests inside the step's own `<button>`. */}
-                      <Show when={s.services && s.services.length > 0}>
-                        <span class="dnode-sidecars">
-                          <For each={s.services}>
-                            {(svc) => {
-                              const scSel = () =>
-                                props.selected === s.id && props.sidecarFocus === svc.index;
-                              const pick = (e: Event) => {
-                                e.stopPropagation();
-                                props.onSelectSidecar?.(s.id, svc.index);
-                              };
-                              return (
-                                <span
-                                  class={`dnode-sidecar ${scSel() ? "sel" : ""}`}
-                                  role="button"
-                                  tabindex="0"
-                                  title={`sidecar · ${svc.image} (service-${svc.index}) — logs inside ${s.id}`}
-                                  onClick={pick}
-                                  onKeyDown={(e) => {
-                                    if (e.key === "Enter" || e.key === " ") {
-                                      e.preventDefault();
-                                      pick(e);
-                                    }
-                                  }}
-                                >
-                                  <span class="sc-hex">⬡</span>
-                                  <span class="sc-name">{shortImage(svc.image)}</span>
-                                </span>
-                              );
-                            }}
-                          </For>
-                        </span>
-                      </Show>
-                    </button>
-                  );
-                }}
-              </For>
-            </div>
-          )}
-        </For>
-        </div>
+        <Cols cols={layers()} />
       </div>
       </div>
     </div>

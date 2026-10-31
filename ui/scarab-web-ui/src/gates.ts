@@ -85,7 +85,7 @@ export type GateStatusLike = GateLike & {
 };
 
 /** The tone a status line renders with, and its text. */
-export type GateStatus = { tone: "passed" | "failed"; text: string };
+export type GateStatus = { tone: "passed" | "failed" | "waiting"; text: string };
 
 /** The verdict that speaks for the gate as it is NOW, or null.
  *

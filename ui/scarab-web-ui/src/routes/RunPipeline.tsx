@@ -6,7 +6,8 @@
 // predicate runs server-side at dispatch and comes back as a per-field error.
 import { createResource, createSignal, createEffect, For, Show } from "solid-js";
 import { A, useParams, useNavigate, useLocation } from "@solidjs/router";
-import { listRefs, listPipelines, pipelineInterface, dispatchRun } from "../api/client";
+import { listRefs, listPipelines, pipelineInterface, dispatchRun, PipelineCompileError } from "../api/client";
+import CompileErrors from "../components/CompileErrors";
 import {
   initialValues,
   reconcilePrefill,
@@ -310,7 +311,15 @@ export default function RunPipeline() {
               <Show
                 when={!iface.error}
                 fallback={
-                  <p class="error">{(iface.error as Error)?.message ?? "failed to load interface"}</p>
+                  iface.error instanceof PipelineCompileError ? (
+                    <CompileErrors
+                      errors={iface.error.failure.errors}
+                      refName={loadedRef()}
+                      sha={iface.error.failure.sha}
+                    />
+                  ) : (
+                    <p class="error">{(iface.error as Error)?.message ?? "failed to load interface"}</p>
+                  )
                 }
               >
                 {(() => {
