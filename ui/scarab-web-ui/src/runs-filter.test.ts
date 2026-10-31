@@ -55,7 +55,7 @@ describe("refused rows in the Runs list", () => {
     { id: 1, created_at: 50, actor: "a.kim", pipeline: ".scarab/ci.yaml" },
   ];
   const ids = (rows: ReturnType<typeof mergeRefused>) =>
-    rows.map((r) => (r.kind === "run" ? (r.run as { id: string }).id : `x${(r.refused as { id: number }).id}`));
+    rows.map((r) => (r.kind === "run" ? (r.run as unknown as { id: string }).id : `x${(r.refused as unknown as { id: number }).id}`));
   const base = { status: "all", author: "", pipeline: "", runOnly: false };
 
   it("interleaves refusals newest first, within the loaded window", () => {

@@ -41,6 +41,10 @@ import {
   Pin,
   PinOff,
   Clock,
+  Ban,
+  Check,
+  CircleX,
+  FileCode,
 } from "lucide";
 
 // IconNode = Array<[tagName, attributes]>.
@@ -86,6 +90,11 @@ const ICONS: Record<string, IconNode> = {
   pin: Pin as IconNode,
   "pin-off": PinOff as IconNode,
   clock: Clock as IconNode,
+  // ADR-0076: yanks, check lists and the invoke chain.
+  ban: Ban as IconNode,
+  check: Check as IconNode,
+  "circle-x": CircleX as IconNode,
+  "file-code": FileCode as IconNode,
 };
 
 export function iconNode(name: string): IconNode | undefined {

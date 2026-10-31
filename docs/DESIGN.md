@@ -327,8 +327,11 @@ Placement is stricter than doodles, because motion competes with content:
 | Chrome | `--pine-deep` band | panel/table headers, top bar |
 | Terminal | `--terminal` pine-black | logs, DAG |
 | Overlay | `--emerald-elevated` + soft shadow (the one exception) | modal |
+| Well | `--well` fill + inset shadow + dot grid | empty states only |
 
-**No shadows on flat chrome.** Depth is shade.
+**No shadows on flat chrome.** Depth is shade. The one other exception is an
+empty state: it is drawn as a recessed well (an inset, debossed shadow over the
+dot grid), so it reads as a space waiting to be filled rather than as a card.
 
 ## 8. Do's and Don'ts
 
