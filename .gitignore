@@ -89,3 +89,7 @@
 # Python bytecode (scripts/ are run directly, never imported in normal use).
 __pycache__/
 *.pyc
+
+# just forgejo-verify tunnel mode (deploy/local-forgejo/up.sh)
+deploy/local-forgejo/.tunnel.*
+deploy/local-forgejo/.libs-manifest.json

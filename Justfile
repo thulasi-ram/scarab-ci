@@ -356,6 +356,9 @@ e2e filter="":
 # Needs: docker (Forgejo is pulled from codeberg.org), kind, and ports 3300 +
 # 8080 free. CI does NOT run this — both tiers are env-gated and skip loudly.
 # `just forgejo-verify keep` leaves both stacks up for poking at afterwards.
+# `FORGEJO_TUNNEL=1 just forgejo-verify` also runs the forge_token cases through
+# a cloudflared quick tunnel (network calls; the Forgejo is reachable from the
+# internet while it runs).
 forgejo-verify keep="0":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -389,6 +392,12 @@ forgejo-verify keep="0":
     # reports it skipped rather than passed; asking for it here is the opt-in.
     # One test at a time: each one reclaims the Forgejo connection first.
     cargo nextest run -p scarab-e2e --test forgejo_onboarding --run-ignored all --no-fail-fast --test-threads 1
+    # Tunnel mode only (FORGEJO_TUNNEL=1): the forge_token cases, which need an
+    # https clone URL that the host and the kind Pods both reach (see
+    # deploy/local-forgejo/up.sh). Opt-in because it makes network calls.
+    if [ "${FORGEJO_TUNNEL:-0}" = 1 ]; then
+      cargo nextest run -p scarab-e2e --test forgejo_tunnel --run-ignored all --no-fail-fast --test-threads 1
+    fi
 
 # LIVE k8s executor tier (`crates/scarab-executor-k8s/tests/cluster.rs`) — the
 # same tier `.github/workflows/kind.yml` runs, against the proc-mode kind cluster.

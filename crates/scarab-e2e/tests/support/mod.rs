@@ -7,6 +7,8 @@
 
 #![allow(dead_code)] // each test binary uses a different slice of the harness
 
+pub mod forgejo;
+
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
