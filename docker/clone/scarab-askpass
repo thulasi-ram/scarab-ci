@@ -4,23 +4,72 @@
 # /scarab/secrets/. The token therefore never appears in a URL, in argv, or in
 # .git/config — the remote URL stays credential-free by construction.
 #
-# HOST-PINNED: the token answers ONLY for the clone URL's own host. A
-# submodule URL is authored in-repo (.gitmodules — attacker-controlled on a
-# fork PR), so a prompt for any other host gets no credential: same-forge
-# repos the token doesn't cover fail at the forge (401), foreign hosts never
-# see the token at all.
+# SCOPED TO ONE REPOSITORY: the token answers only when the prompt names the
+# clone URL's own repository over https: same host, same path (a `.git`
+# suffix and a trailing slash are ignored), or that repository's LFS endpoint
+# (`<repo>.git/info/lfs`). On Forgejo and GitHub PAT connections the token is
+# long-lived and reads every repository its user can, and the commit being
+# cloned decides which other URLs git and git-lfs ask about (`.gitmodules`,
+# `.lfsconfig`). Anything else gets no answer:
+#   - another repository on the same host, or another host;
+#   - a prompt with no path (git includes the path only when
+#     `credential.useHttpPath` is on; scarab-clone.sh turns it on);
+#   - any clone URL that is not https;
+#   - a prompt this script does not recognise.
+#
+# git asks "Username for 'https://host/path': " and
+# "Password for 'https://user@host/path': ". git-lfs asks the same questions
+# as `Username for "https://host/path"` (double quotes, no colon).
+set -u
 
-# The prompt names its target: "Username for 'https://host': " /
-# "Password for 'https://user@host': ".
-prompt_host=$(printf '%s' "$1" | sed -n "s/.*'[a-z+]*:\/\/\([^/']*\).*/\1/p" | sed 's/.*@//')
-clone_host=$(printf '%s' "${SCARAB_CLONE_URL:-}" | sed -n 's/^[a-z+]*:\/\/\([^/]*\).*/\1/p' | sed 's/.*@//')
-if [ -n "$prompt_host" ] && [ "$prompt_host" != "$clone_host" ]; then
-  echo "scarab-askpass: refusing to answer for '$prompt_host' (token is pinned to '$clone_host')" >&2
+refuse() {
+  echo "scarab-askpass: $*; answering nothing" >&2
   exit 1
-fi
+}
 
-case "$1" in
-  Username*) printf '%s' "${SCARAB_CLONE_USERNAME:-x-access-token}" ;;
-  Password*) cat "${SCARAB_CLONE_TOKEN_FILE:-/scarab/secrets/clone-token}" ;;
-  *) exit 1 ;;
+prompt=${1:-}
+case "$prompt" in
+  "Username for '"*"': ") what=Username; target=${prompt#"Username for '"}; target=${target%"': "} ;;
+  "Password for '"*"': ") what=Password; target=${prompt#"Password for '"}; target=${target%"': "} ;;
+  'Username for "'*'"') what=Username; target=${prompt#'Username for "'}; target=${target%'"'} ;;
+  'Password for "'*'"') what=Password; target=${prompt#'Password for "'}; target=${target%'"'} ;;
+  *) refuse "unrecognised prompt" ;;
+esac
+
+# Splits "scheme://[user@]host[/path]" into $scheme, $host and $path, with
+# the path's trailing slashes removed and no leading slash.
+split_url() {
+  case "$1" in
+    *://*) ;;
+    *) scheme=; host=; path=; return ;;
+  esac
+  scheme=${1%%://*}
+  rest=${1#*://}
+  authority=${rest%%/*}
+  host=${authority##*@}
+  case "$rest" in
+    */*) path=${rest#*/} ;;
+    *) path= ;;
+  esac
+  while [ "${path%/}" != "$path" ]; do path=${path%/}; done
+}
+
+split_url "${SCARAB_CLONE_URL:-}"
+clone_scheme=$scheme
+clone_host=$host
+clone_repo=${path%.git}
+[ "$clone_scheme" = "https" ] || refuse "the clone URL is not https"
+[ -n "$clone_host" ] && [ -n "$clone_repo" ] || refuse "the clone URL names no repository"
+
+split_url "$target"
+[ "$scheme" = "https" ] || refuse "'$target' is not https"
+[ "$host" = "$clone_host" ] || refuse "'$host' is not the clone host '$clone_host'"
+case "$path" in
+  "$clone_repo" | "$clone_repo.git" | "$clone_repo/info/lfs" | "$clone_repo.git/info/lfs") ;;
+  *) refuse "'$path' is not the cloned repository '$clone_repo'" ;;
+esac
+
+case "$what" in
+  Username) printf '%s' "${SCARAB_CLONE_USERNAME:-x-access-token}" ;;
+  Password) cat "${SCARAB_CLONE_TOKEN_FILE:-/scarab/secrets/clone-token}" ;;
 esac

@@ -197,6 +197,47 @@ impl Db for PostgresDb {
         Ok(())
     }
 
+    async fn begin_run_creation(
+        &self,
+        run: &RunId,
+        ir_version: u32,
+        event_schema_version: u32,
+        at: Timestamp,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO runs (id, status, ir_version, event_schema_version, created_at, updated_at,
+                               creating)
+             VALUES ($1, $2, $3, $4, $5, $5, TRUE)",
+        )
+        .bind(&run.0)
+        .bind(run_status_str(RunStatus::Pending))
+        .bind(ir_version as i32)
+        .bind(event_schema_version as i32)
+        .bind(at.0)
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn finish_run_creation(&self, run: &RunId) -> Result<(), DbError> {
+        sqlx::query("UPDATE runs SET creating = FALSE WHERE id = $1")
+            .bind(&run.0)
+            .execute(self.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn run_creation_unfinished(&self, run: &RunId) -> Result<bool, DbError> {
+        let row = sqlx::query("SELECT creating FROM runs WHERE id = $1")
+            .bind(&run.0)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(row.is_some_and(|r| r.get::<bool, _>("creating")))
+    }
+
     async fn create_step_run(
         &self,
         run: &RunId,
@@ -1348,6 +1389,7 @@ impl Db for PostgresDb {
         // scarce capacity to higher-priority work before lower (ADR-0011, 0032).
         let rows = sqlx::query(
             "SELECT id FROM runs WHERE status IN ('pending', 'running', 'suspended')
+               AND NOT creating
              ORDER BY priority DESC, created_at",
         )
         .fetch_all(self.pool())

@@ -397,6 +397,7 @@ DNS, which must be the usual `kube-system` Pods labelled `k8s-app=kube-dns`.
 | Key | Default | Notes |
 |-----|---------|-------|
 | `image.repository` / `image.tag` | `ghcr.io/thulasi-ram/scarab-server` / appVersion | container image |
+| `strategy` | `type: Recreate` | server Deployment update strategy: old server Pods stop before new ones start, so two versions never run Steps side by side. Switch to `RollingUpdate` only where a release's notes say mixed versions are safe |
 | `scarab.role` | `converged` | `api` / `scheduler` / `executor` / `webhook` / `converged` |
 | `scarab.executor` | `k8s` | `k8s` (prod) or `local` (dev only) |
 | `scarab.namespace` | release ns | namespace step Pods launch into (RBAC granted there) |

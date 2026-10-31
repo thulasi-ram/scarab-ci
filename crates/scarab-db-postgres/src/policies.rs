@@ -1,4 +1,4 @@
-//! [`PolicyStore`] on Postgres (ADR-0075 §9, §11; migration 0069).
+//! [`PolicyStore`] on Postgres (ADR-0075 §9, §11; migration 0070).
 //!
 //! A write takes the Policy row `FOR UPDATE`, compares its version with the
 //! one the caller read, and writes the row and a `policy_versions` row in one
