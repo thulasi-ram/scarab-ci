@@ -234,6 +234,8 @@ struct InMemoryState {
     run_pipeline: HashMap<RunId, String>,
     /// Per-run Headline / trigger title (mirrors the `trigger_title` column).
     run_trigger_title: HashMap<RunId, String>,
+    /// Refused Run creations (ADR-0076; mirrors `refused_runs`).
+    refused_runs: Vec<scarab_engine::RefusedRun>,
     /// ForgeConnection registry rows (ADR-0046).
     forge_connections: HashMap<String, scarab_forge::ForgeConnection>,
     /// Repo bindings: (owner, name) → (connection id, org, project).
@@ -1281,6 +1283,32 @@ impl Db for InMemoryDb {
 
     async fn run_pipeline(&self, run: &RunId) -> Result<Option<String>, DbError> {
         Ok(self.state.lock().unwrap().run_pipeline.get(run).cloned())
+    }
+
+    async fn record_refused_run(&self, r: &scarab_engine::RefusedRun) -> Result<(), DbError> {
+        let mut st = self.state.lock().unwrap();
+        let mut r = r.clone();
+        r.id = st.refused_runs.len() as i64 + 1;
+        st.refused_runs.push(r);
+        Ok(())
+    }
+
+    async fn refused_runs_for_tenant(
+        &self,
+        org: &str,
+        project: &str,
+        limit: u32,
+    ) -> Result<Vec<scarab_engine::RefusedRun>, DbError> {
+        let st = self.state.lock().unwrap();
+        let mut out: Vec<_> = st
+            .refused_runs
+            .iter()
+            .filter(|r| r.org == org && r.project == project)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| (b.created_at.0, b.id).cmp(&(a.created_at.0, a.id)));
+        out.truncate(limit as usize);
+        Ok(out)
     }
 
     async fn set_run_trigger_title(&self, run: &RunId, title: &str) -> Result<(), DbError> {

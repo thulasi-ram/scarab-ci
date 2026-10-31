@@ -277,6 +277,11 @@ impl Op {
         }
     }
 
+    /// Its summary comes from `describe` instead of [`describe_generic`].
+    const fn describe_with(self, describe: fn(&Op, &OpInput) -> OpSummary) -> Op {
+        Op { describe, ..self }
+    }
+
     /// A request for it may seal a body of up to `bytes`.
     const fn max_request_body(self, bytes: usize) -> Op {
         Op {
@@ -323,6 +328,50 @@ pub fn describe_generic(op: &Op, input: &OpInput) -> OpSummary {
         operation: op.label.to_string(),
         target: escape_invisible(&target.join("/")),
         changes,
+    }
+}
+
+/// The first 12 characters of a content hash, as refusals name a version.
+fn short_hash(h: &str) -> String {
+    h.chars().take(12).collect()
+}
+
+/// `library.install`: the library by its Pipeline name and the org,
+/// `lib:acme/deploy-helm in acme`, and the version change first
+/// (`version = 5d1e0c7a9b3f → 0c4e7b2a91f5`), then the full hashes.
+pub fn describe_library_install(op: &Op, input: &OpInput) -> OpSummary {
+    let generic = describe_generic(op, input);
+    let (Some(org), Some(publisher), Some(name)) = (
+        input.param("org"),
+        input.param("publisher"),
+        input.param("name"),
+    ) else {
+        return generic;
+    };
+    let new = input.body_str("/content_hash").unwrap_or_default();
+    let version = match input.body_str("/replaces") {
+        Some(old) => format!("version = {} → {}", short_hash(&old), short_hash(&new)),
+        None => format!("version = {} (nothing installed before)", short_hash(&new)),
+    };
+    let mut changes = vec![escape_invisible(&version)];
+    changes.extend(generic.changes);
+    OpSummary {
+        operation: generic.operation,
+        target: escape_invisible(&format!("lib:{publisher}/{name} in {org}")),
+        changes,
+    }
+}
+
+/// `library.unyank`: the version and the org, `version 5d1e0c7a9b3f in acme`.
+pub fn describe_library_unyank(op: &Op, input: &OpInput) -> OpSummary {
+    let generic = describe_generic(op, input);
+    let (Some(org), Some(hash)) = (input.param("org"), input.param("hash")) else {
+        return generic;
+    };
+    OpSummary {
+        operation: generic.operation,
+        target: escape_invisible(&format!("version {} in {org}", short_hash(hash))),
+        changes: vec![escape_invisible(&format!("content_hash = {hash}"))],
     }
 }
 
@@ -1317,7 +1366,8 @@ pub static LIBRARY_INSTALL: Op = op(
         "path:name",
         "body:/content_hash",
     ],
-);
+)
+.describe_with(describe_library_install);
 pub static LIBRARY_REMOVE: Op = op(
     "library.remove",
     "Remove a library",
@@ -1347,7 +1397,8 @@ pub static LIBRARY_UNYANK: Op = op(
     OrgOf::Path("org"),
     &[],
     &["path:org", "path:hash"],
-);
+)
+.describe_with(describe_library_unyank);
 pub static LIBRARY_DEFAULTS_RETRY: Op = op(
     "library.defaults_retry",
     "Install the first-party libraries",
@@ -1425,6 +1476,32 @@ mod tests {
         let all = format!("{s:?}");
         assert!(!all.contains("hunter2"), "{all}");
         assert!(s.changes.contains(&"value = (hidden)".to_string()));
+    }
+
+    #[test]
+    fn a_library_upgrade_names_the_library_and_the_version_change() {
+        let (old, new) = ("5d1e0c7a9b3f".repeat(5) + "abcd", "0c4e7b2a91f5".repeat(5) + "abcd");
+        let mut i = input(json!({ "content_hash": new, "replaces": old }));
+        i.params = vec![
+            ("org".into(), "acme".into()),
+            ("publisher".into(), "acme".into()),
+            ("name".into(), "deploy-helm".into()),
+        ];
+        let s = LIBRARY_INSTALL.summary(&i);
+        assert_eq!(s.operation, "Install or upgrade a library");
+        assert_eq!(s.target, "lib:acme/deploy-helm in acme");
+        assert_eq!(s.changes[0], "version = 5d1e0c7a9b3f → 0c4e7b2a91f5");
+        assert!(s.changes.contains(&format!("content_hash = {new}")), "{:?}", s.changes);
+
+        i.body = json!({ "content_hash": new });
+        let s = LIBRARY_INSTALL.summary(&i);
+        assert_eq!(s.changes[0], "version = 0c4e7b2a91f5 (nothing installed before)");
+
+        let mut u = input(Value::Null);
+        u.params = vec![("org".into(), "acme".into()), ("hash".into(), old.clone())];
+        let s = LIBRARY_UNYANK.summary(&u);
+        assert_eq!(s.target, "version 5d1e0c7a9b3f in acme");
+        assert_eq!(s.changes, vec![format!("content_hash = {old}")]);
     }
 
     #[test]

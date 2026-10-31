@@ -2,54 +2,53 @@
 // installs a library from a git source, upgrades it after reading the diff,
 // removes it, and yanks a version.
 //
-// Installing is two steps. "Fetch" reads the source at its commit, checks it
-// is a library that invokes only installed libraries, and shows its content
-// (or the diff from the installed version); "Install" then installs exactly
-// the version shown, and asks for a step-up. Removing and yanking tighten and
-// ask for nothing; lifting a yank asks for a step-up.
+// The panel is a table of installations. Installing and upgrading happen on
+// their own page (`/settings/libraries/review`, routes/LibraryReview.tsx):
+// fetch, read the diff and the checks, then install, which asks for a
+// step-up. Removing and yanking tighten and ask for nothing; lifting a yank
+// asks for a step-up. Yanking opens a dialog that says which Runs in
+// progress use the version and can cancel them.
 //
 // First-party libraries come from Scarab's release manifest. A new org gets
 // them when its first repo is bound; if the source could not be read, the
-// panel lists what is missing, and the admin can retry, point at a mirror, or
-// paste a copy (checked against the manifest's hash).
+// empty state says what is missing, and the admin can retry, point at a
+// mirror, or paste a copy (checked against the manifest's hash).
 import { createResource, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { Portal } from "solid-js/web";
+import { A, useNavigate } from "@solidjs/router";
 import {
-  fetchLibrary,
-  installLibrary,
-  listConnections,
   listLibraries,
   removeLibrary,
   retryLibraryDefaults,
   unyankLibrary,
+  yankImpact,
   yankLibrary,
-  type FetchedLibrary,
   type LibraryInstallation,
+  type OrgLibraries,
 } from "../api/client";
 import {
-  defaultsLine,
-  diffLines,
   missingLabel,
+  reviewHref,
   shortHash,
-  sourceError,
-  toFetchBody,
+  trustNote,
+  impactRunLabel,
   updateLine,
+  yankButtonLabel,
+  yankImpactLine,
   yankReasonError,
-  type FetchForm,
 } from "../libraries";
 import { relTime, absTime } from "../fmt";
+import Doodle from "./Doodle";
 import Icon from "./Icon";
 
-/** What the install dialog opens with. */
-type Prefill = Partial<FetchForm>;
-
 export default function Libraries(props: { org: string }) {
+  const nav = useNavigate();
   const [epoch, setEpoch] = createSignal(0);
   const [libs] = createResource(
     () => ({ org: props.org, epoch: epoch() }),
     (k) => listLibraries(k.org),
   );
-  const [installing, setInstalling] = createSignal<Prefill | null>(null);
+  const [yanking, setYanking] = createSignal<LibraryInstallation | null>(null);
   const [error, setError] = createSignal<string | null>(null);
   const [notice, setNotice] = createSignal<string | null>(null);
   const reload = () => setEpoch((e) => e + 1);
@@ -57,6 +56,7 @@ export default function Libraries(props: { org: string }) {
   const unavailable = () => !libs.loading && !libs.error && libs() === null;
   const rows = () => libs()?.installations ?? [];
   const offered = () => (libs()?.first_party ?? []).filter((f) => !f.installed);
+  const missing = () => libs()?.defaults?.state === "missing";
 
   const act = async (what: () => Promise<unknown>, fallback: string, done?: string) => {
     setError(null);
@@ -81,23 +81,6 @@ export default function Libraries(props: { org: string }) {
     void act(() => removeLibrary(props.org, l.publisher, l.name), `Could not remove ${id}.`, `${id} is removed.`);
   };
 
-  const yank = (l: LibraryInstallation) => {
-    const reason = window.prompt(
-      `Yank version ${shortHash(l.content_hash)} of lib:${l.publisher}/${l.name}?\n\nNew Runs that use it are refused, and so are Steps and gates of existing Runs that use it, Reruns and Retries included. The reason is shown with every refusal.`,
-    );
-    if (reason === null) return;
-    const problem = yankReasonError(reason);
-    if (problem) {
-      setError(problem);
-      return;
-    }
-    void act(
-      () => yankLibrary(props.org, l.content_hash, reason.trim()),
-      "Could not yank the version.",
-      `Version ${shortHash(l.content_hash)} is yanked in ${props.org}.`,
-    );
-  };
-
   const unyank = (hash: string) =>
     void act(
       () => unyankLibrary(props.org, hash),
@@ -105,13 +88,18 @@ export default function Libraries(props: { org: string }) {
       `Version ${shortHash(hash)} can run again.`,
     );
 
+  const installDefaults = () =>
+    void act(
+      () => retryLibraryDefaults(props.org, { mirror: null, files: {} }),
+      "Could not install the first-party libraries.",
+      "The first-party libraries are installed.",
+    );
+
   return (
     <div class="panel">
       <div class="panel-h">
         <span>Libraries · {props.org}</span>
-        <Show when={rows().length > 0}>
-          <span class="tok-count">{rows().length}</span>
-        </Show>
+        <span class="tok-count">{rows().length}</span>
       </div>
       <div class="secrets-body">
         <Show when={libs.error}>
@@ -126,15 +114,11 @@ export default function Libraries(props: { org: string }) {
 
         <Show when={!libs.loading} fallback={<p class="empty">loading…</p>}>
           <Show when={!unavailable()} fallback={<p class="empty">This server does not manage libraries.</p>}>
-            <Defaults
-              org={props.org}
-              defaults={libs()?.defaults ?? null}
-              onDone={(msg) => {
-                setError(null);
-                setNotice(msg);
-                reload();
-              }}
-            />
+            <Show when={libs()?.defaults?.state === "pending"}>
+              <p class="subtle">
+                <Icon icon="rotate-cw" size={12} /> Installing the first-party libraries…
+              </p>
+            </Show>
             <Show when={libs()?.manifest_error}>
               {(e) => (
                 <p class="subtle">
@@ -146,33 +130,81 @@ export default function Libraries(props: { org: string }) {
               )}
             </Show>
 
+            <Show when={missing()}>
+              <div class="lib-well">
+                <Doodle icon="package" size={104} opacity={0.3} />
+                <MissingDefaults
+                  org={props.org}
+                  libs={libs()!}
+                  onDone={(msg) => {
+                    setError(null);
+                    setNotice(msg);
+                    reload();
+                  }}
+                />
+              </div>
+            </Show>
+
             <Show
               when={rows().length > 0}
               fallback={
-                <p class="empty">
-                  No libraries installed. A Pipeline uses an installed library with{" "}
-                  <span class="mono">invoke: lib:&lt;publisher&gt;/&lt;name&gt;</span>.
-                </p>
+                <Show when={!missing()}>
+                  <div class="lib-well">
+                    <Doodle icon="package" size={104} opacity={0.3} />
+                    <div class="lib-empty">
+                      <div class="t1">
+                        <Icon icon="package" size={14} /> No libraries installed
+                      </div>
+                      <p class="t2">
+                        A Pipeline uses an installed library with{" "}
+                        <span class="mono">invoke: lib:&lt;publisher&gt;/&lt;name&gt;</span>. Checking
+                        out a repository needs <span class="mono">lib:thulasi-ram/clone</span>.
+                      </p>
+                      <div class="acts">
+                        <button class="btn btn-primary btn-sm" onClick={() => nav(reviewHref({}))}>
+                          <Icon icon="plus" size={14} /> Install library
+                        </button>
+                        <Show when={offered().length > 0}>
+                          <button class="btn btn-ghost btn-sm" onClick={installDefaults}>
+                            Install first-party libraries ({offered().length})
+                          </button>
+                        </Show>
+                      </div>
+                    </div>
+                  </div>
+                </Show>
               }
             >
-              <ul class="tok-list">
-                <For each={rows()}>
-                  {(l) => (
-                    <LibraryRow
-                      library={l}
-                      onUpgrade={(source) =>
-                        setInstalling({ source: source ?? "", publisher: l.publisher, name: l.name })
-                      }
-                      onRemove={() => remove(l)}
-                      onYank={() => yank(l)}
-                      onUnyank={() => unyank(l.content_hash)}
-                    />
-                  )}
-                </For>
-              </ul>
+              <table class="table lib-table">
+                <thead>
+                  <tr>
+                    <th>library</th>
+                    <th>version</th>
+                    <th>source</th>
+                    <th>installed</th>
+                    <th />
+                  </tr>
+                </thead>
+                <tbody>
+                  <For each={rows()}>
+                    {(l) => (
+                      <LibraryRow
+                        library={l}
+                        trust={trustNote(l, libs()?.trusted_sources ?? [])}
+                        onUpgrade={(source) =>
+                          nav(reviewHref({ source: source ?? l.source, publisher: l.publisher, name: l.name }))
+                        }
+                        onRemove={() => remove(l)}
+                        onYank={() => setYanking(l)}
+                        onUnyank={() => unyank(l.content_hash)}
+                      />
+                    )}
+                  </For>
+                </tbody>
+              </table>
             </Show>
 
-            <Show when={offered().length > 0}>
+            <Show when={offered().length > 0 && rows().length > 0}>
               <p class="subtle">First-party libraries not installed here:</p>
               <ul class="tok-list">
                 <For each={offered()}>
@@ -187,9 +219,7 @@ export default function Libraries(props: { org: string }) {
                         <span class="oenv-actions">
                           <button
                             class="btn btn-ghost btn-sm"
-                            onClick={() =>
-                              setInstalling({ source: f.source, publisher: f.publisher, name: f.name })
-                            }
+                            onClick={() => nav(reviewHref({ source: f.source, publisher: f.publisher, name: f.name }))}
                           >
                             install
                           </button>
@@ -245,11 +275,13 @@ export default function Libraries(props: { org: string }) {
               </ul>
             </Show>
 
-            <div class="secrets-actions">
-              <button class="btn btn-primary btn-sm" onClick={() => setInstalling({})}>
-                <Icon icon="plus" size={14} /> Install library
-              </button>
-            </div>
+            <Show when={rows().length > 0}>
+              <div class="secrets-actions">
+                <button class="btn btn-primary btn-sm" onClick={() => nav(reviewHref({}))}>
+                  <Icon icon="plus" size={14} /> Install library
+                </button>
+              </div>
+            </Show>
             <p class="subtle">
               <small>
                 <Icon icon="shield-check" size={12} /> An installation is one file at one commit,
@@ -261,18 +293,19 @@ export default function Libraries(props: { org: string }) {
         </Show>
       </div>
 
-      <Show when={installing()}>
-        {(prefill) => (
+      <Show when={yanking()}>
+        {(l) => (
           <Portal>
-            <InstallDialog
+            <YankDialog
               org={props.org}
-              prefill={prefill()}
-              onClose={() => setInstalling(null)}
-              onInstalled={(l) => {
-                setInstalling(null);
+              library={l()}
+              onClose={() => setYanking(null)}
+              onYanked={(msg, upgrade) => {
+                setYanking(null);
                 setError(null);
-                setNotice(`lib:${l.publisher}/${l.name} is installed at ${shortHash(l.content_hash)}.`);
+                setNotice(msg);
                 reload();
+                if (upgrade) nav(reviewHref({ source: upgrade, publisher: l().publisher, name: l().name }));
               }}
             />
           </Portal>
@@ -282,9 +315,10 @@ export default function Libraries(props: { org: string }) {
   );
 }
 
-/** One installation: name, version, source, yank and update notice. */
+/** One installation: two table rows, the second only for its notices. */
 function LibraryRow(props: {
   library: LibraryInstallation;
+  trust: string | null;
   onUpgrade: (source?: string) => void;
   onRemove: () => void;
   onYank: () => void;
@@ -292,108 +326,125 @@ function LibraryRow(props: {
 }) {
   const l = () => props.library;
   const update = () => updateLine(l().update);
+  const hasNotice = () => !!l().yanked || !!update();
   return (
-    <li class="tok" classList={{ "tok-dead": !!l().yanked }}>
-      <div class="tok-head">
-        <Icon icon="package" size={15} />
-        <span class="tok-name mono">
-          lib:{l().publisher}/{l().name}
-        </span>
-        <span class="tok-scope mono" title={l().content_hash}>
-          {shortHash(l().content_hash)}
-        </span>
-        <Show when={l().first_party}>
-          <span class="tok-role" title="This version is listed in Scarab's release manifest.">
-            first-party
+    <>
+      <tr classList={{ dead: !!l().yanked }}>
+        <td>
+          <div class="mono" style={{ color: "var(--soft-white)", "font-size": "var(--fs-md)" }}>
+            lib:{l().publisher}/{l().name}
+          </div>
+          <div class="lib-badges" style={{ "margin-top": "4px" }}>
+            <Show when={l().first_party}>
+              <span class="tok-role" title="This version is listed in Scarab's release manifest.">
+                first-party
+              </span>
+            </Show>
+            <Show when={props.trust}>
+              {(t) => (
+                <span class="tok-state lib-trust" title={t()}>
+                  forge_token
+                </span>
+              )}
+            </Show>
+            <Show when={l().yanked}>
+              <span class="tok-state tok-revoked">yanked</span>
+            </Show>
+            <Show when={l().update}>
+              {(u) => (
+                <span class={`tok-state ${u().security_fix ? "lib-sec" : "lib-upd"}`}>
+                  {u().security_fix ? "security fix" : "update"}
+                </span>
+              )}
+            </Show>
+          </div>
+        </td>
+        <td>
+          <span class="lib-hash" title={l().content_hash}>
+            {shortHash(l().content_hash)}
           </span>
-        </Show>
-        <Show when={l().yanked}>
-          <span class="tok-state tok-revoked">yanked</span>
-        </Show>
-        <span class="oenv-actions">
+        </td>
+        <td class="lib-src">{l().source}</td>
+        <td class="mono" style={{ "font-size": "var(--fs-sm)" }} title={absTime(l().installed_at)}>
+          {l().installed_by}
+          <br />
+          <span class="subtle">{relTime(l().installed_at)}</span>
+        </td>
+        <td class="acts keep">
           <button class="btn btn-ghost btn-sm" onClick={() => props.onUpgrade()}>
             upgrade
           </button>
-          <Show
-            when={l().yanked}
-            fallback={
-              <button class="btn btn-danger btn-sm" onClick={props.onYank}>
-                yank
-              </button>
-            }
-          >
-            <button class="btn btn-ghost btn-sm" onClick={props.onUnyank}>
-              lift yank
+          <Show when={!l().yanked}>
+            <button class="btn btn-danger btn-sm" onClick={props.onYank}>
+              yank
             </button>
           </Show>
           <button class="btn btn-ghost btn-sm" onClick={props.onRemove}>
             remove
           </button>
-        </span>
-      </div>
-      <div class="tok-facts">
-        <span>
-          <Icon icon="git-commit-horizontal" size={12} />
-          <span class="mono">{l().source}</span>
-        </span>
-        <span title={absTime(l().installed_at)}>
-          <Icon icon="user" size={12} />
-          installed by {l().installed_by} · {relTime(l().installed_at)}
-        </span>
-      </div>
-      <Show when={l().yanked}>
-        {(y) => (
-          <div class="tok-facts">
-            <span class="plg-killed" title={absTime(y().yanked_at)}>
-              <Icon icon="alert-triangle" size={12} />
-              yanked by {y().yanked_by}: {y().reason}
-            </span>
-          </div>
-        )}
+        </td>
+      </tr>
+      <Show when={hasNotice()}>
+        <tr class="sub">
+          <td colspan={5} class="keep">
+            <Show when={l().yanked}>
+              {(y) => (
+                <div class="lib-notice yank" title={absTime(y().yanked_at)}>
+                  <Icon icon="alert-triangle" size={12} /> yanked by {y().yanked_by} ·{" "}
+                  {relTime(y().yanked_at)}: {y().reason}
+                  <button class="btn btn-ghost btn-sm" onClick={props.onUnyank}>
+                    lift yank
+                  </button>
+                </div>
+              )}
+            </Show>
+            <Show when={update()}>
+              {(line) => (
+                <div class={`lib-notice ${l().update?.security_fix ? "sec" : "upd"}`}>
+                  <Icon icon={l().update?.security_fix ? "alert-triangle" : "arrow-up"} size={12} />{" "}
+                  {line()} <span class="lib-hash">{shortHash(l().update?.content_hash ?? "")}</span>
+                  <button class="btn btn-ghost btn-sm" onClick={() => props.onUpgrade(l().update?.source)}>
+                    review the upgrade
+                  </button>
+                </div>
+              )}
+            </Show>
+          </td>
+        </tr>
       </Show>
-      <Show when={update()}>
-        {(line) => (
-          <div class="tok-facts">
-            <span classList={{ "plg-killed": !!l().update?.security_fix }}>
-              <Icon icon={l().update?.security_fix ? "alert-triangle" : "arrow-up"} size={12} />
-              {line()}
-            </span>
-            <button class="btn btn-ghost btn-sm" onClick={() => props.onUpgrade(l().update?.source)}>
-              review the upgrade
-            </button>
-          </div>
-        )}
-      </Show>
-    </li>
+    </>
   );
 }
 
-/** Missing first-party defaults, and the form that retries them. */
-function Defaults(props: {
-  org: string;
-  defaults: { state: string; missing: { publisher: string; name: string; error: string }[]; mirror?: string | null } | null;
-  onDone: (msg: string) => void;
-}) {
-  const [mirror, setMirror] = createSignal(props.defaults?.mirror ?? "");
+/** A new org whose first-party defaults could not be read: retry, a mirror,
+ *  or pasted copies. Drawn inside the empty-state well. */
+function MissingDefaults(props: { org: string; libs: OrgLibraries; onDone: (msg: string) => void }) {
+  const d = () => props.libs.defaults!;
+  const [pane, setPane] = createSignal<"" | "mirror" | "paste">("");
+  const [mirror, setMirror] = createSignal(d().mirror ?? "");
   const [copies, setCopies] = createSignal<Record<string, string>>({});
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
-  const line = () => defaultsLine(props.defaults);
+  const named = () => d().missing.filter((m) => m.name);
+  const release = () => props.libs.first_party[0]?.release;
 
-  const retry = async () => {
+  const retry = async (from: "source" | "mirror" | "paste") => {
     if (busy()) return;
     setBusy(true);
     setError(null);
     try {
-      const files = Object.fromEntries(Object.entries(copies()).filter(([, v]) => v.trim() !== ""));
-      const d = await retryLibraryDefaults(props.org, {
-        mirror: mirror().trim() || null,
+      const files =
+        from === "paste"
+          ? Object.fromEntries(Object.entries(copies()).filter(([, v]) => v.trim() !== ""))
+          : {};
+      const r = await retryLibraryDefaults(props.org, {
+        mirror: from === "mirror" ? mirror().trim() || null : null,
         files,
       });
       props.onDone(
-        d.state === "installed"
+        r.state === "installed"
           ? "The first-party libraries are installed."
-          : "Some first-party libraries are still missing; see why below.",
+          : "Some first-party libraries are still missing; see the errors.",
       );
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not install the first-party libraries.");
@@ -401,84 +452,108 @@ function Defaults(props: {
       setBusy(false);
     }
   };
+  const toggle = (p: "mirror" | "paste") => setPane((c) => (c === p ? "" : p));
 
   return (
-    <Show when={line()}>
-      {(text) => (
-        <div class="plg-conns">
-          <p class="plg-killed">
-            <Icon icon="alert-triangle" size={12} /> {text()}
+    <div class="lib-empty">
+      <div class="t1 warn">
+        <Icon icon="alert-triangle" size={14} /> First-party libraries are not installed
+      </div>
+      <p class="t2">
+        Scarab could not read them. Until <span class="mono">lib:thulasi-ram/clone</span> is
+        installed, every Pipeline that checks out fails to compile.
+      </p>
+      <div class="acts">
+        <button class="btn btn-primary btn-sm" disabled={busy()} onClick={() => void retry("source")}>
+          <Icon icon="rotate-cw" size={14} /> {busy() ? "Installing…" : "Retry"}
+        </button>
+        <button class="btn btn-ghost btn-sm" classList={{ on: pane() === "mirror" }} onClick={() => toggle("mirror")}>
+          Use a mirror
+        </button>
+        <Show when={named().length > 0}>
+          <button class="btn btn-ghost btn-sm" classList={{ on: pane() === "paste" }} onClick={() => toggle("paste")}>
+            Paste the files
+          </button>
+        </Show>
+      </div>
+      <details class="lib-errs">
+        <summary>
+          {d().missing.length} {d().missing.length === 1 ? "file failed" : "files failed"} · show errors
+        </summary>
+        <pre>{d().missing.map((m) => `${missingLabel(m)}  ${m.error}`).join("\n")}</pre>
+      </details>
+      <Show when={pane() === "mirror"}>
+        <div class="lib-pane">
+          <label>mirror of Scarab's repository</label>
+          <div class="row">
+            <input
+              class="input mono"
+              placeholder="git.example.com/mirrors/scarab-ci"
+              value={mirror()}
+              onInput={(e) => setMirror(e.currentTarget.value)}
+            />
+            <button
+              class="btn btn-primary btn-sm"
+              disabled={busy() || mirror().trim() === ""}
+              onClick={() => void retry("mirror")}
+            >
+              <Icon icon="rotate-cw" size={14} /> Read from mirror
+            </button>
+          </div>
+          <p class="fieldnote" style={{ margin: 0 }}>
+            Each file is read at the same path and commit, and must have the hash the release lists.
           </p>
-          <For each={props.defaults?.missing ?? []}>
+        </div>
+      </Show>
+      <Show when={pane() === "paste"}>
+        <div class="lib-pane">
+          <For each={named()}>
             {(m) => (
-              <div class="form-r">
+              <>
                 <label class="mono">{missingLabel(m)}</label>
-                <p class="fieldnote">{m.error}</p>
-                <Show when={m.name}>
-                  <textarea
-                    class="input mono"
-                    rows={3}
-                    placeholder="or paste a copy of the file from the release"
-                    value={copies()[`${m.publisher}/${m.name}`] ?? ""}
-                    onInput={(e) =>
-                      setCopies((c) => ({ ...c, [`${m.publisher}/${m.name}`]: e.currentTarget.value }))
-                    }
-                  />
-                </Show>
-              </div>
+                <textarea
+                  class="input mono"
+                  rows={2}
+                  placeholder={`paste the file from the ${release() ?? "release"}`}
+                  value={copies()[`${m.publisher}/${m.name}`] ?? ""}
+                  onInput={(e) => setCopies((c) => ({ ...c, [`${m.publisher}/${m.name}`]: e.currentTarget.value }))}
+                />
+              </>
             )}
           </For>
-          <Show when={props.defaults?.state === "missing"}>
-            <div class="form-r">
-              <label>mirror (optional)</label>
-              <input
-                class="input mono"
-                placeholder="git.example.com/mirrors/scarab-ci"
-                value={mirror()}
-                onInput={(e) => setMirror(e.currentTarget.value)}
-              />
-              <p class="fieldnote">
-                A copy of Scarab's repository on a forge Scarab can read. Each file is read at the
-                same path and commit, and must have the hash the release lists.
-              </p>
-            </div>
-            <Show when={error()}>
-              <p class="error">{error()}</p>
-            </Show>
-            <div class="modal-actions">
-              <button class="btn btn-primary btn-sm" disabled={busy()} onClick={() => void retry()}>
-                <Icon icon="rotate-cw" size={14} /> {busy() ? "Installing…" : "Retry"}
-              </button>
-            </div>
-          </Show>
+          <p class="fieldnote" style={{ margin: 0 }}>
+            Scarab checks each pasted file against the hash the release lists before it installs it.
+          </p>
+          <div>
+            <button class="btn btn-primary btn-sm" disabled={busy()} onClick={() => void retry("paste")}>
+              <Icon icon="plus" size={14} /> Install pasted files
+            </button>
+          </div>
         </div>
-      )}
-    </Show>
+      </Show>
+      <Show when={error()}>
+        <p class="error">{error()}</p>
+      </Show>
+    </div>
   );
 }
 
-/** Fetch a version, read it (or its diff), then install it. */
-function InstallDialog(props: {
+/** Yank a version: the Runs in progress that use it, what happens, a
+ *  required reason, and an opt-in cancel of those Runs. */
+function YankDialog(props: {
   org: string;
-  prefill: Prefill;
+  library: LibraryInstallation;
   onClose: () => void;
-  onInstalled: (l: LibraryInstallation) => void;
+  onYanked: (msg: string, upgradeSource: string | null) => void;
 }) {
-  const [connections] = createResource(() => listConnections().catch(() => []));
-  const [form, setForm] = createSignal<FetchForm>({
-    source: props.prefill.source ?? "",
-    connection: props.prefill.connection ?? "",
-    publisher: props.prefill.publisher ?? "",
-    name: props.prefill.name ?? "",
-  });
-  const [fetched, setFetched] = createSignal<FetchedLibrary | null>(null);
+  const l = () => props.library;
+  const [impact] = createResource(() => yankImpact(props.org, l().content_hash));
+  const [reason, setReason] = createSignal("");
+  const [cancel, setCancel] = createSignal(false);
+  const [upgrade, setUpgrade] = createSignal(!!l().update);
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
-  const set = (k: keyof FetchForm, v: string) => {
-    setFetched(null);
-    setForm((f) => ({ ...f, [k]: v }));
-  };
-  const built = () => toFetchBody(form());
+  const runs = () => impact()?.runs ?? [];
 
   onMount(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -488,157 +563,117 @@ function InstallDialog(props: {
     onCleanup(() => document.removeEventListener("keydown", onKey));
   });
 
-  const doFetch = async () => {
-    const body = built().body;
-    if (!body || busy()) return;
-    setBusy(true);
-    setError(null);
-    try {
-      setFetched(await fetchLibrary(props.org, body));
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not fetch the library.");
-    } finally {
-      setBusy(false);
+  const submit = async () => {
+    const problem = yankReasonError(reason());
+    if (problem) {
+      setError(problem);
+      return;
     }
-  };
-
-  const doInstall = async () => {
-    const f = fetched();
-    if (!f || busy()) return;
     setBusy(true);
     setError(null);
     try {
-      props.onInstalled(
-        await installLibrary(props.org, f.publisher, f.name, {
-          content_hash: f.content_hash,
-          replaces: f.current?.content_hash ?? null,
-        }),
+      const y = await yankLibrary(props.org, l().content_hash, reason().trim(), cancel() && runs().length > 0);
+      const cancelled = y.cancelled_runs?.length ?? 0;
+      props.onYanked(
+        `Version ${shortHash(l().content_hash)} is yanked in ${props.org}.` +
+          (cancelled ? ` ${cancelled} ${cancelled === 1 ? "Run was" : "Runs were"} cancelled.` : ""),
+        upgrade() ? (l().update?.source ?? null) : null,
       );
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not install the library.");
+      setError(e instanceof Error ? e.message : "Could not yank the version.");
     } finally {
       setBusy(false);
     }
-  };
-
-  const same = () => {
-    const f = fetched();
-    return !!f && f.current?.content_hash === f.content_hash;
   };
 
   return (
     <div class="modal-scrim" onClick={props.onClose}>
-      <div class="modal modal-tall" onClick={(e) => e.stopPropagation()}>
+      <div class="modal" style={{ width: "min(580px, 94vw)" }} onClick={(e) => e.stopPropagation()}>
         <div class="panel-h">
-          <span>{props.prefill.name ? `Install lib:${props.prefill.publisher}/${props.prefill.name}` : "Install library"}</span>
+          <span>
+            <Icon icon="ban" size={13} /> Yank lib:{l().publisher}/{l().name} {shortHash(l().content_hash)}
+          </span>
         </div>
-        <div class="modal-body token-form">
-          <div class="form-r">
-            <label>source</label>
-            <input
-              class="input mono"
-              placeholder="github.com/acme/scarab-libs//deploy-helm.yaml@<commit>"
-              value={form().source}
-              onInput={(e) => set("source", e.currentTarget.value)}
-            />
-            <Show when={sourceError(form().source)}>
-              <p class="error">{sourceError(form().source)}</p>
-            </Show>
-            <p class="fieldnote">
-              A file in a git repository at a full commit id. A public repository on github.com or a
-              Forgejo connection's host is read without credentials.
-            </p>
-          </div>
-          <div class="form-r">
-            <label>connection (private repository)</label>
-            <select class="input" value={form().connection} onChange={(e) => set("connection", e.currentTarget.value)}>
-              <option value="">none: read it anonymously</option>
-              <For each={connections() ?? []}>
-                {(c) => (
-                  <option value={c.id}>
-                    {c.id} ({c.kind}, {c.base_url})
-                  </option>
+        <div class="modal-body">
+          <div class="yk-impact">
+            <Show when={!impact.loading} fallback={<div class="yk-count subtle">Counting the Runs that use it…</div>}>
+              <Show when={impact()} fallback={<div class="yk-count subtle">Could not count the Runs that use it.</div>}>
+                {(i) => (
+                  <div class="yk-count">
+                    {yankImpactLine(i())}
+                    <Show when={runs().length > 0}>
+                      <span class="runs">
+                        <For each={runs()}>
+                          {(r, k) => (
+                            <>
+                              {k() > 0 ? " · " : ""}
+                              <A href={`/${props.org}/${r.project}/runs/${r.id}`}>{impactRunLabel(r)}</A>
+                              {r.running_steps.length > 0 ? ` (${r.running_steps.join(", ")} running)` : ""}
+                            </>
+                          )}
+                        </For>
+                      </span>
+                    </Show>
+                  </div>
                 )}
-              </For>
-            </select>
+              </Show>
+            </Show>
+            <ul class="yk-lines">
+              <li>
+                <span>
+                  {cancel() && runs().length > 0
+                    ? "The Runs above are cancelled, and their running Steps stop."
+                    : "A Step that is running finishes."}
+                </span>
+              </li>
+              <li>
+                <span>
+                  A later Step from this version fails as a config error, and Steps that need it do not
+                  run. Gates from this version cannot be approved; a timer gate fails.
+                </span>
+              </li>
+              <li>
+                <span>New Runs and Reruns that use this version are refused.</span>
+              </li>
+            </ul>
+            <Show when={runs().length > 0}>
+              <label class="yk-cancel">
+                <input type="checkbox" checked={cancel()} onChange={(e) => setCancel(e.currentTarget.checked)} />{" "}
+                Cancel {runs().length === 1 ? "this Run" : `these ${runs().length} Runs`} now
+              </label>
+            </Show>
+          </div>
+          <div>
+            <label>reason (shown with every refusal)</label>
+            <textarea
+              class="input"
+              rows={3}
+              style={{ width: "100%", "font-family": "var(--font-ui)" }}
+              value={reason()}
+              onInput={(e) => setReason(e.currentTarget.value)}
+              ref={(el) => queueMicrotask(() => el.focus())}
+            />
             <p class="fieldnote">
-              Through a connection, only a repository bound to {props.org} through it can be
-              read, or one owned by {props.org} once {props.org} has a repository bound through
-              it.
+              Required. Other orgs on this server are not affected. Yanking asks for no passkey;
+              lifting a yank does.
             </p>
           </div>
-          <div class="form-r">
-            <label>publisher and name (optional)</label>
-            <div class="plg-caps">
-              <input
-                class="input mono"
-                placeholder="the repository owner"
-                value={form().publisher}
-                onInput={(e) => set("publisher", e.currentTarget.value)}
-              />
-              <input
-                class="input mono"
-                placeholder="the file name"
-                value={form().name}
-                onInput={(e) => set("name", e.currentTarget.value)}
-              />
-            </div>
-            <p class="fieldnote">
-              Pipelines name it <span class="mono">lib:{form().publisher || "<owner>"}/{form().name || "<file>"}</span>.
-            </p>
-          </div>
-
-          <Show when={fetched()}>
-            {(f) => (
-              <div class="form-r">
-                <label>
-                  {f().current ? `change from ${shortHash(f().current!.content_hash)}` : "content"} ·{" "}
-                  <span class="mono">{shortHash(f().content_hash)}</span>
-                  <Show when={f().first_party}> · first-party</Show>
-                </label>
-                <Show
-                  when={f().current}
-                  fallback={<pre class="mono lib-diff">{f().content}</pre>}
-                >
-                  <Show when={!same()} fallback={<p class="fieldnote">This version is installed already.</p>}>
-                    <pre class="mono lib-diff">
-                      <For each={diffLines(f().diff)}>
-                        {(d) => (
-                          <span classList={{ "lib-add": d.sign === "+", "lib-del": d.sign === "-" }}>
-                            {d.sign}
-                            {d.text}
-                            {"\n"}
-                          </span>
-                        )}
-                      </For>
-                    </pre>
-                  </Show>
-                </Show>
-              </div>
+          <Show when={l().update}>
+            {(u) => (
+              <label class="yk-cancel">
+                <input type="checkbox" checked={upgrade()} onChange={(e) => setUpgrade(e.currentTarget.checked)} />{" "}
+                then review the upgrade to <span class="lib-hash">{shortHash(u().content_hash)}</span> (
+                {u().release}; asks for your passkey)
+              </label>
             )}
-          </Show>
-        </div>
-
-        <div class="modal-foot">
-          <Show when={built().error && form().source.trim() !== "" && !sourceError(form().source)}>
-            <p class="error">{built().error}</p>
           </Show>
           <Show when={error()}>
             <p class="error">{error()}</p>
           </Show>
           <div class="modal-actions">
-            <Show
-              when={fetched() && !same()}
-              fallback={
-                <button class="btn btn-primary" disabled={!built().body || busy()} onClick={() => void doFetch()}>
-                  {busy() ? "Fetching…" : "Fetch and review"}
-                </button>
-              }
-            >
-              <button class="btn btn-primary" disabled={busy()} onClick={() => void doInstall()}>
-                <Icon icon="plus" size={14} /> {busy() ? "Installing…" : fetched()?.current ? "Upgrade" : "Install"}
-              </button>
-            </Show>
+            <button class="btn btn-danger" disabled={busy() || reason().trim() === ""} onClick={() => void submit()}>
+              <Icon icon="ban" size={14} /> {busy() ? "Yanking…" : yankButtonLabel(cancel(), runs().length)}
+            </button>
             <button class="btn btn-ghost" onClick={props.onClose}>
               Cancel
             </button>

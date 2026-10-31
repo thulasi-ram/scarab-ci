@@ -795,13 +795,32 @@ export async function removeLibrary(org: string, publisher: string, name: string
   }
 }
 
-/** Yank a version in this org (`POST …/library-yanks`). */
-export async function yankLibrary(org: string, content_hash: string, reason: string): Promise<void> {
-  const { error, response } = await api.POST("/v1/orgs/{org}/library-yanks", {
-    params: { path: { org } },
-    body: { content_hash, reason },
+export type YankImpact = components["schemas"]["YankImpactDto"];
+export type LibraryYank = components["schemas"]["LibraryYankDto"];
+
+/** The Runs in progress that use a version (`GET …/library-yanks/{hash}/impact`). */
+export async function yankImpact(org: string, hash: string): Promise<YankImpact> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/library-yanks/{hash}/impact", {
+    params: { path: { org, hash } },
   });
-  if (!response.ok) throw new Error(errorText(error) || `could not yank the version (${response.status})`);
+  if (error || !data) throw new Error(errorText(error) || `could not count the Runs (${response.status})`);
+  return data;
+}
+
+/** Yank a version in this org (`POST …/library-yanks`); `cancel_runs` also
+ *  cancels the Runs in progress that use it. */
+export async function yankLibrary(
+  org: string,
+  content_hash: string,
+  reason: string,
+  cancel_runs = false,
+): Promise<LibraryYank> {
+  const { data, error, response } = await api.POST("/v1/orgs/{org}/library-yanks", {
+    params: { path: { org } },
+    body: { content_hash, reason, cancel_runs },
+  });
+  if (error || !data) throw new Error(errorText(error) || `could not yank the version (${response.status})`);
+  return data;
 }
 
 /** Lift a yank (`DELETE …/library-yanks/{hash}`). Asks for a step-up. */
@@ -1057,6 +1076,9 @@ export async function pipelineInterface(
     "/v1/repos/{org}/{repo}/pipelines/{name}/interface",
     { params: { path: { org, repo, name }, query: { ref } } },
   );
+  if (response.status === 400 && error && typeof error === "object" && "errors" in error) {
+    throw new PipelineCompileError(error as unknown as CompileFailure);
+  }
   if (error || !data) {
     throw new Error(
       response.status === 400
@@ -1093,6 +1115,39 @@ export async function dispatchRun(
   });
   if (data) return { ok: true, id: data.id };
   return { ok: false, status: response.status, message: errorText(error) };
+}
+
+export type CompileError = components["schemas"]["CompileErrorDto"];
+export type CompileFailure = components["schemas"]["CompileErrorResponse"];
+
+/** Thrown by [`pipelineInterface`] when the Pipeline does not compile: the
+ *  server's errors, each with its fields. */
+export class PipelineCompileError extends Error {
+  constructor(readonly failure: CompileFailure) {
+    super(`pipeline failed to compile: ${failure.message}`);
+  }
+}
+
+export type RefusedRun = components["schemas"]["RefusedRunDto"];
+
+/** A Project's triggers that did not become a Run (`GET …/refused-runs`). */
+export async function listRefusedRuns(org: string, repo: string, limit = 50): Promise<RefusedRun[]> {
+  const { data, error } = await api.GET("/v1/repos/{org}/{repo}/refused-runs", {
+    params: { path: { org, repo }, query: { limit } },
+  });
+  if (error || !data) throw new Error(`failed to list refused runs for ${org}/${repo}`);
+  return data.refused;
+}
+
+export type StepOrigin = components["schemas"]["StepOriginDto"];
+
+/** Where a Step comes from (`GET /v1/runs/{id}/steps/{step}/origin`). */
+export async function stepOrigin(run: string, step: string): Promise<StepOrigin> {
+  const { data, error, response } = await api.GET("/v1/runs/{id}/steps/{step}/origin", {
+    params: { path: { id: run, step } },
+  });
+  if (error || !data) throw new Error(errorText(error) || `could not load where ${step} comes from (${response.status})`);
+  return data;
 }
 
 /** Best-effort extraction of an error body to text. The dispatch/interface 4xx

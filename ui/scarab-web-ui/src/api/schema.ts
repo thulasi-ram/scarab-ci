@@ -907,6 +907,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/orgs/{org}/library-yanks/{hash}/impact": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The Runs in progress that use a library version (ADR-0076 §6) */
+        get: operations["get_yank_impact"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/orgs/{org}/members/{subject}/passkeys/reset": {
         parameters: {
             query?: never;
@@ -1531,6 +1548,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/repos/{org}/{repo}/refused-runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Triggers that did not become a Run (ADR-0076) */
+        get: operations["list_refused_runs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/repos/{org}/{repo}/runs": {
         parameters: {
             query?: never;
@@ -2001,6 +2035,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/runs/{id}/steps/{step}/origin": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Where a Step comes from (ADR-0076) */
+        get: operations["get_step_origin"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/runs/{id}/steps/{step}/rerun": {
         parameters: {
             query?: never;
@@ -2436,6 +2487,18 @@ export interface components {
             role: string;
             subject: string;
         };
+        /** @description One input in the scope of a Step's invocation. */
+        BoundInputDto: {
+            /** @description The literal value, or the template text. */
+            bound: Record<string, never>;
+            /**
+             * @description `literal` (a value known at compile: the caller's literal or the
+             *     input's default) or `template` (the caller's `${{ … }}`, rendered at
+             *     launch).
+             */
+            kind: string;
+            name: string;
+        };
         /**
          * @description One capability Scarab needs of a forge app, as the preflight reports it
          *     (`scarab_forge::preflight::ForgeRequirement` on the wire).
@@ -2477,6 +2540,46 @@ export interface components {
              *     passes as `pipeline`.
              */
             name: string;
+        };
+        /**
+         * @description One compile error with the fields a reader acts on (ADR-0076): the Step,
+         *     the command index and the template it reads, and for a library Step the
+         *     library and the caller's binding. `message` is the compiler's text.
+         */
+        CompileErrorDto: {
+            /** @description For a library Step: the caller's `with:` value for `input`. */
+            bound?: string | null;
+            /** Format: int32 */
+            command_index?: number | null;
+            /** @description For a library Step: the library input the caller binds. */
+            input?: string | null;
+            /**
+             * @description `command_value` (a `command` argument reads free text from outside
+             *     the Pipeline), `script_template` (a `${{ … }}` in a script) or
+             *     `other`.
+             */
+            kind: string;
+            /** @description For a library Step: the library (`<publisher>/<name>` or a path). */
+            library?: string | null;
+            /** @description For a library Step: its id inside the library. */
+            library_step?: string | null;
+            message: string;
+            /** @description The `${{ … }}` the argument reads. */
+            read?: string | null;
+            /** @description The Step in the Pipeline file; for a library Step, the invoke Step. */
+            step?: string | null;
+        };
+        /**
+         * @description `400` body for a Pipeline that does not compile: the whole text, as a
+         *     plain-text 400 carried it before, and each error with its fields.
+         */
+        CompileErrorResponse: {
+            /** @description Always `compile_failed`. */
+            code: string;
+            errors: components["schemas"]["CompileErrorDto"][];
+            message: string;
+            /** @description The commit the Pipeline was read at. */
+            sha?: string | null;
         };
         /**
          * @description One registered forge connection, as global Settings renders it (ADR-0060).
@@ -2923,6 +3026,14 @@ export interface components {
             /** @description `string`, `boolean`, `number` or `choice` (inputs only). */
             type: string;
         };
+        /** @description One output a plugin gate returns on release. */
+        GateOutputDto: {
+            name: string;
+            /** @description `string`, `boolean` or `number`. */
+            type: string;
+            /** @description The value the plugin released the gate with; absent until then. */
+            value?: Record<string, never> | null;
+        };
         /** @description How a gate's wait resolved: its `GateResolved` journal entry. */
         GateResolutionDto: {
             /**
@@ -3037,6 +3148,8 @@ export interface components {
             yanked?: null | components["schemas"]["LibraryYankDto"];
         };
         LibraryYankDto: {
+            /** @description The Runs a yank with `cancel_runs` cancelled. Omitted otherwise. */
+            cancelled_runs?: string[];
             content_hash: string;
             reason: string;
             /** Format: int64 */
@@ -3266,6 +3379,22 @@ export interface components {
              */
             unresolved_owner_entries: number;
         };
+        /** @description One link of a Step's invoke chain, outermost first. */
+        OriginLinkDto: {
+            /** @description SHA-256 of the library source (or of the plugin's approved manifest). */
+            content_hash: string;
+            /** @description `file`, `library` or `plugin`. */
+            kind: string;
+            /**
+             * @description A repo-relative path (`file`), `<publisher>/<name>` (`library`) or the
+             *     plugin installation and gate (`plugin`).
+             */
+            name: string;
+            /** @description Where an installed library comes from, at its commit. */
+            source?: string | null;
+            /** @description The version is yanked in the Run's org now. */
+            yanked?: boolean;
+        };
         /** @description One of the caller's passkeys. */
         PasskeyDto: {
             /** @description The credential may be synced to other devices (BE). */
@@ -3494,6 +3623,37 @@ export interface components {
             passed: boolean;
             /** @description Why the gate failed: 1 to 1024 bytes, required with `passed: false`. */
             reason?: string | null;
+        };
+        /** @description What a `gate: plugin` node waits on, and where its wait stands. */
+        PluginGateViewDto: {
+            /**
+             * Format: int64
+             * @description `gate_expires_after`, seconds.
+             */
+            expires_after?: number | null;
+            /**
+             * Format: int64
+             * @description When the latest wait expires (Unix ms).
+             */
+            expires_at?: number | null;
+            /** @description The gate's name in the plugin's manifest. */
+            gate: string;
+            /** @description The inputs rendered when the gate was reached; absent before. */
+            inputs?: Record<string, never> | null;
+            installation: string;
+            /** Format: int64 */
+            killed_at?: number | null;
+            killed_by?: string | null;
+            outputs: components["schemas"]["GateOutputDto"][];
+            /** @description `enabled` or `killed`; absent when the installation is gone. */
+            plugin_state?: string | null;
+            /** @description The Principal that may release it: `plugin:<installation>`. */
+            releaser: string;
+            /**
+             * Format: int64
+             * @description When the latest wait began (Unix ms).
+             */
+            waiting_since?: number | null;
         };
         /** @description A PluginInstallation (ADR-0072 §10). */
         PluginInstallationDto: {
@@ -3922,6 +4082,33 @@ export interface components {
             /** @description Branches first, then tags; each group name-sorted. */
             refs: components["schemas"]["RefDto"][];
         };
+        /** @description A trigger that did not become a Run. */
+        RefusedRunDto: {
+            actor?: string | null;
+            /** Format: int64 */
+            created_at: number;
+            /** @description Each error: for `compile` with its fields, otherwise its message. */
+            errors: components["schemas"]["CompileErrorDto"][];
+            git_ref?: string | null;
+            /** Format: int64 */
+            id: number;
+            message: string;
+            /** @description The pipeline file, `.scarab/<name>.yaml`. */
+            pipeline: string;
+            /**
+             * @description `compile`, `yanked`, `policy`, `environment`, `event_field` or
+             *     `forge_token`.
+             */
+            reason_kind: string;
+            sha?: string | null;
+            /** @description The trigger's headline: a push's commit subject, a dispatch reason. */
+            title?: string | null;
+            trigger_kind: string;
+        };
+        /** @description `GET /v1/repos/{org}/{repo}/refused-runs` body. */
+        RefusedRunListResponse: {
+            refused: components["schemas"]["RefusedRunDto"][];
+        };
         /** @description `POST /v1/runs/{id}/gates/{step}/reject` body: why the gate is failed. */
         RejectGateRequest: {
             /**
@@ -3929,6 +4116,16 @@ export interface components {
              *     Required: 1 to 1024 bytes once trimmed.
              */
             reason: string;
+        };
+        /** @description A Step's image, command and env as its launch renders them. */
+        RenderedSpecDto: {
+            command: string[];
+            /** @description `[name, value]` pairs. */
+            env: [
+                string,
+                string
+            ][];
+            image: string;
         };
         /**
          * @description An allowed read on a connection: method + path pattern (`*` = one
@@ -4066,6 +4263,12 @@ export interface components {
              *     trigger carried no headline and on runs created before headline-stamping.
              */
             trigger_title?: string | null;
+            /**
+             * @description The library versions this Run uses that are yanked in its org now
+             *     (ADR-0076 §6). A Rerun or Retry of a Step from one is refused at
+             *     launch: it reuses the Steps the Run was compiled with. Empty when none.
+             */
+            yanked_libraries?: components["schemas"]["RunYankDto"][];
         };
         /**
          * @description One run in the list view: identity, status, creation time (epoch millis),
@@ -4151,6 +4354,18 @@ export interface components {
              *     terminal or queued Run).
              */
             waiting_gates?: components["schemas"]["WaitingGateDto"][];
+        };
+        /** @description A library version a Run uses that is yanked in its org. */
+        RunYankDto: {
+            content_hash: string;
+            /** @description `<publisher>/<name>`. */
+            name: string;
+            reason: string;
+            /** @description The Steps of the Run inlined from it. */
+            steps: string[];
+            /** Format: int64 */
+            yanked_at: number;
+            yanked_by: string;
         };
         /**
          * @description What the plugin runtime last observed of the workload.
@@ -4405,6 +4620,25 @@ export interface components {
              */
             uses?: string[];
         };
+        /** @description `GET /v1/runs/{id}/steps/{step}/origin`. */
+        StepOriginDto: {
+            /**
+             * @description The invoke chain, outermost first. Empty for a Step written in the
+             *     Pipeline file itself.
+             */
+            chain: components["schemas"]["OriginLinkDto"][];
+            /**
+             * @description The inputs bound in the Step's own invocation. Empty for a Step
+             *     written in the Pipeline file.
+             */
+            inputs: components["schemas"]["BoundInputDto"][];
+            /** @description The Pipeline the Run was created from, by name. */
+            pipeline?: string | null;
+            /** @description Why `rendered` is absent. Not set for a gate. */
+            render_note?: string | null;
+            rendered?: null | components["schemas"]["RenderedSpecDto"];
+            step: string;
+        };
         /**
          * @description One named result a step published (ADR-0041) — the `${{ outputs.<step>.<name> }}`
          *     values, exposed read-only for the run detail Inspector. `type_name` is a
@@ -4458,6 +4692,14 @@ export interface components {
              *     UI folds these into the run's graph view.
              */
             needs?: string[];
+            /**
+             * @description The invoke chain this Step was inlined through, outermost first
+             *     (ADR-0076): the `origin` the compiler recorded, each library version
+             *     marked when it is yanked in the Run's org. Empty for a Step written in
+             *     the Pipeline file itself.
+             */
+            origin?: components["schemas"]["OriginLinkDto"][];
+            plugin_gate?: null | components["schemas"]["PluginGateViewDto"];
             /**
              * @description Co-located sidecar services (ADR-0058) this step declares — rendered as
              *     sidecar nodes attached to the step, each with its own log stream (fetched
@@ -4681,7 +4923,35 @@ export interface components {
             /** @description The path listed (empty string = snapshot root). */
             path: string;
         };
+        /**
+         * @description What a yank of one version would stop in its org: the Runs in progress
+         *     that use it.
+         */
+        YankImpactDto: {
+            content_hash: string;
+            /** @description How many of the Runs' Steps from the version are running now. */
+            running_steps: number;
+            runs: components["schemas"]["YankImpactRunDto"][];
+        };
+        /** @description A Run in progress that uses a library version. */
+        YankImpactRunDto: {
+            id: string;
+            project: string;
+            /** Format: int64 */
+            run_number?: number | null;
+            /** @description Of those, the ones running now. */
+            running_steps: string[];
+            status: string;
+            /** @description The Run's Steps inlined from the version. */
+            steps: string[];
+        };
         YankLibraryRequest: {
+            /**
+             * @description Also cancel the Runs in progress that use the version, as
+             *     `POST /v1/runs/{id}/cancel` does: their running Steps stop. Default
+             *     `false`: a Step that is running finishes.
+             */
+            cancel_runs?: boolean;
             content_hash: string;
             /** @description Shown in every refusal. */
             reason: string;
@@ -7168,6 +7438,44 @@ export interface operations {
             };
         };
     };
+    get_yank_impact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description content hash */
+                hash: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["YankImpactDto"];
+                };
+            };
+            /** @description not a content hash */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     reset_member_passkeys: {
         parameters: {
             query?: never;
@@ -8999,12 +9307,14 @@ export interface operations {
                     "application/json": components["schemas"]["PipelineInterfaceResponse"];
                 };
             };
-            /** @description the pipeline failed to compile (structured diagnostic) */
+            /** @description the pipeline failed to compile: each error with its fields */
             400: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["CompileErrorResponse"];
+                };
             };
             /** @description no pipeline by that name at the ref */
             404: {
@@ -9039,6 +9349,33 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["RefsResponse"];
+                };
+            };
+        };
+    };
+    list_refused_runs: {
+        parameters: {
+            query?: {
+                /** @description at most this many (default 50, capped 200) */
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                /** @description org slug */
+                org: string;
+                /** @description project (repo) name */
+                repo: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RefusedRunListResponse"];
                 };
             };
         };
@@ -9820,6 +10157,37 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description no such run or step */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_step_origin: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description run id */
+                id: string;
+                /** @description step id */
+                step: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepOriginDto"];
+                };
             };
             /** @description no such run or step */
             404: {

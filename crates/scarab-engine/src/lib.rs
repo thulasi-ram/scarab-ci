@@ -78,6 +78,31 @@ pub enum RunStatus {
     DeadLettered,
 }
 
+/// A Run creation that was refused (ADR-0076): what was triggered, where,
+/// and why no Run exists. Recorded so the Runs list can show it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefusedRun {
+    /// Assigned by the store; ignored when recording.
+    pub id: i64,
+    pub org: String,
+    pub project: String,
+    /// The pipeline file, `.scarab/<name>.yaml`.
+    pub pipeline: String,
+    pub trigger_kind: String,
+    pub actor: Option<String>,
+    pub git_ref: Option<String>,
+    pub sha: Option<String>,
+    /// The trigger's headline (a push's commit subject).
+    pub title: Option<String>,
+    /// `compile`, `yanked`, `policy`, `environment`, `event_field` or
+    /// `forge_token`.
+    pub reason_kind: String,
+    pub message: String,
+    /// For `compile`: each error with its fields. `[]` otherwise.
+    pub errors: serde_json::Value,
+    pub created_at: Timestamp,
+}
+
 /// A one-line summary of a run for a list view (`GET /v1/runs`): identity,
 /// current status, and creation time. Deliberately lean — the full run + its
 /// steps come from `run_status` / `steps_of_run`.

@@ -267,6 +267,33 @@ pub struct LibraryYankDto {
     pub reason: String,
     pub yanked_by: String,
     pub yanked_at: i64,
+    /// The Runs a yank with `cancel_runs` cancelled. Omitted otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cancelled_runs: Vec<String>,
+}
+
+/// A Run in progress that uses a library version.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct YankImpactRunDto {
+    pub id: String,
+    pub project: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_number: Option<i64>,
+    pub status: String,
+    /// The Run's Steps inlined from the version.
+    pub steps: Vec<String>,
+    /// Of those, the ones running now.
+    pub running_steps: Vec<String>,
+}
+
+/// What a yank of one version would stop in its org: the Runs in progress
+/// that use it.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct YankImpactDto {
+    pub content_hash: String,
+    pub runs: Vec<YankImpactRunDto>,
+    /// How many of the Runs' Steps from the version are running now.
+    pub running_steps: usize,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -406,6 +433,11 @@ pub struct YankLibraryRequest {
     pub content_hash: String,
     /// Shown in every refusal.
     pub reason: String,
+    /// Also cancel the Runs in progress that use the version, as
+    /// `POST /v1/runs/{id}/cancel` does: their running Steps stop. Default
+    /// `false`: a Step that is running finishes.
+    #[serde(default)]
+    pub cancel_runs: bool,
 }
 
 #[derive(Debug, Default, Deserialize, ToSchema)]
@@ -487,6 +519,7 @@ fn yank_dto(y: &LibraryYank) -> LibraryYankDto {
         reason: y.reason.clone(),
         yanked_by: y.yanked_by.clone(),
         yanked_at: y.yanked_at,
+        cancelled_runs: Vec::new(),
     }
 }
 
@@ -1197,7 +1230,123 @@ pub(crate) async fn yank_library(
         .await
         .map_err(store_api_error)?;
     tracing::warn!(org = %y.org, version = %y.content_hash, by = %by, "library version yanked");
-    Ok(Json(yank_dto(&y)))
+    let mut dto = yank_dto(&y);
+    // After the yank is stored, so no Step from the version launches while
+    // the Runs are being cancelled. Each cancel is the operator cancel a
+    // Run's Cancel button makes, journalled with the caller as `by`.
+    if body.cancel_runs {
+        for r in yank_impact(&st, &y.org, &y.content_hash).await?.runs {
+            let run = scarab_engine::RunId(r.id.clone());
+            match scarab_engine::cancel_run_request(&*st.db, &*st.clock, &run, Some(by.clone()))
+                .await
+            {
+                Ok(true) => dto.cancelled_runs.push(r.id),
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(run = %r.id, error = %e, "cancelling a Run on yank failed")
+                }
+            }
+        }
+    }
+    Ok(Json(dto))
+}
+
+/// The Runs in progress in `org` whose Steps use version `hash`: read from
+/// each active Run's stored `origin`.
+pub(crate) async fn yank_impact(
+    st: &AppState,
+    org: &str,
+    hash: &str,
+) -> Result<YankImpactDto, ApiError> {
+    let active = st.db.active_runs().await?;
+    let tenants = if active.is_empty() {
+        Default::default()
+    } else {
+        st.db.run_tenants(&active).await?
+    };
+    let mut runs = Vec::new();
+    let mut running = 0;
+    for run in active {
+        let Some((run_org, project)) = tenants.get(&run) else {
+            continue;
+        };
+        if run_org != org {
+            continue;
+        }
+        let Some(ir) = st.db.run_ir(&run).await? else {
+            continue;
+        };
+        let Ok(ir) = serde_json::from_value::<StoredIr>(ir) else {
+            continue;
+        };
+        let using: Vec<String> = ir
+            .steps
+            .into_iter()
+            .filter(|s| {
+                s.origin.iter().any(|o| {
+                    o.kind == scarab_pipeline::OriginKind::Library && o.content_hash == hash
+                })
+            })
+            .map(|s| s.id)
+            .collect();
+        if using.is_empty() {
+            continue;
+        }
+        let Some(status) = st.db.run_status(&run).await? else {
+            continue;
+        };
+        let running_steps: Vec<String> = st
+            .db
+            .steps_of_run(&run)
+            .await?
+            .into_iter()
+            .filter(|s| {
+                s.status == scarab_engine::StepStatus::Running && using.contains(&s.step.0)
+            })
+            .map(|s| s.step.0)
+            .collect();
+        running += running_steps.len();
+        runs.push(YankImpactRunDto {
+            run_number: st.db.run_number(&run).await?,
+            id: run.0,
+            project: project.clone(),
+            status: crate::run_status_name(status).to_string(),
+            steps: using,
+            running_steps,
+        });
+    }
+    runs.sort_by(|a, b| (&a.project, a.run_number).cmp(&(&b.project, b.run_number)));
+    Ok(YankImpactDto {
+        content_hash: hash.to_string(),
+        runs,
+        running_steps: running,
+    })
+}
+
+/// The Runs in progress in this org that use a library version: what a yank
+/// of it would stop. Administer on the org.
+#[utoipa::path(
+    get,
+    path = "/v1/orgs/{org}/library-yanks/{hash}/impact",
+    params(
+        ("org" = String, Path, description = "org"),
+        ("hash" = String, Path, description = "content hash")
+    ),
+    summary = "The Runs in progress that use a library version (ADR-0076 §6)",
+    responses(
+        (status = 200, body = YankImpactDto),
+        (status = 400, description = "not a content hash"),
+        (status = 403, description = "not an org admin")
+    )
+)]
+pub(crate) async fn get_yank_impact(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((org, hash)): Path<(String, String)>,
+) -> Result<Json<YankImpactDto>, ApiError> {
+    org_caller(&st, &headers, &org, Action::Administer).await?;
+    check_hash(&hash)?;
+    Ok(Json(yank_impact(&st, &org, &hash).await?))
 }
 
 /// Lift a yank. Needs a step-up: it loosens (ADR-0076 §6). Administer on

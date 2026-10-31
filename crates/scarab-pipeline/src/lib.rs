@@ -20,6 +20,7 @@
 //! the [`cel`] submodule and is wired up by a later slice.
 
 pub mod cel;
+pub mod diagnostic;
 pub mod event;
 pub mod oci;
 pub mod params;

@@ -10,6 +10,7 @@ import RepoView from "./routes/RepoView";
 import RunDetail from "./routes/RunDetail";
 import RunPipeline from "./routes/RunPipeline";
 import Settings from "./routes/Settings";
+import LibraryReview from "./routes/LibraryReview";
 import Account from "./routes/Account";
 import ConfirmRequest from "./routes/ConfirmRequest";
 
@@ -31,6 +32,9 @@ export default function App() {
       {/* Global, org-scoped settings (ADR-0060). One segment, so it can't
           collide with the two-segment /:org/:repo tier. */}
       <Route path="/settings" component={Settings} />
+      {/* Install or upgrade a library (ADR-0076 §4): its own page, so the
+          review can be sent to a second reviewer. */}
+      <Route path="/settings/libraries/review" component={LibraryReview} />
       {/* Your sign-in accounts (ADR-0069) — everyone's, not admin-gated. */}
       <Route path="/account" component={Account} />
       {/* The same page, scrolled to Security (ADR-0073): where every "enroll

@@ -177,6 +177,23 @@ Major Mono Display; section headings stay Space Grotesk.
 | Filter pill / chip | Mono | 11.5px | 400 | 0 |
 | Code / id / SHA / log | Mono | 12–13px | 400 | 0 |
 
+### Type scale
+
+Inside the app, a font size is one of five steps, kept as custom properties in
+`ui/scarab-web-ui/src/styles.css`. Mono text uses the same steps.
+
+| Token | Size | Use |
+|-------|------|-----|
+| `--fs-xs` | 11px | badges, chips, hashes |
+| `--fs-sm` | 12px | table cells, secondary text |
+| `--fs-md` | 13px | body, form controls |
+| `--fs-lg` | 15px | section headings |
+| `--fs-xl` | 20px | page titles |
+
+A new or rewritten component uses only these tokens: no literal font size and
+no half-pixel size. Older components still carry one-off sizes and move to the
+scale separately; do not add new ones.
+
 ### Principles
 - **Punchy display, comfortable body.** Headlines are Space Grotesk 700 with
   tight negative tracking (film-title weight); body is Inter at 1.5 for readability.
@@ -327,8 +344,11 @@ Placement is stricter than doodles, because motion competes with content:
 | Chrome | `--pine-deep` band | panel/table headers, top bar |
 | Terminal | `--terminal` pine-black | logs, DAG |
 | Overlay | `--emerald-elevated` + soft shadow (the one exception) | modal |
+| Well | `--well` fill + inset shadow + dot grid | empty states only |
 
-**No shadows on flat chrome.** Depth is shade.
+**No shadows on flat chrome.** Depth is shade. The one other exception is an
+empty state: it is drawn as a recessed well (an inset, debossed shadow over the
+dot grid), so it reads as a space waiting to be filled rather than as a card.
 
 ## 8. Do's and Don'ts
 

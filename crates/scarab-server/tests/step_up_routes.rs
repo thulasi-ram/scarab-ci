@@ -104,6 +104,7 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     ),
     ("GET", "/v1/repos", "read", "READ"),
     ("GET", "/v1/repos/{org}/{repo}/runs", "read", "READ"),
+    ("GET", "/v1/repos/{org}/{repo}/refused-runs", "read", "READ"),
     ("POST", "/v1/runs", "run.create", "NG"),
     ("GET", "/v1/runs", "read", "READ"),
     ("GET", "/v1/runs/{id}", "read", "READ"),
@@ -384,6 +385,8 @@ const EXPECTED: &[(&str, &str, &str, &str)] = &[
     ("GET", "/v1/orgs/{org}/policy-decisions", "read", "READ"),
     ("GET", "/v1/runs/{id}/policy-decisions", "read", "READ"),
     ("GET", "/v1/orgs/{org}/libraries", "read", "READ"),
+    ("GET", "/v1/orgs/{org}/library-yanks/{hash}/impact", "read", "READ"),
+    ("GET", "/v1/runs/{id}/steps/{step}/origin", "read", "READ"),
     (
         "POST",
         "/v1/orgs/{org}/libraries/fetch",

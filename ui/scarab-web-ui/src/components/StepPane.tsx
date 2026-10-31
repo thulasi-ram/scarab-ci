@@ -15,6 +15,7 @@ import {
   workspaceFileUrl,
   streamStepLogs,
   streamStepSidecarLogs,
+  stepOrigin,
   type StepStatus,
   type Attempt,
 } from "../api/client";
@@ -28,10 +29,13 @@ import {
 } from "../attempts";
 import { levelOf } from "../logs";
 import type { GateStatus } from "../gates";
+import { clock, clockLow, expiryPercent, isYankRefusal, originParts, pluginGateState } from "../run-origin";
+import { shortHash } from "../libraries";
+import { absTime } from "../fmt";
 import Icon from "./Icon";
 import AttemptsDropdown, { type FilmstripTry } from "./AttemptsDropdown";
 
-type Tab = "logs" | "results" | "outputs" | "workspace";
+type Tab = "logs" | "results" | "outputs" | "workspace" | "origin" | "gate";
 
 // Cap rendered lines so a giant attempt can't blow up the DOM (windowing v1).
 const MAX_LINES = 1500;
@@ -87,8 +91,40 @@ export default function StepPane(props: {
   /** The step's gate verdict (gates.ts `gateStatus`) — shown under the stamp. `null` = nothing to say (or viewing
    * an older version, which this line does not describe). */
   gateStatus?: GateStatus | null;
+  /** The Run's pipeline name, for the origin line (ADR-0076). */
+  pipeline?: string | null;
+  /** The page's clock tick, for a plugin gate's expiry countdown. */
+  now?: number;
 }) {
   const [tab, setTab] = createSignal<Tab>("logs");
+  // A plugin gate (ADR-0076 §7) opens on its Gate tab; any other step never
+  // stays on one.
+  const isPluginGate = () => !!props.step?.plugin_gate;
+  createEffect(
+    on(
+      () => props.step?.id,
+      () => {
+        if (isPluginGate()) setTab("gate");
+        else if (tab() === "gate" || (tab() === "origin" && (props.step?.origin ?? []).length === 0)) setTab("logs");
+      },
+    ),
+  );
+  // Where the step comes from: the chain, its bound inputs, and its render.
+  // Read when the Origin or Gate tab is open.
+  const [origin] = createResource(
+    () => {
+      const s = props.step;
+      const t = tab();
+      return s && (t === "origin" || t === "gate") ? { run: props.runId, step: s.id, n: s.attempt_list?.length ?? 0 } : null;
+    },
+    (k) => stepOrigin(k.run, k.step).catch(() => null),
+  );
+  const parts = () => (props.step ? originParts(props.pipeline, props.step) : []);
+  // A launch refused because a library version is yanked (ADR-0076 §6).
+  const yankRefusal = () => {
+    const a = props.step?.attempt_list?.[props.step.attempt_list.length - 1];
+    return a?.failure === "config" && isYankRefusal(a.failure_detail) ? a.failure_detail : null;
+  };
   const [wsPath, setWsPath] = createSignal("");
   const [openFile, setOpenFile] = createSignal<string | null>(null);
   const [wrap, setWrap] = createSignal(true);
@@ -399,12 +435,63 @@ export default function StepPane(props: {
                 </div>
               )}
             </Show>
+            <Show when={!props.gateStatus && isPluginGate() && pluginGateState(s()) !== "released"}>
+              <div
+                class={`gate-status ${pluginGateState(s()) === "expired" || pluginGateState(s()) === "rejected" ? "failed" : ""}`}
+                role="status"
+              >
+                {pluginGateState(s()) === "killed"
+                  ? "waiting for its plugin · the plugin is killed"
+                  : "waiting for its plugin"}
+              </div>
+            </Show>
+            <Show when={yankRefusal()}>
+              {(d) => (
+                <div class="gate-status failed" role="status">
+                  config error · refused at launch: {d()}
+                </div>
+              )}
+            </Show>
+            <Show when={parts().length > 0}>
+              <div class="origin-strip">
+                <span class="k">origin</span>
+                <For each={parts()}>
+                  {(p, k) => (
+                    <>
+                      <Show when={k() > 0}>
+                        <span class="sep">›</span>
+                      </Show>
+                      <Show when={p.kind === "step"}>
+                        <span>step</span>
+                      </Show>
+                      <span class="lnk" classList={{ y: p.kind === "lib" && p.yanked }}>
+                        {p.text}
+                      </span>
+                      <Show when={p.kind === "lib" ? p : null}>{(l) => <span class="h">{l().hash}</span>}</Show>
+                    </>
+                  )}
+                </For>
+              </div>
+            </Show>
             <div class="pane-tabbar">
               <div class="tabs">
-                <TabBtn id="logs" label="Logs" />
-                <TabBtn id="results" label="Results" count={results()?.length ?? 0} />
-                <TabBtn id="outputs" label="Outputs" count={outResults()?.length ?? 0} />
-                <TabBtn id="workspace" label="Workspace" />
+                <Show
+                  when={isPluginGate()}
+                  fallback={
+                    <>
+                      <TabBtn id="logs" label="Logs" />
+                      <TabBtn id="results" label="Results" count={results()?.length ?? 0} />
+                      <TabBtn id="outputs" label="Outputs" count={outResults()?.length ?? 0} />
+                      <TabBtn id="workspace" label="Workspace" />
+                      <Show when={(s().origin ?? []).length > 0}>
+                        <TabBtn id="origin" label="Origin" />
+                      </Show>
+                    </>
+                  }
+                >
+                  <TabBtn id="gate" label="Gate" />
+                  <TabBtn id="outputs" label="Outputs" count={outResults()?.length ?? 0} />
+                </Show>
               </div>
               <span class="grow1" />
               <Show when={props.deadLettered && attemptsOf().some((a) => a.failed)}>
@@ -754,6 +841,239 @@ export default function StepPane(props: {
                 </Show>
                 </Show>
               </div>
+            </Show>
+
+            {/* Origin (ADR-0076): the invoke chain, the inputs bound in this
+                Step's invocation, and the Step as its launch renders it. */}
+            <Show when={tab() === "origin"}>
+              <div class="tabpane">
+                <Show when={origin()} fallback={<p class="empty">{origin.loading ? "loading…" : "Could not load where this Step comes from."}</p>}>
+                  {(o) => (
+                    <div class="split2">
+                      <div>
+                        <p class="pane-sub">invoke chain</p>
+                        <ol class="chain">
+                          <li>
+                            <span class="dot">
+                              <Icon icon="file-code" size={12} />
+                            </span>
+                            <div class="t">
+                              <div class="l1">
+                                <span class="kind">pipeline</span>
+                                <span class="mono">{props.pipeline ? `.scarab/${props.pipeline}.yaml` : "the Pipeline file"}</span>
+                              </div>
+                              <div class="lib-src">the Run's own file</div>
+                            </div>
+                          </li>
+                          <For each={o().chain}>
+                            {(c, k) => (
+                              <li>
+                                <span class="dot">
+                                  <Icon icon={c.kind === "plugin" ? "shield-check" : "package"} size={12} />
+                                </span>
+                                <div class="t">
+                                  <div class="l1">
+                                    <span class="kind">{c.kind === "library" ? "lib" : c.kind}</span>
+                                    <span class="mono">{c.name}</span>
+                                    <span class="lib-hash">{shortHash(c.content_hash)}</span>
+                                    <Show when={c.kind !== "plugin"}>
+                                      <span class="subtle" style={{ "font-size": "var(--fs-sm)" }}>
+                                        invoked as <span class="mono">{s().id.split("/").slice(0, k() + 1).join("/")}</span>
+                                      </span>
+                                    </Show>
+                                  </div>
+                                  <Show when={c.source}>{(src) => <div class="lib-src">{src()}</div>}</Show>
+                                  <Show when={c.kind === "library"}>
+                                    <div class="subtle" style={{ "font-size": "var(--fs-sm)" }}>
+                                      {c.yanked ? <span class="plg-killed">yanked in this org</span> : "not yanked"}
+                                    </div>
+                                  </Show>
+                                </div>
+                              </li>
+                            )}
+                          </For>
+                          <li>
+                            <span class="dot" style={{ "border-color": "var(--emerald)", color: "var(--emerald)" }}>
+                              <Icon icon="container" size={12} />
+                            </span>
+                            <div class="t">
+                              <div class="l1">
+                                <span class="kind">step</span>
+                                <span class="mono">{s().id.split("/").pop()}</span>
+                                <span class="subtle" style={{ "font-size": "var(--fs-sm)" }}>
+                                  → <span class="mono">{s().id}</span> in this Run
+                                </span>
+                              </div>
+                            </div>
+                          </li>
+                        </ol>
+                      </div>
+                      <div>
+                        <p class="pane-sub">inputs in this invocation's scope</p>
+                        <Show when={o().inputs.length > 0} fallback={<p class="empty">none: a Step in the Pipeline file reads the Run's parameters</p>}>
+                          <table class="table inputs-tbl" style={{ "font-size": "var(--fs-sm)" }}>
+                            <thead>
+                              <tr>
+                                <th>input</th>
+                                <th>bound</th>
+                                <th>kind</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              <For each={o().inputs}>
+                                {(i) => (
+                                  <tr>
+                                    <td class="mono">{i.name}</td>
+                                    <td class="mono">{typeof i.bound === "string" ? i.bound : JSON.stringify(i.bound)}</td>
+                                    <td class="subtle">{i.kind}</td>
+                                  </tr>
+                                )}
+                              </For>
+                            </tbody>
+                          </table>
+                        </Show>
+                        <p class="pane-sub" style={{ "margin-top": "14px" }}>rendered at launch</p>
+                        <Show when={o().rendered} fallback={<p class="empty">{o().render_note ?? "not rendered"}</p>}>
+                          {(r) => (
+                            <pre class="rendered">
+                              {`image    ${r().image}\ncommand  ${r().command.join(" ")}${r()
+                                .env.map(([k, v], n) => `\n${n === 0 ? "env      " : "         "}${k}=${v}`)
+                                .join("")}`}
+                            </pre>
+                          )}
+                        </Show>
+                      </div>
+                    </div>
+                  )}
+                </Show>
+              </div>
+            </Show>
+
+            {/* A plugin gate (ADR-0076 §7): who releases it, its expiry, the
+                inputs rendered when it was reached, and its typed outputs. */}
+            <Show when={tab() === "gate" ? s().plugin_gate : null}>
+              {(g) => {
+                const state = () => pluginGateState(s());
+                const left = () => (g().expires_at != null ? g().expires_at! - (props.now ?? Date.now()) : null);
+                const bound = (name: string) => origin()?.inputs.find((i) => i.name === name);
+                return (
+                  <div class="tabpane">
+                    <div class="gp">
+                      <div class="gp-card">
+                        <h4>who releases it</h4>
+                        <div class="gp-big" style={{ "font-size": "var(--fs-lg)" }}>
+                          {g().releaser}
+                        </div>
+                        <div class="gp-line">
+                          <Show
+                            when={g().plugin_state === "killed"}
+                            fallback={
+                              <>
+                                <span class="plg-enabled">● {g().plugin_state ?? "not installed"}</span> · gate{" "}
+                                <span class="mono">{g().gate}</span>
+                              </>
+                            }
+                          >
+                            <span class="plg-killed">● killed</span>
+                            {g().killed_by ? ` by ${g().killed_by}` : ""}
+                            {g().killed_at ? ` · ${absTime(g().killed_at!)}` : ""}
+                          </Show>
+                        </div>
+                        <div class="gp-line">
+                          Only {g().installation} can pass this gate. Anyone with write access to the
+                          Project can reject it with a reason. Nobody can approve it in the plugin's
+                          place.
+                        </div>
+                      </div>
+                      <div class="gp-card">
+                        <h4>expiry</h4>
+                        <Show
+                          when={g().expires_at != null}
+                          fallback={<div class="gp-line">The wait has not started: the gate is not reached yet.</div>}
+                        >
+                          <div
+                            class={`gp-big ${state() === "released" ? "good" : state() === "expired" || state() === "rejected" ? "bad" : "warn"}`}
+                          >
+                            {state() === "released"
+                              ? "released"
+                              : state() === "expired"
+                                ? "expired"
+                                : state() === "rejected"
+                                  ? "rejected"
+                                  : `${clock(left()!)} left`}
+                          </div>
+                          <div class="bar">
+                            <i
+                              style={{
+                                width: `${state() === "expired" ? 100 : expiryPercent(g().waiting_since!, g().expires_at!, state() === "released" || state() === "rejected" ? (s().gate_resolution?.at ?? props.now ?? 0) : (props.now ?? Date.now()))}%`,
+                                background: left() != null && clockLow(left()!) && state() === "waiting" ? "var(--danger)" : undefined,
+                              }}
+                            />
+                          </div>
+                          <div class="gp-line">
+                            reached {absTime(g().waiting_since!)} ·{" "}
+                            <span class="mono">gate_expires_after: {g().expires_after}</span>
+                            {state() === "waiting" || state() === "killed"
+                              ? ` · fails at ${absTime(g().expires_at!)} if not released`
+                              : s().gate_resolution
+                                ? ` · ${state()} ${absTime(s().gate_resolution!.at)}`
+                                : ""}
+                          </div>
+                        </Show>
+                      </div>
+                      <div class="gp-card">
+                        <h4>inputs · rendered when the gate was reached</h4>
+                        <Show
+                          when={g().inputs && typeof g().inputs === "object"}
+                          fallback={<div class="gp-line">Rendered when the gate is reached.</div>}
+                        >
+                          <table class="table" style={{ "font-size": "var(--fs-sm)" }}>
+                            <tbody>
+                              <For each={Object.entries((g().inputs ?? {}) as Record<string, unknown>)}>
+                                {([k, v]) => (
+                                  <tr>
+                                    <td class="mono">{k}</td>
+                                    <td class="mono">{typeof v === "string" ? v : JSON.stringify(v)}</td>
+                                    <td class="subtle mono">
+                                      {bound(k)?.kind === "template" ? String(bound(k)!.bound) : bound(k) ? "literal" : ""}
+                                    </td>
+                                  </tr>
+                                )}
+                              </For>
+                            </tbody>
+                          </table>
+                        </Show>
+                      </div>
+                      <div class="gp-card">
+                        <h4>outputs</h4>
+                        <Show when={g().outputs.length > 0} fallback={<div class="gp-line">This gate returns no outputs.</div>}>
+                          <For each={g().outputs}>
+                            {(o) => (
+                              <div class="gp-line">
+                                <span class="mono">{o.name}</span>{" "}
+                                <span class="tok-state" style={{ color: "var(--copper)" }}>
+                                  {o.type}
+                                </span>
+                                {o.value !== undefined && o.value !== null ? (
+                                  <>
+                                    {" "}= <span class="mono">{typeof o.value === "string" ? o.value : JSON.stringify(o.value)}</span> · by{" "}
+                                    <b>{g().releaser}</b>
+                                  </>
+                                ) : state() === "waiting" || state() === "killed" ? (
+                                  <>: set by {g().installation} when it releases the gate</>
+                                ) : (
+                                  <> was never set; Steps that read it did not run</>
+                                )}
+                                {" "}· read as <span class="mono">{`\${{ outputs.${s().id}.${o.name} }}`}</span>
+                              </div>
+                            )}
+                          </For>
+                        </Show>
+                      </div>
+                    </div>
+                  </div>
+                );
+              }}
             </Show>
           </>
         )}

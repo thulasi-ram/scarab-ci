@@ -82,7 +82,9 @@ pub mod plugins;
 /// decision logs and the policy test API.
 pub mod policies;
 pub mod retention;
+mod refused_runs;
 mod routes;
+pub mod run_origin;
 /// Slice b, criterion 5: the Run page's gate resolution per step.
 mod run_gate_view;
 pub use routes::{route_table, RouteEntry};
@@ -1056,6 +1058,11 @@ pub struct RunStatusResponse {
     /// cold tier's time bound, made explicit rather than left implicit in a
     /// sweeper's config, plus any manual pin over it.
     pub snapshot_retention: SnapshotRetentionDto,
+    /// The library versions this Run uses that are yanked in its org now
+    /// (ADR-0076 §6). A Rerun or Retry of a Step from one is refused at
+    /// launch: it reuses the Steps the Run was compiled with. Empty when none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub yanked_libraries: Vec<run_origin::RunYankDto>,
 }
 
 /// The cold-tier retention promise over one Run's **Workspace Snapshots**
@@ -1404,6 +1411,16 @@ pub struct StepStatusDto {
     /// Run that deploys. Omitted when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub deploy: bool,
+    /// The invoke chain this Step was inlined through, outermost first
+    /// (ADR-0076): the `origin` the compiler recorded, each library version
+    /// marked when it is yanked in the Run's org. Empty for a Step written in
+    /// the Pipeline file itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub origin: Vec<run_origin::OriginLinkDto>,
+    /// For a `gate: plugin` node (ADR-0076 §7): who releases it, its expiry,
+    /// its rendered inputs and its typed outputs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin_gate: Option<run_origin::PluginGateViewDto>,
 }
 
 /// How a gate's wait resolved: its `GateResolved` journal entry.
@@ -1575,6 +1592,9 @@ pub enum ApiError {
     /// A dependency that must work for the request to be safe is down (503):
     /// a crown jewel whose authorisation cannot be recorded does not run.
     Unavailable(String),
+    /// A Pipeline that does not compile (400), with each error's fields.
+    /// JSON body: [`CompileErrorResponse`].
+    Compile(Box<CompileErrorResponse>),
     /// A log body read failed while the index says chunks exist — the bytes are
     /// gone or unreachable, and the reader must be told rather than handed a
     /// plausible blank pane (ADR-0063 part 5: absence is authoritative only when
@@ -1661,6 +1681,7 @@ impl IntoResponse for ApiError {
             )
                 .into_response(),
             ApiError::Unavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m).into_response(),
+            ApiError::Compile(body) => (StatusCode::BAD_REQUEST, Json(*body)).into_response(),
             ApiError::TooManyRequests(m) => (StatusCode::TOO_MANY_REQUESTS, m).into_response(),
         }
     }
@@ -2114,7 +2135,7 @@ async fn list_refs(
     responses(
         (status = 200, description = "the compiled typed parameter schema", body = PipelineInterfaceResponse),
         (status = 404, description = "no pipeline by that name at the ref"),
-        (status = 400, description = "the pipeline failed to compile (structured diagnostic)")
+        (status = 400, description = "the pipeline failed to compile: each error with its fields", body = CompileErrorResponse)
     )
 )]
 async fn pipeline_interface(
@@ -2141,12 +2162,14 @@ async fn pipeline_interface(
     // Resolve the ref → SHA (echoed back), read the named pipeline there, and
     // fully compile — mapping each failure to a structured 4xx via DispatchError
     // (the same shape dispatch uses: not-found → 404, compile/forge → 400).
+    let mut resolved: Option<String> = None;
     let interface = async {
         let sha = forge
             .latest_commit(&repo, &q.r#ref)
             .await
             .map_err(DispatchError::Forge)?
             .sha;
+        resolved = Some(sha.clone());
         let (_, yaml) = read_named_pipeline(forge, &repo, &sha, &name).await?;
         let installed =
             installed_libraries(st.libraries.as_deref(), st.plugins.as_deref(), &repo.owner)
@@ -2160,9 +2183,122 @@ async fn pipeline_interface(
             inputs: ir.interface.inputs,
         })
     }
-    .await?;
+    .await;
 
-    Ok(Json(interface))
+    match interface {
+        Ok(i) => Ok(Json(i)),
+        // A compile failure answers with each error's fields (ADR-0076), so
+        // the form can show what is wrong and the fix line by line.
+        Err(DispatchError::Pipeline(text)) => Err(ApiError::Compile(Box::new(
+            CompileErrorResponse::from_text(format!("pipeline: {text}"), resolved),
+        ))),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// One compile error with the fields a reader acts on (ADR-0076): the Step,
+/// the command index and the template it reads, and for a library Step the
+/// library and the caller's binding. `message` is the compiler's text.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CompileErrorDto {
+    /// `command_value` (a `command` argument reads free text from outside
+    /// the Pipeline), `script_template` (a `${{ … }}` in a script) or
+    /// `other`.
+    pub kind: String,
+    /// The Step in the Pipeline file; for a library Step, the invoke Step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<String>,
+    /// For a library Step: the library (`<publisher>/<name>` or a path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library: Option<String>,
+    /// For a library Step: its id inside the library.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library_step: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_index: Option<u32>,
+    /// The `${{ … }}` the argument reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read: Option<String>,
+    /// For a library Step: the library input the caller binds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<String>,
+    /// For a library Step: the caller's `with:` value for `input`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound: Option<String>,
+    pub message: String,
+}
+
+impl From<scarab_pipeline::diagnostic::Diagnostic> for CompileErrorDto {
+    fn from(d: scarab_pipeline::diagnostic::Diagnostic) -> Self {
+        use scarab_pipeline::diagnostic::DiagnosticKind;
+        CompileErrorDto {
+            kind: match d.kind {
+                DiagnosticKind::CommandValue => "command_value",
+                DiagnosticKind::ScriptTemplate => "script_template",
+                DiagnosticKind::Other => "other",
+            }
+            .to_string(),
+            step: d.step,
+            library: d.library,
+            library_step: d.library_step,
+            command_index: d.command_index.and_then(|i| u32::try_from(i).ok()),
+            read: d.read,
+            input: d.input,
+            bound: d.bound,
+            message: d.message,
+        }
+    }
+}
+
+/// `400` body for a Pipeline that does not compile: the whole text, as a
+/// plain-text 400 carried it before, and each error with its fields.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CompileErrorResponse {
+    /// Always `compile_failed`.
+    pub code: String,
+    pub message: String,
+    /// The commit the Pipeline was read at.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha: Option<String>,
+    pub errors: Vec<CompileErrorDto>,
+}
+
+impl CompileErrorDto {
+    /// A refusal that is not a compile error: its message only.
+    pub fn other(message: String) -> Self {
+        CompileErrorDto {
+            kind: "other".into(),
+            step: None,
+            library: None,
+            library_step: None,
+            command_index: None,
+            read: None,
+            input: None,
+            bound: None,
+            message,
+        }
+    }
+}
+
+impl CompileErrorResponse {
+    /// The response for a compile failure's text.
+    pub fn from_text(message: String, sha: Option<String>) -> Self {
+        CompileErrorResponse {
+            code: "compile_failed".into(),
+            errors: compile_errors(&message),
+            message,
+            sha,
+        }
+    }
+}
+
+/// Each compile error in a compile failure's text, with its fields.
+pub fn compile_errors(text: &str) -> Vec<CompileErrorDto> {
+    let text = text.strip_prefix("pipeline: ").unwrap_or(text);
+    scarab_pipeline::diagnostic::diagnostics(text)
+        .into_iter()
+        .map(Into::into)
+        .collect()
 }
 
 /// Query for [`list_runs`]: an optional page size.
@@ -2281,10 +2417,12 @@ async fn get_run(
     // edges and address per-sidecar logs by index. A step with no stored spec
     // (e.g. a gate) carries empty vecs.
     let mut gate_views = run_gate_view::step_gate_views(&st, &run, &steps).await?;
+    let (mut origin_views, yanked_libraries) = run_origin::step_views(&st, &run, &steps).await?;
     let deploy_steps = st.db.deploy_steps_of_run(&run).await?;
     let mut step_dtos = Vec::with_capacity(steps.len());
     for s in steps {
         let view = gate_views.remove(&s.step.0).unwrap_or_default();
+        let origin_view = origin_views.remove(&s.step.0).unwrap_or_default();
         let deploy = deploy_steps.contains(&s.step);
         let (services, uses) = match st.db.step_spec(&run, &s.step).await? {
             Some(spec) => (
@@ -2312,6 +2450,8 @@ async fn get_run(
             services,
             uses,
             deploy,
+            origin: origin_view.origin,
+            plugin_gate: origin_view.plugin_gate,
         });
     }
     Ok(Json(RunStatusResponse {
@@ -2324,6 +2464,7 @@ async fn get_run(
         trigger_title,
         origin_pr_base,
         snapshot_retention,
+        yanked_libraries,
     }))
 }
 
@@ -4474,7 +4615,14 @@ pub async fn trigger_runs_from_event(
         // Pre-fetch transitive `invoke:` libraries at this ref and compile
         // (ADR-0038) — the shared read-at-ref → compile primitive also used by
         // the manual/api dispatch path.
-        let ir = prefetch_libs_and_compile(forge, repo, &git_ref, &yaml, &installed).await?;
+        let ir = record_compile_failure(
+            db,
+            clock,
+            event,
+            path,
+            prefetch_libs_and_compile(forge, repo, &git_ref, &yaml, &installed).await,
+        )
+        .await?;
 
         let matched = scarab_pipeline::matches_trigger(&ir, kind.as_str(), &ctx)
             .map_err(|e| TriggerError::Pipeline(e.to_string()))?;
@@ -4939,7 +5087,104 @@ async fn resolve_governance(
 /// as a webhook deploy — there is no gate-bypass here. `params`, when supplied,
 /// are the already-resolved launch parameters frozen onto the run (ADR-0043 §5).
 #[allow(clippy::too_many_arguments)] // a cohesive admission routine; splitting hides the flow
+/// [`admit_unrecorded`], recording a refusal (other than a ref an
+/// Environment does not allow, which is the rule working) so the Runs list
+/// can show it (ADR-0076).
+#[allow(clippy::too_many_arguments)]
 async fn admit_and_create_run(
+    forge: &dyn scarab_forge::ForgePort,
+    db: &dyn Db,
+    clock: &dyn Clock,
+    ports: AdmissionPorts<'_>,
+    event: &scarab_forge::Event,
+    ir: &scarab_pipeline::PipelineIr,
+    path: &str,
+    excluded: &[String],
+    params: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
+) -> Result<Admission, TriggerError> {
+    let admission =
+        admit_unrecorded(forge, db, clock, ports, event, ir, path, excluded, params).await?;
+    if let (Admission::Refused(refusal), Some(repo)) = (&admission, event.repo()) {
+        let (kind, messages): (&str, &[String]) = match refusal {
+            AdmissionRefusal::RefNotAllowed => ("", &[]),
+            AdmissionRefusal::UnknownEnvironment { .. }
+            | AdmissionRefusal::NotEligible { .. } => ("environment", &[]),
+            AdmissionRefusal::PolicyDenied { messages, .. } => ("policy", messages),
+            AdmissionRefusal::LibraryYanked { messages } => ("yanked", messages),
+            AdmissionRefusal::EventField { messages } => ("event_field", messages),
+            AdmissionRefusal::ForgeToken { messages } => ("forge_token", messages),
+        };
+        if !kind.is_empty() {
+            let message = admission_refusal_message(refusal, &repo.owner, &repo.name);
+            let errors: Vec<CompileErrorDto> = if messages.is_empty() {
+                vec![CompileErrorDto::other(message.clone())]
+            } else {
+                messages.iter().cloned().map(CompileErrorDto::other).collect()
+            };
+            record_refusal(db, clock, event, path, kind, message, &errors).await;
+        }
+    }
+    Ok(admission)
+}
+
+/// Record that `event` did not become a Run of `pipeline` (ADR-0076). Best
+/// effort: a failed write is logged and changes nothing about the refusal.
+async fn record_refusal(
+    db: &dyn Db,
+    clock: &dyn Clock,
+    event: &scarab_forge::Event,
+    pipeline: &str,
+    reason_kind: &str,
+    message: String,
+    errors: &[CompileErrorDto],
+) {
+    let Some(repo) = event.repo() else {
+        return;
+    };
+    let refused = scarab_engine::RefusedRun {
+        id: 0,
+        org: repo.owner.clone(),
+        project: repo.name.clone(),
+        pipeline: pipeline.to_string(),
+        trigger_kind: event.trigger_kind().as_str().to_string(),
+        actor: event.actor().map(str::to_string),
+        git_ref: event.protection_ref(),
+        sha: origin_sha(event),
+        title: event.trigger_title(),
+        reason_kind: reason_kind.to_string(),
+        message,
+        errors: serde_json::to_value(errors).unwrap_or(serde_json::Value::Array(Vec::new())),
+        created_at: clock.now().await,
+    };
+    if let Err(e) = db.record_refused_run(&refused).await {
+        tracing::warn!(
+            org = %refused.org,
+            project = %refused.project,
+            pipeline = %refused.pipeline,
+            error = %e,
+            "recording a refused Run failed"
+        );
+    }
+}
+
+/// Record a Pipeline that did not compile for `event`, and pass the error on.
+async fn record_compile_failure<T>(
+    db: &dyn Db,
+    clock: &dyn Clock,
+    event: &scarab_forge::Event,
+    pipeline: &str,
+    compiled: Result<T, TriggerError>,
+) -> Result<T, TriggerError> {
+    if let Err(TriggerError::Pipeline(text)) = &compiled {
+        let message = format!("pipeline: {text}");
+        let errors = compile_errors(&message);
+        record_refusal(db, clock, event, pipeline, "compile", message, &errors).await;
+    }
+    compiled
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn admit_unrecorded(
     forge: &dyn scarab_forge::ForgePort,
     db: &dyn Db,
     clock: &dyn Clock,
@@ -5641,7 +5886,7 @@ pub async fn dispatch_run(
     let installed = installed_libraries(ports.libraries, ports.plugins, &repo.owner)
         .await
         .map_err(DispatchError::Db)?;
-    let ir = prefetch_libs_and_compile(forge, &repo, &sha, &yaml, &installed).await?;
+    let compiled = prefetch_libs_and_compile(forge, &repo, &sha, &yaml, &installed).await;
 
     // Build the repo+ref-aware event: the config is read/pinned at the resolved
     // commit (`sha`), while allowed_refs (ADR-0037) matches the *symbolic* ref the
@@ -5654,6 +5899,7 @@ pub async fn dispatch_run(
     // (that is an Environment ProtectionRule at admission, thread D). Excluded
     // from `context()`, so it never reaches trigger-matching / interpolation.
     let event = kind.into_event(actor, repo, sym, sha, reason);
+    let ir = record_compile_failure(db, clock, &event, &path, compiled).await?;
     let ctx = event.context();
 
     // Opt-in (ADR-0043 §4): the pipeline is dispatchable only if it declares a
@@ -11156,6 +11402,9 @@ impl utoipa::Modify for StepUpResponses {
         libraries::retry_library_defaults,
         libraries::trust_library_source,
         libraries::untrust_library_source,
+        libraries::get_yank_impact,
+        run_origin::get_step_origin,
+        refused_runs::list_refused_runs,
         policies::list_org_policies,
         policies::create_org_policy,
         policies::get_org_policy,
@@ -11335,6 +11584,19 @@ impl utoipa::Modify for StepUpResponses {
         libraries::InstalledVersionDto,
         libraries::InstallLibraryRequest,
         libraries::YankLibraryRequest,
+        libraries::YankImpactDto,
+        CompileErrorDto,
+        CompileErrorResponse,
+        refused_runs::RefusedRunDto,
+        refused_runs::RefusedRunListResponse,
+        libraries::YankImpactRunDto,
+        run_origin::OriginLinkDto,
+        run_origin::RunYankDto,
+        run_origin::GateOutputDto,
+        run_origin::PluginGateViewDto,
+        run_origin::BoundInputDto,
+        run_origin::RenderedSpecDto,
+        run_origin::StepOriginDto,
         libraries::RetryDefaultsRequest,
         libraries::TrustedSourceDto,
         libraries::TrustSourceRequest,
