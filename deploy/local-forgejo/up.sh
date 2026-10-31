@@ -29,6 +29,9 @@ base="http://127.0.0.1:${FORGEJO_HTTP_PORT}"
 owner="$FORGEJO_ADMIN_USER"
 hook_repo="verify-hook"
 onboard_repo="verify-onboard"
+# ADR-0076 live case: a Pipeline that invokes an installed library, and one
+# that reads event.branch (a branch named with `;` must refuse only that one).
+library_repo="verify-library"
 
 # Same rule as deploy/local-proc/up.sh: never seed, or grade, an instance this
 # script did not start. Here the port bind would normally fail loudly inside
@@ -129,12 +132,37 @@ put_file() {
 for r in "$hook_repo" "$onboard_repo"; do
   put_file "$r" ".scarab/ci.yaml" "$ci_yaml"
 done
+ensure_repo "$library_repo" true
+library_ci_yaml=$(cat <<'YAML'
+on:
+  push: {}
+steps:
+  - id: say
+    invoke: lib:thulasi-ram/notify
+    with: { channel: verify }
+YAML
+)
+branch_yaml=$(cat <<'YAML'
+on:
+  push: {}
+steps:
+  - id: show
+    image: busybox:latest
+    security:
+      run_as_root: true
+    env:
+      - [BRANCH, "${{ event.branch }}"]
+    command: ["sh", "-c", "echo \"branch=$BRANCH\""]
+YAML
+)
+put_file "$library_repo" ".scarab/ci.yaml" "$library_ci_yaml"
+put_file "$library_repo" ".scarab/branch.yaml" "$branch_yaml"
 
 echo "==> seeding $FORGEJO_PAD_REPOS filler repos (forces a second /user/repos page)"
 for i in $(seq -f '%03g' 1 "$FORGEJO_PAD_REPOS"); do
   ensure_repo "verify-pad-$i" false
 done
-total=$((FORGEJO_PAD_REPOS + 2))
+total=$((FORGEJO_PAD_REPOS + 3))
 echo "    $total repos reachable by the token"
 
 # ADR-0069 s7: an ORG repo reached three different ways — the org's owner (the
@@ -155,6 +183,9 @@ done
 api -o /dev/null -X POST -d "{\"username\":\"$team_org\"}" "$base/api/v1/orgs"
 api -o /dev/null -X POST -d "{\"name\":\"$team_repo\",\"auto_init\":false,\"private\":true}" \
   "$base/api/v1/orgs/$team_org/repos"
+# The admin owns the org, so /user/repos lists this repo too (b3678d46 added
+# it without counting it, and the pagination case expected one repo too few).
+total=$((total + 1))
 team_id="$(api "$base/api/v1/orgs/$team_org/teams" | python3 -c '
 import json,sys
 print(next((t["id"] for t in json.load(sys.stdin) if t["name"]=="devs"), ""))')"
@@ -176,6 +207,7 @@ SCARAB_TEST_FORGEJO_TOKEN=$token
 SCARAB_TEST_FORGEJO_OWNER=$owner
 SCARAB_TEST_FORGEJO_HOOK_REPO=$hook_repo
 SCARAB_TEST_FORGEJO_ONBOARD_REPO=$onboard_repo
+SCARAB_TEST_FORGEJO_LIBRARY_REPO=$library_repo
 SCARAB_TEST_FORGEJO_REPO_TOTAL=$total
 SCARAB_TEST_FORGEJO_TEAM_ORG=$team_org
 SCARAB_TEST_FORGEJO_TEAM_REPO=$team_repo

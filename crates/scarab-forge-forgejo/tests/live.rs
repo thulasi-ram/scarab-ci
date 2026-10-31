@@ -203,7 +203,7 @@ async fn list_accessible_repos_walks_past_the_first_page() {
         env("SCARAB_TEST_FORGEJO_TOKEN"),
     );
     let owner = env("SCARAB_TEST_FORGEJO_OWNER");
-    let expected: usize = env_or("SCARAB_TEST_FORGEJO_REPO_TOTAL", "57")
+    let expected: usize = env_or("SCARAB_TEST_FORGEJO_REPO_TOTAL", "59")
         .parse()
         .expect("SCARAB_TEST_FORGEJO_REPO_TOTAL is a number");
     assert!(
@@ -239,8 +239,14 @@ async fn list_accessible_repos_walks_past_the_first_page() {
     // The owner spelling actually used by the real response — `repos_from_page`
     // accepts `login` or `username`, and an owner-less row is dropped silently,
     // so an empty owner here would mean the pick-list lost its coordinates.
+    // The admin's own repos, plus the team org's repo, which it owns through
+    // the org (seeded for the list_collaborators cases).
+    let team_org = env("SCARAB_TEST_FORGEJO_TEAM_ORG");
     for r in &repos {
-        assert_eq!(r.owner, owner, "every seeded repo belongs to {owner}");
+        assert!(
+            r.owner == owner || r.owner == team_org,
+            "every seeded repo belongs to {owner} or {team_org}: {r:?}"
+        );
     }
     // And the two working repos are in the set, not just the filler.
     for name in [
