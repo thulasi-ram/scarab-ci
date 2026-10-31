@@ -4815,6 +4815,13 @@ pub async fn dispatch_run(
         .latest_commit(&repo, &r#ref)
         .await
         .map_err(DispatchError::Forge)?;
+    // The pinned commit reaches `git fetch` in the clone container as an
+    // argument; a forge answer that is not a hex SHA never becomes a Run.
+    if !scarab_forge::is_commit_sha(&commit.sha) {
+        return Err(DispatchError::Forge(scarab_forge::ForgeError::Api(
+            "the forge resolved the ref to a value that is not a commit SHA".into(),
+        )));
+    }
     let sha = commit.sha;
 
     // Read the named pipeline at the resolved commit.

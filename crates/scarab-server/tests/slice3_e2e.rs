@@ -37,7 +37,7 @@ steps:
 fn signed_push_request() -> Request<Body> {
     let body = serde_json::to_vec(&serde_json::json!({
         "ref": "refs/heads/main",
-        "after": "sha-abc",
+        "after": "abc1234",
         "repository": { "name": "app", "owner": { "login": "acme" } }
     }))
     .unwrap();
