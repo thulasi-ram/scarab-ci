@@ -443,3 +443,14 @@ async fn a_cancelled_unit_is_torn_down() {
     let bogus = scarab_engine::ports::ExecHandle("local://nope/nope/0".into());
     assert!(exec.torn_down(&bogus).await.unwrap());
 }
+
+/// The local executor resolves no library state and mounts no forge
+/// credential: a gate is never refused here, and no Attempt ever holds a
+/// token to revoke (a `forge_token` Step is refused at launch instead).
+#[tokio::test]
+async fn no_gate_refusal_and_no_forge_credential_to_take() {
+    let exec = LocalExecutor::new();
+    assert_eq!(exec.gate_refusal(&step("r1", "gate")).await.unwrap(), None);
+    let handle = scarab_engine::ports::ExecHandle("local://r1/ok/0".into());
+    assert!(exec.take_forge_credential(&handle).await.unwrap().is_none());
+}
