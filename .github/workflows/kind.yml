@@ -47,7 +47,11 @@ on:
       - 'crates/scarab-workspace-client/**'
       - 'docker/**'
       - '.github/workflows/kind.yml'
+  # `labeled` / `unlabeled`: the ci:skip label skips the job, and removing it
+  # starts a run (see ci.yml's trigger note). ci:full changes nothing here:
+  # the `paths:` filter below decides whether this workflow starts at all.
   pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
     paths:
       - 'crates/scarab-executor-k8s/**'
       - 'crates/scarab-engine/**'
@@ -57,8 +61,10 @@ on:
       - 'docker/**'
       - '.github/workflows/kind.yml'
 
+# A run started by a change to any label but ci:skip gets a group of its own,
+# so it cannot cancel a real run in flight.
 concurrency:
-  group: kind-${{ github.ref }}
+  group: kind-${{ github.ref }}${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ci:skip' && format('-label-{0}', github.run_id) || '' }}
   cancel-in-progress: true
 
 env:
@@ -87,6 +93,15 @@ env:
 
 jobs:
   cluster-tests:
+    # Skipped, with no runner started, under the ci:skip label and on a change
+    # to any other label. Pushes to main never skip.
+    if: >-
+      github.event_name != 'pull_request' || (
+        !contains(github.event.pull_request.labels.*.name, 'ci:skip') && !(
+          (github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
+          github.event.label.name != 'ci:skip'
+        )
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 60
     # The control plane's Postgres (ADR-0067 part 2): the workspace service
