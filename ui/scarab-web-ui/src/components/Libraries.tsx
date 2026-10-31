@@ -331,7 +331,7 @@ function LibraryRow(props: {
     <>
       <tr classList={{ dead: !!l().yanked }}>
         <td>
-          <div class="mono" style={{ color: "var(--soft-white)", "font-size": "13px" }}>
+          <div class="mono" style={{ color: "var(--soft-white)", "font-size": "var(--fs-md)" }}>
             lib:{l().publisher}/{l().name}
           </div>
           <div class="lib-badges" style={{ "margin-top": "4px" }}>
@@ -365,7 +365,7 @@ function LibraryRow(props: {
           </span>
         </td>
         <td class="lib-src">{l().source}</td>
-        <td class="mono" style={{ "font-size": "12px" }} title={absTime(l().installed_at)}>
+        <td class="mono" style={{ "font-size": "var(--fs-sm)" }} title={absTime(l().installed_at)}>
           {l().installed_by}
           <br />
           <span class="subtle">{relTime(l().installed_at)}</span>

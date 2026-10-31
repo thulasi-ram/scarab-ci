@@ -877,14 +877,14 @@ export default function StepPane(props: {
                                     <span class="mono">{c.name}</span>
                                     <span class="lib-hash">{shortHash(c.content_hash)}</span>
                                     <Show when={c.kind !== "plugin"}>
-                                      <span class="subtle" style={{ "font-size": "12px" }}>
+                                      <span class="subtle" style={{ "font-size": "var(--fs-sm)" }}>
                                         invoked as <span class="mono">{s().id.split("/").slice(0, k() + 1).join("/")}</span>
                                       </span>
                                     </Show>
                                   </div>
                                   <Show when={c.source}>{(src) => <div class="lib-src">{src()}</div>}</Show>
                                   <Show when={c.kind === "library"}>
-                                    <div class="subtle" style={{ "font-size": "12px" }}>
+                                    <div class="subtle" style={{ "font-size": "var(--fs-sm)" }}>
                                       {c.yanked ? <span class="plg-killed">yanked in this org</span> : "not yanked"}
                                     </div>
                                   </Show>
@@ -900,7 +900,7 @@ export default function StepPane(props: {
                               <div class="l1">
                                 <span class="kind">step</span>
                                 <span class="mono">{s().id.split("/").pop()}</span>
-                                <span class="subtle" style={{ "font-size": "12px" }}>
+                                <span class="subtle" style={{ "font-size": "var(--fs-sm)" }}>
                                   → <span class="mono">{s().id}</span> in this Run
                                 </span>
                               </div>
@@ -911,7 +911,7 @@ export default function StepPane(props: {
                       <div>
                         <p class="pane-sub">inputs in this invocation's scope</p>
                         <Show when={o().inputs.length > 0} fallback={<p class="empty">none: a Step in the Pipeline file reads the Run's parameters</p>}>
-                          <table class="table inputs-tbl" style={{ "font-size": "12.5px" }}>
+                          <table class="table inputs-tbl" style={{ "font-size": "var(--fs-sm)" }}>
                             <thead>
                               <tr>
                                 <th>input</th>
@@ -961,7 +961,7 @@ export default function StepPane(props: {
                     <div class="gp">
                       <div class="gp-card">
                         <h4>who releases it</h4>
-                        <div class="gp-big" style={{ "font-size": "16px" }}>
+                        <div class="gp-big" style={{ "font-size": "var(--fs-lg)" }}>
                           {g().releaser}
                         </div>
                         <div class="gp-line">
@@ -1027,7 +1027,7 @@ export default function StepPane(props: {
                           when={g().inputs && typeof g().inputs === "object"}
                           fallback={<div class="gp-line">Rendered when the gate is reached.</div>}
                         >
-                          <table class="table" style={{ "font-size": "12.5px" }}>
+                          <table class="table" style={{ "font-size": "var(--fs-sm)" }}>
                             <tbody>
                               <For each={Object.entries((g().inputs ?? {}) as Record<string, unknown>)}>
                                 {([k, v]) => (
