@@ -4890,30 +4890,38 @@ fn validate_output_reads(ir: &PipelineIr, diagnostics: &mut Vec<String>) {
     if declared.is_empty() {
         return;
     }
+    // `with:` templates already checked, by the invoke Step that wrote them:
+    // every Step a library inlines carries its invocation's bindings.
+    let mut bindings_seen: BTreeSet<(&str, &str)> = BTreeSet::new();
     for t in &ir.steps {
         // The templates written on `t`, with the `outputs` view they read
-        // through (`None`: Step ids as written).
-        let mut written: Vec<(&str, Option<&BTreeMap<String, OutputSource>>)> =
+        // through (`None`: Step ids as written) and the Step a diagnostic
+        // names.
+        let mut written: Vec<(&str, Option<&BTreeMap<String, OutputSource>>, &str)> =
             interpolatable_strings(t)
                 .into_iter()
-                .map(|text| (text, t.scope.as_ref().map(|s| &s.outputs)))
+                .map(|text| (text, t.scope.as_ref().map(|s| &s.outputs), t.id.as_str()))
                 .collect();
-        // A plugin gate's `with:` templates are kept as its input bindings
-        // and render in the invoke step's scope when the gate is reached.
-        if t.plugin_gate.is_some() {
-            if let Some(scope) = &t.scope {
-                if let (ScopeInputs::Bound(bindings), Some(caller)) =
-                    (&scope.inputs, &scope.caller)
-                {
-                    for b in bindings.values() {
-                        if let BoundValue::Template(text) = &b.value {
-                            written.push((text.as_str(), Some(&caller.outputs)));
+        // An invoke's `with:` templates are kept as input bindings and render
+        // in the invoke Step's scope: when a plugin gate is reached, and when
+        // a library Step launches. A diagnostic names the invoke Step: the
+        // gate itself, or the prefix of the library Step's id.
+        if let Some(scope) = &t.scope {
+            if let (ScopeInputs::Bound(bindings), Some(caller)) = (&scope.inputs, &scope.caller) {
+                let invoke = match &t.plugin_gate {
+                    Some(_) => t.id.as_str(),
+                    None => t.id.rsplit_once('/').map_or(t.id.as_str(), |(p, _)| p),
+                };
+                for b in bindings.values() {
+                    if let BoundValue::Template(text) = &b.value {
+                        if bindings_seen.insert((invoke, text.as_str())) {
+                            written.push((text.as_str(), Some(&caller.outputs), invoke));
                         }
                     }
                 }
             }
         }
-        for (text, view) in written {
+        for (text, view, reader) in written {
             for i in cel::scan_interpolations(text).0 {
                 let Ok(reads) = cel::reads(text[i.inner].trim()) else {
                     continue;
@@ -4936,9 +4944,8 @@ fn validate_output_reads(ir: &PipelineIr, diagnostics: &mut Vec<String>) {
                     if let Some(results) = declared.get(step.as_str()) {
                         if !results.contains(&field) {
                             diagnostics.push(format!(
-                                "step `{}`: reads `outputs.{name}.{field}`, which step `{step}` \
-                                 does not declare (it declares results: [{}])",
-                                t.id,
+                                "step `{reader}`: reads `outputs.{name}.{field}`, which step \
+                                 `{step}` does not declare (it declares results: [{}])",
                                 results.join(", ")
                             ));
                         }
