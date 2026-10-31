@@ -5,8 +5,16 @@ set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+if [ -f "$here/.tunnel.pid" ]; then
+  pid="$(cat "$here/.tunnel.pid" 2>/dev/null || true)"
+  if [ -n "$pid" ] && ps -o comm= -p "$pid" 2>/dev/null | grep -q cloudflared; then
+    echo "==> stopping the cloudflared tunnel (pid $pid)"
+    kill "$pid" 2>/dev/null || true
+  fi
+fi
 echo "==> removing the verification Forgejo (container + volume)"
 docker compose -f "$here/compose.yaml" down -v --remove-orphans
 
 # The generated env files carry a live API token — do not leave them lying about.
-rm -f "$here/.env.generated" "$here/.env.scarab"
+rm -f "$here/.env.generated" "$here/.env.scarab" "$here/.tunnel.pid" "$here/.tunnel.log" \
+  "$here/.libs-manifest.json"

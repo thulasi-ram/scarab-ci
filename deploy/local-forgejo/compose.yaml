@@ -29,9 +29,13 @@ services:
       FORGEJO__server__HTTP_PORT: "3000"
       # Must match the published port: Forgejo builds clone URLs and webhook
       # payload links from ROOT_URL.
-      FORGEJO__server__ROOT_URL: http://127.0.0.1:${FORGEJO_HTTP_PORT:-3300}/
+      # up.sh sets FORGEJO_ROOT_URL: the loopback URL, or the tunnel's https URL
+      # in tunnel mode (FORGEJO_TUNNEL=1).
+      FORGEJO__server__ROOT_URL: ${FORGEJO_ROOT_URL:-http://127.0.0.1:3300/}
       FORGEJO__server__DISABLE_SSH: "true"
       FORGEJO__service__DISABLE_REGISTRATION: "true"
+      # true in tunnel mode, where the instance is reachable from the internet.
+      FORGEJO__service__REQUIRE_SIGNIN_VIEW: ${FORGEJO_REQUIRE_SIGNIN_VIEW:-false}
       FORGEJO__repository__DEFAULT_BRANCH: main
       # THE setting that decides whether this tier can prove anything: Forgejo's
       # webhook allow-list defaults to `external`, which REFUSES to deliver to a

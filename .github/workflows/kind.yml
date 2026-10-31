@@ -222,13 +222,25 @@ jobs:
       # to :1.36 (ADR-0039: :latest defaults to root and the kubelet refuses it).
       # postgres:16 is the uid-pinned service sidecar case's image (git-bug
       # 908f534); the job's own Postgres service already pulled it.
+      #
+      # Each image is loaded as a ONE-platform archive. `kind load docker-image`
+      # imports with `--all-platforms`, and under the runner's containerd image
+      # store a multi-arch pull holds only amd64's layers, so the import fails
+      # with "content digest ...: not found" before any test runs. This failed
+      # every run from 304171e0 (postgres:16 added) on. The `kube-tests` recipe
+      # loads the same way.
       - name: Load step images into kind
         run: |
-          docker pull busybox:latest
-          docker pull busybox:1.36
-          docker pull postgres:16
-          kind load docker-image --name scarab-ci \
-            "$CLONE_IMAGE" "$SIDECAR_IMAGE" "$WSFETCH_IMAGE" busybox:latest busybox:1.36 postgres:16
+          platform="linux/$(docker version -f '{{.Server.Arch}}')"
+          for img in busybox:latest busybox:1.36 postgres:16; do
+            docker pull -q --platform "$platform" "$img"
+          done
+          for img in "$CLONE_IMAGE" "$SIDECAR_IMAGE" "$WSFETCH_IMAGE" busybox:latest busybox:1.36 postgres:16; do
+            archive="$RUNNER_TEMP/kind-image.tar"
+            docker save --platform "$platform" -o "$archive" "$img"
+            kind load image-archive "$archive" --name scarab-ci
+            rm -f "$archive"
+          done
 
       # The `kind: build` live test pushes to an in-cluster plain-HTTP registry
       # (SCARAB_TEST_REGISTRY) and verifies its tag list from a Pod.

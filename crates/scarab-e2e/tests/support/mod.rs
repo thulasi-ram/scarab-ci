@@ -7,6 +7,8 @@
 
 #![allow(dead_code)] // each test binary uses a different slice of the harness
 
+pub mod forgejo;
+
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -46,7 +48,13 @@ pub fn base_url() -> String {
 /// discovered values for exactly this "a different process" case; `just e2e`
 /// sources it. Missing → panic: an opted-in tier must not boot a server that
 /// structurally cannot finish a step.
-pub fn stack_workspace_env() -> [(&'static str, String); 3] {
+///
+/// Two URLs, as `up.sh` gives the stack server: Pods dial the discovered one,
+/// and this host process dials the service on loopback. Given only the Pod URL,
+/// the server fetched drain records from it; on darwin that is
+/// `host.docker.internal`, which the host cannot resolve, so the step never
+/// settled and the run sat `slow:running` until the budget ran out.
+pub fn stack_workspace_env() -> [(&'static str, String); 4] {
     let need = |k: &str| {
         std::env::var(k).unwrap_or_else(|_| {
             panic!("{k} unset — `just e2e` sources deploy/local-proc/.env.generated (written by up.sh)")
@@ -54,6 +62,7 @@ pub fn stack_workspace_env() -> [(&'static str, String); 3] {
     };
     [
         ("SCARAB_WORKSPACE_URL", need("SCARAB_TEST_WORKSPACE_POD_URL")),
+        ("SCARAB_WORKSPACE_CONTROL_URL", need("SCARAB_TEST_WORKSPACE_URL")),
         ("SCARAB_WORKSPACE_TOKEN_SECRET", need("SCARAB_TEST_WORKSPACE_SECRET")),
         ("SCARAB_WSFETCH_IMAGE", need("SCARAB_TEST_WSFETCH_IMAGE")),
     ]

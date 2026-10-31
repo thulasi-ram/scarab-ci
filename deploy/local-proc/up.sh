@@ -72,6 +72,13 @@ fi
 echo "==> ensuring namespace 'scarab'"
 KUBECONFIG="$kubeconfig" kubectl create namespace scarab \
   --dry-run=client -o yaml | KUBECONFIG="$kubeconfig" kubectl apply -f -
+# A namespace created seconds ago has no `default` ServiceAccount yet, and a Pod
+# created before the controller adds it is refused. On a fresh kind cluster that
+# refused the workspace probe below, and the stack failed to come up.
+for _ in $(seq 1 30); do
+  KUBECONFIG="$kubeconfig" kubectl get serviceaccount default -n scarab >/dev/null 2>&1 && break
+  sleep 1
+done
 
 if [ "$pg_managed" = 1 ]; then
   echo "==> waiting for Postgres to be healthy"
@@ -286,9 +293,9 @@ ws_probe_pod="ws-discover-$$"
 # produces no output would fail `just up` on a stack whose network is perfectly
 # fine, which is the kind of false red that gets a gate deleted.
 kubectl delete pod "$ws_probe_pod" -n scarab --ignore-not-found --wait=false >/dev/null 2>&1 || true
-kubectl run "$ws_probe_pod" -n scarab \
+ws_probe_run_error="$(kubectl run "$ws_probe_pod" -n scarab \
   --image=busybox:1.36 --restart=Never \
-  --command -- sh -c "$ws_probe_script" >/dev/null 2>&1 || true
+  --command -- sh -c "$ws_probe_script" 2>&1 >/dev/null || true)"
 ws_host=""
 for _ in $(seq 1 30); do
   phase="$(kubectl get pod "$ws_probe_pod" -n scarab -o jsonpath='{.status.phase}' 2>/dev/null || true)"
@@ -297,8 +304,13 @@ for _ in $(seq 1 30); do
   esac
   sleep 2
 done
+# `|| true`: a Pod that never ran has no logs, `kubectl logs` exits non-zero,
+# and under `pipefail` that ended this script with no message at all instead of
+# the error below.
 ws_host="$(kubectl logs "$ws_probe_pod" -n scarab 2>/dev/null \
-           | sed -n 's/^SCARAB_WS_HOST=//p' | tr -d '\r' | head -n 1)"
+           | sed -n 's/^SCARAB_WS_HOST=//p' | tr -d '\r' | head -n 1 || true)"
+ws_probe_state="$(kubectl get pod "$ws_probe_pod" -n scarab \
+  -o jsonpath='{.status.phase} {.status.containerStatuses[0].state}' 2>/dev/null || true)"
 kubectl delete pod "$ws_probe_pod" -n scarab --ignore-not-found --wait=false >/dev/null 2>&1 || true
 if [ -z "$ws_host" ] || [ "$ws_host" = none ]; then
   # A HARD GATE, not a warning — and this is the promotion the previous version's
@@ -312,6 +324,8 @@ if [ -z "$ws_host" ] || [ "$ws_host" = none ]; then
   {
     echo "error: no Pod-reachable address for the workspace service was found."
     echo "  Tried: $ws_candidates (port $ws_port)"
+    echo "  Probe Pod state: ${ws_probe_state:-never created}"
+    [ -n "$ws_probe_run_error" ] && echo "  kubectl run said: $ws_probe_run_error"
     echo "  Since ADR-0061 s3-feed this is FATAL: a Step that inherits a workspace"
     echo "  is provisioned by an init container that dials this URL, and the old"
     echo "  control-plane 'kubectl exec' feed is deleted, not kept as a fallback."
