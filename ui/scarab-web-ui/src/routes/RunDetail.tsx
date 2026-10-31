@@ -67,7 +67,7 @@ import {
   widenedNote,
 } from "../snapshot-retention";
 import { planDivergence, type ConfirmKind } from "../rerun-confirm";
-import { clock, clockLow, rerunYank, yankNote } from "../run-origin";
+import { clock, clockLow, isYankRefusal, rerunYank, yankNote } from "../run-origin";
 import { relTime, absTime, duration } from "../fmt";
 import { forgeCommitUrl, forgePrUrl } from "../forge";
 import StatusBadge from "../components/StatusBadge";
@@ -307,6 +307,10 @@ export default function RunDetail() {
         note: tv
           ? null
           : (gateStatus(s) ??
+            (s.attempt_list?.[s.attempt_list.length - 1]?.failure === "config" &&
+            isYankRefusal(s.attempt_list[s.attempt_list.length - 1]!.failure_detail)
+              ? { tone: "failed" as const, text: "refused · yanked" }
+              : null) ??
             (s.plugin_gate && gateLeft(s) != null && ["pending", "ready"].includes(s.status)
               ? { tone: "waiting" as const, text: `${clock(gateLeft(s)!)} left` }
               : null)),
@@ -883,7 +887,9 @@ export default function RunDetail() {
                     !!rerunBlockedByYank()
                   }
                   title={
-                    prereqBlocker(sel())
+                    rerunBlockedByYank()
+                      ? `refused: ${sel()} comes from lib:${rerunBlockedByYank()!.name}, which is yanked; start a new run`
+                      : prereqBlocker(sel())
                       ? `blocked — prerequisite ${prereqBlocker(sel())} failed; retry that first`
                       : `retry ${sel()} — another attempt in this version (no new version)`
                   }

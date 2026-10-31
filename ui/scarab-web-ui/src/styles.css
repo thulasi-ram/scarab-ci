@@ -3476,7 +3476,6 @@ h1, .crumb-head, .run-title {
   position: relative; border: 1px dashed var(--border-copper); border-radius: 5px;
   padding: 8px 10px 10px; background: color-mix(in srgb, var(--copper) 4%, transparent);
 }
-.dgroup .dnode { width: 172px; }
 .dgroup-h {
   margin: 0 0 8px;
   font-family: var(--font-mono); font-size: 10px; color: var(--copper);
@@ -3638,3 +3637,5 @@ code.c { font-family: var(--font-mono); font-size: 12px; color: var(--copper); }
 .rd-yank { position: static; max-width: none; width: auto; display: flex; align-items: center; gap: 8px; margin: 10px 0; box-shadow: none; }
 .rd-yank .btn { margin-left: auto; flex: none; }
 .origin-strip .lnk.y { color: var(--danger); }
+.lib-table td.lib-src { font-size: 11.5px; }
+.lib-table td { font-size: 13px; }

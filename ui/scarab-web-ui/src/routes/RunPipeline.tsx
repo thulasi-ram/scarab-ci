@@ -302,8 +302,17 @@ export default function RunPipeline() {
         <div class="panel">
           <div class="panel-h">
             <span>Parameters · {selected()}</span>
-            <Show when={iface()}>
+            {/* Read `iface()` only when it holds no error: reading an errored
+                resource throws, and the form below would never render. */}
+            <Show when={!iface.error && iface()}>
               {(i) => <span class="subtle mono">{i().inputs.length} declared</span>}
+            </Show>
+            <Show when={iface.error instanceof PipelineCompileError ? iface.error : null}>
+              {(e) => (
+                <span class="subtle mono">
+                  {e().failure.errors.length} {e().failure.errors.length === 1 ? "error" : "errors"}
+                </span>
+              )}
             </Show>
           </div>
           <div class="rp-form">

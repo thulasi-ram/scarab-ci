@@ -391,7 +391,7 @@ export default function LibraryReview() {
 /** One side-by-side diff cell. */
 function Cell(props: { c: SideCell; side: "old" | "new" }) {
   const c = props.c;
-  if ("fold" in c) return <div class="ud-row fold">⋯ {c.fold} unchanged lines</div>;
+  if ("fold" in c) return <div class="ud-row fold">⋯ {c.fold} unchanged {c.fold === 1 ? "line" : "lines"}</div>;
   if ("blank" in c) {
     return (
       <div class="ud-row blank">
